@@ -66,51 +66,6 @@ site crates/kr-worker/src/service/standing.rs limits &mut 1
 # limits' own (the writes are the caller's, which are listed).
 site crates/kr-worker/src/session.rs journal_mut &mut 1
 
-# The names that a body calls and the scan does not follow, one row to a body. Each is the standard
-# library's method here or a name that several functions of the crate declare, and was read for
-# the calls this roster counts (the list of names in the case); none makes one, except where a name
-# is shared with a function that does:
-#
-# * `drop` is the standard function; the crate's `Drop` impls cannot be called by name.
-# * `expect`, `filter` and `map` are the standard methods of an `Option`, a `Result` or an
-#   iterator; the crate declares one function of each name that these bodies do not call.
-# * `require_rich_work`: the call is the volatile state's read of the fence; the broker's own
-#   function of that name notes a fence and is called by none of the scoped bodies.
-#
-# A name that a row allows is not followed: what it calls is not seen.
-allow crates/kr-worker/src/action/time.rs pure_proven_ms lock projected
-allow crates/kr-worker/src/action/time.rs pure_wall_ms get now_ms
-allow crates/kr-worker/src/action/time.rs utc_deadline_standing load named recorded
-allow crates/kr-worker/src/broker/methods.rs checks application_instance_id binding_revision recheck
-allow crates/kr-worker/src/broker/methods.rs checks require_rich_work resource_id
-allow crates/kr-worker/src/broker/mod.rs check_responsible all filter
-allow crates/kr-worker/src/broker/mod.rs recheck_answer_trust unknown
-allow crates/kr-worker/src/service.rs check_accepted_deadline now
-allow crates/kr-worker/src/service.rs check_admission_limits drop
-allow crates/kr-worker/src/service.rs check_admission_limits map outstanding parse revision session
-allow crates/kr-worker/src/service.rs check_authority expect
-allow crates/kr-worker/src/service.rs check_dispatch_lease input refused
-allow crates/kr-worker/src/service.rs check_envelope contains epoch id
-allow crates/kr-worker/src/service.rs check_local_standing assert_not_held
-allow crates/kr-worker/src/service.rs check_preconditions as_str geometry lease output_cursor state
-allow crates/kr-worker/src/service.rs uncertain_outcome_in_the_way clone
-allow crates/kr-worker/src/service.rs uncertain_with_identity holds_back identity_of
-allow crates/kr-worker/src/service.rs validate any
-allow crates/kr-worker/src/service.rs validate iter
-# More names that a body calls and the scan does not follow, one row to a body (a name allowed
-# for one body is not allowed for another):
-allow crates/kr-worker/src/broker/methods.rs checks get
-allow crates/kr-worker/src/broker/mod.rs check_package_grants get iter
-allow crates/kr-worker/src/broker/mod.rs check_responsible get
-allow crates/kr-worker/src/broker/mod.rs recheck_answer_trust get
-allow crates/kr-worker/src/service.rs check_admission_limits get filter
-allow crates/kr-worker/src/service.rs check_dispatch_lease now revision expect
-allow crates/kr-worker/src/service.rs check_preconditions get parse
-allow crates/kr-worker/src/service.rs check_validated_revision input
-allow crates/kr-worker/src/service.rs validate as_str contains parse
-allow crates/kr-worker/src/input_domain.rs lock expect new with
-allow crates/kr-worker/src/service.rs holds_attachment expect
-
 # The functions that make the time contract's writes. The full check and the second raise stand
 # with the first admission's local owner check and the writer's; the kept reading stands with the
 # contract's own functions and no other. A call from any other function of the crate fails: the
@@ -130,163 +85,6 @@ only proven_wall_ms crates/kr-worker/src/action/time.rs settled_utc_ms 1
 only proven_wall_ms crates/kr-worker/src/action/time.rs check_utc_deadline 1
 only proven_wall_ms crates/kr-worker/src/action/time.rs validity 1
 
-# The target of each call of a name that several functions of the crate declare, one row to a
-# body: `allow` where the call is the standard library's or another crate's method (the scan does
-# not follow it), `calls` with the file of the definition that the body calls (the scan reads it).
-allow crates/kr-worker/src/action/time.rs lock lock
-allow crates/kr-worker/src/broker/capability.rs map get
-allow crates/kr-worker/src/broker/methods.rs require_in_time get
-allow crates/kr-worker/src/broker/methods.rs require_in_time now
-allow crates/kr-worker/src/broker/methods.rs upstream_deadline_passed get
-allow crates/kr-worker/src/broker/mod.rs resource clone
-allow crates/kr-worker/src/broker/mod.rs resource get
-allow crates/kr-worker/src/history_filter/mod.rs admit_question contains
-allow crates/kr-worker/src/history_filter/mod.rs filter new
-allow crates/kr-worker/src/history_filter/mod.rs filter push
-allow crates/kr-worker/src/history_filter/mod.rs from_history collect
-allow crates/kr-worker/src/history_filter/mod.rs from_history get
-allow crates/kr-worker/src/history_filter/mod.rs from_history iter
-allow crates/kr-worker/src/history_filter/retained.rs reaches_question get
-allow crates/kr-worker/src/history_filter/retained.rs reaches_resource get
-allow crates/kr-worker/src/input_domain.rs lock lock
-allow crates/kr-worker/src/journal.rs faulted describe
-allow crates/kr-worker/src/journal.rs faulted get
-allow crates/kr-worker/src/journal.rs faulted now_ms
-allow crates/kr-worker/src/journal.rs parse_action new
-allow crates/kr-worker/src/journal.rs uncertain_for_subject as_str
-allow crates/kr-worker/src/journal.rs uncertain_for_subject get
-allow crates/kr-worker/src/journal.rs uncertain_for_subject_matching as_str
-allow crates/kr-worker/src/journal.rs uncertain_for_subject_matching contains
-allow crates/kr-worker/src/journal.rs uncertain_for_subject_matching get
-allow crates/kr-worker/src/journal.rs uncertain_for_subject_matching next
-allow crates/kr-worker/src/journal.rs uncertain_for_subject_matching prepare
-allow crates/kr-worker/src/journal.rs uncertain_for_subject_matching query
-allow crates/kr-worker/src/local_gate.rs lock lock
-allow crates/kr-worker/src/local_gate.rs restrictions load
-allow crates/kr-worker/src/questions/mod.rs check_resolvable_reaching get
-allow crates/kr-worker/src/questions/store.rs check_request clone
-allow crates/kr-worker/src/questions/store.rs payload_digest as_str
-allow crates/kr-worker/src/questions/store.rs payload_digest collect
-allow crates/kr-worker/src/questions/store.rs payload_digest get
-allow crates/kr-worker/src/questions/store.rs payload_digest iter
-allow crates/kr-worker/src/questions/store.rs payload_digest text
-allow crates/kr-worker/src/service.rs check_admission_limits lock
-allow crates/kr-worker/src/service.rs check_authority lock
-allow crates/kr-worker/src/service.rs check_dispatch_lease lock
-allow crates/kr-worker/src/service.rs check_envelope validate
-allow crates/kr-worker/src/service.rs check_granted as_str
-allow crates/kr-worker/src/service.rs check_granted contains
-allow crates/kr-worker/src/service.rs check_session id
-allow crates/kr-worker/src/service.rs disclosure new
-allow crates/kr-worker/src/service.rs holds_attachment contains
-allow crates/kr-worker/src/service.rs holds_attachment lock
-allow crates/kr-worker/src/service.rs params_application_instance as_str
-allow crates/kr-worker/src/service.rs question_clock now_ms
-calls crates/kr-worker/src/broker/methods.rs check_reached state crates/kr-worker/src/broker/mod.rs
-calls crates/kr-worker/src/broker/methods.rs check_reached unknown crates/kr-worker/src/broker/error.rs
-calls crates/kr-worker/src/broker/methods.rs checks package crates/kr-worker/src/broker/methods.rs
-calls crates/kr-worker/src/broker/mod.rs resource pending crates/kr-worker/src/broker/ledger.rs
-calls crates/kr-worker/src/broker/mod.rs resource unknown crates/kr-worker/src/broker/error.rs
-calls crates/kr-worker/src/broker/mod.rs suspension_reason reason crates/kr-worker/src/broker/stream.rs
-calls crates/kr-worker/src/broker/mod.rs suspension_reason suspension crates/kr-worker/src/broker/bridge.rs
-calls crates/kr-worker/src/broker/mod.rs trusted_to_decode holds crates/kr-worker/src/broker/profiles.rs
-calls crates/kr-worker/src/broker/mod.rs unknown_binding unknown crates/kr-worker/src/broker/error.rs
-calls crates/kr-worker/src/broker/mod.rs unknown_instance unknown crates/kr-worker/src/broker/error.rs
-calls crates/kr-worker/src/history_filter/mod.rs filter produced_at_ms crates/kr-worker/src/history_filter/mod.rs
-calls crates/kr-worker/src/history_filter/mod.rs filter record crates/kr-worker/src/history_filter/mod.rs
-calls crates/kr-worker/src/history_filter/retained.rs reaches_resource admit_resource crates/kr-worker/src/history_filter/mod.rs
-calls crates/kr-worker/src/journal.rs faulted observe crates/kr-worker/src/persistence/fault.rs
-calls crates/kr-worker/src/local_gate.rs check_bound lock crates/kr-worker/src/local_gate.rs
-calls crates/kr-worker/src/questions/mod.rs check_create key crates/kr-worker/src/questions/binding.rs
-calls crates/kr-worker/src/questions/mod.rs check_create locked crates/kr-worker/src/questions/mod.rs
-calls crates/kr-worker/src/questions/mod.rs check_own locked crates/kr-worker/src/questions/mod.rs
-calls crates/kr-worker/src/questions/mod.rs check_resolvable_reaching locked crates/kr-worker/src/questions/mod.rs
-calls crates/kr-worker/src/questions/mod.rs check_resolvable_reaching read crates/kr-worker/src/questions/store.rs
-calls crates/kr-worker/src/questions/mod.rs check_resolvable_reaching unknown crates/kr-worker/src/questions/error.rs
-calls crates/kr-worker/src/questions/mod.rs question locked crates/kr-worker/src/questions/mod.rs
-calls crates/kr-worker/src/questions/mod.rs question read crates/kr-worker/src/questions/store.rs
-calls crates/kr-worker/src/questions/store.rs check_request by_request crates/kr-worker/src/questions/store.rs
-calls crates/kr-worker/src/questions/store.rs check_token key crates/kr-worker/src/questions/binding.rs
-calls crates/kr-worker/src/questions/store.rs check_token verify crates/kr-worker/src/questions/token.rs
-calls crates/kr-worker/src/questions/store.rs read_row row crates/kr-worker/src/questions/store.rs
-calls crates/kr-worker/src/questions/store.rs read_row unknown crates/kr-worker/src/questions/error.rs
-calls crates/kr-worker/src/service.rs bound_source source crates/kr-worker/src/questions/binding.rs
-calls crates/kr-worker/src/service.rs check_authority check_bound crates/kr-worker/src/service.rs
-calls crates/kr-worker/src/service.rs check_dispatch_lease lock crates/kr-worker/src/input_domain.rs
-calls crates/kr-worker/src/service.rs check_local_standing check_bound crates/kr-worker/src/local_gate.rs
-calls crates/kr-worker/src/service.rs check_validated_revision check_validated_revision crates/kr-worker/src/input_domain.rs
-calls crates/kr-worker/src/service.rs check_validated_revision lock crates/kr-worker/src/input_domain.rs
-calls crates/kr-worker/src/service.rs detach_subject detach_for_token crates/kr-worker/src/session.rs
-calls crates/kr-worker/src/service.rs launching_attachment lease crates/kr-worker/src/session.rs
-calls crates/kr-worker/src/service.rs params_attachment parse crates/kr-worker/src/service.rs
-calls crates/kr-worker/src/service/standing.rs authority check_validated_revision crates/kr-worker/src/service.rs
-calls crates/kr-worker/src/service/standing.rs subject validate crates/kr-worker/src/service.rs
-calls crates/kr-worker/src/session.rs attachment_capabilities capabilities crates/kr-worker/src/input_domain.rs
-calls crates/kr-worker/src/session.rs attachment_capabilities lock crates/kr-worker/src/input_domain.rs
-allow crates/kr-worker/src/broker/framing.rs find len
-allow crates/kr-worker/src/broker/ledger.rs pending get
-allow crates/kr-worker/src/broker/mod.rs follow_health clone
-allow crates/kr-worker/src/broker/mod.rs state clone
-allow crates/kr-worker/src/broker/mod.rs state from
-allow crates/kr-worker/src/broker/mod.rs state lock
-allow crates/kr-worker/src/broker/mod.rs state now_ms
-allow crates/kr-worker/src/broker/stream.rs reason as_str
-allow crates/kr-worker/src/history_filter/mod.rs record push
-allow crates/kr-worker/src/input_domain.rs capabilities get
-allow crates/kr-worker/src/input_domain.rs check_validated_revision get
-allow crates/kr-worker/src/persistence/fault.rs condition clone
-allow crates/kr-worker/src/persistence/fault.rs durable_through load
-allow crates/kr-worker/src/persistence/fault.rs faults_opened load
-allow crates/kr-worker/src/persistence/fault.rs observe describe
-allow crates/kr-worker/src/persistence/fault.rs observe new
-allow crates/kr-worker/src/projection.rs position from
-allow crates/kr-worker/src/projection.rs position new
-allow crates/kr-worker/src/questions/binding.rs key get
-allow crates/kr-worker/src/questions/binding.rs source clone
-allow crates/kr-worker/src/questions/mod.rs locked lock
-allow crates/kr-worker/src/questions/mod.rs locked unavailable
-allow crates/kr-worker/src/questions/store.rs hydrate_row as_str
-allow crates/kr-worker/src/questions/store.rs hydrate_row new
-allow crates/kr-worker/src/questions/store.rs hydrate_row read
-allow crates/kr-worker/src/questions/store.rs hydrate_row text
-allow crates/kr-worker/src/questions/store.rs hydrate_row unavailable
-allow crates/kr-worker/src/questions/store.rs read unknown
-allow crates/kr-worker/src/questions/store.rs row get
-allow crates/kr-worker/src/service.rs check_bound contains
-allow crates/kr-worker/src/service.rs parse as_str
-allow crates/kr-worker/src/service.rs parse default
-allow crates/kr-worker/src/service.rs parse get
-allow crates/kr-worker/src/session.rs detach_for_token get
-allow crates/kr-worker/src/session.rs detach_for_token lock
-allow crates/kr-worker/src/session.rs lease lock
-calls crates/kr-worker/src/broker/ledger.rs pending decode crates/kr-worker/src/broker/ledger.rs
-calls crates/kr-worker/src/broker/ledger.rs pending fault crates/kr-worker/src/broker/ledger.rs
-calls crates/kr-worker/src/broker/mod.rs follow_health fault crates/kr-worker/src/persistence/fault.rs
-calls crates/kr-worker/src/broker/mod.rs follow_health fence crates/kr-worker/src/broker/mod.rs
-calls crates/kr-worker/src/broker/mod.rs follow_health is_healthy crates/kr-worker/src/persistence/fault.rs
-calls crates/kr-worker/src/broker/mod.rs follow_health mode crates/kr-worker/src/broker/mod.rs
-calls crates/kr-worker/src/history_filter/mod.rs admit_resource admit_approval crates/kr-worker/src/history_filter/mod.rs
-calls crates/kr-worker/src/questions/store.rs hydrate_row uuid_from crates/kr-worker/src/questions/store.rs
-calls crates/kr-worker/src/questions/store.rs read row crates/kr-worker/src/questions/store.rs
-calls crates/kr-worker/src/questions/token.rs verify covered crates/kr-worker/src/questions/token.rs
-calls crates/kr-worker/src/session.rs detach_for_token detach_for_token crates/kr-worker/src/session.rs
-calls crates/kr-worker/src/session.rs detach_for_token fence crates/kr-worker/src/session.rs
-calls crates/kr-worker/src/session.rs lease lease crates/kr-worker/src/session.rs
-allow crates/kr-worker/src/broker/arbitration.rs enter_volatile clone
-allow crates/kr-worker/src/broker/arbitration.rs enter_volatile new
-allow crates/kr-worker/src/broker/arbitration.rs enter_volatile push
-allow crates/kr-worker/src/history_filter/mod.rs admit_approval contains
-allow crates/kr-worker/src/questions/store.rs uuid_from unavailable
-allow crates/kr-worker/src/questions/token.rs covered get
-allow crates/kr-worker/src/questions/token.rs covered len
-allow crates/kr-worker/src/session.rs fence lock
-allow crates/kr-worker/src/session.rs fence of
-calls crates/kr-worker/src/broker/ledger.rs fault of crates/kr-worker/src/broker/ledger.rs
-calls crates/kr-worker/src/broker/mod.rs fence mode crates/kr-worker/src/broker/mod.rs
-calls crates/kr-worker/src/broker/mod.rs mode mode crates/kr-worker/src/broker/mod.rs
-calls crates/kr-worker/src/broker/mod.rs mode state crates/kr-worker/src/broker/mod.rs
-calls crates/kr-worker/src/persistence/fault.rs is_healthy is_healthy crates/kr-worker/src/persistence/fault.rs
-
 # The base's own writes that the follow shows below the pass, each as at the base (no line of them
 # is in the range): the subject's check reaches the broker's state (`check_reached`), whose lock is
 # taken through `Broker::state`, and `state` runs the health refresh before anything is decided: a
@@ -301,8 +99,198 @@ site crates/kr-worker/src/broker/mod.rs fence raise 1
 site crates/kr-worker/src/broker/arbitration.rs enter_volatile &mut 1
 site crates/kr-worker/src/history_filter/mod.rs record &mut 1
 site crates/kr-worker/src/persistence/fault.rs observe note_fault 1
-allow crates/kr-worker/src/broker/ledger.rs of describe
-allow crates/kr-worker/src/broker/ledger.rs of get
-allow crates/kr-worker/src/broker/ledger.rs of load
-allow crates/kr-worker/src/broker/ledger.rs of now_ms
+
+# The names that a body calls where the receiver is a type of the standard library or of another
+# crate: the receiver's type was read in the body, from a parameter, a field's declared type or a
+# local's initialiser, and no function of this crate is called. A name that this crate declares too
+# (a `get`, a `clone`, an `expect`) is allowed for a body only where the receiver is not a type of
+# this crate. The row counts for that body alone, and the scan does not follow a name it allows.
+allow crates/kr-worker/src/action/dedup.rs holds_back identity_of
+allow crates/kr-worker/src/action/dedup.rs revision clone get
+allow crates/kr-worker/src/action/time.rs lock lock
+allow crates/kr-worker/src/action/time.rs now_ms load new now_ms
+allow crates/kr-worker/src/action/time.rs pure_wall_ms get
+allow crates/kr-worker/src/action/time.rs utc_deadline_standing load named recorded
+allow crates/kr-worker/src/attachments.rs geometry new
+allow crates/kr-worker/src/attachments.rs get get
+allow crates/kr-worker/src/broker/arbitration.rs enter_volatile clone new push
+allow crates/kr-worker/src/broker/arbitration.rs get get
+allow crates/kr-worker/src/broker/capability.rs is_usable get record
+allow crates/kr-worker/src/broker/capability.rs map get
+allow crates/kr-worker/src/broker/capability.rs recheck get record
+allow crates/kr-worker/src/broker/framing.rs find len
+allow crates/kr-worker/src/broker/ledger.rs of describe get load now_ms
+allow crates/kr-worker/src/broker/ledger.rs pending get
+allow crates/kr-worker/src/broker/methods.rs checks get
+allow crates/kr-worker/src/broker/methods.rs require_in_time get now
+allow crates/kr-worker/src/broker/methods.rs upstream_deadline_passed get
+allow crates/kr-worker/src/broker/mod.rs check_package_grants get iter
+allow crates/kr-worker/src/broker/mod.rs check_responsible all filter get
+allow crates/kr-worker/src/broker/mod.rs follow_health clone
+allow crates/kr-worker/src/broker/mod.rs resource clone
+allow crates/kr-worker/src/broker/mod.rs state clone from lock now_ms
+allow crates/kr-worker/src/broker/mod.rs trusted_to_decode holds
+allow crates/kr-worker/src/broker/stream.rs reason as_str
+allow crates/kr-worker/src/fence/driver.rs detach_for_token bytes len
+allow crates/kr-worker/src/history_filter/mod.rs admit_approval contains
+allow crates/kr-worker/src/history_filter/mod.rs admit_question contains
+allow crates/kr-worker/src/history_filter/mod.rs filter new push
+allow crates/kr-worker/src/history_filter/mod.rs from_history collect get iter
+allow crates/kr-worker/src/history_filter/mod.rs record push
+allow crates/kr-worker/src/history_filter/retained.rs reaches_question get
+allow crates/kr-worker/src/history_filter/retained.rs reaches_resource get
+allow crates/kr-worker/src/input.rs new new
+allow crates/kr-worker/src/input.rs to_wire new
+allow crates/kr-worker/src/input_domain.rs assert_not_held with
+allow crates/kr-worker/src/input_domain.rs capabilities get
+allow crates/kr-worker/src/input_domain.rs check_validated_revision get
+allow crates/kr-worker/src/input_domain.rs lock expect lock with
+allow crates/kr-worker/src/input_domain.rs new default get set with
+allow crates/kr-worker/src/journal.rs faulted describe get now_ms
+allow crates/kr-worker/src/journal.rs outstanding as_str get
+allow crates/kr-worker/src/journal.rs parse_action new
+allow crates/kr-worker/src/journal.rs uncertain_for_subject as_str get
+allow crates/kr-worker/src/journal.rs uncertain_for_subject_matching as_str contains get next prepare query
+allow crates/kr-worker/src/local_gate.rs lock lock
+allow crates/kr-worker/src/local_gate.rs restrictions load
+allow crates/kr-worker/src/persistence/fault.rs condition clone
+allow crates/kr-worker/src/persistence/fault.rs durable_through load
+allow crates/kr-worker/src/persistence/fault.rs faults_opened load
+allow crates/kr-worker/src/persistence/fault.rs observe describe new
+allow crates/kr-worker/src/projection.rs position from new
+allow crates/kr-worker/src/questions/binding.rs key get
+allow crates/kr-worker/src/questions/binding.rs source clone
+allow crates/kr-worker/src/questions/mod.rs check_resolvable_reaching get
+allow crates/kr-worker/src/questions/mod.rs locked lock
+allow crates/kr-worker/src/questions/store.rs check_request clone
+allow crates/kr-worker/src/questions/store.rs hydrate_row as_str new read text
+allow crates/kr-worker/src/questions/store.rs payload_digest as_str collect get iter text
+allow crates/kr-worker/src/questions/store.rs row get
+allow crates/kr-worker/src/questions/token.rs covered get len
+allow crates/kr-worker/src/runtime.rs lock_session lock try_lock
+allow crates/kr-worker/src/runtime.rs new new
+allow crates/kr-worker/src/runtime.rs session expect
+allow crates/kr-worker/src/service.rs check_accepted_deadline now
+allow crates/kr-worker/src/service.rs check_admission_limits drop filter get lock map
+allow crates/kr-worker/src/service.rs check_authority expect lock
+allow crates/kr-worker/src/service.rs check_bound contains
+allow crates/kr-worker/src/service.rs check_dispatch_lease expect now refused
+allow crates/kr-worker/src/service.rs check_envelope contains validate
+allow crates/kr-worker/src/service.rs check_granted as_str contains
+allow crates/kr-worker/src/service.rs check_preconditions as_str get
+allow crates/kr-worker/src/service.rs holds_attachment contains expect lock
+allow crates/kr-worker/src/service.rs params_application_instance as_str
+allow crates/kr-worker/src/service.rs parse as_str default get
+allow crates/kr-worker/src/service.rs question_clock now_ms
+allow crates/kr-worker/src/service.rs uncertain_outcome_in_the_way clone
+allow crates/kr-worker/src/service.rs uncertain_with_identity identity_of
+allow crates/kr-worker/src/service.rs validate any as_str contains iter
+
+# The function that a body calls, where several functions of this crate declare its name and the
+# receiver is a type of this crate: the file of that type's definition, which the scan reads. A
+# call through a field, a guard or a parameter names the definition of that type and never the
+# body's own file by default. A name has an `allow` row or a `calls` row for a body, not both.
+calls crates/kr-worker/src/action/time.rs pure_proven_ms lock crates/kr-worker/src/action/time.rs
+calls crates/kr-worker/src/action/time.rs pure_proven_ms projected crates/kr-worker/src/action/time.rs
+calls crates/kr-worker/src/action/time.rs pure_wall_ms now_ms crates/kr-worker/src/action/time.rs
+calls crates/kr-worker/src/broker/ledger.rs fault of crates/kr-worker/src/broker/ledger.rs
 calls crates/kr-worker/src/broker/ledger.rs of observe crates/kr-worker/src/persistence/fault.rs
+calls crates/kr-worker/src/broker/ledger.rs pending decode crates/kr-worker/src/broker/ledger.rs
+calls crates/kr-worker/src/broker/ledger.rs pending fault crates/kr-worker/src/broker/ledger.rs
+calls crates/kr-worker/src/broker/methods.rs check_reached state crates/kr-worker/src/broker/mod.rs
+calls crates/kr-worker/src/broker/methods.rs check_reached unknown crates/kr-worker/src/broker/error.rs
+calls crates/kr-worker/src/broker/methods.rs checks application_instance_id crates/kr-worker/src/broker/methods.rs
+calls crates/kr-worker/src/broker/methods.rs checks binding_revision crates/kr-worker/src/broker/methods.rs
+calls crates/kr-worker/src/broker/methods.rs checks package crates/kr-worker/src/broker/methods.rs
+calls crates/kr-worker/src/broker/methods.rs checks recheck crates/kr-worker/src/broker/capability.rs
+calls crates/kr-worker/src/broker/methods.rs checks require_rich_work crates/kr-worker/src/broker/volatile.rs
+calls crates/kr-worker/src/broker/methods.rs checks resource_id crates/kr-worker/src/broker/methods.rs
+calls crates/kr-worker/src/broker/mod.rs fence mode crates/kr-worker/src/broker/volatile.rs
+calls crates/kr-worker/src/broker/mod.rs follow_health fault crates/kr-worker/src/persistence/fault.rs
+calls crates/kr-worker/src/broker/mod.rs follow_health fence crates/kr-worker/src/broker/mod.rs
+calls crates/kr-worker/src/broker/mod.rs follow_health is_healthy crates/kr-worker/src/persistence/fault.rs
+calls crates/kr-worker/src/broker/mod.rs follow_health mode crates/kr-worker/src/broker/volatile.rs
+calls crates/kr-worker/src/broker/mod.rs recheck_answer_trust get crates/kr-worker/src/broker/arbitration.rs
+calls crates/kr-worker/src/broker/mod.rs recheck_answer_trust unknown crates/kr-worker/src/broker/error.rs
+calls crates/kr-worker/src/broker/mod.rs resource get crates/kr-worker/src/broker/arbitration.rs
+calls crates/kr-worker/src/broker/mod.rs resource pending crates/kr-worker/src/broker/ledger.rs
+calls crates/kr-worker/src/broker/mod.rs resource unknown crates/kr-worker/src/broker/error.rs
+calls crates/kr-worker/src/broker/mod.rs suspension_reason reason crates/kr-worker/src/broker/stream.rs
+calls crates/kr-worker/src/broker/mod.rs suspension_reason suspension crates/kr-worker/src/broker/bridge.rs
+calls crates/kr-worker/src/broker/mod.rs unknown_binding unknown crates/kr-worker/src/broker/error.rs
+calls crates/kr-worker/src/broker/mod.rs unknown_instance unknown crates/kr-worker/src/broker/error.rs
+calls crates/kr-worker/src/history_filter/mod.rs admit_resource admit_approval crates/kr-worker/src/history_filter/mod.rs
+calls crates/kr-worker/src/history_filter/mod.rs filter produced_at_ms crates/kr-worker/src/history_filter/mod.rs
+calls crates/kr-worker/src/history_filter/mod.rs filter record crates/kr-worker/src/history_filter/mod.rs
+calls crates/kr-worker/src/history_filter/retained.rs reaches_resource admit_resource crates/kr-worker/src/history_filter/mod.rs
+calls crates/kr-worker/src/input_domain.rs lease to_wire crates/kr-worker/src/input.rs
+calls crates/kr-worker/src/input_domain.rs lock new crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/input.rs
+calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/input_domain.rs new new crates/kr-worker/src/runtime.rs
+calls crates/kr-worker/src/journal.rs faulted observe crates/kr-worker/src/persistence/fault.rs
+calls crates/kr-worker/src/local_gate.rs check_bound lock crates/kr-worker/src/local_gate.rs
+calls crates/kr-worker/src/persistence/fault.rs is_healthy is_healthy crates/kr-worker/src/persistence/fault.rs
+calls crates/kr-worker/src/questions/mod.rs check_create key crates/kr-worker/src/questions/binding.rs
+calls crates/kr-worker/src/questions/mod.rs check_create locked crates/kr-worker/src/questions/mod.rs
+calls crates/kr-worker/src/questions/mod.rs check_own locked crates/kr-worker/src/questions/mod.rs
+calls crates/kr-worker/src/questions/mod.rs check_resolvable_reaching locked crates/kr-worker/src/questions/mod.rs
+calls crates/kr-worker/src/questions/mod.rs check_resolvable_reaching read crates/kr-worker/src/questions/store.rs
+calls crates/kr-worker/src/questions/mod.rs check_resolvable_reaching unknown crates/kr-worker/src/questions/error.rs
+calls crates/kr-worker/src/questions/mod.rs locked unavailable crates/kr-worker/src/questions/error.rs
+calls crates/kr-worker/src/questions/mod.rs question locked crates/kr-worker/src/questions/mod.rs
+calls crates/kr-worker/src/questions/mod.rs question read crates/kr-worker/src/questions/store.rs
+calls crates/kr-worker/src/questions/store.rs check_request by_request crates/kr-worker/src/questions/store.rs
+calls crates/kr-worker/src/questions/store.rs check_token key crates/kr-worker/src/questions/binding.rs
+calls crates/kr-worker/src/questions/store.rs check_token verify crates/kr-worker/src/questions/token.rs
+calls crates/kr-worker/src/questions/store.rs hydrate_row unavailable crates/kr-worker/src/questions/error.rs
+calls crates/kr-worker/src/questions/store.rs hydrate_row uuid_from crates/kr-worker/src/questions/store.rs
+calls crates/kr-worker/src/questions/store.rs read row crates/kr-worker/src/questions/store.rs
+calls crates/kr-worker/src/questions/store.rs read unknown crates/kr-worker/src/questions/error.rs
+calls crates/kr-worker/src/questions/store.rs read_row row crates/kr-worker/src/questions/store.rs
+calls crates/kr-worker/src/questions/store.rs read_row unknown crates/kr-worker/src/questions/error.rs
+calls crates/kr-worker/src/questions/store.rs uuid_from unavailable crates/kr-worker/src/questions/error.rs
+calls crates/kr-worker/src/questions/token.rs verify covered crates/kr-worker/src/questions/token.rs
+calls crates/kr-worker/src/runtime.rs lock_session assert_not_held crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/service.rs bound_source source crates/kr-worker/src/questions/binding.rs
+calls crates/kr-worker/src/service.rs check_admission_limits outstanding crates/kr-worker/src/journal.rs
+calls crates/kr-worker/src/service.rs check_admission_limits parse crates/kr-worker/src/service.rs
+calls crates/kr-worker/src/service.rs check_admission_limits revision crates/kr-worker/src/action/dedup.rs
+calls crates/kr-worker/src/service.rs check_admission_limits session crates/kr-worker/src/runtime.rs
+calls crates/kr-worker/src/service.rs check_authority check_bound crates/kr-worker/src/service.rs
+calls crates/kr-worker/src/service.rs check_dispatch_lease input crates/kr-worker/src/runtime.rs
+calls crates/kr-worker/src/service.rs check_dispatch_lease lock crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/service.rs check_dispatch_lease revision crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/service.rs check_envelope epoch crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs check_envelope id crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs check_local_standing assert_not_held crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/service.rs check_local_standing check_bound crates/kr-worker/src/local_gate.rs
+calls crates/kr-worker/src/service.rs check_preconditions geometry crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs check_preconditions lease crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs check_preconditions output_cursor crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs check_preconditions parse crates/kr-worker/src/service.rs
+calls crates/kr-worker/src/service.rs check_preconditions state crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs check_session id crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs check_validated_revision check_validated_revision crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/service.rs check_validated_revision input crates/kr-worker/src/runtime.rs
+calls crates/kr-worker/src/service.rs check_validated_revision lock crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/service.rs detach_subject detach_for_token crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs disclosure new crates/kr-worker/src/history_filter/mod.rs
+calls crates/kr-worker/src/service.rs launching_attachment lease crates/kr-worker/src/session.rs
+calls crates/kr-worker/src/service.rs params_attachment parse crates/kr-worker/src/service.rs
+calls crates/kr-worker/src/service.rs uncertain_with_identity holds_back crates/kr-worker/src/action/dedup.rs
+calls crates/kr-worker/src/service.rs validate parse crates/kr-worker/src/service.rs
+calls crates/kr-worker/src/service/standing.rs authority check_validated_revision crates/kr-worker/src/service.rs
+calls crates/kr-worker/src/service/standing.rs subject validate crates/kr-worker/src/service.rs
+calls crates/kr-worker/src/session.rs attachment_capabilities capabilities crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/session.rs attachment_capabilities lock crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/session.rs detach_for_token detach_for_token crates/kr-worker/src/fence/driver.rs
+calls crates/kr-worker/src/session.rs detach_for_token fence crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/session.rs detach_for_token get crates/kr-worker/src/attachments.rs
+calls crates/kr-worker/src/session.rs detach_for_token lock crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/session.rs geometry geometry crates/kr-worker/src/attachments.rs
+calls crates/kr-worker/src/session.rs lease lease crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/session.rs lease lock crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/session.rs output_cursor next_cursor crates/kr-worker/src/history.rs
+calls crates/kr-worker/src/session.rs state lock crates/kr-worker/src/input_domain.rs
+calls crates/kr-worker/src/session.rs state state crates/kr-worker/src/input_domain.rs
