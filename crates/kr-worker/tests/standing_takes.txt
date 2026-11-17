@@ -150,16 +150,24 @@ only check_utc_deadline crates/kr-worker/src/runtime.rs start_and_say_if_the_she
 only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
 
 # The guards held where a call is made, from the text before it: `BAR` is a dispatch barrier that
-# the same function takes with a `let` that locks `dispatch`, `SES` the session that a function is
-# given or takes before the call. The first admission and the prepared path do not take the barrier
-# themselves: their callers, `receipt_once` and `prepared_once`, take it with `try_boundary` and
-# call `receipted` and `continue_prepared` while they hold it, and the reader does not know
-# `try_boundary` as a guard. So the rows of `receipted` and `continue_prepared` read no `BAR`: that
-# the barrier is held there is not read, and the one `caller` row of each function is what keeps
-# a call from anywhere else out.
+# the same function takes with a `let` that locks `dispatch` or calls `try_boundary` (which
+# returns the guard of that lock, or none), `SES` the session that a function is given or takes
+# before the call. `let Some(x) =` and `let Ok(x) =` bind `x`, a binding `_` holds nothing, and a
+# `drop(x)` ends the guard.
+# The first admission and the prepared path do not take the barrier themselves: their callers,
+# `receipt_once` and `prepared_once`, take it with `try_boundary` and call `receipted` and
+# `continue_prepared` while they hold it. The `held` row of each of those two calls says `BAR`, so
+# a caller that lets the barrier go before the call, or takes it with a binding `_`, fails it. What
+# keeps a call from any other function out is an `only` row, not a `caller` row: a `caller` row
+# reads only the file that it names, and a function of a child module of the service can call
+# these private methods; an `only` row reads every file of this crate's `src`, so a second caller
+# in any file fails it. What neither row reads is the barrier taken in a way the reader does not
+# know (a guard that another function returns).
 # The first admission asks the authority and the limits under no guard that the reader sees, the
 # envelope under a session of its own, and takes the session for the limits itself.
-caller receipted crates/kr-worker/src/service.rs receipt_once 1
+only receipted crates/kr-worker/src/service.rs receipt_once 1
+held crates/kr-worker/src/service.rs receipt_once receipted BAR
+only admit_and_dispatch crates/kr-worker/src/service.rs receipted 1
 held crates/kr-worker/src/service.rs receipted authority none
 held crates/kr-worker/src/service.rs receipted envelope SES
 held crates/kr-worker/src/service.rs receipted limits none
@@ -230,7 +238,8 @@ site crates/kr-worker/src/broker/bridge.rs attested_thread state 1
 # and hand the session on.
 caller dispatch_accepted crates/kr-worker/src/service.rs admit_and_dispatch 1
 caller dispatch_accepted crates/kr-worker/src/service.rs continue_prepared 1
-caller continue_prepared crates/kr-worker/src/service.rs prepared_once 1
+only continue_prepared crates/kr-worker/src/service.rs prepared_once 1
+held crates/kr-worker/src/service.rs prepared_once continue_prepared BAR
 held crates/kr-worker/src/service.rs continue_prepared dispatch_accepted SES
 supplies crates/kr-worker/src/service.rs admit_and_dispatch dispatch_accepted 1 session
 supplies crates/kr-worker/src/service.rs continue_prepared dispatch_accepted 1 session
