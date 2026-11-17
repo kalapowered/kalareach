@@ -182,6 +182,27 @@ async fn until_the_revision_holds(host: &Host) -> RevocationBarrier {
     }
 }
 
+/// Waits until the daemon's own ask of its worker has been settled: the registry holds the worker as
+/// having acknowledged the revision in force.
+///
+/// A daemon asks a worker the registry holds behind the revision in force by itself, at its start
+/// and at each pass after (five seconds apart), and announces that revision to it. A worker that
+/// finds its dispatch boundary held answers that it will fence it later, and the ask ends there.
+/// A revocation made before the ask is settled is a second announcement beside it: the worker joins
+/// the two revisions into one fence, and the result of the newer reads the older one, which the
+/// worker cannot say what its fence named for.
+async fn until_the_daemon_has_settled_its_own_ask(host: &Host) {
+    let revision = host.controller().policy().authority_revision().get();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while acknowledged_in_the_registry(host) < revision {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the daemon's own ask did not settle the worker at revision {revision}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The revision the registry holds the worker as having acknowledged.
 fn acknowledged_in_the_registry(host: &Host) -> u64 {
     let registry = rusqlite::Connection::open(host.tree().environment().registry_database())
@@ -359,6 +380,27 @@ async fn a_restarted_daemon_reads_the_newest_revisions_of_a_long_gap_and_says_th
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_restarted_daemon_does_not_read_a_worker_made_after_the_revisions_that_passed_when_no_fence_was_owed()
  {
+    a_worker_made_after_the_revisions_that_passed_is_revoked_after_a_restart(false).await;
+}
+
+/// KR-REQ-10.45, 09.13: the same, where the worker finds its dispatch boundary held when the
+/// daemon's own ask of it at the start arrives, as it does for a moment while another exchange is
+/// inside it. The worker owes that revision, and the daemon asks again at its next pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_restarted_daemon_does_not_read_a_worker_that_refused_its_first_ask_after_the_revisions_that_passed()
+ {
+    a_worker_made_after_the_revisions_that_passed_is_revoked_after_a_restart(true).await;
+}
+
+/// Three revocations, a stop, a worker made while the daemon is stopped, a start that adopts it,
+/// and one more revocation. Asserts that the result of the last names nothing of the revisions
+/// the worker was never told.
+///
+/// `refuse_the_first_ask` makes the worker refuse the daemon's own ask at the start for its
+/// dispatch boundary, once.
+async fn a_worker_made_after_the_revisions_that_passed_is_revoked_after_a_restart(
+    refuse_the_first_ask: bool,
+) {
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     for _ in 0..3 {
@@ -369,14 +411,27 @@ async fn a_restarted_daemon_does_not_read_a_worker_made_after_the_revisions_that
     }
     let stopped = host.shut_down().await;
     let worker = Worker::start_reserved(stopped.tree(), 1).await;
+    if refuse_the_first_ask {
+        worker.service.refuse_announcements_for_tests(true);
+    }
     let settings = stopped.settings().clone();
     let host = stopped.start(settings).await;
+    if refuse_the_first_ask {
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            worker.service.refused_for_the_boundary_beyond(0),
+        )
+        .await
+        .expect("the daemon's start asked the worker, which refused for its boundary");
+        worker.service.refuse_announcements_for_tests(false);
+    }
     let adopted = Adopted {
         host,
         owner,
         workers: vec![worker],
     };
     adopted.until_adopted(&adopted.workers[0]).await;
+    until_the_daemon_has_settled_its_own_ask(&adopted.host).await;
 
     adopted
         .host
