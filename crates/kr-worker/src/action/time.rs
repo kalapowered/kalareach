@@ -3441,6 +3441,11 @@ mod tests {
         /// reading of it from when it was armed, as a clock moves between two tries.
         set_before: std::sync::atomic::AtomicI64,
         set_before_to: std::sync::atomic::AtomicU64,
+        /// The owner confirms the clock in `confirm_in`, with the readings of that moment, right
+        /// after the pause has landed in the reading for the `confirm_after`th time from when it
+        /// was armed, and after the wall clock was set there, if it was.
+        confirm_after: std::sync::atomic::AtomicI64,
+        confirm_in: Mutex<Option<Arc<kr_ipc::floor::SharedFloor>>>,
     }
 
     impl Holdup {
@@ -3462,6 +3467,8 @@ mod tests {
                 set_to: std::sync::atomic::AtomicU64::new(0),
                 set_before: std::sync::atomic::AtomicI64::new(0),
                 set_before_to: std::sync::atomic::AtomicU64::new(0),
+                confirm_after: std::sync::atomic::AtomicI64::new(0),
+                confirm_in: Mutex::new(None),
             })
         }
 
@@ -3475,6 +3482,16 @@ mod tests {
             self.set_to
                 .store(wall_ms, std::sync::atomic::Ordering::SeqCst);
             self.set_after
+                .store(landing, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// The owner confirms the clock in `floor` right after the pause has landed `landing` times.
+        fn confirms_after_landing(&self, landing: i64, floor: Arc<kr_ipc::floor::SharedFloor>) {
+            *self
+                .confirm_in
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(floor);
+            self.confirm_after
                 .store(landing, std::sync::atomic::Ordering::SeqCst);
         }
 
@@ -3537,6 +3554,16 @@ mod tests {
             }
             if lands && self.set_after.fetch_sub(1, SeqCst) == 1 {
                 self.wall.set(self.set_to.load(SeqCst));
+            }
+            if lands
+                && self.confirm_after.fetch_sub(1, SeqCst) == 1
+                && let Some(floor) = self
+                    .confirm_in
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_ref()
+            {
+                floor.establish(self.wall.now_ms().get(), self.continuous.boot_elapsed_ms());
             }
             reading
         }
@@ -4115,6 +4142,209 @@ mod tests {
             contract.trust(),
             WallClockTrust::Trusted,
             "a pause in the following reads no peak, so the confirmation is followed"
+        );
+    }
+
+    /// A worker that found a rollback and does not trust its clock, and the owner's confirmation
+    /// made after it: no look has met the confirmation yet, and the clock stands where the owner
+    /// put it.
+    fn found_a_rollback_and_was_confirmed()
+    -> (Arc<kr_ipc::floor::SharedFloor>, Arc<Holdup>, TimeContract) {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 8_000);
+        assert!(contract.observe().rolled_back);
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        (floor, held, contract)
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the narrow reading of the following is compared with each held-up
+    /// proof by itself, not with the one furthest reference. The worker proved an older peak of
+    /// ten minutes ahead, and the owner then corrected the clock and confirmed. The look finds
+    /// that first step back. The first try of the following reads a lower peak after the owner
+    /// spoke, held up, and the clock goes back again before the narrow retry. The retry is far
+    /// behind what that try proved, so the confirmation is refused, though the worker's own mark
+    /// projects further than the try's wall and was proved before the owner spoke.
+    #[test]
+    fn the_following_compares_the_narrow_reading_with_each_held_up_proof_by_itself() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        held.wall.set(WALL + 600_000);
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(WALL + 61_000);
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        held.sets_the_wall_before_reading(2, WALL + 500_000);
+        held.sets_the_wall_after_landing(1, WALL + 72_000);
+        held.arm(1, 1);
+        let found = contract.observe();
+        assert!(found.rolled_back, "the look finds the first step back");
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back 438 s from a reading taken after the owner spoke"
+        );
+    }
+
+    /// KR-REQ-09.18: a peak that only the three held-up tries of the following of the owner read
+    /// is in the mark, as the three held-up tries of a look are: the following spends nothing, the
+    /// mark holds the peak at the third try's second reading and is owed its write, and the next
+    /// look finds the step back made after it.
+    #[test]
+    fn a_peak_only_the_three_held_up_tries_of_the_following_read_is_kept() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        let (_, written) = contract.durable_state();
+        contract.note_saved(written);
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        let peak = held.wall.now_ms().get() + 600_000;
+        held.sets_the_wall_before_reading(2, peak);
+        held.sets_the_wall_after_landing(3, peak + 30_000 - 60_000);
+        held.arm(1, 3);
+        let found = contract.observe();
+        assert!(found.suspended, "the following owes the revalidation");
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Trusted,
+            "and spends nothing"
+        );
+        let mark = contract.durable_state().0.proven.0.expect("a mark");
+        assert_eq!(
+            (mark.wall_clock_ms.get(), mark.continuous_ms.get()),
+            (peak + 30_000, 3_692_000),
+            "the peak is in the mark, stamped at the third try's second reading"
+        );
+        assert!(
+            contract.unsaved(),
+            "and the step forward it shows is owed its write"
+        );
+        contract.leases_revalidated();
+        assert!(
+            contract.observe().rolled_back,
+            "the next look finds the step back made after the peak"
+        );
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a worker that does not trust its clock keeps what the held-up
+    /// tries of its following read until the confirmation is decided. All three tries of one
+    /// attempt are held up at a peak, the clock goes back to the owner's, and no narrow reading
+    /// was had: nothing is decided. The next attempt's narrow reading agrees with the owner's
+    /// clock and is far behind that peak, which was read after the owner spoke: the confirmation is
+    /// refused.
+    #[test]
+    fn a_worker_that_does_not_trust_its_clock_keeps_the_proofs_of_an_exhausted_following() {
+        let (_floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let owner_level = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(2, owner_level + 600_000);
+        held.sets_the_wall_after_landing(3, owner_level + 30_000);
+        held.arm(1, 3);
+        let found = contract.observe();
+        assert!(
+            found.suspended,
+            "no narrow bracket in the following: nothing is decided"
+        );
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a peak that the held-up tries read after the \
+             owner spoke"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the worker's own mark, where it carries further than a held-up
+    /// proof, is compared with the narrow reading as well. The owner confirms, the clock then
+    /// reads ten minutes ahead and the look's narrow reading raises the mark to it, after the
+    /// owner spoke. The first try of the following reads the owner's clock, held up. The narrow
+    /// retry agrees with that try and is ten minutes behind the mark: the confirmation is refused.
+    #[test]
+    fn the_mark_that_carries_further_than_a_held_up_proof_refuses_the_confirmation() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        let owner_level = held.wall.now_ms().get();
+        floor.establish(owner_level, held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        held.wall.set(owner_level + 600_000);
+        held.sets_the_wall_before_reading(2, owner_level + 2_000);
+        held.arm(1, 1);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading the worker proved after the owner spoke"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: what the held-up tries of the following kept is bounded, and at
+    /// the bound it is the older proofs that fold, into one with the later stamp and the greater
+    /// wall. The first try of the first attempt reads a peak and the clock goes back to the
+    /// owner's before the second; five more attempts are held up in all three tries, so the proofs
+    /// pass the bound twice; the narrow reading that follows is far behind the peak and the
+    /// confirmation is refused.
+    #[test]
+    fn a_peak_among_the_oldest_held_up_proofs_of_the_following_survives_the_bound() {
+        let (_floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let owner_level = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(2, owner_level + 600_000);
+        held.sets_the_wall_after_landing(1, owner_level + 10_000);
+        held.arm(1, 3);
+        contract.observe();
+        for _ in 0..5 {
+            held.pass(Duration::from_secs(1));
+            held.arm(1, 3);
+            assert!(contract.observe().suspended);
+        }
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the peak that the first held-up try read is still held against the confirmation"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a confirmation that replaces the pending one does not inherit
+    /// the proofs kept for the old one. The third held-up try of the following of the first
+    /// confirmation reads the peak and the owner corrects the clock and confirms again inside it,
+    /// so the try is stamped at the new confirmation; the following of the new one takes its own
+    /// readings, which agree with the owner, and is not refused by a reading from before it.
+    #[test]
+    fn a_new_confirmation_does_not_inherit_the_held_up_proofs_kept_for_the_one_it_replaces() {
+        let (floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let owner_level = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(2, owner_level + 600_000);
+        held.sets_the_wall_after_landing(3, owner_level + 30_000);
+        held.confirms_after_landing(3, Arc::clone(&floor));
+        held.arm(1, 3);
+        assert!(contract.observe().suspended);
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Trusted,
+            "the new confirmation is followed: its own readings agree with it"
         );
     }
 }
