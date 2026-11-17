@@ -964,7 +964,7 @@ of one holds that host's own lock, which a dial takes before it decides, so the 
 visit that began before the forget either finishes its introduction first, and the forget then takes
 the host out, or waits for the forget and is refused. A caller that stops waiting leaves nothing
 behind that the forget does not remove. A forget waits for the introduction of its own host and
-for those two shared waits, and not for another host's introduction. A new pairing with the same
+for those two shared waits, and not for another host's lock. A new pairing with the same
 host has an identity of its own and is not refused, and the host stays in the endpoint until the
 last pairing that introduced it is forgotten. The pool
 closes its endpoint only when `EndpointPool::close`
