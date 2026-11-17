@@ -1197,6 +1197,14 @@ struct LinkState {
     /// test makes by [`as_a_visit`] are not.
     holding_own: bool,
     unreachable: bool,
+    /// The host whose connections are held once the device endpoint has taken the host in, before the
+    /// caller is given the connection, and what is told each time one is held.
+    holding_dialled: Option<(
+        kr_protocol::scalars::EndpointKey,
+        std::sync::mpsc::Sender<()>,
+    )>,
+    /// The connections held that way, each let go by its sender.
+    dialled_waiting: Vec<tokio::sync::oneshot::Sender<()>>,
     /// Whether a connection that is let through is ended as it is made, as a network that drops it
     /// at once does.
     ending: bool,
@@ -1280,6 +1288,78 @@ impl LinkControl {
     /// forgets it: what the case reads in `look` is what stands when the endpoint is asked.
     pub fn at_the_forget(&self, look: impl Fn() + Send + Sync + 'static) {
         *self.forgetting.lock().expect("the record") = Some(Arc::new(look));
+    }
+
+    /// Holds the next dial of `host` that has passed the device endpoint's first look at its
+    /// pairing and is about to introduce the host, until the hold is released.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the control governs no device.
+    pub fn hold_next_introduce_of(
+        &self,
+        host: &kr_protocol::scalars::EndpointKey,
+    ) -> kr_client::pairing::link::IntroduceHold {
+        self.pool
+            .lock()
+            .expect("the record")
+            .as_ref()
+            .expect("the control governs a device")
+            .hold_next_introduce_of(host)
+    }
+
+    /// Asks the device's endpoint for the host `host` names, as the pairing that record is, as the
+    /// dial of a visit that began under the record does: what such a visit asks of the endpoint
+    /// after the record is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the endpoint refused the host.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the control governs no device.
+    pub async fn dial_as(
+        &self,
+        host: &kr_client::pairing::paired::PairedHost,
+    ) -> Result<(), kr_client::pairing::link::LinkError> {
+        let pool = self
+            .pool
+            .lock()
+            .expect("the record")
+            .clone()
+            .expect("the control governs a device");
+        pool.endpoint(
+            &host.network_config,
+            &host.host_endpoint_id,
+            kr_client::pairing::link::Standing::Paired(host.device_id),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Holds each connection to `host` once the device endpoint has taken the host in and the
+    /// connection is made, before the caller is given it, until [`Self::release_dialled`]. The
+    /// receiver is told each time a connection arrives at the hold.
+    pub fn hold_dialled(
+        &self,
+        host: kr_protocol::scalars::EndpointKey,
+    ) -> std::sync::mpsc::Receiver<()> {
+        let (told, arrivals) = std::sync::mpsc::channel();
+        self.state.lock().expect("the record").holding_dialled = Some((host, told));
+        arrivals
+    }
+
+    /// Lets go the connections held by [`Self::hold_dialled`] and holds no more.
+    pub fn release_dialled(&self) {
+        let waiting = {
+            let mut state = self.state.lock().expect("the record");
+            state.holding_dialled = None;
+            std::mem::take(&mut state.dialled_waiting)
+        };
+        for sender in waiting {
+            let _ = sender.send(());
+        }
     }
 
     /// How many connections have been asked for, held ones included.
@@ -1893,6 +1973,21 @@ impl ControlledLink {
             ));
         }
         let transport = self.own.connect_paired_transport(host, identity).await?;
+        let held_after = {
+            let mut state = self.control.state.lock().expect("the record");
+            match state.holding_dialled.clone() {
+                Some((key, told)) if key == host.host_endpoint_id => {
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    state.dialled_waiting.push(sender);
+                    let _ = told.send(());
+                    Some(receiver)
+                }
+                _ => None,
+            }
+        };
+        if let Some(receiver) = held_after {
+            let _ = receiver.await;
+        }
         if ending {
             transport.close();
         }
@@ -2349,7 +2444,7 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
 
     fn forget_host<'a>(
         &'a self,
-        host: &'a kr_protocol::scalars::EndpointKey,
+        host: &'a kr_client::pairing::paired::PairedHost,
     ) -> kr_client::pairing::BoxFuture<'a, ()> {
         let look = self.control.forgetting.lock().expect("the record").clone();
         if let Some(look) = look {
