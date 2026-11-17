@@ -40,6 +40,8 @@ kr-delivery.workspace = true
 # and this daemon maps none: it names every session from metadata.
 kr-describe.workspace = true
 kr-flush = { workspace = true, features = ["sqlite"] }
+# The moment a refusal of a pairing names, in the form the command line shows every moment in.
+jiff.workspace = true
 kr-ipc.workspace = true
 kr-loopback.workspace = true
 kr-pairing.workspace = true
@@ -109,7 +111,6 @@ kr-controller = { path = ".", features = ["testing"] }
 # catalogue's own generation builder.
 aws-lc-rs.workspace = true
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
-jiff.workspace = true
 kr-cbor.workspace = true
 # The upload cases that end a client's first data stream, which the client compiles only for tests.
 kr-client = { workspace = true, features = ["terminal", "testing"] }

@@ -639,6 +639,7 @@ impl PairingHost {
                 let mut identity = self.identity.clone();
                 identity.network_config = network_config;
                 let rows = self.rows.issuing(terms, action);
+                let advertising = rows.clone();
                 let slot = rows.write_admission().clone();
                 let (spendable, mut challenges) = self.owner.spend(&expectation, &|_| true)?;
                 if let Some(invited) = self.invited(&open, caller, action) {
@@ -672,6 +673,7 @@ impl PairingHost {
                         qr_text: qr_text(&payload)?,
                     },
                 };
+                advertising.advertise(answer.expires_at_ms);
                 (OpenMode::Direct(Box::new(invitation)), answer, slot)
             }
             InviteMode::Code { .. } => {
@@ -693,6 +695,7 @@ impl PairingHost {
                 let mut identity = self.identity.clone();
                 identity.network_config = network_config;
                 let rows = self.rows.issuing(terms, action);
+                let advertising = rows.clone();
                 let slot = rows.write_admission().clone();
                 let (spendable, mut challenges) = self.owner.spend(&expectation, &|_| true)?;
                 if let Some(invited) = self.invited(&open, caller, action) {
@@ -731,6 +734,7 @@ impl PairingHost {
                         qr_text: qr_text(&payload)?,
                     },
                 };
+                advertising.advertise(answer.expires_at_ms);
                 let (stop, stopped) = watch::channel(false);
                 let reservation = invitation.reservation();
                 let ticket = RoomTicket {

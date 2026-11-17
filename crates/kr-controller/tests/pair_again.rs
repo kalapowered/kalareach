@@ -266,6 +266,8 @@ async fn a_device_pairs_again_after_its_grant_ran_out() {
 struct Bound {
     client: kr_ipc::client::LocalClient,
     invitation_id: InvitationId,
+    /// The moment the invitation advertised that it stays open until, as the owner was told it.
+    expires_at_ms: u64,
     _connection: iroh::endpoint::Connection,
 }
 
@@ -284,14 +286,15 @@ async fn bind(host: &Host, device: &Device, owner: &DeviceKeys) -> Bound {
     Bound {
         client,
         invitation_id: invited.invitation_id,
+        expires_at_ms: invited.expires_at_ms.get(),
         _connection: connection,
     }
 }
 
 /// The words a person reads when the host is still finishing the earlier withdrawal of access, and
-/// the moment the invitation stays open until, which is five minutes after it was issued.
-fn barrier_words(issued_at_ms: i64) -> String {
-    let until = jiff::Timestamp::from_millisecond(issued_at_ms + 5 * 60 * 1000)
+/// the moment the invitation stays open until, which is the expiry the invitation advertised.
+fn barrier_words(expires_at_ms: u64) -> String {
+    let until = jiff::Timestamp::from_millisecond(i64::try_from(expires_at_ms).expect("a moment"))
         .expect("a moment")
         .strftime("%Y-%m-%d %H:%M:%S UTC")
         .to_string();
@@ -353,13 +356,6 @@ async fn a_replacement_waits_for_the_barrier_and_a_first_pairing_does_not() {
     // The device with the ended record is bound to a new invitation and the owner confirms it.
     let signer = Signer::OwnerDevice(&owner);
     let mut again = bind(&host, &phone, &owner).await;
-    let issued_at_ms: i64 = registry(&host)
-        .query_row(
-            "SELECT issued_at_ms FROM pairing_invitations WHERE invitation_id = ?1",
-            [again.invitation_id.get().as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .expect("the invitation's issue moment");
     let spent = count(
         &host,
         "SELECT COUNT(*) FROM owner_confirmations WHERE consumed_at_ms IS NOT NULL",
@@ -378,7 +374,7 @@ async fn a_replacement_waits_for_the_barrier_and_a_first_pairing_does_not() {
     .await
     .expect_err("the host is still finishing the earlier withdrawal");
     assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
-    assert_eq!(refused.message, barrier_words(issued_at_ms));
+    assert_eq!(refused.message, barrier_words(again.expires_at_ms));
     assert_eq!(
         count(
             &host,
@@ -487,6 +483,132 @@ async fn a_replacement_waits_for_the_barrier_and_a_first_pairing_does_not() {
             .map(|record| record.device_id),
         Some(second.device_id)
     );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the moment the refusal names is the moment the invitation advertised, not one
+/// rebuilt from when the host stamped the invitation as issued. The host stamps the issue first,
+/// and the invitation reads the clock again for the expiry it advertises once its record is
+/// written; a wait between the two makes them differ. Here the case holds the registry's write
+/// lock for three seconds while the invitation is issued, so the two reads are three seconds
+/// apart. The refusal of the confirmation names the advertised expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_barrier_refusal_names_the_expiry_the_invitation_advertised() {
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    host.controller().hold_the_pass_asks_for_tests(true);
+    let worker = &workers[0];
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let boundary = worker.hold_the_dispatch_boundary().await;
+    let barrier = within(
+        "the revocation",
+        BOUND,
+        host.network().revoke_device(first.device_id),
+    )
+    .await
+    .expect("the device is revoked");
+    assert_eq!(barrier.pending(), vec![worker.session_id], "{barrier:?}");
+
+    // The owner answers the invitation's challenge, and the case then holds the registry's write
+    // lock while the invitation is issued.
+    let signer = Signer::OwnerDevice(&owner);
+    let mut client = host.client().await;
+    // One proposal for the challenge and the invitation: its expiry is read from the clock.
+    let proposed = rights();
+    calls::confirm_subject(
+        host.environment_id,
+        &mut client,
+        ConfirmationSubject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            rendezvous_origin: Nullable::null(),
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: proposed.clone(),
+        },
+        &signer,
+    )
+    .await
+    .expect("the owner answers");
+    let (locked, lock_held) = std::sync::mpsc::channel::<()>();
+    let path = host.registry_database();
+    let holder = std::thread::spawn(move || {
+        let connection = rusqlite::Connection::open(path).expect("the registry opens");
+        connection
+            .busy_timeout(Duration::from_secs(30))
+            .expect("waits for the daemon's writes");
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("the write lock is taken");
+        locked.send(()).expect("the case is waiting");
+        std::thread::sleep(Duration::from_secs(3));
+        connection
+            .execute_batch("COMMIT")
+            .expect("the lock is let go");
+    });
+    lock_held
+        .recv_timeout(BOUND)
+        .expect("the case holds the registry's write lock");
+    let invited = within(
+        "the invitation",
+        BOUND,
+        calls::mutate::<_, PairInviteResult>(
+            host.environment_id,
+            &mut client,
+            Method::PairInvite,
+            &PairInviteParams {
+                mode: InviteMode::Direct,
+                grant_kind: InviteGrantKind::SessionInvitation,
+                proposed_grant: proposed,
+            },
+        ),
+    )
+    .await
+    .expect("an invitation");
+    holder.join().expect("the holding thread ends");
+    let (connection, _candidate, _value) = calls::redeem(&phone.candidate(), &invited).await;
+    let issued_at_ms: u64 = registry(&host)
+        .query_row(
+            "SELECT issued_at_ms FROM pairing_invitations WHERE invitation_id = ?1",
+            [invited.invitation_id.get().as_bytes().as_slice()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|stamped| u64::try_from(stamped).expect("a moment"))
+        .expect("the invitation's issue moment");
+    let reconstructed = issued_at_ms + 5 * 60 * 1000;
+    assert!(
+        invited.expires_at_ms.get() >= reconstructed + 2_500,
+        "the advertised expiry {} was read after the wait, later than the stamp of the issue \
+         {issued_at_ms} says",
+        invited.expires_at_ms.get()
+    );
+    let refused = within(
+        "the confirmation",
+        BOUND,
+        calls::confirm_candidate(
+            host.environment_id,
+            &mut client,
+            invited.invitation_id,
+            &signer,
+        ),
+    )
+    .await
+    .expect_err("the host is still finishing the earlier withdrawal");
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+    assert_eq!(
+        refused.message,
+        barrier_words(invited.expires_at_ms.get()),
+        "the refusal names the moment the invitation advertised"
+    );
+    assert_ne!(
+        refused.message,
+        barrier_words(reconstructed),
+        "and not one rebuilt from the stamp of the issue"
+    );
+    boundary.release();
+    drop(connection);
     host.stop().await;
 }
 
