@@ -3004,16 +3004,18 @@ async fn end_a_window_at_its_take(
 }
 
 /// Whether, by `deadline`, a statement has either waited for a detach that is pending or been
-/// acknowledged.
+/// acknowledged. The count of waits is cumulative, so `sample` is its value read before the
+/// statement started: a wait that an earlier statement made does not count for this one.
 async fn waits_or_is_answered(
     world: &Arc<World>,
     acknowledged: &Arc<std::sync::atomic::AtomicBool>,
+    sample: usize,
     deadline: std::time::Instant,
 ) -> bool {
     let waiting = Arc::clone(&world.service);
     let answered = Arc::clone(acknowledged);
     holds_by(deadline, move || {
-        waiting.detach_waits_for_tests() > 0 || is_set(&answered)
+        waiting.detach_waits_for_tests() > sample || is_set(&answered)
     })
     .await
 }
@@ -3071,8 +3073,9 @@ async fn a_statement_meets_the_end_of_a_connection_that_comes_after_it()
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
 
     let release_first = end_a_window_at_its_take(&world, first_window, deadline).await?;
+    let sample = world.service.detach_waits_for_tests();
     let (acknowledged, daemon_end) = start_the_statement(daemon, open(2));
-    if !waits_or_is_answered(&world, &acknowledged, deadline).await {
+    if !waits_or_is_answered(&world, &acknowledged, sample, deadline).await {
         let _ = release_first.send(());
         return Err("the statement neither waited for the first end's detach nor was acknowledged");
     }
@@ -3157,8 +3160,9 @@ async fn an_open_statement_under_churn_and_the_closed_that_follows()
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
 
     let release_first = end_a_window_at_its_take(&world, first_window, deadline).await?;
+    let sample = world.service.detach_waits_for_tests();
     let (acknowledged, daemon_end) = start_the_statement(daemon, open(2));
-    if !waits_or_is_answered(&world, &acknowledged, deadline).await {
+    if !waits_or_is_answered(&world, &acknowledged, sample, deadline).await {
         let _ = release_first.send(());
         return Err(
             "the Open statement neither waited for the first end's detach nor was acknowledged",
@@ -3240,9 +3244,11 @@ fn an_open_statement_under_churn_is_acknowledged_and_the_closed_that_follows_is_
     );
 }
 
-/// What the session held when a statement was acknowledged by the service's own pass, and how many
-/// detaches that pass made.
+/// Whether a statement was acknowledged before the session was let go, what the session held when
+/// the service's own pass had made the owed detach and the statement was acknowledged, and how
+/// many detaches that pass made.
 struct OwedAndLater {
+    answered_before_the_session_was_let_go: bool,
     at_the_answer: Held,
     second: AttachmentId,
     settled_by_the_service: u64,
@@ -3286,11 +3292,13 @@ async fn a_statement_meets_a_detach_that_a_connections_end_owed()
         let _ = release_session.send(());
         return Err("the first window's connection never ended");
     }
+    let sample = world.service.detach_waits_for_tests();
     let (acknowledged, daemon_end) = start_the_statement(daemon, open(2));
-    if !waits_or_is_answered(&world, &acknowledged, deadline).await {
+    if !waits_or_is_answered(&world, &acknowledged, sample, deadline).await {
         let _ = release_session.send(());
         return Err("the statement neither waited for the owed detach nor was acknowledged");
     }
+    let answered_before_the_session_was_let_go = is_set(&acknowledged);
     let release_second = match end_a_window_at_its_take(&world, second_window, deadline).await {
         Ok(release) => release,
         Err(step) => {
@@ -3317,6 +3325,7 @@ async fn a_statement_meets_a_detach_that_a_connections_end_owed()
     }
     world.close();
     Ok(OwedAndLater {
+        answered_before_the_session_was_let_go,
         at_the_answer,
         second,
         settled_by_the_service,
@@ -3330,6 +3339,10 @@ async fn a_statement_meets_a_detach_that_a_connections_end_owed()
 fn a_statement_is_acknowledged_when_the_service_makes_the_detach_that_a_connections_end_owed() {
     let landed = on_a_runtime(a_statement_meets_a_detach_that_a_connections_end_owed())
         .expect("the schedule came about");
+    assert!(
+        !landed.answered_before_the_session_was_let_go,
+        "the statement was acknowledged while the session was held and the owed detach was pending"
+    );
     assert_eq!(
         landed.settled_by_the_service, 1,
         "the service's own pass did not make the owed detach"
