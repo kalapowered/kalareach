@@ -1765,7 +1765,9 @@ struct WriterOrder {
     /// How many answers and withdrawals waited, and what the session held, at the first step that
     /// can tell whether the writer's withdrawal waits for the hold.
     waiting_at_the_hold: usize,
-    at_the_hold: Held,
+    /// What the session held at that step. The clock's order reads nothing there: the attach holds
+    /// the session from its check to its push, as it does on the way to the marker.
+    at_the_hold: Option<Held>,
     /// What the session held when the withdrawal and the acknowledgement were complete, the end of
     /// the window's connection being stopped before it detached anything.
     when_complete: Held,
@@ -1792,16 +1794,30 @@ async fn the_writer_withdraws_a_window_whose_attach_is_in_flight(
             tell(&mut daemon, world.machine.lease(1, 1_000, FAR_MS)).await;
         }
     }
+    // The clock's order has the stream's next frame in the delivery's hand before the attach takes
+    // the session, and written only once the lease has ended: the attach holds the session, and no
+    // frame is made while it does.
+    let frame = matches!(ends, Ends::ByClock)
+        .then(|| world.service.stall_a_delivery_before_its_next_frame());
     let first = world.attach(&mut window).await;
     world.subscribe(&mut window, first).await;
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    let go_frame = match frame {
+        Some((arrived, go_frame)) => {
+            if ends_by(deadline, async move { arrived.await.is_ok() }).await != Some(true) {
+                return Err("the stream's delivery never had a frame in hand");
+            }
+            Some(go_frame)
+        }
+        None => None,
+    };
     // A lease that ends is caught by the attach's own check of its lease and deadline, so the
-    // clock's order stops the attach after those and before its marker.
+    // clock's order stops the attach after those and before its marker, with the session held.
     let (checked, go_attach) = match ends {
         Ends::ByStatement => world.service.stall_a_mutation_after_its_dispatch_check(),
         Ends::ByClock => world.service.stall_a_mutation_after_its_deadline_check(),
     };
     let (_at_the_end, go_end) = world.service.stall_a_connection_at_its_end();
-    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
     let before = Arc::new(held(&world));
     let attach_ended = start_the_geometry_attach(&world, window);
     if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
@@ -1814,6 +1830,9 @@ async fn the_writer_withdraws_a_window_whose_attach_is_in_flight(
         Ends::ByStatement => (Some(start_the_statement(daemon, closed(2))), None, 2),
         Ends::ByClock => {
             world.machine.runs(Duration::from_millis(1_001));
+            if let Some(go_frame) = go_frame {
+                let _ = go_frame.send(());
+            }
             (None, Some(daemon), 1)
         }
     };
@@ -1824,10 +1843,13 @@ async fn the_writer_withdraws_a_window_whose_attach_is_in_flight(
     // window's first attachment out of the session, or the statement was acknowledged.
     let waiting = Arc::clone(&world);
     let answered = acknowledged.clone();
+    let by_clock = matches!(ends, Ends::ByClock);
     if !holds_by(deadline, move || {
         waiting.service.statements_waiting_for_tests() >= wanted
-            || waiting.holds_nothing()
             || answered.as_ref().is_some_and(|flag| is_set(flag))
+            // The session is free only in the statement's order; in the clock's, the attach holds
+            // it and nothing may look at it before the attach is let go.
+            || (!by_clock && waiting.holds_nothing())
     })
     .await
     {
@@ -1835,11 +1857,15 @@ async fn the_writer_withdraws_a_window_whose_attach_is_in_flight(
     }
     let answered_while_held = acknowledged.as_ref().is_some_and(|flag| is_set(flag));
     let waiting_at_the_hold = world.service.statements_waiting_for_tests();
-    let at_the_hold = {
+    let at_the_hold = if by_clock {
+        None
+    } else {
         let reader = Arc::clone(&world);
-        tokio::task::spawn_blocking(move || held(&reader))
-            .await
-            .expect("the session is read")
+        Some(
+            tokio::task::spawn_blocking(move || held(&reader))
+                .await
+                .expect("the session is read"),
+        )
     };
 
     go_attach.send(()).expect("lets the attach go");
@@ -1926,8 +1952,9 @@ fn a_window_the_writer_withdraws_waits_for_the_hold_of_the_attach_that_was_in_fl
         "the statement and the writer's withdrawal did not both wait for the hold: {}",
         order.waiting_at_the_hold
     );
+    let at_the_hold = order.at_the_hold.expect("the session was read at the hold");
     assert_eq!(
-        order.at_the_hold.attachments,
+        at_the_hold.attachments,
         vec![order.first],
         "the writer's withdrawal ran while the hold of the attach stood"
     );
@@ -1963,13 +1990,8 @@ fn a_window_the_writer_withdraws_when_its_lease_ends_waits_for_the_hold_of_the_a
     .expect("the schedule came about");
     assert!(
         order.waiting_at_the_hold >= 1,
-        "the writer's withdrawal did not wait for the hold: {}",
+        "the writer's withdrawal was not waiting for the hold: {}",
         order.waiting_at_the_hold
-    );
-    assert_eq!(
-        order.at_the_hold.attachments,
-        vec![order.first],
-        "the writer's withdrawal ran while the hold of the attach stood"
     );
 }
 
