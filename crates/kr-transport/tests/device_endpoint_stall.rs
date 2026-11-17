@@ -13,7 +13,9 @@
 
 mod support;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -51,20 +53,68 @@ const BEFORE: usize = 200;
 const DURING: usize = 400;
 const AFTER: usize = 200;
 
-// The library's own log lines of its relay transport, kept with their time. ----------------------
+// The library's own log lines of its relay transport, kept with their time and with the endpoint
+// and the relay client whose spans each came in. --------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Line {
     /// "Lost connection to relay server: ..."
     Lost,
     /// A dial that ran out, or a flush that dropped the datagrams the queue held.
     Dialling,
-    /// A relay client of the endpoint connected, to this URL.
-    Connected(String),
+    /// A relay client of the endpoint connected.
+    Connected,
+}
+
+/// One kept line: when it came, the span of the endpoint and the URL of the relay client that it
+/// came from, and what it said. A line that came outside the spans of an endpoint has span 0, and a
+/// line outside those of a relay client has an empty relay: neither matches a filter.
+#[derive(Clone, Debug)]
+struct Logged {
+    when: Instant,
+    endpoint: u64,
+    relay: String,
+    line: Line,
 }
 
 #[derive(Default)]
-struct Seen(Mutex<Vec<(Instant, Line)>>);
+struct Seen {
+    lines: Mutex<Vec<Logged>>,
+    /// Set just before the device's endpoint is bound: the next `endpoint` span is the device's.
+    expecting: AtomicBool,
+    device: AtomicU64,
+}
+
+impl Seen {
+    /// Marks the next endpoint that is bound as the device's, so that its lines can be told from
+    /// the lines of the hosts' endpoints, which log in the same program.
+    fn expect_the_device(&self) {
+        self.device.store(0, Ordering::SeqCst);
+        self.expecting.store(true, Ordering::SeqCst);
+    }
+
+    /// The span of the device's endpoint, once it was bound.
+    fn the_device(&self) -> u64 {
+        let span = self.device.load(Ordering::SeqCst);
+        assert_ne!(span, 0, "the capture saw the span of the device's endpoint");
+        span
+    }
+
+    /// The kept lines of the endpoint with this span about the relay `relay`, in the order they
+    /// came.
+    fn of(&self, endpoint: u64, relay: &RelayUrl) -> Vec<Logged> {
+        self.lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|logged| {
+                logged.endpoint == endpoint
+                    && logged.relay.parse::<RelayUrl>().ok().as_ref() == Some(relay)
+            })
+            .cloned()
+            .collect()
+    }
+}
 
 #[derive(Default)]
 struct Words {
@@ -82,18 +132,68 @@ impl tracing::field::Visit for Words {
     }
 }
 
-struct Capture(Arc<Seen>);
+/// A span of the library on the way from an endpoint to a relay client: `endpoint`, `relay-actor`
+/// and `active-relay`, which has the relay client's URL in `url`.
+struct Scope {
+    name: &'static str,
+    url: String,
+    parent: Option<u64>,
+}
+
+thread_local! {
+    /// The spans entered on this thread, the innermost last.
+    static ENTERED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+struct Capture {
+    seen: Arc<Seen>,
+    scopes: Mutex<HashMap<u64, Scope>>,
+    next: AtomicU64,
+}
+
+impl Capture {
+    fn scopes(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Scope>> {
+        self.scopes.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 impl tracing::Subscriber for Capture {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        if metadata.is_span() {
+            return matches!(metadata.name(), "endpoint" | "relay-actor" | "active-relay");
+        }
         (metadata
             .target()
             .starts_with("iroh::socket::transports::relay")
             && *metadata.level() <= tracing::Level::DEBUG)
             || metadata.target() == "iroh::_events::relay::connected"
     }
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(1)
+    fn new_span(&self, attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        let mut words = Words::default();
+        attributes.record(&mut words);
+        let parent = attributes
+            .parent()
+            .map(tracing::span::Id::into_u64)
+            .or_else(|| {
+                attributes
+                    .is_contextual()
+                    .then(|| ENTERED.with(|entered| entered.borrow().last().copied()))
+                    .flatten()
+            });
+        let id = self.next.fetch_add(1, Ordering::SeqCst);
+        let name = attributes.metadata().name();
+        if name == "endpoint" && self.seen.expecting.swap(false, Ordering::SeqCst) {
+            self.seen.device.store(id, Ordering::SeqCst);
+        }
+        self.scopes().insert(
+            id,
+            Scope {
+                name,
+                url: words.url,
+                parent,
+            },
+        );
+        tracing::span::Id::from_u64(id)
     }
     fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
@@ -101,7 +201,7 @@ impl tracing::Subscriber for Capture {
         let mut words = Words::default();
         event.record(&mut words);
         let line = if event.metadata().target() == "iroh::_events::relay::connected" {
-            Line::Connected(words.url)
+            Line::Connected
         } else if words.message.contains("Lost connection to relay server") {
             Line::Lost
         } else if words.message.contains("trying to establish a connection")
@@ -111,13 +211,50 @@ impl tracing::Subscriber for Capture {
         } else {
             return;
         };
-        let mut lines = self.0.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut endpoint, mut relay) = (0, words.url);
+        let mut at = event.parent().map(tracing::span::Id::into_u64).or_else(|| {
+            event
+                .is_contextual()
+                .then(|| ENTERED.with(|entered| entered.borrow().last().copied()))
+                .flatten()
+        });
+        {
+            let scopes = self.scopes();
+            while let Some((id, scope)) = at.and_then(|id| scopes.get(&id).map(|scope| (id, scope)))
+            {
+                match scope.name {
+                    "endpoint" if endpoint == 0 => endpoint = id,
+                    "active-relay" if relay.is_empty() => relay.clone_from(&scope.url),
+                    _ => {}
+                }
+                at = scope.parent;
+            }
+        }
+        let mut lines = self
+            .seen
+            .lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if lines.len() < 100_000 {
-            lines.push((Instant::now(), line));
+            lines.push(Logged {
+                when: Instant::now(),
+                endpoint,
+                relay,
+                line,
+            });
         }
     }
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
+    fn enter(&self, span: &tracing::span::Id) {
+        ENTERED.with(|entered| entered.borrow_mut().push(span.into_u64()));
+    }
+    fn exit(&self, span: &tracing::span::Id) {
+        ENTERED.with(|entered| {
+            let mut entered = entered.borrow_mut();
+            if let Some(index) = entered.iter().rposition(|id| *id == span.into_u64()) {
+                entered.remove(index);
+            }
+        });
+    }
 }
 
 /// Installs the capture once for the whole test program.
@@ -125,25 +262,32 @@ fn capture() -> &'static Arc<Seen> {
     static SEEN: OnceLock<Arc<Seen>> = OnceLock::new();
     SEEN.get_or_init(|| {
         let seen = Arc::new(Seen::default());
-        let _ = tracing::subscriber::set_global_default(Capture(Arc::clone(&seen)));
+        let _ = tracing::subscriber::set_global_default(Capture {
+            seen: Arc::clone(&seen),
+            scopes: Mutex::default(),
+            next: AtomicU64::new(1),
+        });
         seen
     })
 }
 
-/// What the stopped relay's actor was doing at `at`, by what the library logged since the switch.
-fn actor_state(seen: &Seen, front: &RelayUrl, switched: Instant, at: Instant) -> &'static str {
+/// What the stopped relay's actor was doing at `at`, by what the library logged since the switch
+/// for the device's endpoint and the front's URL alone.
+fn actor_state(
+    seen: &Seen,
+    endpoint: u64,
+    front: &RelayUrl,
+    switched: Instant,
+    at: Instant,
+) -> &'static str {
     let mut dialling = false;
-    for (when, line) in seen.0.lock().unwrap_or_else(PoisonError::into_inner).iter() {
-        if *when > at {
+    for logged in seen.of(endpoint, front) {
+        if logged.when > at {
             break;
         }
-        match line {
-            Line::Lost if *when >= switched => dialling = true,
-            Line::Connected(url)
-                if dialling && url.parse::<RelayUrl>().ok().as_ref() == Some(front) =>
-            {
-                dialling = false;
-            }
+        match logged.line {
+            Line::Lost if logged.when >= switched => dialling = true,
+            Line::Connected if dialling => dialling = false,
             _ => {}
         }
     }
@@ -152,6 +296,19 @@ fn actor_state(seen: &Seen, front: &RelayUrl, switched: Instant, at: Instant) ->
     } else {
         "CONNECTED"
     }
+}
+
+/// The count of each kind of kept line of the device's endpoint about the relay `relay`, for the
+/// printout, with the endpoint's short identity and its span.
+fn events_line(seen: &Seen, endpoint: u64, identity: &str, relay: &RelayUrl) -> String {
+    let kept = seen.of(endpoint, relay);
+    let count = |wanted: Line| kept.iter().filter(|logged| logged.line == wanted).count();
+    format!(
+        "EVENTS endpoint {identity} (span {endpoint}) relay {relay}: lost {}, dialling {}, connected {}",
+        count(Line::Lost),
+        count(Line::Dialling),
+        count(Line::Connected),
+    )
 }
 
 // The hosts and the questions. -------------------------------------------------------------------
@@ -313,6 +470,7 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
     }
 
     let keys = DeviceKeys::generate().expect("device keys");
+    seen.expect_the_device();
     let device = DeviceEndpoint::bind(
         &EndpointConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
@@ -326,6 +484,8 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
     )
     .await
     .expect("the device's endpoint");
+    let me = device.endpoint().id().fmt_short().to_string();
+    let device_span = seen.the_device();
     let view = |relay: &RelayUrl| EndpointConfig {
         relay_urls: vec![relay.clone()],
         ..EndpointConfig::default()
@@ -433,12 +593,13 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
         lines.push(figure(name, &answered, rows.len()));
         for (index, outcome) in rows {
             let started_at = outcomes[*index].0;
-            let state = actor_state(seen, &front.url, switched, started_at);
+            let state = actor_state(seen, device_span, &front.url, switched, started_at);
             match outcome {
                 Ok(rtt) if rtt.as_millis() > u128::from(LIMIT_MS) => {
                     lines.push(format!(
-                        "OVER {LIMIT_MS} ms: request {index} in {name} took {} ms, relay actor {state}",
-                        rtt.as_millis()
+                        "OVER {LIMIT_MS} ms: request {index} in {name} took {} ms, relay actor {state} (endpoint {me}, relay {})",
+                        rtt.as_millis(),
+                        front.url
                     ));
                     if worst.is_none_or(|(_, longest, _)| *rtt > longest) {
                         worst = Some((*index, *rtt, state));
@@ -446,7 +607,8 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
                 }
                 Ok(_) => {}
                 Err(reason) => lines.push(format!(
-                    "UNANSWERED: request {index} in {name}, relay actor {state}: {reason}"
+                    "UNANSWERED: request {index} in {name}, relay actor {state} (endpoint {me}, relay {}): {reason}",
+                    front.url
                 )),
             }
         }
@@ -461,6 +623,7 @@ async fn arrangement(hosts: usize) -> (Vec<String>, bool, usize, Option<String>)
         front.read_from_device(),
         front_after - front_before,
     ));
+    lines.push(events_line(seen, device_span, &me, &front.url));
     match worst {
         None => {
             lines.push(format!("LIMIT {LIMIT_MS} ms: HELD"));
