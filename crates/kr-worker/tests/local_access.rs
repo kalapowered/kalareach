@@ -790,6 +790,9 @@ async fn input_waiting_for_the_session_when_the_host_restricts_its_owner_is_not_
 
     let attachment = world.attach(&mut window).await;
     let epoch = world.acquire(&mut window, attachment).await;
+    // The shell sets the terminal raw before it prints its marker: input typed before that is
+    // taken by the line discipline of a terminal that is not raw yet.
+    produced(&world.runtime, b"kr-ready.").await;
     world
         .type_as(&mut window, attachment, epoch, 0, b"kr-early")
         .await
@@ -2312,10 +2315,11 @@ async fn a_hold_of_the_dispatch_boundary_is_counted_before_the_next_holder_has_t
     let counted = received_by(deadline, seen_end)
         .await
         .expect("the second holder took the boundary");
-    assert_eq!(
-        counted,
-        before + 1,
-        "the second holder had the boundary and the first hold was not counted"
+    // Another holder of the boundary (the host's own maintenance) may take it between the two, so
+    // the count is at least one more; a count that is not raised stays where it was.
+    assert!(
+        counted > before,
+        "the second holder had the boundary and the first hold was not counted: {counted} after {before}"
     );
     world.close();
 }
