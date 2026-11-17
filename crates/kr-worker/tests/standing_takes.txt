@@ -100,12 +100,16 @@ site crates/kr-worker/src/input_domain.rs lock lock 1
 site crates/kr-worker/src/broker/methods.rs check_reached state 1
 site crates/kr-worker/src/service.rs holds_attachment lock 1
 
-# The call sites, each in the one function that makes the call. A call from another function of the
-# files named here, or one call more or less, fails. The pieces, and the three functions that run
-# them: the first admission, the accept's hold and the dispatch after it.
-caller standing_pass crates/kr-worker/src/service.rs receipted 1
-caller standing_pass crates/kr-worker/src/service.rs admit_and_dispatch 1
-caller standing_pass crates/kr-worker/src/service.rs dispatch_accepted 1
+# The call sites, each in the one function that makes the call. A `caller` row reads only the file
+# that it names: a call from another function of that file, or one call more or less, fails. An
+# `only` row reads every file of this crate's `src`, which a function of a child module of the
+# service can call a private method from. The two entries into the pass, `standing_pass` and
+# `dispatch_accepted`, have `only` rows: their calls in the whole crate are the five listed here.
+# The pieces have `caller` rows, and the three functions that run them (the first admission, the
+# accept's hold and the dispatch after it) are called as the rows below say.
+only standing_pass crates/kr-worker/src/service.rs receipted 1
+only standing_pass crates/kr-worker/src/service.rs admit_and_dispatch 1
+only standing_pass crates/kr-worker/src/service.rs dispatch_accepted 1
 caller authority crates/kr-worker/src/service.rs receipted 1
 caller envelope crates/kr-worker/src/service.rs receipted 1
 caller limits crates/kr-worker/src/service.rs receipted 1
@@ -150,19 +154,22 @@ only check_utc_deadline crates/kr-worker/src/runtime.rs start_and_say_if_the_she
 only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
 
 # The guards held where a call is made, from the text before it: `BAR` is a dispatch barrier that
-# the same function takes with a `let` that locks `dispatch` or calls `try_boundary` (which
-# returns the guard of that lock, or none), `SES` the session that a function is given or takes
-# before the call. `let Some(x) =` and `let Ok(x) =` bind `x`, a binding `_` holds nothing, and a
-# `drop(x)` ends the guard.
+# the same function takes with a `let` that locks `dispatch`, or with the one form
+# `let Some(x) = self.try_boundary() else { .. };`; `SES` is the session that a function is given
+# or takes before the call. A binding `_` holds nothing, and a `let` that `if`, `while` or `&&`
+# precedes is not read.
 # The first admission and the prepared path do not take the barrier themselves: their callers,
-# `receipt_once` and `prepared_once`, take it with `try_boundary` and call `receipted` and
-# `continue_prepared` while they hold it. The `held` row of each of those two calls says `BAR`, so
-# a caller that lets the barrier go before the call, or takes it with a binding `_`, fails it. What
-# keeps a call from any other function out is an `only` row, not a `caller` row: a `caller` row
-# reads only the file that it names, and a function of a child module of the service can call
-# these private methods; an `only` row reads every file of this crate's `src`, so a second caller
-# in any file fails it. What neither row reads is the barrier taken in a way the reader does not
-# know (a guard that another function returns).
+# `receipt_once` and `prepared_once`, take it with `try_boundary` in that one form and call
+# `receipted` and `continue_prepared` while they hold it. The `held` row of each of those two
+# calls says `BAR`. It fails when the take is in any other form (a mapped, tested, discarded or
+# deferred result, a plain binding of the option, a path pattern, a take under an `if let`), when
+# the name of the guard is mentioned again before the call (a `drop` of any spelling, a move or a
+# use), or when the take is gone. It does not see a body that is written as a closure under the
+# guard and run after the guard's drop, or a call through a function value; `try_boundary` is
+# known by its name and its body is not read. What keeps a call from any other function out is an
+# `only` row, not a `caller` row: a `caller` row reads only the file that it names, and a
+# function of a child module of the service can call these private methods; an `only` row reads
+# every file of this crate's `src`, so a second caller in any file fails it.
 # The first admission asks the authority and the limits under no guard that the reader sees, the
 # envelope under a session of its own, and takes the session for the limits itself.
 only receipted crates/kr-worker/src/service.rs receipt_once 1
@@ -235,9 +242,10 @@ site crates/kr-worker/src/broker/bridge.rs attested_thread state 1
 # hold that reaches the accept, and the prepared path (an action prepared earlier and continued
 # here). Both run inside the barrier that their callers take (the first admission's `receipt_once`
 # and the prepared path's `prepared_once`, one call each), hold the session where they call it,
-# and hand the session on.
-caller dispatch_accepted crates/kr-worker/src/service.rs admit_and_dispatch 1
-caller dispatch_accepted crates/kr-worker/src/service.rs continue_prepared 1
+# and hand the session on. The dispatch is an entry into the pass: its callers are read in every
+# file of the crate.
+only dispatch_accepted crates/kr-worker/src/service.rs admit_and_dispatch 1
+only dispatch_accepted crates/kr-worker/src/service.rs continue_prepared 1
 only continue_prepared crates/kr-worker/src/service.rs prepared_once 1
 held crates/kr-worker/src/service.rs prepared_once continue_prepared BAR
 held crates/kr-worker/src/service.rs continue_prepared dispatch_accepted SES
