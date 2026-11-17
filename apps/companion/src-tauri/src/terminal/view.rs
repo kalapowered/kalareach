@@ -898,7 +898,8 @@ struct View {
     /// Every key the lane has taken and has not said the host settled, in every epoch, by its epoch
     /// and number in it. The lane settles a key when it says the host accepted or refused it. The
     /// value is the view's number for the key, which the lease knows it by, until the lease was
-    /// told that the key's epoch is over.
+    /// told that the key's epoch is over; the entry itself stays until a later acceptance covers it.
+    /// Taking the number out bounds the lease's own record of writes and nothing else.
     keys: BTreeMap<(u64, u64), Option<RequestId>>,
     /// What the host accepted of each epoch.
     proven: Proven,
@@ -1758,7 +1759,11 @@ impl View {
         }
         self.lane_epoch = Some(epoch);
         // The lane gives no event for a frame of an older epoch that is answered after this, so
-        // the lease is told now that none of them waits for an answer it will read.
+        // the lease is told now that none of them waits for an answer it will read: their request
+        // numbers leave the lease's `writes` at once. Without this they would stay there until a
+        // later key is accepted, at most the frames that this epoch's begin dropped unsent (the
+        // lane's bound of 1,024). No decision and no shown text depends on it: no refusal of an
+        // older epoch reaches the lease, and nothing else reads `writes` for a key of the lane.
         for tag in self.keys.range_mut(..(epoch.get(), 0)).map(|(_, tag)| tag) {
             if let Some(tag) = tag.take() {
                 self.lease.answered(tag, Ok(ParamsValue::empty()));
@@ -1775,29 +1780,29 @@ impl View {
             self.attachment.attachment_id,
         )
         .worker_states_input_lane(self.states_input_lane);
-        let session = Arc::clone(self.link.session());
-        let tag = self.next_id();
-        self.requests.push(Box::pin(async move {
-            (tag, Completed::Lane(session.input_lane(target).await))
-        }));
         #[cfg(feature = "testing")]
         let target = match &self.probe.lane_bounds {
             Some(bounds) => target.bounded_by(Arc::clone(bounds)),
             None => target,
         };
+        let session = Arc::clone(self.link.session());
+        let tag = self.next_id();
+        self.requests.push(Box::pin(async move {
+            (tag, Completed::Lane(session.input_lane(target).await))
+        }));
     }
 
     /// The lane's opening ended: the lane is there to type on, or the words say why it is not.
     fn lane_opened(&mut self, opened: Result<InputLane, ClientError>) -> Option<Ending> {
         match opened {
             Ok(lane) => {
+                #[cfg(feature = "testing")]
+                self.probe.publish_lane(&lane);
                 self.lane_events = lane.events();
                 self.lane = Some(lane);
                 self.sync_epoch();
             }
             Err(failed) => {
-                #[cfg(feature = "testing")]
-                self.probe.publish_lane(&lane);
                 self.lane_lost = Some(format!("its input stream could not be opened: {failed}"));
             }
         }

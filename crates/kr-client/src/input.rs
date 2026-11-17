@@ -789,11 +789,13 @@ impl Core {
     }
 
     /// Whether a frame is queued, or written and not answered, in any epoch, on a lane that has
-    /// not ended. A lane that has ended has none: the end drops what was queued and the writer takes
-    /// no frame after it, so a charge the end leaves is for a frame that nothing waits for any more.
-    /// The host answered it with an outcome it could not state, which ends the lane, or the
-    /// connection ended with it. A frame held behind a network launch is not queued, and counts as
-    /// nothing.
+    /// not ended. A lane that has ended has none, whatever its charges still say: the end drops what
+    /// was queued and the writer takes no frame after it, so nothing waits behind a charge any more.
+    /// A charge outlives the end where the host's answer to the frame ended the lane (an outcome it
+    /// could not state, an answer that did not decode, or one that broke the stream's contract),
+    /// where the stream was reset or the connection ended under a frame that had no answer yet, and
+    /// where the holder dropped the lane. A frame held behind a network launch is not queued, and
+    /// counts as nothing.
     fn keys_pending(&self) -> bool {
         self.ended.is_none()
             && (!self.charges.is_empty()
@@ -1760,8 +1762,6 @@ impl InputLane {
         self.shared.lock().keys_pending()
     }
 
-    /// Whether a request that follows this lane's typing on a local connection asks for the count of
-    /// bytes it discarded: only of a worker that states the input lane, which the caller said when it
     /// Gives a way to ask, from outside the lane's holder, whether the lane has ended, as the lane
     /// records it. Compiled in for tests and in no shipped build.
     #[cfg(feature = "testing")]
@@ -1772,6 +1772,8 @@ impl InputLane {
         Arc::new(move || shared.lock().ended.is_some())
     }
 
+    /// Whether a request that follows this lane's typing on a local connection asks for the count of
+    /// bytes it discarded: only of a worker that states the input lane, which the caller said when it
     /// made the target. A paired host sets this itself on what it forwards, so a network lane says no.
     #[must_use]
     pub const fn fenced_report(&self) -> bool {

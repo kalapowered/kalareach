@@ -81,8 +81,8 @@ pub struct ScriptedLane {
     shared: Arc<Shared>,
     commands: mpsc::UnboundedSender<Command>,
     task: tokio::task::JoinHandle<()>,
-    /// Last, so that the lane's task, which `Drop` ends first, lets go of the endpoint's file
-    /// before the directory is removed.
+    /// Declared last: fields drop in declaration order, so the directory is removed after the
+    /// fields above it.
     _dir: PrivateTempDir,
 }
 
