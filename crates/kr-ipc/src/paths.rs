@@ -435,7 +435,8 @@ impl EnvironmentPaths {
     /// Returns the directory holding the time indexes of retained output.
     ///
     /// It lies beside the spool and not inside it, so nothing that lists or measures a spool meets
-    /// an index, and an earlier release that reads the spool by its own rules never sees one.
+    /// an index, and a release from before the indexes, which reads the spool by its own rules,
+    /// never sees one.
     #[must_use]
     pub fn output_times_dir(&self) -> PathBuf {
         self.state_dir.join("output-times")

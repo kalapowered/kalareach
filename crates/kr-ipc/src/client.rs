@@ -1164,9 +1164,9 @@ impl<C: Codec> Client<C> {
     /// states it holds results to one ([`Self::forward_within`]).
     ///
     /// `lease` is the remote dispatch lease the host took for a paired device's mutation, and a
-    /// local caller's action, which does not depend on the lease, passes none. A link to a worker of
-    /// an earlier release refuses a frame that carries one, so the lease is passed only on a link
-    /// whose worker is at this build's own level.
+    /// local caller's action, which does not depend on the lease, passes none. Every worker of a
+    /// level this release retains reads the lease, so the host passes it on a link whatever its
+    /// worker's level; a worker from before the lease refuses a frame that carries one.
     ///
     /// # Errors
     ///

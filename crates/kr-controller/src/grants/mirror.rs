@@ -13,9 +13,9 @@
 //! row the host keeps. A write of the mirror that fails is reported and leaves the same state, so
 //! the protection waits for the next write rather than stopping the host.
 //!
-//! An earlier release neither reads the file nor raises the sequence, so a host that goes back to
-//! it and forward again meets a row that is newer than its sequence says: the row is kept, as it
-//! is whenever the sequences are equal.
+//! A release from before the mirror neither reads the file nor raises the sequence, so a host that
+//! goes back to one and forward again meets a row that is newer than its sequence says: the row is
+//! kept, as it is whenever the sequences are equal.
 //!
 //! The limits. A registry and a mirror put back together are one earlier state, and nothing in
 //! this host can tell it from the host's own; only its comparison with its authority feed can, and

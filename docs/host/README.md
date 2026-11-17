@@ -4779,8 +4779,8 @@ have given up what the first reading found over, and it gives up what is then ov
 does not get the lock gives up nothing for the host's cap on that pass and looks again soon, and a
 worker whose spool holds no output takes none. So workers whose passes fall together,
 as passes on the wall clock's half minutes do whatever the moments their sessions began at, give up
-the excess once and not once each. A worker of an earlier release takes no lock, so the exclusion is
-among the workers of this one. The control daemon applies the cap
+the excess once and not once each. A worker from before the lock takes none, so the exclusion is
+among the workers that take it. The control daemon applies the cap
 every minute to the sessions that have closed, taking the output of the session whose oldest segment
 was written longest ago first. The two keep no order between them, so a live session can give up
 output before a closed one does. The reading is the segment files, each sized by asking the file: a
@@ -8184,7 +8184,7 @@ again. `kr doctor` shows a `restored-policy` warning, whether or not the host re
 number of enrolments, whether exclusive management is on and the bound.
 
 A start reads the record. The host waits when the record names the policy it holds, when it names
-another policy (an earlier release rewrote it, or the owner changed it while the wait stood, and
+another policy (a release from before this record rewrote it, or the owner changed it while the wait stood, and
 nobody confirmed the policy now held; the record is then rewritten to name the policy held and keeps
 the moment the restore was found, unless the directory cannot be flushed), and when it cannot be read (the file stays and the doctor says so).
 It waits for nothing when there is no record, and it removes a record when it holds no policy. When
@@ -8530,8 +8530,8 @@ notice again. Setting a clock back will not make any numbers be lower than any p
   The registry's policy row, which holds the floors, the enrolments, the exclusive-management flag,
   the offline bound and the lease records, carries a sequence beside it that every write of the row
   raises in the same transaction. After each write the host copies the policy and the sequence to
-  `policy-mirror.cbor` beside the registry, in a store of its own that an earlier release does not
-  read. At a start the host reads both, and when the registry's sequence is below the copy's, the
+  `policy-mirror.cbor` beside the registry, in a store of its own that a release from before the
+  mirror does not read. At a start the host reads both, and when the registry's sequence is below the copy's, the
   registry was put back to an earlier state: the copy is the policy, and the older row revives
   nothing, an enrolment that was withdrawn included. The copy is written after the row has
   committed, so a stop between the two leaves the row the newer, and it is kept. A copy that fails

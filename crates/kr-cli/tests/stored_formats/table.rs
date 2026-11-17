@@ -1178,8 +1178,9 @@ pub fn table() -> Vec<Store> {
             )],
         },
         // The last policy the host wrote, kept beside the registry so that a registry put back to an
-        // earlier state does not bring an older policy back. An earlier release does not name this
-        // store; the registry it reads holds the policy and a sequence beside it that it ignores.
+        // earlier state does not bring an older policy back. A release from before this store does
+        // not name it; the registry it reads holds the policy and a sequence beside it that it
+        // ignores.
         Store {
             levels: None,
             writers: Writers::Daemon,
@@ -1206,8 +1207,8 @@ pub fn table() -> Vec<Store> {
             ],
         },
         // The record that a restored policy row waits for the person at this machine, kept beside
-        // the registry. An earlier release does not name this store and neither reads nor writes
-        // it; the policy it keeps a digest of is the one the mirror above keeps.
+        // the registry. A release from before this store does not name it and neither reads nor
+        // writes it; the policy it keeps a digest of is the one the mirror above keeps.
         Store {
             levels: None,
             writers: Writers::Daemon,
