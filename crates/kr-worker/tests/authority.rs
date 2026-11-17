@@ -2319,26 +2319,49 @@ async fn a_living_presentation_does_not_give_up_while_the_boundary_stays_held() 
 /// How many times a case lets go of the boundary and takes it again while its waiters try.
 const RELEASES: u64 = 300;
 
-/// The first pause that the wake cases give the waits for the boundary. A wait that is woken by a
-/// release keeps it, so a waiter goes on in time only because a release woke it: a stall of the
-/// machine does not change which, and a waiter that no release woke sits until this pause is
-/// over, which ends the case at its own assertion.
-const A_PAUSE_ONLY_A_RELEASE_ENDS: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long a wake case lets its waiters go on with no count moving before it says that a release
+/// did not wake them. It is the case's own bound: the only thing that ends a wait that no release
+/// woke, and it restarts at every count that moves.
+const WAKE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The first pause that the wake cases give the waits for the boundary. It is far longer than
+/// `WAKE_BOUND`, so that a waiter goes on only because a release woke it: a stall of the machine,
+/// however long, cannot make a correct wait take its timer before the case's own bound ends the
+/// case.
+const A_PAUSE_LONGER_THAN_THE_BOUND: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Lets the presentations that the worker stops after a counted try go on, and stops no more, when
+/// the case ends in any way.
+struct Unparked(Arc<WorkerService>);
+
+impl Drop for Unparked {
+    fn drop(&mut self) {
+        self.0.stop_parking_presentations_for_tests();
+    }
+}
 
 /// How a series of releases ended.
 #[derive(Debug, PartialEq, Eq)]
 enum PulseEnd {
-    /// Every release woke every waiter that had tried, and none ran its pause out.
+    /// Every release woke every waiter, and none ran its pause out.
     Done,
-    /// A wait ran its pause out, after `after` releases, of which the last woke `woken` of its
-    /// `waiters` waiters.
+    /// A wait ran its pause out after `after` releases, which only a pause longer than any stall
+    /// can do without a release's wake.
     PauseRanOut {
         after: u64,
         woken: u64,
         waiters: u64,
     },
-    /// The waiters had all tried again, and fewer woke at the last release than there were
-    /// waiters.
+    /// After release `after`, fewer than `waiters` waiters made their next try within the case's
+    /// bound: `parked` of them did, and `woken` waits ended in a wake since the release.
+    NoNextTry {
+        after: u64,
+        parked: u64,
+        woken: u64,
+        waiters: u64,
+    },
+    /// The waiters had all tried again, and fewer waits ended in a wake since the release than
+    /// there were waiters.
     NotAllWoken {
         after: u64,
         woken: u64,
@@ -2348,17 +2371,19 @@ enum PulseEnd {
     Stopped,
 }
 
-/// The dispatch boundary, held on a thread of its own and let go of and taken again at once, over
-/// and over: a release that wakes every waiter and finds the boundary held again when they try.
+/// The dispatch boundary, held on a thread of its own and let go of and taken again, over and over,
+/// while every waiter is stopped between its counted try and the wait that follows it.
 ///
-/// A release comes as soon as every waiter has made its try since the last one, which is while
-/// the last of them is still between its try and its wait. That is the moment a
-/// release must not be lost in. Each release is judged by two counts of the waits themselves: the
-/// waits that a release woke, and the waits that their pause ended. With a long first pause, a
-/// correct wait ends in a wake each time and no count depends on how long anything takes. A
-/// waiter that a release finds in the unlocked gap before the boundary is taken again may take
-/// the boundary and be decided, which is no fault: it was woken, and the waiter that takes its
-/// place (see [`presenting_again`]) is waiting before the next release is made.
+/// The case arms the worker's stop of presentations after a counted try, so each waiter makes its
+/// try, which finds the boundary held, and stops there: after its count, and before anything that
+/// its wait does next (the future that a release completes is made before the try, in the wait as
+/// it is). A release comes only when every waiter is stopped, and the holder takes the boundary
+/// again before it tells them to go on, so no waiter can take the boundary in the gap and each
+/// finds it held at its next try. That is the moment a release must not be lost in, and it is
+/// reached at every release whatever the schedule: a wait that makes its future after its try
+/// finds the release gone, and a wait that no release wakes sits until the case's own bound ends
+/// it. At each release the case asserts what the waits counted themselves: every waiter woke, and
+/// none ran its pause out.
 struct Pulse {
     stop: Arc<std::sync::atomic::AtomicBool>,
     made: Arc<std::sync::atomic::AtomicU64>,
@@ -2366,8 +2391,8 @@ struct Pulse {
 }
 
 impl Pulse {
-    /// Takes the boundary on a thread of its own, and lets it go and takes it again `RELEASES`
-    /// times, each time `waiters` waiters are there and have tried.
+    /// Takes the boundary on a thread of its own and lets it go and takes it again `RELEASES`
+    /// times, each time `waiters` waiters are stopped after a try.
     async fn start(host: &Host, waiters: u64) -> Self {
         use std::sync::atomic::Ordering;
 
@@ -2383,20 +2408,17 @@ impl Pulse {
                 let _ = held.send(());
                 let mut woken_before = service.boundary_wakes_for_tests();
                 for after in 0..=RELEASES {
-                    // Every presenter has made the try that follows the last release: each has
-                    // one wait, which makes one try for each release, and a release starts the
-                    // count of tries again (a presenter that took the boundary in the instant it
-                    // was free is replaced by one whose first try counts in its place). Until
-                    // then the thread spins, and sleeps a millisecond at a time once it has spun
-                    // long, for no time that anything is promised.
+                    // Every waiter has made its next try and stopped. The thread spins, then sleeps
+                    // a millisecond at a time; no wait here is a time that anything is promised,
+                    // except the case's own bound on counts that do not move.
                     let mut spun = 0_u32;
+                    let mut seen = (u64::MAX, u64::MAX);
+                    let mut moved = std::time::Instant::now();
                     loop {
                         if stop.load(Ordering::SeqCst) {
                             return PulseEnd::Stopped;
                         }
-                        // The tries are read before the wakes: a wake is counted before the try
-                        // that follows it, so a try that is seen has its wake counted.
-                        let tries = service.presentation_tries_since_release_for_tests();
+                        let parked = service.presentations_parked_for_tests();
                         let woken = service.boundary_wakes_for_tests() - woken_before;
                         if service.boundary_pauses_run_out_for_tests() > 0 {
                             return PulseEnd::PauseRanOut {
@@ -2405,7 +2427,7 @@ impl Pulse {
                                 waiters,
                             };
                         }
-                        if tries >= waiters {
+                        if parked >= waiters {
                             if after > 0 && woken < waiters {
                                 return PulseEnd::NotAllWoken {
                                     after,
@@ -2414,6 +2436,17 @@ impl Pulse {
                                 };
                             }
                             break;
+                        }
+                        if (parked, woken) != seen {
+                            seen = (parked, woken);
+                            moved = std::time::Instant::now();
+                        } else if moved.elapsed() > WAKE_BOUND {
+                            return PulseEnd::NoNextTry {
+                                after,
+                                parked,
+                                woken,
+                                waiters,
+                            };
                         }
                         spun += 1;
                         if spun < 20_000 {
@@ -2428,6 +2461,7 @@ impl Pulse {
                     woken_before = service.boundary_wakes_for_tests();
                     drop(boundary.take());
                     boundary = Some(service.hold_the_dispatch_boundary());
+                    service.let_parked_presentations_go_for_tests();
                     made.fetch_add(1, Ordering::SeqCst);
                 }
                 PulseEnd::Done
@@ -2470,79 +2504,45 @@ impl Drop for Pulse {
     }
 }
 
-/// A connection that says hello and presents `generation` on a task of its own, and, when the
-/// worker has decided it, gives the link back and does it again on a new connection, and so on
-/// until the task ends. A case that lets a release go through the waits keeps its number of
-/// waiters this way: a waiter that takes the boundary in the instant that it is free leaves a
-/// place that is taken at once. The task never ends by itself unless a connection fails.
-fn presenting_again(host: &Host, generation: u64) -> tokio::task::JoinHandle<()> {
-    let endpoint = host.endpoint.clone();
-    let identity = Arc::clone(&host.controller);
-    let boot = host.boot.clone();
-    tokio::spawn(async move {
-        loop {
-            let mut link = BoundLink::connect(&endpoint, build())
-                .await
-                .expect("a presenter connects");
-            let signer = Signer {
-                identity: Arc::clone(&identity),
-                boot: boot.clone(),
-            };
-            // Accepted, or refused because a later connection holds the authority: either way the
-            // worker decided it, which is all that a waiter of these cases needs.
-            let _ = present(&mut link, signer, generation).await;
-        }
-    })
-}
-
 /// Lets `waiters` waiting presentations through `RELEASES` releases of the boundary, with the
-/// worker's first pause long, and says how the series ended. The host is ready and its
-/// maintenance is held out, so that no release but the case's own wakes anyone.
+/// worker's first pause longer than the case's own bound, and says how the series ended. The host
+/// is ready and its maintenance is held out, so that no release but the case's own wakes anyone.
 async fn releases_through_waiters(waiters: u64) -> PulseEnd {
     let host = host_ready().await;
-    let service = &host.service;
+    let service = Arc::clone(&host.service);
     let _maintenance = maintenance_out(&host).await;
-    service.set_first_boundary_pause_for_tests(A_PAUSE_ONLY_A_RELEASE_ENDS);
+    service.set_first_boundary_pause_for_tests(A_PAUSE_LONGER_THAN_THE_BOUND);
+    service.park_presentations_after_a_try_for_tests();
+    let _unparked = Unparked(Arc::clone(&service));
     let mut pulse = Pulse::start(&host, waiters).await;
-    let presenters: Vec<_> = (0..waiters).map(|_| presenting_again(&host, 1)).collect();
+    let waiting = presenting_many(&host, waiters as usize, 1);
     await_progress(
         "the releases",
         || {
             pulse.made()
-                + service.presentation_tries_for_tests()
+                + service.presentations_parked_for_tests()
                 + service.boundary_wakes_for_tests()
                 + service.boundary_pauses_run_out_for_tests()
         },
-        || pulse.ended() || presenters.iter().any(tokio::task::JoinHandle::is_finished),
+        || pulse.ended(),
     )
     .await;
     let end = pulse.end();
-    for presenter in &presenters {
-        if presenter.is_finished() {
-            continue;
-        }
-        presenter.abort();
-    }
-    for presenter in presenters {
-        if let Err(failure) = presenter.await {
-            assert!(
-                failure.is_cancelled(),
-                "a presenter ended by itself: {failure}"
-            );
-        }
-    }
+    service.stop_parking_presentations_for_tests();
+    peers_go(waiting).await;
     end
 }
 
 /// A release wakes every presentation that waits, not one of them.
 ///
-/// Three presentations wait at the boundary, which is let go of and taken again at once each time
-/// all three have tried. At each release the case asserts what the waits counted themselves: all
-/// three were woken by it, and none ran its pause out. A release that woke one of them leaves the
-/// other two with nothing to end their pause but the pause itself, which is twenty seconds long
-/// here, and the case fails at its own assertion when it is over. What is asserted is a count of
-/// how the waits ended, which no stall of the machine changes.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// Three presentations wait at the boundary, each stopped between its counted try and its wait
+/// while the holder lets go of the boundary and takes it again, and only then goes on. At each
+/// release the case asserts what the waits counted themselves: all three were woken by it and none
+/// ran its pause out, which is an hour long here. A release that woke one of them leaves the other
+/// two with nothing to end their wait but a pause that the case's own bound of thirty seconds
+/// ends first, at its own assertion. What is asserted is a count of how the waits ended, which no
+/// stall of the machine changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_release_wakes_every_presentation_that_waits() {
     let end = releases_through_waiters(3).await;
     assert_eq!(
@@ -2554,11 +2554,12 @@ async fn a_release_wakes_every_presentation_that_waits() {
 
 /// A release that comes between a presentation's try and its wait is not missed.
 ///
-/// One presentation waits at the boundary, which is let go of and taken again as soon as the
-/// presentation has tried: while it is between the try that found the boundary held and the wait,
-/// which is the moment a wait that is made after its try would miss the release in. At each release
-/// the case asserts that the waiter was woken by it and did not run its pause out.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// One presentation waits at the boundary, stopped after its counted try and before its wait, which
+/// is where a wait that is made after its try has no future to complete, while the holder lets go
+/// of the boundary and takes it again and then tells it to go on. This is the case at every
+/// release, whatever the schedule. The case asserts at each release that the waiter was woken by it
+/// and did not run its pause out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_release_between_a_try_and_the_wait_is_not_missed() {
     let end = releases_through_waiters(1).await;
     assert_eq!(
@@ -2575,7 +2576,7 @@ async fn a_release_between_a_try_and_the_wait_is_not_missed() {
 enum WhileTheReleaseStood {
     /// It took the boundary, which it found unlocked, on its own pause.
     TookTheBoundary,
-    /// A release woke it, or it found the boundary held.
+    /// A wake was counted, or it found the boundary held.
     WokenAtALockedBoundary,
     /// Neither happened before the guard against a hang.
     Neither,
@@ -2584,36 +2585,32 @@ enum WhileTheReleaseStood {
 /// A release unlocks the boundary before it wakes the presentations that wait.
 ///
 /// The host is ready and its maintenance is held out, so that the release that the case makes is
-/// the only one. The case's holder takes the boundary, the case arms the pause (a pause of the
-/// worker's between the unlock and the wake) under that hold, and a presentation waits with its
-/// pause at the cap. The holder lets go on its own thread as soon as the presentation has made its
-/// next try. The release then stops between its unlock and its wake: nothing has been woken and the
-/// boundary is unlocked. A presentation that finds the boundary free takes it on its own pause,
-/// and no wake is counted. A release that woke first would have counted a wake and sent the
-/// presentation to a boundary that was still held. The case reads what happened from the counts
-/// and the presentation's end, in a wait of threads of the blocking pool: no wait of the case is a
-/// timer of the runtime while the pause stands, and the holder is a thread of the standard
-/// library. The verdict does not depend on how long anything takes: only on which of the two came.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// the only one. The case's holder takes the boundary, and under that hold the case arms the pause
+/// (a pause of the worker's between the unlock and the wake) for the holder's thread alone, and the
+/// stop of presentations after a counted try. A presentation tries, finds the boundary held, counts
+/// the try and stops: its count is complete. The case takes its snapshot of the counts, and tells
+/// the holder to let go. The release unlocks the boundary and stands at the pause: nothing has been
+/// woken, and no presentation can try. The case then lets the presentation go on. A presentation
+/// that finds the boundary free takes it on its own pause, and no wake is counted. A release that
+/// woke first would have counted a wake before the pause, and the presentation would find the
+/// boundary still held. The case waits only on threads of the blocking pool while the pause
+/// stands, and no wait of it is a timer of the runtime; the holder is a thread of the standard
+/// library and waits for the case's word, not for a time. The verdict is which of the two came,
+/// whatever the schedule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_release_unlocks_the_boundary_before_it_wakes_a_presentation() {
     let host = host_ready().await;
     let service = Arc::clone(&host.service);
     let _maintenance = maintenance_out(&host).await;
     let (held, confirmed) = tokio::sync::oneshot::channel::<()>();
-    let (tried, tell) = std::sync::mpsc::channel::<u64>();
+    let (drop_now, wait) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn({
         let service = Arc::clone(&service);
         move || {
             let boundary = service.hold_the_dispatch_boundary();
             let _ = held.send(());
-            let Ok(seen) = tell.recv() else {
-                return;
-            };
-            // Right after the try that follows the case's count: no wait of this thread is for
-            // time.
-            while service.presentation_tries_for_tests() <= seen {
-                std::thread::yield_now();
-            }
+            // The case's word, or the case's end: the guard goes either way.
+            let _ = wait.recv();
             drop(boundary);
         }
     });
@@ -2621,33 +2618,35 @@ async fn a_release_unlocks_the_boundary_before_it_wakes_a_presentation() {
         .await
         .expect("the boundary is held in time")
         .expect("the holder ended without holding the boundary");
-    let (arrived, go) = service.pause_after_the_boundary_is_unlocked();
+    let (arrived, go) = service.pause_after_the_boundary_is_unlocked(holder.thread().id());
+    service.park_presentations_after_a_try_for_tests();
+    let _unparked = Unparked(Arc::clone(&service));
     let living = presenting(&host, 1);
-    // The pause is at its cap, and a try has just found the boundary held.
     assert!(
-        settle(|| service.presentation_tries_for_tests() >= 8).await,
-        "the presentation tries again and again"
+        settle(|| service.presentations_parked_for_tests() == 1).await,
+        "the presentation tries and stops after the try is counted"
     );
+    // The try is counted and the presentation is stopped: nothing is in flight.
     let wakes_before = service.boundary_wakes_for_tests();
-    tried
-        .send(service.presentation_tries_for_tests())
-        .expect("the holder is there");
+    let tries_before = service.presentation_tries_for_tests();
+
+    drop_now.send(()).expect("the holder is there");
     let reached = tokio::task::spawn_blocking(move || arrived.recv_timeout(WAIT))
         .await
         .expect("the wait ends");
     let stood = if reached.is_ok() {
+        // The boundary is unlocked and nothing is woken. The presentation goes on from its try.
+        service.let_parked_presentations_go_for_tests();
         let service = Arc::clone(&service);
         let (living, verdict) = tokio::task::spawn_blocking(move || {
-            // Any try that finds the boundary held from here on found it locked: it is unlocked
-            // while the release stands, so a presentation that tries takes it. A bound on the
-            // polls only guards against a hang.
-            let tries = service.presentation_tries_for_tests();
+            // A bound on the polls only guards against a hang: what the case waits for comes by
+            // itself, as the presentation's own pause ends or as a wake reaches it.
             for _ in 0..WAIT.as_millis() {
                 if living.is_finished() {
                     return (living, WhileTheReleaseStood::TookTheBoundary);
                 }
                 if service.boundary_wakes_for_tests() > wakes_before
-                    || service.presentation_tries_for_tests() > tries
+                    || service.presentation_tries_for_tests() > tries_before
                 {
                     return (living, WhileTheReleaseStood::WokenAtALockedBoundary);
                 }

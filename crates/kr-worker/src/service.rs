@@ -678,6 +678,10 @@ pub struct WorkerService {
     /// on, which this host's own tests set. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     first_boundary_pause_ms: std::sync::atomic::AtomicU64,
+    /// A stop of presentations after a counted failed try, which this host's own tests arm. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    try_gate: TryGate,
     /// How many waits for the dispatch boundary ended because the boundary was let go. It is
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -732,20 +736,11 @@ pub struct WorkerService {
 struct DispatchBoundary {
     lock: Mutex<()>,
     released: tokio::sync::Notify,
-    /// A pause between the unlock and the wake of the next release, which this host's own tests
-    /// arm. It is compiled away in every shipped build.
+    /// A pause between the unlock and the wake of the next release that the thread it names makes,
+    /// which this host's own tests arm. A release made by any other thread passes it by. It is
+    /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    pause_after_unlock: Mutex<
-        Option<(
-            std::sync::mpsc::SyncSender<()>,
-            std::sync::mpsc::Receiver<()>,
-        )>,
-    >,
-    /// How many presentations have found the boundary held since its last release, which this
-    /// host's own tests read: each release starts the count again, so a presentation that is woken
-    /// and tries once is counted once. It is compiled away in every shipped build.
-    #[cfg(feature = "testing")]
-    presentation_tries_since_release: std::sync::atomic::AtomicU64,
+    pause_after_unlock: Mutex<Option<ArmedPause>>,
 }
 
 impl DispatchBoundary {
@@ -755,8 +750,6 @@ impl DispatchBoundary {
             released: tokio::sync::Notify::new(),
             #[cfg(feature = "testing")]
             pause_after_unlock: Mutex::new(None),
-            #[cfg(feature = "testing")]
-            presentation_tries_since_release: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -793,17 +786,36 @@ impl DispatchBoundary {
     /// every shipped build.
     #[cfg(feature = "testing")]
     fn wait_after_the_unlock(&self) {
-        let armed = self
-            .pause_after_unlock
-            .lock()
-            .expect("the pause is not poisoned")
-            .take();
-        if let Some((arrived, go)) = armed {
+        let armed = {
+            let mut slot = self
+                .pause_after_unlock
+                .lock()
+                .expect("the pause is not poisoned");
+            if slot
+                .as_ref()
+                .is_some_and(|(holder, _, _)| *holder == std::thread::current().id())
+            {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, arrived, go)) = armed {
             let _ = arrived.send(());
             let _ = go.recv();
         }
     }
 }
+
+/// A pause between the unlock and the wake of a release, armed for the thread that makes it: the
+/// thread, the end that says the release has reached the pause, and the end that lets it go on.
+/// Compiled away in every shipped build.
+#[cfg(feature = "testing")]
+type ArmedPause = (
+    std::thread::ThreadId,
+    std::sync::mpsc::SyncSender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
 
 /// The dispatch boundary, held. Letting go of it wakes the presentations waiting for it.
 #[derive(Debug)]
@@ -827,10 +839,6 @@ impl Drop for DispatchGuard<'_> {
         drop(self.guard.take());
         #[cfg(feature = "testing")]
         self.boundary.wait_after_the_unlock();
-        #[cfg(feature = "testing")]
-        self.boundary
-            .presentation_tries_since_release
-            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.boundary.released.notify_waiters();
     }
 }
@@ -932,6 +940,65 @@ enum Tried<T> {
     Held,
     /// The peer has gone, and nothing was done for it.
     PeerGone,
+}
+
+/// A stop that a presentation makes after a try that found the dispatch boundary held and counted
+/// it, until a test lets it go, so that a test decides what happens between a try and the wait
+/// that follows it. Nothing stops while the gate is not armed. It is compiled away in every shipped
+/// build.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct TryGate {
+    state: Mutex<TryGateState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct TryGateState {
+    armed: bool,
+    /// Which stop is current: a presentation stopped in an earlier one has been let go.
+    generation: u64,
+    /// How many presentations are stopped in the current one.
+    parked: u64,
+}
+
+#[cfg(feature = "testing")]
+impl TryGate {
+    fn state(&self) -> std::sync::MutexGuard<'_, TryGateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn is_armed(&self) -> bool {
+        self.state().armed
+    }
+
+    /// Stops the calling thread until the current stop is ended or the gate is disarmed.
+    fn park(&self) {
+        let mut state = self.state();
+        if !state.armed {
+            return;
+        }
+        let mine = state.generation;
+        state.parked += 1;
+        while state.armed && state.generation == mine {
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// Lets every presentation that is stopped go, and starts a new stop.
+    fn let_go(&self, disarm: bool) {
+        let mut state = self.state();
+        state.armed = state.armed && !disarm;
+        state.generation += 1;
+        state.parked = 0;
+        self.changed.notify_all();
+    }
 }
 
 /// A presentation that is waiting for the dispatch boundary, counted for as long as it waits. It is
@@ -1352,6 +1419,8 @@ impl WorkerService {
             first_boundary_pause_ms: std::sync::atomic::AtomicU64::new(
                 u64::try_from(BOUNDARY_FIRST_RETRY.as_millis()).unwrap_or(u64::MAX),
             ),
+            #[cfg(feature = "testing")]
+            try_gate: TryGate::default(),
             #[cfg(feature = "testing")]
             boundary_wakes: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
@@ -1838,17 +1907,19 @@ impl WorkerService {
             .expect("the dispatch barrier is not poisoned")
     }
 
-    /// Stops the next release of the dispatch boundary between its unlock and its wake of the
-    /// requests that wait for it, for this host's own tests.
+    /// Stops the next release of the dispatch boundary that `holder`, a thread of the case's own,
+    /// makes, between its unlock and its wake of the requests that wait for it, for this host's own
+    /// tests.
     ///
     /// Returns the end that says the release has reached the pause, with the boundary unlocked and
     /// nothing woken, and the end that lets it go on to the wake. The pause fires once, for the
-    /// first release that reaches it, and holds the thread that drops the guard: a case drops the
-    /// guard it holds on a thread of its own, and does not wait for that thread on a thread of the
-    /// runtime.
+    /// first release that `holder` makes, and holds that thread: a release by another thread, a
+    /// presentation's own among them, passes it by, and the case does not wait for the holder on a
+    /// thread of the runtime.
     #[cfg(feature = "testing")]
     pub fn pause_after_the_boundary_is_unlocked(
         &self,
+        holder: std::thread::ThreadId,
     ) -> (
         std::sync::mpsc::Receiver<()>,
         std::sync::mpsc::SyncSender<()>,
@@ -1859,7 +1930,7 @@ impl WorkerService {
             .dispatch
             .pause_after_unlock
             .lock()
-            .expect("the pause is not poisoned") = Some((arrived, go));
+            .expect("the pause is not poisoned") = Some((holder, arrived, go));
         (watch, release)
     }
 
@@ -1945,15 +2016,34 @@ impl WorkerService {
         );
     }
 
-    /// How many times a presentation has found the dispatch boundary held since the boundary was
-    /// last let go, for this host's own tests. A release starts the count again, so the presentation
-    /// that it wakes and that tries once is counted once.
+    /// Makes every presentation stop after a try that finds the dispatch boundary held and counts
+    /// it, until [`Self::let_parked_presentations_go_for_tests`], for this host's own tests. The try
+    /// is counted before the stop, and the stop comes before anything that the wait does next, so
+    /// that a case decides what happens between a try and the wait that follows it. The stop holds a
+    /// thread that the runtime does without.
+    #[cfg(feature = "testing")]
+    pub fn park_presentations_after_a_try_for_tests(&self) {
+        self.try_gate.state().armed = true;
+    }
+
+    /// How many presentations are stopped after a counted try now, for this host's own tests.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn presentation_tries_since_release_for_tests(&self) -> u64 {
-        self.dispatch
-            .presentation_tries_since_release
-            .load(std::sync::atomic::Ordering::SeqCst)
+    pub fn presentations_parked_for_tests(&self) -> u64 {
+        self.try_gate.state().parked
+    }
+
+    /// Lets the presentations that are stopped after a counted try go on, for this host's own tests.
+    /// The next try of each stops again.
+    #[cfg(feature = "testing")]
+    pub fn let_parked_presentations_go_for_tests(&self) {
+        self.try_gate.let_go(false);
+    }
+
+    /// Lets the presentations that are stopped go on and stops no more, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn stop_parking_presentations_for_tests(&self) {
+        self.try_gate.let_go(true);
     }
 
     /// How many waits for the dispatch boundary have ended because it was let go, for this host's
@@ -5360,9 +5450,9 @@ impl WorkerService {
             {
                 self.presentation_tries
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                self.dispatch
-                    .presentation_tries_since_release
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.try_gate.is_armed() {
+                    off_the_executor(|| self.try_gate.park());
+                }
             }
             return Self::after_a_failed_try(state);
         };
