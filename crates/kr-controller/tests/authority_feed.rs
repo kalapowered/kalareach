@@ -9114,13 +9114,13 @@ async fn a_completed_request_is_replayed_by_the_record_that_decides_it_when_the_
                 "naming an identifier no record holds"
             }
         );
+        // The passes have ended (above), so the state is read at once: a replay that was not carried
+        // out fails here, at the assertion, and not at the bound of a wait.
         if carried_out {
-            within("the replay carries the withdrawal out", async {
-                while !rig.has_revoked(victim.device_id).await {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-            })
-            .await;
+            assert!(
+                rig.has_revoked(victim.device_id).await,
+                "{why}: the replay carries the withdrawal out"
+            );
         } else {
             assert!(
                 !rig.has_revoked(victim.device_id).await,
