@@ -32,6 +32,12 @@ use tokio::task::JoinHandle;
 /// How long a state may take before the case calls it a failure.
 const PATIENCE: Duration = Duration::from_secs(60);
 
+/// How long a net report may take to hold the relays that a case waits for, counted from the
+/// start of the wait. The case with two such waits takes about 35 seconds on an idle machine, so
+/// this is more than three times that, for a loaded one; it is still how long the case lets a
+/// report be missing a relay before it calls the relay missing.
+const REPORT_PATIENCE: Duration = Duration::from_secs(120);
+
 /// How often a case looks at a count that no future announces.
 const LOOK: Duration = Duration::from_millis(50);
 
@@ -240,7 +246,7 @@ fn measured(report: &NetReport, relay: &RelayUrl) -> bool {
 /// Waits until the device's latest net report holds every relay in `relays`.
 async fn until_reported(device: &DeviceEndpoint, relays: &[&RelayUrl]) {
     let mut report = device.endpoint().net_report();
-    tokio::time::timeout(PATIENCE, async {
+    tokio::time::timeout(REPORT_PATIENCE, async {
         loop {
             if let Some(latest) = report.get()
                 && relays.iter().all(|relay| measured(&latest, relay))
