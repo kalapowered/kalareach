@@ -328,6 +328,7 @@ pub const fn consumed(reason: PairingConsumedReason) -> FailureKind {
         PairingConsumedReason::Cancelled => FailureKind::Withdrawn,
         PairingConsumedReason::AttemptsExhausted => FailureKind::HostTriesUsed,
         PairingConsumedReason::HostRestarted => FailureKind::HostRestarted,
+        PairingConsumedReason::EndpointPaired => FailureKind::DidNotFinish,
     }
 }
 

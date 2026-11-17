@@ -1269,6 +1269,7 @@ const fn ended_because(reason: PairingConsumedReason) -> &'static str {
         PairingConsumedReason::Cancelled => "the invitation was withdrawn",
         PairingConsumedReason::AttemptsExhausted => "too many wrong codes were tried",
         PairingConsumedReason::HostRestarted => "the host restarted before it finished",
+        PairingConsumedReason::EndpointPaired => "the pairing did not finish",
     }
 }
 

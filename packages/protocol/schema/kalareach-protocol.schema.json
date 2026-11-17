@@ -27129,6 +27129,11 @@
           "const": "host_restarted",
           "description": "The host restarted while the invitation was unfinished.",
           "type": "string"
+        },
+        {
+          "const": "endpoint_paired",
+          "description": "The device that used the invitation is already paired with this host.",
+          "type": "string"
         }
       ]
     },
