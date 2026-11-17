@@ -568,3 +568,29 @@ fn a_take_planted_in_the_questions_stores_read_is_reported() {
         "questions/store.rs read calls lock 1 time(s) and no row lists it",
     );
 }
+
+#[test]
+fn a_take_planted_in_the_binders_count_of_open_work_is_reported() {
+    let found = planted(
+        "crates/kr-worker/src/broker/binder.rs",
+        "    fn admitted_open(&self, binding_id: BrokerBindingId) -> bool {\n",
+        "    fn admitted_open(&self, binding_id: BrokerBindingId) -> bool {\n        let _held = self.gate.lock();\n",
+    );
+    only_finding(
+        &found,
+        "binder.rs admitted_open calls lock 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_new_caller_of_the_binders_count_of_open_work_is_reported() {
+    let found = planted(
+        "crates/kr-worker/src/broker/binder.rs",
+        "    fn admitted_open(&self, binding_id: BrokerBindingId) -> bool {\n",
+        "    fn rogue(&self, binding_id: BrokerBindingId) -> bool {\n        self.admitted_open(binding_id)\n    }\n\n    fn admitted_open(&self, binding_id: BrokerBindingId) -> bool {\n",
+    );
+    only_finding(
+        &found,
+        "binder.rs rogue calls admitted_open 1 time(s) and no row lists the caller",
+    );
+}
