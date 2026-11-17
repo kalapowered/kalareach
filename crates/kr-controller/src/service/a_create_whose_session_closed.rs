@@ -468,24 +468,42 @@ async fn a_create_asked_again_whose_worker_ended_before_it_was_described_is_answ
     assert!(replayed.deduplicated, "the answer says it is a repeat");
 }
 
-/// Holds the session of a worker's service, so that the worker answers no request that needs it,
-/// until the hold is let go. The lock is taken on a thread of its own, which keeps it for as long
-/// as the hold lives, and the hold is in place when this returns.
+/// Holds the session of a worker's service until the hold is let go. The locks are taken on a
+/// thread of its own, which keeps them for as long as the hold lives, and the hold is in place when
+/// this returns.
+///
+/// A worker whose session alone is held answers a read from the summary it published, with the
+/// lifecycle state read from the input domain, so a read is answered. [`Self::with_the_domain`]
+/// holds the input domain as well, which that answer needs, and the worker then answers a read of
+/// its session with nothing at all.
 struct HeldSession {
     release: Option<std::sync::mpsc::Sender<()>>,
     holder: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HeldSession {
+    /// Holds the session alone, as a call that waits for a disk does.
     fn of(service: &Arc<kr_worker::service::WorkerService>) -> Self {
+        Self::take(service, false)
+    }
+
+    /// Holds the session and then the input domain, in the order the worker's own code takes them,
+    /// so that the worker answers no read of its session.
+    fn with_the_domain(service: &Arc<kr_worker::service::WorkerService>) -> Self {
+        Self::take(service, true)
+    }
+
+    fn take(service: &Arc<kr_worker::service::WorkerService>, with_the_domain: bool) -> Self {
         let service = Arc::clone(service);
         let (held, is_held) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let holder = std::thread::spawn(move || {
             let session = service.runtime().session();
+            let domain = with_the_domain.then(|| service.runtime().input().lock());
             held.send(()).expect("the case is waiting for the hold");
             // Ends when the hold is let go, or dropped, which is the same.
             let _ = released.recv();
+            drop(domain);
             drop(session);
         });
         is_held.recv().expect("the session is held");
@@ -505,21 +523,14 @@ impl Drop for HeldSession {
     }
 }
 
-/// KR-REQ-09.12: a create, and the same create asked again, do not wait for ever on a worker that
-/// has reported itself and does not describe its session. A real worker whose session this case
-/// holds answers nothing that needs it, over a connection the daemon already has; each create ends
-/// with the failure of the wait, no closure is invented for a worker the kernel says is running, and
-/// the session is still there to be described once the worker answers.
-///
-/// The case waits for the daemon's own bound. It decides by what the creates return; the minute
-/// it allows them only ends a case in which they never do.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_session() {
+/// A daemon, a real worker that has reported itself, the registry's row that names the worker as
+/// the one process the kernel says is running, so that no closure can be established for it, and
+/// the daemon's link to the worker, which is open before the worker stops answering.
+async fn reported_and_running() -> (Served, Reservation) {
     use kr_ipc::identity::current_process_start_identity;
 
     let (world, reservation) = reported().await;
     let controller = &world.controller;
-    // The worker is the one process the kernel says is running, so no closure can be established.
     controller
         .registry
         .lock()
@@ -533,15 +544,32 @@ async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_
             Some(&DesktopBinding::none()),
         )
         .expect("the registry records the worker");
-    // The daemon's link to the worker is open before the worker stops answering.
     let mut link = controller
         .worker_client(&world.worker)
         .await
         .expect("the daemon opens its link to the worker");
     link.give_back();
     drop(link);
+    (world, reservation)
+}
 
-    let held = HeldSession::of(world.service());
+/// KR-REQ-09.12: a create, and the same create asked again, do not wait for ever on a worker that
+/// has reported itself and does not describe its session. A real worker whose session and input
+/// domain this case holds answers no read of its session, over a connection the daemon already has;
+/// each create ends with the failure of the wait, no closure is invented for a worker the kernel
+/// says is running, and the session is still there to be described once the worker answers.
+///
+/// The session alone is not enough to make a worker that does not describe its session: a worker
+/// whose session is held answers a read from the summary it published (see the case below), and
+/// reads the lifecycle state for that answer from the input domain, so the domain is held as well.
+///
+/// The case waits for the daemon's own bound. It decides by what the creates return; the minute
+/// it allows them only ends a case in which they never do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_session() {
+    let (world, reservation) = reported_and_running().await;
+    let controller = &world.controller;
+    let held = HeldSession::with_the_domain(world.service());
     let endpoint = world.worker.endpoint.as_text();
     let (created, replayed) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
         tokio::join!(answer(controller, &reservation, endpoint), async {
@@ -560,10 +588,9 @@ async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_
         ("the create", created),
         ("the create asked again", replayed),
     ] {
-        let refused = outcome.expect_err("a session nothing describes is not answered");
         assert!(
-            matches!(refused, ControllerError::Uncertain { .. }),
-            "{what} ends with the failure of the wait, which leaves the create uncertain: {refused:?}"
+            matches!(outcome, Err(ControllerError::Uncertain { .. })),
+            "a session nothing describes is not answered: {what} ends with the failure of the wait, which leaves the create uncertain: {outcome:?}"
         );
     }
     assert!(
@@ -588,6 +615,91 @@ async fn a_create_and_its_replay_give_up_on_a_worker_that_does_not_describe_its_
     );
     assert_ne!(described.session.state, SessionState::Closed);
     assert!(described.deduplicated);
+}
+
+/// KR-REQ-09.12: a worker whose session is held by a call that waits for a disk describes its
+/// session from the summary it published, with the lifecycle state the input domain holds, so a
+/// create and the same create asked again are answered with it. Each answer is the session as the
+/// worker describes it with the endpoint the worker reported, the create is not a repeat of itself
+/// and its repeat says that it is, and no closure is invented for a worker the kernel says is
+/// running.
+///
+/// The case decides by what the creates return. The minute it allows them only ends a case in which
+/// they wait on the worker for as long as the daemon's own bound and are then left uncertain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_and_its_replay_whose_worker_holds_its_session_are_answered_from_its_published_summary()
+ {
+    let (world, reservation) = reported_and_running().await;
+    let controller = &world.controller;
+    let held = HeldSession::of(world.service());
+    assert!(
+        world
+            .service()
+            .runtime()
+            .session_within(std::time::Duration::from_millis(50))
+            .is_none(),
+        "the worker's session is held"
+    );
+    let endpoint = world.worker.endpoint.as_text();
+    let (created, replayed) = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::join!(answer(controller, &reservation, endpoint.clone()), async {
+            controller
+                .replay_create(&reservation)
+                .await
+                .copied()
+                .into_answer_for_test()
+        })
+    })
+    .await
+    .expect("a create waits on a worker whose session is held for longer than any bound it has");
+    drop(held);
+
+    for (what, outcome) in [
+        ("the create", &created),
+        ("the create asked again", &replayed),
+    ] {
+        assert!(
+            outcome.is_ok(),
+            "{what} is answered from the summary that the held session published: {outcome:?}"
+        );
+    }
+    let created = to_a_result(created.expect("answered, as asserted above"));
+    let replayed = to_a_result(replayed.expect("answered, as asserted above"));
+    for (what, result) in [
+        ("the create", &created),
+        ("the create asked again", &replayed),
+    ] {
+        assert_eq!(
+            result.session.session_id, reservation.session_id,
+            "{what} is answered with the session it made"
+        );
+        assert_eq!(
+            result.session.state,
+            SessionState::Live,
+            "{what} says the state that the input domain holds"
+        );
+        assert_eq!(
+            result.endpoint.0.as_deref(),
+            Some(endpoint.as_str()),
+            "{what} gives the endpoint to attach to"
+        );
+    }
+    assert!(
+        !created.deduplicated,
+        "an answer made for the create itself is not a replay of it"
+    );
+    assert!(replayed.deduplicated, "the answer says it is a repeat");
+    assert!(
+        !world
+            .controller
+            .registry
+            .lock()
+            .await
+            .closure(reservation.session_id)
+            .expect("the registry answers")
+            .is_some(),
+        "no closure was invented for a worker that is running"
+    );
 }
 
 /// A process this test holds, ended when the test lets it go.
