@@ -392,6 +392,11 @@ async fn repositories_workspaces_change_sets_and_diffs_are_managed_through_the_d
         "{reports}"
     );
     assert_eq!(reports["omitted"], "0", "{reports}");
+    a_daemon_that_lists_no_method_for_reports_is_not_taken_for_a_grant_without_the_right(
+        &read,
+        &change_set,
+    )
+    .await;
     let materialised = host.kr_json(&[
         "changeset",
         "materialize",
@@ -542,6 +547,87 @@ async fn repositories_workspaces_change_sets_and_diffs_are_managed_through_the_d
         Value::Bool(true),
         "{removed}"
     );
+}
+
+/// A daemon that lists no method for a version's test reports refuses the request as it refuses any
+/// method it does not list, `PERMISSION_DENIED`, which is also what a grant without the right is
+/// refused with. `kr changeset test-reports` reads the same version once more, which asks for the
+/// same right: where that is answered, the daemon does not read test reports and `kr` says so;
+/// where it is refused too, the refusal is the grant's and is shown as it is. `read` is the document
+/// that a real daemon's read of the version printed, which the scripted daemon answers the second
+/// read with.
+async fn a_daemon_that_lists_no_method_for_reports_is_not_taken_for_a_grant_without_the_right(
+    read: &Value,
+    change_set: &str,
+) {
+    // The document `kr --json` prints is the protocol's answer with the command's own `ok` beside it.
+    let mut answered = read.clone();
+    answered
+        .as_object_mut()
+        .expect("the document is an object")
+        .remove("ok");
+    let answer = ParamsValue::from_typed(
+        &serde_json::from_value::<kr_protocol::changeset::ChangesetReadResult>(answered)
+            .expect("the document a read printed is the shape the protocol answers it in"),
+    )
+    .expect("the answer encodes");
+    let refusal = || {
+        ProtocolError::new(
+            ErrorCode::PermissionDenied,
+            "this daemon lists no such method",
+        )
+    };
+
+    // The daemon lists the read of a version and no method for its reports.
+    let old = kr_ipc::testing::TempHost::create();
+    let (asked, serving) = scripted_daemon(
+        &old,
+        Box::new(move |method, _| {
+            if method == "changeset.read" {
+                Ok(answer.clone())
+            } else {
+                Err(refusal())
+            }
+        }),
+    );
+    let (status, said) = json(&old, &["changeset", "test-reports", change_set]);
+    assert_ne!(status, Some(0), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not read test reports"),
+        "the daemon is said to be of a release that does not read them: {said}"
+    );
+    let asked: Vec<String> = asked
+        .lock()
+        .expect("the record")
+        .iter()
+        .filter(|method| method.starts_with("changeset."))
+        .cloned()
+        .collect();
+    assert_eq!(
+        asked,
+        ["changeset.test_reports", "changeset.read"],
+        "the second read is the one that tells the daemon from the grant"
+    );
+    serving.abort();
+
+    // The control: a daemon that refuses the read too is refusing the right, and the refusal is
+    // shown as the grant's and not as an old daemon's.
+    let denied = kr_ipc::testing::TempHost::create();
+    let (_asked, serving) = scripted_daemon(&denied, always(Err(refusal())));
+    let (status, said) = json(&denied, &["changeset", "test-reports", change_set]);
+    assert_ne!(status, Some(0), "{said}");
+    assert_eq!(said["code"], "PERMISSION_DENIED", "{said}");
+    assert!(
+        !said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not read test reports"),
+        "{said}"
+    );
+    serving.abort();
 }
 
 /// KR-REQ-07.47: each family refuses what the daemon does not have, with the daemon's own reason, a
