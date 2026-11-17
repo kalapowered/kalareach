@@ -1843,14 +1843,6 @@ impl View {
             Ok(lane) => {
                 #[cfg(feature = "testing")]
                 self.probe.publish_lane(&lane);
-                // What the lane that ended said behind its end is read before the new lane's words.
-                if let Some(ended) = self.lane_events.as_mut() {
-                    let mut left = Vec::new();
-                    while let Some(event) = ended.try_recv() {
-                        left.push(Heard::Lane(Some(event)));
-                    }
-                    self.queue(left);
-                }
                 self.lane_events = lane.events();
                 self.lane = Some(lane);
                 self.lane_lost = None;
