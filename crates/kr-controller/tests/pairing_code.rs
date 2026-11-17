@@ -30,6 +30,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nonce256, Nullable};
 use net_support::pairing::{self as calls, Signer};
 use net_support::room::{CodeCandidate, Stopped};
+use net_support::worker::Adopted;
 use net_support::{Device, Host, proposal};
 
 fn keys() -> DeviceKeys {
@@ -903,4 +904,136 @@ fn pairing_secrets_reach_no_log_and_no_diagnostics() {
             );
         }
     }
+}
+
+/// Waits for `future` for at most two minutes, and ends the case when it takes longer.
+async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
+    match tokio::time::timeout(std::time::Duration::from_secs(120), future).await {
+        Ok(output) => output,
+        Err(_) => panic!("{what} did not finish within 120s"),
+    }
+}
+
+/// The words of the refusal that a replacement meets while an earlier withdrawal of access is
+/// being finished, naming `expires_at_ms` as the moment the invitation stays open until.
+fn barrier_words(expires_at_ms: u64) -> String {
+    let until = jiff::Timestamp::from_millisecond(i64::try_from(expires_at_ms).expect("a moment"))
+        .expect("a moment")
+        .strftime("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
+    format!(
+        "This host is still finishing an earlier withdrawal of access, so it cannot add this \
+         device yet. Ask for a new confirmation in a minute; this invitation stays open until \
+         {until}."
+    )
+}
+
+/// KR-REQ-10.08: a code pairing's refusal names the moment its own invitation advertised. A device
+/// pairs through the room with a code, its record's withdrawal is still being finished by a worker
+/// that does not acknowledge it, and the same endpoint pairs again with a code: the owner's
+/// confirmation is refused with the complete fixed words, which name `expires_at_ms` of the answer
+/// that issued the second invitation. A host that never advertised a moment would refuse with
+/// words that have no time in them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_refusal_of_a_code_pairing_again_names_the_expiry_its_invitation_advertised() {
+    let Adopted {
+        host,
+        owner: owner_keys,
+        workers,
+    } = Adopted::start(1).await;
+    host.controller().hold_the_pass_asks_for_tests(true);
+    let worker = &workers[0];
+    let device = Device::create().await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+
+    // The first code pairing commits through the room.
+    let first_invited = within(
+        "the first invitation",
+        invite_code(
+            environment,
+            &mut client,
+            InviteGrantKind::SessionInvitation,
+            &viewer(),
+            &owner,
+        ),
+    )
+    .await;
+    let (origin, code) = code_of(&first_invited);
+    let mut candidate = within(
+        "the first candidate",
+        CodeCandidate::start(&host.room, device.candidate(), &origin, &code),
+    )
+    .await
+    .expect("admitted");
+    candidate.confirm().await.expect("the host proved the code");
+    candidate
+        .send_bundle()
+        .await
+        .expect("the host took the bundle");
+    let (first_connection, _first_session, _finished) = candidate.finish().await;
+    let first = within(
+        "the first confirmation",
+        calls::confirm_candidate(
+            environment,
+            &mut client,
+            first_invited.invitation_id,
+            &owner,
+        ),
+    )
+    .await
+    .expect("the first pairing commits");
+    first_connection.close(0u32.into(), b"paired");
+
+    // The record is revoked while the worker holds its acknowledgement back.
+    let boundary = worker.hold_the_dispatch_boundary().await;
+    let barrier = within(
+        "the revocation",
+        host.network().revoke_device(first.device_id),
+    )
+    .await
+    .expect("the device is revoked");
+    assert_eq!(barrier.pending(), vec![worker.session_id], "{barrier:?}");
+
+    // The same endpoint pairs again with a code.
+    let invited = within(
+        "the second invitation",
+        invite_code(
+            environment,
+            &mut client,
+            InviteGrantKind::SessionInvitation,
+            &viewer(),
+            &owner,
+        ),
+    )
+    .await;
+    let (origin, code) = code_of(&invited);
+    let mut candidate = within(
+        "the second candidate",
+        CodeCandidate::start(&host.room, device.candidate(), &origin, &code),
+    )
+    .await
+    .expect("admitted");
+    candidate.confirm().await.expect("the host proved the code");
+    candidate
+        .send_bundle()
+        .await
+        .expect("the host took the bundle");
+    let (connection, _session, _finished) = candidate.finish().await;
+    let refused = within(
+        "the second confirmation",
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner),
+    )
+    .await
+    .expect_err("the host is still finishing the earlier withdrawal");
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
+    assert_eq!(
+        refused.message,
+        barrier_words(invited.expires_at_ms.get()),
+        "the refusal names the moment the code invitation advertised"
+    );
+    boundary.release();
+    connection.close(0u32.into(), b"refused");
+    host.stop().await;
 }
