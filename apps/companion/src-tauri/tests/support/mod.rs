@@ -1202,6 +1202,8 @@ pub struct LinkControl {
     /// How many times a connection was asked whether this device ended it, and told each time.
     ended_asked: std::sync::atomic::AtomicUsize,
     ended_asks: tokio::sync::Notify,
+    /// How many connections a device made through this control were closed by their owner.
+    closed: std::sync::atomic::AtomicUsize,
 }
 
 /// A change a case makes to the voice result that carries a challenge.
@@ -1394,6 +1396,11 @@ impl LinkControl {
             .get(host)
             .copied()
             .unwrap_or(0)
+    }
+
+    /// How many connections were closed by their owner.
+    pub fn closed(&self) -> usize {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How many connections have been asked for, held ones included.
@@ -2458,6 +2465,9 @@ impl kr_client::transport::ControlTransport for Tapped {
     }
 
     fn close(&self) {
+        self.control
+            .closed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.close();
     }
 }
