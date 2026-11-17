@@ -6270,6 +6270,10 @@ enum OnStop {
     /// Closes the connection at the hello, with no answer, and stops listening, as a daemon does
     /// that is ending: the greeting fails and nothing answers after it.
     EndAtTheGreeting,
+    /// Answers the first request to stop, which asks only how the daemon was started, with no
+    /// launch, and closes the connection with no answer to the second, which is the stop, and
+    /// ends: the stop's outcome is not known.
+    AnswerTheLaunchThenCut,
 }
 
 /// How many `host.info` that follow its close `OnStop::CloseAndEndAfterTwoLooks` answers before it
@@ -6354,6 +6358,8 @@ impl TestDaemon {
                 // How many `host.info` the daemon has answered since it closed a connection, where it
                 // has closed one.
                 let mut looks_since_the_close: Option<u32> = None;
+                // How many requests to stop the daemon has received.
+                let mut stops_received: u32 = 0;
                 loop {
                     if over.load(std::sync::atomic::Ordering::SeqCst) {
                         *stopped.lock().expect("the instant") = Some(Instant::now());
@@ -6477,11 +6483,31 @@ impl TestDaemon {
                                     .lock()
                                     .expect("the record")
                                     .push(mutation.method.as_str().to_owned());
+                                stops_received += 1;
                                 match &on_stop {
                                     OnStop::Cut => {
                                         over.store(true, std::sync::atomic::Ordering::SeqCst);
                                         break;
                                     }
+                                    OnStop::AnswerTheLaunchThenCut if stops_received > 1 => {
+                                        over.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        break;
+                                    }
+                                    OnStop::AnswerTheLaunchThenCut => ControlFrame::Response(Response {
+                                        request_id: mutation.request_id,
+                                        outcome: Outcome::Ok(
+                                            ParamsValue::from_typed(
+                                                &kr_protocol::update::HostStopResult {
+                                                    pid: kr_protocol::scalars::U64::new(
+                                                        u64::from(std::process::id()),
+                                                    ),
+                                                    unsettled: kr_protocol::scalars::U64::new(0),
+                                                    launch: Nullable::null(),
+                                                },
+                                            )
+                                            .expect("encodes"),
+                                        ),
+                                    }),
                                     OnStop::Refuse
                                     | OnStop::HoldTheLook
                                     | OnStop::CloseAfterTheLook
@@ -7684,6 +7710,49 @@ fn a_restart_whose_request_could_not_be_made_because_the_daemon_ended_goes_on_to
         "no request to stop left: {:?}",
         daemon.received()
     );
+    assert!(attempts(&host).is_empty(), "no record stands");
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (a restart whose stop has no answer): a daemon that takes the request and closes
+/// the connection with no answer, and ends, leaves an unknown outcome. The restart says the stop's
+/// own words for that, that the daemon did not show whether it took the stop and that it has ended,
+/// and never that it stopped the daemon; then that it started a daemon, which answers. `--json`
+/// says `ended`, as the stop does for that state.
+#[test]
+fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    // Of an older generation than any daemon the start makes, so that the one that answers after
+    // it is new.
+    let mut daemon = TestDaemon::serve_generation(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerTheLaunchThenCut,
+        true,
+        0,
+    );
+    let output = start(host.kr(&["host", "restart"])).finish("kr host restart");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{out} {said}");
+    assert!(
+        out.starts_with("The control daemon for environment ")
+            && out.contains(" did not show whether it took the stop (")
+            && out.contains(
+                "), and it has ended. This command then started a control daemon (process "
+            ),
+        "the stop's words for an unknown outcome, then what the start did: {out}"
+    );
+    assert!(!out.contains("Stopped the control daemon"), "{out}");
+    assert!(
+        out.trim_end()
+            .ends_with(" under the standalone start. No session was stopped."),
+        "{out}"
+    );
+    assert!(host.answers(), "the daemon this command started answers");
+    assert_eq!(host.running().len(), 1, "one daemon runs");
     assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
 }
