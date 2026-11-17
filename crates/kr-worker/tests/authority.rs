@@ -3399,15 +3399,16 @@ async fn a_waiting_request_among_a_stream_of_mutations_is_taken_soon_after_the_r
     let service = &host.service;
     let boundary = Held::boundary(&host).await;
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let made = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let streams: Vec<_> = (0..4)
-        .map(|_| {
+    let progress: Vec<Arc<Progress>> = (0..4).map(|_| Arc::default()).collect();
+    let streams: Vec<_> = progress
+        .iter()
+        .map(|progress| {
             tokio::spawn(mutating(
                 host.endpoint.clone(),
                 host.environment_id,
                 host.session_id,
                 Arc::clone(&stop),
-                Arc::clone(&made),
+                Arc::clone(progress),
             ))
         })
         .collect();
@@ -3449,9 +3450,10 @@ async fn a_waiting_request_among_a_stream_of_mutations_is_taken_soon_after_the_r
         .expect("the probe is answered within ten seconds of the release")
         .expect("the connection is read");
     eprintln!(
-        "the probe was answered {:?} after the release; the stream made {} calls so far",
+        "the probe was answered {:?} after the release; the stream started {} calls and was answered {} so far",
         released.elapsed(),
-        made.load(std::sync::atomic::Ordering::SeqCst)
+        progress.iter().map(|client| client.started()).sum::<u64>(),
+        progress.iter().map(|client| client.answered()).sum::<u64>()
     );
     let ControlFrame::Response(response) = answered else {
         panic!("the worker answered {answered:?}");
