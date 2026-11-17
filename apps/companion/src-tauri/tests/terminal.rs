@@ -7511,3 +7511,48 @@ async fn the_notice_after_the_right_to_type_ended_tells_the_page_and_the_next_ta
         "the host's words for the refused take"
     );
 }
+
+/// A key that the worker could not say it took (its outcome is unknown) ends the view's input lane:
+/// control ends with the stream's words, the epoch the view held is given back once and names no
+/// position, and the next take opens a new lane, whose first key is number 0 of a new epoch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_key_the_worker_could_not_say_it_took_ends_control_and_the_next_take_opens_a_new_lane() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let mut lease = WorkerLease::at(4);
+    let (view, mut link) =
+        controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    page.text(&view, 1, "a").expect("the key is taken");
+    let key = link.expect(Method::InputWrite).await;
+    link.refuse_with(&key, ErrorCode::OutcomeUnknown, "no word of it")
+        .await;
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the end of the lane ended control within the bound");
+    assert_eq!(
+        ended["control"]["ended"], "Control ended: this view's input stream ended.",
+        "the stream's words, whole"
+    );
+    let release = release_of_the_epoch_within_the_bound(&mut link, 5).await;
+    lease.answer(&mut link, &release).await;
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "the epoch is given back once"
+    );
+    page.take(&view, 2);
+    let acquire = link.expect(Method::InputAcquire).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest_within(3, |state| control(state) == (2, "controlling".to_owned()))
+        .await
+        .expect("the second take took control within the bound");
+    page.text(&view, 2, "b").expect("the key is taken");
+    let write = link.expect(Method::InputWrite).await;
+    let asked: InputWriteParams = write.params();
+    assert_eq!(
+        (asked.epoch.get(), asked.sequence.get()),
+        (lease.epoch, 0),
+        "the first key of the new lane is number 0 of the new epoch"
+    );
+    assert!(lease.epoch > 5, "a new take has a new epoch");
+}
