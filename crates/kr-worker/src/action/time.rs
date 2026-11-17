@@ -4749,4 +4749,29 @@ mod tests {
         );
         assert!(kept.tries.is_empty(), "and the second decision uses it up");
     }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a reading that no narrow bracket could be taken for is evidence for
+    /// the pending confirmation too. A caller that needs only a wall reading, as a tombstone's stamp
+    /// does, is held up in all three tries and reads the clock once more with no bracket, which
+    /// reads a peak ten minutes ahead of the owner's clock; the clock is back at the owner's level
+    /// for the next look.
+    #[test]
+    fn a_reading_no_bracket_could_be_taken_for_is_held_against_the_pending_confirmation() {
+        let (_floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let start = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(4, start + 600_000);
+        held.arm(0, 3);
+        assert_eq!(
+            contract.wall_reading(),
+            start + 600_000,
+            "the reading with no bracket is the peak"
+        );
+        held.wall.set(start + 30_000);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading that no bracket was taken for"
+        );
+    }
 }
