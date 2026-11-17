@@ -4327,6 +4327,288 @@ mod tests {
         );
     }
 
+    /// The gateway of the push registrations below: it takes every bearer and begins every renewal,
+    /// and says on `answered` that it has begun the renewal, which is the last thing a registration
+    /// asks it.
+    #[derive(Debug)]
+    struct Gateway {
+        answered: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl kr_client::services::ServiceHttp for Gateway {
+        fn post_json<'a>(
+            &'a self,
+            url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer>
+        {
+            let renewal = url.ends_with("/api/push/sender/renew");
+            let body = if renewal {
+                serde_json::json!({
+                    "ok": true,
+                    "data": {
+                        "gateway_nonce": kr_protocol::scalars::Nonce256::from_bytes([7; 32]),
+                        "expires_at_ms": TimestampMs::new(4_000_000_000_000),
+                    },
+                })
+            } else {
+                serde_json::json!({ "ok": true, "data": null })
+            };
+            if renewal {
+                let _ = self.answered.lock().expect("not poisoned").send(());
+            }
+            Box::pin(async move {
+                Ok(kr_client::services::ServiceHttpAnswer {
+                    status: 200,
+                    body: serde_json::to_vec(&body).expect("the answer encodes"),
+                })
+            })
+        }
+    }
+
+    /// Every origin reaches the one gateway.
+    #[derive(Debug)]
+    struct ThroughGateway(Arc<Gateway>);
+
+    impl crate::push::transport::DeliveryTransports for ThroughGateway {
+        fn to(
+            &self,
+            _origin: &kr_protocol::service::GatewayOrigin,
+        ) -> Result<Arc<dyn kr_client::services::ServiceHttp>, String> {
+            Ok(Arc::clone(&self.0) as Arc<dyn kr_client::services::ServiceHttp>)
+        }
+
+        fn outbound(&self) -> crate::config::Outbound {
+            crate::config::Outbound::Direct
+        }
+    }
+
+    /// The request in which the host's device registers a push destination, with a credential its
+    /// own authorisation key names, from the official gateway.
+    fn push_registration(host: &Host, action: u8) -> MutationRequest {
+        let now = host.wall.load(Ordering::SeqCst);
+        let authorisation = host
+            .controller
+            .devices()
+            .record_for_device(host.device_id)
+            .expect("a read")
+            .expect("the device")
+            .authorisation;
+        let credential = kr_protocol::push::PushDeliveryCredential {
+            expires_at_ms: TimestampMs::new(now + 86_400_000),
+            gateway_origin: kr_protocol::service::GatewayOrigin::new(
+                host.controller.gateways.official(),
+            )
+            .expect("an origin"),
+            installation_id: kr_protocol::service::installation_id(&authorisation),
+            issued_at_ms: TimestampMs::new(now),
+            revision: kr_protocol::ids::PushSenderRevision::new(1),
+            secret: kr_protocol::scalars::SecretBytes32::from_bytes([9; 32]),
+            sender_record_id: PushSenderRecordId::new(uuid(31)),
+        };
+        MutationRequest {
+            action_id: ActionId::new(uuid(action)),
+            request_id: kr_protocol::ids::RequestId::new(u64::from(action)),
+            method: kr_protocol::method::Method::DevicePushRegister.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(host.controller.paths().environment_id()),
+            expected: ParamsValue::empty(),
+            action_window_id: kr_protocol::ids::ActionWindowId::new("window-1").expect("a window"),
+            requested_ttl_ms: kr_protocol::scalars::DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&kr_protocol::push::DevicePushRegisterParams {
+                credential,
+                previews_enabled: true,
+            })
+            .expect("params"),
+        }
+    }
+
+    /// The destination the delivery journal holds under `device_id`'s identifier.
+    fn destination_of(host: &Host, device_id: DeviceId) -> Option<DestinationRecord> {
+        host.controller
+            .delivery()
+            .with(|producer| {
+                Ok(producer
+                    .journal()
+                    .destination(&DestinationId::new(device_id.to_string()).expect("an identifier"))
+                    .expect("a read"))
+            })
+            .expect("a read")
+    }
+
+    /// Runs one push registration of the host's device to the point after the gateway has taken
+    /// it, where it waits for the registry, which this holds; does `ends` to the device's record
+    /// there; then lets the registry go and returns what the registration ended as. The connection
+    /// it came on stays admitted.
+    async fn push_registered_while(
+        host: &Host,
+        ends: impl FnOnce(&Host),
+    ) -> crate::error::Result<ParamsValue> {
+        let (answered, gateway_answered) = std::sync::mpsc::channel();
+        let gateway = Arc::new(Gateway {
+            answered: std::sync::Mutex::new(answered),
+        });
+        assert!(
+            host.controller
+                .attach_delivery_transport(Arc::new(ThroughGateway(gateway))),
+            "no transport was attached before this one"
+        );
+        let admission = host.admission(Duration::from_secs(600));
+        let mutation = push_registration(host, 0x72);
+        let actor = kr_transport::listener::device_principal(&host.device_id);
+        let registry = host.controller.registry.lock().await;
+        let controller = Arc::clone(&host.controller);
+        let effect = tokio::spawn(async move {
+            controller
+                .device_push_register(&actor, &mutation, admission)
+                .await
+        });
+        tokio::task::spawn_blocking(move || gateway_answered.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("the wait ends")
+            .expect("the gateway was asked to begin the renewal");
+        ends(host);
+        drop(registry);
+        effect.await.expect("the registration ends")
+    }
+
+    /// KR-REQ-10.08: a push registration is decided on the device's record as the registry shows
+    /// it where the destination is written, after the gateway has answered. A record that is
+    /// revoked while the registration waits for the registry gets no destination, though the
+    /// connection it came on is still admitted; the control, with the record standing, gets one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_registration_whose_record_is_revoked_while_it_waits_for_the_registry_writes_no_destination()
+     {
+        for revoked in [false, true] {
+            let host = Host::start(GrantExpiry::Never, false).await;
+            let outcome = push_registered_while(&host, |host| {
+                if revoked {
+                    assert!(
+                        host.controller
+                            .devices()
+                            .revoke(
+                                host.device_id,
+                                TimestampMs::new(host.wall.load(Ordering::SeqCst))
+                            )
+                            .expect("a write"),
+                        "the owner's revocation ends the record"
+                    );
+                }
+            })
+            .await;
+            let destination = destination_of(&host, host.device_id);
+            if revoked {
+                let error = outcome.expect_err("a revoked record registers no destination");
+                assert!(
+                    matches!(
+                        &error,
+                        crate::error::ControllerError::InvalidArgument(detail)
+                            if detail.contains("not paired or has been revoked")
+                    ),
+                    "the registry's own read of the record refuses it: {error}"
+                );
+                assert!(
+                    destination.is_none(),
+                    "no destination stands under the revoked device: {destination:?}"
+                );
+            } else {
+                outcome.expect("the control registers");
+                assert!(
+                    destination.is_some(),
+                    "the control's destination stands under the device"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-10.08: a registration whose device's record is replaced while it waits, the endpoint
+    /// identity paired again under a new identifier, writes no destination under the old
+    /// identifier and none under the new one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_registration_whose_record_is_replaced_while_it_waits_writes_no_destination_for_either_device()
+     {
+        let host = Host::start(GrantExpiry::Never, false).await;
+        let new_id = DeviceId::new(uuid(11));
+        let outcome = push_registered_while(&host, |host| {
+            let mut replacement = host
+                .controller
+                .devices()
+                .record_for_device(host.device_id)
+                .expect("a read")
+                .expect("the device");
+            assert!(
+                host.controller
+                    .devices()
+                    .revoke(
+                        host.device_id,
+                        TimestampMs::new(host.wall.load(Ordering::SeqCst))
+                    )
+                    .expect("a write"),
+                "the owner's revocation ends the record"
+            );
+            replacement.device_id = new_id;
+            replacement.revoked_at_ms = None;
+            replacement.grant.grant_id = GrantId::new(uuid(102));
+            replacement.grant.recipient_device_id = new_id;
+            host.controller
+                .devices()
+                .commit(&replacement)
+                .expect("the endpoint identity pairs again under a new identifier");
+        })
+        .await;
+        let error = outcome.expect_err("a replaced record registers no destination");
+        assert!(
+            matches!(
+                &error,
+                crate::error::ControllerError::InvalidArgument(detail)
+                    if detail.contains("not paired or has been revoked")
+            ),
+            "the registry's own read of the record refuses it: {error}"
+        );
+        let old = destination_of(&host, host.device_id);
+        assert!(
+            old.is_none(),
+            "no destination stands under the old device: {old:?}"
+        );
+        let new = destination_of(&host, new_id);
+        assert!(
+            new.is_none(),
+            "no destination stands under the new device: {new:?}"
+        );
+    }
+
+    /// KR-REQ-10.08: a registration whose device's grant runs out in UTC while it waits for the
+    /// registry, with the record not marked and the connection still admitted, is refused where
+    /// the grant is read on its clocks, and writes no destination.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_registration_whose_grant_runs_out_while_it_waits_for_the_registry_writes_no_destination()
+     {
+        let now = kr_ipc::now_ms().get();
+        let host = Host::start(
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 3_600_000),
+            },
+            false,
+        )
+        .await;
+        let outcome = push_registered_while(&host, |host| {
+            host.wall.store(now + 3_600_001, Ordering::SeqCst);
+        })
+        .await;
+        let error = outcome.expect_err("a grant that has run out registers no destination");
+        let crate::error::ControllerError::PermissionDenied { detail } = &error else {
+            panic!("a grant that has run out is refused: {error}");
+        };
+        assert!(detail.contains("has run out"), "{detail}");
+        let destination = destination_of(&host, host.device_id);
+        assert!(
+            destination.is_none(),
+            "no destination stands under the device: {destination:?}"
+        );
+    }
+
     /// KR-REQ-09.13: the daemon's entry for a worker replaces the one an answer was given with only
     /// when it carries every name that answer gave. An entry whose totals are as high but from
     /// which a carried report's names have gone, as the report of an earlier revision does when

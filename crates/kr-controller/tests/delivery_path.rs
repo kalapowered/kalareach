@@ -6869,14 +6869,20 @@ async fn a_push_registration_answered_after_its_record_was_replaced_writes_nothi
         held.release();
         (again, ended)
     };
-    let (_answer, (again, ended)) = tokio::join!(late_registration, replacing);
+    let (answer, (again, ended)) = tokio::join!(late_registration, replacing);
 
-    // The client's request can end when its connection closes, which says nothing of the host's
-    // action. The host serves the owner's device list only after it has served the revocation and
-    // the new pairing, and the list asks for the registry's lock, which the late registration asks
-    // for after the gateway's answer: the lock is handed on in the order it was asked for, so a
-    // registration that is still running has passed it, by a refusal or by a write, before the
-    // list is answered.
+    // The host closes the connection of an ended record when the end is on record, at a revocation
+    // and at an expiry alike, and the late request goes with it: it ends with its connection and
+    // never reaches the registry's lock after the gateway's answer. So this case shows that the
+    // connection ended and that the stores are as the revocation left them; the registration's
+    // own guards at the registry are read by the cases of the authority changes' module. The
+    // owner's list is no proof that a late write has passed: the lock hands on in order only among
+    // tasks that already wait for it, and a late registration that ran on would ask for it only
+    // after the gateway's answer, so the list could ask first.
+    assert!(
+        answer.is_none(),
+        "the late registration ends with the connection the host closed at the revocation: {answer:?}"
+    );
     let mut owner = environment.host.client().await;
     let _: kr_protocol::sharing::DeviceListResult = net_support::pairing::read(
         &mut owner,
@@ -6886,7 +6892,7 @@ async fn a_push_registration_answered_after_its_record_was_replaced_writes_nothi
         },
     )
     .await
-    .expect("the owner's list is answered once the late action has passed the registry");
+    .expect("the owner's list is answered");
     assert!(
         environment.destination(again.device_id()).is_none(),
         "the new identifier has no destination after the late registration: {:?}",
