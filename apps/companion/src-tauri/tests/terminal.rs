@@ -48,10 +48,6 @@ const QUIET: Duration = Duration::from_millis(300);
 /// its own assertion. The states of a correct view come within a fraction of a second.
 const STATE_BOUND: Duration = Duration::from_secs(10);
 
-/// How long a case that writes more than the view, the channel and the reader hold gives the reader
-/// to read what is on the connection before it lets a held view take a first look.
-const READER_SETTLES: Duration = Duration::from_secs(2);
-
 /// The page: an application with the view's commands, and every state each channel was sent.
 struct Page {
     app: tauri::App<MockRuntime>,
@@ -307,6 +303,55 @@ impl Page {
                 self.states(channel)
             )
         })
+    }
+
+    /// Waits, under [`STATE_BOUND`], until the view's session has read the output stream through
+    /// the event `sequence`: the reader records an event before it hands it on, so an event that
+    /// waits for room in a full channel is read. A case that must fail by its own assertion when
+    /// the reader stops asks for the reader's progress this way.
+    async fn reader_reaches(&self, view: &str, sequence: u64) {
+        let views = self.app.state::<companion_tauri::terminal::TerminalViews>();
+        let stream = kr_protocol::ids::StreamId::new(scripted_worker::OUTPUT_STREAM)
+            .expect("a literal stream name");
+        let reached = tokio::time::timeout(STATE_BOUND, async {
+            loop {
+                if views
+                    .read_through(view, &stream)
+                    .await
+                    .is_some_and(|read| read.get() >= sequence)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            reached.is_ok(),
+            "the session's reader had not read the output stream through {sequence} within the \
+             bound: it read {:?}",
+            views
+                .read_through(view, &stream)
+                .await
+                .map(|read| read.get())
+        );
+    }
+
+    /// Waits, under [`STATE_BOUND`], until the view's input lane has recorded its end, which a held
+    /// view has not read.
+    async fn lane_ends(&self, view: &str) {
+        let views = self.app.state::<companion_tauri::terminal::TerminalViews>();
+        let ended = tokio::time::timeout(STATE_BOUND, async {
+            while views.lane_ended(view) != Some(true) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            ended.is_ok(),
+            "the view's input lane had not recorded its end within the bound: {:?}",
+            views.lane_ended(view)
+        );
     }
 
     /// How many views the application holds open.
@@ -5170,7 +5215,9 @@ fn flood_texts(states: &[Value], from: usize) -> Vec<String> {
 /// the view's queue, the channel is empty, and the host writes the answer to a launch surface read
 /// and 255 notifications more, which the channel holds with no room in the socket. A loop that looks
 /// at its calls at every turn takes that answer with the channel at its next turn, and the queue
-/// then holds more than the channel and one look: the case fails on the queue's peak.
+/// then holds more than the channel and one look: the case fails on the queue's peak. The case
+/// moves on only when the session's reader has read what the host wrote (the reader's own record of
+/// the last event it read, which the registry gives a test), and each write it makes is bounded.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_command() {
     const BEFORE_ACQUIRE: u64 = 150;
@@ -5185,8 +5232,9 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
     const SECOND: u64 = CHANNEL as u64 - 1;
     const SECOND_SCREENS: u64 = SECOND - AFTER_NOTICES - 1;
     const FLOOD: u64 = BEFORE_ACQUIRE + FIRST_SCREENS + SECOND_SCREENS;
-    // The states the page takes one at a time after the second flood is written, which gives a
-    // loop that looks at every turn the turns it needs to take the answer and the channel.
+    // The states the page takes one at a time once the reader has read the second flood: a loop that
+    // looks at every turn takes the answer and the channel at the first of them, and a correct one
+    // takes nothing until its queue is empty.
     const PACED: usize = 20;
     const CALLS_IN_FLIGHT: usize = 3;
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -5215,29 +5263,33 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
         )
     };
     let notice = json!({"requested_cursor": "10", "oldest_retained_cursor": "20"});
-    for number in 0..BEFORE_ACQUIRE {
-        link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
-    }
-    lease.answer(&mut link, &acquire).await;
-    for _ in 0..BETWEEN_NOTICES {
-        link.push("session.gap", &notice).await;
-    }
-    for number in BEFORE_ACQUIRE..BEFORE_ACQUIRE + FIRST_SCREENS {
-        link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
-    }
+    // Each write of the case is bounded, so that a session whose reader has stopped fails the case
+    // here and does not hang it: the host's writes wait for the reader once the socket is full.
+    let written = tokio::time::timeout(STATE_BOUND, async {
+        for number in 0..BEFORE_ACQUIRE {
+            link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
+        }
+        lease.answer(&mut link, &acquire).await;
+        for _ in 0..BETWEEN_NOTICES {
+            link.push("session.gap", &notice).await;
+        }
+        for number in BEFORE_ACQUIRE..BEFORE_ACQUIRE + FIRST_SCREENS {
+            link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
+        }
+    })
+    .await;
+    assert!(
+        written.is_ok(),
+        "the host could not write the first flood within the bound: the session's reader stopped"
+    );
     // The view is inside the first state of the flood, and holds nothing else.
     assert!(
         page.state_within(3, first).await.is_some(),
         "the view did not reach the first state of the flood within the bound"
     );
-    // Nothing on the wire or in the page shows that the session's reader has read all 258
-    // notifications and waits for room in the channel, so the case gives it the time of a settle:
-    // a late reader would make the first look take less than the channel, and the assertion below
-    // fails the case, which is a correct view's failure only if the reader took more than that.
-    assert!(
-        link.quiet_for(READER_SETTLES).await,
-        "nothing goes to the worker while the view is held"
-    );
+    // The session's reader has read every notification of the flood, the last of them waiting for
+    // room in the full channel, so that the first look takes the channel whole.
+    page.reader_reaches(&view, link.next_sequence() - 1).await;
     // The page takes states one at a time until a look has moved what the channel held into the
     // view's queue.
     let mut recorded = first + 1;
@@ -5284,19 +5336,29 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
     // The channel is empty and the queue is not: the host answers the surface read and sends 255
     // notifications more. The loop does not look at its calls until the queue is empty, so the
     // answer and the channel wait.
-    link.answer(&surface, &a_surface_held_here(worker.session_id))
+    let written = tokio::time::timeout(STATE_BOUND, async {
+        link.answer(&surface, &a_surface_held_here(worker.session_id))
+            .await;
+        for _ in 0..AFTER_NOTICES {
+            link.push("session.gap", &notice).await;
+        }
+        for number in BEFORE_ACQUIRE + FIRST_SCREENS..FLOOD {
+            link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
+        }
+        link.push(
+            PROJECTION_DELTA_EVENT,
+            &delta(1, 40 + FLOOD, 41 + FLOOD, 10, 2, 0, vec![row(1, "after")]),
+        )
         .await;
-    for _ in 0..AFTER_NOTICES {
-        link.push("session.gap", &notice).await;
-    }
-    for number in BEFORE_ACQUIRE + FIRST_SCREENS..FLOOD {
-        link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
-    }
-    link.push(
-        PROJECTION_DELTA_EVENT,
-        &delta(1, 40 + FLOOD, 41 + FLOOD, 10, 2, 0, vec![row(1, "after")]),
-    )
+    })
     .await;
+    assert!(
+        written.is_ok(),
+        "the host could not write the second flood within the bound: the session's reader stopped"
+    );
+    // The reader has read the answer, which stood before the notifications, and every notification
+    // after it: the answer's call has completed, and the channel holds the whole second flood.
+    page.reader_reaches(&view, link.next_sequence() - 1).await;
     for _ in 0..PACED {
         held.let_pass(1);
         assert!(
@@ -5505,8 +5567,9 @@ async fn a_key_answered_before_the_view_read_its_acceptance_does_not_stop_the_de
 /// A key that the worker could not say it took ends the lane, whose end the held view has not read:
 /// a close that the view serves first still writes the detach whole, as the key has its answer and
 /// the lane writes nothing more. The release that stands behind the key is never written, since the
-/// lane ends before its turn; the case gives the lane's writer the time of a quiet to read the
-/// refusal that is already on the connection.
+/// lane ends before its turn. The case closes only once the lane has recorded its end (the lane's
+/// own record, which the registry gives a test), and the view, held inside a state, has read none
+/// of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_close_before_the_view_read_the_end_of_its_lane_still_writes_the_detach() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -5526,11 +5589,15 @@ async fn a_close_before_the_view_read_the_end_of_its_lane_still_writes_the_detac
     link.restart_stream();
     screen(&mut link, 2, 60, vec![row(0, "one"), row(1, "two")], 0).await;
     // The view is inside the first state it published after the marker, and takes nothing.
-    page.state(3, first).await;
+    assert!(
+        page.state_within(3, first).await.is_some(),
+        "the view did not reach the state after the marker within the bound"
+    );
     link.refuse_with(&key, ErrorCode::OutcomeUnknown, "no word of it")
         .await;
+    page.lane_ends(&view).await;
     assert!(
-        link.quiet_for(QUIET).await,
+        link.call_within(QUIET).await.is_none(),
         "the release behind the key is not written: the lane ended before its turn"
     );
     page.app
@@ -5796,6 +5863,87 @@ impl Page {
             .over(host.transport());
         page
     }
+
+    /// As [`Self::over`], with the waits of the view's input lane taken from `deadlines`: a
+    /// barrier's wait of the lane ends when the case ends it and not with time.
+    fn over_bounded(host: &mut ScriptedHost, deadlines: &Arc<BarrierDeadlines>) -> Self {
+        let page = Self::over(host);
+        page.app
+            .state::<companion_tauri::terminal::TerminalViews>()
+            .bound_lanes_by(Arc::clone(deadlines) as Arc<dyn kr_transport::deadlines::Deadlines>);
+        page
+    }
+}
+
+/// The waits of an input lane in which the barrier's wait ends when the case calls
+/// [`BarrierDeadlines::expire`] and at no other time, so that a stall of the machine cannot end a
+/// barrier that a case holds. This is the lane's own deadline abstraction (`Deadlines`); the
+/// application's test build does not enable the transport's ready-made manual source, so this is
+/// the same thing in the one kind that the cases need. Every other wait runs on the shipped
+/// timers.
+#[derive(Debug)]
+struct BarrierDeadlines {
+    expired: tokio::sync::watch::Sender<u64>,
+    armed: Arc<std::sync::atomic::AtomicUsize>,
+    timers: kr_transport::deadlines::TimerDeadlines,
+}
+
+/// A barrier's wait in force, which stops being so when its future is dropped or has resolved.
+struct ArmedWait(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ArmedWait {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl BarrierDeadlines {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            expired: tokio::sync::watch::channel(0).0,
+            armed: Arc::default(),
+            timers: kr_transport::deadlines::TimerDeadlines {
+                header: kr_client::input::INPUT_OPEN_WAIT,
+                ..kr_transport::deadlines::TimerDeadlines::default()
+            },
+        })
+    }
+
+    /// Waits, under [`STATE_BOUND`], until a barrier's wait is in force, which is the lane having
+    /// taken a barrier, and ends every wait that is in force then. A wait that starts afterwards is
+    /// not ended.
+    async fn expire_when_armed(&self) {
+        let armed = tokio::time::timeout(STATE_BOUND, async {
+            while self.armed.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            armed.is_ok(),
+            "no barrier's wait was in force within the bound"
+        );
+        self.expired.send_modify(|count| *count += 1);
+    }
+}
+
+impl kr_transport::deadlines::Deadlines for BarrierDeadlines {
+    fn start(
+        &self,
+        kind: kr_transport::deadlines::DeadlineKind,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
+        if !matches!(kind, kr_transport::deadlines::DeadlineKind::Admission) {
+            return kr_transport::deadlines::Deadlines::start(&self.timers, kind);
+        }
+        let mut expired = self.expired.subscribe();
+        let seen = *expired.borrow();
+        self.armed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let armed = ArmedWait(Arc::clone(&self.armed));
+        Box::pin(async move {
+            let _armed = armed;
+            let _ = expired.wait_for(|count| *count > seen).await;
+        })
+    }
 }
 
 /// A view of a paired host's session, attached and showing `at`, whose host takes the input stream
@@ -5907,6 +6055,20 @@ async fn barriers_taken(page: &Page, view: &str, count: usize) {
     );
 }
 
+/// The keys `keys`, taken by the view under the page's take 1, on a host whose window is three
+/// frames: the host has read the first three, and the lane holds the others until the host's
+/// acceptance gives room.
+async fn keys_beyond_the_window(page: &Page, view: &str, host: &ScriptedHost, keys: &[&str]) {
+    for key in keys {
+        page.text(view, 1, key).expect("the key is taken");
+    }
+    host.script
+        .until("the three frames the window takes", |seen| {
+            seen.frames.len() == 3
+        })
+        .await;
+}
+
 /// Three keys, `a`, `b` and `c`, taken by the view under the page's take 1 and read by the host, and
 /// none of them accepted: the lane's barrier for an ending that follows cannot be reached.
 async fn three_keys_the_host_has_read(page: &Page, view: &str, host: &ScriptedHost) {
@@ -5953,11 +6115,14 @@ async fn an_unreached_release_goes_at_once_naming_the_typing_the_host_accepted()
 
 /// A release stays off the control stream until the host reaches its barrier: the view has taken the
 /// release's barrier, the host has accepted two of three frames, and nothing of the release is on the
-/// wire; once the host accepts the third, the release goes at once and names the three.
+/// wire; once the host accepts the third, the release goes at once and names the three. The lane's
+/// wait for the barrier is the case's to end and is never ended, so no stall of the machine can send
+/// the release before the host reaches its barrier.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_release_stays_off_the_control_stream_until_the_host_reaches_its_barrier() {
     let mut host = ScriptedHost::start(lane_window(8)).await;
-    let page = Page::over(&mut host);
+    let deadlines = BarrierDeadlines::new();
+    let page = Page::over_bounded(&mut host, &deadlines);
     let mut lease = WorkerLease::default();
     let (view, mut link) =
         paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
@@ -5985,10 +6150,10 @@ async fn a_release_stays_off_the_control_stream_until_the_host_reaches_its_barri
 }
 
 /// A key that the host refuses on the input stream as the lease having moved on ends the view's
-/// control with the host's words, and the page is told so; the input of the take is refused after
-/// it.
+/// control, and the page is told so in the view's own sentence for a lost lease, whole; the input of
+/// the take is refused after it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_lease_refusal_on_the_input_stream_ends_control_with_the_hosts_words() {
+async fn a_lease_refusal_on_the_input_stream_ends_control_and_tells_the_page_why() {
     let mut host = ScriptedHost::start(lane_window(8)).await;
     let page = Page::over(&mut host);
     let mut lease = WorkerLease::default();
@@ -6006,7 +6171,10 @@ async fn a_lease_refusal_on_the_input_stream_ends_control_with_the_hosts_words()
     let words = ended["control"]["ended"]
         .as_str()
         .expect("words of the end");
-    assert!(words.starts_with("Control ended"), "{words}");
+    assert_eq!(
+        words, "Control ended: another view took it, or the program changed how it reads keys.",
+        "the sentence for a lost lease"
+    );
     assert_eq!(
         code(
             &page
@@ -6160,18 +6328,21 @@ async fn a_refusal_that_states_what_was_accepted_moves_the_count_an_ending_names
 }
 
 /// The host's acceptance that the view has taken from its lane into its own queue and not served
-/// is counted by the close before the detach names the typing the host has. The view is held inside
-/// the state of a first update; the host accepts two of three frames and a second update reaches the
-/// session's channel; when the view is let on, one look takes the second update and then the
-/// acceptance, serves the update, and is held inside its state: the acceptance is in the view's
-/// queue, not the lane's, when the close is served. The host never reaches the barrier, so the
-/// detach names what the close counted: the two frames. The case gives the lane's reader `QUIET`
-/// to read the acceptance before the view is let on: a late reader leaves the acceptance in the
-/// lane's queue, where the close's second drain reads it, and the case still passes.
+/// is counted by the close before the detach names the typing the host has. The host's window is
+/// three frames and the view has taken four keys. The view is held inside the state of a first
+/// update; the host accepts two frames, which lets the lane write the fourth key, and the host
+/// reads it, so the lane has the acceptance; two more updates reach the session's channel, and the
+/// session's reader has read through the last of them, so the channel holds the second. When the
+/// view is let on, its one look takes the second update and then the acceptance into its own
+/// queue, serves the update and is held inside its state: the acceptance is in the view's queue,
+/// and in no other, when the close is served. The host never reaches the barrier, and the close's
+/// wait for it ends when the case ends it, so the detach names what the close counted: the two
+/// frames.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_close_names_the_acceptance_that_the_view_heard_and_had_not_served() {
-    let mut host = ScriptedHost::start(lane_window(8)).await;
-    let page = Page::over(&mut host);
+    let mut host = ScriptedHost::start(lane_window(3)).await;
+    let deadlines = BarrierDeadlines::new();
+    let page = Page::over_bounded(&mut host, &deadlines);
     let mut lease = WorkerLease::default();
     let (view, mut link) = paired_controlling(
         &page,
@@ -6181,7 +6352,7 @@ async fn the_close_names_the_acceptance_that_the_view_heard_and_had_not_served()
         &mut lease,
     )
     .await;
-    three_keys_the_host_has_read(&page, &view, &host).await;
+    keys_beyond_the_window(&page, &view, &host, &["a", "b", "c", "d"]).await;
     let first = page.states(3).len();
     let held = Held::new(&page.gate);
     link.push(
@@ -6194,16 +6365,34 @@ async fn the_close_names_the_acceptance_that_the_view_heard_and_had_not_served()
         page.state_within(3, first).await.is_some(),
         "the view did not reach the state of the first update within the bound"
     );
-    link.push(
-        PROJECTION_DELTA_EVENT,
-        &delta(1, 52, 64, 10, 2, 0, vec![row(1, "two")]),
-    )
-    .await;
+    // The lane has the acceptance: it writes the fourth key, which waited for room, and the host
+    // reads it.
     host.script.accept(1, 1);
+    host.script
+        .until_soon(
+            "the fourth key, written once the lane has the acceptance",
+            |seen| seen.frames.len() == 4,
+        )
+        .await;
+    // The session's reader has read through the third update, so it has handed the second on.
+    let written = tokio::time::timeout(STATE_BOUND, async {
+        link.push(
+            PROJECTION_DELTA_EVENT,
+            &delta(1, 52, 64, 10, 2, 0, vec![row(1, "two")]),
+        )
+        .await;
+        link.push(
+            PROJECTION_DELTA_EVENT,
+            &delta(1, 64, 76, 10, 2, 0, vec![row(1, "three")]),
+        )
+        .await;
+    })
+    .await;
     assert!(
-        link.call_within(QUIET).await.is_none(),
-        "nothing goes to the worker while the view is held"
+        written.is_ok(),
+        "the host could not write the updates within the bound: the session's reader stopped"
     );
+    page.reader_reaches(&view, link.next_sequence() - 1).await;
     held.let_pass(1);
     // The view took the second update ahead of the acceptance, and is inside the update's state.
     assert!(
@@ -6214,6 +6403,8 @@ async fn the_close_names_the_acceptance_that_the_view_heard_and_had_not_served()
         .state::<companion_tauri::terminal::TerminalViews>()
         .closer(&view)();
     drop(held);
+    barriers_taken(&page, &view, 1).await;
+    deadlines.expire_when_armed().await;
     assert!(
         page.held_within_the_close_bound().await,
         "the close ended the view within the bound"
@@ -6248,16 +6439,27 @@ fn detaches_written(host: &ScriptedHost) -> Vec<SessionDetachParams> {
 }
 
 /// The close's detach is written whole, once, naming what the host accepted, and that counts what the
-/// host accepts while the close waits for the rest.
+/// host accepts while the close waits for the rest. The host's window is three frames and the view
+/// has taken five keys: the lane writes the fourth once it has the first acceptance and the fifth
+/// once it has the second, which the host reads, so the case knows that the lane has each
+/// acceptance. The close's wait for its barrier ends when the case ends it, after the second
+/// acceptance reached the lane and not before.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_close_names_what_the_host_accepted_including_what_it_accepted_while_it_waited() {
-    let mut host = ScriptedHost::start(lane_window(8)).await;
-    let page = Page::over(&mut host);
+    let mut host = ScriptedHost::start(lane_window(3)).await;
+    let deadlines = BarrierDeadlines::new();
+    let page = Page::over_bounded(&mut host, &deadlines);
     let mut lease = WorkerLease::default();
     let (view, mut link) =
         paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
-    three_keys_the_host_has_read(&page, &view, &host).await;
+    keys_beyond_the_window(&page, &view, &host, &["a", "b", "c", "d", "e"]).await;
     host.script.accept(1, 0);
+    host.script
+        .until_soon(
+            "the fourth key, written once the lane has the first acceptance",
+            |seen| seen.frames.len() == 4,
+        )
+        .await;
     page.app
         .state::<companion_tauri::terminal::TerminalViews>()
         .closer(&view)();
@@ -6265,24 +6467,20 @@ async fn the_close_names_what_the_host_accepted_including_what_it_accepted_while
     // reaches the lane while the close waits for the barrier, and only that wait reads it.
     barriers_taken(&page, &view, 1).await;
     host.script.accept(1, 1);
+    host.script
+        .until_soon(
+            "the fifth key, written once the lane has the second acceptance",
+            |seen| seen.frames.len() == 5,
+        )
+        .await;
+    deadlines.expire_when_armed().await;
     assert!(
-        ended_within_the_close_bound(&page, &view).await,
+        page.held_within_the_close_bound().await,
         "the close ended the view within the bound"
     );
     // The view writes the detach and closes the connection at once, so the host may not read what
     // the connection took whole: the case reads it where the connection took it.
-    let detaches: Vec<SessionDetachParams> = host
-        .written()
-        .into_iter()
-        .filter_map(|frame| match frame {
-            kr_protocol::envelope::ControlFrame::Mutation(mutation)
-                if mutation.method.to_string() == Method::SessionDetach.to_string() =>
-            {
-                mutation.params.to_typed().ok()
-            }
-            _ => None,
-        })
-        .collect();
+    let detaches = detaches_written(&host);
     assert_eq!(detaches.len(), 1, "the detach is written once");
     let barrier = detaches[0]
         .after_input
@@ -6341,11 +6539,14 @@ async fn an_unreached_launch_is_not_sent_and_the_typing_behind_it_goes_in_order(
 }
 
 /// A launch asked while an earlier launch stands in the lane is not started, in the ruled words:
-/// nothing of it is sent, and the earlier launch is not disturbed.
+/// nothing of it is sent, and the earlier launch is not disturbed. The earlier launch's wait for its
+/// barrier ends when the case ends it, after the second launch was told, so that no stall of the
+/// machine can end the hold before the second launch asks.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_launch_behind_another_launch_is_not_started_and_says_so() {
     let mut host = ScriptedHost::start(lane_window(8)).await;
-    let page = Page::over(&mut host);
+    let deadlines = BarrierDeadlines::new();
+    let page = Page::over_bounded(&mut host, &deadlines);
     let mut lease = WorkerLease::default();
     let (view, mut link) =
         paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
@@ -6371,6 +6572,8 @@ async fn a_launch_behind_another_launch_is_not_started_and_says_so() {
         told["message"],
         "The launch was not started: an earlier launch or release of this view stands before it."
     );
+    // Only now does the first launch's barrier run out.
+    deadlines.expire_when_armed().await;
     let told = tokio::time::timeout(AFTER_BARRIER, first)
         .await
         .expect("the first launch was answered within the bound")

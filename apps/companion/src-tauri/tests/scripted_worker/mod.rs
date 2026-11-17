@@ -643,6 +643,12 @@ impl Link {
             .expect("the refusal is written");
     }
 
+    /// The sequence that the next event pushed on the output stream takes: every event before it
+    /// has been written.
+    pub fn next_sequence(&self) -> u64 {
+        self.sequence
+    }
+
     /// Pushes one event on the output stream, at the stream's next sequence.
     pub async fn push<T: serde::Serialize>(&mut self, event_type: &str, payload: &T) {
         let payload = ParamsValue::from_typed(payload).expect("a payload the protocol encodes");
