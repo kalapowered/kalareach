@@ -1055,7 +1055,7 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
         ));
         if asked_in_stop == 0 {
             failures.push(format!(
-                "stop {stop}: no question was asked from {SETTLE:?} after the switch to the resume, so the stop was not checked"
+                "stop {stop}: no question that was asked from {SETTLE:?} after the switch to the resume had ended, so the stop was not checked"
             ));
         }
         if answered_early != 0 {
