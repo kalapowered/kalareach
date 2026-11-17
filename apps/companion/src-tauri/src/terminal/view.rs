@@ -1919,11 +1919,11 @@ impl View {
                 self.lane = None;
                 // Whatever ended it, a view that holds the lease ends control: no key can be
                 // written under it any more, the keys of a new stream need a new epoch, and the
-                // lease's epoch is given back, except where the connection's end ended the lane: no
-                // release can reach the host then, and the host gives the lease back itself.
-                let changed = match cause {
-                    EndCause::Connection { .. } => self.lease.connection_ended(),
-                    _ => self.lease.stream_ended(),
+                // lease's epoch is given back, except where the connection is gone: no release can
+                // reach the host then, and the host gives the lease back itself.
+                let changed = match owes_at_the_lane_end(&cause, self.link.session()) {
+                    Owes::Nothing => self.lease.connection_ended(),
+                    Owes::Release => self.lease.stream_ended(),
                 };
                 if changed {
                     self.control_changed();
@@ -2515,14 +2515,50 @@ impl View {
     }
 }
 
+/// What the view owes the session for the lease it holds when its input lane ends.
+#[derive(Debug, PartialEq, Eq)]
+enum Owes {
+    /// The lease is given back: the session can still carry the release.
+    Release,
+    /// Nothing is given back: the connection is gone, and the host gives the lease back at its end.
+    Nothing,
+}
+
+/// What a lane's end by `cause` leaves the view owing over `session`. Nothing is owed only where the
+/// lane ended with its connection and the session cannot send or has its end; in every other case the
+/// lease is given back.
+///
+/// The session is read at once, as a call is admitted: its transport can write no frame, or the end of
+/// its connection is recorded. Both only ever change from standing to gone, so a session that reads
+/// as gone never carries a release later. A session that ends right after it read as standing only
+/// makes the release fail, which is how a release ends when the connection goes under it.
+fn owes_at_the_lane_end(cause: &EndCause, session: &Session) -> Owes {
+    if matches!(cause, EndCause::Connection { .. })
+        && (!session.transport().can_send() || session.closed().now_or_never().is_some())
+    {
+        Owes::Nothing
+    } else {
+        Owes::Release
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LaunchReadStage, Step, build_name, launch_read_step, not_opened};
+    use super::{
+        LaunchReadStage, Owes, Step, build_name, launch_read_step, not_opened, owes_at_the_lane_end,
+    };
     use crate::launch::LaunchSurfaceAnswer;
-    use kr_protocol::envelope::{Outcome, ParamsValue};
+    use kr_client::input::EndCause;
+    use kr_client::session::Session;
+    use kr_client::transport::{ControlTransport, DeviceEnd, StreamOpener, TransportFuture};
+    use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue};
     use kr_protocol::error::{ErrorCode, ProtocolError};
-    use kr_protocol::ids::BuildId;
-    use kr_protocol::scalars::Nullable;
+    use kr_protocol::hello::{ActionWindow, ReceiveLimits};
+    use kr_protocol::ids::{ActionWindowId, BootEpoch, BuildId, ConnectionId};
+    use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     /// A build identifier is said when it is a program's name and a release, and any other text a
     /// worker states is replaced rather than repeated.
@@ -2750,6 +2786,134 @@ mod tests {
             failure.lost && failure.reason.contains("could not be reached"),
             "{}",
             failure.reason
+        );
+    }
+
+    /// A connection that carries nothing: `sendable` says whether a frame can still be written, and
+    /// `end` ends its read as the peer's end does, with `sendable` as it was.
+    #[derive(Debug)]
+    struct Standing {
+        sendable: AtomicBool,
+        over: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl Standing {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                sendable: AtomicBool::new(true),
+                over: tokio::sync::watch::channel(false).0,
+            })
+        }
+
+        fn end(&self) {
+            self.over.send_replace(true);
+        }
+    }
+
+    impl ControlTransport for Standing {
+        fn connection_id(&self) -> ConnectionId {
+            ConnectionId::new(kr_ipc::new_uuid())
+        }
+
+        fn limits(&self) -> ReceiveLimits {
+            ReceiveLimits::default()
+        }
+
+        fn initial_action_window(&self) -> ActionWindow {
+            ActionWindow {
+                action_window_id: ActionWindowId::new("window-1").expect("a window"),
+                connection_id: self.connection_id(),
+                boot_epoch: BootEpoch::new(1),
+                issued_at_ms: TimestampMs::new(0),
+                valid_for_ms: DurationMs::new(60_000),
+            }
+        }
+
+        fn ended_by_this_device(&self) -> Option<DeviceEnd> {
+            None
+        }
+
+        fn send<'a>(&'a self, _frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn claim_receiver(&self) -> kr_client::Result<()> {
+            Ok(())
+        }
+
+        fn stream_opener(&self) -> Option<Arc<dyn StreamOpener>> {
+            None
+        }
+
+        fn recv(&self) -> TransportFuture<'_, Option<ControlFrame>> {
+            Box::pin(async move {
+                let mut over = self.over.subscribe();
+                let _ = over.wait_for(|over| *over).await;
+                Ok(None)
+            })
+        }
+
+        fn revoke_streams(&self) {}
+
+        fn close(&self) {}
+
+        fn is_closed(&self) -> bool {
+            false
+        }
+
+        fn can_send(&self) -> bool {
+            self.sendable.load(Ordering::Acquire)
+        }
+    }
+
+    /// A lane's end leaves the view owing nothing only where the lane ended with its connection and
+    /// the session cannot send or has its end; in every other case, and over a session that stands,
+    /// the lease is given back.
+    #[tokio::test]
+    async fn a_lane_end_leaves_nothing_owed_only_where_the_connection_is_gone() {
+        let connection = || EndCause::Connection { refusal: None };
+        let transport = Standing::new();
+        let standing = Session::start(Arc::clone(&transport) as Arc<dyn ControlTransport>)
+            .expect("a session over a standing connection");
+        assert_eq!(
+            owes_at_the_lane_end(&connection(), &standing),
+            Owes::Release,
+            "a session that stands carries the release"
+        );
+        assert_eq!(
+            owes_at_the_lane_end(&EndCause::Reset, &standing),
+            Owes::Release,
+            "a reset of the stream gives the lease back over a session that stands"
+        );
+        // The transport can write no frame, and the session has recorded no end.
+        transport.sendable.store(false, Ordering::Release);
+        assert_eq!(
+            owes_at_the_lane_end(&connection(), &standing),
+            Owes::Nothing,
+            "a session that cannot send carries no release"
+        );
+        assert_eq!(
+            owes_at_the_lane_end(&EndCause::Reset, &standing),
+            Owes::Release,
+            "a reset of the stream gives the lease back whatever the session can do"
+        );
+        // The connection's end is recorded, and the transport still says it can send.
+        let ended = Standing::new();
+        let gone = Session::start(Arc::clone(&ended) as Arc<dyn ControlTransport>)
+            .expect("a session over a connection that will end");
+        ended.end();
+        tokio::time::timeout(Duration::from_secs(10), gone.closed())
+            .await
+            .expect("the session recorded the end of its connection within the bound");
+        assert_eq!(
+            owes_at_the_lane_end(&connection(), &gone),
+            Owes::Nothing,
+            "a session that has its end carries no release"
+        );
+        assert_eq!(
+            owes_at_the_lane_end(&EndCause::Reset, &gone),
+            Owes::Release,
+            "a reset of the stream gives the lease back whatever the session has recorded"
         );
     }
 }
