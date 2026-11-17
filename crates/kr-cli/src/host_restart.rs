@@ -456,7 +456,16 @@ async fn restart_the_daemon(
                 knows: Knows::Refused,
                 ..begun.none.clone()
             };
-            return host_stop::refused(&mut client, id, &info, error, &refusal, json).await;
+            return host_stop::refused(
+                &mut client,
+                Which::Restart,
+                id,
+                &info,
+                error,
+                &refusal,
+                json,
+            )
+            .await;
         }
         // A daemon that cannot say how it was started, or whose answer was cut or withheld, gives
         // no launch to compare: the restart goes on, since a start that fails after the stop says

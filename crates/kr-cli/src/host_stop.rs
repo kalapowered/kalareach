@@ -1590,7 +1590,7 @@ pub(crate) async fn ask_and_wait(
                 ..none.clone()
             };
             return Err(Cut::Said(
-                refused(&mut client, id, info, error, &refusal, json).await,
+                refused(&mut client, which, id, info, error, &refusal, json).await,
             ));
         }
     };
@@ -2170,6 +2170,7 @@ fn is_the_daemons_own_refusal(
 /// daemon's own and is shown as it is, the lapse of a lease included.
 pub(crate) async fn refused(
     client: &mut LocalClient,
+    which: Which,
     id: EnvironmentId,
     info: &HostInfoResult,
     error: ProtocolError,
@@ -2181,7 +2182,7 @@ pub(crate) async fn refused(
         info.build_id.as_str(),
         error.code,
     ) {
-        return failed(CliError::Refused(error), none, json);
+        return failed(refusal_said(which, error), none, json);
     }
     let probe = tokio::time::timeout(
         startup::ANSWER_BOUND,
@@ -2190,12 +2191,26 @@ pub(crate) async fn refused(
     .await
     .ok()
     .map(|read| read.map(|answer| answer.map(|_| ())));
-    failed(after_the_probe(id, error, probe), none, json)
+    failed(after_the_probe(which, id, error, probe), none, json)
+}
+
+/// The daemon's own refusal as the command says it: the stop gives the daemon's words as they
+/// are, and the restart adds that nothing was stopped, since a refusal that is definite means that
+/// the daemon did not take the request.
+fn refusal_said(which: Which, refusal: ProtocolError) -> CliError {
+    match which {
+        Which::Stop => CliError::Refused(refusal),
+        Which::Restart => CliError::refused_in_its_own_words(
+            refusal.code,
+            shown!("{}. Nothing was stopped.", Shown::protocol(&refusal)),
+        ),
+    }
 }
 
 /// What the probe's answer makes of a refusal that may be the daemon's own. `None` is a probe
 /// that was not answered in its bound.
 fn after_the_probe(
+    which: Which,
     id: EnvironmentId,
     refusal: ProtocolError,
     probe: Option<std::result::Result<std::result::Result<(), ProtocolError>, kr_ipc::IpcError>>,
@@ -2223,8 +2238,8 @@ fn after_the_probe(
                 ),
             )
         }
-        Some(Ok(Err(other))) => CliError::Refused(other),
-        Some(Err(_)) | None => CliError::Refused(refusal),
+        Some(Ok(Err(other))) => refusal_said(which, other),
+        Some(Err(_)) | None => refusal_said(which, refusal),
     }
 }
 
@@ -3856,7 +3871,7 @@ mod tests {
         let (_temp, environment) = an_environment_for_the_whole_texts();
         let id = environment.environment_id;
         let refusal = ProtocolError::new(ErrorCode::PermissionDenied, "refused for the case");
-        let failure = after_the_probe(id, refusal, Some(Ok(Ok(()))));
+        let failure = after_the_probe(Which::Restart, id, refusal, Some(Ok(Ok(()))));
         assert_eq!(failure.exit_code(), 1);
         assert_eq!(
             failure.said().to_string(),
@@ -3874,7 +3889,7 @@ mod tests {
         let id = environment.environment_id;
         let refusal = ProtocolError::new(ErrorCode::PermissionDenied, "refused for the case");
         let probe = ProtocolError::new(ErrorCode::PermissionDenied, "the check was refused");
-        let failure = after_the_probe(id, refusal, Some(Ok(Err(probe.clone()))));
+        let failure = after_the_probe(Which::Restart, id, refusal, Some(Ok(Err(probe.clone()))));
         assert_eq!(failure.exit_code(), 8);
         assert_eq!(
             failure.said().to_string(),
@@ -3886,14 +3901,15 @@ mod tests {
     }
 
     /// The restart's sentence for a stop request that is refused in the daemon's own words, and
-    /// for one whose check cannot be read: the refusal, as the daemon gave it.
+    /// for one whose check cannot be read or is refused in other words: the refusal as the daemon
+    /// gave it, and that nothing was stopped, with the refusal's code and exit 8; the stop's
+    /// own sentence for the same refusal is the daemon's words alone.
     #[test]
-    fn the_restart_says_in_its_own_words_what_the_daemon_refused() {
+    fn the_restart_says_in_its_own_words_what_the_daemon_refused_and_that_nothing_was_stopped() {
         use kr_client::shown::Said as _;
         let (_temp, environment) = an_environment_for_the_whole_texts();
         let id = environment.environment_id;
         let refusal = ProtocolError::new(ErrorCode::PermissionDenied, "refused for the case");
-        let own = CliError::Refused(refusal.clone());
         for probe in [
             None,
             Some(Err(kr_ipc::IpcError::socket(
@@ -3901,25 +3917,37 @@ mod tests {
                 std::io::Error::from(std::io::ErrorKind::BrokenPipe),
             ))),
         ] {
-            let failure = after_the_probe(id, refusal.clone(), probe);
-            assert_eq!(failure.exit_code(), own.exit_code());
-            assert_eq!(failure.said().to_string(), own.said().to_string());
-            assert!(
-                failure.said().to_string().contains("refused for the case"),
-                "{}",
-                failure.said()
+            let failure = after_the_probe(Which::Restart, id, refusal.clone(), probe);
+            assert_eq!(failure.exit_code(), 8);
+            assert_eq!(
+                failure.said().to_string(),
+                format!("{}. Nothing was stopped.", Shown::protocol(&refusal))
+            );
+            assert_eq!(
+                failure.machine_message().to_string(),
+                format!(
+                    "PERMISSION_DENIED: {}. Nothing was stopped.",
+                    Shown::protocol(&refusal)
+                )
             );
         }
         let other = ProtocolError::new(ErrorCode::EnvironmentUnavailable, "the check says why");
-        let failure = after_the_probe(id, refusal, Some(Ok(Err(other.clone()))));
-        assert_eq!(
-            failure.exit_code(),
-            CliError::Refused(other.clone()).exit_code()
+        let failure = after_the_probe(
+            Which::Restart,
+            id,
+            refusal.clone(),
+            Some(Ok(Err(other.clone()))),
         );
-        assert!(
-            failure.said().to_string().contains("the check says why"),
-            "{}",
-            failure.said()
+        assert_eq!(failure.exit_code(), 8);
+        assert_eq!(
+            failure.said().to_string(),
+            format!("{}. Nothing was stopped.", Shown::protocol(&other))
+        );
+        let stop = after_the_probe(Which::Stop, id, refusal.clone(), None);
+        assert_eq!(
+            stop.said().to_string(),
+            CliError::Refused(refusal).said().to_string(),
+            "the stop says the daemon's words alone"
         );
     }
 
@@ -5887,7 +5915,7 @@ mod tests {
             ))),
             Some(Err(a_fault_of_the_socket())),
         ] {
-            match after_the_probe(id, a_refusal(), probe) {
+            match after_the_probe(Which::Stop, id, a_refusal(), probe) {
                 CliError::Refused(refusal) => {
                     assert_eq!(refusal.code, ErrorCode::PermissionDenied);
                 }
@@ -5895,18 +5923,19 @@ mod tests {
             }
         }
         let withheld = ProtocolError::new(ErrorCode::PermissionDenied, "the check is refused too");
-        let said = after_the_probe(id, a_refusal(), Some(Ok(Err(withheld)))).to_string();
+        let said =
+            after_the_probe(Which::Stop, id, a_refusal(), Some(Ok(Err(withheld)))).to_string();
         assert!(
             said.contains("takes no stop request or refuses it")
                 && said.contains("Nothing was stopped"),
             "the check's own refusal is shown in this command's words: {said}"
         );
         let another = ProtocolError::new(ErrorCode::ResourceUnavailable, "the daemon is busy");
-        match after_the_probe(id, a_refusal(), Some(Ok(Err(another)))) {
+        match after_the_probe(Which::Stop, id, a_refusal(), Some(Ok(Err(another)))) {
             CliError::Refused(refusal) => assert_eq!(refusal.code, ErrorCode::ResourceUnavailable),
             other => panic!("another refusal of the probe is shown as it is, not {other}"),
         }
-        match after_the_probe(id, a_refusal(), Some(Ok(Ok(())))) {
+        match after_the_probe(Which::Stop, id, a_refusal(), Some(Ok(Ok(())))) {
             CliError::Unfinished { message, .. } => {
                 assert!(message.to_string().contains("takes no stop request"));
             }
