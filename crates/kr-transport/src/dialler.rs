@@ -368,7 +368,7 @@ impl DeviceEndpoint {
     /// Starts the task that sets the relay map equal to the table, and waits for it.
     ///
     /// The map is changed by a task that no caller's drop reaches: the library changes its map at
-    /// once and then awaits a send to its relay actor, so a caller that stopped after its first
+    /// once and then awaits a send to its socket actor, so a caller that stopped after its first
     /// poll would leave the map changed and the actor not told.
     async fn set_the_map(&self) -> Result<()> {
         tokio::spawn(set_map_to_table(
@@ -502,9 +502,9 @@ pub struct ReconcileHold {
     ended: tokio::sync::oneshot::Receiver<()>,
 }
 
-/// How long a wait on a hold may take before it is a failure. The held task has the shared lock and
-/// one change of the map to make, on this machine, so this is a bound on a fault and not a time
-/// that anything is expected to take.
+/// How long a wait on a hold may take before it is a failure. The held task stops before it takes
+/// its turn; once released it takes the shared lock and has one change of the map to make, on this
+/// machine, so this is a bound on a fault and not a time that anything is expected to take.
 #[cfg(feature = "testing")]
 const HOLD_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -615,6 +615,65 @@ mod tests {
         assert_eq!(paired.pkarr_resolver, invited.pkarr_resolver);
         assert_eq!(paired.dns_origin, invited.dns_origin);
         assert_eq!(paired.identity(), invited.identity());
+    }
+
+    /// KR-REQ-10.02: the tasks that set the relay map take turns. A task that finds the turn held
+    /// changes nothing while it is held and sets the map to the table when it is free, so two tasks
+    /// never interleave their changes of the map.
+    ///
+    /// The table holds a host that names a relay and the map lacks it, as a call of `introduce`
+    /// leaves them. The turn is held here, the task is polled once and must not end or change the
+    /// map, and when the turn is released the task puts the relay in. The relay's address is on the
+    /// loopback, so nothing outside the machine is reached.
+    #[tokio::test]
+    async fn a_task_that_finds_the_turn_held_changes_the_map_only_once_it_is_free() {
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let device = DeviceEndpoint::bind(
+            &EndpointConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("an address")),
+                ..EndpointConfig::default()
+            },
+            &identity,
+        )
+        .await
+        .expect("the device's endpoint");
+        let relay: RelayUrl = "https://127.0.0.1:9".parse().expect("a relay URL");
+        let services = HostServices::paired(
+            &EndpointConfig {
+                relay_urls: vec![relay.clone()],
+                ..EndpointConfig::default()
+            },
+            &key(),
+        )
+        .expect("a paired host");
+        device.shared.table().hosts.insert(
+            services.identity,
+            Host {
+                services,
+                lookups: Vec::new(),
+            },
+        );
+
+        let turn = device.shared.turn.lock().await;
+        let task = set_map_to_table(
+            Arc::clone(&device.shared),
+            device.endpoint.clone(),
+            device.relay_map.clone(),
+        );
+        tokio::pin!(task);
+        tokio::select! {
+            biased;
+            () = &mut task => panic!("the task ended while the turn was held"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(
+            device.relay_urls().is_empty(),
+            "the task changed the map while the turn was held"
+        );
+        drop(turn);
+        task.await;
+        assert_eq!(device.relay_urls(), BTreeSet::from([relay]));
+        device.close().await;
     }
 
     /// KR-REQ-10.02: the device's endpoint takes its relays and lookups from hosts alone, so a
