@@ -3977,7 +3977,8 @@ struct PasteLeftOpen {
     clock: kr_ipc::clock::ManualSharedClock,
     id: AttachmentId,
     epoch: u64,
-    /// The runtime directory, declared last so that it is removed after the files in it are closed.
+    /// Declared last: fields drop in declaration order, so the directory is removed after the
+    /// fields above it.
     _host: kr_ipc::testing::TempHost,
 }
 

@@ -333,8 +333,8 @@ struct Rig {
     proxy_connection: ConnectionId,
     grant: GrantId,
     device: DeviceId,
-    /// The last two fields, so that the runtime and the service, whose application keeps files in
-    /// them, are dropped before the directories are removed.
+    /// Declared last: fields drop in declaration order, so the directories are removed after the
+    /// fields above them.
     _kept: tempfile::TempDir,
     _temp: kr_ipc::testing::TempHost,
 }

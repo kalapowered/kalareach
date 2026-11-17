@@ -81,8 +81,8 @@ pub struct ScriptedLane {
     shared: Arc<Shared>,
     commands: mpsc::UnboundedSender<Command>,
     task: tokio::task::JoinHandle<()>,
-    /// The directory the endpoint lives in, declared last so that it is removed after the files in
-    /// it are closed.
+    /// Declared last: fields drop in declaration order, so the directory is removed after the
+    /// fields above it.
     _dir: PrivateTempDir,
 }
 
