@@ -17,12 +17,24 @@
 //!   call to a name that no function of this crate declares (the standard library and other
 //!   crates);
 //! * what a guard is, beyond the names it knows: a `let` that calls `session` (SES), a `let` that
-//!   locks the service's `dispatch` or calls `try_boundary` (BAR), and a parameter of the
-//!   session's type (SES). `let Some(x) =` and `let Ok(x) =` bind `x`, with the initialiser after
-//!   the pattern, and a binding `_` holds nothing. It does not know a guard that any other
-//!   function returns, a pattern of another shape (`Some((x, y))`, a struct), or a guard that an
-//!   `if let`, a `while let` or a `match` arm binds for its own block (a `let` statement is
-//!   read, and the guard lives to the end of the block that holds it);
+//!   locks the service's `dispatch` (BAR), and a parameter whose type names `Session` (SES, held
+//!   or not: a `supplies` row tells two calls apart). `let Some(x) =` and `let Ok(x) =` bind `x`,
+//!   with the initialiser after the pattern, and a binding `_` holds nothing. A `let` that `if`,
+//!   `while` or `&&` precedes binds for its condition's block and is not read. The take of the
+//!   barrier by `try_boundary` is read from ONE form: `let Some(x) = self.try_boundary() else
+//!   { .. };` with one name `x` (or `mut x`). Any other `let` that calls `try_boundary` holds
+//!   nothing (a mapped, tested or discarded result, a closure, a plain binding of the option, a
+//!   path pattern such as `Option::Some(x)`), so a row that needs `BAR` fails there. That guard
+//!   is only held: any later mention of its name ends it, a `drop` of any spelling, a move or a
+//!   use. A row that says `none` or `SES` holds only against the guards that are known: a guard
+//!   that any other function returns, a pattern of another shape (`Some((x, y))`, a struct) and a
+//!   `match` arm's binding are not known;
+//! * where a call runs: a call is read where it is written, so a body written as a closure under
+//!   a guard and run after the guard's drop (`let body = || { .. call .. }; drop(guard);
+//!   run(body)`) reads as held; a call through a function value (`let f = Self::callee;
+//!   f(self)`) is not a call of the name. A `caller` row reads only the file that it names and an
+//!   `only` row every file of the crate; `try_boundary` and `session` are known by name and their
+//!   bodies are not read;
 //! * the body of an `allow`ed name;
 //! * the body of a callee that a counted name reaches. A counted call is counted and not followed,
 //!   so a second take or write inside `Broker::state`, `Questions::locked`, `lock_session` or
@@ -1094,24 +1106,68 @@ fn depths(text: &[char]) -> Vec<i32> {
 
 /// The domain a guard belongs to, from the text that makes it: a function's parameter of the
 /// session's type, or a `let` whose initialiser calls `session`, holds the session (SES); a `let`
-/// whose initialiser locks the service's `dispatch` or calls `try_boundary` (which returns the
-/// guard of that lock, or none) holds the dispatch barrier (BAR).
+/// whose initialiser locks the service's `dispatch` holds the dispatch barrier (BAR). The take of
+/// the barrier by `try_boundary` is not read here: `takes_the_barrier` reads its one form.
 fn domain_of(made: &[char], parameter: bool) -> Option<&'static str> {
     let words = idents(made);
     let names: Vec<&str> = words.iter().map(|(_, name)| name.as_str()).collect();
     if parameter {
         return names.contains(&"Session").then_some("SES");
     }
-    let called = calls(made);
-    if called.iter().any(|(_, name)| name == "session") {
+    if calls(made).iter().any(|(_, name)| name == "session") {
         Some("SES")
-    } else if called.iter().any(|(_, name)| name == "try_boundary")
-        || (names.contains(&"dispatch") && names.contains(&"lock"))
-    {
+    } else if names.contains(&"dispatch") && names.contains(&"lock") {
         Some("BAR")
     } else {
         None
     }
+}
+
+/// Whether a `let` takes the dispatch barrier in the one form that is read: the pattern is
+/// `Some(x)`, or `Some(mut x)`, with one name, and the initialiser is the direct call
+/// `self.try_boundary()` followed by `else`. `pattern` is the text inside the parentheses and
+/// `initialiser` the text after the pattern's closing parenthesis, up to the end of the statement.
+/// Any other `let` that calls `try_boundary` holds nothing.
+fn takes_the_barrier(pattern: &[char], initialiser: &[char]) -> bool {
+    let pattern: String = pattern.iter().collect();
+    let pattern = pattern.trim();
+    let name = match pattern.strip_prefix("mut") {
+        Some(rest) if rest.starts_with(char::is_whitespace) => rest.trim_start(),
+        _ => pattern,
+    };
+    let initialiser: String = outside_braces(initialiser)
+        .into_iter()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    !name.is_empty() && name.chars().all(is_ident) && initialiser == "=self.try_boundary()else"
+}
+
+/// Whether the `let` at `start` follows `if`, `while` or `&&`: it binds for the block of its
+/// condition, and the reader does not follow that block, so the `let` is not read.
+fn in_a_condition(
+    text: &[char],
+    words: &[(usize, String)],
+    index: usize,
+    start: usize,
+    base: usize,
+) -> bool {
+    let mut before = start;
+    while before > 0 && text[before - 1].is_whitespace() {
+        before -= 1;
+    }
+    if before >= 2 && text[before - 1] == '&' && text[before - 2] == '&' {
+        return true;
+    }
+    index > 0 && {
+        let (word_at, word) = &words[index - 1];
+        matches!(word.as_str(), "if" | "while") && base + word_at + word.len() == before
+    }
+}
+
+/// Whether `name` is mentioned between the end of its statement and the call at `at`: a guard of
+/// the barrier is only held, so a `drop`, a move or any other use ends it.
+fn mentioned(text: &[char], from: usize, at: usize, name: &str) -> bool {
+    idents(&text[from..at]).iter().any(|(_, word)| word == name)
 }
 
 /// Whether `drop(name)` stands in `text[from..to]`.
@@ -1195,7 +1251,9 @@ fn closing(text: &[char], open: usize, limit: usize) -> Option<usize> {
 /// The domains of the guards that are live where `at` stands in the function `span`: the
 /// parameters of the session's type and the `let` bindings before `at` whose block is still open
 /// and that no `drop` ended. `let Some(x) =` and `let Ok(x) =` bind `x`, and the initialiser is
-/// the text after the pattern; a binding `_` holds nothing.
+/// the text after the pattern; a binding `_` holds nothing. A `let` that `if`, `while` or `&&`
+/// precedes is not read. The barrier is held only by the one form of `takes_the_barrier`, and
+/// any later mention of its name ends it.
 fn live_guards(text: &[char], open_braces: &[i32], span: &Span, at: usize) -> BTreeSet<String> {
     let mut live = BTreeSet::new();
     for parameter in parameters(&text[span.at..span.open]) {
@@ -1215,6 +1273,9 @@ fn live_guards(text: &[char], open_braces: &[i32], span: &Span, at: usize) -> BT
             continue;
         }
         let start = span.open + word_at;
+        if in_a_condition(text, &words, index, start, span.open) {
+            continue;
+        }
         let mut next = index + 1;
         if words.get(next).is_some_and(|(_, word)| word == "mut") {
             next += 1;
@@ -1226,6 +1287,7 @@ fn live_guards(text: &[char], open_braces: &[i32], span: &Span, at: usize) -> BT
         // Where the initialiser starts: after the name, or after the pattern of `Some(name)` and
         // `Ok(name)`, which bind the name inside the parentheses.
         let mut initialiser = span.open + name_at + name.len();
+        let mut pattern = None;
         if matches!(name, "Some" | "Ok")
             && let Some(open) = text[initialiser..at]
                 .iter()
@@ -1251,6 +1313,9 @@ fn live_guards(text: &[char], open_braces: &[i32], span: &Span, at: usize) -> BT
             }
             name = inner_name.as_str();
             initialiser = close + 1;
+            if words[index + 1].1 == "Some" && next == index + 1 {
+                pattern = Some((open + 1, close));
+            }
         }
         // A binding `_` drops its value at once.
         if name == "_" {
@@ -1273,8 +1338,16 @@ fn live_guards(text: &[char], open_braces: &[i32], span: &Span, at: usize) -> BT
         let still_open = open_braces[start + 1..=at]
             .iter()
             .all(|depth| *depth >= open_braces[start]);
-        if still_open
-            && let Some(domain) = domain_of(&outside_braces(&text[initialiser..end]), false)
+        if !still_open {
+            continue;
+        }
+        let barrier = pattern
+            .is_some_and(|(from, to)| takes_the_barrier(&text[from..to], &text[initialiser..end]));
+        if barrier {
+            if !mentioned(text, end, at, name) {
+                live.insert("BAR".to_owned());
+            }
+        } else if let Some(domain) = domain_of(&outside_braces(&text[initialiser..end]), false)
             && !dropped(text, end, at, name)
         {
             live.insert(domain.to_owned());
