@@ -2366,9 +2366,9 @@ impl WorkerService {
         self.delivery_end_stall.arm()
     }
 
-    /// How many statements of what the local owner may do are waiting to be answered now, for this
-    /// host's own tests: each has changed the gate and waits for the hold in place, or for a
-    /// withdrawal.
+    /// How many answers to a statement of what the local owner may do, and how many withdrawals of
+    /// a connection that its writer asked for, are waiting now, for this host's own tests: each
+    /// waits for the hold in place, or for a withdrawal.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn statements_waiting_for_tests(&self) -> usize {
@@ -5881,6 +5881,8 @@ impl WorkerService {
     /// withdrawal that ran now would not see it. It holds no lock while it waits.
     async fn withdraw_after_the_hold(&self, connection_id: ConnectionId) {
         let after = self.dispatch.releases();
+        #[cfg(feature = "testing")]
+        let _waiting = WaitingCount::begin(&self.statements_waiting);
         self.wait_for_the_hold(after).await;
         off_the_executor(|| self.withdraw(connection_id));
     }
