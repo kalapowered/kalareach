@@ -2063,6 +2063,61 @@ fn a_grant_that_ran_out_before_the_commit_is_marked_once_and_its_endpoint_identi
     assert_eq!(live_rows_of(&path, &harness), 1);
 }
 
+/// KR-REQ-10.08: a record whose grant ran out before this boot ever read it is marked as run out
+/// by the commit, before its transaction begins, and the endpoint identity is then free. Nothing
+/// read the record since the host started, so nothing anchored its grant in this boot; the end is
+/// found by the commit's own read of the paired rows and written through the lifetimes' own path,
+/// once. The commit succeeds, and whoever waits on the end is told once.
+#[test]
+fn a_grant_that_ran_out_before_anything_read_it_is_marked_by_the_commit_and_its_endpoint_identity_is_free()
+ {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let clock = ManualClock::new();
+    let (directory, rows) = open_with(&path, &clock);
+    let harness = Harness::new(rows.clone());
+    let listed = expiring_squatter(&harness, kr_ipc::now_ms().get().saturating_sub(60_000));
+    directory
+        .commit(&listed)
+        .expect("the host lists the device");
+    let told = Arc::new(Mutex::new(Vec::new()));
+    rows.lifetimes().pending_expiry().on_recorded({
+        let told = Arc::clone(&told);
+        move |device_id| told.lock().expect("the list").push(device_id)
+    });
+    let record = directory
+        .record_for_device(listed.device_id)
+        .expect("readable")
+        .expect("the listed record");
+    assert!(
+        record.expired_at_ms.is_none() && record.revoked_at_ms.is_none(),
+        "nothing has marked the record: {record:?}"
+    );
+
+    let mut host = harness.issue();
+    bind(&harness, &mut host);
+    approve_as(
+        &harness,
+        &mut host,
+        Answered::ByTheOwnerDevice,
+        &harness.identities_of(18, 19),
+    )
+    .expect("the grant ran out, so the endpoint identity takes a new record");
+    assert!(
+        directory
+            .record_for_device(listed.device_id)
+            .expect("readable")
+            .is_some_and(|old| old.expired_at_ms.is_some()),
+        "the end of the grant is on record"
+    );
+    assert_eq!(
+        *told.lock().expect("the list"),
+        vec![listed.device_id],
+        "whoever waits on the end was told once"
+    );
+    assert_eq!(live_rows_of(&path, &harness), 1);
+}
+
 /// KR-REQ-10.08: a record that this host cannot prove has ended counts as live. With this boot's
 /// clock continuity lost, a record whose grant is past its end is not marked, the commit is refused
 /// before its confirmation is spent, and nothing about the record is written. A revocation reads no

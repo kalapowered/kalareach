@@ -183,11 +183,16 @@ async fn assert_the_device_is_paired_again(
     );
     let session = within("the connection", BOUND, connect(host, device, second)).await;
     within("the host counting the connection", BOUND, async {
-        while host.connections_of(second) != 1 {
+        while host.connections_of(first) + host.connections_of(second) != 1 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await;
+    assert_eq!(
+        host.connections_of(second),
+        1,
+        "the connection counts under the new identifier"
+    );
     assert_eq!(host.connections_of(first), 0);
     session.close();
 }
@@ -1005,11 +1010,12 @@ async fn is_served(session: &kr_client::session::Session) -> bool {
 }
 
 /// KR-REQ-10.08: a connection is the record it was admitted under for its whole life. One device
-/// has its grant run out while its connection stays open, and one has its record revoked while
-/// its connection is open; both pair again. The expired device's old connection stays open and
-/// is refused every request, because its checks read the old record by its identifier and never
-/// the new one; the revoked device's old connection is ended by the barrier. The new connections
-/// are served and count toward the new identifiers from zero.
+/// has its grant run out while its connection is open, and one has its record revoked while its
+/// connection is open; both pair again. The host ends each old connection and drops it from the
+/// table it counts connections in when its record ends, before any new record exists, so nothing
+/// of it can count toward the new identifier or be read under the new record: a request on either
+/// old connection after the second pairing is served nothing. The new connections are served and
+/// count toward the new identifiers from zero, each under its own identifier.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_record() {
     let (moved, clocks) = Moved::new();
@@ -1027,11 +1033,18 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
         is_served(&old_ran_out).await,
         "served while its grant stands"
     );
+    assert_eq!(host.connections_of(&first_ran_out), 1);
     moved.past_the_grant();
     let path = host.registry_database();
     let device_id = first_ran_out.device_id;
     until("the end of the grant being on record", move || {
         expired(&path, device_id)
+    })
+    .await;
+    within("the host dropping the connection", BOUND, async {
+        while host.connections_of(&first_ran_out) != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     })
     .await;
 
@@ -1044,6 +1057,7 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
     )
     .await;
     assert!(is_served(&old_revoked).await, "served while it stands");
+    assert_eq!(host.connections_of(&first_revoked), 1);
     let barrier = within(
         "the revocation",
         BOUND,
@@ -1052,6 +1066,11 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
     .await
     .expect("the device is revoked");
     assert!(barrier.holds(), "{barrier:?}");
+    assert_eq!(
+        host.connections_of(&first_revoked),
+        0,
+        "the revoked record's connection was dropped when its record ended"
+    );
 
     let second_ran_out = within(
         "the second pairing",
@@ -1068,28 +1087,35 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
 
     assert!(
         !is_served(&old_ran_out).await,
-        "the connection of the record that ran out is refused every request"
+        "the connection of the record that ran out is served nothing"
     );
     assert!(
         !is_served(&old_revoked).await,
-        "the connection of the revoked record was ended"
+        "the connection of the revoked record is served nothing"
     );
+    let mut sessions = Vec::new();
     for (device, second) in [(&ran_out, &second_ran_out), (&revoked, &second_revoked)] {
         let session = within("the connection", BOUND, connect(&host, device, second)).await;
         assert!(is_served(&session).await, "the new connection is served");
-        within("the host counting the connection", BOUND, async {
-            while host.connections_of(second) != 1 {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
+        sessions.push(session);
+    }
+    within("the host counting the connections", BOUND, async {
+        while host.connections_of(&second_ran_out) + host.connections_of(&second_revoked) != 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert_eq!(host.connections_of(&second_ran_out), 1);
+    assert_eq!(host.connections_of(&second_revoked), 1);
+    for record in [&first_ran_out, &first_revoked] {
+        assert_eq!(
+            host.connections_of(record),
+            0,
+            "nothing counts under the old identifier"
+        );
+    }
+    for session in sessions {
         session.close();
     }
-    assert_eq!(
-        host.connections_of(&first_revoked),
-        0,
-        "nothing is counted for the revoked record"
-    );
-    old_ran_out.close();
     host.stop().await;
 }
