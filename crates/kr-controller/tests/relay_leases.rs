@@ -5535,3 +5535,151 @@ async fn a_device_that_is_refused_free_capacity_is_handed_its_own_wait() {
     assert!((1..=90).contains(&wait), "{wait}");
     assert_eq!(told_paths(&failure), STAND_IN_PATHS);
 }
+
+/// The endpoint identity a device connects as, in the form the service's request bodies carry it.
+fn destination_of(device: &Device) -> serde_json::Value {
+    serde_json::to_value(*device.keys().transport.public()).expect("an endpoint")
+}
+
+/// KR-REQ-17.51: a device whose record was revoked pairs again once the keeper has ended the
+/// first lease of the pair for the revoked record. The service ends the first lease as it did
+/// for an unpaired device, the ending is asked once, and the new record is given a lease of its
+/// own, which the ending of the first does not touch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_paired_again_after_its_lease_ended_is_given_a_new_lease() {
+    let rig = Rig::start().await;
+    let (phone, first) = rig.pairs().await;
+    rig.until("the paired device holds a lease", || rig.holds(&first))
+        .await;
+    let lease = rig.live_lease_for(&first).expect("a lease");
+    rig.host
+        .network()
+        .revoke_device(first.device_id)
+        .await
+        .expect("the device is revoked");
+    rig.until("the service has ended the lease", || {
+        rig.live_lease_for(&first).is_none() && rig.endings_owed() == 0
+    })
+    .await;
+
+    let second = pair_with(
+        &rig.host,
+        &phone,
+        &rig.owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    rig.until("the new record holds a lease", || rig.holds(&second))
+        .await;
+    let leases = rig.leases_for(&second);
+    assert_eq!(leases.len(), 2, "the ended lease and the new one");
+    assert_eq!(leases[0].lease_id, lease.lease_id);
+    assert_eq!(leases[0].ended_for, Some("unpaired"));
+    let current = rig.live_lease_for(&second).expect("a new lease");
+    assert_ne!(current.lease_id, lease.lease_id);
+    assert_eq!(rig.revocations_of(&lease.lease_id), 1);
+    assert_eq!(rig.revocations_of(&current.lease_id), 0);
+}
+
+/// KR-REQ-17.51: a lease belongs to the pair of endpoints and its payer, not to a pairing's
+/// record. While the keeper is inside a pass, held by the service on another pair's request, the
+/// device's record is revoked and the device pairs again. The pass that follows keeps the lease
+/// the pair holds and sends no ending for it, and the next refill names that lease, so the service
+/// raises its reservation and opens no second one. A request carries neither a device identifier
+/// nor a grant. (A revocation that no replacement follows ends the lease as unpaired, which
+/// `an_unpaired_device_has_its_lease_ended` shows.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_lease_continues_across_a_replacement_of_its_pairing_record() {
+    let rig = Rig::start().await;
+    let (phone, first) = rig.pairs().await;
+    rig.until("the paired device holds a lease", || rig.holds(&first))
+        .await;
+    let lease = rig.live_lease_for(&first).expect("a lease");
+
+    // The keeper is held inside a pass: the service holds the request for another pair.
+    let other = Device::create().await;
+    rig.served.web().fail_matching(
+        ISSUE,
+        serde_json::json!({ "destination_endpoint_key": destination_of(&other) }),
+        1,
+        Moment::Gate,
+    );
+    let other_record = pair_with(
+        &rig.host,
+        &other,
+        &rig.owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(180), async {
+        while rig.requests_for(&other_record) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the keeper asks for the other pair's lease, and the service holds the request");
+
+    // The record is revoked and replaced while no pass can look.
+    rig.host
+        .network()
+        .revoke_device(first.device_id)
+        .await
+        .expect("the device is revoked");
+    let second = pair_with(
+        &rig.host,
+        &phone,
+        &rig.owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    rig.served.web().release_held();
+    rig.pass().await;
+    rig.pass().await;
+
+    assert_eq!(
+        rig.revocations_of(&lease.lease_id),
+        0,
+        "no ending was sent for the lease"
+    );
+    assert_eq!(rig.endings_owed(), 0);
+    assert_eq!(rig.leases_for(&second).len(), 1, "the pair holds one lease");
+    assert_eq!(
+        rig.live_lease_for(&second).expect("the lease").lease_id,
+        lease.lease_id
+    );
+    assert_eq!(
+        rig.lease_in_the_record(&second),
+        Some(Some(lease.lease_id.clone())),
+        "the record keeps the lease under the destination"
+    );
+
+    // The next refill names the lease.
+    rig.time_passes(
+        Duration::from_secs(u64::from(LEASE_SECONDS)) - REFILL_WHEN_LEFT + Duration::from_secs(1),
+    );
+    rig.pass().await;
+    let destination = destination_of(&phone);
+    let sent = rig.bodies(ISSUE);
+    let refill = sent
+        .iter()
+        .rev()
+        .find(|body| body["destination_endpoint_key"] == destination)
+        .expect("a request for the pair");
+    assert_eq!(
+        refill["lease_id"], lease.lease_id,
+        "the refill names the held lease: {sent:?}"
+    );
+    assert!(
+        refill
+            .as_object()
+            .expect("an object")
+            .keys()
+            .all(|member| !member.contains("device") && !member.contains("grant")),
+        "the request names no device identifier and no grant: {refill}"
+    );
+    assert_eq!(
+        rig.leases_for(&second).len(),
+        1,
+        "no second lease was opened"
+    );
+}
