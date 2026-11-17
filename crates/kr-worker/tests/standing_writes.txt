@@ -100,6 +100,7 @@ allow crates/kr-worker/src/service.rs validate iter
 # More names that a body calls and the scan does not follow, one row to a body (a name allowed
 # for one body is not allowed for another):
 allow crates/kr-worker/src/broker/methods.rs checks get
+allow crates/kr-worker/src/broker/mod.rs check_package_grants get iter
 allow crates/kr-worker/src/broker/mod.rs check_responsible get
 allow crates/kr-worker/src/broker/mod.rs recheck_answer_trust get
 allow crates/kr-worker/src/service.rs check_admission_limits get filter
@@ -183,6 +184,7 @@ allow crates/kr-worker/src/service.rs params_application_instance as_str
 allow crates/kr-worker/src/service.rs question_clock now_ms
 calls crates/kr-worker/src/broker/methods.rs check_reached state crates/kr-worker/src/broker/mod.rs
 calls crates/kr-worker/src/broker/methods.rs check_reached unknown crates/kr-worker/src/broker/error.rs
+calls crates/kr-worker/src/broker/methods.rs checks package crates/kr-worker/src/broker/methods.rs
 calls crates/kr-worker/src/broker/mod.rs resource pending crates/kr-worker/src/broker/ledger.rs
 calls crates/kr-worker/src/broker/mod.rs resource unknown crates/kr-worker/src/broker/error.rs
 calls crates/kr-worker/src/broker/mod.rs suspension_reason reason crates/kr-worker/src/broker/stream.rs

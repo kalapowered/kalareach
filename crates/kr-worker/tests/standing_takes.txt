@@ -132,6 +132,7 @@ allow crates/kr-worker/src/session.rs attachment_capabilities capabilities
 # More names that a body calls and the scan does not follow, one row to a body (a name allowed
 # for one body is not allowed for another):
 allow crates/kr-worker/src/broker/methods.rs checks get
+allow crates/kr-worker/src/broker/mod.rs check_package_grants get iter
 allow crates/kr-worker/src/broker/mod.rs check_responsible get
 allow crates/kr-worker/src/broker/mod.rs recheck_answer_trust get
 allow crates/kr-worker/src/questions/mod.rs check_resolvable_reaching get unknown
@@ -175,6 +176,17 @@ caller utc_end_reached crates/kr-worker/src/action/time.rs utc_deadline_standing
 # The broker's checks, and the expiry sweep inside the subject's check.
 caller check_responsible crates/kr-worker/src/broker/methods.rs checks 1
 caller recheck_answer_trust crates/kr-worker/src/broker/methods.rs checks 1
+# The package grants of a plugin action's admission are asked from the checks, once, by the one
+# check that the first admission's token spend and the effect's validation also call: it reads the
+# binding's grants and nothing else, so what a later ask puts is what the admission put. The three
+# callers of the checks are the first admission, the answer's marker and the two repeats'
+# wrapper, and each hands on the admission's own record of what it was admitted against.
+caller check_package_grants crates/kr-worker/src/broker/methods.rs checks 1
+caller check_package_grants crates/kr-worker/src/broker/methods.rs validate_effect 1
+caller check_package_grants crates/kr-worker/src/broker/mod.rs check_invocation 1
+caller checks crates/kr-worker/src/broker/methods.rs recheck_broker 1
+caller checks crates/kr-worker/src/broker/mod.rs commit_dispatch 1
+caller checks crates/kr-worker/src/broker/mod.rs admit_mutation_in 1
 caller sweep_questions crates/kr-worker/src/service.rs validate 3
 # The full check of the local owner, which raises the host's floor, stands outside the pass: the
 # two calls of the first admission's check and the one of the writer's.
@@ -226,6 +238,14 @@ supplies crates/kr-worker/src/service/standing.rs limits check_admission_limits 
 supplies crates/kr-worker/src/service/standing.rs subject validate 0 session
 supplies crates/kr-worker/src/service/standing.rs subject check_preconditions 0 session
 supplies crates/kr-worker/src/service/standing.rs dispatch decidable 0 session
+# What each call of the broker's checks hands on: the repeats hand the admission's own record of
+# what it was admitted against (a record made again would hold no package grants) and ask again;
+# the first admission hands the record it has just made, which holds none yet, and asks first.
+supplies crates/kr-worker/src/broker/methods.rs recheck_broker checks 0 admitted
+supplies crates/kr-worker/src/broker/methods.rs recheck_broker checks 3 Ask::Again
+supplies crates/kr-worker/src/broker/mod.rs commit_dispatch checks 0 against
+supplies crates/kr-worker/src/broker/mod.rs commit_dispatch checks 3 crate::broker::methods::Ask::Again
+supplies crates/kr-worker/src/broker/mod.rs admit_mutation_in checks 0 &against
 
 # The target of each call of a name that several functions of the crate declare, one row to a
 # body: `allow` where the call is the standard library's or another crate's method (the scan does
@@ -287,6 +307,7 @@ allow crates/kr-worker/src/service.rs holds_attachment contains
 allow crates/kr-worker/src/service.rs params_application_instance as_str
 allow crates/kr-worker/src/service.rs question_clock now_ms
 calls crates/kr-worker/src/broker/methods.rs check_reached unknown crates/kr-worker/src/broker/error.rs
+calls crates/kr-worker/src/broker/methods.rs checks package crates/kr-worker/src/broker/methods.rs
 calls crates/kr-worker/src/broker/mod.rs resource pending crates/kr-worker/src/broker/ledger.rs
 calls crates/kr-worker/src/broker/mod.rs resource unknown crates/kr-worker/src/broker/error.rs
 calls crates/kr-worker/src/broker/mod.rs suspension_reason reason crates/kr-worker/src/broker/stream.rs
