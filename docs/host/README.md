@@ -1214,9 +1214,9 @@ instant and two starts take the same time. The counter usually advances at a res
 guarantees that it does. A repeat would take the new boot for the old one and measure the old
 boot's continuous deadlines on the new boot's clock.
 
-A build before this one identified a Windows boot by its boot time in whole seconds. Its boot
-record, its workers' descriptors, and the deadlines and checkpoints it bound to the current boot
-all read as an earlier boot once, after the upgrade. The daemon closes the sessions that build
+A build of level 0.47 or earlier identified a Windows boot by its boot time in whole seconds. Its
+boot record, its workers' descriptors, and the deadlines and checkpoints it bound to the current
+boot all read as an earlier boot once, after the upgrade. The daemon closes the sessions that build
 recorded, as it would after a restart, and `kr bind` skips its workers' descriptors.
 
 A process identifier alone is never enough. Every ownership check compares the start value as well,
@@ -1239,10 +1239,10 @@ be established. Windows describes a process that has exited for as long as anyth
 so a process whose identity matches is asked as well whether it has exited.
 
 Windows records a creation time in hundreds of nanoseconds, and the start value keeps them, so two
-processes created under one identifier within one second are two start identities. A worker of the
-previous release states its start in whole seconds, and so do the records it and its controller
-wrote. Such an identity names the process that holds the identifier now if that process was created
-in the same second, which is how that release read it. Each time the controller opens its
+processes created under one identifier within one second are two start identities. A worker from
+before 0.40.1 states its start in whole seconds, and so do the records it and its controller
+wrote. Such an identity names the process that holds the identifier now if that process was
+created in the same second, which is how those releases read it. Each time the controller opens its
 registry, a record in whole seconds whose process is still running is rewritten at the finer value,
 one whose process has gone is marked ended, and one the kernel will not describe is left for the
 next opening; each worker's row keeps the source the worker itself states. Whole seconds are read
@@ -3326,9 +3326,10 @@ with the history scope of the device's grant, and the worker holds the answer to
 shared history filter: a snapshot carries what the agent said at or after the moment the grant
 reaches back to, and says how much it withheld, and an approval's record from before that moment is
 answered as a resource the host does not hold, unless the grant names that approval and it can still
-be decided. A worker says in its answer to the daemon's hello that it reads such a scope, one that
-names approvals by the broker's resource identity, and one that does not say so is sent none and
-refuses both reads itself. `events.subscribe` and `events.snapshot` go to the worker with the same
+be decided. Every worker of a level this release retains says in its answer to the daemon's hello
+that it reads such a scope, one that names approvals by the broker's resource identity, and the
+daemon sends it to every worker; a daemon of level 0.74 or earlier sent none to a worker that did
+not say so, and that worker refused both reads itself. `events.subscribe` and `events.snapshot` go to the worker with the same
 scope, and the worker holds the resources the broker arbitrates to it by the rule the approval
 record follows: a snapshot, every page of it, carries an approval the grant names while it can still
 be decided, and any other resource only when it was recorded at or after the moment the grant
@@ -3338,7 +3339,7 @@ at or after its own start. The local owner, and a read
 that comes with no scope, are shown every resource and every transition. `grant.list` answers with
 the grants the device issued and everything delegated from them, and it needs `session.share`.
 
-`agent.instances` is a subset of `events.snapshot`, appropriate for a view of an agent. It produces a snapshot of the live agent instances in the session, and also a single page's worth of the resources waiting on a person, subject to the same filter and pagination. It carries no screen, geometry, lease or attachment, so it is served to a grant that does not include the live screen, which `events.snapshot` refuses. A worker must declare in its answer to the daemon's hello that it serves this read, and the daemon does not ask a worker that has not done so: the device is refused with `UNSUPPORTED_CAPABILITY`. A read that reaches a worker with no scope is refused unless the local owner made it.
+`agent.instances` is a subset of `events.snapshot`, appropriate for a view of an agent. It produces a snapshot of the live agent instances in the session, and also a single page's worth of the resources waiting on a person, subject to the same filter and pagination. It carries no screen, geometry, lease or attachment, so it is served to a grant that does not include the live screen, which `events.snapshot` refuses. Every worker of a level this release retains declares in its answer to the daemon's hello that it serves this read, and the daemon asks every worker; a daemon of level 0.74 or earlier did not ask a worker that had not declared it, and refused the device with `UNSUPPORTED_CAPABILITY`. A read that reaches a worker with no scope is refused unless the local owner made it.
 
 `session.describe` is answered by the daemon from the environment's store of session names,
 filtered for the device: the generated text of a description only when the device's grant reaches
@@ -4371,7 +4372,7 @@ When access ends or narrows, the worker ends what the owner holds. A connection 
 
 A worker the daemon starts refuses held methods from the moment its socket is bound until the daemon has told it. The daemon tells it before it makes the worker known, for up to two seconds, tells it again whenever the answer changes until the worker acknowledges, and tells every worker at each start. A worker that holds a lease and meets a newer daemon waits to be told again, because a lease does not outlive the daemon that held it. A worker that needs no lease keeps serving across a restart.
 
-Turning exclusive management on tells every worker before the host answers, and the answer reports each worker's state as a withdrawal's does: a worker that did not acknowledge in time is named as pending, `kr organisation exclusive on` then fails with a pending result, and that worker may serve on the bound it held until the host tells it again, which it does every few seconds. The host refuses the change while a worker cannot be told at all, which means a worker an earlier release started, or one the host has not reached. `organisation.list` names those sessions, and `kr close` ends them. On a host that is already exclusive, such a worker serves its local callers without the hold until its session ends.
+Turning exclusive management on tells every worker before the host answers, and the answer reports each worker's state as a withdrawal's does: a worker that did not acknowledge in time is named as pending, `kr organisation exclusive on` then fails with a pending result, and that worker may serve on the bound it held until the host tells it again, which it does every few seconds. The host refuses the change while a worker cannot be told at all, which means a worker whose level cannot read that statement, or one the host has not reached. `organisation.list` names those sessions, and `kr close` ends them. On a host that is already exclusive, such a worker serves its local callers without the hold until its session ends.
 
 Nothing presents the host's lease on its own yet. The owner runs `kr organisation present` before each lease ends, at most fifteen minutes apart, and again after the host's daemon restarts, because no lease survives a restart. A lease with fewer rights than the one before it changes nothing for the local owner, whose access depends only on when the lease ends.
 

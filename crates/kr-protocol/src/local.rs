@@ -450,8 +450,9 @@ pub struct ForwardedMutation {
     ///
     /// It is absent from the wire when it is absent, so a mutation without one is byte for byte
     /// what a worker built before scopes travelled with mutations reads, and the daemon's own link
-    /// for a local caller's action never writes one. A daemon sends one only to a worker that states
-    /// [`FORWARDED_RESULT_SCOPE`].
+    /// for a local caller's action never writes one. A daemon sends one to every worker, because
+    /// every worker of a level this release retains states [`FORWARDED_RESULT_SCOPE`]; a daemon of
+    /// level 0.74 or earlier sent one only to a worker that stated it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::grant::HistoryScope>,
     /// The kind of grant the host decided this mutation under, for a `session.attach` only.
@@ -463,8 +464,9 @@ pub struct ForwardedMutation {
     /// is and the narrower reading discloses nothing the other does not.
     ///
     /// It is absent from the wire when it is absent, so a frame without one is byte for byte what a
-    /// worker built before it read, and a daemon sends it only to a worker that states
-    /// [`FORWARDED_SCREEN_BASIS`].
+    /// worker built before it read, and a daemon sends it to every worker, because every worker of
+    /// a level this release retains states [`FORWARDED_SCREEN_BASIS`]; a daemon of level 0.74 or
+    /// earlier sent it only to a worker that stated it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screen_basis: Option<ScreenBasis>,
     /// The workflow run a `session.close` from a workflow acts for.
@@ -628,9 +630,11 @@ pub struct ForwardedRequest {
     /// is the local owner, and refuses anybody else.
     ///
     /// It is absent from the wire when it is absent, so a read without one is byte for byte what a
-    /// worker built before scopes travelled reads. A daemon sends one only to a worker that states
-    /// [`FORWARDED_HISTORY_SCOPE`], and a question read with one only to a worker that also states
-    /// [`FORWARDED_QUESTION_SCOPE`].
+    /// worker built before scopes travelled reads. A daemon sends one, and a question read with
+    /// one, to every worker, because every worker of a level this release retains states
+    /// [`FORWARDED_HISTORY_SCOPE`] and [`FORWARDED_QUESTION_SCOPE`]; a daemon of level 0.74 or
+    /// earlier sent one only to a worker that stated the first, and a question read with one only
+    /// to a worker that stated both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<crate::grant::HistoryScope>,
 }
@@ -863,10 +867,11 @@ mod tests {
         );
     }
 
-    /// A forwarded mutation without a history scope is the frame a worker of an earlier build
-    /// reads, member for member, and a frame such a daemon wrote reads as one without a scope. A
-    /// scope round-trips, and an earlier worker could not read it, which is why a daemon sends one
-    /// only to a worker that states it holds results to a scope.
+    /// A forwarded mutation without a history scope is the frame a worker built before scopes
+    /// travelled with mutations reads, member for member, and a frame a daemon built before then
+    /// wrote reads as one without a scope. A scope round-trips, and such a worker could not read
+    /// it, which is why a daemon of level 0.74 or earlier sent one only to a worker that stated it
+    /// holds results to a scope.
     #[test]
     fn a_forwarded_mutation_without_a_scope_is_the_frame_an_earlier_worker_reads() {
         use crate::actor::{ActorEnvelope, ActorIngress};

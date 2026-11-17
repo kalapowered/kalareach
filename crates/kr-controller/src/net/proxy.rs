@@ -213,7 +213,7 @@ pub struct WorkerProxy {
     /// The level the worker stated, which every frame on this link is read and written under.
     level: kr_protocol::retained::Level,
     /// What the worker stated about itself in its answer to the hello: the reads and frames it
-    /// serves that a worker of an earlier release does not.
+    /// serves.
     capabilities: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
     /// How many calls have begun to wait for the write half.
     #[cfg(test)]

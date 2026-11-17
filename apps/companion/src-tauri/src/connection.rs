@@ -314,8 +314,8 @@ impl Connection {
     }
 }
 
-/// What a host's refusal to open a paired connection becomes. A host of an earlier build does not
-/// list the method and refuses it as any unlisted method is refused (`PERMISSION_DENIED` with
+/// What a host's refusal to open a paired connection becomes. A host of level 0.71 or earlier does
+/// not list the method and refuses it as any unlisted method is refused (`PERMISSION_DENIED` with
 /// [`kr_transport::actor::METHOD_NOT_AVAILABLE`]), and only that refusal is told to be updated: a
 /// host that refuses for a reason of its own, such as a feed it has not caught up with, says that
 /// reason alone.
@@ -342,8 +342,8 @@ fn opening_refused(refusal: kr_protocol::error::ProtocolError) -> Unopened {
 /// Opens a paired connection for the host alone, and returns the rights the host decided the open
 /// with.
 ///
-/// A host of an earlier build does not list the method and refuses it as any unlisted method is
-/// refused, so that refusal says to update the host.
+/// A host of level 0.71 or earlier does not list the method and refuses it as any unlisted method
+/// is refused, so that refusal says to update the host.
 async fn open_for_the_host(session: &Session) -> std::result::Result<Vec<ActionRight>, Unopened> {
     use kr_protocol::scalars::Nullable;
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
@@ -1215,9 +1215,9 @@ mod tests {
     }
 
     /// A host that opens a paired connection with a refusal of its own says that reason alone. Only
-    /// the refusal a host of an earlier build gives (it does not list the method, and refuses it as
-    /// it refuses any unlisted method) is told to be updated; the refusals the host's authority feed
-    /// produces, which are `PERMISSION_DENIED` too, are not.
+    /// the refusal a host of level 0.71 or earlier gives (it does not list the method, and refuses
+    /// it as it refuses any unlisted method) is told to be updated; the refusals the host's
+    /// authority feed produces, which are `PERMISSION_DENIED` too, are not.
     #[test]
     fn only_the_refusal_of_an_unlisted_method_tells_the_person_to_update_the_host() {
         use kr_controller::grants::Refusal;

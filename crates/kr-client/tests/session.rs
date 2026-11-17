@@ -1453,9 +1453,8 @@ async fn a_launch_surface_refused_as_not_permitted_and_then_as_unsupported_is_no
     serving.abort();
 }
 
-/// KR-REQ-13.11: a host whose worker is of an earlier release refuses the launch surface as an
-/// unsupported capability, which is the host not serving the read; any other refusal is returned as
-/// it is, and no probe is made for it.
+/// KR-REQ-13.11: a host that refuses the launch surface as an unsupported capability is a host not
+/// serving the read; any other refusal is returned as it is, and no probe is made for it.
 #[tokio::test]
 async fn a_launch_surface_refused_as_unsupported_is_not_served_and_any_other_refusal_is_returned() {
     let host = side(1, true).await;
