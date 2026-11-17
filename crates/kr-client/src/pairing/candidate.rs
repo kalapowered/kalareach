@@ -2730,6 +2730,9 @@ mod tests {
         TooSoon(Duration),
         /// That the question came too soon, at this moment.
         TooSoonAt(tokio::time::Instant),
+        /// An answer this device cannot read, as a status whose reason it does not know is: the
+        /// link reports a lost answer, this long after the question went.
+        Unreadable(Duration),
     }
 
     /// A host's pre-authorisation surface, scripted: every status question is answered as `reply`
@@ -2787,6 +2790,12 @@ mod tests {
                     Reply::TooSoonAt(at) => {
                         tokio::time::sleep_until(at).await;
                         Err(too_soon())
+                    }
+                    Reply::Unreadable(after) => {
+                        tokio::time::sleep(after).await;
+                        Err(LinkError::Lost(
+                            "the host's answer could not be read".to_owned(),
+                        ))
                     }
                 }
             })
@@ -2950,6 +2959,8 @@ mod tests {
         dials: usize,
         /// Whether the loop ended within the run.
         ended: bool,
+        /// How the loop ended, when it did and it failed.
+        failure: Option<FailureKind>,
     }
 
     /// Runs the waiting loop for `run` on a paused clock, on a connection the device began to open
@@ -3040,9 +3051,13 @@ mod tests {
             2,
         );
         let (progress, _shown) = watch::channel(AttemptState::Idle);
-        let ended = tokio::time::timeout(run, pairing.waiting(pending, Some(held), &progress))
+        let outcome = tokio::time::timeout(run, pairing.waiting(pending, Some(held), &progress))
             .await
-            .is_ok();
+            .ok();
+        let ended = outcome.is_some();
+        let failure = outcome
+            .and_then(|outcome| outcome.err())
+            .map(|failure| failure.kind);
         let asked = asked
             .lock()
             .expect("the record")
@@ -3054,6 +3069,7 @@ mod tests {
             asked,
             dials,
             ended,
+            failure,
         }
     }
 
@@ -3159,6 +3175,43 @@ mod tests {
             after_the_call,
             [call],
             "only the question kept for the attempt's last call goes after it: {:?}",
+            run.asked
+        );
+    }
+
+    /// KR-REQ-10.08: a device whose host answers every question in a way it cannot read, as a host
+    /// that gave a refusal code or a status reason this device does not know would, waits for the
+    /// owner and ends with `approval_unknown` when the attempt's own time has passed, on a clock the
+    /// test moves. It asks again after each unreadable answer, within the host's budget for the
+    /// connection, and never ends before the deadline.
+    #[tokio::test(start_paused = true)]
+    async fn answers_it_cannot_read_end_at_the_attempts_deadline_as_approval_unknown() {
+        let run = waited(
+            Script {
+                held: Reply::Unreadable(Duration::from_secs(1)),
+                fail_after: Duration::ZERO,
+                opening: None,
+                deadline: Duration::from_secs(120),
+            },
+            Duration::from_secs(300),
+        )
+        .await;
+        assert!(run.ended, "the attempt ends at its deadline");
+        assert_eq!(
+            run.failure,
+            Some(FailureKind::ApprovalUnknown),
+            "the device does not know what became of its pairing"
+        );
+        assert!(
+            run.asked.len() > 1,
+            "the device asked more than once before it gave up: {:?}",
+            run.asked
+        );
+        assert!(
+            run.asked
+                .iter()
+                .all(|sent| *sent < Duration::from_secs(120)),
+            "nothing is asked after the attempt's deadline: {:?}",
             run.asked
         );
     }
