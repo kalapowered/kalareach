@@ -1,25 +1,27 @@
 name: keep-evidence-test
 
-# The test of `.github/actions/keep-evidence`, started by hand and by nothing else. Run it after a
-# change to that action or to the upload action it calls: every hosted job ends with that action,
-# and a job that cannot keep its evidence is red, so a fault in it shows only at the end of a long
-# job.
+# The test of the second try that every evidence upload of the landing and conformance workflows
+# has, started by hand and by nothing else. Run it after a change to that form or to the upload
+# action it calls: every hosted job ends with such an upload, and a job that cannot keep its
+# evidence is red, so a fault in the form shows only at the end of a long job.
+#
+# Each case below holds the three steps that those workflows hold at each upload: the first try
+# with its failure let pass, a pause of 60 seconds that runs only where the first try failed, and
+# the second try that runs only there too and whose failure fails the job. The upload action is
+# named in this workflow, so the runner fetches it when each job is set up and no step here
+# fetches anything.
 #
 # A real outage of the artifact service cannot be made on request, so the second try is reached
-# through the one fault the action reads the same way: a path that holds nothing, with the rule
-# that a path that holds nothing fails the try. The first try fails on it, the pause follows, and
-# the files appear while the action waits. Each job first calls the action in its `only-load` mode,
-# as the real jobs do, so that the runner has fetched the upload action before the first try
-# starts: the first try then begins within a second of its step, and the files appear well after
-# it and well before the second try.
+# through the one fault the form reads the same way: a path that holds nothing, with the rule that
+# a path that holds nothing fails the try.
 #
-# - first-try: the files exist, the first try keeps them, `tries` is 1. The job's log shows the
-#   upload action fetched in the `only-load` step and not in the step that keeps the evidence.
-# - second-try: the files appear 20 seconds after the step starts, the first try fails, the second
-#   keeps them, `tries` is 2 and the run carries the notice that says so.
-# - both-fail: the files never appear, both tries fail and the action's step fails. The step lets
-#   its failure pass so that the job can read it: its outcome is `failure`.
-# - verdict: fails unless the three jobs passed.
+# - first-try: the files exist, the first try keeps them, the pause and the second try are skipped.
+# - second-try: the files appear 25 seconds after the step before the first try starts. The first
+#   try begins within a few seconds of that step, so it finds nothing and fails; the pause runs;
+#   the second try finds the files and keeps them.
+# - both-fail: the files never appear, both tries fail and the job fails, which is what a job
+#   without its evidence does. This job is red by design, and the run with it.
+# - verdict: fails unless the first two jobs passed and the third failed.
 #
 # Each job keeps its artifact under a name of its own. The run's artifacts list holds the first
 # two and not the third.
@@ -36,111 +38,147 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Check out the action
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          sparse-checkout: .github/actions
-
-      - name: Load the action
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
-
       - name: Write the evidence
         run: |
           mkdir -p "$RUNNER_TEMP/evidence"
           echo "kept by the first try" > "$RUNNER_TEMP/evidence/record.txt"
 
       - name: Keep the evidence
-        id: keep
-        uses: ./.github/actions/keep-evidence
+        id: first
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: keep-evidence-test-first-try
           path: ${{ runner.temp }}/evidence
           if-no-files-found: error
 
-      - name: Read which try kept it
-        env:
-          TRIES: ${{ steps.keep.outputs.tries }}
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the evidence, pause before the second try
+        id: pause
+        if: ${{ steps.first.outcome == 'failure' }}
+        shell: bash
         run: |
-          echo "tries: ${TRIES}"
-          test "${TRIES}" = 1
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the evidence, second try
+        id: second
+        if: ${{ steps.first.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: keep-evidence-test-first-try
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+
+      - name: Read how the tries ended
+        env:
+          FIRST: ${{ steps.first.outcome }}
+          PAUSE: ${{ steps.pause.outcome }}
+          SECOND: ${{ steps.second.outcome }}
+        run: |
+          echo "first try: ${FIRST}, pause: ${PAUSE}, second try: ${SECOND}"
+          test "${FIRST}" = success
+          test "${PAUSE}" = skipped
+          test "${SECOND}" = skipped
 
   second-try:
     name: the second try keeps the evidence
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Check out the action
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          sparse-checkout: .github/actions
-
-      - name: Load the action
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
-
-      - name: Write the evidence 20 seconds from now
+      - name: Write the evidence 25 seconds from now
         run: |
           late="$RUNNER_TEMP/late-evidence"
           mkdir -p "$late"
-          # The first try starts at once and fails on the empty path, and the action then waits a
-          # minute: the file is there for the second try and not for the first.
-          (sleep 20; echo "kept by the second try" > "$late/record.txt") < /dev/null > /dev/null 2>&1 &
+          # The step after this one starts the first try within seconds, and the pause then lasts
+          # a minute: the file is there for the second try and not for the first.
+          (sleep 25; echo "kept by the second try" > "$late/record.txt") < /dev/null > /dev/null 2>&1 &
           disown
 
       - name: Keep the evidence
-        id: keep
-        uses: ./.github/actions/keep-evidence
+        id: first
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: keep-evidence-test-second-try
           path: ${{ runner.temp }}/late-evidence
           if-no-files-found: error
 
-      - name: Read which try kept it
-        env:
-          TRIES: ${{ steps.keep.outputs.tries }}
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the evidence, pause before the second try
+        id: pause
+        if: ${{ steps.first.outcome == 'failure' }}
+        shell: bash
         run: |
-          echo "tries: ${TRIES}"
-          test "${TRIES}" = 2
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the evidence, second try
+        id: second
+        if: ${{ steps.first.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: keep-evidence-test-second-try
+          path: ${{ runner.temp }}/late-evidence
+          if-no-files-found: error
+
+      - name: Read how the tries ended
+        env:
+          FIRST: ${{ steps.first.outcome }}
+          PAUSE: ${{ steps.pause.outcome }}
+          SECOND: ${{ steps.second.outcome }}
+        run: |
+          echo "first try: ${FIRST}, pause: ${PAUSE}, second try: ${SECOND}"
+          test "${FIRST}" = failure
+          test "${PAUSE}" = success
+          test "${SECOND}" = success
 
   both-fail:
-    name: the step fails when both tries fail
+    name: the job fails when both tries fail
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Check out the action
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-        with:
-          persist-credentials: false
-          sparse-checkout: .github/actions
-
-      - name: Load the action
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
-
-      - name: Keep evidence that does not exist
-        id: keep
+      - name: Keep the evidence
+        id: first
         continue-on-error: true
-        uses: ./.github/actions/keep-evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: keep-evidence-test-both-fail
           path: ${{ runner.temp }}/no-evidence
           if-no-files-found: error
 
-      - name: Read how the step ended
-        env:
-          OUTCOME: ${{ steps.keep.outcome }}
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the evidence, pause before the second try
+        id: pause
+        if: ${{ steps.first.outcome == 'failure' }}
+        shell: bash
         run: |
-          echo "outcome of the action's step: ${OUTCOME}"
-          test "${OUTCOME}" = failure
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the evidence, second try
+        id: second
+        if: ${{ steps.first.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: keep-evidence-test-both-fail
+          path: ${{ runner.temp }}/no-evidence
+          if-no-files-found: error
+
+      - name: Read how the tries ended
+        if: ${{ !cancelled() }}
+        env:
+          FIRST: ${{ steps.first.outcome }}
+          PAUSE: ${{ steps.pause.outcome }}
+          SECOND: ${{ steps.second.outcome }}
+        run: |
+          echo "first try: ${FIRST}, pause: ${PAUSE}, second try: ${SECOND}"
+          test "${FIRST}" = failure
+          test "${PAUSE}" = success
+          test "${SECOND}" = failure
 
   verdict:
-    name: the three jobs passed
+    name: the first two jobs passed and the third failed
     if: ${{ always() }}
     needs: [first-try, second-try, both-fail]
     runs-on: ubuntu-24.04
@@ -148,7 +186,9 @@ jobs:
     steps:
       - name: Read the jobs' results
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+          FIRST_TRY: ${{ needs.first-try.result }}
+          SECOND_TRY: ${{ needs.second-try.result }}
+          BOTH_FAIL: ${{ needs.both-fail.result }}
         run: |
-          echo "results: ${RESULTS}"
-          test "${RESULTS}" = "success success success"
+          echo "results: ${FIRST_TRY} ${SECOND_TRY} ${BOTH_FAIL}"
+          test "${FIRST_TRY} ${SECOND_TRY} ${BOTH_FAIL}" = "success success failure"
