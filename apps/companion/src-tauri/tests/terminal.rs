@@ -5122,26 +5122,35 @@ fn flood_texts(states: &[Value], from: usize) -> Vec<String> {
 /// (every screen the host sent before an answer is shown before the answer's effect), the page's
 /// command leaves in the turn that takes it while the page still holds the view and the view's queue
 /// holds what the channel held, and that queue never holds more than the session's channel and what
-/// was ready in one look.
+/// was ready in one look, also when a second answer and a second flood arrive while the queue is
+/// not empty.
 ///
 /// The page is held by the gate of its publication: the view's own task waits inside a state until
 /// the case lets it pass. While it is held the host writes only what the view, the session's
-/// channel and the session's reader hold between them: 258 notifications (one, 256 and one), the
-/// answer to the take's acquire after the first 150 screens, and the answer to a launch surface
-/// read after ten notices that draw nothing and 87 screens more, then ten notices and one screen.
-/// The answers take no place in the channel, so both are read while the channel is full and are
-/// ready in the first look, with all of the channel. Nothing the host writes needs room in the
-/// socket, so nothing here depends on how much a socket holds.
+/// channel and the session's reader hold between them: 258 notifications (one, 256 and one), and
+/// the answer to the take's acquire after the first 150 screens, which takes no place in the channel
+/// and is ready in the first look with all of the channel. Once that look has moved the channel into
+/// the view's queue, the channel is empty, and the host writes the answer to a launch surface read
+/// and 255 notifications more, which the channel holds with no room in the socket. A loop that looks
+/// at its calls at every turn takes that answer with the channel at its next turn, and the queue
+/// then holds more than the channel and one look: the case fails on the queue's peak.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_command() {
     const BEFORE_ACQUIRE: u64 = 150;
     const BETWEEN_NOTICES: u64 = 10;
-    const BEFORE_SURFACE: u64 = 87;
-    const AFTER_NOTICES: u64 = 10;
-    const FLOOD: u64 = BEFORE_ACQUIRE + BEFORE_SURFACE;
     const CHANNEL: usize = 256;
-    // The view holds one, the channel 256 and the session's reader one.
-    const _: () = assert!(FLOOD + BETWEEN_NOTICES + AFTER_NOTICES + 1 == 1 + CHANNEL as u64 + 1);
+    // The first flood: the view holds one, the channel 256 and the session's reader one.
+    const FIRST: u64 = 1 + CHANNEL as u64 + 1;
+    const FIRST_SCREENS: u64 = FIRST - BEFORE_ACQUIRE - BETWEEN_NOTICES;
+    // The second flood: what the channel can still take once the reader's held notification is in
+    // it, which is ten notices, the screens and the one screen that ends the flood.
+    const AFTER_NOTICES: u64 = 10;
+    const SECOND: u64 = CHANNEL as u64 - 1;
+    const SECOND_SCREENS: u64 = SECOND - AFTER_NOTICES - 1;
+    const FLOOD: u64 = BEFORE_ACQUIRE + FIRST_SCREENS + SECOND_SCREENS;
+    // The states the page takes one at a time after the second flood is written, which gives a
+    // loop that looks at every turn the turns it needs to take the answer and the channel.
+    const PACED: usize = 20;
     const CALLS_IN_FLIGHT: usize = 3;
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
@@ -5168,27 +5177,17 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
             vec![row(1, &format!("flood {number}"))],
         )
     };
+    let notice = json!({"requested_cursor": "10", "oldest_retained_cursor": "20"});
     for number in 0..BEFORE_ACQUIRE {
         link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
     }
     lease.answer(&mut link, &acquire).await;
-    let notice = json!({"requested_cursor": "10", "oldest_retained_cursor": "20"});
     for _ in 0..BETWEEN_NOTICES {
         link.push("session.gap", &notice).await;
     }
-    for number in BEFORE_ACQUIRE..FLOOD {
+    for number in BEFORE_ACQUIRE..BEFORE_ACQUIRE + FIRST_SCREENS {
         link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
     }
-    link.answer(&surface, &a_surface_held_here(worker.session_id))
-        .await;
-    for _ in 0..AFTER_NOTICES {
-        link.push("session.gap", &notice).await;
-    }
-    link.push(
-        PROJECTION_DELTA_EVENT,
-        &delta(1, 40 + FLOOD, 41 + FLOOD, 10, 2, 0, vec![row(1, "after")]),
-    )
-    .await;
     // The view is inside the first state of the flood, and holds nothing else.
     page.state(3, first).await;
     // The page takes states one at a time until a look has moved what the channel held into the
@@ -5202,12 +5201,17 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
         page.state(3, recorded).await;
         recorded += 1;
     }
+    assert!(
+        views.queue_peak(&view).expect("the view is open") >= CHANNEL - CHANNEL / 8,
+        "no look moved what the channel held into the queue"
+    );
     // A command of the page, while the view is held in the middle of that queue: a size report,
     // which nothing in flight stops. One state passes, and the command leaves in the turn that
     // takes it, with the rest of the queue still waiting.
     page.resize(&view, 12, 3);
     held.let_pass(1);
     page.state(3, recorded).await;
+    recorded += 1;
     let report = link.call_within(STATE_BOUND).await.expect(
         "the size report was not on the wire within the bound while the page still holds the view",
     );
@@ -5223,11 +5227,37 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
         link.quiet_for(QUIET).await,
         "the command made one request, and nothing else was owed"
     );
-    drop(held);
-    page.newest(3, |state| {
-        state["state"] == "showing" && text_of(state)[1] == "after"
-    })
+    // The channel is empty and the queue is not: the host answers the surface read and sends 255
+    // notifications more. The loop does not look at its calls until the queue is empty, so the
+    // answer and the channel wait.
+    link.answer(&surface, &a_surface_held_here(worker.session_id))
+        .await;
+    for _ in 0..AFTER_NOTICES {
+        link.push("session.gap", &notice).await;
+    }
+    for number in BEFORE_ACQUIRE + FIRST_SCREENS..FLOOD {
+        link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
+    }
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(1, 40 + FLOOD, 41 + FLOOD, 10, 2, 0, vec![row(1, "after")]),
+    )
     .await;
+    for _ in 0..PACED {
+        held.let_pass(1);
+        page.state(3, recorded).await;
+        recorded += 1;
+    }
+    drop(held);
+    let reached = page
+        .newest_within(3, |state| {
+            state["state"] == "showing" && text_of(state)[1] == "after"
+        })
+        .await;
+    assert!(
+        reached.is_some(),
+        "the last screen of the flood was not shown within the bound"
+    );
     let states = page.states(3);
     let expected: Vec<String> = (0..FLOOD)
         .map(|number| format!("flood {number}"))
@@ -5256,7 +5286,11 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
         peak <= CHANNEL + CALLS_IN_FLIGHT,
         "the queue never held more than the channel's size and what was ready in one look: {peak}"
     );
-    let told = reading.await.expect("joins").expect("the surface is read");
+    let told = tokio::time::timeout(STATE_BOUND, reading)
+        .await
+        .expect("the surface read was answered within the bound")
+        .expect("joins")
+        .expect("the surface is read");
     assert_eq!(told["state"], "served", "{told}");
 }
 
