@@ -145,7 +145,7 @@ impl Directory {
             else {
                 directory.quarantined.push(Quarantined {
                     session_id: descriptor.session_id,
-                    worker_public_key: Some(descriptor.worker_public_key.clone()),
+                    worker_public_key: Some(descriptor.worker_public_key),
                     reason: "no registry row records this session".to_owned(),
                 });
                 continue;
@@ -153,7 +153,7 @@ impl Directory {
             if row.public_key != descriptor.worker_public_key {
                 directory.quarantined.push(Quarantined {
                     session_id: descriptor.session_id,
-                    worker_public_key: Some(descriptor.worker_public_key.clone()),
+                    worker_public_key: Some(descriptor.worker_public_key),
                     reason: "the descriptor's key is not the one the rendezvous established"
                         .to_owned(),
                 });
@@ -169,7 +169,7 @@ impl Directory {
             {
                 directory.quarantined.push(Quarantined {
                     session_id: descriptor.session_id,
-                    worker_public_key: Some(descriptor.worker_public_key.clone()),
+                    worker_public_key: Some(descriptor.worker_public_key),
                     reason: "the reservation this worker was started for is fenced".to_owned(),
                 });
                 continue;
@@ -187,7 +187,7 @@ impl Directory {
                 }
                 Err(reason) => directory.quarantined.push(Quarantined {
                     session_id: descriptor.session_id,
-                    worker_public_key: Some(descriptor.worker_public_key.clone()),
+                    worker_public_key: Some(descriptor.worker_public_key),
                     reason,
                 }),
             }
@@ -479,7 +479,7 @@ mod tests {
         let session_id = SessionId::new(Uuid::from_bytes([1; 16]));
         let other = SessionId::new(Uuid::from_bytes([2; 16]));
         let admitted = worker(&host, session_id);
-        let key = admitted.descriptor.worker_public_key.clone();
+        let key = admitted.descriptor.worker_public_key;
         let out = |session_id, worker_public_key, reason: &str| Quarantined {
             session_id,
             worker_public_key,
@@ -487,7 +487,7 @@ mod tests {
         };
         let mut directory = Directory {
             quarantined: vec![
-                out(session_id, Some(key.clone()), "its challenge failed"),
+                out(session_id, Some(key), "its challenge failed"),
                 out(
                     session_id,
                     Some(AuthorisationKey::from_bytes([8; 32])),
