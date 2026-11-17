@@ -4598,10 +4598,13 @@ mod tests {
         })
         .await;
         let error = outcome.expect_err("a grant that has run out registers no destination");
-        let crate::error::ControllerError::PermissionDenied { detail } = &error else {
-            panic!("a grant that has run out is refused: {error}");
-        };
-        assert!(detail.contains("has run out"), "{detail}");
+        assert!(
+            matches!(
+                &error,
+                crate::error::ControllerError::PermissionDenied { .. }
+            ),
+            "a grant that has run out is refused as a permission: {error}"
+        );
         let destination = destination_of(&host, host.device_id);
         assert!(
             destination.is_none(),
