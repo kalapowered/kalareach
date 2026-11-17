@@ -63,6 +63,11 @@ pub(super) const ENDED: &str = "This view has ended, and took nothing.";
 const ENDED_BY_ENCODING: &str =
     "Control ended: the program now reads keys in a form this view cannot send.";
 
+/// Why control ended when the session said the lease was lost, at a refused write or at the notice
+/// that the epoch ended.
+const ENDED_BY_LOST_LEASE: &str =
+    "Control ended: another view took it, or the program changed how it reads keys.";
+
 /// Why a view did not take an input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Refused {
@@ -563,6 +568,21 @@ impl Lease {
         true
     }
 
+    /// The session says the lease of `epoch` is over: another view took it, or the program changed
+    /// how it reads keys. Control ends as a refused write for a lost lease ends it, and nothing is
+    /// given back, since the lease is not the view's any more. Returns whether control changed: a
+    /// lease that is not held at `epoch` changes nothing, as the view's own release, which took the
+    /// lease out of the view's hands before the session's notice, or an older epoch's notice.
+    pub fn epoch_ended(&mut self, epoch: InputLeaseEpoch) -> bool {
+        if self.held.as_ref().is_none_or(|held| held.epoch != epoch) {
+            return false;
+        }
+        self.held = None;
+        self.wanted = false;
+        self.ended = Some(ENDED_BY_LOST_LEASE.to_owned());
+        true
+    }
+
     /// What the page is told of control.
     #[must_use]
     pub fn control(&self) -> TerminalControl {
@@ -601,7 +621,7 @@ fn refused_release(refusal: &ProtocolError) -> String {
 /// Why control ended at a refused write, in words for the person.
 fn ended_by(refusal: &ProtocolError) -> String {
     if refusal.code == ErrorCode::LeaseLost {
-        "Control ended: another view took it, or the program changed how it reads keys.".to_owned()
+        ENDED_BY_LOST_LEASE.to_owned()
     } else {
         format!(
             "Control ended. The session refused this view's input: {}",
@@ -879,6 +899,44 @@ mod tests {
         assert_eq!(lease.owed(), None);
         assert!(lease.write(1).is_err());
         assert_eq!(lease.control().ended, control.ended, "the words stay");
+    }
+
+    /// The session's notice that the held epoch is over ends control as a lost lease does, with the
+    /// same words, and gives nothing back; a notice for an epoch that is not held changes nothing.
+    #[test]
+    fn the_notice_that_the_held_epoch_ended_ends_control_as_a_lost_lease_does() {
+        let mut lease = holding();
+        assert!(
+            !lease.epoch_ended(InputLeaseEpoch::new(4)),
+            "an older epoch"
+        );
+        assert!(!lease.epoch_ended(InputLeaseEpoch::new(6)), "a newer epoch");
+        assert_eq!(lease.control().state, ControlState::Controlling);
+        assert!(lease.epoch_ended(InputLeaseEpoch::new(5)));
+        let control = lease.control();
+        assert_eq!(control.state, ControlState::Watching);
+        assert_eq!(
+            control.ended.as_deref(),
+            Some("Control ended: another view took it, or the program changed how it reads keys.")
+        );
+        assert_eq!(
+            lease.owed(),
+            None,
+            "the lease is not the view's to give back"
+        );
+        assert!(lease.write(1).is_err());
+        assert!(!lease.epoch_ended(InputLeaseEpoch::new(5)), "told once");
+    }
+
+    /// A lease the view gave back is not held: the session's notice for it changes nothing and
+    /// shows nothing.
+    #[test]
+    fn the_notice_for_a_lease_the_view_gave_back_changes_nothing() {
+        let mut lease = holding();
+        assert!(lease.request(2, false));
+        assert!(!lease.epoch_ended(InputLeaseEpoch::new(5)));
+        assert_eq!(lease.control().ended, None);
+        assert_eq!(lease.owed(), Some(Owed::Release(InputLeaseEpoch::new(5))));
     }
 
     #[test]

@@ -1841,7 +1841,15 @@ impl View {
                 self.send_barred(&barrier, false);
                 None
             }
-            InputEvent::EpochEnded { .. } | InputEvent::LaunchReserved { .. } => None,
+            InputEvent::EpochEnded { epoch, .. } => {
+                // Control moved while the view held it: it ends as a lost lease ends it, and no key
+                // is taken after it.
+                if self.lease.epoch_ended(epoch) {
+                    self.control_changed();
+                }
+                None
+            }
+            InputEvent::LaunchReserved { .. } => None,
             InputEvent::Ended { cause, .. } => {
                 // The lane's handle goes, which is what lets its events end, and the reader is kept
                 // and read to its end: what the lane says behind its end, the barriers it did not
