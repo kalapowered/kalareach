@@ -544,7 +544,7 @@ impl Request {
     }
 
     /// What the request's failure said where whether the daemon took the stop is not known.
-    const fn not_known(&self) -> Option<&Shown> {
+    pub(crate) const fn not_known(&self) -> Option<&Shown> {
         match self {
             Self::Told => None,
             Self::MaybeAsked(failure) => Some(failure),

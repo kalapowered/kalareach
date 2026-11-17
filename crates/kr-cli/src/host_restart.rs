@@ -331,6 +331,49 @@ struct Stopped {
     /// The stop's own words, where its request could not be made and the daemon was seen to end:
     /// the restart did not stop it, and says so before it says what its start did.
     first: Option<Shown>,
+    /// What the request's failure said, where the request was written and whether the daemon took
+    /// it is not known: the restart did not see it take the stop, and says so before it says what
+    /// its start did.
+    unknown: Option<Shown>,
+}
+
+impl Stopped {
+    /// The stop's words as the first sentence of a result: where the request could not be made,
+    /// the words for that; where its outcome is not known, the stop's words for that, closed by a
+    /// full stop; and none where the daemon took the stop.
+    fn opening(&self, id: EnvironmentId) -> Option<Shown> {
+        match (&self.first, &self.unknown) {
+            (Some(first), _) => Some(first.clone()),
+            (None, Some(_)) => Some(shown!("{}.", self.clause(id))),
+            (None, None) => None,
+        }
+    }
+
+    /// The stop's words that open a sentence of the result: that the daemon was stopped where it
+    /// took the stop, and that it ended where the request's outcome is not known.
+    fn clause(&self, id: EnvironmentId) -> Shown {
+        stop_clause(id, self.named, self.unknown.as_ref())
+    }
+}
+
+/// What the restart says of the daemon's end: that it stopped the daemon where the daemon took the
+/// stop, and, where the request's outcome is not known (`unknown` is its failure), the stop's own
+/// words that the daemon did not show whether it took the stop and that it has ended.
+fn stop_clause(id: EnvironmentId, named: Option<u64>, unknown: Option<&Shown>) -> Shown {
+    match unknown {
+        None => shown!(
+            "Stopped the control daemon for environment {}{}",
+            id,
+            process_said(named)
+        ),
+        Some(failure) => shown!(
+            "The control daemon for environment {}{} did not show whether it took the stop ({}), \
+             and it has ended",
+            id,
+            process_said(named),
+            *failure
+        ),
+    }
 }
 
 /// A control daemon answers: asks how it was started, refuses before it stops anything where the
@@ -409,25 +452,40 @@ async fn restart_the_daemon(
             .await;
         }
     };
+    match stopped_by_the_request(settled, info.generation) {
+        Ok((stopped, old)) => {
+            after_the_end(host, environment, json, progress, past, begun, stopped, old).await
+        }
+        // The daemon was not seen to end: the stop's own words, with nothing started.
+        Err(settled) => host_stop::say_the_stop(
+            Which::Restart,
+            *settled,
+            environment,
+            &begun.none,
+            json,
+            progress,
+            &begun.earlier,
+        ),
+    }
+}
+
+/// What the restart's stop came to where its request was written and the daemon was seen to end,
+/// and the daemon's identity where the stop read it; the stop as it came out where the daemon was
+/// not seen to end, which the stop says in its own words.
+fn stopped_by_the_request(
+    settled: Settled,
+    generation: ControllerGeneration,
+) -> std::result::Result<(Stopped, Option<kr_protocol::identity::ProcessStartIdentity>), Box<Settled>>
+{
     let (successor, named) = match &settled.ended {
         End::Gone => (None, settled.old.as_ref().map(|old| old.pid.get())),
         End::Successor(successor) => (
             Some(*successor),
             settled.old.as_ref().map(|old| old.pid.get()),
         ),
-        // The daemon was not seen to end: the stop's own words, with nothing started.
-        End::NotEnded(..) => {
-            return host_stop::say_the_stop(
-                Which::Restart,
-                settled,
-                environment,
-                &begun.none,
-                json,
-                progress,
-                &begun.earlier,
-            );
-        }
+        End::NotEnded(..) => return Err(Box::new(settled)),
     };
+    let unknown = settled.request.not_known().cloned();
     let Settled {
         pid,
         unsettled,
@@ -439,10 +497,11 @@ async fn restart_the_daemon(
         pid,
         unsettled,
         successor,
-        generation: Some(info.generation),
+        generation: Some(generation),
         first: None,
+        unknown,
     };
-    after_the_end(host, environment, json, progress, past, begun, stopped, old).await
+    Ok((stopped, old))
 }
 
 /// What ended the command before the daemon's end was waited for. A daemon that was seen to end
@@ -552,6 +611,7 @@ fn stopped_unmade(
         },
         generation,
         first: Some(first),
+        unknown: None,
     };
     (stopped, old)
 }
@@ -605,51 +665,17 @@ async fn after_the_end(
         None => start_and_prove(host, environment, stopped.generation, progress, past).await,
     };
     let creates = host_stop::creates_under_way(stopped.unsettled);
+    let opening = stopped.opening(id);
     match proved {
-        Ok(Proved::Ours(started)) => {
+        Ok(proved) => {
             progress.remove_marker();
-            let said = match &stopped.first {
-                None => restarted_said(id, stopped.named, &started, creates),
-                Some(first) => unmade_then_started_said(first, &started),
-            };
-            host_stop::done(
-                &said,
-                &Facts {
+            let said = said_after_the_proof(id, &stopped, &proved, creates);
+            let facts = match proved {
+                Proved::Ours(started) => Facts {
                     started: Some(Some(started_fact(&started))),
                     ..facts
                 },
-                json,
-                &begun.earlier,
-            )
-        }
-        Ok(Proved::Another {
-            serving,
-            launched,
-            cut,
-        }) => {
-            progress.remove_marker();
-            let said = match (&stopped.first, launched) {
-                (Some(first), launched) => unmade_and_another_serves_said(
-                    first,
-                    stopped.successor.is_some(),
-                    serving,
-                    launched,
-                    cut,
-                ),
-                (None, Some(started)) if cut => stopped_and_another_serves_after_a_cut(
-                    id,
-                    stopped.named,
-                    serving,
-                    &started,
-                    creates,
-                ),
-                (None, launched) => stopped_and_another_already_serves_said(
-                    id,
-                    stopped.named,
-                    serving,
-                    launched,
-                    creates,
-                ),
+                Proved::Another { .. } => facts,
             };
             host_stop::done(&said, &facts, json, &begun.earlier)
         }
@@ -658,13 +684,56 @@ async fn after_the_end(
                 .reported(
                     environment,
                     Had::Daemon(stopped.named),
-                    stopped.first.as_ref(),
+                    opening.as_ref(),
                     json,
                     progress,
                     &facts,
                 )
                 .await
         }
+    }
+}
+
+/// What the restart says where its start came to `proved` after a stop that came to `stopped`: the
+/// stop's words come first (that the daemon was stopped, or what the stop's own words say where its
+/// request could not be made or its outcome is not known), then what the start did.
+fn said_after_the_proof(
+    id: EnvironmentId,
+    stopped: &Stopped,
+    proved: &Proved,
+    creates: Shown,
+) -> Shown {
+    match proved {
+        Proved::Ours(started) => match stopped.opening(id) {
+            None => restarted_said(id, stopped.named, started, creates),
+            Some(first) => unmade_then_started_said(&first, started),
+        },
+        Proved::Another {
+            serving,
+            launched,
+            cut,
+        } => match (&stopped.first, launched) {
+            (Some(first), launched) => unmade_and_another_serves_said(
+                first,
+                stopped.successor.is_some(),
+                *serving,
+                *launched,
+                *cut,
+            ),
+            (None, Some(started)) if *cut => stopped_and_another_serves_after_a_cut(
+                &stopped.clause(id),
+                *serving,
+                started,
+                creates,
+            ),
+            (None, launched) => stopped_and_another_already_serves_said(
+                &stopped.clause(id),
+                *serving,
+                *launched,
+                stopped.unknown.is_some(),
+                creates,
+            ),
+        },
     }
 }
 
@@ -904,23 +973,26 @@ fn restarted_said(id: EnvironmentId, old: Option<u64>, started: &Started, create
     )
 }
 
-/// What a restart says where it stopped a daemon and another daemon already serves the
-/// environment: the process that answers, and where this command launched a start, that it did not
-/// take the environment.
+/// What a restart says where the daemon ended and another daemon already serves the environment:
+/// the stop's words (`clause`), the process that answers, and where this command launched a start,
+/// that it did not take the environment. Where the request's outcome is not known and this command
+/// launched nothing, it says that it started none.
 fn stopped_and_another_already_serves_said(
-    id: EnvironmentId,
-    stopped: Option<u64>,
+    clause: &Shown,
     serving: Option<u64>,
     launched: Option<Started>,
+    say_none_started: bool,
     creates: Shown,
 ) -> Shown {
+    let own = match launched {
+        None if say_none_started => Shown::said(" This command started none."),
+        launched => Proved::own_start_said(launched),
+    };
     shown!(
-        "Stopped the control daemon for environment {}{}; a control daemon already serves it{}.{} \
-         No session was stopped.{}",
-        id,
-        process_said(stopped),
+        "{}; a control daemon already serves it{}.{} No session was stopped.{}",
+        *clause,
         process_said(serving),
-        Proved::own_start_said(launched),
+        own,
         creates
     )
 }
@@ -958,22 +1030,20 @@ fn none_ran_and_another_already_serves_said(
     )
 }
 
-/// What a restart says where it stopped a daemon, launched a start whose exchange was cut, and a
+/// What a restart says where the daemon ended, it launched a start whose exchange was cut, and a
 /// daemon of another process then gave a whole exchange. It says what it read and nothing of what
 /// became of the daemon on the cut connection: the control daemon that serves the environment now
 /// (process Q), and that its own start (process P) does not serve it.
 fn stopped_and_another_serves_after_a_cut(
-    id: EnvironmentId,
-    stopped: Option<u64>,
+    clause: &Shown,
     serving: Option<u64>,
     started: &Started,
     creates: Shown,
 ) -> Shown {
     shown!(
-        "Stopped the control daemon for environment {}{}; a control daemon now serves it{}. This \
-         command's own start{} does not serve it. No session was stopped.{}",
-        id,
-        process_said(stopped),
+        "{}; a control daemon now serves it{}. This command's own start{} does not serve it. No \
+         session was stopped.{}",
+        *clause,
         process_said(serving),
         process_said(started.pid.map(u64::from)),
         creates
@@ -996,6 +1066,21 @@ fn none_ran_and_another_serves_after_a_cut(
         process_said(started.pid.map(u64::from)),
         under_way
     )
+}
+
+/// What a restart says where its start failed after a stop whose words come first (`first`), or
+/// after what it had stopped where the stop's words are not the first.
+fn failure_said(
+    id: EnvironmentId,
+    had: Had,
+    first: Option<&Shown>,
+    own: Shown,
+    launched: bool,
+) -> Shown {
+    match first {
+        None => start_failed_said(id, had, own, launched),
+        Some(first) => unmade_and_start_failed_said(first, own, launched),
+    }
 }
 
 /// What a restart says where its start failed: what it had stopped, the start's own words, that the
@@ -1076,10 +1161,7 @@ impl StartFailed {
         {
             progress.remove_marker();
         }
-        let message = match first {
-            None => start_failed_said(id, had, self.error.said(), self.launched),
-            Some(first) => unmade_and_start_failed_said(first, self.error.said(), self.launched),
-        };
+        let message = failure_said(id, had, first, self.error.said(), self.launched);
         let error = match self.error {
             CliError::HostUnavailable(_) => CliError::HostUnavailable(message),
             CliError::Unfinished { code, .. } => CliError::Unfinished { code, message },
@@ -1303,6 +1385,7 @@ fn interrupt_says(progress: &Progress, stage: Stage, past: &Past) -> (Knows, Sho
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_stop::Request;
 
     fn started(pid: Option<u32>) -> Started {
         Started {
@@ -1412,8 +1495,7 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let id = host.environment_id();
         let said = stopped_and_another_serves_after_a_cut(
-            id,
-            Some(30),
+            &stop_clause(id, Some(30), None),
             Some(41),
             &started(Some(40)),
             Shown::said(""),
@@ -1427,8 +1509,12 @@ mod tests {
             )
         );
         let creates = host_stop::creates_under_way(Some(2));
-        let said =
-            stopped_and_another_serves_after_a_cut(id, None, Some(41), &started(Some(40)), creates);
+        let said = stopped_and_another_serves_after_a_cut(
+            &stop_clause(id, None, None),
+            Some(41),
+            &started(Some(40)),
+            creates,
+        );
         assert!(
             said.to_string().starts_with(&format!(
                 "Stopped the control daemon for environment {id}; a control daemon now serves it \
@@ -1523,10 +1609,10 @@ mod tests {
         let id = host.environment_id();
         assert_eq!(
             stopped_and_another_already_serves_said(
-                id,
-                Some(30),
+                &stop_clause(id, Some(30), None),
                 Some(41),
                 Some(started(Some(40))),
+                false,
                 Shown::said("")
             )
             .to_string(),
@@ -1537,8 +1623,14 @@ mod tests {
             )
         );
         assert_eq!(
-            stopped_and_another_already_serves_said(id, Some(30), None, None, Shown::said(""))
-                .to_string(),
+            stopped_and_another_already_serves_said(
+                &stop_clause(id, Some(30), None),
+                None,
+                None,
+                false,
+                Shown::said("")
+            )
+            .to_string(),
             format!(
                 "Stopped the control daemon for environment {id} (process 30); a control daemon \
                  already serves it. No session was stopped."
@@ -1781,79 +1873,101 @@ mod tests {
         }
     }
 
-    /// The stop's own words for a request that could not be made where the daemon ended, as the
-    /// restart takes them, and the environment they name.
-    fn the_stops_words_for_an_end_without_a_request() -> (EnvironmentId, Shown) {
+    /// The restart's stop where its request could not be made and the daemon was seen to end: the
+    /// stop's own words for that state, the environment they name, and what the restart makes of
+    /// them with what it read of the daemon before.
+    fn a_stop_whose_request_could_not_be_made(end: End) -> (EnvironmentId, Shown, Stopped) {
         let id = kr_ipc::testing::TempHost::create().environment_id();
         let first = host_stop::ended_before_the_request_said(
             id,
             Some(4000),
-            &End::Gone,
+            &end,
             &Shown::said("the connection closed"),
         );
-        assert_eq!(
-            first.to_string(),
-            format!(
-                "The control daemon for environment {id} (process 4000) ended, and this command \
-                 could not make its request for it: the connection closed. This command sent \
-                 nothing."
-            )
-        );
-        (id, first)
+        let before = Before::Ended {
+            said: first.clone(),
+            pid: Some(4000),
+            end,
+        };
+        let Ok(ended) = ended_without_a_request(before) else {
+            panic!("an end that was seen goes on");
+        };
+        let (stopped, _) = stopped_unmade(Some((ControllerGeneration::new(3), None)), ended);
+        (id, first, stopped)
+    }
+
+    fn another(serving: Option<u64>, launched: Option<Started>, cut: bool) -> Proved {
+        Proved::Another {
+            serving,
+            launched,
+            cut,
+        }
     }
 
     /// Where the stop's request could not be made and the daemon was seen to end, the restart says
     /// the stop's own words first, that it did not stop the daemon, and then what its start did:
     /// the start took the environment, another daemon serves it (with this command's own start
     /// or with none, and after a cut exchange), another daemon holds it since the end, or the
-    /// start failed.
+    /// start failed. The words are those of the result that the decision makes, from the stop's
+    /// words as it gives them.
     #[test]
     fn a_request_that_could_not_be_made_where_the_daemon_ended_says_so_and_then_what_the_start_did()
     {
-        let (_, first) = the_stops_words_for_an_end_without_a_request();
+        let (id, first, stopped) = a_stop_whose_request_could_not_be_made(End::Gone);
         let x = first.to_string();
+        let said = |proved: &Proved| {
+            said_after_the_proof(id, &stopped, proved, Shown::said("")).to_string()
+        };
         let start = start_said(&started(Some(40)));
         assert_eq!(
-            unmade_then_started_said(&first, &started(Some(40))).to_string(),
+            said(&Proved::Ours(started(Some(40)))),
             format!(
                 "{x} This command then started a control daemon (process 40) under the {start} \
                  start. No session was stopped."
             )
         );
         assert_eq!(
-            unmade_and_another_serves_said(&first, false, Some(50), Some(started(Some(40))), false)
-                .to_string(),
+            said(&another(Some(50), Some(started(Some(40))), false)),
             format!(
                 "{x} A control daemon already serves the environment (process 50). This command's \
                  own start (process 40) did not take the environment. No session was stopped."
             )
         );
         assert_eq!(
-            unmade_and_another_serves_said(&first, false, Some(50), None, false).to_string(),
+            said(&another(Some(50), None, false)),
             format!(
                 "{x} A control daemon already serves the environment (process 50). This command \
                  started none. No session was stopped."
             )
         );
         assert_eq!(
-            unmade_and_another_serves_said(&first, false, Some(50), Some(started(Some(40))), true)
-                .to_string(),
+            said(&another(Some(50), Some(started(Some(40))), true)),
             format!(
                 "{x} A control daemon now serves the environment (process 50). This command's own \
                  start (process 40) does not serve it. No session was stopped."
             )
         );
+        let (id, first, successor) =
+            a_stop_whose_request_could_not_be_made(End::Successor(Some(77)));
         assert_eq!(
-            unmade_and_another_serves_said(&first, true, Some(50), None, false).to_string(),
-            format!("{x} This command sent nothing and started none. No session was stopped.")
+            said_after_the_proof(
+                id,
+                &successor,
+                &another(Some(77), None, false),
+                Shown::said("")
+            )
+            .to_string(),
+            format!("{first} This command sent nothing and started none. No session was stopped.")
         );
         for (launched, still) in [
             (false, ""),
             (true, " The requested daemon may still start."),
         ] {
             assert_eq!(
-                unmade_and_start_failed_said(
-                    &first,
+                failure_said(
+                    id,
+                    Had::Daemon(stopped.named),
+                    stopped.opening(id).as_ref(),
                     Shown::said("the log could not be used"),
                     launched
                 )
@@ -1868,27 +1982,135 @@ mod tests {
     }
 
     /// A request that could not be made where the daemon was seen to end, or another holds the
-    /// environment now, goes on to the start with the stop's own words and what the end was; any
-    /// other end of a request that could not be made is the stop's.
+    /// environment now, goes on to the start with the stop's own words and what the end was, which
+    /// the result reads: a daemon that holds the environment since the end is not started beside;
+    /// any other end of a request that could not be made is the stop's.
     #[test]
     fn only_an_end_that_was_seen_goes_on_to_the_start_and_any_other_is_the_stops() {
-        let said = Shown::said("the daemon ended");
-        for end in [End::Gone, End::Successor(Some(77))] {
-            let before = Before::Ended {
-                said: said.clone(),
-                pid: Some(4000),
-                end,
-            };
-            match ended_without_a_request(before) {
-                Ok((first, pid, _)) => {
-                    assert_eq!(first.to_string(), "the daemon ended");
-                    assert_eq!(pid, Some(4000));
-                }
-                Err(_) => panic!("an end that was seen goes on"),
-            }
+        for (end, successor) in [
+            (End::Gone, None),
+            (End::Successor(Some(77)), Some(Some(77))),
+            (End::Successor(None), Some(None)),
+        ] {
+            let (_, first, stopped) = a_stop_whose_request_could_not_be_made(end);
+            assert_eq!(stopped.successor, successor);
+            assert_eq!(stopped.named, Some(4000));
+            assert_eq!(stopped.first.as_ref(), Some(&first));
         }
         for before in [Before::Silent { accepted: true }, Before::OwnFault] {
             assert!(ended_without_a_request(before).is_err());
         }
+    }
+
+    /// The stop's request as the stop settled it where the daemon was seen to end: the process it
+    /// named, and what the request came to.
+    fn settled(request: Request, ended: End) -> Settled {
+        Settled {
+            request,
+            ended,
+            pid: Some(4000),
+            unsettled: None,
+            old: Some(kr_protocol::identity::ProcessStartIdentity::new(
+                4000,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                1,
+            )),
+        }
+    }
+
+    /// Where the daemon took the stop the restart says that it stopped the daemon; where the request
+    /// was written and the daemon did not show whether it took it, the restart says the stop's own
+    /// words for that, and never "Stopped", before what its start did; where the daemon was not seen
+    /// to end the stop says it.
+    #[test]
+    fn a_stop_whose_outcome_is_not_known_is_said_so_before_what_the_start_did() {
+        let id = kr_ipc::testing::TempHost::create().environment_id();
+        let failure = Shown::said("the connection closed");
+        let generation = ControllerGeneration::new(3);
+        let Ok((taken, _)) = stopped_by_the_request(settled(Request::Told, End::Gone), generation)
+        else {
+            panic!("an end that was seen goes on");
+        };
+        let Ok((unknown, _)) = stopped_by_the_request(
+            settled(Request::MaybeAsked(failure.clone()), End::Gone),
+            generation,
+        ) else {
+            panic!("an end that was seen goes on");
+        };
+        let said = |stopped: &Stopped, proved: &Proved| {
+            said_after_the_proof(id, stopped, proved, Shown::said("")).to_string()
+        };
+        let s = format!(
+            "The control daemon for environment {id} (process 4000) did not show whether it \
+             took the stop (the connection closed), and it has ended"
+        );
+        let start = start_said(&started(Some(40)));
+        assert_eq!(
+            said(&taken, &Proved::Ours(started(Some(40)))),
+            format!(
+                "Restarted the control daemon for environment {id} (process 4000 ended, process \
+                 40 started) under the {start} start. No session was stopped."
+            )
+        );
+        assert_eq!(
+            said(&unknown, &Proved::Ours(started(Some(40)))),
+            format!(
+                "{s}. This command then started a control daemon (process 40) under the {start} \
+                 start. No session was stopped."
+            )
+        );
+        assert_eq!(
+            said(&unknown, &another(Some(50), Some(started(Some(40))), false)),
+            format!(
+                "{s}; a control daemon already serves it (process 50). This command's own start \
+                 (process 40) did not take the environment. No session was stopped."
+            )
+        );
+        assert_eq!(
+            said(&unknown, &another(Some(50), Some(started(Some(40))), true)),
+            format!(
+                "{s}; a control daemon now serves it (process 50). This command's own start \
+                 (process 40) does not serve it. No session was stopped."
+            )
+        );
+        assert_eq!(
+            said(&unknown, &another(Some(50), None, false)),
+            format!(
+                "{s}; a control daemon already serves it (process 50). This command started \
+                 none. No session was stopped."
+            )
+        );
+        assert_eq!(
+            said(&taken, &another(Some(50), None, false)),
+            format!(
+                "Stopped the control daemon for environment {id} (process 4000); a control daemon \
+                 already serves it (process 50). No session was stopped."
+            )
+        );
+        assert_eq!(
+            failure_said(
+                id,
+                Had::Daemon(unknown.named),
+                unknown.opening(id).as_ref(),
+                Shown::said("the log could not be used"),
+                true
+            )
+            .to_string(),
+            format!(
+                "{s}. This command's start failed: the log could not be used. The requested \
+                 daemon may still start. No session was stopped: its workers keep running and a \
+                 local attach still works. Fix the cause and run kr host restart again."
+            )
+        );
+        let Err(not_ended) = stopped_by_the_request(
+            settled(
+                Request::Told,
+                End::NotEnded(crate::host_stop::Why::Running, None),
+            ),
+            generation,
+        ) else {
+            panic!("a daemon that was not seen to end is the stop's");
+        };
+        assert!(matches!(not_ended.ended, End::NotEnded(..)));
     }
 }
