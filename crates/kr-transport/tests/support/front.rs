@@ -46,9 +46,18 @@ pub struct RelayFront {
 /// way when it stopped can end after the switch, so it can still take this much from each connection.
 pub const CHUNK: usize = 16 * 1024;
 
-/// The receive buffer of a stalling front's listener, which its accepted sockets inherit: a few
-/// KiB, so that a stalled front takes almost nothing of what the device sends.
-const STALLED_RECEIVE_BUFFER: u32 = 4096;
+/// The receive buffer that a stalling front's listener can be given, which its accepted sockets
+/// inherit: a few KiB, so that a stalled front takes almost nothing of what the device sends and
+/// the device's queue for the relay fills.
+///
+/// A buffer this small also leaves a window of about one segment after a stop. The sockets of a
+/// case on Linux showed what follows: the device's side of the connection sends one segment on
+/// each round of its persist timer, so the bytes that the stop held back drain at about ten KB a
+/// second, or slower, for tens of seconds after the resume, and nothing a host sends in that
+/// time reaches the relay. A case that needs the hosts of the stopped relay answered again soon
+/// after the resume gives the front no buffer of its own (`None`), which leaves the system's
+/// default.
+pub const STALLED_RECEIVE_BUFFER: u32 = 4096;
 
 impl RelayFront {
     /// Starts a front that passes every connection to `relay` unchanged, so the relay's own TLS
@@ -154,7 +163,8 @@ impl RelayFront {
     }
 
     /// Starts a front that passes every byte to `relay` and back until it is told to stall, with
-    /// a receive buffer of a few KiB of its own.
+    /// `receive_buffer` bytes as the receive buffer of its listener (see
+    /// [`STALLED_RECEIVE_BUFFER`]) or, for `None`, the system's default.
     ///
     /// Stalled, it starts no pass of its copy loop on any connection that it holds, so the sockets
     /// stay open and the device's side of each fills. The switch does not stop a pass that is under
@@ -164,7 +174,7 @@ impl RelayFront {
     /// meets a connection that never completes its handshake and not a refusal. On resume it
     /// passes again, bytes and new connections alike; a chunk that was read is written and the
     /// rest was never read, so no byte is lost.
-    pub fn stalling(relay: &LocalRelay) -> Self {
+    pub fn stalling(relay: &LocalRelay, receive_buffer: Option<u32>) -> Self {
         let upstream = authority(&relay.url);
         let (switch, gate) = watch::channel(false);
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -178,9 +188,11 @@ impl RelayFront {
         let (counting, counted) = (Arc::clone(&accepted), Arc::clone(&from_device));
         runtime.spawn(async move {
             let socket = TcpSocket::new_v4().expect("a front socket");
-            socket
-                .set_recv_buffer_size(STALLED_RECEIVE_BUFFER)
-                .expect("a small receive buffer");
+            if let Some(bytes) = receive_buffer {
+                socket
+                    .set_recv_buffer_size(bytes)
+                    .expect("a small receive buffer");
+            }
             socket
                 .bind((Ipv4Addr::LOCALHOST, 0).into())
                 .expect("a front address");
