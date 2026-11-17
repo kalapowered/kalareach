@@ -6506,6 +6506,12 @@ impl WorkerService {
         // The authority binding goes with the registration. A connection whose registration has
         // been withdrawn must not still be one a generation speaks through.
         self.unbind(connection_id);
+        // Counted from before the registration leaves the registry until the last attachment is
+        // detached, so that a statement's acknowledgement does not go out while this withdrawal is
+        // still detaching what a restriction asked it to take back: a sweep that runs after the
+        // remove finds no registration and sees only this count. It is lowered again by the
+        // return below where the remove finds nothing.
+        let _running = RunningCount::begin(&self.withdrawals_running);
         let held = self
             .admitted
             .lock()
@@ -6516,10 +6522,6 @@ impl WorkerService {
         };
         #[cfg(feature = "testing")]
         self.withdrawal_gap_stall.stand();
-        // Counted from the moment the registration is gone from the registry until the last
-        // attachment is detached, so that a statement's acknowledgement does not go out while
-        // this withdrawal is still detaching what a restriction asked it to take back.
-        let _running = RunningCount::begin(&self.withdrawals_running);
         if let Some(task) = registration
             .delivery
             .lock()
