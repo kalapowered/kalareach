@@ -7768,3 +7768,67 @@ fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
     assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
 }
+
+/// KR-REQ-07.12 (a restart that waits for the daemon that holds the environment since the end): its
+/// greeting failed, the daemon ended and another holds the environment, so the command asks nothing
+/// and starts nothing while it waits for that daemon to answer. No record of an attempt
+/// stands in that time, since none of the phases a record names has happened; the result names the
+/// daemon that answers and says that this command launched none. The wait for the record to stay
+/// absent is a bounded series of looks, because nothing signals that the command is waiting.
+#[test]
+fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_record() {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    let lock = host.tree.environment().singleton_lock();
+    let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
+        .expect("takes the lock");
+    let mut old = a_process_named_kr_controller(&host, "old");
+    let mut successor = a_process_named_kr_controller(&host, "successor");
+    std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
+    let mut first = TestDaemon::serve_generation(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::EndAtTheGreeting,
+        true,
+        0,
+    );
+    let running = start(host.kr(&["--json", "host", "restart"]));
+    let looked_for = Instant::now() + Duration::from_secs(60);
+    while first.stopped_listening_at().is_none() {
+        assert!(
+            Instant::now() < looked_for,
+            "the command never greeted the daemon"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The old daemon ends, and the lock is held again by the one that replaces it.
+    old.kill().expect("ends the old daemon");
+    old.wait().expect("collects it");
+    std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
+    for _ in 0..20 {
+        assert!(
+            attempts(&host).is_empty(),
+            "a record stands where nothing was asked or started"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let mut second =
+        TestDaemon::serve_generation(&host, "kr-controller/9.9.9", OnStop::Refuse, true, 2);
+    let output = running.finish("kr host restart");
+    let said = document(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(0), "{said}");
+    assert_eq!(stop_of(&said), "ended", "{said}");
+    assert_eq!(
+        said["serving"].as_u64(),
+        Some(u64::from(successor.id())),
+        "{said}"
+    );
+    assert_eq!(said["launched"], Value::Null, "{said}");
+    assert!(attempts(&host).is_empty(), "no record stands");
+    let _ = successor.kill();
+    let _ = successor.wait();
+    drop(held);
+    first.end();
+    second.end();
+}
