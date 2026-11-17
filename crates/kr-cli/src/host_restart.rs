@@ -1038,18 +1038,12 @@ fn unmade_and_another_serves_said(
 
 /// What a restart says where the stop's request could not be made, the daemon was seen to end and
 /// the start failed: the stop's own words, the start's, and what to do.
-fn unmade_and_start_failed_said(first: &Shown, own: Shown, launched: bool) -> Shown {
-    let still = if launched {
-        Shown::said(" The requested daemon may still start.")
-    } else {
-        Shown::said("")
-    };
+fn unmade_and_start_failed_said(first: &Shown, own: Shown, launched: bool, reach: Reach) -> Shown {
     shown!(
-        "{} This command's start failed: {}.{} No session was stopped: its workers keep running and \
-         a local attach still works. Paired devices cannot connect until a control daemon runs. Fix the cause and run kr host restart again.",
+        "{} This command's start failed: {}.{}",
         *first,
         own,
-        still
+        failure_tail(true, launched, reach)
     )
 }
 
@@ -1247,17 +1241,82 @@ fn failure_said(
     first: Option<&Shown>,
     own: Shown,
     launched: bool,
+    reach: Reach,
 ) -> Shown {
     match first {
-        None => start_failed_said(id, had, own, launched),
-        Some(first) => unmade_and_start_failed_said(first, own, launched),
+        None => start_failed_said(id, had, own, launched, reach),
+        Some(first) => unmade_and_start_failed_said(first, own, launched, reach),
+    }
+}
+
+/// What a failed start knows of a control daemon besides its own words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// No control daemon answered during the start, and none answers now.
+    Nobody,
+    /// A control daemon answers now, whether or not one answered during the start.
+    Answers,
+    /// A control daemon answered during the start, and none answers now.
+    Answered,
+}
+
+/// What a failure says after the start's own words: that a requested daemon may still start where
+/// none answered or answers; what became of the sessions (`stopped`: the old daemon was stopped);
+/// what is known of a control daemon; and what to do. Paired devices are said to be unable to
+/// connect only where the old daemon was stopped and no daemon answers now, and a requested daemon
+/// is said to be able to start only where no daemon answered at all, since a daemon that holds the
+/// environment lets no second one start.
+fn failure_tail(stopped: bool, launched: bool, reach: Reach) -> Shown {
+    let sessions = if stopped {
+        Shown::said(
+            "No session was stopped: its workers keep running and a local attach still works.",
+        )
+    } else {
+        Shown::said("Nothing was stopped.")
+    };
+    let paired = if stopped {
+        Shown::said(" Paired devices cannot connect until a control daemon runs.")
+    } else {
+        Shown::said("")
+    };
+    match reach {
+        Reach::Nobody => {
+            let still = if launched {
+                Shown::said(" The requested daemon may still start.")
+            } else {
+                Shown::said("")
+            };
+            shown!(
+                "{} {}{} Fix the cause and run kr host restart again.",
+                still,
+                sessions,
+                paired
+            )
+        }
+        Reach::Answers => shown!(
+            " A control daemon answers now. {} Run kr host restart again if that daemon must be \
+             replaced.",
+            sessions
+        ),
+        Reach::Answered => shown!(
+            " A control daemon answered during the start, and none answers now. {}{} Run kr host \
+             restart again.",
+            sessions,
+            paired
+        ),
     }
 }
 
 /// What a restart says where its start failed: what it had stopped, the start's own words, that the
 /// requested daemon may still start where a daemon was launched and not seen to end, that no
 /// session was stopped, and what to do.
-fn start_failed_said(id: EnvironmentId, had: Had, own: Shown, launched: bool) -> Shown {
+fn start_failed_said(
+    id: EnvironmentId,
+    had: Had,
+    own: Shown,
+    launched: bool,
+    reach: Reach,
+) -> Shown {
     let stop = match had {
         Had::NoDaemon => shown!(
             "No control daemon was running for environment {} and the start failed",
@@ -1269,24 +1328,11 @@ fn start_failed_said(id: EnvironmentId, had: Had, own: Shown, launched: bool) ->
             process_said(pid)
         ),
     };
-    let still = if launched {
-        Shown::said(" The requested daemon may still start.")
-    } else {
-        Shown::said("")
-    };
-    let sessions = match had {
-        Had::NoDaemon => Shown::said("Nothing was stopped."),
-        Had::Daemon(_) => Shown::said(
-            "No session was stopped: its workers keep running and a local attach still works. \
-             Paired devices cannot connect until a control daemon runs.",
-        ),
-    };
     shown!(
-        "{}: {}.{} {} Fix the cause and run kr host restart again.",
+        "{}: {}.{}",
         stop,
         own,
-        still,
-        sessions
+        failure_tail(matches!(had, Had::Daemon(_)), launched, reach)
     )
 }
 
@@ -1306,6 +1352,9 @@ pub(crate) struct StartFailed {
     /// Whether a daemon was started, or the service manager or the task was asked to start one: the
     /// requested daemon may still come up.
     pub(crate) launched: bool,
+    /// Whether a control daemon answered during the start: the proof's failures come after an
+    /// answer, and a start's own failure comes before one.
+    pub(crate) answered: bool,
 }
 
 impl StartFailed {
@@ -1323,17 +1372,24 @@ impl StartFailed {
     ) -> Completion {
         let id = environment.environment_id;
         let _ = progress.with_marker(|marker| marker.start_failed());
-        // A daemon that answers now, started by something else meanwhile, leaves the record
-        // nothing to say: it is removed, and the failure is still said as it was.
-        if let Ok(endpoint) = environment.paths.controller_endpoint()
+        // A daemon that answers now leaves the record nothing to say: it is removed, and the
+        // failure says that a daemon answers.
+        let answers_now = if let Ok(endpoint) = environment.paths.controller_endpoint()
             && matches!(
                 startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await,
                 startup::Reached::Answered(_)
-            )
-        {
+            ) {
             progress.remove_marker();
-        }
-        let message = failure_said(id, had, first, self.error.said(), self.launched);
+            true
+        } else {
+            false
+        };
+        let reach = match (answers_now, self.answered) {
+            (true, _) => Reach::Answers,
+            (false, true) => Reach::Answered,
+            (false, false) => Reach::Nobody,
+        };
+        let message = failure_said(id, had, first, self.error.said(), self.launched, reach);
         let error = match self.error {
             CliError::HostUnavailable(_) => CliError::HostUnavailable(message),
             CliError::Unfinished { code, .. } => CliError::Unfinished { code, message },
@@ -1929,7 +1985,8 @@ mod tests {
         let id = host.environment_id();
         let own = Shown::said("the daemon did not answer");
         assert_eq!(
-            start_failed_said(id, Had::Daemon(Some(30)), own.clone(), true).to_string(),
+            start_failed_said(id, Had::Daemon(Some(30)), own.clone(), true, Reach::Nobody)
+                .to_string(),
             format!(
                 "The control daemon for environment {id} (process 30) was stopped and the start \
                  failed: the daemon did not answer. The requested daemon may still start. No \
@@ -1938,13 +1995,98 @@ mod tests {
             )
         );
         assert_eq!(
-            start_failed_said(id, Had::NoDaemon, own, false).to_string(),
+            start_failed_said(id, Had::NoDaemon, own, false, Reach::Nobody).to_string(),
             format!(
                 "No control daemon was running for environment {id} and the start failed: the \
                  daemon did not answer. Nothing was stopped. Fix the cause and run kr host \
                  restart again."
             )
         );
+    }
+
+    /// A start that fails after a control daemon answered, with a proof's own words, says what is
+    /// known of a daemon and not that none runs: where a daemon answers now it says only that, and
+    /// does not say that a requested daemon may still start or that paired devices cannot connect;
+    /// where one answered during the start and none answers now it says that, and the sentence on
+    /// paired devices stands. The frame is the same where the old daemon's stop opens it.
+    #[test]
+    fn a_start_that_fails_after_a_daemon_answered_says_what_is_known_of_a_daemon() {
+        let host = kr_ipc::testing::TempHost::create();
+        let id = host.environment_id();
+        let own = || {
+            Shown::said(
+                "this command started a control daemon (process 31) but could not read which \
+                 control daemon serves the environment, and no control daemon gave a whole answer \
+                 within 30 seconds",
+            )
+        };
+        let first = Shown::said("The control daemon for environment E ended.");
+        let stopped = format!(
+            "The control daemon for environment {id} (process 30) was stopped and the start failed: "
+        );
+        let sessions =
+            "No session was stopped: its workers keep running and a local attach still works.";
+        assert_eq!(
+            start_failed_said(id, Had::Daemon(Some(30)), own(), false, Reach::Answers).to_string(),
+            format!(
+                "{stopped}{}. A control daemon answers now. {sessions} Run kr host restart again if that daemon must be replaced.",
+                own()
+            )
+        );
+        assert_eq!(
+            start_failed_said(id, Had::Daemon(Some(30)), own(), false, Reach::Answered).to_string(),
+            format!(
+                "{stopped}{}. A control daemon answered during the start, and none answers now. {sessions} Paired devices cannot connect until a control daemon runs. Run kr host restart again.",
+                own()
+            )
+        );
+        assert_eq!(
+            start_failed_said(id, Had::NoDaemon, own(), false, Reach::Answers).to_string(),
+            format!(
+                "No control daemon was running for environment {id} and the start failed: {}. A control daemon answers now. Nothing was stopped. Run kr host restart again if that daemon must be replaced.",
+                own()
+            )
+        );
+        assert_eq!(
+            start_failed_said(id, Had::NoDaemon, own(), false, Reach::Answered).to_string(),
+            format!(
+                "No control daemon was running for environment {id} and the start failed: {}. A control daemon answered during the start, and none answers now. Nothing was stopped. Run kr host restart again.",
+                own()
+            )
+        );
+        for launched in [false, true] {
+            assert_eq!(
+                failure_said(
+                    id,
+                    Had::Daemon(Some(30)),
+                    Some(&first),
+                    own(),
+                    launched,
+                    Reach::Answers
+                )
+                .to_string(),
+                format!(
+                    "The control daemon for environment E ended. This command's start failed: {}. A control daemon answers now. {sessions} Run kr host restart again if that daemon must be replaced.",
+                    own()
+                ),
+                "no requested daemon may still start where one answers"
+            );
+            assert_eq!(
+                failure_said(
+                    id,
+                    Had::Daemon(Some(30)),
+                    Some(&first),
+                    own(),
+                    launched,
+                    Reach::Answered
+                )
+                .to_string(),
+                format!(
+                    "The control daemon for environment E ended. This command's start failed: {}. A control daemon answered during the start, and none answers now. {sessions} Paired devices cannot connect until a control daemon runs. Run kr host restart again.",
+                    own()
+                )
+            );
+        }
     }
 
     /// A start that cannot be made is refused before the stop with the start's own words, that
@@ -2211,7 +2353,8 @@ mod tests {
                     Had::Daemon(stopped.named),
                     stopped.opening(id).as_ref(),
                     Shown::said("the log could not be used"),
-                    launched
+                    launched,
+                    Reach::Nobody
                 )
                 .to_string(),
                 format!(
@@ -2335,7 +2478,8 @@ mod tests {
                 Had::Daemon(unknown.named),
                 unknown.opening(id).as_ref(),
                 Shown::said("the log could not be used"),
-                true
+                true,
+                Reach::Nobody
             )
             .to_string(),
             format!(

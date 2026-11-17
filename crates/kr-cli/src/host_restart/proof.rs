@@ -161,6 +161,7 @@ pub(super) async fn prove<O: Operations>(
             return Err(StartFailed {
                 error,
                 launched: launched.load(Ordering::SeqCst),
+                answered: false,
             });
         }
     };
@@ -175,6 +176,7 @@ pub(super) async fn prove<O: Operations>(
             message: Shown::said(message),
         },
         launched: started.is_some(),
+        answered: true,
     })?;
     Ok(if cut { proved.after_a_cut() } else { proved })
 }
@@ -209,6 +211,7 @@ async fn after_a_cut<O: Operations>(
                 },
                 // A daemon answered, so there is no requested daemon that may still start.
                 launched: false,
+                answered: true,
             });
         }
         operations.pause(LOOK_EVERY.min(left())).await;
@@ -695,6 +698,33 @@ mod tests {
              control daemon gave a whole answer within 30 seconds"
         );
         assert!(!launched);
+    }
+
+    /// Each failure of a proof says that a control daemon answered: the generation that was told to
+    /// stop, a daemon that states no process, and an exchange that stayed cut to the bound.
+    #[tokio::test(start_paused = true)]
+    async fn the_failures_of_a_proof_say_that_a_daemon_answered() {
+        let old = Old::Generation(ControllerGeneration::new(4));
+        let not_newer = Supplied::new(
+            Duration::ZERO,
+            started(100),
+            vec![says(4, Some(100))],
+            vec![],
+        );
+        let no_process = Supplied::new(Duration::ZERO, started(100), vec![says(5, None)], vec![]);
+        let cut_to_the_bound = Supplied::new(
+            Duration::ZERO,
+            started(100),
+            vec![cut()],
+            vec![at_once(None)],
+        );
+        for supplied in [not_newer, no_process, cut_to_the_bound] {
+            let failed = prove(&supplied, old, BOUND)
+                .await
+                .err()
+                .expect("the proof fails");
+            assert!(failed.answered, "a daemon answered");
+        }
     }
 
     /// A daemon that answers the information request and withholds the answer to the launch-only
