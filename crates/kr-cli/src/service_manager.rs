@@ -1015,8 +1015,21 @@ pub fn remove(environment: &EnvironmentPaths, _held: &Lock) -> Result<Removal> {
 pub enum Refusal {
     /// The service start is not set up as it has to be: what is wrong, and the setup action.
     NotSetUp(Shown),
-    /// The manager was asked and did not start the daemon, or could not be asked.
+    /// The manager could not be asked, or refused at once: its command could not be run, or it ran
+    /// and ended with a failure. Nothing was asked of the manager that it may still be doing.
     Failed(Shown),
+    /// The manager was asked to start the daemon and did not answer within its bound: the request
+    /// may still be carried out.
+    NoAnswer(Shown),
+}
+
+impl Refusal {
+    /// Whether the manager was asked to start the daemon and did not answer in time, so that the
+    /// daemon may still start.
+    #[must_use]
+    pub const fn may_still_start(&self) -> bool {
+        matches!(self, Self::NoAnswer(_))
+    }
 }
 
 /// A daemon the manager was asked to start.
@@ -1125,19 +1138,69 @@ fn text(path: &Path) -> Result<&str> {
     Ok(text)
 }
 
+/// Why a command put to the service manager gave no answer.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Debug)]
+struct Unanswered {
+    /// What happened, as a sentence says it.
+    why: Shown,
+    /// Whether the command was run and did not answer within its bound: the manager was asked. A
+    /// command that could not be run, or whose answer could not be read, did not ask it.
+    timed_out: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl Unanswered {
+    fn not_asked(why: Shown) -> Self {
+        Self {
+            why,
+            timed_out: false,
+        }
+    }
+
+    /// What a start request that got no answer is: a manager that was asked and did not answer
+    /// may still carry the request out, and one that could not be asked has been asked nothing.
+    fn refusal(self) -> Refusal {
+        if self.timed_out {
+            Refusal::NoAnswer(self.why)
+        } else {
+            Refusal::Failed(self.why)
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl From<Unanswered> for Shown {
+    fn from(unanswered: Unanswered) -> Self {
+        unanswered.why
+    }
+}
+
 /// Runs one command put to the service manager within [`MANAGER_BOUND`], with `environment` set
 /// for it, and returns its answer or why there was none. `asked` is the command as a sentence says
 /// it.
-///
-/// What it prints is read while it runs, so an answer of any size cannot stall it. One that does
-/// not answer in time is ended and collected: it is this process's own child.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn run(
     program: &str,
     arguments: &[&str],
     environment: &[(&str, &std::ffi::OsStr)],
     asked: &Shown,
-) -> std::result::Result<std::process::Output, Shown> {
+) -> std::result::Result<std::process::Output, Unanswered> {
+    run_within(MANAGER_BOUND, program, arguments, environment, asked)
+}
+
+/// [`run`] with the bound given.
+///
+/// What it prints is read while it runs, so an answer of any size cannot stall it. One that does
+/// not answer in time is ended and collected: it is this process's own child.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn run_within(
+    bound: Duration,
+    program: &str,
+    arguments: &[&str],
+    environment: &[(&str, &std::ffi::OsStr)],
+    asked: &Shown,
+) -> std::result::Result<std::process::Output, Unanswered> {
     let mut child = std::process::Command::new(program)
         .args(arguments)
         .envs(environment.iter().copied())
@@ -1145,7 +1208,9 @@ fn run(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|error| shown!("{} could not be run: {}", *asked, Shown::io(&error)))?;
+        .map_err(|error| {
+            Unanswered::not_asked(shown!("{} could not be run: {}", *asked, Shown::io(&error)))
+        })?;
     let readers = child
         .stdout
         .take()
@@ -1158,14 +1223,14 @@ fn run(
             // This process's own child, not collected yet, so the number is still its.
             let _ = child.kill();
             let _ = child.wait();
-            return Err(shown!(
+            return Err(Unanswered::not_asked(shown!(
                 "{}: its answer could not be read: {}",
                 *asked,
                 Shown::io(&error)
-            ));
+            )));
         }
     };
-    let deadline = Instant::now() + MANAGER_BOUND;
+    let deadline = Instant::now() + bound;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1176,11 +1241,14 @@ fn run(
                 // This process's own child, not collected yet, so the number is still its.
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(shown!(
-                    "{} did not answer within {} seconds",
-                    *asked,
-                    MANAGER_BOUND.as_secs()
-                ));
+                return Err(Unanswered {
+                    why: shown!(
+                        "{} did not answer within {} seconds",
+                        *asked,
+                        bound.as_secs()
+                    ),
+                    timed_out: true,
+                });
             }
         }
     };
@@ -1238,8 +1306,8 @@ mod platform {
     use kr_protocol::identity::WorkerProfile;
 
     use super::{
-        Asked, Definition, Line, Manager, Record, Refusal, SETUP_ACTION, domain_said, label_said,
-        refused, run, same_file, text,
+        Asked, Definition, Line, Manager, Record, Refusal, SETUP_ACTION, Unanswered, domain_said,
+        label_said, refused, run, same_file, text,
     };
     use crate::error::{CliError, Result};
 
@@ -1286,7 +1354,7 @@ mod platform {
                 domain_said(&domain),
                 refused(&asked, &output)
             ))),
-            Err(why) => Err(CliError::HostUnavailable(why)),
+            Err(unanswered) => Err(CliError::HostUnavailable(unanswered.into())),
         }
     }
 
@@ -1677,8 +1745,8 @@ mod platform {
                 .map_err(Refusal::Failed)?;
         }
         let asked = shown!("launchctl kickstart -p {}", said);
-        let output =
-            run(LAUNCHCTL, &["kickstart", "-p", &target], &[], &asked).map_err(Refusal::Failed)?;
+        let output = run(LAUNCHCTL, &["kickstart", "-p", &target], &[], &asked)
+            .map_err(Unanswered::refusal)?;
         if !output.status.success() {
             return Err(Refusal::Failed(refused(&asked, &output)));
         }
@@ -1706,7 +1774,7 @@ mod platform {
     use kr_ipc::paths::EnvironmentPaths;
 
     use super::{
-        Asked, Definition, Line, Manager, READ_LIMIT, Record, Refusal, SETUP_ACTION,
+        Asked, Definition, Line, Manager, READ_LIMIT, Record, Refusal, SETUP_ACTION, Unanswered,
         applied_drop_ins, refused, run, same_file, text,
     };
     use crate::error::{CliError, Result};
@@ -1807,6 +1875,15 @@ mod platform {
         arguments: &[&str],
         asked: &Shown,
     ) -> std::result::Result<std::process::Output, Shown> {
+        systemctl_telling(arguments, asked).map_err(Shown::from)
+    }
+
+    /// [`systemctl`], with why there was no answer told apart: a command that could not be run, or
+    /// one that did not answer in time.
+    fn systemctl_telling(
+        arguments: &[&str],
+        asked: &Shown,
+    ) -> std::result::Result<std::process::Output, Unanswered> {
         let mut all = vec!["--user", "--no-pager", "--no-ask-password"];
         all.extend_from_slice(arguments);
         let runtime = runtime_directory();
@@ -2443,11 +2520,11 @@ mod platform {
     ) -> std::result::Result<Asked, Refusal> {
         let name = record.target();
         let said = record.target_said();
-        succeeded(
-            &["start", &name],
-            &shown!("systemctl --user start {}", said),
-        )
-        .map_err(Refusal::Failed)?;
+        let asked = shown!("systemctl --user start {}", said);
+        let output = systemctl_telling(&["start", &name], &asked).map_err(Unanswered::refusal)?;
+        if !output.status.success() {
+            return Err(Refusal::Failed(refused(&asked, &output)));
+        }
         Ok(Asked {
             manager: Manager::Systemd,
             pid: unit(&name, &said).ok().and_then(|found| found.pid),
@@ -3863,5 +3940,83 @@ mod tests {
                 .is_some_and(|note| note.contains(&kr_client::shown::spelled(drop_in)))),
             "{notes}"
         );
+    }
+
+    /// The stand-ins for the manager's command in the cases below are programs of this machine: one
+    /// that cannot be run, one that ends with a failure at once, and one that takes the request and
+    /// does not answer inside the bound.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn asked_of_a_stand_in() -> Shown {
+        Shown::said("the manager's stand-in")
+    }
+
+    /// A command that cannot be run asked the manager nothing: its failure is the manager not being
+    /// asked, and it leaves no daemon that may still start.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_manager_whose_command_cannot_be_run_was_not_asked() {
+        let unanswered = run_within(
+            Duration::from_secs(5),
+            "/nonexistent/kr-manager-stand-in",
+            &[],
+            &[],
+            &asked_of_a_stand_in(),
+        )
+        .expect_err("the command cannot be run");
+        assert!(!unanswered.timed_out);
+        assert!(
+            unanswered.why.to_string().contains("could not be run"),
+            "{}",
+            unanswered.why
+        );
+        let refusal = unanswered.refusal();
+        assert!(matches!(refusal, Refusal::Failed(_)), "{refusal:?}");
+        assert!(!refusal.may_still_start());
+    }
+
+    /// A command that refuses at once answered: what it ended with is the manager's refusal, which
+    /// the start says as a failure, and it leaves no daemon that may still start.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_manager_that_refuses_at_once_has_answered_and_nothing_may_still_start() {
+        let asked = asked_of_a_stand_in();
+        let output = run_within(
+            Duration::from_secs(30),
+            "/bin/sh",
+            &["-c", "exit 3"],
+            &[],
+            &asked,
+        )
+        .expect("the command answers");
+        assert_eq!(output.status.code(), Some(3));
+        let refusal = Refusal::Failed(refused(&asked, &output));
+        assert!(!refusal.may_still_start());
+    }
+
+    /// A command that takes the request and does not answer inside the bound was asked and gave no
+    /// answer: the manager may still carry the request out, so the requested daemon may still start.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_manager_that_takes_the_request_and_does_not_answer_in_time_may_still_start_the_daemon() {
+        let unanswered = run_within(
+            Duration::from_secs(1),
+            "/bin/sh",
+            &["-c", "sleep 30"],
+            &[],
+            &asked_of_a_stand_in(),
+        )
+        .expect_err("the command does not answer");
+        assert!(unanswered.timed_out);
+        assert!(
+            unanswered
+                .why
+                .to_string()
+                .contains("did not answer within 1 seconds"),
+            "{}",
+            unanswered.why
+        );
+        let refusal = unanswered.refusal();
+        assert!(matches!(refusal, Refusal::NoAnswer(_)), "{refusal:?}");
+        assert!(refusal.may_still_start());
     }
 }
