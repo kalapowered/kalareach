@@ -6993,3 +6993,170 @@ async fn a_view_that_holds_the_lease_ends_control_when_the_host_resets_its_input
 async fn a_view_that_holds_the_lease_ends_control_when_the_host_breaks_the_streams_contract() {
     control_ends_with_the_stream(|host| host.script.accept(1, 5)).await;
 }
+
+/// A view of a paired host that is attached and showing `at`, whose host has been asked whether it
+/// takes a stream of its own for typing and has not answered: the view's lane is opening.
+async fn paired_opening(
+    page: &Page,
+    host: &mut ScriptedHost,
+    channel: u32,
+    at: &Frame,
+) -> (String, Link, scripted_worker::Call) {
+    let view = page.open(host.session_id, at.window_columns, at.window_rows, channel);
+    let mut link = host.link().await;
+    link.attach().await;
+    let asked = link.expect(Method::TransferStreams).await;
+    frame(&mut link, at).await;
+    page.newest(channel, |state| state["state"] == "showing")
+        .await;
+    (view, link, asked)
+}
+
+/// Answers the question that the view asks the host, whether it takes a stream of its own for
+/// typing, with yes. The question comes under [`AFTER_BARRIER`], or the case fails by its own
+/// message: the view did not ask.
+async fn takes_the_stream_when_asked(link: &mut Link) {
+    let asked = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the view asked the host for its input stream within the bound");
+    assert_eq!(asked.method, Method::TransferStreams.to_string());
+    link.answer(
+        &asked,
+        &kr_protocol::transfer::TransferStreamsResult {
+            accepted_streams: vec![kr_protocol::frame::StreamKind::TerminalInput],
+        },
+    )
+    .await;
+}
+
+/// The next call on the control stream, under [`AFTER_BARRIER`], is the view's acquire.
+async fn acquire_within_the_bound(link: &mut Link) -> scripted_worker::Call {
+    let acquire = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the acquire went within the bound");
+    assert_eq!(acquire.method, Method::InputAcquire.to_string());
+    acquire
+}
+
+/// A take that finds the lane opening waits for it and acquires nothing; when the opening fails the
+/// take is refused, in the view's words for a stream that did not open, whole; the next take asks
+/// the host for the stream again, the stream opens, the acquire follows, and the typing goes on the
+/// new stream under the epoch that the acquire gave.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_waits_for_the_input_stream_and_is_refused_if_it_does_not_open_and_the_next_take_asks_again()
+ {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link, asked) = paired_opening(&page, &mut host, 3, &reporting(Mouse::Sgr)).await;
+    page.take(&view, 1);
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "no acquire goes while the stream is opening"
+    );
+    link.refuse_with(&asked, ErrorCode::InvalidArgument, "refused")
+        .await;
+    let refused = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the take was refused within the bound");
+    assert_eq!(
+        refused["control"]["ended"],
+        "This view could not take control: its input stream did not open. Take control again to retry.",
+        "the view's sentence for a stream that did not open, whole"
+    );
+    // The next take opens the stream again, and acquires once it is open.
+    page.take(&view, 2);
+    takes_the_stream_when_asked(&mut link).await;
+    host.script
+        .until("the input stream's header", |seen| seen.headers.len() == 1)
+        .await;
+    let acquire = acquire_within_the_bound(&mut link).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest_within(3, |state| control(state) == (2, "controlling".to_owned()))
+        .await
+        .expect("the second take took control within the bound");
+    page.text(&view, 2, "a").expect("the key is taken");
+    host.script
+        .until_soon("the key on the new stream", |seen| seen.frames.len() == 1)
+        .await;
+    assert_eq!(read_by(&host), vec![(lease.epoch, 0, "a".to_owned())]);
+}
+
+/// A host that states by its typed code that it takes no input stream takes none for the view's
+/// life: a take acquires at once with no lane, no stream is ever opened, and the keys are refused
+/// with the view's words for an input that did not reach the program.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_on_a_host_that_takes_no_input_stream_acquires_with_no_lane() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link, asked) = paired_opening(&page, &mut host, 3, &reporting(Mouse::Sgr)).await;
+    link.answer(
+        &asked,
+        &kr_protocol::transfer::TransferStreamsResult {
+            accepted_streams: Vec::new(),
+        },
+    )
+    .await;
+    page.take(&view, 1);
+    let acquire = acquire_within_the_bound(&mut link).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest_within(3, |state| control(state) == (1, "controlling".to_owned()))
+        .await
+        .expect("the take took control within the bound");
+    let refused = page
+        .text(&view, 1, "a")
+        .expect_err("a key with no stream to write it on");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|words| words.starts_with(
+                "That input did not reach the program: its input stream could not be opened:"
+            )),
+        "{refused}"
+    );
+    assert_eq!(
+        host.script.seen(|seen| seen.headers.len()),
+        0,
+        "no input stream was opened"
+    );
+}
+
+/// After the host ended the input stream while the view held the lease, the next take opens a new
+/// stream, acquires a new epoch on it, and the typing goes under that epoch from 0.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_after_the_input_stream_ended_opens_a_new_stream_and_a_new_epoch() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    host.script.say(Out::Reset);
+    page.newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the end of the stream ended control within the bound");
+    let release = link.expect(Method::InputRelease).await;
+    lease.answer(&mut link, &release).await;
+    let first_epoch = lease.epoch;
+    page.take(&view, 2);
+    takes_the_stream_when_asked(&mut link).await;
+    host.script
+        .until("the second input stream's header", |seen| {
+            seen.headers.len() == 2
+        })
+        .await;
+    let acquire = acquire_within_the_bound(&mut link).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest_within(3, |state| control(state) == (2, "controlling".to_owned()))
+        .await
+        .expect("the second take took control within the bound");
+    assert!(lease.epoch > first_epoch, "a new stream has a new epoch");
+    page.text(&view, 2, "b").expect("the key is taken");
+    host.script
+        .until_soon("the key on the new stream", |seen| seen.frames.len() == 1)
+        .await;
+    assert_eq!(read_by(&host), vec![(lease.epoch, 0, "b".to_owned())]);
+}
