@@ -1068,8 +1068,10 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
     .await
     .expect("the device is revoked");
     assert!(barrier.holds(), "{barrier:?}");
+    // The wait ends only at zero, so a host that keeps the connection ends it at the wait's bound,
+    // and its words say what the host was to do.
     within(
-        "the host dropping the revoked record's connection",
+        "the host dropping the revoked record's connection when its record ended",
         BOUND,
         async {
             while host.connections_of(&first_revoked) != 0 {
@@ -1078,11 +1080,6 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
         },
     )
     .await;
-    assert_eq!(
-        host.connections_of(&first_revoked),
-        0,
-        "the revoked record's connection was dropped when its record ended"
-    );
 
     let second_ran_out = within(
         "the second pairing",
@@ -1117,12 +1114,14 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
         &second_ran_out,
         &second_revoked,
     ];
-    within("the host counting the connections", BOUND, async {
+    // Waits for the two new connections to count. A count that stays above two (an old record still
+    // counting) ends the wait, and the assertion below shows which identifiers count.
+    within("the host counting the new connections", BOUND, async {
         while records
             .iter()
             .map(|record| host.connections_of(record))
             .sum::<u32>()
-            != 2
+            < 2
         {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1256,8 +1255,9 @@ async fn the_answers_kept_for_the_ended_record_are_found_under_its_identifier_an
         .expect("retained");
     drop(hold);
     worker.seed_undispatched_intents(&old_actor, 1);
+    let receipt = worker_receipt(worker, &old_actor, action);
     assert!(
-        worker_receipt(worker, &old_actor, action).is_some(),
+        receipt.is_some(),
         "the worker holds a receipt for the old actor's action"
     );
 
@@ -1275,11 +1275,20 @@ async fn the_answers_kept_for_the_ended_record_are_found_under_its_identifier_an
         ),
         "a retry under the old identifier is given the kept answer"
     );
-    // The old identifier still finds the worker's receipt.
+    // The old identifier still finds the worker's receipt, whole: the revocation rejected the action
+    // that was not yet dispatched (its state, reason, revision, error and moment), and everything
+    // else of the receipt is as it was.
+    let kept = worker_receipt(worker, &old_actor, action)
+        .expect("the worker still holds the receipt of the old actor");
+    let mut expected = receipt.expect("the receipt held before the replacement");
+    expected.state = kr_protocol::receipt::ReceiptState::Rejected;
+    expected.reason = Nullable::some(kr_protocol::receipt::RejectionReason::Revoked);
+    expected.revision = kept.revision;
+    expected.error = kept.error.clone();
+    expected.updated_at_ms = kept.updated_at_ms;
     assert_eq!(
-        worker_receipt(worker, &old_actor, action).map(|receipt| receipt.actor_id),
-        Some(old_actor.clone()),
-        "the worker's receipt is still the old actor's"
+        kept, expected,
+        "the worker's receipt is the old actor's whole receipt, rejected by the revocation"
     );
     // The new identifier finds nothing in either store.
     assert_eq!(
@@ -1704,9 +1713,24 @@ async fn a_share_naming_the_old_identifier_is_decided_on_the_old_record_alone() 
             ),
         )
         .await;
+        // The caller is a paired device, which is told one sentence for every way a recipient cannot
+        // carry a share, so the words do not tell the cause: the refusal's code and words are those.
+        let refusal = match &answer {
+            Some(Err(error)) => error,
+            other => panic!(
+                "{ended}: a share to the identifier of an ended record is refused: {other:?}"
+            ),
+        };
+        assert_eq!(
+            refusal.code,
+            ErrorCode::PermissionDenied,
+            "{ended}: the refusal's code: {refusal:?}"
+        );
         assert!(
-            matches!(answer, Some(Err(_))),
-            "{ended}: a share to the identifier of an ended record is refused: {answer:?}"
+            refusal
+                .message
+                .contains("this host cannot share the session with that device for that long"),
+            "{ended}: the refusal's words: {refusal:?}"
         );
         assert_eq!(
             store.records().expect("readable").len(),
@@ -1770,6 +1794,34 @@ async fn a_replacement_and_another_owner_mutation_are_refused_alike_while_a_debt
     // whose barrier has not started.
     let signer = Signer::OwnerDevice(&owner);
     let mut again = bind(&host, &phone, &owner).await;
+    // The owner's confirmation is completed BEFORE the debt is published: a request for a new
+    // confirmation is refused at the admission while the debt stands, so the request that commits
+    // the pairing is reached only by an answer given earlier, and is sent here directly.
+    let approval = within(
+        "the candidate's status",
+        BOUND,
+        calls::owner_status(&mut again.client, again.invitation_id),
+    )
+    .await
+    .expect("the owner reads the candidate")
+    .owner
+    .0
+    .and_then(|view| view.approval.0)
+    .expect("a bound candidate the owner can approve");
+    within(
+        "the owner's confirmation",
+        BOUND,
+        calls::confirm_subject(
+            host.environment_id,
+            &mut again.client,
+            ConfirmationSubject::ConfirmDevice {
+                invitation_id: again.invitation_id,
+            },
+            &signer,
+        ),
+    )
+    .await
+    .expect("the owner confirms the candidate");
     host.controller().hold_fence(true);
     let spent = count(
         &host,
@@ -1777,14 +1829,31 @@ async fn a_replacement_and_another_owner_mutation_are_refused_alike_while_a_debt
     );
     let events = count(&host, "SELECT COUNT(*) FROM pairing_events");
 
-    let replacement = within(
-        "the confirmation",
+    // A new confirmation is refused at the admission (what a pairing's helper meets first) ...
+    let asked_again = within(
+        "the new confirmation's request",
         BOUND,
         calls::confirm_candidate(
             host.environment_id,
             &mut again.client,
             again.invitation_id,
             &signer,
+        ),
+    )
+    .await
+    .expect_err("a new confirmation is refused while a debt is published");
+    // ... and so is the request itself, under the answer given before the debt.
+    let replacement = within(
+        "the pairing's confirm",
+        BOUND,
+        calls::mutate::<_, kr_protocol::invitation::PairConfirmResult>(
+            host.environment_id,
+            &mut again.client,
+            Method::PairConfirm,
+            &PairConfirmParams {
+                invitation_id: again.invitation_id,
+                approval,
+            },
         ),
     )
     .await
@@ -1817,6 +1886,8 @@ async fn a_replacement_and_another_owner_mutation_are_refused_alike_while_a_debt
     );
     assert_eq!(other.code, replacement.code, "alike: {other:?}");
     assert_eq!(other.message, replacement.message, "alike");
+    assert_eq!(asked_again.code, replacement.code, "alike: {asked_again:?}");
+    assert_eq!(asked_again.message, replacement.message, "alike");
 
     assert!(
         host.record_of(spare.device_id).is_paired(),
