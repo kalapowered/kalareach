@@ -4396,26 +4396,190 @@ mod tests {
         );
     }
 
-    /// KR-REQ-09.18, KR-REQ-09.19: a confirmation that replaces the pending one does not inherit
-    /// the proofs kept for the old one. The third held-up try of the following of the first
-    /// confirmation reads the peak and the owner corrects the clock and confirms again inside it,
-    /// so the try is stamped at the new confirmation; the following of the new one takes its own
-    /// readings, which agree with the owner, and is not refused by a reading from before it.
+    /// KR-REQ-09.18, KR-REQ-09.19: a confirmation that replaces the pending one is not refused by
+    /// what was read before it. All three tries of the following of the first confirmation are
+    /// held up and read a peak, and the owner then corrects the clock and confirms again, after
+    /// the tries have ended; the following of the new confirmation takes its own readings, which
+    /// agree with the owner, and is not refused by a reading from before the owner's act.
     #[test]
     fn a_new_confirmation_does_not_inherit_the_held_up_proofs_kept_for_the_one_it_replaces() {
         let (floor, held, contract) = found_a_rollback_and_was_confirmed();
         let owner_level = held.wall.now_ms().get();
         held.sets_the_wall_before_reading(2, owner_level + 600_000);
-        held.sets_the_wall_after_landing(3, owner_level + 30_000);
-        held.confirms_after_landing(3, Arc::clone(&floor));
         held.arm(1, 3);
         assert!(contract.observe().suspended);
+        held.pass(Duration::from_secs(1));
+        held.wall.set(owner_level + 31_000);
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
         held.pass(Duration::from_secs(1));
         contract.observe();
         assert_eq!(
             contract.trust(),
             WallClockTrust::Trusted,
             "the new confirmation is followed: its own readings agree with it"
+        );
+    }
+
+    /// A worker that trusts its clock and has met no confirmation: the owner confirmed the clock
+    /// after its last look, and the clock stands where the owner put it.
+    fn trusting_and_confirmed() -> (Arc<kr_ipc::floor::SharedFloor>, Arc<Holdup>, TimeContract) {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        (floor, held, contract)
+    }
+
+    /// A confirmation that no look has met yet, for a worker that trusts its clock or one that
+    /// does not.
+    fn pending_confirmation(
+        trusting: bool,
+    ) -> (Arc<kr_ipc::floor::SharedFloor>, Arc<Holdup>, TimeContract) {
+        if trusting {
+            trusting_and_confirmed()
+        } else {
+            found_a_rollback_and_was_confirmed()
+        }
+    }
+
+    /// The following of the first confirmation takes three tries that are all held up (the pause
+    /// is 10 s in each). The owner confirms again inside the first, a peak ten minutes ahead of
+    /// the owner's clock is read in the second, which starts after the new confirmation, and the
+    /// clock is back at the owner's level before the third. The next look reads the owner's clock.
+    fn the_second_confirmation_came_inside_a_held_up_try(trusting: bool) -> WallClockTrust {
+        let (floor, held, contract) = pending_confirmation(trusting);
+        let start = held.wall.now_ms().get();
+        held.confirms_after_landing(1, Arc::clone(&floor));
+        held.sets_the_wall_before_reading(3, start + 610_000);
+        held.sets_the_wall_after_landing(2, start + 20_000);
+        held.arm(1, 3);
+        assert!(
+            contract.observe().suspended,
+            "no narrow reading is had in three tries"
+        );
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        contract.trust()
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a worker that does not trust its clock keeps what a try after the
+    /// owner's second confirmation read. The owner confirmed again inside a held-up try of the
+    /// following; a later try of the same attempt, stamped after the new confirmation, read a peak;
+    /// the clock is back at the owner's level and the next look reads it. The reading is behind a
+    /// reading that was taken after the owner spoke last.
+    #[test]
+    fn a_peak_read_after_a_second_confirmation_inside_a_held_up_try_refuses_it() {
+        assert_eq!(
+            the_second_confirmation_came_inside_a_held_up_try(false),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken after the owner spoke last"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the same order for a worker that trusts its clock, whose mark
+    /// takes the exhausted attempt's tries.
+    #[test]
+    fn a_trusting_worker_refuses_the_peak_read_after_a_second_confirmation_in_a_held_up_try() {
+        assert_eq!(
+            the_second_confirmation_came_inside_a_held_up_try(true),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken after the owner spoke last"
+        );
+    }
+
+    /// The first try of a look is held up and reads a peak ten minutes ahead of the owner's clock,
+    /// after the owner confirmed; the clock is back at the owner's level before the second, which
+    /// is narrow, and the following that the same look makes reads the owner's clock.
+    fn a_look_read_a_held_up_peak_after_the_confirmation(trusting: bool) -> WallClockTrust {
+        let (_floor, held, contract) = pending_confirmation(trusting);
+        let start = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(1, start + 600_000);
+        held.sets_the_wall_after_landing(1, start + 10_000);
+        held.arm(0, 1);
+        contract.observe();
+        contract.trust()
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a held-up try of a look is evidence for the pending
+    /// confirmation whatever the worker thinks of its clock. A worker that does not trust it read
+    /// a peak in the look's first try, and the narrow reading that the same look's following took
+    /// is ten minutes behind it.
+    #[test]
+    fn a_held_up_try_of_a_look_is_held_against_the_pending_confirmation() {
+        assert_eq!(
+            a_look_read_a_held_up_peak_after_the_confirmation(false),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a peak that the look's held-up try read"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the same for a worker that trusts its clock, whose mark takes the
+    /// look's held-up try.
+    #[test]
+    fn a_trusting_worker_holds_the_look_held_up_try_against_the_pending_confirmation() {
+        assert_eq!(
+            a_look_read_a_held_up_peak_after_the_confirmation(true),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a peak that the look's held-up try read"
+        );
+    }
+
+    /// The narrow reading of a look reads a peak ten minutes ahead of the owner's clock, and the
+    /// clock is back at the owner's level for the reading of the following that the same look makes.
+    fn a_look_read_a_narrow_peak_after_the_confirmation(trusting: bool) -> WallClockTrust {
+        let (_floor, held, contract) = pending_confirmation(trusting);
+        let start = held.wall.now_ms().get();
+        held.wall.set(start + 600_000);
+        held.sets_the_wall_before_reading(2, start);
+        contract.observe();
+        contract.trust()
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the narrow reading of a look is evidence for the pending
+    /// confirmation whatever the worker thinks of its clock.
+    #[test]
+    fn a_narrow_reading_of_a_look_is_held_against_the_pending_confirmation() {
+        assert_eq!(
+            a_look_read_a_narrow_peak_after_the_confirmation(false),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a peak that the look read after the owner spoke"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the same for a worker that trusts its clock, whose mark takes the
+    /// look's narrow reading.
+    #[test]
+    fn a_trusting_worker_holds_the_look_narrow_reading_against_the_pending_confirmation() {
+        assert_eq!(
+            a_look_read_a_narrow_peak_after_the_confirmation(true),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a peak that the look read after the owner spoke"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a proof is carried to the narrow reading by the continuous time
+    /// since it, and the step back it shows is that much more. One attempt of the following is held
+    /// up in all three tries with the wall 30 s ahead of the owner's clock; 60 s later the clock
+    /// goes back 30 s to the owner's level. The step back is more than five seconds and less than
+    /// the 60 s since the proof, so a proof compared without its carry would let it pass.
+    #[test]
+    fn a_step_back_smaller_than_the_time_since_a_held_up_proof_refuses_the_confirmation() {
+        let (_floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let start = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(2, start + 30_000);
+        held.arm(1, 3);
+        assert!(contract.observe().suspended);
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 30_000);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back 30 s from a reading taken 60 s earlier, after the owner spoke"
         );
     }
 }
