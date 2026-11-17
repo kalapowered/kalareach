@@ -1927,10 +1927,10 @@ async fn the_writer_withdraws_a_window_whose_attach_is_in_flight(
 /// checked before the restriction, so the attach's attachment is withdrawn with the window's.
 ///
 /// The window's stream has frames. The attach is stopped after its check, the host takes access
-/// away by a statement, and the writer meets the next frame under the new statement. A withdrawal
-/// that ran at once would take the window out of the registry before the attach pushed, and
-/// nothing would look at the window again: the attachment would stay until the connection's own
-/// end, which the case holds, so that the acknowledgement is read before it.
+/// away by a statement, and the writer meets the next frame under the new statement. The attach
+/// ends as applied and the withdrawal takes its attachment back, or the push refuses it: either
+/// way no attachment of the window is left. The end of the window's connection is held, so that
+/// the acknowledgement is read before it can detach anything.
 #[test]
 fn a_window_the_writer_withdraws_does_not_keep_the_attach_that_was_in_flight() {
     let order = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight(
@@ -1973,8 +1973,9 @@ fn a_window_the_writer_withdraws_waits_for_the_hold_of_the_attach_that_was_in_fl
 /// leaves no attachment behind once the writer's withdrawal is complete.
 ///
 /// No statement follows: the lease the host gave ends, the writer meets the next frame of the
-/// window's stream, and its withdrawal waits for the hold the attach is in. A withdrawal that ran
-/// at once would leave the attach's attachment in a connection that no registry holds.
+/// window's stream, and its withdrawal waits for the hold the attach is in. The attach ends as
+/// applied and the withdrawal takes its attachment back, or the push refuses it: either way no
+/// attachment of the window is left.
 #[test]
 fn a_window_the_writer_withdraws_when_its_lease_ends_does_not_keep_the_attach_that_was_in_flight() {
     let order = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight(
@@ -1988,10 +1989,15 @@ fn a_window_the_writer_withdraws_when_its_lease_ends_does_not_keep_the_attach_th
     );
 }
 
-/// KR-REQ-17.54: the writer's withdrawal that the end of a lease asks for waits for the hold of
-/// the attach that was checked under the lease.
+/// KR-REQ-17.54: when a lease ends on the clock under a frame that the writer holds, the writer
+/// asks for the withdrawal of its window while the attach that was checked under the lease is
+/// still in flight.
+///
+/// The case reads only the ask. In the clock's order the attach holds the session, so nothing can
+/// tell a withdrawal that waits for the hold from one that waits for the session; the statement's
+/// cases, which read the session at the hold, hold the wait itself.
 #[test]
-fn a_window_the_writer_withdraws_when_its_lease_ends_waits_for_the_hold_of_the_attach_that_was_in_flight()
+fn the_writer_asks_for_the_withdrawal_of_a_window_when_its_lease_ends_under_an_attach_that_was_in_flight()
  {
     let order = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight(
         Ends::ByClock,
@@ -1999,7 +2005,7 @@ fn a_window_the_writer_withdraws_when_its_lease_ends_waits_for_the_hold_of_the_a
     .expect("the schedule came about");
     assert!(
         order.waiting_at_the_hold >= 1,
-        "the writer's withdrawal was not waiting for the hold: {}",
+        "the writer did not ask for the withdrawal while the attach's hold stood: {}",
         order.waiting_at_the_hold
     );
 }
@@ -2875,6 +2881,22 @@ async fn a_sweep_waits_for_a_lock_on_a_runtime_with_one_thread() -> Result<OnOne
         .expect("the second window is served under an open host");
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
 
+    // The host's own maintenance pass owes the same withdrawal and waits for the same lock, and it
+    // runs off the executor: with it out of the way, the counter of withdrawals that wait for the
+    // fence's lock is the statement's own, and a sweep on the executor's thread cannot be hidden
+    // by a pass that raised it.
+    let (maintenance_held, maintenance_end) = std::sync::mpsc::channel();
+    let (release_maintenance, keep) = std::sync::mpsc::channel::<()>();
+    let keeper = Arc::clone(&world);
+    std::thread::spawn(move || {
+        let _maintenance = keeper.service.hold_maintenance();
+        let _ = maintenance_held.send(());
+        let _ = keep.recv();
+    });
+    if received_by(deadline, maintenance_end).await.is_none() {
+        return Err("the maintenance pass was never kept out");
+    }
+
     let (held, held_end) = std::sync::mpsc::channel();
     let (let_go, go) = std::sync::mpsc::channel::<()>();
     let holder = Arc::clone(&world);
@@ -2913,6 +2935,7 @@ async fn a_sweep_waits_for_a_lock_on_a_runtime_with_one_thread() -> Result<OnOne
     let nothing = Arc::clone(&world);
     let holds_nothing_at_the_end = holds_by(deadline, move || nothing.holds_nothing()).await;
     drop(holder_window);
+    let _ = release_maintenance.send(());
     world.close();
     Ok(OnOneThread {
         answered_while_held,
