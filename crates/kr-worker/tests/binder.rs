@@ -2502,3 +2502,400 @@ fn kr_req_23_30_a_component_action_is_waited_for_until_its_component_is_register
         "a component the broker refused is never registered"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// A plugin action's package grants, asked again until the action is sent
+// ---------------------------------------------------------------------------------------------
+
+/// Which action is admitted: one a component prepared, or the cancellation the host carries out
+/// itself. Both are admitted under the token's spend and the effect's validation.
+#[derive(Clone, Copy, Debug)]
+enum Kind {
+    Prepared,
+    HostCancel,
+}
+
+/// Where the installation changes after the effect's validation.
+#[derive(Clone, Copy, Debug)]
+enum When {
+    /// After the validation and before the permit is taken.
+    BeforeTheTake,
+    /// With the permit taken, on the thread that makes the transport's call, at its pause.
+    AtTheSubmitPause,
+}
+
+/// The action the declared cancellation names.
+fn cancel_declaration() -> kr_plugin_sdk::effect::ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": "turn.cancel",
+        "label": "Cancel the turn",
+        "effect": "upstream.cancel",
+        "implementation": { "type": "upstream_cancel" },
+        "parameters": { "parameters": [] },
+        "description": "Stop the turn that is running",
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads")
+}
+
+/// One package's binding on instance 1, with the transport and the evidence an action needs, and
+/// one plugin action to admit through it.
+struct Acting {
+    worker: Worker,
+    source: ConnectorSource,
+    package: AdmittedPackage,
+    upstream: Arc<RecordingUpstream>,
+    kind: Kind,
+}
+
+impl Acting {
+    fn open(kind: Kind) -> Self {
+        let worker = Worker::open();
+        let source = component_action_package(&worker);
+        let package = testing::admitted(&source);
+        let frame = worker.admit(1, vec![package.clone()]);
+        worker.register(1);
+        worker
+            .bind(1, 1, source.package_digest, frame)
+            .expect("the package binds");
+        let upstream = Arc::new(RecordingUpstream::default());
+        worker
+            .broker
+            .bind_dispatch(instance(1), Arc::clone(&upstream) as _)
+            .expect("the transport is bound");
+        let capability = match kind {
+            Kind::Prepared => "agent.prompt",
+            Kind::HostCancel => "agent.cancel",
+        };
+        worker
+            .broker
+            .record_capability(InstanceCapabilityRecord {
+                capability_id: CapabilityId::new(capability).expect("valid"),
+                capability_version: "1".to_owned(),
+                application_instance_id: instance(1),
+                identity: InstanceCapabilityIdentity::default(),
+                revision: CapabilityRevision::new(1),
+                state: InstanceCapabilityState::QualifiedAvailable,
+                source: InstanceEvidenceSource::HostProbe,
+                invalidated_by: [InstanceInvalidation::BindingChanged].into_iter().collect(),
+                disabled_reason: Nullable::null(),
+                observed_at: TimestampMs::new(1),
+            })
+            .expect("the evidence is recorded");
+        if matches!(kind, Kind::HostCancel) {
+            let refused = worker
+                .broker
+                .register_actions(binding(1), &[cancel_declaration()])
+                .expect("the cancellation is registered");
+            assert!(refused.is_empty(), "{refused:?}");
+            worker
+                .broker
+                .set_turn(
+                    instance(1),
+                    Some(kr_protocol::ids::AgentTurnId::new("turn-1").expect("valid")),
+                )
+                .expect("a turn is running");
+        }
+        Self {
+            worker,
+            source,
+            package,
+            upstream,
+            kind,
+        }
+    }
+
+    fn broker(&self) -> &Broker {
+        &self.worker.broker
+    }
+
+    fn params(&self) -> kr_protocol::agent::PluginActionInvokeParams {
+        let (action, parameters): (&str, &[u8]) = match self.kind {
+            Kind::Prepared => ("prompt.send", br#"{"text":"hello"}"#),
+            Kind::HostCancel => ("turn.cancel", b"{}"),
+        };
+        kr_protocol::agent::PluginActionInvokeParams {
+            target: kr_protocol::agent::AgentMutationTarget {
+                subject: kr_worker::broker::subject(session(), instance(1)),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            plugin_id: kr_protocol::ids::PluginId::new("kalareach.claude-code").expect("valid"),
+            action: ActionName::new(action).expect("valid"),
+            draft_id: Nullable::null(),
+            resource_id: Nullable::null(),
+            parameters: kr_protocol::scalars::Bytes::from(parameters.to_vec()),
+        }
+    }
+
+    /// Admits the action and validates its effect: the token is spent, and every grant the
+    /// admission needs is checked. The first admission passes.
+    fn admit(&self) -> kr_worker::broker::MutationAdmission {
+        let caller = Caller {
+            actor_id: ActorId::new("device-1").expect("valid"),
+            grant_id: None,
+        };
+        let params = self.params();
+        match self.kind {
+            Kind::Prepared => {
+                let admitted = self
+                    .broker()
+                    .admit_plugin_action(&caller, binding(1), &params, None, kr_ipc::now_ms())
+                    .expect("the action is admitted");
+                let effect = kr_protocol::broker::PreparedEffect {
+                    action: params.action.clone(),
+                    class: kr_protocol::authority::EffectClass::Write,
+                    operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+                    draft_id: Nullable::null(),
+                    argument_hash: Digest256::from_bytes(kr_cbor::sha256(
+                        params.parameters.as_slice(),
+                    )),
+                };
+                self.broker()
+                    .validate_effect(&admitted, &effect)
+                    .expect("its effect is validated");
+                admitted
+            }
+            Kind::HostCancel => self
+                .broker()
+                .admit_host_cancel(&caller, binding(1), &params, kr_ipc::now_ms())
+                .expect("the cancellation is admitted"),
+        }
+    }
+
+    /// A narrower installation: the same package at the same hash, without the grant to act
+    /// upstream. It moves no revision.
+    fn narrow(&self, round: u64) {
+        let mut narrowed = self.source.clone();
+        narrowed.granted.remove(&PluginCapability::UpstreamAction);
+        self.worker.admit(round, vec![testing::admitted(&narrowed)]);
+        assert!(
+            !self.worker.grants(1).holds(BrokerGrant::UpstreamAction),
+            "the binding lost the grant to act upstream"
+        );
+    }
+
+    /// The package's release is revoked under the policy that disables at once.
+    fn revoke(&self, round: u64) {
+        self.worker.hand_over(Snapshot {
+            policy: RevocationPolicy::DisableAtOnce,
+            releases: vec![revoked(testing::release_of(&self.package))],
+            ..Snapshot::admitting(round, Vec::new())
+        });
+    }
+
+    fn sent(&self) -> usize {
+        self.upstream
+            .submitted
+            .lock()
+            .expect("the record is not poisoned")
+            .len()
+    }
+
+    /// Carries the admitted action as the worker's service does, with `event` landing where
+    /// `when` says: the permit is taken, the broker's checks are asked on the thread that makes
+    /// the transport's call, and the transport is called only if they pass.
+    fn carry(
+        &self,
+        admitted: &kr_worker::broker::MutationAdmission,
+        when: When,
+        event: impl FnOnce(),
+    ) -> Result<(), BrokerError> {
+        let mut event = Some(event);
+        if matches!(when, When::BeforeTheTake)
+            && let Some(event) = event.take()
+        {
+            event();
+        }
+        let taken = self.broker().take_plugin_action(admitted)?;
+        let against = admitted.admitted_against();
+        let (dispatch, request) = taken.transmission();
+        let pause =
+            matches!(when, When::AtTheSubmitPause).then(|| self.broker().pause_before_submit());
+        let broker = self.broker();
+        let sending = std::thread::scope(|scope| {
+            let sending = scope.spawn(|| {
+                broker.recheck_before_submit(&against, &request)?;
+                dispatch.submit(&request)
+            });
+            if let Some((arrived, release)) = pause {
+                arrived
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("the call reaches the thread that makes the transport's call");
+                if let Some(event) = event.take() {
+                    event();
+                }
+                release.send(()).expect("the call is let go");
+            }
+            sending.join().expect("the call ends")
+        });
+        let _in_flight = taken.submitted(sending?);
+        Ok(())
+    }
+}
+
+/// KR-REQ-23.30: a plugin action is admitted when the binding's package holds the grants the
+/// token's spend and the effect's validation need, and a narrower installation removes one of
+/// them at once and moves no revision. The repeat asks the grants the admission required, once
+/// before the permit is taken and once at the pause before the transport's call: nothing is sent,
+/// the refusal is the first admission's own, proven unsent and `PERMISSION_DENIED`, and no second
+/// token is spent. The control, a revocation alone, changes what the binding may do next and lets
+/// what it admitted finish: the action is sent once, and the binding, which is ending, stays until
+/// then. The same holds for the cancellation the host carries out itself.
+#[test]
+fn kr_req_23_30_a_narrower_installation_that_removes_the_action_grant_stops_an_admitted_action_at_the_repeat()
+ {
+    for kind in [Kind::Prepared, Kind::HostCancel] {
+        for when in [When::BeforeTheTake, When::AtTheSubmitPause] {
+            let what = format!("{kind:?} {when:?}");
+
+            let narrower = Acting::open(kind);
+            let admitted = narrower.admit();
+            assert_eq!(narrower.broker().tokens_issued(), 1, "{what}");
+            let refused = narrower
+                .carry(&admitted, when, || narrower.narrow(2))
+                .expect_err(&format!(
+                    "{what}: an action whose grant was removed is refused"
+                ));
+            let BrokerError::NotTransmitted(inner) = &refused else {
+                panic!("{what}: the refusal says nothing was transmitted: {refused:?}");
+            };
+            assert!(
+                matches!(**inner, BrokerError::Grant(_)),
+                "{what}: the grant is not held: {inner:?}"
+            );
+            assert!(refused.proven_unsent(), "{what}");
+            assert_eq!(
+                refused.code(),
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "{what}"
+            );
+            assert_eq!(narrower.sent(), 0, "{what}: nothing was sent");
+            assert_eq!(
+                narrower.broker().tokens_issued(),
+                1,
+                "{what}: no second token was spent"
+            );
+
+            let revoked = Acting::open(kind);
+            let admitted = revoked.admit();
+            revoked
+                .carry(&admitted, when, || {
+                    revoked.revoke(2);
+                    let ending = revoked
+                        .broker()
+                        .binding_record(binding(1))
+                        .expect("the binding stays while its admitted action is not sent");
+                    assert!(ending.ending, "{what}: it is ending");
+                })
+                .unwrap_or_else(|refused| {
+                    panic!("{what}: a revocation lets what was admitted finish: {refused:?}")
+                });
+            assert_eq!(revoked.sent(), 1, "{what}: the action was sent once");
+            assert_eq!(revoked.broker().tokens_issued(), 1, "{what}");
+            revoked.revoke(3);
+            assert!(
+                revoked.broker().binding_record(binding(1)).is_none(),
+                "{what}: the binding closes at the first snapshot after its action was sent"
+            );
+        }
+    }
+}
+
+/// KR-REQ-25.22: a binding that is due to end stays until what it admitted is done, and an action
+/// is open work from its token's spend until it is sent or its permit is given up. The binding
+/// stays through the permit's take and through the repeat, admits nothing more, and closes at the
+/// first snapshot after the action was sent; one whose permit was abandoned closes at the next
+/// snapshot too.
+#[test]
+fn kr_req_25_22_an_ending_binding_stays_until_its_admitted_action_is_sent() {
+    for kind in [Kind::Prepared, Kind::HostCancel] {
+        let what = format!("{kind:?}");
+        let acting = Acting::open(kind);
+        let admitted = acting.admit();
+        acting.revoke(2);
+        let ending = acting
+            .broker()
+            .binding_record(binding(1))
+            .unwrap_or_else(|| panic!("{what}: the binding stays while its action is admitted"));
+        assert!(ending.ending, "{what}");
+        assert!(
+            acting
+                .broker()
+                .live_bindings()
+                .iter()
+                .any(|live| live.binding_id == binding(1) && live.ending),
+            "{what}: and is reported ending"
+        );
+        assert!(
+            acting.worker.rich_admission(1, 1).is_err(),
+            "{what}: it admits nothing more"
+        );
+
+        let taken = acting
+            .broker()
+            .take_plugin_action(&admitted)
+            .unwrap_or_else(|refused| panic!("{what}: the admitted action is taken: {refused:?}"));
+        acting.revoke(3);
+        assert!(
+            acting.broker().binding_record(binding(1)).is_some(),
+            "{what}: nothing closes it while the action is taken and not sent"
+        );
+        let (dispatch, request) = taken.transmission();
+        acting
+            .broker()
+            .recheck_before_submit(&admitted.admitted_against(), &request)
+            .unwrap_or_else(|refused| panic!("{what}: the repeat passes: {refused:?}"));
+        let pending = dispatch.submit(&request).expect("the transport takes it");
+        let _in_flight = taken.submitted(pending);
+        assert_eq!(acting.sent(), 1, "{what}");
+        acting.revoke(4);
+        assert!(
+            acting.broker().binding_record(binding(1)).is_none(),
+            "{what}: it closes at the first snapshot after its action was sent"
+        );
+        assert!(acting.worker.row(1).is_none(), "{what}: with its row");
+
+        let given_up = Acting::open(kind);
+        let admitted = given_up.admit();
+        given_up.revoke(2);
+        assert!(
+            given_up.broker().binding_record(binding(1)).is_some(),
+            "{what}: the binding stays while its action is admitted"
+        );
+        given_up.broker().abandon(&admitted);
+        given_up.revoke(3);
+        assert!(
+            given_up.broker().binding_record(binding(1)).is_none(),
+            "{what}: an action whose permit was given up counts no more"
+        );
+        assert_eq!(given_up.sent(), 0, "{what}");
+    }
+}
+
+/// KR-REQ-23.30: the repeat never passes a binding that is gone. A call that outlived its permit,
+/// as one does when the deadline passes while it waits for a thread, is asked again after the
+/// binding closed: it is refused, and nothing is sent.
+#[test]
+fn kr_req_23_30_the_repeat_refuses_an_action_whose_binding_is_gone() {
+    let acting = Acting::open(Kind::Prepared);
+    let admitted = acting.admit();
+    let against = admitted.admitted_against();
+    let taken = acting
+        .broker()
+        .take_plugin_action(&admitted)
+        .expect("the admitted action is taken");
+    let (_dispatch, request) = taken.transmission();
+    // The wait for the call is given up: the permit goes, and the binding that was ending closes.
+    drop(taken);
+    acting.revoke(2);
+    assert!(
+        acting.broker().binding_record(binding(1)).is_none(),
+        "nothing holds the binding any more"
+    );
+    let refused = acting
+        .broker()
+        .recheck_before_submit(&against, &request)
+        .expect_err("a binding that is gone holds no grant");
+    assert!(refused.proven_unsent(), "{refused:?}");
+    assert_eq!(acting.sent(), 0);
+}
