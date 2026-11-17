@@ -7913,8 +7913,9 @@ fn a_restart_where_the_greeting_fails_because_the_daemon_is_ending_goes_on_to_st
     assert_eq!(output.status.code(), Some(0), "{said}");
     assert_eq!(said["ok"], true, "{said}");
     assert_eq!(stop_of(&said), "ended", "{said}");
-    // Nothing was read of the daemon that ended, so no stopped generation holds the answer: the
-    // result says what answers and what this command launched, and does not call it its own.
+    // Nothing was read of the daemon that ended, so no stopped generation is held against the
+    // answer; the daemon states the process this command launched after it saw the old daemon end,
+    // and a live process number names one process: the daemon that answers is the one started.
     assert_eq!(
         said["launched"]["start"], "standalone",
         "the restart started a daemon after the end: {said}"
@@ -7925,7 +7926,7 @@ fn a_restart_where_the_greeting_fails_because_the_daemon_is_ending_goes_on_to_st
         "the process this command started is the daemon that answers: {said}"
     );
     assert_eq!(said["serving"], said["launched"]["pid"], "{said}");
-    assert_eq!(said["started"], Value::Null, "{said}");
+    assert_eq!(said["started"], said["launched"], "{said}");
     assert!(host.answers(), "a daemon answers");
     assert_eq!(host.running().len(), 1, "one daemon runs");
     assert!(

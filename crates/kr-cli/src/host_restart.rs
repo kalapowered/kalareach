@@ -941,8 +941,8 @@ pub(crate) enum Proved {
         cut: bool,
     },
     /// A control daemon answers, and what it states does not show whether it is the one this
-    /// command started: the start names no process, or the generation of the daemon that was
-    /// stopped was not read to hold it against. The command says what it read and what it asked.
+    /// command started: the start names no process. The command says what it read and what it
+    /// asked.
     Unproven {
         /// The process that the answering daemon states, where it states one.
         serving: Option<u64>,
@@ -1388,12 +1388,14 @@ pub(crate) enum Old {
 /// it. `started` is what the start made, and none where its look found a daemon already there.
 ///
 /// Three strengths of evidence. The daemon is the one that was started where the start knows its
-/// process, the daemon states that process, and the daemon is of a newer generation than the one
-/// that was stopped (where none ran there is none to be newer than). Where the start has no process
-/// to name (the scheduled task, a manager that does not say), or the generation of the daemon that
-/// was stopped was not read, a daemon answers and nothing shows whether it is the one that was
-/// started: that is [`Proved::Unproven`], and it says only what was read. A daemon of another
-/// process than the one the start made is another daemon whatever else is known.
+/// process and the daemon states that process, and, where the generation of the daemon that was
+/// stopped was read, the daemon is of a newer generation than it. A live process number names one
+/// process, and this command saw the daemon that it stopped, or none, end before it launched: a
+/// daemon that states the process the command launched is that process's own, whatever was read of
+/// the old daemon. Where the start has no process to name (the scheduled task, a manager that does
+/// not say), a daemon answers and nothing shows whether it is the one that was started: that is
+/// [`Proved::Unproven`], and it says only what was read. A daemon of another process than the one
+/// the start made is another daemon whatever else is known.
 fn judge(
     started: Option<Started>,
     old: Old,
@@ -1425,10 +1427,7 @@ fn judge(
             launched: Some(started),
             cut: false,
         }),
-        (Some(_), Some(_)) => Ok(match old {
-            Old::Unread => unproven(false),
-            Old::None | Old::Generation(_) => Proved::Ours(started),
-        }),
+        (Some(_), Some(_)) => Ok(Proved::Ours(started)),
         (Some(_), None) => Err(
             "the control daemon that answers did not state its process, so it \
              cannot be told from the one that was started",
@@ -1689,19 +1688,16 @@ mod tests {
         ));
     }
 
-    /// Where a daemon was stopped and its generation was not read, the answer holds nothing to be
-    /// newer than: the same process proves nothing, and another process is another's whatever else
-    /// is known. Where none ran and the start has no process to name, nothing shows either.
+    /// Where a daemon was stopped and its generation was not read, an answer that states the process
+    /// this command launched is its own start (a live process number names one process, and the
+    /// command saw the old daemon end before it launched), and another process is another's
+    /// whatever else is known. Where the start has no process to name, nothing shows either.
     #[test]
-    fn where_the_stopped_generation_was_not_read_the_process_alone_proves_nothing() {
+    fn where_the_stopped_generation_was_not_read_the_launched_process_is_still_the_proof() {
         let unread = |started, answering: &Answering| judge(started, Old::Unread, answering);
         assert!(matches!(
             unread(Some(started(Some(40))), &answering(1, Some(40))),
-            Ok(Proved::Unproven {
-                serving: Some(40),
-                newer: false,
-                ..
-            })
+            Ok(Proved::Ours(_))
         ));
         assert!(matches!(
             unread(Some(started(Some(40))), &answering(1, Some(41))),
