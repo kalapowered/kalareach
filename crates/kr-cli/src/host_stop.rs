@@ -7042,17 +7042,19 @@ mod tests {
             .len()
     }
 
-    /// Holds the walk of a set to the set. The one list of the set's variants, each as a pattern,
-    /// is the count and also the arms of a `match` with no wildcard arm: a variant added to the
-    /// set is an error in the test build until the list names it, and a walk that gives fewer
-    /// distinct variants than the list names fails the assertion. A variant named twice makes the
-    /// count larger than any walk can give, so that the assertion fails for it too.
+    /// Holds the walk of a set to the set. The one list of the set's variants, each as a path, is
+    /// the count and also the arms of a `match` with no wildcard arm: the macro writes each
+    /// pattern itself, so an entry that would match more than one variant (a wildcard or a
+    /// binding) is no path and does not build, and a variant added to the set is an error in the
+    /// test build until the list names it. A walk that gives fewer distinct variants than the list
+    /// names fails the assertion. A variant named twice makes the count larger than any walk can
+    /// give, so that the assertion fails for it too.
     macro_rules! the_walk_gives_every_variant {
-        ($walk:expr; $($variant:pat_param),+ $(,)?) => {{
+        ($walk:expr; $($variant:path),+ $(,)?) => {{
             let walk = $walk;
             for value in &walk {
                 match value {
-                    $($variant => {})+
+                    $($variant { .. } => {})+
                 }
             }
             assert_eq!(variants_walked(&walk), [$(stringify!($variant)),+].len());
@@ -7066,7 +7068,7 @@ mod tests {
     fn each_walk_sees_every_variant_of_its_set() {
         the_walk_gives_every_variant!(
             every::<Lock>();
-            Lock::Free, Lock::Held, Lock::Unreadable(_)
+            Lock::Free, Lock::Held, Lock::Unreadable
         );
         the_walk_gives_every_variant!(
             every::<Process>();
@@ -7074,11 +7076,11 @@ mod tests {
         );
         the_walk_gives_every_variant!(
             every::<Holder>();
-            Holder::NotRead, Holder::Nobody, Holder::Asked, Holder::Other(_)
+            Holder::NotRead, Holder::Nobody, Holder::Asked, Holder::Other
         );
         the_walk_gives_every_variant!(
             every::<Request>();
-            Request::Told, Request::MaybeAsked(_)
+            Request::Told, Request::MaybeAsked
         );
         the_walk_gives_every_variant!(
             every::<Start>();
@@ -7086,7 +7088,7 @@ mod tests {
         );
         the_walk_gives_every_variant!(
             every::<Before>();
-            Before::Ended { .. }, Before::Silent { .. }, Before::Answers(_), Before::OwnFault
+            Before::Ended, Before::Silent, Before::Answers, Before::OwnFault
         );
         the_walk_gives_every_variant!(
             every::<Gave>();
@@ -7094,19 +7096,19 @@ mod tests {
             Gave::NothingInTime,
             Gave::NothingListens,
             Gave::LinkFailed,
-            Gave::GreetingReplied(_),
+            Gave::GreetingReplied,
             Gave::GreetingOfAnotherMajor,
-            Gave::Reported(_),
-            Gave::ReadRefused(_),
-            Gave::ReadUndecodable(_),
-            Gave::ReadReplied(_)
+            Gave::Reported,
+            Gave::ReadRefused,
+            Gave::ReadUndecodable,
+            Gave::ReadReplied
         );
         assert!(every::<Look>().iter().any(Option::is_none));
         the_walk_gives_every_variant!(
             every::<Look>().into_iter().flatten().collect::<Vec<_>>();
             Endpoint::Nobody,
-            Endpoint::Same(_),
-            Endpoint::Unproved(_),
+            Endpoint::Same,
+            Endpoint::Unproved,
             Endpoint::Another,
             Endpoint::Unclear
         );
