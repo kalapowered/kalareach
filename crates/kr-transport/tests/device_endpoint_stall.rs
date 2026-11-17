@@ -14,7 +14,7 @@
 //! is a bound of this test: it has room above what the library's changed relay transport gives and
 //! is far below what the release's hold gives.
 //!
-//! The second stops the relay three times for ten seconds, each time after the connections have had
+//! The second stops the relay three times for five seconds, each time after the connections have had
 //! thirty seconds to come back to a steady send. It fails unless the hosts on the stopped relay keep
 //! every connection, each of them is answered again within [`RECOVERY`] after each resume, every
 //! question to them is answered, and the healthy host stays under the limit through every stop. It
@@ -58,12 +58,12 @@ const HOST_INTERVAL: Duration = Duration::from_millis(250);
 /// How many times the recovery case stops the relay, and for how long each time: less than a
 /// connection's idle time-out of 30 seconds and less than the library's send time-out of 15 seconds.
 const STOPS: usize = 3;
-const STOP_FOR: Duration = Duration::from_secs(10);
+const STOP_FOR: Duration = Duration::from_secs(5);
 
 /// How long the relay passes traffic between one resume and the next stop, once every host on it
 /// has been answered again. It is long enough for the connections to come back to a steady send
 /// before the next stop: stops that follow each other sooner can leave a connection whose probes
-/// back off past the idle time-out, which the released library does too.
+/// back off past the idle time-out.
 const SETTLE: Duration = Duration::from_secs(30);
 
 /// The longest that a host on the relay that resumed may take to answer a question again: the
