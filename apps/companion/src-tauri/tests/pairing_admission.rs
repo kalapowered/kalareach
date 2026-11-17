@@ -73,7 +73,7 @@ async fn this_computer_asks_the_managed_service_to_admit_it_as_it_dials_a_host()
         origin,
         http: Arc::clone(&service) as _,
     });
-    parts.link = Some(Box::new(move |own| {
+    parts.link = Some(Box::new(move |own, _pool| {
         *kept.lock().expect("the link") = Some(Arc::clone(&own));
         own
     }));
