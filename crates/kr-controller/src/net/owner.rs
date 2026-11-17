@@ -50,8 +50,8 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKe
 
 use super::devices::{CommitFn, DeviceDirectory, DeviceRecord};
 use super::invitations::{
-    AcceptanceRow, ActionSubject, InvitationRows, PairingAction, TerminalStanding, another_subject,
-    claim_effect, consume, noted_as_a_copy,
+    AcceptanceRow, ActionSubject, InvitationRows, PairingAction, Standing, TerminalStanding,
+    another_subject, claim_effect, consume, noted_as_a_copy,
 };
 use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
@@ -1422,8 +1422,10 @@ impl OwnerAuthority {
                     &spendable.proof,
                     "establish this host's clock",
                     established,
-                    TerminalStanding::Bootstrap,
-                    AcceptanceRow::Optional,
+                    Standing {
+                        terminal: TerminalStanding::Bootstrap,
+                        acceptance: AcceptanceRow::Optional,
+                    },
                 )?;
                 claim_effect(transaction, &claimed)?;
                 self.still_covers(&state, &spendable, &expectation)?;
