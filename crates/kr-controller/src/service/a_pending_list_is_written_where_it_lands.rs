@@ -23,6 +23,15 @@
 //! a socket is writable again is its own, and a case does not rest on one). An arrival at the pause
 //! shows that a read of the peer ended a wait, and no more than that. The case ends what it ends
 //! there, the writer goes on, and the fillers that remain are read. The replies are read whole.
+//!
+//! The pause holds the writer's worker thread, and the worker that runs the writer's task when the
+//! socket turns writable is the one that drives the runtime's timers and socket events: until the
+//! case lets the writer go, nothing drives them. So between the arming of the pause and the
+//! release of the writer the case awaits no timer and no event of the runtime that it could still
+//! be waiting on when the writer arrives: the fillers it reads are queued and need no event, the
+//! count of the writer's wait is read on a thread of the blocking pool, and the writer's arrival
+//! is waited for with the channel's own bounded wait on that pool. A thread of the standard
+//! library, the case's watch, fails a case that stays in one stage for longer than its bound.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -305,13 +314,16 @@ async fn a_list_asked_for_with_an_unknown_member_is_refused_as_the_devices_door_
     );
 }
 
-/// Reads one filler frame, and fails the case when none comes within thirty seconds.
+/// How long the writer's arrival, or the count of its wait, is waited for on a thread of the
+/// blocking pool.
+#[cfg(unix)]
+const ARRIVAL: Duration = Duration::from_secs(30);
+
+/// Reads one filler frame. The frames the case reads are queued whole, so a read finds its bytes
+/// and waits for no event of the runtime; the case's watch bounds the stage.
 #[cfg(unix)]
 async fn filler(reader: &mut kr_ipc::framed::FrameReader) {
-    tokio::time::timeout(Duration::from_secs(30), reader.read_payload())
-        .await
-        .expect("a filler frame comes")
-        .expect("a filler frame");
+    reader.read_payload().await.expect("a filler frame");
 }
 
 /// Reads filler frames, one at a time, until the writer says it has reached the end of its wait for
@@ -319,36 +331,34 @@ async fn filler(reader: &mut kr_ipc::framed::FrameReader) {
 /// writable again is the kernel's to say (Linux reports a Unix socket writable only when what is
 /// queued on it has fallen to a fraction of its send buffer, which one frame's read need not do), so
 /// the case reads until the writer arrives and does not assume that one read is enough. Where every
-/// filler has been read the socket is empty, and the writer is waited for under the same bound.
+/// filler has been read the socket is empty, and the writer is waited for with the channel's own
+/// bounded wait on a thread of the blocking pool: a timer of the runtime would wait on a driver
+/// that the writer, once it has arrived, holds in its pause.
 #[cfg(unix)]
 async fn drained_until_the_writer_arrives(
     reader: &mut kr_ipc::framed::FrameReader,
-    arrived: &std::sync::mpsc::Receiver<()>,
+    arrived: std::sync::mpsc::Receiver<()>,
     fillers: usize,
 ) -> usize {
     let mut read = 0;
-    // The bound is read from the clock at every turn of the loop, and the timeout beside it is the
-    // second guard: a loaded machine can stretch a timer, and the loop must still end by its bound.
-    let begun = std::time::Instant::now();
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while arrived.try_recv().is_err() {
-            assert!(
-                begun.elapsed() < Duration::from_secs(30),
-                "the writer reaches the end of its wait within thirty seconds, {read} of {fillers} fillers read"
-            );
-            if read < fillers {
-                filler(reader).await;
-                read += 1;
-                // The writer's task runs on what the read freed: no pause is put between two
-                // reads, since a loaded machine stretches a pause and the bound is on the whole.
-                tokio::task::yield_now().await;
-            } else {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+    while arrived.try_recv().is_err() {
+        if read == fillers {
+            tokio::task::spawn_blocking(move || arrived.recv_timeout(ARRIVAL))
+                .await
+                .expect("the wait for the writer ends")
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "the writer reaches the end of its wait within {ARRIVAL:?}, {read} of {fillers} fillers read"
+                    )
+                });
+            break;
         }
-    })
-    .await
-    .expect("the writer reaches the end of its wait");
+        filler(reader).await;
+        read += 1;
+        // The writer's task runs on what the read freed: no pause is put between two reads, since
+        // a loaded machine stretches a pause and the bound is on the whole.
+        tokio::task::yield_now().await;
+    }
     read
 }
 
@@ -417,10 +427,140 @@ async fn filled(
     whole
 }
 
+/// The end of a case that needs no runtime: a thread of the standard library, started with the
+/// case and ended with it, that tells the case the name of its stage when one stage has lasted
+/// longer than [`Watch::BOUND`]. Each [`Watch::stage`] starts the bound afresh. The thread waits on
+/// a condition variable with a time bound and tells the case through a channel whose send needs no
+/// runtime either, so a runtime whose every worker is held cannot stop it. The case then fails
+/// with the stage's name. Where the case has not ended [`Watch::GRACE`] after that, the thread
+/// ends the test program with the stage's name on standard error, since a case that its own
+/// failure cannot end holds the list just as a stand does. A stage of a correct run lasts
+/// milliseconds, and seconds on a loaded machine; the bound is a minute, so the watch cannot
+/// fire in a slow but correct run.
+#[cfg(unix)]
+struct Watch {
+    stage: Arc<(std::sync::Mutex<Stage>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Where the case is, and since when; `ended` is set by the case's end.
+#[cfg(unix)]
+struct Stage {
+    name: &'static str,
+    since: std::time::Instant,
+    ended: bool,
+}
+
+#[cfg(unix)]
+impl Watch {
+    const BOUND: Duration = Duration::from_secs(60);
+    const GRACE: Duration = Duration::from_secs(30);
+
+    /// Starts the watch at the stage `first`, and returns the end that carries the name of a stage
+    /// that stood past its bound.
+    fn armed(first: &'static str) -> (Self, tokio::sync::oneshot::Receiver<&'static str>) {
+        let stage = Arc::new((
+            std::sync::Mutex::new(Stage {
+                name: first,
+                since: std::time::Instant::now(),
+                ended: false,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let (expires, expired) = tokio::sync::oneshot::channel();
+        let thread = std::thread::spawn({
+            let stage = Arc::clone(&stage);
+            move || {
+                let (lock, changed) = &*stage;
+                let mut at = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut told = Some(expires);
+                loop {
+                    if at.ended {
+                        return;
+                    }
+                    let past = at.since.elapsed();
+                    let bound = if told.is_some() {
+                        Self::BOUND
+                    } else {
+                        Self::GRACE
+                    };
+                    if let Some(left) = bound.checked_sub(past).filter(|left| !left.is_zero()) {
+                        at = changed
+                            .wait_timeout(at, left)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .0;
+                    } else if let Some(expires) = told.take() {
+                        let _ = expires.send(at.name);
+                        at.since = std::time::Instant::now();
+                    } else {
+                        eprintln!(
+                            "the case stood in the stage \"{}\" and its failure did not end it",
+                            at.name
+                        );
+                        std::process::exit(101);
+                    }
+                }
+            }
+        });
+        (
+            Self {
+                stage,
+                thread: Some(thread),
+            },
+            expired,
+        )
+    }
+
+    /// The case has reached the stage `name`.
+    fn stage(&self, name: &'static str) {
+        let mut at = self
+            .stage
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        at.name = name;
+        at.since = std::time::Instant::now();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stage
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .ended = true;
+        self.stage.1.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// What the writer put on the connection when the socket had no room for the list and `ends` came
-/// in that wait: the frames are read once the writer has gone on.
+/// in that wait: the frames are read once the writer has gone on. A case that stays in one stage
+/// past the watch's bound fails with the stage's name.
 #[cfg(unix)]
 async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFrame, ControlFrame) {
+    let (watch, mut stood) = Watch::armed("the connection is staged");
+    tokio::select! {
+        written = written_in_stages(ends, &watch) => written,
+        Ok(stage) = &mut stood => panic!(
+            "the case stood in the stage \"{stage}\" for more than {:?}",
+            Watch::BOUND
+        ),
+    }
+}
+
+/// The stages of [`written_after_a_wait_for_room`].
+#[cfg(unix)]
+async fn written_in_stages(
+    ends: Ends,
+    watch: &Watch,
+) -> (ControlFrame, ControlFrame, ControlFrame) {
     let Staged {
         _temp,
         controller,
@@ -439,10 +579,12 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
     // consumes it, and a call that finds the mark returns at once, with the socket full. The mark
     // is consumed here, while the socket is empty, so that the readiness call the writer makes
     // after the fill finds the socket full and waits for it.
+    watch.stage("the registration's mark is consumed");
     tokio::time::timeout(Duration::from_secs(30), writer.writable().ready())
         .await
         .expect("the readiness call on the empty socket returns")
         .expect("the connection can be waited on");
+    watch.stage("the socket is filled");
     let fillers = filled(&mut writer, &mut reader).await;
     let replacement_waits = matches!(
         ends,
@@ -451,6 +593,7 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
     if replacement_waits {
         continuous.advance(Duration::from_secs(16 * 60));
     }
+    watch.stage("the writer is started");
     let (arrived, go) = controller.pause_after_a_wait_for_room();
     let writing = {
         let controller = Arc::clone(&controller);
@@ -469,14 +612,24 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
             stood
         })
     };
-    // The writer is waiting for room once its wait has been counted.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while controller.local_writes_blocked() < 1 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the writer waits for room");
+    // The writer is waiting for room once its wait has been counted. The count is read on a thread
+    // of the blocking pool: no timer of the runtime is waited on from here to the writer's release.
+    watch.stage("the wait for room is counted");
+    {
+        let controller = Arc::clone(&controller);
+        tokio::task::spawn_blocking(move || {
+            let begun = std::time::Instant::now();
+            while controller.local_writes_blocked() < 1 {
+                assert!(
+                    begun.elapsed() < ARRIVAL,
+                    "the writer waits for room within {ARRIVAL:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+        .await
+        .expect("the writer waits for room");
+    }
     if replacement_waits {
         assert_eq!(
             controller.local_writes_blocked(),
@@ -485,7 +638,8 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
              with no byte written"
         );
     }
-    let drained = drained_until_the_writer_arrives(&mut reader, &arrived, fillers).await;
+    watch.stage("the fillers are read until the writer arrives");
+    let drained = drained_until_the_writer_arrives(&mut reader, arrived, fillers).await;
     assert!(
         drained >= 1,
         "the peer read at least one filler before the writer arrived, so a read ended its wait"
@@ -502,13 +656,16 @@ async fn written_after_a_wait_for_room(ends: Ends) -> (ControlFrame, ControlFram
         Ends::TheReplacementWaitsAndItsRegistrationEnd => controller.deregister(connection_id),
     }
     go.send(()).expect("the writer goes on");
+    watch.stage("the rest of the fillers is read");
     for _ in drained..fillers {
         filler(&mut reader).await;
     }
+    watch.stage("the reply is read");
     let read = tokio::time::timeout(Duration::from_secs(30), reader.read_message())
         .await
         .expect("the daemon wrote or ended the connection")
         .expect("the list reads");
+    watch.stage("the writer's task ends");
     assert!(
         tokio::time::timeout(Duration::from_secs(30), writing)
             .await
