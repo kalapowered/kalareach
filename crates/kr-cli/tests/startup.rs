@@ -6435,6 +6435,9 @@ enum OnStop {
     },
     /// Answers the hello with a version of another major than this program's.
     AnotherMajor,
+    /// Closes the connection at the hello, with no answer, and stops listening, as a daemon does
+    /// that is ending: the greeting fails and nothing answers after it.
+    EndAtTheGreeting,
 }
 
 /// How many `host.info` that follow its close `OnStop::CloseAndEndAfterTwoLooks` answers before it
@@ -6536,6 +6539,10 @@ impl TestDaemon {
                         let mut then_end = false;
                         let mut then_close = false;
                         let answer = match frame {
+                            ControlFrame::Hello(_) if matches!(on_stop, OnStop::EndAtTheGreeting) => {
+                                over.store(true, std::sync::atomic::Ordering::SeqCst);
+                                break;
+                            }
                             ControlFrame::Hello(_) => ControlFrame::HelloAck(Box::new(
                                 kr_protocol::local::LocalHelloAck {
                                     selected_version: if matches!(on_stop, OnStop::AnotherMajor) {
@@ -6651,6 +6658,7 @@ impl TestDaemon {
                                     | OnStop::RefuseTheRead(_)
                                     | OnStop::UndecodableRead
                                     | OnStop::AnotherMajor
+                                    | OnStop::EndAtTheGreeting
                                     | OnStop::RefuseAndHoldTheProbe => {
                                         ControlFrame::Response(Response {
                                             request_id: mutation.request_id,
@@ -7809,6 +7817,90 @@ fn a_daemon_that_closed_the_connection_and_goes_is_waited_for_to_its_end_whichev
     assert!(
         daemon.stopped_listening_at().is_some(),
         "the command ended before the daemon had answered two looks after its close: {out}"
+    );
+    assert!(attempts(&host).is_empty(), "no record stands");
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (a restart where the greeting fails because the daemon is ending): a daemon that
+/// closes the connection at its hello and stops listening has ended when the command's wait looks,
+/// as one does whose stop another command has taken. The restart goes on to the start as it does
+/// after any end: the daemon that answers is the one it started, the stop is `ended`, no request to
+/// stop was made, and no record stands.
+#[test]
+fn a_restart_where_the_greeting_fails_because_the_daemon_is_ending_goes_on_to_start_one() {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    let mut daemon =
+        TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::EndAtTheGreeting, true);
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let said = document(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(0), "{said}");
+    assert_eq!(said["ok"], true, "{said}");
+    assert_eq!(stop_of(&said), "ended", "{said}");
+    assert_eq!(
+        said["started"]["start"], "standalone",
+        "the restart started a daemon after the end: {said}"
+    );
+    assert_eq!(
+        said["started"]["pid"].as_u64(),
+        Some(u64::from(host.one_daemon())),
+        "the process this command started is the daemon that answers: {said}"
+    );
+    assert!(host.answers(), "a daemon answers");
+    assert_eq!(host.running().len(), 1, "one daemon runs");
+    assert!(
+        !daemon.received().iter().any(|method| method == "host.stop"),
+        "no request to stop left: {:?}",
+        daemon.received()
+    );
+    assert!(attempts(&host).is_empty(), "no record stands");
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (a request that could not be made because the daemon ended, with a restart): the
+/// daemon answers the look, closes the connection and stops listening. The restart says what the
+/// stop says of that state, that it ended and that this command sent nothing, and then that it
+/// started a daemon, which answers; no record stands and no request to stop left.
+#[test]
+fn a_restart_whose_request_could_not_be_made_because_the_daemon_ended_goes_on_to_start_one() {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    // Of an older generation than any daemon the start makes, so that the one that answers after
+    // it is new.
+    let mut daemon = TestDaemon::serve_generation(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::CloseAfterTheLookAndEnd,
+        true,
+        0,
+    );
+    let output = start(host.kr(&["host", "restart"])).finish("kr host restart");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let said = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{out} {said}");
+    assert!(
+        out.starts_with("The control daemon for environment ")
+            && out.contains(" ended, and this command could not make its request for it: ")
+            && out.contains(
+                " This command sent nothing. This command then started a control daemon (process "
+            ),
+        "the stop's words for the state, then what the start did: {out}"
+    );
+    assert!(
+        out.trim_end()
+            .ends_with(" under the standalone start. No session was stopped."),
+        "{out}"
+    );
+    assert!(!said.contains("Asked the control daemon"), "{said}");
+    assert!(host.answers(), "the daemon this command started answers");
+    assert_eq!(host.running().len(), 1, "one daemon runs");
+    assert!(
+        !daemon.received().iter().any(|method| method == "host.stop"),
+        "no request to stop left: {:?}",
+        daemon.received()
     );
     assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
