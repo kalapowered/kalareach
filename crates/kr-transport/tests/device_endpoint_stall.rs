@@ -58,6 +58,7 @@ use kr_transport::config::EndpointConfig;
 use kr_transport::dialler::{DeviceEndpoint, HostServices};
 use support::front::RelayFront;
 use support::{LocalRelay, Side};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// How long an answer may take before the case counts the question as unanswered.
@@ -488,11 +489,11 @@ type Outcome = Option<(Instant, Result<Duration, String>)>;
 
 /// Asks one question on a task of its own. The task takes the question's start right before it
 /// asks and the answer's arrival right after the answer comes, so both are recorded by the task
-/// that sends and receives. `began` is set once the start is taken.
+/// that sends and receives. `began` is sent once the start is taken.
 fn spawn_question(
     connection: Connection,
     slots: &Arc<Mutex<Vec<Outcome>>>,
-    began: Option<Arc<AtomicBool>>,
+    began: Option<oneshot::Sender<()>>,
 ) -> JoinHandle<()> {
     let index = {
         let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
@@ -503,7 +504,7 @@ fn spawn_question(
     tokio::spawn(async move {
         let started = Instant::now();
         if let Some(began) = began {
-            began.store(true, Ordering::SeqCst);
+            let _ = began.send(());
         }
         let outcome = match tokio::time::timeout(PATIENCE, ask(&connection)).await {
             Ok(Ok(())) => Ok(started.elapsed()),
@@ -619,20 +620,16 @@ impl Asker {
     /// taken its start. The start is recorded by that task, so it is later than anything that
     /// happened before this call and earlier than anything that happens after it returns.
     async fn ask_now(&self) {
-        let began = Arc::new(AtomicBool::new(false));
-        let task = spawn_question(
-            self.connection.clone(),
-            &self.slots,
-            Some(Arc::clone(&began)),
-        );
+        let (began, started) = oneshot::channel();
+        let task = spawn_question(self.connection.clone(), &self.slots, Some(began));
         self.extra
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(task);
-        until("the case's own question to start", || {
-            began.load(Ordering::SeqCst)
-        })
-        .await;
+        tokio::time::timeout(Duration::from_secs(600), started)
+            .await
+            .expect("the case's own question never started")
+            .expect("the case's own question ended before it started");
     }
 
     fn started(&self) -> usize {
@@ -1151,12 +1148,13 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
     // before the resume. Every instant compared here is taken where its event happens, at the event,
     // and no instant of the case's own task is used: the stop's confirmation and the resume by the
     // front under its lock, a question's start and its answer's arrival by the question's own task.
-    // A delay of any task can only move the question's recorded start or arrival later.
+    // A delay of any task can only move the question's recorded start or arrival later. A clock may
+    // give equal instants, so a question that began at the resume's instant counts in the window.
     for (number, ((_, resumed), stood)) in windows.iter().zip(&stood).enumerate() {
         let Some(stood) = stood else { continue };
         let (mut in_window, mut answered_early) = (0, 0);
         for (began, outcome) in by_connection.iter().flatten() {
-            if began >= stood && began < resumed {
+            if began >= stood && began <= resumed {
                 in_window += 1;
                 answered_early +=
                     usize::from(matches!(outcome, Ok(rtt) if *began + *rtt < *resumed));
