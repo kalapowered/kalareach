@@ -157,7 +157,7 @@ impl HomeLayout {
     ///
     /// This is the reading for what never depends on PowerShell's answer, `kr shell status` and
     /// removal: a PowerShell that is found and cannot be asked gets no target here, so a broken one
-    /// never stops a removal, and it is given the short time ([`ASK_DEADLINE`]) a command that only
+    /// never stops a removal, and it is given the short time (`ASK_DEADLINE`) a command that only
     /// reports should wait. An install uses [`Self::try_targets`], which says why and waits as long
     /// as the installer's other two questions do.
     #[must_use]
