@@ -12,9 +12,10 @@
 //! whole endpoint for longer than the library's own time-outs and longer than a connection's
 //! 30-second idle time-out, so it can delay a host's traffic on another relay and can also close
 //! that host's connection. With the fork's changes the stall case under `tests/` keeps a healthy
-//! host's answers under 2 seconds beside such a relay; it does not show a slow uplink, ordinary
-//! use or a real round trip, and a relay that stops again and again within seconds can still cost
-//! its own hosts some connections.
+//! host's answers under 2 seconds beside a relay that stops reading; it does not show a slow
+//! uplink, ordinary use or a real round trip, and, since a full queue now drops datagrams, a relay
+//! that stops more than once while its hosts carry a heavy load can cost those hosts some
+//! connections.
 //!
 //! The endpoint is built with no relay and no discovery service. It takes them one host at a time,
 //! when the device first dials that host:
