@@ -78,10 +78,12 @@ enum Command {
 /// A scripted lane and the endpoint it listens at.
 pub struct ScriptedLane {
     endpoint: Endpoint,
-    _dir: PrivateTempDir,
     shared: Arc<Shared>,
     commands: mpsc::UnboundedSender<Command>,
     task: tokio::task::JoinHandle<()>,
+    /// The directory the endpoint lives in, declared last so that it is removed after the files in
+    /// it are closed.
+    _dir: PrivateTempDir,
 }
 
 impl ScriptedLane {
