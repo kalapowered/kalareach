@@ -9117,7 +9117,8 @@ including the cancellation the host carries out itself, is checked against the p
 admission needed: a narrower installation that removes one of them stops the action at that check,
 until the call that sends it. A revocation or a component fault disables the binding's rich
 capabilities and lets what it already admitted finish, and a binding that is due to end stays until
-its admitted action is sent. A refusal there is proven: nothing was sent, the broker wrote no dispatch marker, and the receipt
+the call that sends its admitted action has ended (the deadline that stops the caller's wait does
+not stop that call), or the action was given up before a call. A refusal there is proven: nothing was sent, the broker wrote no dispatch marker, and the receipt
 is refused, not uncertain. What nothing orders is the interval between the take and the bytes reaching
 the transport's queue. A frame the host writes names its thread (an approval's answer names its
 request), so a frame past the take reaches the thread the binding named when it was admitted and
