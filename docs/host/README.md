@@ -6644,13 +6644,16 @@ on a journal that records its clock as distrusted answers only to a confirmation
 restarted. A later action of the owner ends that distrust.
 
 A session's worker reads its clocks inside a short bracket, two readings of the continuous clock
-around the others. Suppose a worker that trusts its clock is held up for more than 250 ms while
-it reads a clock that is ahead, and the owner then sets the clock back by more than five seconds
-and confirms before that reading ends. The command reports success and the worker becomes
-unresolved, because the held-up reading counts from its end, after the confirmation, and the clock
-now reads behind it. No command prints this. The session stops pruning by age, and a session
-export counts the output it timed meanwhile as `output_clock_unproven`. The owner confirms again,
-and that confirmation holds unless the clock steps again.
+around the others. A reading held up for more than 250 ms decides nothing, but the wall clock it
+read is kept as evidence of how far the clock had got when the reading ended. Suppose a worker
+that trusts its clock is held up while it reads a clock that has jumped ahead since the worker
+last read it, and the owner then sets the clock back and confirms before that reading ends. The
+command reports success. The worker can then become unresolved, because the held-up reading
+counts from its end, after the confirmation, and a later reading more than five seconds behind it
+is a step back that the owner did not see. No command prints this. While the worker is
+unresolved, the session stops pruning by age, and a session export counts the output it timed
+meanwhile as `output_clock_unproven`. The owner then confirms again, and that confirmation holds
+unless the clock steps again.
 
 A restatement answers to a different rule, because it adds nothing to what the worker knows. A
 worker that began with nothing recorded, such as a new session, and has met no confirmation and

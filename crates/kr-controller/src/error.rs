@@ -150,9 +150,9 @@ pub enum ControllerError {
     ///
     /// The two readings of the continuous clock that bracket a reading of the others were too far
     /// apart in each of three tries, so a pause could lie between the pair. It finds nothing wrong
-    /// with the clock: it sets no distrust and spends no confirmation. What the held-up tries read
-    /// is kept as evidence, so it can raise the durable mark and write an owed anchor, and a later
-    /// try takes a new reading.
+    /// with the clock: it sets no distrust and spends no confirmation. What held-up tries read of
+    /// the wall clock is kept as evidence, so it can raise the durable mark and write an owed
+    /// anchor, and a later try takes a new reading.
     #[error("{detail}")]
     ClockNotRead {
         /// What happened, and what was and was not changed.
