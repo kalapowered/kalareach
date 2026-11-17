@@ -649,11 +649,6 @@ async fn after_the_end(
 ) -> Completion {
     let id = environment.environment_id;
     past.end_seen();
-    // The record is the command's own until a daemon that it started answers. A request that could
-    // not be made let it go, and the start needs it again.
-    if progress.with_marker(|_| ()).is_none() {
-        let _ = begin_the_record(environment, old, progress);
-    }
     let facts = Facts {
         knows: Knows::Ended,
         pid: stopped.pid,
@@ -666,7 +661,16 @@ async fn after_the_end(
             Ok(proved) => Ok(proved),
             Err(error) => return host_stop::failed(error, &facts, json),
         },
-        None => start_and_prove(host, environment, stopped.generation, progress, past).await,
+        None => {
+            // The start's side. The record is the command's own until a daemon that it started
+            // answers. A request that could not be made let it go, and the start needs it again;
+            // where another daemon holds the environment nothing is asked or started, and no
+            // record is written.
+            if progress.with_marker(|_| ()).is_none() {
+                let _ = begin_the_record(environment, old, progress);
+            }
+            start_and_prove(host, environment, stopped.generation, progress, past).await
+        }
     };
     let creates = host_stop::creates_under_way(stopped.unsettled);
     let opening = stopped.opening(id);
