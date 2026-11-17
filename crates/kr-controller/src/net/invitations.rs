@@ -1519,10 +1519,10 @@ pub(super) enum AcceptanceRow {
 
 /// The device whose record answered a confirmation, read from its acceptance row.
 ///
-/// A row of one of the two device channels names the device that answered, and every consumption
-/// refuses a row that names none; the terminal's row names none by design, because its signer is
-/// the bootstrap key. A confirmation with no row is refused when the consumption requires one, and
-/// has no answering record to be bound to otherwise.
+/// A row that `complete` wrote for one of the two device channels names the device that answered,
+/// and every consumption refuses a row that names none; the terminal's row names none by design,
+/// because its signer is the bootstrap key. A confirmation with no row is refused when the
+/// consumption requires one, and has no answering record to be bound to otherwise.
 fn answering_device(
     transaction: &Connection,
     proof: &OwnerConfirmationProof,

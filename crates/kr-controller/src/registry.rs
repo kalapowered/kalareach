@@ -954,9 +954,11 @@ impl Registry {
     ) -> Result<Self> {
         // A file that records a version this build neither reads nor brings forward is refused
         // before any write of the registry's own: not its journal mode, not a table it lacks, not
-        // a step. The engine may first recover a hot rollback journal or the frames of a
-        // write-ahead log, as it does at the first read of the open, which a read of the main file
-        // alone would see stale or torn.
+        // a step. The engine may first recover a hot rollback journal into the main file, as it
+        // does at the first read of the open. For a write-ahead log that read writes only the
+        // index, and the log's frames reach the main file at the checkpoint that the close of the
+        // refused connection runs. Both engine writes occur at the base as well, and neither
+        // changes what the file records. A read of the main file alone would see it stale or torn.
         if let Some(version) = recorded_schema_version(&connection)?
             && !is_read_or_brought_forward(version)
         {
