@@ -23,6 +23,7 @@ use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerLaunch, Wor
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
@@ -702,7 +703,7 @@ impl Host {
         // over, not how soon the runtime drops the last reference to the one before it. Anything
         // else fails at once.
         let started = std::time::Instant::now();
-        kr_controller::testing::taken_over(|| {
+        let daemon = kr_controller::testing::taken_over(|| {
             let supervisor = self.temp.supervisor(self.with_the_marking(
                 match (self.worker_packages.clone(), self.launched.clone()) {
                     (Some(packages), _) => Box::new(WorkerWithPackageRoot {
@@ -730,7 +731,12 @@ impl Host {
                 "the daemon did not start in {:.1?}: {error}",
                 started.elapsed()
             )
-        })
+        });
+        // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+        daemon
+            .controller
+            .set_host_environment(StartedEnvironment::within(self.temp.root()).host_variables());
+        daemon
     }
 
     async fn client(&self) -> LocalClient {
@@ -868,6 +874,17 @@ async fn create_with(
     extra: &[(&str, &str)],
 ) -> SessionCreateResult {
     let mut params = create_params(host.environment_id, host.temp.root());
+    // The shell is given a home inside the host's tree, not the person's.
+    #[cfg(unix)]
+    params
+        .environment_snapshot
+        .push(kr_protocol::session::EnvironmentVariable {
+            name: "HOME".to_owned(),
+            value: StartedEnvironment::within(host.temp.root())
+                .home()
+                .display()
+                .to_string(),
+        });
     params
         .environment_snapshot
         .extend(
@@ -980,6 +997,53 @@ fn workspace_root() -> PathBuf {
     root.pop();
     root.pop();
     std::fs::canonicalize(&root).unwrap_or(root)
+}
+
+/// A session's shell starts under the home of the host's own tree: the startup files it reads are
+/// the ones a case puts there, and the person's profile is never read or run.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sessions_shell_has_a_home_inside_the_hosts_own_tree() {
+    let host = Host::create();
+    let _daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host).await;
+    let session_id = created.session.session_id;
+    let dimensions = created.session.dimensions;
+    drop(client);
+
+    // The shell's echo of the line is `kr-%s|%s|%s`, so only its output reads `kr-home|`.
+    let mut terminal = LocalTerminal::attach(&host, session_id, dimensions, true).await;
+    terminal
+        .type_line("printf 'kr-%s|%s|%s\\n' home \"$HOME\" \"$PATH\"")
+        .await;
+    terminal.shown("kr-home|", 1).await;
+    let start = terminal.seen.find("kr-home|").expect("the shell's answer");
+    let answer = terminal.seen[start..].lines().next().expect("a line");
+    let mut parts = answer.trim().splitn(3, '|').skip(1);
+    let home = Path::new(parts.next().expect("the home"));
+    assert!(
+        home.starts_with(host.temp.root()),
+        "the shell's home {} is not inside the host's tree {}",
+        home.display(),
+        host.temp.root().display()
+    );
+    // What the system adds to a login shell's search path is its own; the person's profile is what
+    // would put a folder of the account's home or of a removable volume on it.
+    let search_path = parts.next().expect("the search path");
+    let account_home = kr_ipc::paths::passwd_entry()
+        .and_then(|entry| entry.home)
+        .filter(|home| home != "/");
+    for folder in search_path.split(':') {
+        assert!(
+            !Path::new(folder).starts_with("/Volumes")
+                && account_home
+                    .as_deref()
+                    .is_none_or(|home| !Path::new(folder).starts_with(home)),
+            "the shell's search path holds {folder}, which the person's profile may have put \
+             there: {search_path}"
+        );
+    }
 }
 
 /// KR-REQ-02.03, KR-REQ-24.04: the control daemon restarting does not close the shell: the root

@@ -26,6 +26,7 @@ use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::{ProcessState, process_state};
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource, WorkerProfile};
@@ -162,6 +163,9 @@ impl Host {
                 started.elapsed()
             )
         });
+        // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+        controller
+            .set_host_environment(StartedEnvironment::within(self.temp.root()).host_variables());
         let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
             .expect("binds the rendezvous");
         let clients = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))

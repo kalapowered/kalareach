@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
@@ -1015,15 +1016,15 @@ async fn a_terminal_of_another_size_is_drawn_a_bounded_projection_and_told_what_
     );
 
     // Ended from outside, the projected attachment says what it could not carry.
-    let detached = std::process::Command::new(kr())
+    let mut detach = std::process::Command::new(kr());
+    StartedEnvironment::within(hosted.temp.root()).apply(&mut detach);
+    let detached = detach
         .args([
             "detach",
             &hosted.display.get().to_string(),
             "--attachment",
             &projected.to_string(),
         ])
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .env(
             "KR_RUNTIME_DIR",
             hosted.temp.paths().runtime_root().display().to_string(),

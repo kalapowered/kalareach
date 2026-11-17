@@ -20,6 +20,7 @@ use kr_controller::supervision::{
 };
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use serde_json::{Value, json};
 use tauri::Manager as _;
@@ -194,6 +195,8 @@ impl Host {
         })
         .await
         .expect("the daemon starts");
+        // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+        controller.set_host_environment(StartedEnvironment::within(tree.root()).host_variables());
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the control endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));

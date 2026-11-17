@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use kr_controller::singleton::SingletonLock;
 use kr_ipc::client::LocalClient;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::ids::{ActionId, BuildId};
 use kr_protocol::local::LocalClientKind;
@@ -124,7 +125,11 @@ fn spawn_daemon(
         .append(true)
         .open(host.root().join("daemon.log"))
         .expect("opens the daemon's log");
-    std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    // The daemon's sessions run a login shell: they are given a home inside the tree, not the
+    // person's.
+    StartedEnvironment::within(host.root()).apply(&mut command);
+    command
         .arg("--runtime-dir")
         .arg(environment.runtime_root())
         .arg("--state-dir")

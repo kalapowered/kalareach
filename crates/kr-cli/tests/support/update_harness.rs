@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use aws_lc_rs::signature::Ed25519KeyPair;
 use kr_ipc::client::LocalClient;
 use kr_ipc::install::{Program, Store};
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::hello::{PACKAGE_VERSION, PackageVersion, ProtocolVersion};
 use kr_protocol::ids::{ActionId, BuildId, SessionId};
@@ -1912,7 +1913,11 @@ impl Second {
         let file = std::fs::File::create(&log).expect("the daemon's log");
         let runtime = tree.paths().runtime_root().display().to_string();
         let state = tree.paths().state_root().display().to_string();
-        let child = Command::new(program)
+        let mut command = Command::new(program);
+        // A home and a working folder of the tree's own, so that a session's login shell reads no
+        // profile of the person's.
+        StartedEnvironment::within(tree.root()).apply(&mut command);
+        let child = command
             .args([
                 "--runtime-dir",
                 &runtime,
@@ -1921,8 +1926,6 @@ impl Second {
                 "--secret-store",
                 "file",
             ])
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
             .env("KR_RUNTIME_DIR", &runtime)
             .env("KR_STATE_DIR", &state)
             .current_dir(tree.root())
@@ -2121,8 +2124,10 @@ impl Host {
         // Nothing of this test's own environment reaches the product. Windows needs the system's
         // variables to start a program at all, so what is taken away there is what would choose a
         // place for the product: every variable it reads for that.
+        // On Unix the program also has a home and a working folder of the tree's own, so that a
+        // session's login shell reads no profile of the person's.
         #[cfg(unix)]
-        command.env_clear().env("PATH", "/usr/bin:/bin");
+        StartedEnvironment::within(self.tree.root()).apply(&mut command);
         #[cfg(windows)]
         for (name, _) in std::env::vars_os() {
             if name.to_string_lossy().to_ascii_uppercase().starts_with("KR_") {

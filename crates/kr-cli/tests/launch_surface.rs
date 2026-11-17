@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
 use kr_protocol::hello::PROTOCOL_VERSION;
@@ -199,12 +200,12 @@ impl Hosted {
         let runtime = self.temp.paths().runtime_root().display().to_string();
         let state = self.temp.paths().state_root().display().to_string();
         tokio::task::spawn_blocking(move || {
-            std::process::Command::new(kr())
+            let mut command = std::process::Command::new(kr());
+            StartedEnvironment::within(&root).apply(&mut command);
+            command
                 .args(&arguments)
                 // Never this test's own directory: the build tree can be on a removable volume.
                 .current_dir(root)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
                 .env("KR_RUNTIME_DIR", runtime)
                 .env("KR_STATE_DIR", state)
                 .output()

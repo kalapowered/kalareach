@@ -289,7 +289,10 @@ impl Tree {
     /// Runs `kr` with this tree's directories, on plain pipes, from the directory the binaries
     /// are in, which is on the internal disk.
     fn kr(&self, line: &[&str]) -> Output {
-        Command::new(support::kr())
+        let mut command = Command::new(support::kr());
+        kr_ipc::testing::started_environment::StartedEnvironment::within(self.temp.root())
+            .apply(&mut command);
+        command
             .args(line)
             .env(
                 kr_ipc::paths::RUNTIME_DIR_VARIABLE,

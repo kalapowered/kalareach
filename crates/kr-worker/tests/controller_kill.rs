@@ -23,6 +23,7 @@ use kr_controller::supervision::DetachedSupervisor;
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::ids::{ActionId, AttachmentId, BuildId, EnvironmentId, SessionId};
@@ -199,6 +200,9 @@ fn start_daemon(
         .open(host.root().join("daemon.log"))
         .expect("opens the daemon's log");
     let mut command = std::process::Command::new(program);
+    // The daemon's sessions run a login shell: they are given a home inside the tree, not the
+    // person's.
+    StartedEnvironment::within(host.root()).apply(&mut command);
     command
         .args([
             "--exact",
