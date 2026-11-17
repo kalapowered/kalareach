@@ -74,8 +74,10 @@ const ENDED_BY_STREAM: &str = "Control ended: this view's input stream ended.";
 const NOT_TAKEN_BY_STREAM: &str =
     "This view could not take control: its input stream did not open. Take control again to retry.";
 
-/// Why a take ended as the session answered it, when the view's input stream had ended first.
-const NOT_TAKEN_FOR_AN_ENDED_STREAM: &str = "This view could not take control: its input stream ended before the host answered. Take control again to retry.";
+/// Why a take ended as the session answered it, when the view had served the end of its input
+/// stream before it read the answer. The words claim no order beyond the view's own.
+const NOT_TAKEN_FOR_AN_ENDED_STREAM: &str =
+    "This view could not take control: its input stream ended. Take control again to retry.";
 
 /// Why every take is refused when the session's answer to the attach granted this view no right to
 /// type. The answer names no cause beyond that, and the words claim none.

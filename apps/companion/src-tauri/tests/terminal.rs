@@ -7356,7 +7356,8 @@ async fn a_take_on_a_view_granted_no_right_to_type_is_refused_at_once_and_asks_t
 }
 
 /// What the page is told when the session grants a take after the view's input stream ended.
-const NOT_TAKEN_FOR_AN_ENDED_STREAM: &str = "This view could not take control: its input stream ended before the host answered. Take control again to retry.";
+const NOT_TAKEN_FOR_AN_ENDED_STREAM: &str =
+    "This view could not take control: its input stream ended. Take control again to retry.";
 
 /// The release that the view gives the lease back with, which names no position because the stream it
 /// would have named it on is gone: the case reads it from the control stream and checks that it is
