@@ -511,7 +511,8 @@ mod tests {
                 "another key for the session",
                 "another session",
                 "unreadable"
-            ]
+            ],
+            "an admitted worker's entries leave the quarantine and no other entry does"
         );
     }
 
