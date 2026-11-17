@@ -1055,7 +1055,7 @@ impl TimeContract {
     /// kept and the floor is not raised.
     ///
     /// A check that asks again whether a UTC end has been reached reads this where it may take no
-    /// lock; what it leaves out against [`Self::proven_wall_ms`] is the kept reading and the
+    /// lock; what it leaves out against `Self::proven_wall_ms` is the kept reading and the
     /// high-water projection, so it can read earlier than the proven reading and never later.
     #[must_use]
     pub fn pure_wall_ms(&self) -> u64 {
