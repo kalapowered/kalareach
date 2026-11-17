@@ -5719,7 +5719,7 @@ fn kr_host_restart_is_refused_inside_a_session_with_nothing_asked() {
         assert_eq!(
             refused["message"],
             format!(
-                "kr host restart runs outside a KalaReach session, and {variable} is set here. {WHERE_TO_RUN} Nothing was stopped. Sessions and local attachments go on through a restart."
+                "PERMISSION_DENIED: kr host restart runs outside a KalaReach session, and {variable} is set here. {WHERE_TO_RUN} Nothing was stopped. Sessions and local attachments go on through a restart."
             ),
             "{variable}"
         );
