@@ -641,14 +641,20 @@ pub struct WorkerService {
     /// is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     after_the_dispatch_check_stall: crate::testing::Stall,
+    /// A stop in the answer to a statement of what the local owner may do, after the hold of the
+    /// dispatch boundary it waited for has ended and before it runs the withdrawal it owes, which
+    /// this host's own tests arm to have another statement arrive in between. It is compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_hold_stall: crate::testing::Stall,
     /// The highest restriction count of the local gate whose withdrawal of local connections is
     /// owed.
     withdrawals_owed: std::sync::atomic::AtomicU64,
     /// The highest restriction count whose withdrawal has been run to its end by a statement's
     /// acknowledgement.
     withdrawals_done: std::sync::atomic::AtomicU64,
-    /// How many withdrawals of one connection are detaching its attachments now, which a
-    /// statement's acknowledgement waits for.
+    /// How many withdrawals are detaching a connection's attachments now, plus how many detaches
+    /// the end of a connection still owes, which a statement's acknowledgement waits for.
     withdrawals_running: std::sync::atomic::AtomicUsize,
     /// How many statements of what the local owner may do are waiting to be answered, which this
     /// host's own tests read. It is compiled away in every shipped build.
@@ -1355,6 +1361,8 @@ impl WorkerService {
             delivery_end_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             after_the_dispatch_check_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            after_the_hold_stall: crate::testing::Stall::default(),
             withdrawals_owed: std::sync::atomic::AtomicU64::new(0),
             withdrawals_done: std::sync::atomic::AtomicU64::new(0),
             withdrawals_running: std::sync::atomic::AtomicUsize::new(0),
@@ -2368,6 +2376,23 @@ impl WorkerService {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Stops the next answer to a statement of what the local owner may do after its wait for the
+    /// hold of the dispatch boundary and before it runs the withdrawal it owes, for this host's own
+    /// tests.
+    ///
+    /// Returns the end that says the answer has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_a_statement_after_its_hold(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.after_the_hold_stall.arm()
+    }
+
     /// Stops the next mutation that passes the dispatch boundary's check of the local owner's
     /// access, before it takes the session, for this host's own tests.
     ///
@@ -2913,6 +2938,8 @@ impl WorkerService {
                     // The fence this detach moved, and any terminator it produced, reach the
                     // writer here.
                     self.runtime.flush_input();
+                    self.withdrawals_running
+                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
@@ -4208,7 +4235,12 @@ impl WorkerService {
         if let Some(task) = state.page_task.take() {
             task.abort();
         }
-        self.detach_or_owe(state.facts.take_attachments());
+        let attachments = state.facts.take_attachments();
+        // Counted until each is detached, here or by the service's own pass, so that a statement's
+        // acknowledgement does not go out while a detach under the earlier statement is owed.
+        self.withdrawals_running
+            .fetch_add(attachments.len(), std::sync::atomic::Ordering::SeqCst);
+        self.detach_or_owe(attachments);
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
         // registration.
@@ -5814,6 +5846,8 @@ impl WorkerService {
         #[cfg(feature = "testing")]
         let _waiting = WaitingCount::begin(&self.statements_waiting);
         self.wait_for_the_hold(after).await;
+        #[cfg(feature = "testing")]
+        self.after_the_hold_stall.stand();
         loop {
             let owed = self
                 .withdrawals_owed
@@ -6507,6 +6541,8 @@ impl WorkerService {
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
             self.runtime.flush_input();
+            self.withdrawals_running
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
