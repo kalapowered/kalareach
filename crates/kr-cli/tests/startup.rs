@@ -7929,7 +7929,9 @@ fn a_restart_whose_request_could_not_be_made_because_the_daemon_ended_goes_on_to
     );
     assert!(
         out.trim_end()
-            .ends_with(" under the standalone start. No session was stopped."),
+            .ends_with(
+            " under the standalone start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
+        ),
         "{out}"
     );
     assert!(!said.contains("Asked the control daemon"), "{said}");
@@ -7978,7 +7980,9 @@ fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
     assert!(!out.contains("Stopped the control daemon"), "{out}");
     assert!(
         out.trim_end()
-            .ends_with(" under the standalone start. No session was stopped."),
+            .ends_with(
+            " under the standalone start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
+        ),
         "{out}"
     );
     assert!(host.answers(), "the daemon this command started answers");
