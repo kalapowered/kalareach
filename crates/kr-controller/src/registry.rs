@@ -1010,8 +1010,9 @@ impl Registry {
         // build reads through is refused below as it is, without a table of theirs being made in
         // it; a file an earlier build recorded at the current version before the others had opened
         // it is not brought here, and each writer brings its own tables the next time it opens the
-        // file.
-        if recorded.is_none_or(|version| version < SCHEMA_VERSION) {
+        // file. A file at 17, which no release wrote, is refused below, and nothing is written in
+        // it first.
+        if recorded.is_none_or(|version| version < SCHEMA_VERSION && version != 17) {
             self.bring_the_other_writers_forward()?;
         }
         match recorded {
