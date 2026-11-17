@@ -1121,9 +1121,11 @@ async fn local_lane() -> (
 async fn queue_request(lane: &kr_client::input::InputLane, session: &Arc<Session>, number: u8) {
     let request = Arc::new(composed(session, number).await);
     let session = Arc::clone(session);
-    let _ = lane
-        .after_keys(move |limit| async move { session.send_written(&request, &limit).await })
-        .expect("the lane queues the request");
+    // The request's answer is not read: only that the lane writes it in its turn matters.
+    drop(
+        lane.after_keys(move |limit| async move { session.send_written(&request, &limit).await })
+            .expect("the lane queues the request"),
+    );
 }
 
 fn accepted(sequence: u64) -> Result<ParamsValue, ProtocolError> {
