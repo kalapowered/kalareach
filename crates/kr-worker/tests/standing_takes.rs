@@ -59,6 +59,13 @@ fn only_finding(found: &[String], names: &str) {
     assert!(found[0].contains(names), "{found:?}");
 }
 
+/// A finding of a plant that names the place, among the others that the plant brings: a plant that
+/// makes the pass reach a function of the time contract's full check puts that function's own
+/// shared names under the boundary too.
+fn finding_among(found: &[String], names: &str) {
+    assert!(found.iter().any(|line| line.contains(names)), "{found:?}");
+}
+
 const TIME: &str = "crates/kr-worker/src/action/time.rs";
 const GATE: &str = "crates/kr-worker/src/local_gate.rs";
 const SERVICE: &str = "crates/kr-worker/src/service.rs";
@@ -110,7 +117,7 @@ fn the_proven_reading_planted_in_the_pure_proven_reader_is_reported() {
         "        let now = self.pure_wall_ms();\n        let _kept = self.proven_wall_ms(&state);\n        state.high_water",
     );
     // The reading is kept under the readings' own lock, in a function that the pass now calls.
-    only_finding(
+    finding_among(
         &found,
         "action/time.rs wall_reading calls lock 1 time(s) and no row lists it",
     );
@@ -123,7 +130,7 @@ fn the_kept_reading_planted_in_the_pure_wall_reader_is_reported() {
         "        self.wall.now_ms().get()\n    }",
         "        let _kept = self.wall_reading();\n        self.wall.now_ms().get()\n    }",
     );
-    only_finding(
+    finding_among(
         &found,
         "action/time.rs wall_reading calls lock 1 time(s) and no row lists it",
     );
@@ -137,13 +144,12 @@ fn the_second_raise_planted_in_the_gates_standing_comparison_is_reported() {
         "        let bound = self.lock().bound;\n        let _second = self.time.settled_utc_ms();\n        match bound {\n            Bound::Open => Ok(()),\n            Bound::Unannounced => Err(Refused::NotTold),",
     );
     // The second raise is read where it stands: it takes the contract's lock and keeps a reading.
-    assert_eq!(found.len(), 3, "{found:?}");
     for names in [
         "action/time.rs settled_utc_ms calls lock 1 time(s) and no row lists it",
         "action/time.rs wall_reading calls lock 1 time(s) and no row lists it",
         "local_gate.rs check_bound calls settled_utc_ms 1 time(s) and no row lists the caller",
     ] {
-        assert!(found.iter().any(|line| line.contains(names)), "{found:?}");
+        finding_among(&found, names);
     }
 }
 
@@ -156,12 +162,9 @@ fn the_full_check_planted_in_place_of_the_standing_comparison_is_reported() {
     );
     // The gate's comparison no longer asks the standing reader, and it calls the full check, which
     // takes the contract's lock and keeps a reading.
-    assert_eq!(found.len(), 4, "{found:?}");
-    assert!(
-        found.iter().any(|line| line.contains(
-            "action/time.rs check_utc_deadline calls lock 1 time(s) and no row lists it"
-        )),
-        "{found:?}"
+    finding_among(
+        &found,
+        "action/time.rs check_utc_deadline calls lock 1 time(s) and no row lists it",
     );
     assert!(
         found.iter().any(|line| line.contains(
@@ -338,5 +341,33 @@ fn an_allow_row_that_no_scoped_body_uses_is_reported() {
         vec![format!(
             "allow {SERVICE} validate no_such_helper: no function that the scan reads makes the call"
         )]
+    );
+}
+
+#[test]
+fn a_take_planted_in_the_services_own_bound_check_is_reported() {
+    // `check_bound` is a name that two functions declare: the authority's check calls the
+    // service's, the local owner's standing calls the gate's, and the roster declares both.
+    let found = planted(
+        SERVICE,
+        "    fn check_bound(facts: &ConnectionFacts, authority: &Authority) -> Result<()> {\n",
+        "    fn check_bound(facts: &ConnectionFacts, authority: &Authority) -> Result<()> {\n        let _held = facts.attachments.lock();\n",
+    );
+    only_finding(
+        &found,
+        "service.rs check_bound calls lock 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_broker_take_planted_in_the_decisions_check_is_reported() {
+    let found = planted(
+        SERVICE,
+        "        let reach = caller.disclosure(true);\n        Ok(self\n            .broker",
+        "        self.broker.require_rich_work()?;\n        let reach = caller.disclosure(true);\n        Ok(self\n            .broker",
+    );
+    only_finding(
+        &found,
+        "service.rs check_decision_reached calls require_rich_work, which several functions of the crate declare",
     );
 }
