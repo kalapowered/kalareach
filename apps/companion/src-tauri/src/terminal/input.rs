@@ -75,6 +75,9 @@ const ENDED_BY_STREAM: &str = "Control ended: this view's input stream ended.";
 const NOT_TAKEN_BY_STREAM: &str =
     "This view could not take control: its input stream did not open. Take control again to retry.";
 
+/// Why a take ended as the session answered it, when the view's input stream had ended first.
+const NOT_TAKEN_FOR_AN_ENDED_STREAM: &str = "This view could not take control: its input stream ended before the host answered. Take control again to retry.";
+
 /// Why every take is refused when the session's answer to the attach granted this view no right to
 /// type. The answer names no cause beyond that, and the words claim none.
 const NOT_TAKEN_FOR_WANT_OF_RIGHT: &str =
@@ -613,6 +616,14 @@ impl Lease {
         self.end_held(ENDED_BY_STREAM)
     }
 
+    /// The session granted the take's lease after the view's input stream ended, and nothing can be
+    /// typed under it. The take ends as it is granted: the lease is given back, once, and the next
+    /// take asks for a new stream. Returns whether control changed; a lease that is not held changes
+    /// nothing.
+    pub fn stream_ended_before_the_answer(&mut self) -> bool {
+        self.end_held(NOT_TAKEN_FOR_AN_ENDED_STREAM)
+    }
+
     /// Ends control for `why`: the view stops wanting it, writes nothing more, and gives back the
     /// lease it holds, once.
     fn end_held(&mut self, why: &str) -> bool {
@@ -1032,6 +1043,30 @@ mod tests {
         assert_eq!(lease.owed(), None, "given back once");
         assert!(lease.write(1).is_err());
         assert!(!lease.stream_ended(), "nothing held, nothing changes");
+    }
+
+    /// A take that the session grants after the view's input stream ended ends as it is granted: the
+    /// words are those of a take that could not be made, the epoch is given back once, and the lease
+    /// is not held; where no lease is held, nothing changes.
+    #[test]
+    fn a_take_granted_after_the_input_stream_ended_ends_as_it_is_granted_and_gives_the_epoch_back()
+    {
+        let mut lease = Lease::default();
+        assert!(
+            !lease.stream_ended_before_the_answer(),
+            "no lease is held, so nothing changes"
+        );
+        let mut lease = holding();
+        assert!(lease.stream_ended_before_the_answer());
+        let control = lease.control();
+        assert_eq!(control.state, ControlState::Watching);
+        assert_eq!(
+            control.ended.as_deref(),
+            Some(NOT_TAKEN_FOR_AN_ENDED_STREAM)
+        );
+        assert_eq!(lease.owed(), Some(Owed::Release(InputLeaseEpoch::new(5))));
+        assert_eq!(lease.owed(), None, "given back once");
+        assert!(lease.write(1).is_err());
     }
 
     /// A take that waits for a stream that did not open is refused with the stream's words, and the

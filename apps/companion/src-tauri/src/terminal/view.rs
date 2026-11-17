@@ -205,6 +205,9 @@ pub(super) struct Probe {
     pub(super) queue_peak: Arc<AtomicUsize>,
     /// How many barriers the view has taken from its input lane.
     pub(super) barriers: Arc<AtomicUsize>,
+    /// How many ends of its input lane the view has served: the lane's own record says that it ended,
+    /// and this says that the view read the end and acted on it.
+    pub(super) lane_ends: Arc<AtomicUsize>,
     /// The view's session, once its link is open.
     pub(super) session: Arc<std::sync::Mutex<Option<Arc<Session>>>>,
     /// Whether the view's input lane has ended, as the lane records it, once the lane is open.
@@ -1340,12 +1343,20 @@ impl View {
                 Outcome::Ok(value) => Ok(value),
                 Outcome::Error(refusal) => Err(refusal),
             };
+            let held = self.lease.held_epoch();
             let changed = self.lease.answered(request_id, outcome);
             self.sync_epoch();
             // A take the session granted just before the program changed to a form the view does
             // not produce ends as its answer arrives, before the page is told it controls anything.
             let ended = !self.keyboard_supplied() && self.lease.unsupported();
-            if changed || ended {
+            // A take the session granted after the view's input stream ended holds a lease that
+            // nothing can be typed under, and a host that takes a stream will not take the typing
+            // without one: control ends as the answer arrives, and the epoch is given back.
+            let ended_before = self.lane.is_none()
+                && !self.no_stream
+                && self.lease.held_epoch() != held
+                && self.lease.stream_ended_before_the_answer();
+            if changed || ended || ended_before {
                 self.control_changed();
             }
             return None;
@@ -1912,6 +1923,8 @@ impl View {
                         self.control_changed();
                     }
                 }
+                #[cfg(feature = "testing")]
+                self.probe.lane_ends.fetch_add(1, Ordering::Relaxed);
                 None
             }
         }
