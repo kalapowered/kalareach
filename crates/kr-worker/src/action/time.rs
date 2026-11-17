@@ -321,7 +321,8 @@ struct Taken {
 /// Its wall reading proves one thing, that the wall clock had read that much by `second_ms`, and a
 /// pause cannot make that wrong, because the continuous clock is read after the wall clock. It
 /// does not say where the wall clock stood at `first_ms`, so it is no comparison against a mark
-/// and is not kept against an owner's confirmation.
+/// and no entry of the staircase of [`Readings`]; it is kept as a proof ([`KeptProofs`]), as is a
+/// narrow reading, which proves the same.
 #[derive(Clone, Copy, Debug)]
 struct HeldUp {
     /// The continuous clock after the others were read: where the reading is stamped.
@@ -337,41 +338,62 @@ struct Attempt {
     held_up: Vec<HeldUp>,
 }
 
-/// What the held-up tries of the following of one confirmation proved, kept until that
-/// confirmation is decided.
+/// What every wall reading this contract took proved about the owner's confirmation in force,
+/// kept until that confirmation is decided.
 ///
-/// A held-up try proves that the wall clock had read its wall by its second reading
-/// ([`HeldUp`]). The following takes its tries after it has loaded the confirmation, so a proof
-/// came after the owner's act, and a narrow reading that is far behind it, carried forward, is a
-/// step back that the owner did not see. The proofs live in memory only: a pending confirmation is
-/// decided in the process that met it, and a restarted contract meets none of what was pending
-/// before.
+/// A reading, narrow or held up, proves that the wall clock had read its wall by its second
+/// reading ([`HeldUp`]). One that is stamped at or after the owner's act came after it, so a
+/// narrow reading that is far behind it, carried forward, is a step back that the owner did not
+/// see, whichever reading saw it and whether or not the worker trusts its clock. Every reading
+/// comes here through [`TimeContract::take`], the one function that reads the wall clock, so no
+/// reading taken while a confirmation is pending is missing. At most [`Self::CAPACITY`] are kept.
+///
+/// What the set holds is not tied to one confirmation: another confirmation keeps the proofs
+/// stamped at or after its act and drops the older ones, since a reading from before the owner
+/// spoke last says nothing of a clock that the owner has put right since. The proofs live in
+/// memory only: a pending confirmation is decided in the process that met it, and a contract that
+/// restored a record meets none of what was pending before, because it marks the confirmation in
+/// force as met and takes only one made after it restored.
 #[derive(Debug, Default)]
 struct KeptProofs {
-    /// The confirmation, by its count, that the proofs were read after.
+    /// The confirmation, by its count, that the proofs were last kept for.
     count: u64,
     /// The proofs, in the order they were read.
     tries: Vec<HeldUp>,
 }
 
 impl KeptProofs {
-    /// At most this many proofs are kept for one confirmation.
+    /// At most this many proofs are kept.
     const CAPACITY: usize = 16;
 
-    /// Keeps `held_up` for the confirmation `count`. Proofs kept for another confirmation are
-    /// dropped first: a try that began before the owner confirmed again says nothing of a clock
-    /// that the owner has put right since.
-    fn keep(&mut self, count: u64, held_up: &[HeldUp]) {
+    /// Keeps `proofs` for the confirmation `count`, which the owner made at `act_ms` on the
+    /// continuous clock. A change of the confirmation keeps what is stamped at or after its act
+    /// and drops the older proofs first.
+    fn keep(&mut self, count: u64, act_ms: u64, proofs: impl IntoIterator<Item = HeldUp>) {
         if self.count != count {
             self.count = count;
-            self.tries.clear();
+            self.tries.retain(|tried| tried.second_ms >= act_ms);
         }
-        for tried in held_up {
-            self.tries.push(*tried);
+        for tried in proofs {
+            self.tries.push(tried);
             if self.tries.len() > Self::CAPACITY {
                 self.fold_oldest();
             }
         }
+    }
+
+    /// Hands over the proofs for the decision of the confirmation `count` made at `act_ms`, by a
+    /// narrow reading at `decided_ms`: those stamped at or before it, which the decision uses up,
+    /// because a decided confirmation is not decided again. A proof stamped after it is another
+    /// caller's later reading; it is no evidence for this decision, since nothing carries a
+    /// reading back, and stays for the next confirmation's.
+    fn take(&mut self, count: u64, act_ms: u64, decided_ms: u64) -> Vec<HeldUp> {
+        self.keep(count, act_ms, []);
+        let (used, later) = std::mem::take(&mut self.tries)
+            .into_iter()
+            .partition(|tried| tried.second_ms <= decided_ms);
+        self.tries = later;
+        used
     }
 
     /// Folds the oldest two proofs into one that keeps the later stamp and the greater wall, the
@@ -494,9 +516,6 @@ struct TimeState {
     /// the reading it restored at, since it cannot tell what the distrust rests on. It is dropped
     /// when the clock is trusted again.
     unanswered_rollback: Option<u64>,
-    /// What the held-up tries of the following of the pending confirmation proved, until it is
-    /// decided. It is never written down.
-    proofs: KeptProofs,
     trust: WallClockTrust,
     checkpoint: Option<TimeCheckpoint>,
     revalidation_owed: bool,
@@ -588,11 +607,19 @@ fn refuting_level(established: &Establishment) -> i128 {
 /// refuse a confirmation by up to a second that the readings taken would not have refused. And at
 /// most [`Readings::CAPACITY`] readings are kept: the oldest is let go, and a confirmation made at
 /// or before the time of the latest reading let go is refused, whatever the readings kept say.
+///
+/// The staircase answers whether a reading is behind the owner's. The proofs beside it answer the
+/// other half of the decision, whether the clock went back from a reading taken after the owner
+/// spoke, and they are kept here so that [`TimeContract::take`] can keep every reading it takes
+/// whoever calls it and whether or not that caller holds the contract's state.
 #[derive(Debug, Default)]
 struct Readings {
     kept: Vec<Kept>,
     /// The time of the latest reading let go, if one was.
     let_go: Option<u64>,
+    /// Every reading as a proof for the confirmation in force ([`KeptProofs`]), until it is
+    /// decided. It is never written down.
+    proofs: KeptProofs,
 }
 
 impl Readings {
@@ -866,7 +893,6 @@ impl TimeContract {
                 followed,
                 adopting,
                 unanswered_rollback,
-                proofs: KeptProofs::default(),
                 owner_confirmed: owner_confirmed_at_restore,
                 saved: high_water,
                 trust,
@@ -1232,11 +1258,12 @@ impl TimeContract {
     }
 
     /// Returns what a confirmation is decided against, each reference by itself: [`Self::reference`]
-    /// and each proof the following kept, every one projected to `continuous_ms` and carrying its
-    /// own stamp, which for a proof is its try's second reading. A held-up try gives no comparison
-    /// of its own and is no entry of the staircase, and the mark does not move: the proofs are
-    /// kept only through the decision. No reference stands for another, because the stamp of the
-    /// one that is furthest ahead can be older than the owner's act while a nearer one is not.
+    /// and each proof kept, every one projected to `continuous_ms` and carrying its own stamp,
+    /// which for a proof is its reading's second reading, none stamped after `continuous_ms`
+    /// ([`KeptProofs::take`]). A held-up try gives no comparison of its own and the mark does not
+    /// move: the proofs are kept only through the decision. No reference stands for another,
+    /// because the stamp of the one that is furthest ahead can be older than the owner's act while
+    /// a nearer one is not.
     fn references_kept(
         &self,
         state: &TimeState,
@@ -1617,12 +1644,13 @@ impl TimeContract {
     /// is not held against a confirmation, as it is not held against a worker that never
     /// distrusted its clock: forward steps expire conservatively.
     ///
-    /// What the held-up tries of the following read is kept until the confirmation is decided, in
-    /// every trust state and through attempts that end with no narrow reading
-    /// ([`KeptProofs`]). The narrow reading is compared with the mark and with each proof by
-    /// itself, and the rollback it is behind is the one proved latest: a peak that only a held-up
-    /// try read after the owner spoke, and a clock that then went back, refuses the confirmation
-    /// even where the mark projects further and was proved before.
+    /// Every wall reading that this contract takes while the confirmation is pending, narrow or
+    /// held up, in a look or in the following, is kept until the confirmation is decided, in every
+    /// trust state and through attempts that end with no narrow reading ([`KeptProofs`]). The
+    /// narrow reading of the following is compared with the mark and with each proof by itself,
+    /// and the rollback it is behind is the one proved latest: a peak that only one reading saw
+    /// after the owner spoke, and a clock that then went back, refuses the confirmation even where
+    /// the mark projects further and was proved before, or the worker does not trust its clock.
     ///
     /// The reading is taken after the confirmation is loaded, never before: a worker that sampled
     /// its clock and was paused while the owner corrected it and confirmed would otherwise spend
@@ -1653,11 +1681,11 @@ impl TimeContract {
             state.followed = established.count;
             return true;
         }
+        // Every reading of this following, narrow or held up, is kept as a proof by `take`, with
+        // those of every look since the owner spoke: evidence of how far the clock had got after
+        // the owner's act, in every trust state and through attempts that end with no narrow
+        // reading, until the confirmation is decided.
         let Attempt { narrow, held_up } = self.take();
-        // What the held-up tries of this following read is evidence of how far the clock had got
-        // after the owner spoke. It is kept in every trust state, and through attempts that end
-        // with no narrow reading, until the confirmation is decided.
-        state.proofs.keep(established.count, &held_up);
         let Some(Taken {
             first_ms: continuous_ms,
             second_ms,
@@ -1676,7 +1704,7 @@ impl TimeContract {
         // The decision is made against the mark and against each proof kept, each by itself: a
         // peak that only a held-up try saw, and a clock that then went back, is the rollback the
         // owner did not see, whatever the mark projects to. The decision clears the proofs.
-        let proofs = std::mem::take(&mut state.proofs.tries);
+        let proofs = self.proofs_taken(&established, second_ms);
         let references = self.references_kept(state, second_ms, &proofs);
         let mut behind_its_reference = false;
         for reference in &references {
@@ -1789,61 +1817,102 @@ impl TimeContract {
         }
     }
 
-    /// Reads the clocks together, between two readings of the continuous clock, and keeps the
+    /// Reads the clocks together, between two readings of the continuous clock, and keeps every
     /// wall reading against the owner's confirmation: every reading this contract takes of the
-    /// wall clock comes through here.
+    /// wall clock comes through here ([`Self::note`]).
     ///
     /// A try is used for a comparison only where the two readings of the continuous clock are no
     /// further apart than [`DISCONTINUITY_TOLERANCE`], and the clocks are read again, at most three
-    /// times in all, where they are not. A try that was held up gives no comparison and is not kept
-    /// against an owner's confirmation, so a pause between the pair cannot put a reading wrongly
-    /// ahead of or behind the continuous clock. Its wall reading is still evidence of how far the
-    /// wall clock had got, so it is published in the host's floor here and handed back, stamped
-    /// at its second reading, for a caller that moves a mark to move it. This takes no lock of the
+    /// times in all, where they are not. A try that was held up gives no comparison, so a pause
+    /// between the pair cannot put a reading wrongly ahead of or behind the continuous clock. Its
+    /// wall reading is still evidence of how far the wall clock had got, so it is published in the
+    /// host's floor here, kept as a proof for the owner's confirmation, and handed back, stamped at
+    /// its second reading, for a caller that moves a mark to move it. This takes no lock of the
     /// contract's state, so a caller that holds it may call this.
     ///
     /// The narrow reading is kept at its second reading, which errs toward refusing a
     /// confirmation.
     fn take(&self) -> Attempt {
         let mut held_up = Vec::new();
+        let mut narrow = None;
         for _ in 0..BRACKET_TRIES {
             let first_ms = self.continuous.boot_elapsed_ms();
             let active_ms = self.active.active_elapsed_ms();
             let wall_ms = self.wall.now_ms().get();
             let second_ms = self.continuous.boot_elapsed_ms();
             if second_ms.saturating_sub(first_ms) <= millis(DISCONTINUITY_TOLERANCE) {
-                self.readings
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .keep(second_ms, wall_ms);
-                return Attempt {
-                    narrow: Some(Taken {
-                        first_ms,
-                        second_ms,
-                        active_ms,
-                        wall_ms,
-                    }),
-                    held_up,
-                };
+                narrow = Some(Taken {
+                    first_ms,
+                    second_ms,
+                    active_ms,
+                    wall_ms,
+                });
+                break;
             }
             self.publish(wall_ms);
             held_up.push(HeldUp { second_ms, wall_ms });
         }
-        Attempt {
-            narrow: None,
-            held_up,
+        let attempt = Attempt { narrow, held_up };
+        self.note(&attempt);
+        attempt
+    }
+
+    /// Keeps what an attempt read, in the one lock that this takes, after every clock was read:
+    /// the narrow reading in the staircase of the lowest readings, and every reading of it, narrow
+    /// or held up, as a proof for the confirmation in force ([`KeptProofs`]). The confirmation is
+    /// loaded after the readings, so a reading that the owner's act came after is stamped before
+    /// the act and cannot refuse it.
+    fn note(&self, attempt: &Attempt) {
+        let confirmation = self.floor.as_ref().and_then(|floor| floor.established());
+        let mut readings = self
+            .readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(taken) = attempt.narrow {
+            readings.keep(taken.second_ms, taken.wall_ms);
+        }
+        if let Some(established) = confirmation {
+            readings.proofs.keep(
+                established.count,
+                established.boot_ms,
+                attempt
+                    .held_up
+                    .iter()
+                    .copied()
+                    .chain(attempt.narrow.map(|taken| HeldUp {
+                        second_ms: taken.second_ms,
+                        wall_ms: taken.wall_ms,
+                    })),
+            );
         }
     }
 
     /// Reads the wall clock for a caller that needs the reading and no clock beside it: a stamp, a
-    /// deadline, a comparison with another host's reading. A reading no narrow bracket could be
-    /// taken for is not kept against the owner's confirmation. No narrow reading here raises a
-    /// mark, so the walls of the tries held up before it are only published, as [`Self::take`]
-    /// does.
+    /// deadline, a comparison with another host's reading. No narrow reading here raises a mark,
+    /// so the walls of the tries held up before it are only published and kept as proofs, as
+    /// [`Self::take`] does. Where no narrow bracket could be taken, the clock is read once more
+    /// with no bracket, and that reading is stamped after it and kept as a proof the same way.
     fn wall_reading(&self) -> u64 {
-        self.take()
-            .narrow
-            .map_or_else(|| self.wall.now_ms().get(), |taken| taken.wall_ms)
+        if let Some(taken) = self.take().narrow {
+            return taken.wall_ms;
+        }
+        let wall_ms = self.wall.now_ms().get();
+        let second_ms = self.continuous.boot_elapsed_ms();
+        self.note(&Attempt {
+            narrow: None,
+            held_up: vec![HeldUp { second_ms, wall_ms }],
+        });
+        wall_ms
+    }
+
+    /// Hands over the proofs kept for the decision of `established` by a narrow reading at
+    /// `decided_ms` ([`KeptProofs::take`]).
+    fn proofs_taken(&self, established: &Establishment, decided_ms: u64) -> Vec<HeldUp> {
+        self.readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .proofs
+            .take(established.count, established.boot_ms, decided_ms)
     }
 
     /// Whether the readings this contract took refuse `established` ([`Readings::refute`]).
@@ -4216,11 +4285,8 @@ mod tests {
         );
     }
 
-    /// A worker that found a rollback and does not trust its clock, and the owner's confirmation
-    /// made after it: no look has met the confirmation yet, and the clock stands where the owner
-    /// put it.
-    fn found_a_rollback_and_was_confirmed()
-    -> (Arc<kr_ipc::floor::SharedFloor>, Arc<Holdup>, TimeContract) {
+    /// A worker that found a rollback and does not trust its clock, with no confirmation made yet.
+    fn found_a_rollback() -> (Arc<kr_ipc::floor::SharedFloor>, Arc<Holdup>, TimeContract) {
         let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
         let held = Holdup::new(HELD_UP, false);
         let contract = held.contract(Some(Arc::clone(&floor)));
@@ -4231,6 +4297,15 @@ mod tests {
         assert!(contract.observe().rolled_back);
         assert_eq!(contract.trust(), WallClockTrust::Unresolved);
         held.pass(Duration::from_secs(1));
+        (floor, held, contract)
+    }
+
+    /// A worker that found a rollback and does not trust its clock, and the owner's confirmation
+    /// made after it: no look has met the confirmation yet, and the clock stands where the owner
+    /// put it.
+    fn found_a_rollback_and_was_confirmed()
+    -> (Arc<kr_ipc::floor::SharedFloor>, Arc<Holdup>, TimeContract) {
+        let (floor, held, contract) = found_a_rollback();
         floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
         held.pass(Duration::from_secs(1));
         (floor, held, contract)
@@ -4581,5 +4656,97 @@ mod tests {
             WallClockTrust::Unresolved,
             "the clock went back 30 s from a reading taken 60 s earlier, after the owner spoke"
         );
+    }
+
+    /// Four more looks, each held up in all three tries, and then one look with a following that
+    /// decides the confirmation: the first look of the caller, the four, and this one keep seventeen
+    /// proofs before the decision, one more than the set holds, so the oldest two are folded.
+    fn four_held_up_looks_and_a_deciding_one(held: &Holdup, contract: &TimeContract) {
+        for _ in 0..4 {
+            held.pass(Duration::from_secs(1));
+            held.arm(0, 3);
+            assert!(contract.observe().suspended);
+        }
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: at the bound the two oldest proofs fold into one that is stamped
+    /// at the later of the two. The owner confirms inside the second try of the first look, so the
+    /// first try is stamped before the owner's act and the second, which read a peak ten minutes
+    /// ahead, at it; the look is held up in all three tries and four more looks are; the
+    /// seventeenth proof folds the first two, and the folded proof has to be stamped at the peak's
+    /// try for the confirmation to be refused: a proof stamped before the owner's act cannot be.
+    #[test]
+    fn the_fold_of_the_oldest_proofs_keeps_the_later_stamp() {
+        let (floor, held, contract) = found_a_rollback();
+        let start = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(2, start + 610_000);
+        held.sets_the_wall_after_landing(2, start + 20_000);
+        held.confirms_after_landing(2, Arc::clone(&floor));
+        held.arm(0, 3);
+        assert!(contract.observe().suspended);
+        four_held_up_looks_and_a_deciding_one(&held, &contract);
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a peak that a folded proof stands for"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: at the bound the older of the two proofs is carried to the later
+    /// stamp with its credit, so the folded proof refuses wherever the older one did. The first
+    /// try of the first look reads the wall six seconds ahead of the owner's clock and the others
+    /// keep its pace; the narrow reading of the deciding look is on the owner's clock, six seconds
+    /// behind what the older proof carries, and the seventeenth proof folds that proof into the
+    /// next, which reads lower.
+    #[test]
+    fn the_fold_of_the_oldest_proofs_carries_the_older_wall_with_its_credit() {
+        let (floor, held, contract) = found_a_rollback();
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        let start = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(1, start + 6_000);
+        held.sets_the_wall_after_landing(1, start + 10_000);
+        held.arm(0, 3);
+        assert!(contract.observe().suspended);
+        four_held_up_looks_and_a_deciding_one(&held, &contract);
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back six seconds from a reading that a folded proof stands for"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the decision uses up the proofs stamped at or before its
+    /// reading. A proof stamped after it is another caller's later reading, no evidence for this
+    /// decision, and stays for the next confirmation, which keeps what is stamped at or after its
+    /// own act.
+    #[test]
+    fn a_proof_stamped_after_a_decision_stays_for_the_next_confirmation() {
+        let proof = |second_ms| HeldUp {
+            second_ms,
+            wall_ms: WALL,
+        };
+        let stamps = |proofs: &[HeldUp]| {
+            proofs
+                .iter()
+                .map(|tried| tried.second_ms)
+                .collect::<Vec<_>>()
+        };
+        let mut kept = KeptProofs::default();
+        kept.keep(1, 100, [proof(120), proof(130), proof(200)]);
+        assert_eq!(
+            stamps(&kept.take(1, 100, 150)),
+            [120, 130],
+            "the decision uses up what is stamped at or before its reading"
+        );
+        kept.keep(2, 160, [proof(210)]);
+        assert_eq!(
+            stamps(&kept.take(2, 160, 300)),
+            [200, 210],
+            "the proof stamped after the first decision is in the second"
+        );
+        assert!(kept.tries.is_empty(), "and the second decision uses it up");
     }
 }
