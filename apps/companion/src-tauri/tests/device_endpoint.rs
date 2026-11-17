@@ -664,7 +664,7 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     // command returns, and the dial is let go.
     pair(&phone, &first, &owner, &[ActionRight::SessionView]).await;
     let old = record_of(&device, &first);
-    let mut at_the_introduction = control.hold_next_introduce_of(&old.host_endpoint_id);
+    let at_the_introduction = control.hold_next_introduce_of(&old.host_endpoint_id);
     at_the_introduction.release();
     control.hold();
     let visit = visit_started(&desk, &device);
@@ -694,8 +694,8 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     // (b) The visit's dial is let through to the endpoint and held between its first look and the
     // introduction, the person forgets the host, and the dial goes on.
     pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
-    let mut at_the_introduction =
-        control.hold_next_introduce_of(&record_of(&device, &second).host_endpoint_id);
+    let at_the_introduction =
+        Arc::new(control.hold_next_introduce_of(&record_of(&device, &second).host_endpoint_id));
     control.hold();
     let visit = visit_started(&desk, &device);
     until("the visit's dial is held on its way to the endpoint", {
@@ -705,7 +705,11 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     .await;
     control.stop_holding();
     control.release_all();
-    at_the_introduction.reached().await;
+    until("the visit's dial is held at the introduction", {
+        let at_the_introduction = Arc::clone(&at_the_introduction);
+        move || at_the_introduction.is_reached()
+    })
+    .await;
     forget(&second);
     assert_eq!(control.relay_urls().await, relays(&[SHARED]));
     at_the_introduction.release();
