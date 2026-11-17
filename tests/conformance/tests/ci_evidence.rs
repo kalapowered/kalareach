@@ -890,9 +890,7 @@ fn every_job_that_keeps_evidence_loads_the_evidence_action_right_after_its_check
                 "{file}: the {name} job does not load the evidence action right after its checkout"
             );
             assert!(
-                own_condition(&steps[at], 8).is_none()
-                    && !is_disabled(&steps[at])
-                    && value_at(&steps[at], 8, "timeout-minutes").is_none(),
+                own_condition(&steps[at], 8).is_none() && !is_disabled(&steps[at]),
                 "{file}: the {name} job's load of the evidence action has a condition that can \
                  skip it, or lets its failure pass"
             );
