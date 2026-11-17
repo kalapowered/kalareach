@@ -1747,4 +1747,44 @@ mod tests {
             "LinkError(\"the host refused: PAIRING_EXPIRED: the invitation expired\")"
         );
     }
+
+    /// KR-REQ-10.08: a refusal under a code this build does not know cannot be read, and what is
+    /// not read is a connection lost, not a refusal. A device built before a host's newer code
+    /// exists reads that host's answer so, and the code alone is not the same as a refusal it can
+    /// act on.
+    #[test]
+    fn a_refusal_under_a_code_this_build_does_not_know_is_a_connection_lost() {
+        use kr_protocol::error::ErrorCode;
+
+        assert_eq!(ErrorCode::from_wire("PAIRING_A_LATER_CODE"), None);
+        let known = kr_protocol::error::ProtocolError::new(ErrorCode::PairingRejected, "no");
+        let mut entries = kr_cbor::to_canonical_value(&known)
+            .expect("the refusal is a value")
+            .as_map()
+            .expect("a map")
+            .clone()
+            .into_entries();
+        for (name, value) in &mut entries {
+            if name == "code" {
+                *value = kr_cbor::CanonicalValue::text("PAIRING_A_LATER_CODE");
+            }
+        }
+        let bytes = kr_cbor::encode(&kr_cbor::CanonicalValue::Map(
+            kr_cbor::CanonicalMap::from_sorted_entries(entries).expect("the same order"),
+        ));
+        let read = kr_protocol::wire::decode::<kr_protocol::error::ProtocolError>(
+            &bytes,
+            &kr_cbor::Limits::DEFAULT,
+        );
+        let Err(unread) = read else {
+            panic!("a code this build does not know is not read: {read:?}");
+        };
+
+        let link = LinkError::from(kr_transport::TransportError::Cbor(unread));
+        assert!(matches!(link, LinkError::Lost(_)), "{link:?}");
+        assert_eq!(
+            format!("{link:?}"),
+            "LinkError(\"the host could not be reached\")"
+        );
+    }
 }
