@@ -1715,11 +1715,12 @@ async fn a_share_naming_the_old_identifier_is_decided_on_the_old_record_alone() 
         .await;
         // The caller is a paired device, which is told one sentence for every way a recipient cannot
         // carry a share, so the words do not tell the cause: the refusal's code and words are those.
-        let refusal = match &answer {
-            Some(Err(error)) => error,
-            other => panic!(
-                "{ended}: a share to the identifier of an ended record is refused: {other:?}"
-            ),
+        assert!(
+            matches!(answer, Some(Err(_))),
+            "{ended}: a share to the identifier of an ended record is refused: {answer:?}"
+        );
+        let Some(Err(refusal)) = &answer else {
+            unreachable!("the answer is a refusal, as asserted above");
         };
         assert_eq!(
             refusal.code,
