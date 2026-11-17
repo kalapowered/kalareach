@@ -5,10 +5,19 @@
 //! [`DispatchBoundary::try_lock`]. The service takes its one boundary through
 //! [`WorkerService::take_boundary`] and [`WorkerService::try_take_boundary`], which are written
 //! here and read the service's own field, so no other code of the service can take a boundary, a
-//! second one made beside the service's included. The functions that run under the boundary take
-//! a borrow of the guard as a parameter, so a caller that holds no guard of a boundary does not
-//! compile. That the guard is the service's own is not held by the compiler: the two entries
-//! (`receipted` and `continue_prepared`) check it with [`DispatchGuard::is_of`] before any work.
+//! second one made beside the service's included.
+//!
+//! Nine functions take a borrow of the guard as a parameter, so a caller that holds no guard of a
+//! boundary does not compile: `receipted`, `continue_prepared`, `admit_and_dispatch`,
+//! `dispatch_accepted`, `standing_pass`, `revalidate_time`, `accept_generation`, `fence` and
+//! `fence_what_is_owed`. Scope alone holds the rest of the work that runs under the boundary (the
+//! expiry task's release of grants, the maintenance pass's session work after its two calls, the
+//! storage recovery and the answers of the announcement), and the compiler does not stop a change
+//! there that lets a guard go early. That the guard is the service's own is not held by the
+//! compiler either: the two entries (`receipted` and `continue_prepared`) check it with
+//! [`DispatchGuard::is_of`] before any work. That no function takes the boundary a second time is
+//! held by a roster that counts, in every file of the crate, the mentions of each name that takes
+//! it (`tests/standing_takes.txt`), not by this module.
 
 use std::sync::Mutex;
 
@@ -240,9 +249,10 @@ mod tests {
     }
 
     /// A guard says whose boundary it holds, and the first admission refuses the guard of another
-    /// service before it does any work: with the check removed the same call goes on to its first
-    /// look at the authority and returns an error, so a refusal that is a panic with the check's own
-    /// text shows that nothing ran before it.
+    /// service with a panic of the check's own text. That the check is the entry's first statement
+    /// is read by the roster case `the_two_entries_begin_with_the_check_that_their_guard_is_the_services_own`;
+    /// this case shows that the guard of another boundary is refused, and that the comparison gives
+    /// false for it and true for the service's own.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_guard_of_another_service_is_refused_by_the_first_admission() {
         let first = a_service();
@@ -290,9 +300,11 @@ mod tests {
                 &foreign,
             )
         }));
-        let panic = refused
-            .err()
-            .expect("the guard of another service is refused");
+        assert!(
+            refused.is_err(),
+            "the guard of another service is refused by a panic"
+        );
+        let panic = refused.err().expect("a panic, as asserted above");
         assert_eq!(
             said(&*panic),
             "the dispatch barrier is the one of this service"

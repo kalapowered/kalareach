@@ -16,19 +16,17 @@
 //! * a call through a function pointer or a closure that is passed in, a macro's expansion, or a
 //!   call to a name that no function of this crate declares (the standard library and other
 //!   crates);
-//! * the dispatch barrier's guard, which this reader does not read: the compiler holds that the
-//!   functions that run under the barrier (`receipted`, `continue_prepared`,
-//!   `admit_and_dispatch`, `dispatch_accepted` and `standing_pass`) and the bodies that the other
-//!   takers of the barrier run (`revalidate_time`, `accept_generation`, `fence` and
-//!   `fence_what_is_owed`) are called with a borrow of a guard, that the pass keeps its borrow, and
-//!   that a boundary can be taken only in its own module (a service takes its one boundary through
-//!   two methods written there). It does not hold that the guard is the service's own: the two
-//!   entries `receipted` and `continue_prepared` check that before any work, and a test shows the
-//!   check. The one thing this reader says of the barrier is narrow and reads no guard lifetime:
-//!   where a `held` row's call stands, a call of `take_boundary` or `try_take_boundary` anywhere
-//!   before it in the function counts as the domain `TAKE`, bound or not, dropped or not, so a
-//!   `none` row refuses a second take under the held barrier. The wrapper `try_boundary` is not
-//!   read;
+//! * the dispatch barrier's guard, which this reader does not read: the compiler holds that nine
+//!   functions (`receipted`, `continue_prepared`, `admit_and_dispatch`, `dispatch_accepted`,
+//!   `standing_pass`, and four of the bodies that the other takers of the barrier run:
+//!   `revalidate_time`, `accept_generation`, `fence` and `fence_what_is_owed`) are called with a
+//!   borrow of a guard, that the pass keeps its borrow, and that a boundary can be taken only in
+//!   its own module (a service takes its one boundary through two methods written there). Scope
+//!   alone holds the rest of the work that runs under the boundary (the expiry task's release, the
+//!   maintenance pass's session work, the storage recovery, the answers). The compiler does not
+//!   hold that the guard is the service's own: the two entries `receipted` and `continue_prepared`
+//!   check that before any work, and a test shows the check. A second take under the held barrier
+//!   is held by the `taker` and `mention` rows below, which count names and read no guard;
 //! * what a guard is, beyond the names it knows: a `let` that calls `session` (SES) and a
 //!   parameter whose type names `Session` (SES, held or not: a `supplies` row tells two calls
 //!   apart). `let Some(x) =` and `let Ok(x) =` bind `x`, with the initialiser after the pattern,
@@ -78,7 +76,7 @@
 //! crate needs an `allow` row, or the scan reads the crate's function of that name.
 //!
 //! The roster has these kinds of row, one to a line, with `#` for a comment. A kind that holds one
-//! value for a key (`site`, `caller` and `only`, `held`, `supplies`) refuses a second row for the
+//! value for a key (`site`, `caller` and `only`, `held`, `supplies`, `mention`) refuses a second row for the
 //! same key, so that a later row never replaces an earlier one:
 //!
 //! * `scope <file> <function>`: a function that has to exist and whose body is read. The row seeds
@@ -100,8 +98,19 @@
 //!   call inside a function that the scan reads is judged by its site row.
 //! * `only <callee> <file> <function> <count>`: as `caller`, in every file of the crate.
 //! * `held <file> <function> <callee> <guards>`: the guards that `function` holds where it calls
-//!   `callee`, as a comma list of `SES` (the session), `TAKE` (a take of the dispatch boundary
-//!   before the call) or `none`.
+//!   `callee`, as a comma list of `SES` (the session) or `none`.
+//! * `taker <name>`: a function that takes the dispatch boundary, or one of the two methods that
+//!   take it, in a list that a person keeps (the functions of the nine take sites and the two
+//!   methods). For each `taker` the reader counts, in every file of the crate, the times that the
+//!   name stands in code: a declaration, a call, an argument, a function value. Comments, string
+//!   literals and test modules are taken out.
+//! * `mention <name> <file> <count>`: how many times the `taker` `name` stands in the code of
+//!   `file`; a file with no row has none. A different number in any file fails the main case,
+//!   wherever the new mention stands (an argument, a helper, a statement after a call): a take
+//!   under the held barrier waits on itself, so a person reads the new text and then sets the
+//!   number, adding a `taker` row first for a new function that takes the boundary. One limit,
+//!   which the crate does not hold: a take that is reached with none of these names in the text
+//!   (a name that a macro makes, or a function that a macro writes).
 //! * `supplies <file> <function> <callee> <position> <text>`: the argument at `position` (from
 //!   zero) of every call of `callee` from `function`, with its white space taken out, is `text`. A
 //!   row for each argument of one call stands beside the others. It reads what a call hands on
@@ -407,14 +416,19 @@ pub struct Roster {
     /// The domains of the guards that a function holds where it makes a call, by file, function
     /// and callee.
     pub held: BTreeMap<(String, String, String), BTreeSet<String>>,
+    /// The functions that take the dispatch boundary and the two methods that take it, by name: a
+    /// list that a person keeps.
+    pub takers: BTreeSet<String>,
+    /// How many times each such name stands in the code of a file, by name and file.
+    pub mentions: BTreeMap<(String, String), usize>,
 }
 
 /// Reads a roster.
 ///
 /// # Panics
 ///
-/// Panics on a row that is not one of the nine kinds, and on a row of a kind that holds one value
-/// per key (`site`, `supplies`, `caller` and `only`, `held`) whose key an earlier row already
+/// Panics on a row that is not one of the eleven kinds, and on a row of a kind that holds one value
+/// per key (`site`, `supplies`, `caller` and `only`, `held`, `mention`) whose key an earlier row already
 /// holds: a later row never replaces an earlier one unseen. A `scope`, `outside` or `allow` row
 /// that repeats is a set's member again, and a `calls` row adds a file to the body's set of
 /// targets, so neither can replace anything.
@@ -516,7 +530,17 @@ pub fn parse(roster: &str) -> Roster {
                     domains,
                 );
             }
-            other => panic!("a roster row that is none of the nine kinds: {other:?}"),
+            ["taker", name] => {
+                rows.takers.insert((*name).to_owned());
+            }
+            ["mention", name, file, count] => {
+                insert_once(
+                    &mut rows.mentions,
+                    ((*name).to_owned(), (*file).to_owned()),
+                    count.parse().expect("a count"),
+                );
+            }
+            other => panic!("a roster row that is none of the eleven kinds: {other:?}"),
         }
     }
     rows
@@ -667,6 +691,7 @@ pub fn violations(files: &[(String, String)], roster: &Roster, callees: &[&str])
     problems.extend(callers(files, roster, callees, &read));
     problems.extend(held(files, roster));
     problems.extend(supplied(files, roster));
+    problems.extend(mentioned(files, roster));
     problems
 }
 
@@ -1118,8 +1143,8 @@ fn depths(text: &[char]) -> Vec<i32> {
 }
 
 /// The domain a guard belongs to, from the text that makes it: a function's parameter of the
-/// session's type, or a `let` whose initialiser calls `session`, holds the session (SES). A take of
-/// the dispatch boundary is read by `takes_the_boundary`, and its guard's lifetime is not.
+/// session's type, or a `let` whose initialiser calls `session`, holds the session (SES). The
+/// dispatch barrier's guard is not read here.
 fn domain_of(made: &[char], parameter: bool) -> Option<&'static str> {
     if parameter {
         return idents(made)
@@ -1131,15 +1156,6 @@ fn domain_of(made: &[char], parameter: bool) -> Option<&'static str> {
         .iter()
         .any(|(_, name)| name == "session")
         .then_some("SES")
-}
-
-/// Whether a text calls one of the two methods through which a service takes its dispatch
-/// boundary. It reads no guard lifetime: a call anywhere in the text counts, whether its result is
-/// bound, dropped or let go.
-fn takes_the_boundary(text: &[char]) -> bool {
-    calls(text)
-        .iter()
-        .any(|(_, name)| name == "take_boundary" || name == "try_take_boundary")
 }
 
 /// Whether the `let` at `start` follows `if`, `while` or `&&`: it binds for the block of its
@@ -1366,10 +1382,7 @@ fn held(files: &[(String, String)], roster: &Roster) -> Vec<String> {
                 .filter(|span| span.name == function && span.open < at && at < span.close)
                 .max_by_key(|span| span.open)
                 .expect("the function that the call stands in");
-            let mut live = live_guards(&text, &open_braces, span, at);
-            if takes_the_boundary(&text[span.open..at]) {
-                live.insert("TAKE".to_owned());
-            }
+            let live = live_guards(&text, &open_braces, span, at);
             if live != *row {
                 problems.push(format!(
                     "{file} {function} calls {callee} holding {live:?} and its held row says {row:?}"
@@ -1382,6 +1395,54 @@ fn held(files: &[(String, String)], roster: &Roster) -> Vec<String> {
             problems.push(format!(
                 "held {file} {function} {callee}: the call is not there"
             ));
+        }
+    }
+    problems
+}
+
+/// The mentions of the names that take the dispatch boundary: for every `taker` name and every file
+/// of the crate, the times that the name stands in the file's code are the `mention` row's number,
+/// or none where there is no row. A name counts wherever it stands (a call, an argument, a
+/// statement after a call, a function value), so a second take of the boundary under a held one
+/// changes a number, whatever its shape. It is a count of names and reads no guard.
+fn mentioned(files: &[(String, String)], roster: &Roster) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, file) in roster.mentions.keys() {
+        if !roster.takers.contains(name) {
+            problems.push(format!("mention {name} {file}: the name has no taker row"));
+        }
+        if !files.iter().any(|(known, _)| known == file) {
+            problems.push(format!(
+                "mention {name} {file}: the file is not in the crate"
+            ));
+        }
+    }
+    let mut stands: BTreeMap<&str, usize> = BTreeMap::new();
+    for (file, source) in files {
+        let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
+        let words = idents(&text);
+        for name in &roster.takers {
+            let count = words.iter().filter(|(_, word)| word == name).count();
+            *stands.entry(name.as_str()).or_default() += count;
+            let listed = roster
+                .mentions
+                .get(&(name.clone(), file.clone()))
+                .copied()
+                .unwrap_or(0);
+            if count != listed {
+                problems.push(format!(
+                    "{file} mentions {name} {count} time(s) and its mention row says {listed}: a name \
+                     that takes the dispatch boundary stands where it did not, or does not where it \
+                     did. Read the new text (a take under the held boundary waits on itself; the \
+                     lock audit's table of takers is the record), then set `mention {name} {file} \
+                     {count}`, and add `taker <name>` first for a new function that takes the boundary"
+                ));
+            }
+        }
+    }
+    for name in &roster.takers {
+        if stands.get(name.as_str()).copied().unwrap_or(0) == 0 {
+            problems.push(format!("taker {name}: no file of the crate mentions it"));
         }
     }
     problems
