@@ -506,3 +506,65 @@ fn a_name_that_a_body_allows_and_declares_a_target_for_is_reported() {
         "{found:?}"
     );
 }
+
+const JOURNAL: &str = "crates/kr-worker/src/journal.rs";
+const DRIVER: &str = "crates/kr-worker/src/fence/driver.rs";
+const INPUT_DOMAIN: &str = "crates/kr-worker/src/input_domain.rs";
+const STORE: &str = "crates/kr-worker/src/questions/store.rs";
+
+#[test]
+fn a_take_planted_in_the_journals_outstanding_count_is_reported() {
+    // The limits read the journal's count of outstanding actions, so the count's own body is under
+    // the pass; its receiver is a journal of this crate and not a standard method.
+    let found = planted(
+        JOURNAL,
+        "    pub fn outstanding(&self, actor_id: &ActorId) -> Result<usize> {\n",
+        "    pub fn outstanding(&self, actor_id: &ActorId) -> Result<usize> {\n        let _held = self.gate.lock();\n",
+    );
+    only_finding(
+        &found,
+        "journal.rs outstanding calls lock 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_take_planted_in_the_fence_drivers_detach_is_reported() {
+    // The presented-token detach reaches the driver's own detach through the input domain's fence.
+    let found = planted(
+        DRIVER,
+        "    pub fn detach_for_token(&self, presented: &str) -> Option<AttachmentId> {\n",
+        "    pub fn detach_for_token(&self, presented: &str) -> Option<AttachmentId> {\n        let _held = self.tokens.lock();\n",
+    );
+    only_finding(
+        &found,
+        "fence/driver.rs detach_for_token calls lock 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_take_planted_in_the_input_domains_fence_is_reported() {
+    let found = planted(
+        INPUT_DOMAIN,
+        "    pub const fn fence(&self) -> Option<&FenceDriver> {\n",
+        "    pub const fn fence(&self) -> Option<&FenceDriver> {\n        let _held = self.guard.lock();\n",
+    );
+    only_finding(
+        &found,
+        "input_domain.rs fence calls lock 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_take_planted_in_the_questions_stores_read_is_reported() {
+    // The expiry sweep and the subject's check read a question through the store's `read`, which
+    // is a name that several functions declare: its receiver is the store of this crate.
+    let found = planted(
+        STORE,
+        "    pub fn read(&self, question_id: QuestionId) -> Result<Question> {\n",
+        "    pub fn read(&self, question_id: QuestionId) -> Result<Question> {\n        let _held = self.connection.lock();\n",
+    );
+    only_finding(
+        &found,
+        "questions/store.rs read calls lock 1 time(s) and no row lists it",
+    );
+}
