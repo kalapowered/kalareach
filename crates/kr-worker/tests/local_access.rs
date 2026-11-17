@@ -1348,3 +1348,176 @@ fn an_attach_checked_before_the_host_restricts_its_owner_does_not_land_after_the
         "the attach changed the session after the statement was acknowledged"
     );
 }
+
+/// Runs `work` on a runtime of its own, and lets the runtime go without waiting for the threads
+/// that a failing case left stuck.
+fn on_a_runtime<T>(work: impl std::future::Future<Output = T>) -> T {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(8)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(work)));
+    runtime.shutdown_background();
+    match outcome {
+        Ok(done) => done,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// What a statement that waits for a hold of the dispatch boundary has already done to the
+/// requests of a window that holds an attachment and the input lease: the gate refuses them from
+/// the moment the worker has the statement, not from the moment it can withdraw.
+async fn the_requests_of_a_window_while_a_statement_waits() {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let attachment = world.attach(&mut window).await;
+    let epoch = world.acquire(&mut window, attachment).await;
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    // The boundary is held on a thread of its own, as a mutation that is between its check and its
+    // outcome holds it.
+    let (held, held_end) = std::sync::mpsc::channel();
+    let (let_go, go) = std::sync::mpsc::channel::<()>();
+    let holder = Arc::clone(&world);
+    std::thread::spawn(move || {
+        let _boundary = holder.service.hold_the_dispatch_boundary();
+        let _ = held.send(());
+        let _ = go.recv();
+    });
+    let holding = tokio::task::spawn_blocking(move || {
+        held_end
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_ok()
+    })
+    .await
+    .unwrap_or(false);
+    assert!(holding, "the boundary was never held");
+
+    // The statement closes the host, and waits for the hold.
+    let (told, told_end) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        tell(&mut daemon, closed(2)).await;
+        let _ = told.send(daemon);
+    });
+    let waiting = Arc::clone(&world.service);
+    assert!(
+        holds_by(deadline, move || waiting.statements_waiting_for_tests() > 0).await,
+        "the statement never waited for the hold"
+    );
+
+    // Held, the window's requests meet the host that is closed: they are refused while the hold
+    // stands.
+    let asking = Arc::clone(&world);
+    let (window, read) = ends_by(deadline, async move {
+        let answer = asking.read(&mut window).await;
+        (window, answer)
+    })
+    .await
+    .expect("the read was answered");
+    let error = read.expect_err("a read is refused while the statement waits");
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    let typing = Arc::clone(&world);
+    let (window, typed) = ends_by(deadline, async move {
+        let mut window = window;
+        let answer = typing
+            .type_as(&mut window, attachment, epoch, 1, b"x")
+            .await;
+        (window, answer)
+    })
+    .await
+    .expect("the input was answered");
+    let error = typed.expect_err("input is refused while the statement waits");
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+
+    // Let the hold go: the statement is acknowledged, and the window holds nothing.
+    let _ = let_go.send(());
+    let acknowledged = tokio::task::spawn_blocking(move || {
+        told_end
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    assert!(
+        acknowledged.is_some(),
+        "the statement was never acknowledged"
+    );
+    let nothing = Arc::clone(&world);
+    assert!(
+        holds_by(deadline, move || nothing.holds_nothing()).await,
+        "the window still holds something after the acknowledgement"
+    );
+    drop(window);
+    world.close();
+}
+
+/// KR-REQ-17.54: a statement that takes access away changes what the gate refuses at once, and
+/// acknowledges only when it has withdrawn what the window held.
+///
+/// A holder keeps the dispatch boundary and the statement waits for it. While it waits, a held
+/// read and an input write of the window are refused, since the gate already has the statement;
+/// when the hold ends the statement is acknowledged and the window holds nothing.
+#[test]
+fn a_statement_that_waits_for_a_hold_of_the_boundary_has_already_refused_what_a_window_asks() {
+    on_a_runtime(the_requests_of_a_window_while_a_statement_waits());
+}
+
+/// A window whose connection a restriction withdrew, and that attaches again once the host is open.
+async fn the_attach_of_a_withdrawn_connection() {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let _first = world.attach(&mut window).await;
+    tell(&mut daemon, closed(2)).await;
+    let nothing = Arc::clone(&world);
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    assert!(
+        holds_by(deadline, move || nothing.holds_nothing()).await,
+        "the restriction did not withdraw the window"
+    );
+    tell(&mut daemon, open(3)).await;
+
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    let target = world.target();
+    let session_id = world.session_id;
+    let attaching = ends_by(deadline, async move {
+        let outcome = window
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: false,
+                    dimensions: Nullable::some(Dimensions::new(80, 24)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                },
+            )
+            .await;
+        (window, outcome)
+    })
+    .await
+    .expect("the attach was answered");
+    // A connection that the worker withdrew attaches nothing: the answer is a refusal, or the
+    // connection is gone, and the session holds no attachment either way.
+    if let Ok(Ok(_)) = attaching.1 {
+        panic!("a withdrawn connection attached again after the host opened");
+    }
+    assert!(world.holds_nothing(), "the session holds an attachment");
+    world.close();
+}
+
+/// KR-REQ-17.54: a connection that a restriction withdrew does not attach again when the host is
+/// open again: nothing would withdraw what it attached, since it is no longer in the registry.
+#[test]
+fn a_connection_that_a_restriction_withdrew_does_not_attach_again_when_the_host_opens() {
+    on_a_runtime(the_attach_of_a_withdrawn_connection());
+}
