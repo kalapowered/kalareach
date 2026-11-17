@@ -25,12 +25,13 @@
 //! twenty seconds. No entry is asked about more than three times between connections, and the
 //! count starts again ten minutes after the last request, which is when what that request got has
 //! ended. Until then a refusal from the service goes on explaining a failed dial, though the minute
-//! it is kept for has passed, because nothing asks again to renew it. It also goes on explaining
-//! one for as long as the request that was made as it stood is alive, so that a dial lost in that
-//! time is not told the host is out of reach for want of an answer that the request is about to
-//! confirm or replace. So an answer explains a failed dial for its keep time, for as long as the
-//! cache will not ask again, and for as long as the request made under it is alive, and never
-//! after a newer answer has replaced it.
+//! it is kept for has passed, because nothing asks again to renew it. It also stands for as long as
+//! the request that was made as it stood is alive, so that a dial lost in that time is not told the
+//! host is out of reach for want of an answer that the request is about to confirm or replace. So an
+//! answer explains a failed dial for its keep time, while the asks for its entry are used up and the
+//! ten minutes after the last of them have not ended, and while the request made under it is alive,
+//! and never after a newer answer has replaced it. A stop of requests, below, holds back the next
+//! ask and keeps no answer standing.
 //!
 //! A request is alive while its task has not finished: the entry holds the task, stored in the
 //! same locked step as the count and the time of the ask, so one request for an entry is alive at
@@ -390,7 +391,7 @@ enum Held {
     /// An admission is installed until then.
     Admitted { until: Instant },
     /// The service is unable, or failed on its side. `kept_until` is how long the answer explains
-    /// a failed dial of itself (a live request for the entry explains it too), and `retry_at` is
+    /// a failed dial of itself (a live request for the entry keeps it standing too), and `retry_at` is
     /// when a dial asks again; a request that fails moves `retry_at`
     /// later and lifts `kept_until` to it. `alternatives` is what the service named, with no entry
     /// for a fault; `retry_after_seconds` is the delay it named, as it named it, and `answered_at`
@@ -451,7 +452,7 @@ impl Entry {
     }
 
     /// Whether the entry holds an answer that the service is unable and that still explains a
-    /// failed dial: for as long as it is kept, for as long as the cache will not ask again (three
+    /// failed dial: for as long as it is kept, while the asks for the entry are used up (three
     /// requests with no connection, until the ten minutes after the last), because nothing renews it
     /// while no request is made, and for as long as the request that was made while it stood is
     /// alive. That request decides what the entry holds next, and a dial that is lost before then
@@ -801,7 +802,7 @@ impl PairingAdmissions {
     /// anything and that answer still stands: no free capacity to admit this device through the
     /// relay the dial addresses, with the paths that still work, or a fault of the service itself,
     /// each with the device's own wait: what is left of the time that no ask is made until (0 when
-    /// it has passed, as it has while a request for the entry is alive past its retry time).
+    /// it has passed, which a live request for the entry does not change).
     ///
     /// It decides what a dial that failed is reported as: a managed relay that cannot admit a
     /// device is not a host that cannot be reached.
@@ -823,10 +824,11 @@ impl PairingAdmissions {
                 // of the times that no ask is made until (the retry time, which a failed request
                 // moves later, the end of the ask window when the asks are used up, the end of a
                 // stop of requests), whether or not the service named a delay, and never less than
-                // what is left of the delay it named. It is 0 once all of them have passed, as they
-                // have while a request for the entry is alive past its retry time: no ask is made
-                // while that request is alive, and the figure does not say so. The answer is kept
-                // past its delay while the cache will not ask again, and every try before then
+                // what is left of the delay it named. It is 0 once all of them have passed. A request
+                // that is alive past the retry time moves none of them: the figure is 0 though no
+                // ask is made until that request ends, unless that request is the third ask (the
+                // end of its window is later) or a stop of requests lasts. The answer is kept past
+                // its delay while the asks for the entry are used up, and every try before then
                 // fails in the same way. At most a day, by the cache's own cap on a delay.
                 let asks_again = [
                     Some(*retry_at),
@@ -870,9 +872,10 @@ pub enum RelayRefusal {
         /// The device's own wait: the seconds from now to the latest of the retry time, the end of
         /// the ask window when the asks are used up and the end of a stop of requests, and not
         /// less than what remains of the delay the service named, when it named one. It is 0 once
-        /// those have passed, as they have while a request for the entry is alive past its retry
-        /// time, and no ask is made while that request is alive. At most a day, by the cache's own
-        /// cap on a delay.
+        /// those have passed. A request that is alive past the retry time moves none of them, so
+        /// the figure is 0 though no ask is made until that request ends, unless that request is the
+        /// third ask (the end of its window is later) or a stop of requests lasts. At most a day, by
+        /// the cache's own cap on a delay.
         retry_after_seconds: u64,
     },
     /// The service failed on its side, and no capacity was refused. An answer that names no path,
@@ -881,9 +884,10 @@ pub enum RelayRefusal {
         /// The device's own wait: the seconds from now to the latest of the retry time, the end of
         /// the ask window when the asks are used up and the end of a stop of requests, and not
         /// less than what remains of the delay the service named, when it named one. It is 0 once
-        /// those have passed, as they have while a request for the entry is alive past its retry
-        /// time, and no ask is made while that request is alive. At most a day, by the cache's own
-        /// cap on a delay.
+        /// those have passed. A request that is alive past the retry time moves none of them, so
+        /// the figure is 0 though no ask is made until that request ends, unless that request is the
+        /// third ask (the end of its window is later) or a stop of requests lasts. At most a day, by
+        /// the cache's own cap on a delay.
         retry_after_seconds: u64,
     },
 }
