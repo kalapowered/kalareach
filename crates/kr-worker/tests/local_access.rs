@@ -775,9 +775,17 @@ async fn a_mutation_inside_the_dispatch_boundary_when_the_host_restricts_its_own
 ///
 /// The connection holding the attachment is withdrawn by the restriction, which refuses the batch
 /// as well, so this does not show the recheck inside the session by itself.
+///
+/// The first window's input is waited for before the host closes. The worker answers a write once
+/// the bytes are queued for its writer, and the restriction ends the window's lease, which drops
+/// whatever the writer has not yet put on the terminal. The control that an open host writes is
+/// input the application has read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn input_waiting_for_the_session_when_the_host_restricts_its_owner_is_not_written() {
     let world = world("stty raw -echo; printf 'kr-ready.'; exec cat", true).await;
+    // Waited for, because until the program has put the terminal into raw mode with the echo off
+    // the line discipline echoes what is typed and the program never reads it.
+    produced(&world.runtime, b"kr-ready.").await;
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
     tell(&mut daemon, open(1)).await;
@@ -788,6 +796,7 @@ async fn input_waiting_for_the_session_when_the_host_restricts_its_owner_is_not_
         .type_as(&mut window, attachment, epoch, 0, b"kr-early")
         .await
         .expect("input under an open host is written");
+    produced(&world.runtime, b"kr-early").await;
 
     let (arrived, release) = world.service.pause_input_before_the_session();
     let session_id = world.session_id;
