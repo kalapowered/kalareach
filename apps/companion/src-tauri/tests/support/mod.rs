@@ -1162,6 +1162,8 @@ pub struct LinkControl {
     asked: std::sync::atomic::AtomicUsize,
     /// The pool that the connections of the device this governs stand on.
     pool: Mutex<Option<Arc<kr_client::pairing::link::EndpointPool>>>,
+    /// What a case looks at when the link is told to forget a host, before the link goes on.
+    forgetting: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     state: Mutex<LinkState>,
     /// Told each time a connection has presented its lease.
     presentations: tokio::sync::Notify,
@@ -1272,6 +1274,12 @@ impl LinkControl {
     /// Lets connections through again. Those held stay held until released.
     pub fn stop_holding(&self) {
         self.state.lock().expect("the record").holding = false;
+    }
+
+    /// Runs `look` each time the link is told to forget a host, at that call and before the link
+    /// forgets it: what the case reads in `look` is what stands when the endpoint is asked.
+    pub fn at_the_forget(&self, look: impl Fn() + Send + Sync + 'static) {
+        *self.forgetting.lock().expect("the record") = Some(Arc::new(look));
     }
 
     /// How many connections have been asked for, held ones included.
@@ -2343,6 +2351,10 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
         &'a self,
         host: &'a kr_protocol::scalars::EndpointKey,
     ) -> kr_client::pairing::BoxFuture<'a, ()> {
+        let look = self.control.forgetting.lock().expect("the record").clone();
+        if let Some(look) = look {
+            look();
+        }
         self.own.forget_host(host)
     }
 }
