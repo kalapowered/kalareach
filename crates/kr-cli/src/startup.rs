@@ -3505,7 +3505,8 @@ mod tests {
     /// and clears the flag that a requested daemon may still start.
     #[cfg(windows)]
     #[tokio::test]
-    async fn the_task_start_launches_nothing_where_a_daemon_answers_and_no_starter_took_the_request() {
+    async fn the_task_start_launches_nothing_where_a_daemon_answers_and_no_starter_took_the_request()
+     {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let host = kr_ipc::testing::TempHost::create();

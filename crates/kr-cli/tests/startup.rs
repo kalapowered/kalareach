@@ -1067,6 +1067,13 @@ fn start(mut command: Command) -> Running {
 }
 
 impl Running {
+    /// Whether `kr` has ended, without waiting for it.
+    fn has_ended(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+    }
+
     /// Waits for `kr` to end, within the deadline, and for both of its streams to reach their end.
     ///
     /// A stream that stays open after `kr` has ended is held by something `kr` started, which is
@@ -8225,6 +8232,97 @@ fn a_restart_whose_request_could_not_be_made_and_whose_start_fails_says_both() {
     daemon.end();
 }
 
+/// The order in which a case saw things happen, each with the time since the case began, all from
+/// one clock, so that a failure says in what order the command, the daemons and the processes of
+/// the case acted.
+struct Events {
+    began: Instant,
+    began_at: std::time::SystemTime,
+    seen: Vec<(Duration, String)>,
+}
+
+impl Events {
+    fn begin() -> Self {
+        Self {
+            began: Instant::now(),
+            began_at: std::time::SystemTime::now(),
+            seen: Vec::new(),
+        }
+    }
+
+    /// Notes `what` as of now.
+    fn note(&mut self, what: &str) {
+        self.seen.push((self.began.elapsed(), what.to_owned()));
+    }
+
+    /// Notes `what` as of `when`, a reading of the same clock that another part of the case took.
+    fn note_at(&mut self, when: Instant, what: &str) {
+        self.seen
+            .push((when.saturating_duration_since(self.began), what.to_owned()));
+        self.seen.sort_by_key(|(at, _)| *at);
+    }
+}
+
+impl std::fmt::Display for Events {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let epoch = self
+            .began_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        writeln!(
+            formatter,
+            "  the case's clock began at {epoch} ms since the Unix epoch"
+        )?;
+        for (at, what) in &self.seen {
+            writeln!(formatter, "  +{:>8.3} s  {what}", at.as_secs_f64())?;
+        }
+        Ok(())
+    }
+}
+
+/// What a case that ran `kr` saw, for the message of its failure: the order of events, and the
+/// whole of the command's standard error and standard output.
+fn what_the_case_saw(events: &Events, output: &Output) -> String {
+    format!(
+        "the order of events:\n{events}the command's standard error:\n{}\nits standard output:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
+}
+
+/// Waits until `silent` has accepted `count` connections, which the command's own reads make, or
+/// until the command has ended, whichever comes first: a command that ends first has not reached
+/// the wait that the case is about, and the case's own assertions on what it said fail with the
+/// order of events. A command that neither connects nor ends within the deadline is a hang, and
+/// that is the failure here.
+fn until_the_command_connects_or_ends(
+    silent: &SilentListener,
+    mut running: Running,
+    count: usize,
+    events: &mut Events,
+) -> Running {
+    let waited = Instant::now();
+    loop {
+        if silent.accepted.load(std::sync::atomic::Ordering::SeqCst) >= count {
+            events.note(&format!("the silent listener accepted connection {count}"));
+            return running;
+        }
+        if running.has_ended() {
+            events.note(&format!(
+                "the command had ended before the silent listener accepted connection {count}"
+            ));
+            return running;
+        }
+        if waited.elapsed() >= LIVENESS_DEADLINE {
+            events.note("the wait for the silent listener's connection reached its bound");
+            panic!(
+                "the silent listener accepted fewer than {count} connections within {LIVENESS_DEADLINE:?} and the command still runs\n{events}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// What answers after the successor was replaced.
 #[derive(Clone, Copy)]
 enum Then {
@@ -8242,6 +8340,7 @@ struct Replaced {
     old: u32,
     successor: u32,
     answering: u32,
+    events: Events,
 }
 
 /// A restart whose greeting fails because the daemon ends, while another process takes the lock
@@ -8277,37 +8376,61 @@ fn a_restart_that_waits_for_a_replaced_successor(json: bool, next: Then) -> Repl
     } else {
         &["host", "restart"]
     };
+    let mut events = Events::begin();
     let running = start(host.kr(arguments));
+    events.note(&format!(
+        "the command was started (old process {}, successor {})",
+        old.id(),
+        successor.id()
+    ));
     let looked_for = Instant::now() + Duration::from_secs(60);
     while first.stopped_listening_at().is_none() {
         assert!(
             Instant::now() < looked_for,
-            "the command never greeted the daemon"
+            "the command never greeted the daemon\n{events}"
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(at) = first.stopped_listening_at() {
+        events.note_at(
+            at,
+            "the first daemon cut the greeting and stopped listening",
+        );
     }
     // The successor takes the lock and a listener that never answers is bound while the old
     // daemon still runs; the old daemon ends only then.
     std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
+    events.note("the successor was named in the lock file");
     let mut silent = SilentListener::bind(&host);
+    events.note("the silent listener was bound");
     old.kill().expect("ends the old daemon");
     old.wait().expect("collects it");
-    silent.until_it_accepted(1);
+    events.note("the old process was ended and collected");
+    let running = until_the_command_connects_or_ends(&silent, running, 1, &mut events);
     assert!(
         attempts(&host).is_empty(),
-        "a record stands where nothing was asked or started"
+        "a record stands where nothing was asked or started\n{events}"
     );
     silent.end();
+    events.note("the silent listener ended");
     successor.kill().expect("ends the successor");
     successor.wait().expect("collects it");
+    events.note("the successor was ended and collected");
     std::fs::write(&lock, format!("{}\n", replacement.id())).expect("names the replacement");
+    events.note("the replacement was named in the lock file");
     let on_stop = match next {
         Then::AnAnswerFrom => OnStop::AnswerAndStay(answering.id()),
         Then::AnExchangeThatIsCut => OnStop::Cut,
     };
     let mut second = TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop, true, 2);
+    events.note("the second daemon was listening");
     let output = running.finish("kr host restart");
-    assert!(attempts(&host).is_empty(), "no record stands");
+    events.note("the command's output was read");
+    assert!(
+        attempts(&host).is_empty(),
+        "no record stands\n{}",
+        what_the_case_saw(&events, &output)
+    );
     let ids = (old.id(), successor.id(), answering.id());
     let _ = replacement.kill();
     let _ = replacement.wait();
@@ -8322,6 +8445,7 @@ fn a_restart_that_waits_for_a_replaced_successor(json: bool, next: Then) -> Repl
         old: ids.0,
         successor: ids.1,
         answering: ids.2,
+        events,
     }
 }
 
@@ -8333,15 +8457,16 @@ fn a_restart_that_waits_for_a_replaced_successor(json: bool, next: Then) -> Repl
 #[test]
 fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_record() {
     let replaced = a_restart_that_waits_for_a_replaced_successor(true, Then::AnAnswerFrom);
+    let saw = what_the_case_saw(&replaced.events, &replaced.output);
     let said = document(&replaced.output, "kr host restart");
-    assert_eq!(replaced.output.status.code(), Some(0), "{said}");
-    assert_eq!(stop_of(&said), "ended", "{said}");
+    assert_eq!(replaced.output.status.code(), Some(0), "{said}\n{saw}");
+    assert_eq!(stop_of(&said), "ended", "{said}\n{saw}");
     assert_eq!(
         said["serving"].as_u64(),
         Some(u64::from(replaced.answering)),
-        "the process that the answering daemon states: {said}"
+        "the process that the answering daemon states: {said}\n{saw}"
     );
-    assert_eq!(said["launched"], Value::Null, "{said}");
+    assert_eq!(said["launched"], Value::Null, "{said}\n{saw}");
 }
 
 /// KR-REQ-07.12 (the text of a restart that waited for a successor that was replaced): the
@@ -8352,24 +8477,24 @@ fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_reco
 fn a_restart_whose_successor_was_replaced_says_what_it_read_and_when() {
     let replaced = a_restart_that_waits_for_a_replaced_successor(false, Then::AnAnswerFrom);
     let out = String::from_utf8_lossy(&replaced.output.stdout);
-    let said = String::from_utf8_lossy(&replaced.output.stderr);
-    assert_eq!(replaced.output.status.code(), Some(0), "{out} {said}");
+    let saw = what_the_case_saw(&replaced.events, &replaced.output);
+    assert_eq!(replaced.output.status.code(), Some(0), "{saw}");
     let id = replaced.host.tree.environment_id();
     assert!(
         out.starts_with(&format!(
             "The control daemon for environment {id} (process {}) ended, and this command could not make its request for it: ",
             replaced.old
         )),
-        "{out}"
+        "{saw}"
     );
     assert!(
         out.contains(&format!(
             " This command sent nothing. After it ended, a control daemon (process {}) held environment {id}, and a control daemon (process {}) answers now. This command started none. No session was stopped.",
             replaced.successor, replaced.answering
         )),
-        "the earlier reading in the past tense, then the process that answers: {out}"
+        "the earlier reading in the past tense, then the process that answers: {saw}"
     );
-    assert!(!out.contains(" now holds environment "), "{out}");
+    assert!(!out.contains(" now holds environment "), "{saw}");
 }
 
 /// A listener on the tree's controller endpoint that accepts connections and answers none, as a
@@ -8513,23 +8638,36 @@ fn a_successor_never_answers_after(
     let mut successor = a_process_named_kr_controller(&host, "successor");
     std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
     let mut daemon = TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop, true, 0);
+    let mut events = Events::begin();
     let running = start(host.kr(&["--json", "host", "restart"]));
+    events.note(&format!(
+        "the command was started (old process {}, successor {})",
+        old.id(),
+        successor.id()
+    ));
     let looked_for = Instant::now() + Duration::from_secs(60);
     while daemon.stopped_listening_at().is_none() {
         assert!(
             Instant::now() < looked_for,
-            "the daemon that was asked never ended"
+            "the daemon that was asked never ended\n{events}"
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(at) = daemon.stopped_listening_at() {
+        events.note_at(at, "the daemon that was asked stopped listening");
     }
     // The old daemon ends, and the lock is held again by the one that replaces it, which never
     // answers: nothing listens.
     old.kill().expect("ends the old daemon");
     old.wait().expect("collects it");
+    events.note("the old process was ended and collected");
     std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
+    events.note("the successor was named in the lock file");
     let output = running.finish("kr host restart");
+    events.note("the command's output was read");
+    let saw = what_the_case_saw(&events, &output);
     let said = document(&output, "kr host restart");
-    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert_eq!(output.status.code(), Some(1), "{said}\n{saw}");
     let message = said["message"].as_str().expect("a message");
     let id = host.tree.environment_id();
     let (opening, closing) = opening_of(&id.to_string(), old.id(), successor.id());
@@ -8539,15 +8677,15 @@ fn a_successor_never_answers_after(
     );
     assert!(
         message.starts_with(&opening) && message.contains(&format!("{closing}{after}")),
-        "the stop's words, then the earlier reading of the successor: {message}"
+        "the stop's words, then the earlier reading of the successor: {message}\n{saw}"
     );
     assert!(
         message.ends_with(". This command started none. Run kr host restart again."),
-        "{message}"
+        "{message}\n{saw}"
     );
     assert!(
         !message.contains("the daemon that was stopped ended"),
-        "{message}"
+        "{message}\n{saw}"
     );
     assert!(host.running().is_empty(), "nothing was started");
     let _ = successor.kill();
@@ -8639,8 +8777,9 @@ fn a_restart_whose_holder_answers_and_ends_before_the_read_of_who_serves_never_s
 #[test]
 fn a_successor_whose_exchange_is_cut_is_no_proof_of_another_daemon() {
     let replaced = a_restart_that_waits_for_a_replaced_successor(true, Then::AnExchangeThatIsCut);
+    let saw = what_the_case_saw(&replaced.events, &replaced.output);
     let said = document(&replaced.output, "kr host restart");
-    assert_eq!(replaced.output.status.code(), Some(1), "{said}");
+    assert_eq!(replaced.output.status.code(), Some(1), "{said}\n{saw}");
     let message = said["message"].as_str().expect("a message");
     let id = replaced.host.tree.environment_id();
     assert!(
@@ -8648,7 +8787,7 @@ fn a_successor_whose_exchange_is_cut_is_no_proof_of_another_daemon() {
             " After it ended, a control daemon (process {}) held environment {id}, and no control daemon answered within 30 seconds: ",
             replaced.successor
         )),
-        "{message}"
+        "{message}\n{saw}"
     );
     assert!(replaced.host.running().is_empty(), "nothing was started");
 }
@@ -8659,7 +8798,7 @@ fn a_successor_whose_exchange_is_cut_is_no_proof_of_another_daemon() {
 /// with the code of the refusal and the stop `refused`.
 #[test]
 fn a_restart_whose_stop_request_the_daemon_refused_after_the_launch_says_that_nothing_was_stopped()
- {
+{
     let host = Standalone::create();
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
