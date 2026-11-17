@@ -224,22 +224,23 @@ impl LocalBuild {
 /// The capability a worker states when it reads the history scope a forwarded read carries
 /// ([`ForwardedRequest::history`]).
 ///
-/// A control daemon of an earlier release reads it before it sends a scope, and a worker keeps
-/// stating it so that such a daemon, which a rollback brings back, goes on sending one. The version
-/// is the second: a scope names approvals by the broker's resource identity.
+/// A control daemon from before the retained levels read it before it sent a scope. Every worker of
+/// a retained level states it, and so does this release's. The version is the second: a scope names
+/// approvals by the broker's resource identity.
 pub const FORWARDED_HISTORY_SCOPE: &str = "forwarded.history-scope/2";
 
 /// The capability a worker states when it holds a local caller to what the control daemon tells it
 /// the host's local owner may do ([`crate::worker::LocalAccess`]).
 ///
-/// A control daemon of an earlier release sends the statement only to a worker that states this.
+/// A control daemon from before the retained levels sent the statement only to a worker that
+/// states this.
 pub const LOCAL_ACCESS: &str = "local.access/1";
 
 /// The capability a worker states when it holds a forwarded `question.read` to the history scope
 /// the read carries.
 ///
-/// A control daemon of an earlier release sends a question read that carries a scope only to a
-/// worker that states this.
+/// A control daemon from before the retained levels sent a question read that carries a scope only
+/// to a worker that states this.
 pub const FORWARDED_QUESTION_SCOPE: &str = "forwarded.question-scope/1";
 
 /// What a worker answers a method it does not list, whoever asks.
@@ -249,29 +250,30 @@ pub const METHOD_NOT_REACHABLE: &str = "the method is not reachable from a local
 /// frame carries: the first answer to a `question.answer` or `question.cancel`, the answer to a
 /// duplicate of any mutation, and the answer to an `action.read`.
 ///
-/// A control daemon of an earlier release sends a mutation's scope ([`ForwardedMutation::history`])
-/// only to a worker that states this.
+/// A control daemon from before the retained levels sent a mutation's scope
+/// ([`ForwardedMutation::history`]) only to a worker that states this.
 pub const FORWARDED_RESULT_SCOPE: &str = "forwarded.result-scope/1";
 
 /// The capability a worker states when it reads the grant a forwarded `session.attach` was decided
 /// under ([`ForwardedMutation::screen_basis`]) and draws the attachment the screen that grant
 /// allows.
 ///
-/// A control daemon of an earlier release refuses a share's attach to a worker that does not state
-/// this.
+/// A control daemon from before the retained levels refused a share's attach to a worker that does
+/// not state this.
 pub const FORWARDED_SCREEN_BASIS: &str = "forwarded.screen-basis/1";
 
 /// The capability a worker states when it reads which grants and devices an authority revision
 /// withdrew ([`crate::worker::AuthorityRevisionNotice::reach`]) and fences the input of those
 /// callers alone.
 ///
-/// A control daemon of an earlier release names a revision's reach only to a worker that states
-/// this.
+/// A control daemon from before the retained levels named a revision's reach only to a worker that
+/// states this.
 pub const AUTHORITY_REVISION_REACH: &str = "authority.revision-reach/1";
 
 /// The capability a worker states when it serves `agent.instances`.
 ///
-/// A control daemon of an earlier release sends the read only to a worker that states this.
+/// A control daemon from before the retained levels sent the read only to a worker that states
+/// this.
 pub const AGENT_INSTANCES_READ: &str = "agent.instances/1";
 
 /// The capability a worker states when it serves `shell.launch.surface`.
@@ -939,8 +941,8 @@ mod tests {
             "an earlier daemon's frame reads as unscoped"
         );
 
-        // A workflow's close names the run it acts for, and a worker of an earlier release cannot
-        // read a frame that does: it is sent only to the worker that started the session.
+        // A workflow's close names the run it acts for, and a worker from before that member
+        // cannot read a frame that does: it is sent only to the worker that started the session.
         let for_a_run = super::ForwardedMutation {
             workflow_run_id: Some(crate::ids::WorkflowRunId::new(Uuid::from_bytes([6; 16]))),
             ..mutation(None)
