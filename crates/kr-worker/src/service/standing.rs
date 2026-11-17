@@ -31,8 +31,7 @@
 //! # What a piece writes
 //!
 //! No piece writes a receipt, and no piece's own code notes a fault. The writes made below the
-//! pieces are the base's own, each as at the base, and each has a row in the rosters of the
-//! standing function:
+//! pieces are the ones listed here, and each has a row in the rosters of the standing function:
 //!
 //! * `subject`, in the first mode, runs the expiry sweep of the questions (through `validate`)
 //!   before it reads the question a method names, so a question that is due or whose binding
@@ -42,13 +41,16 @@
 //!   last decision fences the broker (`follow_health`, `fence`, which raises the volatile
 //!   state's fence);
 //! * a journal that fails a read of the limits records the fault itself, inside the read
-//!   (`JournalHealth::note_fault`), in both modes;
+//!   (`JournalHealth::note_fault`), in both modes; the subject's read of the ledger for a
+//!   resource that the broker has forgotten records a fault through the same note;
 //! * `dispatch`, for a mutation the broker owns, takes the broker's claim, its permit and its
-//!   token (`decidable`), which is the admission itself: a second pass cannot run it again; the
+//!   token (`decidable`), which is the admission itself: a second pass cannot run it again. The
 //!   same admission counts a refusal that the journal's fence causes (`note_fenced`, in
 //!   `admit_mutation_in`: rich work is fenced while the journal is faulted, and the refusal is
-//!   counted in the gap), notes the intent of a prompt (`note_intent`, in `admit_prompt`) and
-//!   makes the broker's fence as above.
+//!   counted in the gap), notes the intent of a prompt (`note_intent`, in `admit_prompt`), makes
+//!   the broker's fence as above and, for a plugin action, adds one to the binding's count of
+//!   open actions (`count_open_action`, under the broker's lock), a counter in memory that the
+//!   guard held by the action takes away when the action ends, sent or given up.
 
 use super::{
     Caller, ConnectionFacts, ConnectionState, ContinuousInstant, Made, Method, MutationRequest,
