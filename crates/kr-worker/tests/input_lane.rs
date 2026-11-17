@@ -319,8 +319,6 @@ fn refusal(outcome: &Outcome) -> Option<ErrorCode> {
 /// A worker with a session whose application keeps what it receives, the control daemon's proxy
 /// link to it, and the identities that the daemon speaks for.
 struct Rig {
-    _temp: kr_ipc::testing::TempHost,
-    _kept: tempfile::TempDir,
     received: std::path::PathBuf,
     /// The pipe that an application which waits to read its terminal is let go through.
     go: std::path::PathBuf,
@@ -335,6 +333,10 @@ struct Rig {
     proxy_connection: ConnectionId,
     grant: GrantId,
     device: DeviceId,
+    /// The last two fields, so that the runtime and the service, whose application keeps files in
+    /// them, are dropped before the directories are removed.
+    _kept: tempfile::TempDir,
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Rig {
@@ -480,8 +482,6 @@ impl Rig {
         tokio::spawn(Arc::clone(&service).serve(listener));
         common::produced(&runtime, b"kr-ready.").await;
         let mut rig = Self {
-            _temp: temp,
-            _kept: kept,
             received,
             go,
             service,
@@ -495,6 +495,8 @@ impl Rig {
             proxy_connection: ConnectionId::new(kr_ipc::new_uuid()),
             grant: GrantId::new(kr_ipc::new_uuid()),
             device: DeviceId::new(kr_ipc::new_uuid()),
+            _kept: kept,
+            _temp: temp,
         };
         let proxy = rig.connect(1, Some(ControllerConnectionRole::Proxy)).await;
         rig.proxy_connection = proxy.acknowledgement().connection_id;

@@ -78,10 +78,12 @@ enum Command {
 /// A scripted lane and the endpoint it listens at.
 pub struct ScriptedLane {
     endpoint: Endpoint,
-    _dir: PrivateTempDir,
     shared: Arc<Shared>,
     commands: mpsc::UnboundedSender<Command>,
     task: tokio::task::JoinHandle<()>,
+    /// Last, so that the lane's task, which `Drop` ends first, lets go of the endpoint's file
+    /// before the directory is removed.
+    _dir: PrivateTempDir,
 }
 
 impl ScriptedLane {
@@ -104,10 +106,10 @@ impl ScriptedLane {
         let task = tokio::spawn(serve(listener, Arc::clone(&shared), ready, received));
         Self {
             endpoint,
-            _dir: dir,
             shared,
             commands,
             task,
+            _dir: dir,
         }
     }
 
