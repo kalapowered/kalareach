@@ -1477,7 +1477,7 @@ async fn a_handshake_whose_record_is_replaced_while_it_waits_is_refused_and_no_c
         let outcome = handshake::connect(&connection, &client.identity, &host.record).await;
         match refusal {
             Some(words) => {
-                let error = outcome.err().expect("the handshake is refused");
+                let error = outcome.expect_err("the handshake is refused");
                 let (kr_transport::error::TransportError::Handshake(error)
                 | kr_transport::error::TransportError::Refused(error)) = error
                 else {

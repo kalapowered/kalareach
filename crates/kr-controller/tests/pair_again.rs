@@ -1619,9 +1619,7 @@ async fn the_deadline_of_the_ended_records_grant_is_not_the_new_records_and_the_
 async fn a_share_naming_the_old_identifier_is_decided_on_the_old_record_alone() {
     use kr_protocol::grant::SessionSelector;
     use kr_protocol::scalars::{DurationMs, TimestampMs};
-    use kr_protocol::sharing::{
-        AuthorityNotice, GrantCreateParams, RoleSelection, SessionRole,
-    };
+    use kr_protocol::sharing::{AuthorityNotice, GrantCreateParams, RoleSelection, SessionRole};
 
     let reaching_no_session = || {
         let mut grant = rights();
@@ -1787,7 +1785,11 @@ async fn a_replacement_and_another_owner_mutation_are_refused_alike_while_a_debt
     )
     .await
     .expect_err("another owner mutation is refused while a debt is published");
-    assert_eq!(replacement.code, ErrorCode::PermissionDenied, "{replacement:?}");
+    assert_eq!(
+        replacement.code,
+        ErrorCode::PermissionDenied,
+        "{replacement:?}"
+    );
     assert!(
         replacement
             .message
