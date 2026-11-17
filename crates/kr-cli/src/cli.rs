@@ -1417,7 +1417,7 @@ pub enum HostCommand {
     /// stopped or started. Exit 3: the host is not set up for the restart, the daemon's launch
     /// differs from this command's start, the daemon could not be reached, or the request could not
     /// be made (nothing was stopped in each of these); or the start could not be set up (after the
-    /// stop, or where no daemon ran, or where a holder gave way; the message says which). Exit 8:
+    /// stop, or where no daemon ran, or where a holder gave way). Exit 8:
     /// the refusal inside a session, or the daemon's refusal of the host read or of the stop
     /// request, in the daemon's own words. Exit 1: every other failure, among them a daemon or a
     /// holder that does not answer, a daemon of another build, a start that failed after the stop,

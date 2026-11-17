@@ -155,7 +155,8 @@ async fn restart(
         Looked::Refused { before, error } => match ended_without_a_request(before) {
             // The greeting failed because the daemon was ending, and the wait saw its end: the
             // restart goes on to its start as it does for a request that could not be made.
-            Ok((first, pid, end)) => {
+            Ok((_, pid, end)) => {
+                let first = ended_unmade_said(id, pid, &error);
                 ended_before_the_request(
                     host,
                     environment,
@@ -238,54 +239,100 @@ async fn wait_for_the_holder(
     let id = environment.environment_id;
     // No daemon was asked here, so no generation is the one that answers: any answer counts.
     let operations = Real::of(host, &environment.paths, Some(ControllerGeneration::new(0)));
-    match holder::wait(&operations, startup::START_BOUND).await {
-        holder::Holder::Answers => {
-            let serving = serving_now(environment, progress).await;
-            host_stop::done(
-                &holder_answers_said(id, serving),
-                &Facts {
-                    pid: serving,
-                    answer: Some(Answer {
-                        serving,
-                        launched: None,
-                    }),
-                    ..begun.none.clone()
-                },
+    let deadline = tokio::time::Instant::now() + startup::START_BOUND;
+    // What the read of who serves gave after the wait saw a daemon answer, where it was no daemon:
+    // the command goes on waiting within its bound and says it if the bound ends so.
+    let mut since: Option<Shown> = None;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match holder::wait(&operations, left).await {
+            holder::Holder::Answers => {
+                match who_serves(environment, startup::ANSWER_BOUND, progress).await {
+                    Serves::Daemon(serving) => {
+                        return host_stop::done(
+                            &holder_answers_said(id, serving),
+                            &Facts {
+                                pid: serving,
+                                answer: Some(Answer {
+                                    serving,
+                                    launched: None,
+                                }),
+                                ..begun.none.clone()
+                            },
+                            json,
+                            &begun.earlier,
+                        );
+                    }
+                    Serves::Replied(why) | Serves::NoReply(why) => since = Some(why),
+                }
+            }
+            holder::Holder::Gone => {
+                return start_where_none_ran(host, environment, json, progress, past, begun).await;
+            }
+            holder::Holder::Silent { replied } => {
+                return host_stop::failed(
+                    holder_silent(environment, replied, since.as_ref()),
+                    &begun.none,
+                    json,
+                );
+            }
+        }
+        if deadline <= tokio::time::Instant::now() {
+            return host_stop::failed(
+                holder_silent(environment, false, since.as_ref()),
+                &begun.none,
                 json,
-                &begun.earlier,
-            )
+            );
         }
-        holder::Holder::Gone => {
-            start_where_none_ran(host, environment, json, progress, past, begun).await
-        }
-        holder::Holder::Silent => host_stop::failed(holder_silent(environment), &begun.none, json),
+        tokio::time::sleep(host_stop::LOOK_EVERY).await;
     }
 }
 
-/// The process that the daemon at the environment's endpoint states now, read on one connection
-/// that it answers and never from the lock file, which may name an earlier daemon: none where
-/// nothing answers, the daemon states none, or its answer is cut.
-async fn serving_now(environment: &KnownEnvironment, progress: &Progress) -> Option<u64> {
-    let endpoint = environment.paths.controller_endpoint().ok()?;
-    match startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await {
-        startup::Reached::Answered(listed) => {
-            stated_by(*listed, environment.environment_id, progress).await
-        }
-        startup::Reached::Silent | startup::Reached::Refused(_) => None,
-    }
+/// What one read of who serves the environment gave, in the three outcomes that a result keeps
+/// apart.
+enum Serves {
+    /// A daemon gave a usable greeting, and this is the process that it states on that connection:
+    /// none where it states none.
+    Daemon(Option<u64>),
+    /// A daemon replied, and this command cannot use the reply.
+    Replied(Shown),
+    /// No daemon replied, or the exchange that reads its process was cut after its greeting.
+    NoReply(Shown),
 }
 
-/// The process that the daemon on the connection `listed` states, read on that connection.
-async fn stated_by(
-    listed: kr_ipc::client::Listed,
-    id: EnvironmentId,
+/// Reads who serves at the environment's endpoint: the greeting, and then the process that the
+/// daemon states, on the connection that answered. It is never read from the lock file, which may
+/// name an earlier daemon.
+async fn who_serves(
+    environment: &KnownEnvironment,
+    bound: std::time::Duration,
     progress: &Progress,
-) -> Option<u64> {
-    let mut client = startup::ours(listed).ok()?;
-    proof::process_stated(&mut client, id, progress)
-        .await
-        .ok()
-        .flatten()
+) -> Serves {
+    let Ok(endpoint) = environment.paths.controller_endpoint() else {
+        return Serves::NoReply(Shown::said("the endpoint's address could not be made"));
+    };
+    match startup::read(&endpoint, bound, &[]).await {
+        startup::Read::Greeting(listed) => {
+            let mut client = match startup::ours(*listed) {
+                Ok(client) => client,
+                Err(error) => return Serves::Replied(error.said()),
+            };
+            let stated = tokio::time::timeout(
+                bound,
+                proof::process_stated(&mut client, environment.environment_id, progress),
+            )
+            .await;
+            match stated {
+                Ok(Ok(process)) => Serves::Daemon(process),
+                Ok(Err(why)) => Serves::NoReply(why),
+                Err(_) => Serves::NoReply(Shown::said(
+                    "a control daemon answered and did not state its process in time",
+                )),
+            }
+        }
+        startup::Read::Reply(why) => Serves::Replied(why),
+        startup::Read::NoReply(why) => Serves::NoReply(why),
+    }
 }
 
 /// What the restart says where a process held the environment and did not answer, and a daemon
@@ -310,21 +357,46 @@ fn not_recorded_before_the_start(error: &kr_ipc::IpcError) -> CliError {
 
 /// The restart's failure where a process holds the environment and neither answers nor lets go
 /// within the start's bound.
-fn holder_silent(environment: &KnownEnvironment) -> CliError {
+fn holder_silent(
+    environment: &KnownEnvironment,
+    replied: bool,
+    since: Option<&Shown>,
+) -> CliError {
     CliError::Unfinished {
         code: ErrorCode::EnvironmentUnavailable,
-        message: holder_silent_said(environment),
+        message: holder_silent_said(environment, replied, since),
     }
 }
 
 /// What the restart says where a process holds the environment and neither answers nor lets go
-/// within the start's bound.
-fn holder_silent_said(environment: &KnownEnvironment) -> Shown {
+/// within the start's bound. `replied` is whether a look of the wait found a reply that this
+/// command cannot use, and `since` what the read of who serves gave after a look saw a daemon
+/// answer: either keeps the sentence from saying that no daemon answered.
+fn holder_silent_said(environment: &KnownEnvironment, replied: bool, since: Option<&Shown>) -> Shown {
+    let answers = if replied || since.is_some() {
+        "gave no usable greeting"
+    } else {
+        "does not answer"
+    };
+    // Where a daemon answered or replied, the closing sentence says that no stop was requested.
+    let (earlier, requested) = match (since, replied) {
+        (Some(why), _) => (
+            shown!(
+                " A control daemon answered during the wait, and none gave a usable greeting after that: {}.",
+                *why
+            ),
+            "",
+        ),
+        (None, true) => (Shown::said(""), ""),
+        (None, false) => (Shown::said(""), " No stop was requested."),
+    };
     shown!(
-        "A control daemon holds environment {} and does not answer, so it may be starting or \
-         stopping. No stop was requested. Run kr host restart again in a moment. {} This command \
-         requested no stop and no start.",
+        "A control daemon holds environment {} and {}, so it may be starting or stopping.{}{} Run \
+         kr host restart again in a moment. {} This command requested no stop and no start.",
         environment.environment_id,
+        answers,
+        earlier,
+        requested,
         host_stop::how_to_end_the_holder(&environment.paths)
     )
 }
@@ -596,7 +668,8 @@ async fn cut_said(
             .await
         }
         Cut::Unmade { before, error } => match ended_without_a_request(before) {
-            Ok(ended) => {
+            Ok((_, pid, end)) => {
+                let ended = (ended_unmade_said(id, pid, &error), pid, end);
                 ended_before_the_request(
                     host,
                     environment,
@@ -644,6 +717,13 @@ async fn ended_before_the_request(
 ) -> Completion {
     let (stopped, old) = stopped_unmade(read, ended);
     after_the_end(host, environment, json, progress, past, begun, stopped, old).await
+}
+
+/// The stop's words for a daemon that ended where this command's request could not be made, said
+/// as for an end with no successor: a process that took the environment after the end is named
+/// apart, in the past tense, as an earlier reading.
+fn ended_unmade_said(id: EnvironmentId, pid: Option<u64>, error: &kr_ipc::IpcError) -> Shown {
+    host_stop::ended_before_the_request_said(id, pid, &End::Gone, &Shown::ipc(error))
 }
 
 /// What the restart's stop came to where its request could not be made and the daemon was seen to
@@ -817,8 +897,9 @@ fn said_after_the_proof(
             cut,
         } => match (&stopped.first, launched) {
             (Some(first), launched) => unmade_and_another_serves_said(
+                id,
                 first,
-                stopped.successor.is_some(),
+                stopped.successor,
                 *serving,
                 *launched,
                 *cut,
@@ -851,35 +932,58 @@ async fn wait_for_the_successor(
     progress: &Progress,
 ) -> std::result::Result<Proved, CliError> {
     let id = environment.environment_id;
-    let endpoint = environment.paths.controller_endpoint()?;
     let deadline = tokio::time::Instant::now() + startup::START_BOUND;
-    match startup::answered_by(&endpoint, deadline, &[], || {}).await {
-        Ok(listed) => Ok(Proved::Another {
-            serving: stated_by(listed, id, progress).await,
-            launched: None,
-            cut: false,
-        }),
-        Err(last) => Err(successor_silent(id, opening, successor, &last)),
+    // Whether any read of the wait was a reply that this command cannot use.
+    let mut replied = false;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let last = match who_serves(environment, left, progress).await {
+            Serves::Daemon(serving) => {
+                return Ok(Proved::Another {
+                    serving,
+                    launched: None,
+                    cut: false,
+                });
+            }
+            Serves::Replied(why) => {
+                replied = true;
+                why
+            }
+            Serves::NoReply(why) => why,
+        };
+        if deadline <= tokio::time::Instant::now() {
+            return Err(successor_silent(id, opening, successor, replied, &last));
+        }
+        tokio::time::sleep(host_stop::LOOK_EVERY.min(left)).await;
     }
 }
 
 /// The restart's failure where another daemon held the environment after the daemon that was
 /// stopped ended and no daemon answers within the start's bound: the stop's own words (`opening`),
-/// what the command read of the successor when the end was seen, and what the last reach said.
+/// what the command read of the successor when the end was seen, and what the last read said. No
+/// daemon "answered" only where no read of the wait was a reply; where one was, none gave a usable
+/// greeting.
 fn successor_silent(
     id: EnvironmentId,
     opening: &Shown,
     successor: Option<u64>,
+    replied: bool,
     last: &Shown,
 ) -> CliError {
+    let did = if replied {
+        "gave a usable greeting"
+    } else {
+        "answered"
+    };
     CliError::Unfinished {
         code: ErrorCode::EnvironmentUnavailable,
         message: shown!(
-            "{} After it ended, a control daemon{} held environment {}, and no control daemon \
-             answered within {} seconds: {}. No new daemon was started. Run kr host restart again.",
+            "{} After it ended, a control daemon{} held environment {}, and no control daemon {} \
+             within {} seconds: {}. This command started none. Run kr host restart again.",
             *opening,
             process_said(successor),
             id,
+            did,
             startup::START_BOUND.as_secs(),
             *last
         ),
@@ -997,6 +1101,15 @@ impl Proved {
 /// What a restart says where the stop's request could not be made, the daemon was seen to end and the
 /// daemon that this command started answers: the stop's own words for that state, then the start.
 fn unmade_then_started_said(first: &Shown, started: &Started) -> Shown {
+    if let (Some(manager), Some(pid)) = (started.manager, started.pid) {
+        return shown!(
+            "{} This command then asked the {} start for a daemon, which named process {}, and process {} answers. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
+            *first,
+            manager.as_str(),
+            pid,
+            pid
+        );
+    }
     shown!(
         "{} This command then started a control daemon{} under the {} start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
         *first,
@@ -1009,16 +1122,20 @@ fn unmade_then_started_said(first: &Shown, started: &Started) -> Shown {
 /// another daemon serves the environment: after a daemon that holds it since the end, nothing was
 /// started; otherwise what this command's own start came to, where it made one.
 fn unmade_and_another_serves_said(
+    id: EnvironmentId,
     first: &Shown,
-    successor: bool,
+    successor: Option<Option<u64>>,
     serving: Option<u64>,
     launched: Option<Started>,
     cut: bool,
 ) -> Shown {
-    if successor {
+    if let Some(successor) = successor {
         return shown!(
-            "{} This command sent nothing and started none. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
-            *first
+            "{} After it ended, a control daemon{} held environment {}, and a control daemon{} answers now. This command started none. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
+            *first,
+            process_said(successor),
+            id,
+            process_said(serving)
         );
     }
     match launched {
@@ -1059,18 +1176,32 @@ fn unmade_and_start_failed_said(first: &Shown, own: Shown, launched: bool, reach
 /// What a restart says where the daemon that it started answers: the process that ended and the one
 /// that started, where it read them, and the start.
 fn restarted_said(id: EnvironmentId, old: Option<u64>, started: &Started, creates: Shown) -> Shown {
+    // A service manager's start names the process, and this command read its identity twice: the
+    // words say who named it, and that it answers, and not that this command started it.
+    let named = started.manager.zip(started.pid);
     let processes = match (old, started.pid) {
+        (Some(old), _) if named.is_some() => shown!(" (process {} ended)", old),
+        (_, _) if named.is_some() => Shown::said(""),
         (Some(old), Some(new)) => shown!(" (process {} ended, process {} started)", old, new),
         (Some(old), None) => shown!(" (process {} ended)", old),
         (None, Some(new)) => shown!(" (process {} started)", new),
         (None, None) => Shown::said(""),
     };
+    let under = match named {
+        Some((manager, pid)) => shown!(
+            "{} start, which named process {}, and process {} answers",
+            manager.as_str(),
+            pid,
+            pid
+        ),
+        None => shown!("{} start", start_said(started)),
+    };
     shown!(
-        "Restarted the control daemon for environment {}{} under the {} start. No session was \
+        "Restarted the control daemon for environment {}{} under the {}. No session was \
          stopped. Paired devices' connections to the old daemon closed; their pairings stand.{}",
         id,
         processes,
-        start_said(started),
+        under,
         creates
     )
 }
@@ -1091,9 +1222,10 @@ fn answers_now(serving: Option<u64>, newer: bool) -> Shown {
 /// one its start made: it asked the start for a daemon, and cannot tell.
 fn asked_and_cannot_tell(started: &Started) -> Shown {
     shown!(
-        " This command asked the {} start for a daemon and cannot tell whether the daemon that \
+        " This command asked the {} start for a daemon{} and cannot tell whether the daemon that \
          answers is that one.",
-        start_said(started)
+        start_said(started),
+        process_said(started.pid.map(u64::from))
     )
 }
 
@@ -1173,6 +1305,16 @@ fn stopped_and_another_already_serves_said(
 
 /// What a restart says where no daemon ran and the one that it started answers.
 fn none_ran_started_said(id: EnvironmentId, started: &Started, under_way: Shown) -> Shown {
+    if let (Some(manager), Some(pid)) = (started.manager, started.pid) {
+        return shown!(
+            "No control daemon was running for environment {}. This command asked the {} start for a daemon, which named process {}, and process {} answers.{}",
+            id,
+            manager.as_str(),
+            pid,
+            pid,
+            under_way
+        );
+    }
     shown!(
         "No control daemon was running for environment {}. Started one{} under the {} start.{}",
         id,
@@ -1258,15 +1400,18 @@ fn failure_said(
     }
 }
 
-/// What a failed start knows of a control daemon besides its own words.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a failed start knows of a control daemon besides its own words, by the last read of the
+/// endpoint.
+#[derive(Clone, Debug)]
 pub(crate) enum Reach {
-    /// No control daemon answered during the start, and none answers now.
+    /// No control daemon answered during the start, and the last read gave no reply.
     Nobody,
-    /// A control daemon answers now, whether or not one answered during the start.
+    /// The last read gave a usable greeting, whether or not one answered during the start.
     Answers,
-    /// A control daemon answered during the start, and none answers now.
+    /// A control daemon answered during the start, and the last read gave no reply.
     Answered,
+    /// The last read gave a reply that this command cannot use: the words say what it was.
+    Replied(Shown),
 }
 
 /// What a failure says after the start's own words: that a requested daemon may still start where
@@ -1313,6 +1458,22 @@ fn failure_tail(stopped: bool, launched: bool, reach: Reach) -> Shown {
             sessions,
             paired
         ),
+        Reach::Replied(why) => {
+            // Where the old daemon was seen to end, its connections to the paired devices closed.
+            let paired = if stopped {
+                Shown::said(
+                    " Paired devices' connections to the old daemon closed; their pairings stand.",
+                )
+            } else {
+                Shown::said("")
+            };
+            shown!(
+                " A control daemon replies, and this command cannot use its reply: {}. {}{}",
+                why,
+                sessions,
+                paired
+            )
+        }
     }
 }
 
@@ -1383,20 +1544,21 @@ impl StartFailed {
         let _ = progress.with_marker(|marker| marker.start_failed());
         // A daemon that answers now leaves the record nothing to say: it is removed, and the
         // failure says that a daemon answers.
-        let answers_now = if let Ok(endpoint) = environment.paths.controller_endpoint()
-            && matches!(
-                startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await,
-                startup::Reached::Answered(_)
-            ) {
-            progress.remove_marker();
-            true
+        let no_reply = if self.answered {
+            Reach::Answered
         } else {
-            false
+            Reach::Nobody
         };
-        let reach = match (answers_now, self.answered) {
-            (true, _) => Reach::Answers,
-            (false, true) => Reach::Answered,
-            (false, false) => Reach::Nobody,
+        let reach = match environment.paths.controller_endpoint() {
+            Ok(endpoint) => match startup::read(&endpoint, startup::ANSWER_BOUND, &[]).await {
+                startup::Read::Greeting(_) => {
+                    progress.remove_marker();
+                    Reach::Answers
+                }
+                startup::Read::Reply(why) => Reach::Replied(why),
+                startup::Read::NoReply(_) => no_reply,
+            },
+            Err(_) => no_reply,
         };
         let message = failure_said(id, had, first, self.error.said(), self.launched, reach);
         let error = match self.error {
@@ -1492,7 +1654,11 @@ fn judge(
             launched: Some(started),
             cut: false,
         }),
-        (Some(_), Some(_)) => Ok(Proved::Ours(started)),
+        // The answer states the launched process's number, and this command holds that process
+        // (or read its start identity twice) only where `held` says so: a number alone can be
+        // used again.
+        (Some(_), Some(_)) if started.held => Ok(Proved::Ours(started)),
+        (Some(_), Some(_)) => Ok(unproven(matches!(old, Old::Generation(_)))),
         (Some(_), None) => Err(
             "the control daemon that answers did not state its process, so it \
              cannot be told from the one that was started",
@@ -1642,7 +1808,7 @@ fn interrupt_says(progress: &Progress, stage: Stage, past: &Past) -> (Knows, Sho
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::host_stop::Request;
     use kr_controller::attempt;
@@ -1652,6 +1818,7 @@ mod tests {
             pid,
             start: ControllerStartup::Standalone,
             manager: None,
+            held: pid.is_some(),
         }
     }
 
@@ -2349,7 +2516,7 @@ mod tests {
             )
             .to_string(),
             format!(
-                "{first} This command sent nothing and started none. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
+                "{first} After it ended, a control daemon (process 77) held environment {id}, and a control daemon (process 77) answers now. This command started none. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         for (launched, still) in [
@@ -2584,7 +2751,7 @@ mod tests {
         use kr_client::shown::Said as _;
 
         let (_temp, environment) = an_environment();
-        let failure = holder_silent(&environment);
+        let failure = holder_silent(&environment, false, None);
         let how = if cfg!(windows) {
             "If it stays like this, end the kr-controller.exe process of this installation in Task Manager."
         } else {
@@ -2674,9 +2841,10 @@ mod tests {
 
     /// The daemon's side of one greeting at the environment's endpoint: accepts the next
     /// connection, reads its hello and answers it, and keeps the connection open.
-    async fn answer_one_hello(
+    pub(crate) async fn answer_one_hello(
         listener: &kr_ipc::endpoint::Listener,
         id: EnvironmentId,
+        another_major: bool,
     ) -> (kr_ipc::framed::FrameReader, kr_ipc::framed::FrameWriter) {
         use kr_protocol::envelope::ControlFrame;
         use kr_protocol::scalars::CanonicalSet;
@@ -2692,8 +2860,16 @@ mod tests {
             .await
             .expect("a hello");
         assert!(matches!(hello, ControlFrame::Hello(_)), "a hello");
+        let selected_version = if another_major {
+            kr_protocol::hello::ProtocolVersion::new(
+                kr_protocol::hello::PROTOCOL_VERSION.major + 1,
+                0,
+            )
+        } else {
+            kr_protocol::hello::PROTOCOL_VERSION
+        };
         let ack = kr_protocol::local::LocalHelloAck {
-            selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+            selected_version,
             role: kr_protocol::local::LocalRole::Controller,
             connection_id,
             environment_id: id,
@@ -2735,7 +2911,7 @@ mod tests {
             .controller_endpoint()
             .expect("an endpoint");
         let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
-        let daemon = tokio::spawn(async move { answer_one_hello(&listener, id).await });
+        let daemon = tokio::spawn(async move { answer_one_hello(&listener, id, false).await });
         let progress = Progress::new(id);
         let failed = StartFailed {
             error: CliError::Other(Shown::said("the daemon did not answer")),
@@ -2780,6 +2956,114 @@ mod tests {
         assert!(attempt::recorded(&environment.paths).is_empty());
     }
 
+    /// What a failed start says where the last read of the endpoint gave a reply that this command
+    /// cannot use: the reply is said as what it is, the sessions' words follow, and the sentence that
+    /// paired devices cannot connect is never said, since a daemon replies. Where the old daemon was
+    /// seen to end, its connections to the paired devices closed, and that is said.
+    #[test]
+    fn a_failed_start_says_what_a_reply_that_cannot_be_used_is() {
+        let id = EnvironmentId::new(kr_ipc::new_uuid());
+        let own = || Shown::said("the daemon did not answer");
+        let reply = || Reach::Replied(Shown::said("it states another public major"));
+        assert_eq!(
+            start_failed_said(id, Had::Daemon(Some(30)), own(), false, reply()).to_string(),
+            format!(
+                "The control daemon for environment {id} (process 30) was stopped and the start failed: the daemon did not answer. A control daemon replies, and this command cannot use its reply: it states another public major. No session was stopped: its workers keep running and a local attach still works. Paired devices' connections to the old daemon closed; their pairings stand."
+            )
+        );
+        assert_eq!(
+            start_failed_said(id, Had::NoDaemon, own(), false, reply()).to_string(),
+            format!(
+                "No control daemon was running for environment {id} and the start failed: the daemon did not answer. A control daemon replies, and this command cannot use its reply: it states another public major. Nothing was stopped."
+            )
+        );
+    }
+
+    /// A failed start where a daemon of another major answers the last read at the endpoint says
+    /// that a daemon replies and that this command cannot use the reply: never that none answers
+    /// now, and never that paired devices cannot connect.
+    #[tokio::test]
+    async fn a_failed_start_where_another_major_replies_never_says_that_none_answers() {
+        use kr_client::shown::Said as _;
+        let (_temp, environment) = an_environment();
+        let id = environment.environment_id;
+        let endpoint = environment
+            .paths
+            .controller_endpoint()
+            .expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let daemon = tokio::spawn(async move { answer_one_hello(&listener, id, true).await });
+        let progress = Progress::new(id);
+        let failed = StartFailed {
+            error: CliError::Other(Shown::said("the daemon did not answer")),
+            launched: false,
+            answered: true,
+        };
+        let reported = failed
+            .reported(
+                &environment,
+                Had::Daemon(Some(30)),
+                None,
+                true,
+                &progress,
+                &Facts::none(Vec::new()),
+            )
+            .await;
+        let Completion::Reported(error) = reported else {
+            panic!("a failure is reported");
+        };
+        let said = error.said().to_string();
+        assert!(
+            said.contains(" A control daemon replies, and this command cannot use its reply: "),
+            "{said}"
+        );
+        assert!(!said.contains("none answers now"), "{said}");
+        assert!(!said.contains("cannot connect"), "{said}");
+        let _connection = daemon.await.expect("the daemon replied once");
+    }
+
+    /// The launched process is "ours" only where this command holds it (or read its start identity
+    /// twice): an answer that states the launched number is otherwise unproven, in every state of
+    /// what was read of the stopped daemon.
+    #[test]
+    fn an_answer_that_states_the_launched_number_is_ours_only_where_the_process_is_held() {
+        let held = started(Some(7));
+        let unheld = Started { held: false, ..held };
+        for old in [
+            Old::None,
+            Old::Unread,
+            Old::Generation(ControllerGeneration::new(1)),
+        ] {
+            assert!(matches!(
+                judge(Some(held), old, &answering(2, Some(7))),
+                Ok(Proved::Ours(_))
+            ));
+            assert!(matches!(
+                judge(Some(unheld), old, &answering(2, Some(7))),
+                Ok(Proved::Unproven { serving: Some(7), .. })
+            ));
+        }
+    }
+
+    /// A wait for a successor in which a read gave a reply that this command cannot use says that
+    /// no control daemon gave a usable greeting, and not that none answered.
+    #[test]
+    fn a_successor_wait_that_met_a_reply_says_that_none_gave_a_usable_greeting() {
+        use kr_client::shown::Said as _;
+
+        let (_temp, environment) = an_environment();
+        let id = environment.environment_id;
+        let opening = Shown::said("The daemon ended.");
+        let last = Shown::said("it states another public major");
+        let failure = successor_silent(id, &opening, Some(77), true, &last);
+        assert_eq!(
+            failure.said().to_string(),
+            format!(
+                "The daemon ended. After it ended, a control daemon (process 77) held environment {id}, and no control daemon gave a usable greeting within 30 seconds: it states another public major. This command started none. Run kr host restart again."
+            )
+        );
+    }
+
     /// The restart's sentence for another daemon that held the environment after the stopped
     /// daemon ended and no daemon answers, with its exit, for a successor whose process is known
     /// and for one whose process is not, after each of the stop's three openings: the daemon took
@@ -2820,12 +3104,13 @@ mod tests {
             ),
         ] {
             for (successor, named) in [(Some(77), " (process 77)"), (None, "")] {
-                let failure = successor_silent(id, &stopped.sentence(id), successor, &last);
+                let failure =
+                    successor_silent(id, &stopped.sentence(id), successor, false, &last);
                 assert_eq!(failure.exit_code(), 1);
                 assert_eq!(
                     failure.said().to_string(),
                     format!(
-                        "{opening} After it ended, a control daemon{named} held environment {id}, and no control daemon answered within 30 seconds: the endpoint accepted the connection and did not answer. No new daemon was started. Run kr host restart again."
+                        "{opening} After it ended, a control daemon{named} held environment {id}, and no control daemon answered within 30 seconds: the endpoint accepted the connection and did not answer. This command started none. Run kr host restart again."
                     )
                 );
             }

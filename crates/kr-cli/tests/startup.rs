@@ -6508,6 +6508,12 @@ enum OnStop {
     /// launch, and closes the connection with no answer to the second, which is the stop, and
     /// ends: the stop's outcome is not known.
     AnswerTheLaunchThenCut,
+    /// Answers the first request to stop, which asks only how the daemon was started, with no
+    /// launch, and refuses the second, which is the stop, with `code`: the daemon did not take it.
+    AnswerTheLaunchThenRefuse(kr_protocol::error::ErrorCode),
+    /// Answers the hello and the first `host.info` and then stops listening, as a daemon that
+    /// ends right after it was seen to answer.
+    EndAfterTheLook,
 }
 
 /// How many `host.info` that follow its close `OnStop::CloseAndEndAfterTwoLooks` answers before it
@@ -6676,6 +6682,8 @@ impl TestDaemon {
                                         }
                                         _ => false,
                                     };
+                                then_end = request.method.method() == Some(Method::HostInfo)
+                                    && matches!(on_stop, OnStop::EndAfterTheLook);
                                 if let Some(looks) = looks_since_the_close.as_mut()
                                     && request.method.method() == Some(Method::HostInfo)
                                 {
@@ -6742,7 +6750,36 @@ impl TestDaemon {
                                             .expect("encodes"),
                                         ),
                                     }),
+                                    OnStop::AnswerTheLaunchThenRefuse(code) if stops_received > 1 => {
+                                        ControlFrame::Response(Response {
+                                            request_id: mutation.request_id,
+                                            outcome: Outcome::Error(kr_client::error::refusal(
+                                                *code,
+                                                kr_client::shown::Shown::said(
+                                                    "this daemon does not take the stop",
+                                                ),
+                                            )),
+                                        })
+                                    }
+                                    OnStop::AnswerTheLaunchThenRefuse(_) => {
+                                        ControlFrame::Response(Response {
+                                            request_id: mutation.request_id,
+                                            outcome: Outcome::Ok(
+                                                ParamsValue::from_typed(
+                                                    &kr_protocol::update::HostStopResult {
+                                                        pid: kr_protocol::scalars::U64::new(
+                                                            u64::from(std::process::id()),
+                                                        ),
+                                                        unsettled: kr_protocol::scalars::U64::new(0),
+                                                        launch: Nullable::null(),
+                                                    },
+                                                )
+                                                .expect("encodes"),
+                                            ),
+                                        })
+                                    }
                                     OnStop::Refuse
+                                    | OnStop::EndAfterTheLook
                                     | OnStop::HoldTheLook
                                     | OnStop::CloseAfterTheLook
                                     | OnStop::CloseAfterTheLookAndEnd
@@ -7020,10 +7057,39 @@ fn an_interrupt_before_the_request_says_that_nothing_was_asked_and_leaves_no_rec
 
 /// A copy of this test program under the name of the daemon, in a folder of its own, which holds
 /// still: a process that a lock file can name as a control daemon.
-fn a_process_named_kr_controller(host: &Standalone, folder: &str) -> Child {
+fn a_process_named_kr_controller(host: &Standalone, folder: &str) -> Ended {
     let directory = host.tree.root().join(folder);
     std::fs::create_dir_all(&directory).expect("a folder");
-    start_a_copy_that_holds_still(host.tree.root(), &directory.join("kr-controller"))
+    Ended(start_a_copy_that_holds_still(
+        host.tree.root(),
+        &directory.join("kr-controller"),
+    ))
+}
+
+/// A process that this test started and that holds still for as long as the test lets it: its
+/// guard ends and collects it where the guard is dropped, so that a case that fails before it ends
+/// the process leaves none behind.
+struct Ended(Child);
+
+impl std::ops::Deref for Ended {
+    type Target = Child;
+
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Ended {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Places a copy of this test program at `copy` and starts it, holding still, with `working` as its
@@ -8142,9 +8208,8 @@ fn a_restart_whose_request_could_not_be_made_and_whose_start_fails_says_both() {
     let id = host.tree.environment_id();
     assert!(
         message.starts_with(&format!(
-            "The control daemon for environment {id} (process "
-        )) && message.contains(" ended, and this command could not make its request for it: ")
-            && message.contains(" This command sent nothing. This command's start failed: "),
+            "The control daemon for environment {id} ended, and this command could not make its request for it: "
+        )) && message.contains(" This command sent nothing. This command's start failed: "),
         "the stop's words for the state, then the start's failure: {message}"
     );
     assert!(
@@ -8160,15 +8225,35 @@ fn a_restart_whose_request_could_not_be_made_and_whose_start_fails_says_both() {
     daemon.end();
 }
 
-/// KR-REQ-07.12 (a restart that waits for the daemon that holds the environment since the end): its
-/// greeting failed, the daemon ended and another holds the environment, so the command asks nothing
-/// and starts nothing while it waits for that daemon to answer. No record of an attempt
-/// stands in that time, since none of the phases a record names has happened; the result names the
-/// daemon that answers and says that this command launched none. The record is read when the
-/// listener that never answers accepts the first connection that the wait makes: the command
-/// makes no other from the time the lock file names the successor.
-#[test]
-fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_record() {
+/// What answers after the successor was replaced.
+#[derive(Clone, Copy)]
+enum Then {
+    /// A daemon that answers, and states a third process.
+    AnAnswerFrom,
+    /// A daemon that answers the greeting and cuts the exchange that reads its process, and then
+    /// ends.
+    AnExchangeThatIsCut,
+}
+
+/// What a restart that waited for a replaced successor leaves to read.
+struct Replaced {
+    host: Standalone,
+    output: Output,
+    old: u32,
+    successor: u32,
+    answering: u32,
+}
+
+/// A restart whose greeting fails because the daemon ends, while another process takes the lock
+/// that the old daemon held, so the command asks nothing and starts nothing while it waits for a
+/// daemon to answer. The successor is published into the lock before the old daemon ends, and the
+/// listener that never answers is bound before it ends, so the first connection that the listener
+/// accepts is the one that the wait makes after the end, and no look of the stop's wait can be it.
+/// No record of an attempt stands in that time, since none of the phases a record names has
+/// happened. The successor is then replaced during the wait by a process that is not the daemon
+/// that answers: the daemon that answers states a third process, which neither the earlier reading
+/// of the lock nor a later one names.
+fn a_restart_that_waits_for_a_replaced_successor(json: bool, next: Then) -> Replaced {
     let host = Standalone::create();
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
@@ -8187,7 +8272,12 @@ fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_reco
         true,
         0,
     );
-    let running = start(host.kr(&["--json", "host", "restart"]));
+    let arguments: &[&str] = if json {
+        &["--json", "host", "restart"]
+    } else {
+        &["host", "restart"]
+    };
+    let running = start(host.kr(arguments));
     let looked_for = Instant::now() + Duration::from_secs(60);
     while first.stopped_listening_at().is_none() {
         assert!(
@@ -8196,42 +8286,29 @@ fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_reco
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // The old daemon ends, and the lock is held again by the one that replaces it, which accepts
-    // the connection of the command's wait and never answers it.
-    old.kill().expect("ends the old daemon");
-    old.wait().expect("collects it");
+    // The successor takes the lock and a listener that never answers is bound while the old
+    // daemon still runs; the old daemon ends only then.
     std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
     let mut silent = SilentListener::bind(&host);
+    old.kill().expect("ends the old daemon");
+    old.wait().expect("collects it");
     silent.until_it_accepted(1);
     assert!(
         attempts(&host).is_empty(),
         "a record stands where nothing was asked or started"
     );
     silent.end();
-    // The successor is replaced during the wait: another process holds the lock now, and the daemon
-    // that answers states a third process, which neither the earlier reading of the lock nor a later
-    // one names.
     successor.kill().expect("ends the successor");
     successor.wait().expect("collects it");
     std::fs::write(&lock, format!("{}\n", replacement.id())).expect("names the replacement");
-    let mut second = TestDaemon::serve_generation(
-        &host,
-        "kr-controller/9.9.9",
-        OnStop::AnswerAndStay(answering.id()),
-        true,
-        2,
-    );
+    let on_stop = match next {
+        Then::AnAnswerFrom => OnStop::AnswerAndStay(answering.id()),
+        Then::AnExchangeThatIsCut => OnStop::Cut,
+    };
+    let mut second = TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop, true, 2);
     let output = running.finish("kr host restart");
-    let said = document(&output, "kr host restart");
-    assert_eq!(output.status.code(), Some(0), "{said}");
-    assert_eq!(stop_of(&said), "ended", "{said}");
-    assert_eq!(
-        said["serving"].as_u64(),
-        Some(u64::from(answering.id())),
-        "the process that the answering daemon states: {said}"
-    );
-    assert_eq!(said["launched"], Value::Null, "{said}");
     assert!(attempts(&host).is_empty(), "no record stands");
+    let ids = (old.id(), successor.id(), answering.id());
     let _ = replacement.kill();
     let _ = replacement.wait();
     let _ = answering.kill();
@@ -8239,6 +8316,60 @@ fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_reco
     drop(held);
     first.end();
     second.end();
+    Replaced {
+        host,
+        output,
+        old: ids.0,
+        successor: ids.1,
+        answering: ids.2,
+    }
+}
+
+/// KR-REQ-07.12 (a restart that waits for the daemon that holds the environment since the end): its
+/// greeting failed, the daemon ended and another holds the environment, so the command asks nothing
+/// and starts nothing while it waits for that daemon to answer. The result names the process that
+/// the daemon on the connection that answered states, which is no process that the lock file
+/// names, and says that this command launched none.
+#[test]
+fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_record() {
+    let replaced = a_restart_that_waits_for_a_replaced_successor(true, Then::AnAnswerFrom);
+    let said = document(&replaced.output, "kr host restart");
+    assert_eq!(replaced.output.status.code(), Some(0), "{said}");
+    assert_eq!(stop_of(&said), "ended", "{said}");
+    assert_eq!(
+        said["serving"].as_u64(),
+        Some(u64::from(replaced.answering)),
+        "the process that the answering daemon states: {said}"
+    );
+    assert_eq!(said["launched"], Value::Null, "{said}");
+}
+
+/// KR-REQ-07.12 (the text of a restart that waited for a successor that was replaced): the
+/// earlier reading of the lock is said once and in the past tense, and the process that answers is
+/// the one the answering daemon states. The text never says that the replaced process now holds the
+/// environment.
+#[test]
+fn a_restart_whose_successor_was_replaced_says_what_it_read_and_when() {
+    let replaced = a_restart_that_waits_for_a_replaced_successor(false, Then::AnAnswerFrom);
+    let out = String::from_utf8_lossy(&replaced.output.stdout);
+    let said = String::from_utf8_lossy(&replaced.output.stderr);
+    assert_eq!(replaced.output.status.code(), Some(0), "{out} {said}");
+    let id = replaced.host.tree.environment_id();
+    assert!(
+        out.starts_with(&format!(
+            "The control daemon for environment {id} (process {}) ended, and this command could not make its request for it: ",
+            replaced.old
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            " This command sent nothing. After it ended, a control daemon (process {}) held environment {id}, and a control daemon (process {}) answers now. This command started none. No session was stopped.",
+            replaced.successor, replaced.answering
+        )),
+        "the earlier reading in the past tense, then the process that answers: {out}"
+    );
+    assert!(!out.contains(" now holds environment "), "{out}");
 }
 
 /// A listener on the tree's controller endpoint that accepts connections and answers none, as a
@@ -8411,7 +8542,7 @@ fn a_successor_never_answers_after(
         "the stop's words, then the earlier reading of the successor: {message}"
     );
     assert!(
-        message.ends_with(". No new daemon was started. Run kr host restart again."),
+        message.ends_with(". This command started none. Run kr host restart again."),
         "{message}"
     );
     assert!(
@@ -8430,12 +8561,12 @@ fn a_successor_never_answers_after(
 /// environment, where no request was made, and never says that the daemon was stopped.
 #[test]
 fn a_successor_that_never_answers_after_a_request_that_could_not_be_made_keeps_the_stops_words() {
-    a_successor_never_answers_after(OnStop::CloseAfterTheLookAndEnd, |id, old, successor| {
+    a_successor_never_answers_after(OnStop::CloseAfterTheLookAndEnd, |id, old, _successor| {
         (
             format!(
-                "The control daemon (process {old}) ended; process {successor} now holds environment {id}, so something started it again."
+                "The control daemon for environment {id} (process {old}) ended, and this command could not make its request for it: "
             ),
-            "",
+            ". This command sent nothing.",
         )
     });
 }
@@ -8453,4 +8584,108 @@ fn a_successor_that_never_answers_after_an_unknown_stop_keeps_the_stops_words() 
             "), and it has ended.",
         )
     });
+}
+
+/// KR-REQ-07.12 (a holder that answers and ends before the read of who serves): the daemon that
+/// holds the environment answers the wait's look and then ends, so the read of the process that
+/// serves meets nothing, and the lock is held still. The command keeps waiting within its bound
+/// and ends as a failure that says that a daemon answered during the wait and none gave a usable
+/// greeting since; it never says that a daemon answers now.
+#[test]
+fn a_restart_whose_holder_answers_and_ends_before_the_read_of_who_serves_never_says_that_one_answers_now()
+ {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    let lock = host.tree.environment().singleton_lock();
+    let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
+        .expect("takes the lock");
+    let mut holder = a_process_named_kr_controller(&host, "holder");
+    std::fs::write(&lock, format!("{}\n", holder.id())).expect("names the holder");
+    let mut silent = SilentListener::bind(&host);
+    let running = start(host.kr(&["--json", "host", "restart"]));
+    silent.until_it_accepted(2);
+    silent.end();
+    let mut daemon = TestDaemon::serve_generation(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::EndAfterTheLook,
+        true,
+        2,
+    );
+    let output = running.finish("kr host restart");
+    let said = document(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let message = said["message"].as_str().expect("a message");
+    assert!(
+        message.contains(
+            " A control daemon answered during the wait, and none gave a usable greeting after that: "
+        ),
+        "{message}"
+    );
+    assert!(!message.contains("answers now"), "{message}");
+    assert!(host.running().is_empty(), "nothing was started");
+    assert!(attempts(&host).is_empty(), "no record stands");
+    let _ = holder.kill();
+    let _ = holder.wait();
+    drop(held);
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (a successor whose exchange is cut): the daemon that holds the environment after
+/// the old one ended answers the greeting and cuts the exchange that reads its process, then ends.
+/// A cut exchange is no proof of another daemon: the command waits for a whole answer, and ends as
+/// a failure where none comes.
+#[test]
+fn a_successor_whose_exchange_is_cut_is_no_proof_of_another_daemon() {
+    let replaced = a_restart_that_waits_for_a_replaced_successor(true, Then::AnExchangeThatIsCut);
+    let said = document(&replaced.output, "kr host restart");
+    assert_eq!(replaced.output.status.code(), Some(1), "{said}");
+    let message = said["message"].as_str().expect("a message");
+    let id = replaced.host.tree.environment_id();
+    assert!(
+        message.contains(&format!(
+            " After it ended, a control daemon (process {}) held environment {id}, and no control daemon answered within 30 seconds: ",
+            replaced.successor
+        )),
+        "{message}"
+    );
+    assert!(replaced.host.running().is_empty(), "nothing was started");
+}
+
+/// KR-REQ-07.12 (a definite refusal of the stop that comes after the launch was read): the daemon
+/// answers the request that asks only how it was started and refuses the stop itself with a code
+/// that is no lack of a right. The restart says the daemon's words and that nothing was stopped,
+/// with the code of the refusal and the stop `refused`.
+#[test]
+fn a_restart_whose_stop_request_the_daemon_refused_after_the_launch_says_that_nothing_was_stopped()
+ {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerTheLaunchThenRefuse(an_error_code_of(
+            kr_protocol::error::RetryCategory::NoRetry,
+        )),
+        true,
+    );
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let said = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(8), "{said}");
+    assert_eq!(stop_of(&said), "refused", "{said}");
+    let message = said["message"].as_str().expect("a message");
+    assert!(
+        message.ends_with(". Nothing was stopped."),
+        "the refusal's words, then that nothing was stopped: {message}"
+    );
+    let stops = daemon
+        .received()
+        .iter()
+        .filter(|method| method.as_str() == "host.stop")
+        .count();
+    assert_eq!(stops, 2, "the launch was read, and the stop was asked");
+    assert!(host.answers(), "the daemon was not stopped");
+    daemon.end();
 }

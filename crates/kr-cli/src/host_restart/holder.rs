@@ -15,7 +15,9 @@ pub(super) enum Holder {
     /// Nothing holds the environment and nothing listens: no daemon runs.
     Gone,
     /// The holder still did not answer and still held the environment when the bound ended.
-    Silent,
+    /// `replied` is whether any look of the wait found a reply that proves nothing and cannot be
+    /// used: the holder did not then "not answer".
+    Silent { replied: bool },
 }
 
 /// Waits up to `bound` for the holder to answer or to let go.
@@ -27,15 +29,17 @@ pub(super) enum Holder {
 pub(super) async fn wait(operations: &impl Operations, bound: Duration) -> Holder {
     let deadline = tokio::time::Instant::now() + bound;
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
+    let mut replied = false;
     loop {
         let held = operations.held(left()).await;
         match operations.look(left()).await {
             Endpoint::Same(_) | Endpoint::Another => return Holder::Answers,
             Endpoint::Nobody if matches!(held, Ok(false)) => return Holder::Gone,
-            Endpoint::Nobody | Endpoint::Unproved(_) | Endpoint::Unclear => {}
+            Endpoint::Unproved(_) => replied = true,
+            Endpoint::Nobody | Endpoint::Unclear => {}
         }
         if left().is_zero() {
-            return Holder::Silent;
+            return Holder::Silent { replied };
         }
         operations.pause(LOOK_EVERY.min(left())).await;
     }
@@ -248,7 +252,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_holder_that_never_answers_ends_the_wait_at_the_bound() {
         let supplied = Supplied::new(vec![at_once(Ok(true))], vec![at_once(Endpoint::Unclear)]);
-        assert_eq!(wait(&supplied, BOUND).await, Holder::Silent);
+        assert_eq!(wait(&supplied, BOUND).await, Holder::Silent { replied: false });
         assert_eq!(supplied.start.elapsed(), BOUND);
         let calls = supplied.calls();
         assert!(
@@ -263,6 +267,24 @@ mod tests {
         );
     }
 
+    /// A holder whose look finds a reply that proves nothing is not one that never answers: the wait
+    /// ends at the bound as for a holder that is silent, and says that a reply came.
+    #[tokio::test(start_paused = true)]
+    async fn a_holder_whose_look_finds_a_reply_ends_the_wait_as_one_that_replied() {
+        let supplied = Supplied::new(
+            vec![at_once(Ok(true))],
+            vec![
+                at_once(Endpoint::Unclear),
+                at_once(Endpoint::Unproved(an_answer())),
+                at_once(Endpoint::Unclear),
+            ],
+        );
+        assert_eq!(
+            wait(&supplied, BOUND).await,
+            Holder::Silent { replied: true }
+        );
+    }
+
     /// A look that takes the whole of what is left, as a listener that does not answer does, ends
     /// the wait at the bound too: the wait never goes on past it.
     #[tokio::test(start_paused = true)]
@@ -274,7 +296,7 @@ mod tests {
                 takes: None,
             }],
         );
-        assert_eq!(wait(&supplied, BOUND).await, Holder::Silent);
+        assert_eq!(wait(&supplied, BOUND).await, Holder::Silent { replied: false });
         assert_eq!(supplied.start.elapsed(), BOUND);
     }
 }
