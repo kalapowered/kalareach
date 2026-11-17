@@ -829,8 +829,12 @@ pub(crate) async fn begin(
 
 /// What the first reach of the endpoint found.
 pub(crate) enum Looked {
-    /// A daemon of this build's public major answered the hello.
-    Daemon(Box<LocalClient>),
+    /// A daemon of this build's public major answered the hello. `holder` is the process that
+    /// held the environment before the reach, read once there.
+    Daemon {
+        client: Box<LocalClient>,
+        holder: Option<ProcessStartIdentity>,
+    },
     /// The reach ends the command with no wait.
     Said(Start),
     /// The greeting failed for a reason other than nothing listening: what that failure came to.
@@ -845,10 +849,14 @@ pub(crate) enum Looked {
 pub(crate) async fn look(host: &HostPaths, environment: &KnownEnvironment) -> Result<Looked> {
     let id = environment.environment_id;
     let endpoint = environment.paths.controller_endpoint()?;
+    // The process that holds the environment before the reach, which is the one that the reach is
+    // made to: read after a failed greeting, the lock file may already name a successor, which is
+    // not the daemon that was asked.
+    let holder = lock_holder(&environment.paths);
     Ok(
         match startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await {
             Reached::Answered(listed) => match *listed {
-                Listed::Ours(client) => Looked::Daemon(client),
+                Listed::Ours(client) => Looked::Daemon { client, holder },
                 _ => Looked::Said(Start::OtherMajor),
             },
             Reached::Silent => Looked::Said(Start::Silent),
@@ -860,7 +868,7 @@ pub(crate) async fn look(host: &HostPaths, environment: &KnownEnvironment) -> Re
                 let before = greeting_failed(
                     &operations,
                     &error,
-                    lock_holder(&environment.paths).as_ref(),
+                    holder.as_ref(),
                     id,
                     tokio::time::Instant::now() + END_BOUND,
                 )
@@ -885,8 +893,18 @@ async fn stop(
         Err(completion) => return Ok(completion),
     };
     Ok(match look(host, environment).await? {
-        Looked::Daemon(client) => {
-            stop_the_daemon(which, host, environment, *client, json, progress, &earlier).await
+        Looked::Daemon { client, holder } => {
+            stop_the_daemon(
+                which,
+                host,
+                environment,
+                *client,
+                holder,
+                json,
+                progress,
+                &earlier,
+            )
+            .await
         }
         Looked::Said(start) => at_the_start(
             which,
@@ -1427,12 +1445,17 @@ pub(crate) struct Settled {
 }
 
 /// A daemon answered the hello: reads what it says of itself, asks it to stop, waits for it to end
-/// and says what that came to.
+/// and says what that came to. `holder` is the process that held the environment before the
+/// reach.
+// One argument for each fact its steps read: the command, the paths, the environment, the
+// connection, the holder before the reach, the output form, the progress and what was said before.
+#[allow(clippy::too_many_arguments)]
 async fn stop_the_daemon(
     which: Which,
     host: &HostPaths,
     environment: &KnownEnvironment,
     client: LocalClient,
+    holder: Option<ProcessStartIdentity>,
     json: bool,
     progress: &Progress,
     earlier: &Earlier,
@@ -1440,13 +1463,15 @@ async fn stop_the_daemon(
     let id = environment.environment_id;
     let none = Facts::none(earlier.said(id));
     let settled = async {
-        let (client, info) = read_the_daemon(host, environment, client, json, &none).await?;
+        let (client, info) =
+            read_the_daemon(host, environment, client, holder.as_ref(), json, &none).await?;
         ask_and_wait(
             which,
             host,
             environment,
             client,
             &info,
+            holder,
             json,
             progress,
             &none,
@@ -1473,11 +1498,13 @@ async fn stop_the_daemon(
 }
 
 /// Reads what a daemon that answered the hello says of itself. A daemon that answered the hello and
-/// does not answer this is a holder that is silent.
+/// does not answer this is a holder that is silent. `holder` is the process that held the
+/// environment before the reach.
 pub(crate) async fn read_the_daemon(
     host: &HostPaths,
     environment: &KnownEnvironment,
     mut client: LocalClient,
+    holder: Option<&ProcessStartIdentity>,
     json: bool,
     none: &Facts,
 ) -> std::result::Result<(LocalClient, HostInfoResult), Cut> {
@@ -1495,7 +1522,7 @@ pub(crate) async fn read_the_daemon(
                 &operations,
                 client,
                 &error,
-                lock_holder(&environment.paths).as_ref(),
+                holder,
                 id,
                 tokio::time::Instant::now() + END_BOUND,
             )
@@ -1518,14 +1545,15 @@ pub(crate) async fn ask_and_wait(
     environment: &KnownEnvironment,
     mut client: LocalClient,
     info: &HostInfoResult,
+    holder: Option<ProcessStartIdentity>,
     json: bool,
     progress: &Progress,
     none: &Facts,
 ) -> std::result::Result<Settled, Cut> {
     let id = environment.environment_id;
-    // Who holds the environment, and which process that is, before anything is asked: a process
-    // that has ended and not been collected is read as gone, and its number may be reused.
-    let holder = lock_holder(&environment.paths);
+    // `holder` is who held the environment, and which process that is, before anything was asked,
+    // read once before the first reach: a process that has ended and not been collected is read as
+    // gone, and its number may be reused.
     let marker = match Marker::begin(&environment.paths, which.attempt(), holder.clone()) {
         Ok(marker) => marker,
         Err(error) => {
@@ -3462,6 +3490,7 @@ mod tests {
             &environment,
             client,
             &info,
+            lock_holder(&environment.paths),
             true,
             &progress,
             &none,

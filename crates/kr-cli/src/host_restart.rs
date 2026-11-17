@@ -136,12 +136,13 @@ async fn restart(
         }
     };
     Ok(match host_stop::look(host, environment).await? {
-        Looked::Daemon(client) => {
+        Looked::Daemon { client, holder } => {
             restart_the_daemon(
                 host,
                 environment,
                 start,
                 *client,
+                holder,
                 json,
                 progress,
                 past,
@@ -357,11 +358,7 @@ fn not_recorded_before_the_start(error: &kr_ipc::IpcError) -> CliError {
 
 /// The restart's failure where a process holds the environment and neither answers nor lets go
 /// within the start's bound.
-fn holder_silent(
-    environment: &KnownEnvironment,
-    replied: bool,
-    since: Option<&Shown>,
-) -> CliError {
+fn holder_silent(environment: &KnownEnvironment, replied: bool, since: Option<&Shown>) -> CliError {
     CliError::Unfinished {
         code: ErrorCode::EnvironmentUnavailable,
         message: holder_silent_said(environment, replied, since),
@@ -372,7 +369,11 @@ fn holder_silent(
 /// within the start's bound. `replied` is whether a look of the wait found a reply that this
 /// command cannot use, and `since` what the read of who serves gave after a look saw a daemon
 /// answer: either keeps the sentence from saying that no daemon answered.
-fn holder_silent_said(environment: &KnownEnvironment, replied: bool, since: Option<&Shown>) -> Shown {
+fn holder_silent_said(
+    environment: &KnownEnvironment,
+    replied: bool,
+    since: Option<&Shown>,
+) -> Shown {
     let answers = if replied || since.is_some() {
         "gave no usable greeting"
     } else {
@@ -499,6 +500,7 @@ fn stop_clause(id: EnvironmentId, named: Option<u64>, unknown: Option<&Shown>) -
 
 /// A control daemon answers: asks how it was started, refuses before it stops anything where the
 /// start would not give what it has, stops the daemon, and then starts one and proves it.
+/// `holder` is the process that held the environment before the reach.
 // One argument for each fact its steps read: the paths, the environment, the start, the connection, the output form, the progress, where the restart is past its stop and what it read before the daemon.
 #[allow(clippy::too_many_arguments)]
 async fn restart_the_daemon(
@@ -506,19 +508,28 @@ async fn restart_the_daemon(
     environment: &KnownEnvironment,
     start: ControllerStartup,
     client: LocalClient,
+    holder: Option<kr_protocol::identity::ProcessStartIdentity>,
     json: bool,
     progress: &Progress,
     past: &Past,
     begun: &Begun,
 ) -> Completion {
     let id = environment.environment_id;
-    let (mut client, info) =
-        match host_stop::read_the_daemon(host, environment, client, json, &begun.none).await {
-            Ok(read) => read,
-            Err(cut) => {
-                return cut_said(host, environment, cut, None, json, progress, past, begun).await;
-            }
-        };
+    let (mut client, info) = match host_stop::read_the_daemon(
+        host,
+        environment,
+        client,
+        holder.as_ref(),
+        json,
+        &begun.none,
+    )
+    .await
+    {
+        Ok(read) => read,
+        Err(cut) => {
+            return cut_said(host, environment, cut, None, json, progress, past, begun).await;
+        }
+    };
     // How it was started, before anything is stopped. The request for it stops nothing. A daemon of
     // another build that lists no such request refuses it, and says so as `kr host stop` does.
     let launch = match host_stop::ask(&mut client, id, json, progress, true).await {
@@ -554,13 +565,14 @@ async fn restart_the_daemon(
             );
         }
     }
-    let old = host_stop::lock_holder(&environment.paths);
+    let old = holder.clone();
     let settled = match host_stop::ask_and_wait(
         Which::Restart,
         host,
         environment,
         client,
         &info,
+        holder,
         json,
         progress,
         &begun.none,
@@ -3028,7 +3040,10 @@ pub(crate) mod tests {
     #[test]
     fn an_answer_that_states_the_launched_number_is_ours_only_where_the_process_is_held() {
         let held = started(Some(7));
-        let unheld = Started { held: false, ..held };
+        let unheld = Started {
+            held: false,
+            ..held
+        };
         for old in [
             Old::None,
             Old::Unread,
@@ -3040,7 +3055,10 @@ pub(crate) mod tests {
             ));
             assert!(matches!(
                 judge(Some(unheld), old, &answering(2, Some(7))),
-                Ok(Proved::Unproven { serving: Some(7), .. })
+                Ok(Proved::Unproven {
+                    serving: Some(7),
+                    ..
+                })
             ));
         }
     }
@@ -3104,8 +3122,7 @@ pub(crate) mod tests {
             ),
         ] {
             for (successor, named) in [(Some(77), " (process 77)"), (None, "")] {
-                let failure =
-                    successor_silent(id, &stopped.sentence(id), successor, false, &last);
+                let failure = successor_silent(id, &stopped.sentence(id), successor, false, &last);
                 assert_eq!(failure.exit_code(), 1);
                 assert_eq!(
                     failure.said().to_string(),
