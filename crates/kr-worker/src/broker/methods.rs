@@ -25,7 +25,7 @@ use kr_protocol::agent::{
     PluginActionInvokeResult,
 };
 use kr_protocol::authority::EffectClass;
-use kr_protocol::broker::{ActionName, ActionProvenance, ActionToken, BrokerGrant};
+use kr_protocol::broker::{ActionName, ActionProvenance, ActionToken, BrokerGrant, BrokerGrants};
 use kr_protocol::gateway::{PendingResource, PendingState, RichOperation};
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, CapabilityId, GrantId,
@@ -322,6 +322,76 @@ struct ExecutionPermit {
     /// A plugin action without one is not executable. The permit carries the plan rather than a
     /// flag saying one was seen, so what transmits is what was validated.
     plan: Option<kr_protocol::broker::PreparedEffect>,
+    /// What counts this action as open work of its binding for as long as the permit is held.
+    open: Option<OpenAction>,
+}
+
+/// One plugin action that a binding admitted and that nothing has sent or given up yet.
+///
+/// The binder's count of a binding's open work reads it: a binding that is due to end stays until
+/// its admitted actions are sent, because the repeat asks the binding's grants and a binding that
+/// is gone has none to ask. It is counted from the token's spend and it stops counting when it is
+/// dropped, which the permit's holder does by sending the action ([`TakenAction::submitted`]), by
+/// giving it up, or by losing it. An approval is counted by the resource it settles and never by
+/// this, so a request is not counted twice.
+#[derive(Debug)]
+pub(crate) struct OpenAction {
+    count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl OpenAction {
+    /// Counts one more open action in `count`.
+    pub(crate) fn counted_in(count: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { count }
+    }
+}
+
+impl Drop for OpenAction {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The package grants that a plugin action's admission required of its binding.
+///
+/// The token's spend required the grant the action declares, and the effect's validation required
+/// the grant the prepared operation needs. A narrower installation removes a grant at once and
+/// moves no revision, so every later ask of the same admission puts the same question again, and
+/// [`crate::broker::BrokerState::check_package_grants`] answers it from the binding's grants
+/// alone, for the first admission and for each of them.
+#[derive(Clone, Debug)]
+pub(crate) struct PackageGrants {
+    binding_id: BrokerBindingId,
+    required: BrokerGrants,
+}
+
+impl PackageGrants {
+    /// What the binding must hold for one grant.
+    pub(crate) fn requiring(binding_id: BrokerBindingId, grant: BrokerGrant) -> Self {
+        Self {
+            binding_id,
+            required: BrokerGrants::granted([grant]),
+        }
+    }
+
+    /// The same, and one more grant.
+    fn and(&self, grant: BrokerGrant) -> Self {
+        let mut required = self.required.clone();
+        required.insert(grant);
+        Self {
+            binding_id: self.binding_id,
+            required,
+        }
+    }
+
+    pub(crate) const fn binding_id(&self) -> BrokerBindingId {
+        self.binding_id
+    }
+
+    pub(crate) const fn required(&self) -> &BrokerGrants {
+        &self.required
+    }
 }
 
 /// Permission to carry one agent mutation to its upstream, and everything it was admitted against.
@@ -361,6 +431,10 @@ pub struct MutationAdmission {
     accepted: Option<AcceptedUntil>,
     /// When the resource this answer resolves stops accepting an answer, where it has a deadline.
     resource_deadline: Option<TimestampMs>,
+    /// The package grants the admission of a plugin action required, which the effect's validation
+    /// adds to. It is not part of the permit, which the take consumes: the asks that follow the
+    /// take read it.
+    package: std::sync::Mutex<Option<PackageGrants>>,
 }
 
 /// What an admission is made against, and what a permit was admitted against, copied out of its
@@ -380,6 +454,8 @@ pub struct AdmittedAgainst {
     accepted: Option<AcceptedUntil>,
     /// When the pending resource this admission answers stops accepting an answer.
     resource_deadline: Option<TimestampMs>,
+    /// The package grants a plugin action's admission required, where it is one.
+    package: Option<PackageGrants>,
 }
 
 /// Which ask of the broker's checks this is.
@@ -387,6 +463,9 @@ pub struct AdmittedAgainst {
 /// A component that stops being answerable, and a capability whose evidence lapses, say whether
 /// rich work would work from now on. A revocation or a fault ends them without ending what the
 /// broker already admitted, which finishes: so the first admission asks them and no later ask does.
+/// A package grant is authority, which a narrower installation removes at once: every ask asks the
+/// grants a plugin action's admission required, and an action whose grant is gone is refused
+/// there, with nothing sent.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Ask<'a> {
     /// The first admission of a mutation, which also asks the component answerable for the
@@ -432,6 +511,7 @@ impl AdmittedAgainst {
             resource_id: None,
             accepted: None,
             resource_deadline: None,
+            package: None,
         }
     }
 
@@ -473,6 +553,11 @@ impl AdmittedAgainst {
     const fn resource_id(&self) -> Option<kr_protocol::ids::PendingResourceId> {
         self.resource_id
     }
+
+    /// The package grants the admission required of its binding, where it is a plugin action.
+    pub(crate) const fn package(&self) -> Option<&PackageGrants> {
+        self.package.as_ref()
+    }
 }
 
 impl MutationAdmission {
@@ -485,6 +570,7 @@ impl MutationAdmission {
             resource_id: self.resource_id,
             accepted: self.accepted.clone(),
             resource_deadline: self.resource_deadline,
+            package: self.package_held().clone(),
         }
     }
 
@@ -518,6 +604,7 @@ impl MutationAdmission {
             turn_id: request.turn_id.clone(),
             accepted: None,
             resource_deadline: None,
+            package: std::sync::Mutex::new(None),
             permit: std::sync::Mutex::new(Some(ExecutionPermit {
                 request,
                 dispatch,
@@ -527,8 +614,37 @@ impl MutationAdmission {
                 draft: None,
                 declared: None,
                 plan: None,
+                open: None,
             })),
         }
+    }
+
+    fn package_held(&self) -> std::sync::MutexGuard<'_, Option<PackageGrants>> {
+        self.package
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records what the admission of a plugin action required of its binding, and counts the
+    /// action as open work of that binding until its permit is dropped.
+    pub(crate) fn with_package(self, package: PackageGrants, open: OpenAction) -> Self {
+        if let Some(permit) = self.held().as_mut() {
+            permit.open = Some(open);
+        }
+        *self.package_held() = Some(package);
+        self
+    }
+
+    /// What the admission required of its binding, with the grant a prepared operation needs.
+    pub(crate) fn package_needing(&self, grant: BrokerGrant) -> Option<PackageGrants> {
+        self.package_held()
+            .as_ref()
+            .map(|package| package.and(grant))
+    }
+
+    /// Records what the effect's validation required of the binding, in what the admission holds.
+    pub(crate) fn hold_package(&self, package: PackageGrants) {
+        *self.package_held() = Some(package);
     }
 
     fn held(&self) -> std::sync::MutexGuard<'_, Option<ExecutionPermit>> {
@@ -905,6 +1021,8 @@ pub struct TakenAction {
     binding_revision: AgentBindingRevision,
     action: ActionName,
     turn_id: Option<kr_protocol::ids::AgentTurnId>,
+    /// What keeps the action counted as open work of its binding until it is sent.
+    open: Option<OpenAction>,
 }
 
 impl TakenAction {
@@ -917,6 +1035,9 @@ impl TakenAction {
     /// The transport took the action: what follows is the wait for what the upstream did.
     #[must_use]
     pub fn submitted(self, pending: PendingTransmission) -> ActionInFlight {
+        // The action is sent: the binding's grants were asked for the last time before the call,
+        // and nothing about the binding needs to outlive it any more.
+        drop(self.open);
         ActionInFlight {
             pending,
             binding_revision: self.binding_revision,
@@ -1743,10 +1864,15 @@ impl Broker {
             .inspect_err(|_| {
                 state.tokens.retire(&token.token_id);
             })?;
+        // What the spend required of the binding is what every later ask of this admission puts
+        // again, and the action is open work of the binding from here until its permit is gone.
+        let package = PackageGrants::requiring(binding_id, invocation.grant);
+        let open = state.count_open_action(binding_id);
         let admitted = admitted
             .with_action_token(spent)
             .with_draft(draft)
-            .with_declaration(registered);
+            .with_declaration(registered)
+            .with_package(package, open);
         admitted.check_transport()?;
         Ok(admitted)
     }
@@ -1931,6 +2057,7 @@ impl Broker {
             request: permit.request,
             binding_revision: token.binding_revision,
             action: token.action,
+            open: permit.open,
         })
     }
 
@@ -2310,9 +2437,13 @@ impl Broker {
         // component to prepare this plan, so it is not proof of anything by the time the plan
         // arrives: a grant withdrawn, a thread selection advanced or a capability invalidated
         // while the component was working is a plan this host will not carry.
-        let grants =
-            state.check_invocation_for(binding_id, &token, registered.capability.clone())?;
-        grants.require(needed)?;
+        state.check_invocation_for(binding_id, &token, registered.capability.clone())?;
+        // The grant the operation needs joins the ones the spend required, and the admission holds
+        // them all for each later ask.
+        let package = admitted.package_needing(needed).ok_or_else(|| {
+            BrokerError::invalid("this admission carries no package grants to require")
+        })?;
+        state.check_package_grants(&package)?;
         // The plan itself goes into the permit, and the operation it prepares goes into the body
         // that will be transmitted. What reaches the upstream is therefore the plan that was
         // checked, rather than an operation beside a flag saying a plan was seen.
@@ -2328,6 +2459,7 @@ impl Broker {
         permit.dispatch.admit(&prepared)?;
         permit.request = prepared;
         permit.plan = Some(effect.clone());
+        admitted.hold_package(package);
         Ok(())
     }
 
@@ -2499,8 +2631,9 @@ impl crate::broker::BrokerState {
     /// fenced, that the instance exists and its mutations are not suspended, that its binding is
     /// the one named, that the turn still fits the operation, that the component answerable for
     /// the dispatch and the capability the operation depends on are still working (the first
-    /// admission's ask alone: see [`Ask`]), that an answer's decoder still holds its authority, and
-    /// that no deadline that bounds the operation has passed at `wall_now`.
+    /// admission's ask alone: see [`Ask`]), that an answer's decoder still holds its authority,
+    /// that the binding of a plugin action still holds the package grants its admission required,
+    /// and that no deadline that bounds the operation has passed at `wall_now`.
     ///
     /// The first admission asks it, and every later ask of the same admission asks it again, so
     /// that one list stands in both places. It makes no change: what the first admission does
@@ -2510,8 +2643,8 @@ impl crate::broker::BrokerState {
     ///
     /// Returns [`BrokerError::PreconditionFailed`] while rich work is fenced or suspended,
     /// [`BrokerError::StaleBinding`] when the binding moved, [`BrokerError::UnknownSubject`] for an
-    /// instance this broker no longer holds, and the refusal of the component, the capability or
-    /// the deadline that stopped it.
+    /// instance this broker no longer holds, [`BrokerError::Grant`] for a package grant that was
+    /// removed, and the refusal of the component, the capability or the deadline that stopped it.
     pub(crate) fn checks(
         &self,
         against: &AdmittedAgainst,
@@ -2563,6 +2696,13 @@ impl crate::broker::BrokerState {
         // installation withdraws without moving the revision either.
         if let Some(resource_id) = against.resource_id() {
             self.recheck_answer_trust(resource_id)?;
+        }
+        // A plugin action is held to the grants its admission required of the package: a narrower
+        // installation withdraws them at once and moves no revision either. A component's disabled
+        // state and a capability's evidence are not authority and are not asked again, so a
+        // revocation or a fault lets what was admitted finish.
+        if let Some(package) = against.package() {
+            self.check_package_grants(package)?;
         }
         // The deadlines last: nothing but the return stands between their reading and the caller.
         against.require_in_time(wall_now)
