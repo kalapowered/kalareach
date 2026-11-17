@@ -2052,6 +2052,96 @@ async fn a_repeated_redemption_of_a_listed_device_gets_the_first_refusals_code()
     host.stop().await;
 }
 
+/// KR-REQ-10.08: the refusal that says the host lists a device is for that device alone. Another
+/// device, one the host does not list, that presents the direct invitation after it ended for the
+/// listed one is given the general rejection at the challenge and at a proof, like every other
+/// ending, and is not told that the host lists it. The listed device still reads its own code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn another_device_presenting_the_invitation_that_ended_for_a_listed_device_gets_the_general_rejection()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    pair_with(&host, &phone, &owner, rights()).await;
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("an invitation");
+    let mut listed = within(
+        "the listed device's redemption",
+        BOUND,
+        calls::try_redeem(&phone.candidate(), &invited),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(listed.outcome.as_ref().expect_err("the host refuses")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+
+    // A device the host does not list meets the ended invitation.
+    let other = Device::create().await;
+    let (_connection, surface) =
+        within("an unpaired connection of the other device", BOUND, async {
+            let candidate = other.candidate();
+            let connection = calls::dial_until_connected(
+                candidate.endpoint,
+                calls::host_addr(&calls::direct_payload(&invited)),
+            )
+            .await;
+            let surface =
+                kr_transport::handshake::connect_unpaired(&connection, candidate.identity).await;
+            (connection, surface)
+        })
+        .await;
+    let mut surface = surface.expect("an unpaired connection");
+    let challenged: Result<kr_protocol::preauth::PairRedeemResult, _> = within(
+        "the other device's challenge",
+        BOUND,
+        surface.call(
+            Method::PairRedeem,
+            &kr_protocol::preauth::PairRedeemParams::Challenge {
+                invitation_id: invited.invitation_id,
+            },
+        ),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(&challenged.expect_err("the ended invitation is refused")),
+        "PAIRING_REJECTED",
+        "a device that is not listed is not told that the host lists it"
+    );
+    let proved: Result<kr_protocol::preauth::PairRedeemResult, _> = within(
+        "the other device's proof",
+        BOUND,
+        surface.call(Method::PairRedeem, &listed.request),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(&proved.expect_err("the ended invitation is refused")),
+        "PAIRING_REJECTED",
+        "the same at a proof"
+    );
+
+    // The listed device reads its own code, as before.
+    let again: Result<kr_protocol::preauth::PairRedeemResult, _> = within(
+        "the listed device's repeat",
+        BOUND,
+        listed.candidate.call(Method::PairRedeem, &listed.request),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(&again.expect_err("refused again")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-10.08: the view of an invitation that did not end because the device is listed carries no
 /// `existing` member, so a reader of the earlier shape reads it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -2096,10 +2186,12 @@ async fn an_invitation_that_did_not_end_for_a_listed_device_has_no_existing_memb
 }
 
 use kr_ipc::client::LocalClient;
-use kr_protocol::ids::EnvironmentId;
-use kr_protocol::invitation::InviteEntry;
+use kr_protocol::ids::{AttemptId, EnvironmentId};
+use kr_protocol::invitation::{InviteEntry, RendezvousMessage};
 use kr_protocol::pairing::{QrPayload, RendezvousOrigin};
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
+use kr_protocol::rendezvous::{ClientFrame, decode_message};
+use kr_protocol::scalars::Nonce256;
 use net_support::room::CodeCandidate;
 
 /// Issues a code invitation at the host's default origin, once the owner device has confirmed it.
@@ -2312,6 +2404,49 @@ async fn a_repeated_finish_of_a_listed_device_gets_the_first_refusals_code() {
         PairStatus::Consumed {
             reason: PairingConsumedReason::EndpointPaired
         }
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the refusal that says the host lists a device is for that device alone. A room
+/// admission that reaches the host after the invitation ended for a listed device, before the room
+/// is closed, is refused with the general rejection like every other ending: the host cannot tell
+/// who stands behind it, and it names no device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_room_admission_after_the_invitation_ended_for_a_listed_device_gets_the_general_rejection()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    pair_with(&host, &phone, &owner, rights()).await;
+    let mut client = host.client().await;
+    let (invited, mut candidate) = code_candidate(&host, &phone, &mut client, &owner).await;
+    let finished = within("the finish", BOUND, candidate.try_finish()).await;
+    assert_eq!(
+        refusal_code(finished.outcome.as_ref().expect_err("refused")),
+        "PAIRING_ENDPOINT_PAIRED",
+        "the listed device reads its own code"
+    );
+
+    let frames = host.network().pairing().room_step(
+        invited.invitation_id,
+        AttemptId::new(kr_ipc::new_uuid()),
+        RendezvousMessage::Admit {
+            client_nonce: Nonce256::from_bytes([7; 32]),
+        },
+    );
+    let Some(ClientFrame::Relay { payload, .. }) = frames.first() else {
+        panic!("a refusal is relayed first: {frames:?}");
+    };
+    let RendezvousMessage::Refused { code, .. } =
+        decode_message(payload.as_slice()).expect("a rendezvous message")
+    else {
+        panic!("the admission is answered with a refusal");
+    };
+    assert_eq!(
+        code,
+        ErrorCode::PairingRejected,
+        "an admission is not told that the host lists a device"
     );
     host.stop().await;
 }

@@ -230,12 +230,11 @@ impl PairingError {
             | Self::Consumed {
                 reason: PairingConsumedReason::AttemptsExhausted,
             } => ErrorCode::PairingAttemptsExhausted,
-            // The same code from the refusal and from every repeat of the request that finds the
-            // invitation consumed for it, so a device whose answer was lost reads the same thing.
-            Self::EndpointPaired { .. }
-            | Self::Consumed {
-                reason: PairingConsumedReason::EndpointPaired,
-            } => ErrorCode::PairingEndpointPaired,
+            // The refusal itself says that the host lists the device it is told to. A request that
+            // finds the invitation consumed for that reason is a rejection like any other ending,
+            // because this error does not know whose request it is: the host gives the code to the
+            // device the refusal was made for and to no other.
+            Self::EndpointPaired { .. } => ErrorCode::PairingEndpointPaired,
             Self::Consumed { .. } | Self::CandidateLocked | Self::AlreadyCommitted => {
                 ErrorCode::PairingRejected
             }
@@ -347,10 +346,11 @@ mod tests {
         assert!(!rendered.contains("origin"));
     }
 
-    /// KR-REQ-10.08: the refusal of a device the host still lists and every later request that finds
-    /// the invitation consumed for it report one code, which no other outcome reports.
+    /// KR-REQ-10.08: only the refusal of a device the host still lists reports the code that says
+    /// so. A request that finds the invitation consumed for that reason is a rejection, so a device
+    /// that is not the one refused is not told that the host lists it.
     #[test]
-    fn a_listed_device_is_refused_under_one_code_whether_the_request_is_the_first_or_a_repeat() {
+    fn only_the_refusal_of_a_listed_device_reports_the_code_that_says_the_host_lists_it() {
         let device_id =
             kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
         assert_eq!(
@@ -362,8 +362,8 @@ mod tests {
                 reason: PairingConsumedReason::EndpointPaired
             }
             .code(),
-            ErrorCode::PairingEndpointPaired,
-            "a repeat is not reported as a rejection"
+            ErrorCode::PairingRejected,
+            "a request that finds the invitation consumed is a rejection"
         );
         assert_ne!(
             PairingError::Consumed {

@@ -1302,9 +1302,10 @@ fn a_direct_invitation_that_names_a_current_approval_or_question_is_not_issued()
 
 /// KR-REQ-10.08: a commit that the host's store refuses because the device is still listed as
 /// paired ends the invitation for that reason, records which listed device the host named, and
-/// writes no commitment. The owner's repeated confirmation reads the same code.
+/// writes no commitment. The owner's repeated confirmation is a rejection like every other ending: the
+/// host gives the code that says it lists the device to that device alone, at its own request.
 #[test]
-fn a_commit_refused_for_a_listed_device_consumes_the_invitation_and_a_repeat_reads_the_same_code() {
+fn a_commit_refused_for_a_listed_device_consumes_the_invitation_and_a_repeat_is_a_rejection() {
     let harness = Harness::new();
     let mut invitation = harness.issue();
     let payload = harness.scan(&invitation);
@@ -1358,7 +1359,7 @@ fn a_commit_refused_for_a_listed_device_consumes_the_invitation_and_a_repeat_rea
     );
     assert_eq!(
         again.as_ref().expect_err("refused again").code(),
-        first_code,
-        "a repeat reads the first refusal's code: {again:?}"
+        kr_protocol::error::ErrorCode::PairingRejected,
+        "a repeat is a rejection like every other ending: {again:?}"
     );
 }

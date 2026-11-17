@@ -58,7 +58,7 @@ use kr_protocol::preauth::{
 };
 use kr_protocol::rendezvous::{ClientFrame, encode_message};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{Bytes, Digest256, Nullable};
+use kr_protocol::scalars::{Bytes, Digest256, EndpointKey, Nullable};
 use kr_transport::preauth::{ConnectionPeer, PairingMethod, PairingSurface};
 use tokio::sync::watch;
 
@@ -1424,10 +1424,13 @@ impl PairingHost {
                 verification_value: locked.verification_value.clone(),
             });
         }
-        let locked = offer
-            .invitation
-            .finish(request, peer as &dyn LivePeer)
-            .map_err(protocol_refusal)?;
+        let locked = match offer.invitation.finish(request, peer as &dyn LivePeer) {
+            Ok(locked) => locked,
+            Err(error) => {
+                let refused_for = offer.invitation.record().refused_for;
+                return Err(self.refusal_to(peer.endpoint_id(), refused_for, error));
+            }
+        };
         // After the code proof and the endpoint proof, and before the owner is shown a candidate:
         // a device that this host still lists as paired is refused, and the invitation ends.
         if let Some(device_id) = self
@@ -1639,11 +1642,13 @@ impl PairingHost {
     /// the code that says so: section 10 asks a specific rejection, and the durable record is what
     /// still knows after the invitation's own object is gone. An invitation this host never issued
     /// as a direct one is not one it is offering, and that is all the candidate is told.
-    fn not_on_offer(&self, invitation_id: InvitationId) -> ProtocolError {
+    fn not_on_offer(&self, peer: &ConnectionPeer, invitation_id: InvitationId) -> ProtocolError {
         match self.rows.row(invitation_id) {
-            Ok(Some(row)) if row.terms.mode == InviteModeKind::Direct => {
-                protocol_refusal(ended_as(row.record.state))
-            }
+            Ok(Some(row)) if row.terms.mode == InviteModeKind::Direct => self.refusal_to(
+                peer.endpoint_id(),
+                row.record.refused_for,
+                ended_as(row.record.state),
+            ),
             Ok(_) => ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "this host is not offering that direct invitation",
@@ -1653,6 +1658,36 @@ impl PairingHost {
                 "this host could not look that invitation up",
             ),
         }
+    }
+
+    /// What the peer at `endpoint` is told when its request met `error`.
+    ///
+    /// An invitation that ended because the host lists the device it was refused for answers that
+    /// device's endpoint, and no other, under the code that says so. Any other peer is told what
+    /// every other ending tells it, so it is not told that the host lists a device that it does
+    /// not.
+    fn refusal_to(
+        &self,
+        endpoint: &EndpointKey,
+        refused_for: Option<DeviceId>,
+        error: kr_pairing::PairingError,
+    ) -> ProtocolError {
+        if matches!(
+            error,
+            kr_pairing::PairingError::Consumed {
+                reason: PairingConsumedReason::EndpointPaired
+            }
+        ) && let Some(device_id) = refused_for
+        {
+            return match self.rows.is_endpoint_of(device_id, endpoint) {
+                Ok(true) => {
+                    protocol_refusal(kr_pairing::PairingError::EndpointPaired { device_id })
+                }
+                Ok(false) => protocol_refusal(error),
+                Err(unreadable) => protocol_refusal(unreadable),
+            };
+        }
+        protocol_refusal(error)
     }
 
     fn redeem(
@@ -1668,29 +1703,31 @@ impl PairingHost {
         let Some(OpenMode::Direct(invitation)) = open.as_mut().map(|offered| &mut offered.mode)
         else {
             drop(open);
-            return Err(self.not_on_offer(named));
+            return Err(self.not_on_offer(peer, named));
         };
         // Whichever step it is, one that names an invitation other than the one on offer is told
         // about the one it names, and not about the one on offer: that is what the invitation's
         // own object would otherwise answer as a proof that does not fit it.
         if named != invitation.invitation_id() {
             drop(open);
-            return Err(self.not_on_offer(named));
+            return Err(self.not_on_offer(peer, named));
         }
         match params {
             PairRedeemParams::Challenge { .. } => {
+                let refused_for = invitation.record().refused_for;
                 let challenge = invitation
                     .issue_challenge(peer as &dyn LivePeer)
-                    .map_err(protocol_refusal)?;
+                    .map_err(|error| self.refusal_to(peer.endpoint_id(), refused_for, error))?;
                 Ok(PairRedeemResult::Challenge(Box::new(challenge)))
             }
             PairRedeemParams::Direct(proof) => {
                 // A redemption that repeats one that already locked the candidate is answered as
                 // it was, and is not asked about the endpoint again.
                 let first = invitation.record().state == InvitationState::Open;
+                let refused_for = invitation.record().refused_for;
                 let candidate = invitation
                     .redeem(proof, peer.endpoint_id(), peer as &dyn LivePeer)
-                    .map_err(protocol_refusal)?;
+                    .map_err(|error| self.refusal_to(peer.endpoint_id(), refused_for, error))?;
                 // After both proofs, and before the owner is shown a candidate: a device that this
                 // host still lists as paired is refused, and the invitation ends.
                 if first

@@ -551,6 +551,24 @@ impl InvitationRows {
             .map(|row| row.device_id))
     }
 
+    /// Tells whether `endpoint` is the endpoint identity of the record this host holds for
+    /// `device_id`, whether or not that record has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be read.
+    pub fn is_endpoint_of(
+        &self,
+        device_id: DeviceId,
+        endpoint: &EndpointKey,
+    ) -> kr_pairing::Result<bool> {
+        Ok(self
+            .directory
+            .record_for_device(device_id)
+            .map_err(store_error)?
+            .is_some_and(|record| record.endpoint_id == *endpoint))
+    }
+
     /// Returns the pairing this host holds for `device_id`, from its own record of the device: the
     /// name and the date it recorded, whatever any later candidate presented.
     ///
