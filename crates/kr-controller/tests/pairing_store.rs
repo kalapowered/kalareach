@@ -2149,13 +2149,16 @@ fn a_grant_that_ran_out_before_anything_read_it_is_marked_by_the_commit_and_its_
 
     let mut host = harness.issue();
     bind(&harness, &mut host);
-    approve_as(
+    let committed = approve_as(
         &harness,
         &mut host,
         Answered::ByTheOwnerDevice,
         &harness.identities_of(18, 19),
-    )
-    .expect("the grant ran out, so the endpoint identity takes a new record");
+    );
+    assert!(
+        committed.is_ok(),
+        "the grant ran out, so the endpoint identity takes a new record: {committed:?}"
+    );
     assert!(
         directory
             .record_for_device(listed.device_id)

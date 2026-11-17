@@ -694,16 +694,17 @@ async fn an_answer_is_not_taken_once_its_record_ended_though_a_new_record_holds_
     let first = host.owner.clone().expect("the host's owner device");
     let signer = Signer::OwnerDevice(&owner);
     let mut client = host.client().await;
+    let proposal = rights();
     let subject = || ConfirmationSubject::IssueInvitation {
         mode: InviteModeKind::Direct,
         rendezvous_origin: Nullable::null(),
         grant_kind: InviteGrantKind::SessionInvitation,
-        proposed_grant: rights(),
+        proposed_grant: proposal.clone(),
     };
     let invite = PairInviteParams {
         mode: InviteMode::Direct,
         grant_kind: InviteGrantKind::SessionInvitation,
-        proposed_grant: rights(),
+        proposed_grant: proposal.clone(),
     };
 
     // The owner device answers; nothing spends the answer yet.
@@ -793,10 +794,11 @@ async fn a_proof_completed_again_is_still_spent_only_under_the_record_that_answe
     let first = host.owner.clone().expect("the host's owner device");
     let signer = Signer::OwnerDevice(&owner);
     let mut client = host.client().await;
+    let proposal = rights();
     let invite = PairInviteParams {
         mode: InviteMode::Direct,
         grant_kind: InviteGrantKind::SessionInvitation,
-        proposed_grant: rights(),
+        proposed_grant: proposal.clone(),
     };
 
     let challenge = calls::request(
@@ -806,7 +808,7 @@ async fn a_proof_completed_again_is_still_spent_only_under_the_record_that_answe
             mode: InviteModeKind::Direct,
             rendezvous_origin: Nullable::null(),
             grant_kind: InviteGrantKind::SessionInvitation,
-            proposed_grant: rights(),
+            proposed_grant: proposal.clone(),
         },
     )
     .await
@@ -1066,6 +1068,16 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
     .await
     .expect("the device is revoked");
     assert!(barrier.holds(), "{barrier:?}");
+    within(
+        "the host dropping the revoked record's connection",
+        BOUND,
+        async {
+            while host.connections_of(&first_revoked) != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await;
     assert_eq!(
         host.connections_of(&first_revoked),
         0,
@@ -1099,21 +1111,28 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
         assert!(is_served(&session).await, "the new connection is served");
         sessions.push(session);
     }
+    let records = [
+        &first_ran_out,
+        &first_revoked,
+        &second_ran_out,
+        &second_revoked,
+    ];
     within("the host counting the connections", BOUND, async {
-        while host.connections_of(&second_ran_out) + host.connections_of(&second_revoked) != 2 {
+        while records
+            .iter()
+            .map(|record| host.connections_of(record))
+            .sum::<u32>()
+            != 2
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await;
-    assert_eq!(host.connections_of(&second_ran_out), 1);
-    assert_eq!(host.connections_of(&second_revoked), 1);
-    for record in [&first_ran_out, &first_revoked] {
-        assert_eq!(
-            host.connections_of(record),
-            0,
-            "nothing counts under the old identifier"
-        );
-    }
+    assert_eq!(
+        records.map(|record| host.connections_of(record)),
+        [0, 0, 1, 1],
+        "the new connections count under the new identifiers and nothing counts under the old ones"
+    );
     for session in sessions {
         session.close();
     }
