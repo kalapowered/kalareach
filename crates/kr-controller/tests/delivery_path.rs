@@ -6871,6 +6871,35 @@ async fn a_push_registration_answered_after_its_record_was_replaced_writes_nothi
     };
     let (_answer, (again, ended)) = tokio::join!(late_registration, replacing);
 
+    // The client's request can end when its connection closes, which says nothing of the host's
+    // action: that goes on past the gateway's answer by asking for the registry's lock. The owner's
+    // device list asks for the same lock, and the lock is handed on in the order it was asked for,
+    // so the list is answered only after the late action has passed it, by a refusal or by a write.
+    let mut owner = environment.host.client().await;
+    let _: kr_protocol::sharing::DeviceListResult = net_support::pairing::read(
+        &mut owner,
+        Method::DeviceList,
+        &kr_protocol::sharing::DeviceListParams {
+            include_revoked: true,
+        },
+    )
+    .await
+    .expect("the owner's list is answered once the late action has passed the registry");
+    assert!(
+        environment.destination(again.device_id()).is_none(),
+        "the new identifier has no destination after the late registration: {:?}",
+        environment.destination(again.device_id())
+    );
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(late_sender)
+            .is_none(),
+        "the credential of the late registration is not kept"
+    );
+
     // The new record registers its own destination, which the late registration, were it to write,
     // would have written before.
     let second_sender = PushSenderRecordId::new(uuid(0x85));
