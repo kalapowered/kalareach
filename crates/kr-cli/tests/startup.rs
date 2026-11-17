@@ -5942,8 +5942,18 @@ fn a_restart_whose_start_fails_after_the_stop_says_so_and_leaves_the_sessions_al
     assert_eq!(failed["pid"].as_u64(), Some(u64::from(old)), "{failed}");
     assert_eq!(failed["started"], Value::Null, "{failed}");
     let message = failed["message"].as_str().expect("a message");
+    let id = host.tree.environment_id();
+    // Whole, except the start's own words, which the run gives.
     assert!(
-        message.contains("was stopped and the start failed"),
+        message.starts_with(&format!(
+            "The control daemon for environment {id} (process {old}) was stopped and the start failed: "
+        )),
+        "{message}"
+    );
+    assert!(
+        message.ends_with(
+            ". No session was stopped: its workers keep running and a local attach still works. Paired devices cannot connect until a control daemon runs. Fix the cause and run kr host restart again."
+        ),
         "{message}"
     );
     // The process that the start made was seen to end, so no requested daemon may still start.
@@ -7822,12 +7832,57 @@ fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
     daemon.end();
 }
 
+/// KR-REQ-07.12 (a start that fails after a request that could not be made): the daemon answers
+/// the look and ends, so that no request is made, and the start then fails. The message opens with
+/// the stop's own words for that state, and not with that the daemon was stopped, then gives the
+/// start's failure, that no session was stopped, and what to do.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn a_restart_whose_request_could_not_be_made_and_whose_start_fails_says_both() {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    host.fail_the_starts_after(0);
+    let mut daemon = TestDaemon::serve_generation(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::CloseAfterTheLookAndEnd,
+        true,
+        0,
+    );
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let failed = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(1), "{failed}");
+    assert_eq!(stop_of(&failed), "ended", "{failed}");
+    let message = failed["message"].as_str().expect("a message");
+    let id = host.tree.environment_id();
+    assert!(
+        message.starts_with(&format!(
+            "The control daemon for environment {id} (process "
+        )) && message.contains(" ended, and this command could not make its request for it: ")
+            && message.contains(" This command sent nothing. This command's start failed: "),
+        "the stop's words for the state, then the start's failure: {message}"
+    );
+    assert!(
+        !message.contains("was stopped and the start failed"),
+        "{message}"
+    );
+    assert!(
+        message.ends_with(
+            ". No session was stopped: its workers keep running and a local attach still works. Paired devices cannot connect until a control daemon runs. Fix the cause and run kr host restart again."
+        ),
+        "{message}"
+    );
+    daemon.end();
+}
+
 /// KR-REQ-07.12 (a restart that waits for the daemon that holds the environment since the end): its
 /// greeting failed, the daemon ended and another holds the environment, so the command asks nothing
 /// and starts nothing while it waits for that daemon to answer. No record of an attempt
 /// stands in that time, since none of the phases a record names has happened; the result names the
-/// daemon that answers and says that this command launched none. The wait for the record to stay
-/// absent is a bounded series of looks, because nothing signals that the command is waiting.
+/// daemon that answers and says that this command launched none. The record is read when the
+/// listener that never answers accepts the first connection that the wait makes: the command
+/// makes no other from the time the lock file names the successor.
 #[test]
 fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_record() {
     let host = Standalone::create();
@@ -7857,17 +7912,18 @@ fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_reco
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    // The old daemon ends, and the lock is held again by the one that replaces it.
+    // The old daemon ends, and the lock is held again by the one that replaces it, which accepts
+    // the connection of the command's wait and never answers it.
     old.kill().expect("ends the old daemon");
     old.wait().expect("collects it");
     std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
-    for _ in 0..20 {
-        assert!(
-            attempts(&host).is_empty(),
-            "a record stands where nothing was asked or started"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let mut silent = SilentListener::bind(&host);
+    silent.until_it_accepted(1);
+    assert!(
+        attempts(&host).is_empty(),
+        "a record stands where nothing was asked or started"
+    );
+    silent.end();
     // The successor is replaced during the wait: another process holds the lock now, and the daemon
     // that answers states a third process, which neither the earlier reading of the lock nor a later
     // one names.
