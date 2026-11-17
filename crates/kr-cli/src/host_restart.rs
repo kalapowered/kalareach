@@ -152,23 +152,40 @@ async fn restart(
         Looked::Said(seen) => {
             at_the_start(host, environment, &seen, json, progress, past, &begun).await
         }
-        Looked::Refused { before, error } => {
-            match host_stop::ended_by(
-                Which::Restart,
-                before,
-                environment,
-                &begun.none,
-                json,
-                &begun.earlier,
-            ) {
-                Ok(completion) => completion,
-                Err(cause) => host_stop::failed(
-                    host_stop::unreached(Which::Restart, id, &error, cause),
+        Looked::Refused { before, error } => match ended_without_a_request(before) {
+            // The greeting failed because the daemon was ending, and the wait saw its end: the
+            // restart goes on to its start as it does for a request that could not be made.
+            Ok((first, pid, end)) => {
+                ended_before_the_request(
+                    host,
+                    environment,
+                    json,
+                    progress,
+                    past,
+                    &begun,
+                    None,
+                    (first, pid, end),
+                )
+                .await
+            }
+            Err(before) => {
+                match host_stop::ended_by(
+                    Which::Restart,
+                    *before,
+                    environment,
                     &begun.none,
                     json,
-                ),
+                    &begun.earlier,
+                ) {
+                    Ok(completion) => completion,
+                    Err(cause) => host_stop::failed(
+                        host_stop::unreached(Which::Restart, id, &error, cause),
+                        &begun.none,
+                        json,
+                    ),
+                }
             }
-        }
+        },
     })
 }
 
@@ -462,23 +479,18 @@ async fn cut_said(
             .await
         }
         Cut::Unmade { before, error } => match ended_without_a_request(before) {
-            Ok((first, pid, end)) => {
-                let (generation, old) = match read {
-                    Some((generation, old)) => (Some(generation), old),
-                    None => (None, None),
-                };
-                let stopped = Stopped {
-                    named: pid,
-                    pid,
-                    unsettled: None,
-                    successor: match end {
-                        End::Successor(successor) => Some(successor),
-                        End::Gone | End::NotEnded(..) => None,
-                    },
-                    generation,
-                    first: Some(first),
-                };
-                after_the_end(host, environment, json, progress, past, begun, stopped, old).await
+            Ok(ended) => {
+                ended_before_the_request(
+                    host,
+                    environment,
+                    json,
+                    progress,
+                    past,
+                    begun,
+                    read,
+                    ended,
+                )
+                .await
             }
             Err(before) => host_stop::unmade_ended(
                 Which::Restart,
@@ -492,6 +504,56 @@ async fn cut_said(
             ),
         },
     }
+}
+
+/// The daemon was seen to end where the restart's request could not be made: the stop's own words for
+/// that state come first, and the restart goes on to its start. `read` is what the command read of
+/// the daemon before, where it read the daemon at all, and `ended` is the stop's words, the process
+/// they name and what the end was.
+// One argument for each fact its steps read: the paths, the environment, the output form, the progress, where the restart is past its stop, what it read before the daemon, and what the end was.
+#[allow(clippy::too_many_arguments)]
+async fn ended_before_the_request(
+    host: &HostPaths,
+    environment: &KnownEnvironment,
+    json: bool,
+    progress: &Progress,
+    past: &Past,
+    begun: &Begun,
+    read: Option<(
+        ControllerGeneration,
+        Option<kr_protocol::identity::ProcessStartIdentity>,
+    )>,
+    ended: (Shown, Option<u64>, End),
+) -> Completion {
+    let (stopped, old) = stopped_unmade(read, ended);
+    after_the_end(host, environment, json, progress, past, begun, stopped, old).await
+}
+
+/// What the restart's stop came to where its request could not be made and the daemon was seen to
+/// end, and the daemon's identity where it was read: the stop's words are the first of the result.
+fn stopped_unmade(
+    read: Option<(
+        ControllerGeneration,
+        Option<kr_protocol::identity::ProcessStartIdentity>,
+    )>,
+    (first, pid, end): (Shown, Option<u64>, End),
+) -> (Stopped, Option<kr_protocol::identity::ProcessStartIdentity>) {
+    let (generation, old) = match read {
+        Some((generation, old)) => (Some(generation), old),
+        None => (None, None),
+    };
+    let stopped = Stopped {
+        named: pid,
+        pid,
+        unsettled: None,
+        successor: match end {
+            End::Successor(successor) => Some(successor),
+            End::Gone | End::NotEnded(..) => None,
+        },
+        generation,
+        first: Some(first),
+    };
+    (stopped, old)
 }
 
 /// What a restart does with a request that could not be made: where the daemon was seen to end, or
