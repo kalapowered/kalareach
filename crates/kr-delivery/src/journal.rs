@@ -7450,8 +7450,8 @@ mod tests {
         }
     }
 
-    /// A version 10 journal, which the release before wrote, is brought forward to 11 when it is
-    /// opened: the version is the only thing that changes, and the destination, the event and the
+    /// A version 10 journal, which a release of level 0.77 wrote, is brought forward to 11 when it
+    /// is opened: the version is the only thing that changes, and the destination, the event and the
     /// queued notification it holds are read as they were.
     #[test]
     fn a_version_10_journal_is_brought_forward_to_11_and_keeps_what_it_holds() {

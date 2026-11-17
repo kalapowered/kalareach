@@ -4994,11 +4994,11 @@ mod tests {
         );
     }
 
-    /// The release before this one kept no table of the times exclusive management was turned off.
-    /// A registry of that release comes forward with the table made empty, and the policy the host
+    /// A registry at version 11 has no table of the times exclusive management was turned off. A
+    /// registry of that version comes forward with the table made empty, and the policy the host
     /// held is as it was.
     #[test]
-    fn a_registry_of_the_release_before_is_brought_forward_with_the_policy_it_held() {
+    fn a_registry_at_version_11_is_brought_forward_with_the_policy_it_held() {
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("registry.sqlite3");
         let held = crate::grants::HostPolicy::personal(AuthorityRevision::new(5)).snapshot();
@@ -5013,7 +5013,7 @@ mod tests {
                 "DROP TABLE exclusive_management_events;
                  UPDATE schema_version SET version = 11;",
             )
-            .expect("sets the file back to the release before");
+            .expect("sets the file back to version 11");
         drop(earlier);
 
         let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");

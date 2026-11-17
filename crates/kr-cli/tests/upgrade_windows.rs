@@ -8,9 +8,10 @@
 //! release, and an update hands the daemon of the release before over to this release's daemon.
 //! The session's worker is then a worker of the release before, beside a daemon of this one.
 //!
-//! The release before cannot install or update a host on Windows, and holds nothing on its release,
-//! so what this shows is the daemon's handover and the adoption of a worker of an older level, not
-//! the hold of a release by a worker of the release before.
+//! The release before, run in place as it is here, keeps no store and holds nothing on its release:
+//! a Windows host keeps a store only when it was installed with `kr host install`, and this host
+//! was not. So what this shows is the daemon's handover and the adoption of a worker of an older
+//! level, not the hold of a release by a worker of the release before.
 //!
 //! The release before is whatever `retained/<level>/RELEASE` of the retained surface names. A commit
 //! that is not there, or a build of it that fails, fails the suite: nothing here skips. The suite is
@@ -209,8 +210,8 @@ async fn an_update_hands_the_daemon_of_the_release_before_over_and_its_worker_go
     // repaired to name it; and an update hands the daemon of the release before over.
     host.install(&one);
     // A daemon of a store records the roots it serves there, which is how an update finds the
-    // environment. The release before keeps no store on Windows and records nothing, so the roots
-    // are recorded here as a daemon of the store would have recorded them.
+    // environment. The release before, run in place, keeps no store on Windows and records nothing,
+    // so the roots are recorded here as a daemon of the store would have recorded them.
     host.store
         .record_roots(
             host.tree.paths().runtime_root(),

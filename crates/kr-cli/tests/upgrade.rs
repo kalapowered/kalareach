@@ -908,9 +908,10 @@ impl Prepared {
 }
 
 /// KR-REQ-26.03: the first command of a package manager's `kr` brings a host that
-/// runs the release before to this release. The release before knows nothing of package managers,
-/// so what is offered it is what it takes of any update, a release archive; it checks the release
-/// and switches as it does for one a person names, and the manager is recorded.
+/// runs the release before to this release. The package manager's `kr` is this release's, and it
+/// hands the release before what every release takes of an update, a release archive (`kr host
+/// update --archive`); the release before checks the release and switches as it does for one a
+/// person names, and the manager is recorded.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_package_managers_first_command_updates_a_host_on_the_release_before() {
     struct Writable(PathBuf);
@@ -2121,11 +2122,11 @@ async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_releas
 /// this release takes a remote dispatch lease for, is performed by the worker of the release
 /// before.
 ///
-/// That worker reads no lease and holds the daemon's deadline and the revision its grant was
-/// checked at, so the daemon sends it the frame it read before this release and not the lease: a
-/// frame that carried one is refused by name at that level and nothing is sent. The device attaches
-/// to the session through the updated daemon, and the worker, which is the process it was
-/// throughout, admits the attachment.
+/// That worker reads the lease too: it holds a paired device's mutation to the lease the frame
+/// carries, to the controller generation it accepts and to the revision it holds, and refuses one
+/// that carries none. The daemon sends the lease in the frame. The device attaches to the session
+/// through the updated daemon, and the worker, which is the process it was throughout, admits the
+/// attachment.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release_before_through_the_daemon_of_this_release()
  {
@@ -2198,11 +2199,12 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
 /// KR-REQ-26.06, KR-REQ-08.53, KR-REQ-20.23: a device paired with the updated host types into the
 /// session of the release before through the new daemon. That worker reads the same input as this
 /// build's, so the daemon gives it a bytes write as it is and a write of console key records as it
-/// is, and the session's shell runs the line of each, in the order the writes were numbered.
+/// is, and the session's shell runs the line of each.
 ///
 /// Each line the shell runs makes a file named by an arithmetic expansion the typed text does not
 /// contain, so a file shows that the line was run and not that it was typed. The files are waited
-/// for while the session is live, which is when the worker forwards what it accepted.
+/// for while the session is live, which is when the worker forwards what it accepted. They show
+/// that each of the three lines was run, and not the order in which the shell ran them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_paired_device_types_bytes_and_key_records_into_the_session_of_the_release_before() {
     use kr_protocol::attachment::{
@@ -2334,7 +2336,7 @@ async fn a_paired_device_types_bytes_and_key_records_into_the_session_of_the_rel
         .await
         .expect("the write after the key records takes the next sequence number");
 
-    // The shell ran the lines it was given, in order.
+    // The shell ran the line of each write.
     for name in ["kept-42", "keys-42", "after-42"] {
         let file = marks.join(name);
         until(
@@ -3830,9 +3832,10 @@ async fn the_release_before_reads_the_journal_of_a_command_session_this_release_
 }
 
 /// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-25.25: a session of this release keeps when its output was
-/// produced in a store of its own beside the spool, which the release before does not name. A
-/// rollback leaves that store where it is, and the release before reads the session's output from
-/// its spool by its own rules: the bytes and the file its `kr export` writes are all there.
+/// produced in a store of its own beside the spool, which the release before keeps in the same form:
+/// its lock names the store, and its workers write it. A rollback leaves that store where it is, and
+/// the release before reads the session's output from its spool: the bytes and the file its
+/// `kr export` writes are all there.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_leaves_the_record_of_when_output_was_produced_and_the_release_before_exports_the_output()
  {
@@ -4248,8 +4251,8 @@ async fn a_rollback_leaves_the_record_of_a_restored_policy_and_an_update_again_w
     door.is_served_again()
         .await
         .expect("the control: with no wait standing the owner device is served");
-    // A device the wait will owe: the record lists it, and the release before knows nothing of the
-    // list.
+    // A device the wait will owe: the record lists it, and the release before reads the same list
+    // and leaves it alone.
     let guest = door
         .pair_a_guest(&endpoint, updated.host.tree.environment_id(), "A guest")
         .await;
@@ -4488,9 +4491,9 @@ async fn a_host_read<P: serde::Serialize + ?Sized, T: kr_protocol::wire::WireMes
 /// protected and an update brings the reports back.
 ///
 /// The release before runs the suite (a result and a report row), this release runs it again (a
-/// second result and a second row, bound to its own run), the release before reads both results
-/// and both rows, records a run of its own with a row, and this release then serves the rows of
-/// all three runs.
+/// second result and a second row, bound to its own run), the release before reads both results,
+/// records a run of its own with a row and serves the rows of all three runs, and this release then
+/// serves the rows of all three runs.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_and_an_update() {
     use kr_protocol::automation::{
@@ -4656,6 +4659,17 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
         }
     };
 
+    // Whether the answer holds the report of each run the store holds a result for.
+    let reported_for_each = |answered: &TestReportsResult, held: &ChangesetReadResult| {
+        answered.reports.len() == held.results.len()
+            && held.results.iter().all(|result| {
+                answered
+                    .reports
+                    .iter()
+                    .any(|report| report.materialisation_id == result.materialisation_id)
+            })
+    };
+
     // The release before: a result, and a report row bound to that run.
     let environment = prepared.host.tree.environment();
     let reports_store = environment
@@ -4771,7 +4785,8 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
         "the result this release wrote, and the evidence beside it, read as they were"
     );
     run("evt-after-the-rollback").await;
-    assert_eq!(read().await.results.len(), 3);
+    let after_the_rollback = read().await;
+    assert_eq!(after_the_rollback.results.len(), 3);
     assert_eq!(
         reports_held(),
         3,
@@ -4781,11 +4796,8 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
         .await
         .expect("the release before reads the rows this release kept");
     assert!(
-        answered
-            .reports
-            .iter()
-            .any(|report| report.materialisation_id == second),
-        "{answered:?}"
+        reported_for_each(&answered, &after_the_rollback),
+        "the release before serves the report of each of the three runs: {answered:?}"
     );
 
     // Forward again: the store serves the report of the run this release made, and the rows of
@@ -4830,6 +4842,10 @@ async fn a_report_store_the_release_before_keeps_too_is_kept_across_a_rollback_a
         "the run of the release before reads"
     );
     assert_eq!(three.results[1], after_the_update.results[1]);
+    assert!(
+        reported_for_each(&again, &three),
+        "this release serves the report of each of the three runs: {again:?}"
+    );
 
     // The change-set store is put back as it was before the second run, with the daemon stopped and
     // the store of reports kept: two of its rows now name a run the store holds no result for.
