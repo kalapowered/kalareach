@@ -300,9 +300,9 @@ pub async fn accept_on(
         return Err(TransportError::Handshake(error));
     }
 
-    let paired = directory.paired_peer(&peer_endpoint_id);
+    let listed = directory.paired_peer(&peer_endpoint_id);
 
-    if early_data && paired.is_some() {
+    if early_data && listed.is_some() {
         // Section 23: reject early data for everything except the bounded pre-authorisation
         // pairing surface. An authorised connection is not that surface, so a handshake stream that
         // carried early data never becomes one. Nothing is lost: this build's client cannot offer
@@ -317,6 +317,14 @@ pub async fn accept_on(
         writer.finish_and_flush(REFUSAL_FLUSH).await;
         return Err(TransportError::Handshake(error));
     }
+
+    // A device that connects to a host it is paired with offers the device identifier of its
+    // record, which the connection proof binds. A pairing candidate offers a fresh identifier that
+    // no host has assigned. So an endpoint that the host lists is on the paired branch only for a
+    // peer that offers the listed record's identifier; any other offer from it is a pairing
+    // candidate whose device lost the host, and reaches the pairing surface, where the host can
+    // tell it that it is still listed.
+    let paired = listed.filter(|record| record.device_id == offer.device_id);
 
     let Some(paired) = paired else {
         // An unpaired endpoint still learns the framing and the selected version: without them it

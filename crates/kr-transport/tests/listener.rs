@@ -425,18 +425,16 @@ async fn no_data_stream_survives_the_failure_of_its_control_stream() {
     listener.shutdown().await;
 }
 
-/// KR-REQ-23.18: nothing sent as 0-RTT early data reaches an authorised connection.
-#[tokio::test]
-async fn early_data_never_reaches_an_authorised_connection() {
-    // KR-ACC-026: version 1 accepts no application mutation in QUIC 0-RTT. The listener accepts the
-    // first stream while the handshake is still running, so it knows whether that stream carried
-    // early data, and refuses to authorise one that did.
-    let (host, client) = paired_pair().await;
-    let handler = Arc::new(TestHandler::new(client.record));
-    let listener = start(&host, Arc::clone(&handler)).await;
-    let addr = listener_addr(&listener);
-
-    // A peer that keeps session tickets, unlike this product's own client, which keeps none.
+/// What the host answers to `claim` written as 0-RTT early data by a peer of `client`'s endpoint
+/// that keeps session tickets, unlike this product's own client, which keeps none. One complete
+/// connection comes first, so the peer holds a ticket; it is proved as the client the host lists.
+async fn answer_to_early_data(
+    client: &Side,
+    host: &Side,
+    handler: &TestHandler,
+    addr: iroh::EndpointAddr,
+    claim: &ClientOffer,
+) -> HelloReply {
     let resuming = iroh::Endpoint::builder(presets::Minimal)
         .secret_key(iroh::SecretKey::from_bytes(
             client.keys.transport.export_endpoint_seed().expose(),
@@ -456,6 +454,7 @@ async fn early_data_never_reaches_an_authorised_connection() {
         .expect("an endpoint");
 
     // One complete connection first, so the peer holds a ticket.
+    let served = handler.served.load(Ordering::Acquire);
     let warm = resuming
         .connect(addr.clone(), ALPN)
         .await
@@ -465,7 +464,7 @@ async fn early_data_never_reaches_an_authorised_connection() {
         .expect("an authorised connection");
     drop(authorised);
     warm.close(0u32.into(), b"done");
-    wait_until(|| handler.served.load(Ordering::Acquire) == 1).await;
+    wait_until(|| handler.served.load(Ordering::Acquire) == served + 1).await;
 
     // Now offer 0-RTT and write the offer as early data.
     let connecting = resuming
@@ -479,18 +478,61 @@ async fn early_data_never_reaches_an_authorised_connection() {
     let mut writer = FrameWriter::new(send, StreamKind::Control);
     let mut reader = FrameReader::new(recv, StreamKind::Control);
     writer
-        .write_message(&offer(&client))
+        .write_message(claim)
         .await
         .expect("the offer was sent as early data");
     let _ = zero_rtt.handshake_completed().await;
 
-    let reply: HelloReply = reader
+    reader
         .read_message()
         .await
         .expect("a reply")
-        .expect("the stream did not end");
+        .expect("the stream did not end")
+}
+
+/// KR-REQ-23.18: nothing sent as 0-RTT early data reaches an authorised connection.
+#[tokio::test]
+async fn early_data_never_reaches_an_authorised_connection() {
+    // KR-ACC-026: version 1 accepts no application mutation in QUIC 0-RTT. The listener accepts the
+    // first stream while the handshake is still running, so it knows whether that stream carried
+    // early data, and refuses to authorise one that did.
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(TestHandler::new(client.record));
+    let listener = start(&host, Arc::clone(&handler)).await;
+    let addr = listener_addr(&listener);
+
+    let reply = answer_to_early_data(&client, &host, &handler, addr, &offer(&client)).await;
     let HelloReply::Refused(error) = reply else {
         panic!("a handshake that arrived as early data is refused");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert_eq!(
+        handler.served.load(Ordering::Acquire),
+        1,
+        "the early-data connection never reached the handler"
+    );
+
+    listener.shutdown().await;
+}
+
+/// KR-REQ-23.18: early data from an endpoint the host lists as paired is refused whatever device
+/// identifier it offers: the refusal is made on the host's own record of the endpoint, before the
+/// identifier decides which branch of the handshake the peer is on, so no early-data exchange
+/// reaches the pairing surface through a record that lists the endpoint.
+#[tokio::test]
+async fn early_data_from_a_listed_endpoint_offering_another_device_id_is_refused() {
+    let (host, client) = paired_pair().await;
+    let handler = Arc::new(TestHandler::new(client.record));
+    let listener = start(&host, Arc::clone(&handler)).await;
+    let addr = listener_addr(&listener);
+
+    let another = ClientOffer {
+        device_id: DeviceId::new(Uuid::from_bytes([0xCA; 16])),
+        ..offer(&client)
+    };
+    let reply = answer_to_early_data(&client, &host, &handler, addr, &another).await;
+    let HelloReply::Refused(error) = reply else {
+        panic!("a handshake that arrived as early data is refused: {reply:?}");
     };
     assert_eq!(error.code, ErrorCode::PermissionDenied);
     assert_eq!(

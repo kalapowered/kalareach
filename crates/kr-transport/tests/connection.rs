@@ -25,7 +25,7 @@ use kr_protocol::hello::{
 };
 use kr_protocol::ids::{
     ActionWindowId, AttachmentId, BuildId, CapabilityId, ConnectionId, ControllerGeneration,
-    EnvironmentId, RequestId, SessionId, TransferId,
+    DeviceId, EnvironmentId, RequestId, SessionId, TransferId,
 };
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::scalars::{CanonicalSet, DurationMs, EndpointKey, Nullable, TimestampMs, Uuid};
@@ -823,9 +823,11 @@ impl PairingSurface for RecordingSurface {
     }
 }
 
-/// Serves the pre-authorisation surface for one unpaired connection.
+/// Serves the pre-authorisation surface for one unpaired connection, which `directory` decides is
+/// unpaired.
 fn spawn_preauth(
     host: &Side,
+    directory: Arc<dyn PairedDirectory>,
     surface: Arc<RecordingSurface>,
     limits: PreAuthLimits,
     clock: ManualClock,
@@ -840,14 +842,14 @@ fn spawn_preauth(
             &connection,
             &identity,
             epochs(),
-            &NoDevices,
+            directory.as_ref(),
             &challenges,
             &issuer,
         )
         .await
         .expect("an admitted connection");
         let Admitted::Unpaired(mut unpaired) = admitted else {
-            panic!("an unknown endpoint is unpaired");
+            panic!("a peer the host does not route to its paired branch is unpaired");
         };
         let _ = preauth::serve(
             &mut unpaired,
@@ -863,68 +865,110 @@ fn spawn_preauth(
     })
 }
 
+/// The device identifier a pairing candidate offers: one that no host has assigned.
+fn candidate_device_id() -> DeviceId {
+    DeviceId::new(Uuid::from_bytes([0xCA; 16]))
+}
+
+/// What a client of `client`'s endpoint offers when it names another device than the one its
+/// record holds.
+fn offered_as(client: &Side, device_id: DeviceId) -> ClientOffer {
+    ClientOffer {
+        device_id,
+        ..offer(client)
+    }
+}
+
+/// The two ways a peer comes to the pairing surface: the host holds no record of its endpoint, or
+/// it lists the endpoint as paired under another device identifier than the one the peer offers.
+/// Each is a directory and what the peer offers.
+fn ways_to_the_pairing_surface(
+    client: &Side,
+) -> [(&'static str, Arc<dyn PairedDirectory>, ClientOffer); 2] {
+    [
+        (
+            "no record of the endpoint",
+            Arc::new(NoDevices),
+            offer(client),
+        ),
+        (
+            "a record of the endpoint under another device identifier",
+            one_device(client),
+            offered_as(client, candidate_device_id()),
+        ),
+    ]
+}
+
 /// KR-REQ-23.19, KR-REQ-10.39: an unpaired connection negotiates hello and reaches only the pairing
-/// surface; an ordinary method is refused.
+/// surface; an ordinary method is refused. The host reaches the same surface for an endpoint it
+/// lists as paired when the peer offers another device identifier than its record's, so a status
+/// read on a fresh connection is answered after a pairing committed.
 #[tokio::test]
 async fn an_unpaired_endpoint_reaches_only_the_pairing_surface() {
     let (host, client) = paired_pair().await;
-    let surface = Arc::new(RecordingSurface::default());
-    let serving = spawn_preauth(
-        &host,
-        Arc::clone(&surface),
-        PreAuthLimits::default(),
-        ManualClock::new(),
-    );
+    for (way, directory, offered) in ways_to_the_pairing_surface(&client) {
+        let surface = Arc::new(RecordingSurface::default());
+        let serving = spawn_preauth(
+            &host,
+            directory,
+            Arc::clone(&surface),
+            PreAuthLimits::default(),
+            ManualClock::new(),
+        );
 
-    let connection = client
-        .endpoint
-        .connect(direct_addr(&host), ALPN)
-        .await
-        .expect("a connection");
-    let (mut writer, mut reader) = control_streams(&connection).await;
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
+            .await
+            .expect("a connection");
+        let (mut writer, mut reader) = control_streams(&connection).await;
 
-    // hello is answered: an unpaired peer still negotiates framing and version.
-    writer.write_message(&offer(&client)).await.expect("sent");
-    assert!(matches!(
-        read_frame::<HelloReply>(&mut reader).await,
-        HelloReply::Selected(_)
-    ));
+        // hello is answered: an unpaired peer still negotiates framing and version.
+        writer.write_message(&offered).await.expect("sent");
+        assert!(matches!(
+            read_frame::<HelloReply>(&mut reader).await,
+            HelloReply::Selected(_)
+        ));
 
-    // A pairing read is served.
-    writer
-        .write_message(&request(Method::PairStatus, 1))
-        .await
-        .expect("sent");
-    let response = read_frame::<Response>(&mut reader).await;
-    assert!(matches!(response.outcome, Outcome::Ok(_)));
+        // A pairing read is served.
+        writer
+            .write_message(&request(Method::PairStatus, 1))
+            .await
+            .expect("sent");
+        let response = read_frame::<Response>(&mut reader).await;
+        assert!(
+            matches!(response.outcome, Outcome::Ok(_)),
+            "{way}: a pairing read is answered"
+        );
 
-    // An ordinary session method is not.
-    writer
-        .write_message(&request(Method::SessionList, 2))
-        .await
-        .expect("sent");
-    let response = read_frame::<Response>(&mut reader).await;
-    let Outcome::Error(error) = response.outcome else {
-        panic!("session.list is not reachable before pairing");
-    };
-    assert_eq!(error.code, ErrorCode::PermissionDenied);
+        // An ordinary session method is not.
+        writer
+            .write_message(&request(Method::SessionList, 2))
+            .await
+            .expect("sent");
+        let response = read_frame::<Response>(&mut reader).await;
+        let Outcome::Error(error) = response.outcome else {
+            panic!("session.list is not reachable before pairing");
+        };
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
 
-    assert_eq!(
-        surface.calls(),
-        vec![PairingMethod::Status],
-        "only the pairing read reached the surface"
-    );
-    // What the transport owes the pairing ceremony: the authenticated endpoint on the other end of
-    // this connection, and whether the step arrived as early data. The ceremony checks the live
-    // peer against the authenticated bundle and refuses a mutation in 0-RTT from these two answers.
-    assert_eq!(
-        surface.peers(),
-        vec![(client.record.endpoint_id, false)],
-        "the surface saw the authenticated peer this connection belongs to"
-    );
+        assert_eq!(
+            surface.calls(),
+            vec![PairingMethod::Status],
+            "{way}: only the pairing read reached the surface"
+        );
+        // What the transport owes the pairing ceremony: the authenticated endpoint on the other end of
+        // this connection, and whether the step arrived as early data. The ceremony checks the live
+        // peer against the authenticated bundle and refuses a mutation in 0-RTT from these two answers.
+        assert_eq!(
+            surface.peers(),
+            vec![(client.record.endpoint_id, false)],
+            "{way}: the surface saw the authenticated peer this connection belongs to"
+        );
 
-    connection.close(0u32.into(), b"done");
-    let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        connection.close(0u32.into(), b"done");
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+    }
 }
 
 /// KR-REQ-10.39: the pre-authorisation surface is rate limited per connection.
@@ -932,49 +976,52 @@ async fn an_unpaired_endpoint_reaches_only_the_pairing_surface() {
 #[tokio::test]
 async fn an_unpaired_connection_runs_out_of_pairing_requests() {
     let (host, client) = paired_pair().await;
-    let limits = PreAuthLimits {
-        max_requests: 2,
-        max_requests_per_window: 2,
-        window: Duration::from_secs(10),
-        max_frame_len: preauth::MAX_PREAUTH_FRAME_LEN,
-    };
-    let serving = spawn_preauth(
-        &host,
-        Arc::new(RecordingSurface::default()),
-        limits,
-        ManualClock::new(),
-    );
+    for (way, directory, offered) in ways_to_the_pairing_surface(&client) {
+        let limits = PreAuthLimits {
+            max_requests: 2,
+            max_requests_per_window: 2,
+            window: Duration::from_secs(10),
+            max_frame_len: preauth::MAX_PREAUTH_FRAME_LEN,
+        };
+        let serving = spawn_preauth(
+            &host,
+            directory,
+            Arc::new(RecordingSurface::default()),
+            limits,
+            ManualClock::new(),
+        );
 
-    let connection = client
-        .endpoint
-        .connect(direct_addr(&host), ALPN)
-        .await
-        .expect("a connection");
-    let (mut writer, mut reader) = control_streams(&connection).await;
-    writer.write_message(&offer(&client)).await.expect("sent");
-    let _ = read_frame::<HelloReply>(&mut reader).await;
-
-    let mut codes = Vec::new();
-    for index in 0..3u64 {
-        writer
-            .write_message(&request(Method::PairStatus, index + 1))
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
             .await
-            .expect("sent");
-        codes.push(match read_frame::<Response>(&mut reader).await.outcome {
-            Outcome::Ok(_) => None,
-            Outcome::Error(error) => Some(error.code),
-        });
-    }
-    assert_eq!(codes[0], None);
-    assert_eq!(codes[1], None);
-    assert_eq!(
-        codes[2],
-        Some(ErrorCode::RateLimited),
-        "the third request is past the budget"
-    );
+            .expect("a connection");
+        let (mut writer, mut reader) = control_streams(&connection).await;
+        writer.write_message(&offered).await.expect("sent");
+        let _ = read_frame::<HelloReply>(&mut reader).await;
 
-    connection.close(0u32.into(), b"done");
-    let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+        let mut codes = Vec::new();
+        for index in 0..3u64 {
+            writer
+                .write_message(&request(Method::PairStatus, index + 1))
+                .await
+                .expect("sent");
+            codes.push(match read_frame::<Response>(&mut reader).await.outcome {
+                Outcome::Ok(_) => None,
+                Outcome::Error(error) => Some(error.code),
+            });
+        }
+        assert_eq!(codes[0], None, "{way}");
+        assert_eq!(codes[1], None, "{way}");
+        assert_eq!(
+            codes[2],
+            Some(ErrorCode::RateLimited),
+            "{way}: the third request is past the budget"
+        );
+
+        connection.close(0u32.into(), b"done");
+        let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
+    }
 }
 
 /// KR-REQ-10.39: the pre-authorisation surface bounds every request. One larger than its frame
@@ -984,10 +1031,169 @@ async fn an_unpaired_connection_runs_out_of_pairing_requests() {
 #[tokio::test]
 async fn an_oversized_pairing_request_never_reaches_the_surface() {
     let (host, client) = paired_pair().await;
-    let surface = Arc::new(RecordingSurface::default());
-    let recording = Arc::clone(&surface);
+    for (way, directory, offered) in ways_to_the_pairing_surface(&client) {
+        let surface = Arc::new(RecordingSurface::default());
+        let recording = Arc::clone(&surface);
+        let endpoint = host.endpoint.clone();
+        let identity = Arc::clone(&host.identity);
+        let serving = tokio::spawn(async move {
+            let connection = accept_connection(&endpoint).await;
+            let clock = ManualClock::new();
+            let challenges = ledger();
+            let issuer = windows(&clock);
+            let admitted = handshake::accept(
+                &connection,
+                &identity,
+                epochs(),
+                directory.as_ref(),
+                &challenges,
+                &issuer,
+            )
+            .await
+            .expect("an admitted connection");
+            let Admitted::Unpaired(mut unpaired) = admitted else {
+                panic!("a peer the host does not route to its paired branch is unpaired");
+            };
+            let outcome = preauth::serve(
+                &mut unpaired,
+                recording.as_ref(),
+                PreAuthLimits::default(),
+                &clock,
+                ControllerGeneration::new(1),
+            )
+            .await;
+            (connection, outcome)
+        });
+
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
+            .await
+            .expect("a connection");
+        let (mut writer, mut reader) = control_streams(&connection).await;
+        writer.write_message(&offered).await.expect("sent");
+        let _ = read_frame::<HelloReply>(&mut reader).await;
+
+        let oversized = Request {
+            request_id: RequestId::new(1),
+            method: Method::PairStatus.into(),
+            method_version: MethodVersion::V1,
+            params: ParamsValue::new(CanonicalValue::bytes(vec![
+                0u8;
+                preauth::MAX_PREAUTH_FRAME_LEN
+            ])),
+        };
+        writer.write_message(&oversized).await.expect("sent");
+
+        let (_connection, outcome) = tokio::time::timeout(Duration::from_secs(10), serving)
+            .await
+            .expect("the host stopped serving")
+            .expect("the host task");
+        assert!(
+            matches!(outcome, Err(TransportError::Frame(_))),
+            "{way}: an oversized request ends the exchange: {outcome:?}"
+        );
+        assert!(
+            surface.calls().is_empty(),
+            "{way}: nothing reached the pairing surface"
+        );
+    }
+}
+
+/// KR-REQ-23.19: a peer that offers the device identifier its record holds is on the paired
+/// branch of the handshake, which waits for a connection proof and refuses a first frame that is
+/// not one. Only a peer that offers another identifier is on the pairing surface.
+#[tokio::test]
+async fn a_listed_endpoint_offering_its_records_device_id_is_still_asked_for_its_proof() {
+    let (host, client) = paired_pair().await;
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let (mut writer, mut reader) = control_streams(&connection).await;
+    writer.write_message(&offer(&client)).await.expect("sent");
+    assert!(matches!(
+        read_frame::<HelloReply>(&mut reader).await,
+        HelloReply::Selected(_)
+    ));
+    writer
+        .write_message(&request(Method::PairStatus, 1))
+        .await
+        .expect("sent");
+    assert!(
+        matches!(
+            read_frame::<ConnectReply>(&mut reader).await,
+            ConnectReply::Refused(_)
+        ),
+        "the paired branch waits for a proof and refuses what is not one"
+    );
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    assert!(admitted.is_err(), "the exchange ended without a connection");
+}
+
+/// KR-REQ-23.09, KR-REQ-23.19: the host checks a connection proof against the listed record when
+/// the peer offers the record's device identifier, and an authorised connection follows. A peer of
+/// the same endpoint that offers another identifier is not asked for a proof at all: the host
+/// routes it to the pairing surface and never reads one.
+#[tokio::test]
+async fn a_proof_is_read_only_from_a_peer_that_offers_the_records_device_id() {
+    let (host, client) = paired_pair().await;
+    for (offered_id, reads_a_proof) in [
+        (client.record.device_id, true),
+        (candidate_device_id(), false),
+    ] {
+        let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
+            .await
+            .expect("a connection");
+        let host_endpoint_id = EndpointKey::from_bytes(*connection.remote_id().as_bytes());
+        let (mut writer, mut reader) = control_streams(&connection).await;
+        let claim = offered_as(&client, offered_id);
+        writer.write_message(&claim).await.expect("sent");
+        let HelloReply::Selected(selection) = read_frame::<HelloReply>(&mut reader).await else {
+            panic!("a hello is answered with a selection whoever sent it");
+        };
+        let proof = ConnectProof {
+            signature: sign_connect(
+                &client.keys.authorisation,
+                &claim,
+                &selection,
+                &client.record.endpoint_id,
+                &host_endpoint_id,
+            )
+            .expect("a proof"),
+        };
+        let _ = writer.write_message(&proof).await;
+        let (_connection, admitted) = accepting.await.expect("the host task");
+        if reads_a_proof {
+            assert!(
+                matches!(admitted, Ok(Admitted::Authorised(_))),
+                "the record's own device is authorised"
+            );
+        } else {
+            assert!(
+                matches!(admitted, Ok(Admitted::Unpaired(_))),
+                "another device identifier is routed to the pairing surface: {:?}",
+                admitted.map(|_| ())
+            );
+        }
+        connection.close(0u32.into(), b"done");
+    }
+}
+
+/// KR-REQ-23.19: what a peer sends on the pairing surface is read as a pairing request. A
+/// connection proof sent there is no request, so the exchange ends and the host gives no
+/// connection reply, which is how a peer would learn that the host lists its endpoint.
+#[tokio::test]
+async fn a_proof_sent_to_the_pairing_surface_is_not_answered_as_a_proof() {
+    let (host, client) = paired_pair().await;
     let endpoint = host.endpoint.clone();
     let identity = Arc::clone(&host.identity);
+    let directory = one_device(&client);
     let serving = tokio::spawn(async move {
         let connection = accept_connection(&endpoint).await;
         let clock = ManualClock::new();
@@ -997,57 +1203,66 @@ async fn an_oversized_pairing_request_never_reaches_the_surface() {
             &connection,
             &identity,
             epochs(),
-            &NoDevices,
+            directory.as_ref(),
             &challenges,
             &issuer,
         )
         .await
         .expect("an admitted connection");
         let Admitted::Unpaired(mut unpaired) = admitted else {
-            panic!("an unknown endpoint is unpaired");
+            panic!("a peer the host does not route to its paired branch is unpaired");
         };
         let outcome = preauth::serve(
             &mut unpaired,
-            recording.as_ref(),
+            &RecordingSurface::default(),
             PreAuthLimits::default(),
             &clock,
             ControllerGeneration::new(1),
         )
         .await;
-        (connection, outcome)
+        // The exchange is over; the host lets the connection go, which ends the peer's read.
+        connection.close(0u32.into(), b"ended");
+        outcome
     });
-
     let connection = client
         .endpoint
         .connect(direct_addr(&host), ALPN)
         .await
         .expect("a connection");
+    let host_endpoint_id = EndpointKey::from_bytes(*connection.remote_id().as_bytes());
     let (mut writer, mut reader) = control_streams(&connection).await;
-    writer.write_message(&offer(&client)).await.expect("sent");
-    let _ = read_frame::<HelloReply>(&mut reader).await;
-
-    let oversized = Request {
-        request_id: RequestId::new(1),
-        method: Method::PairStatus.into(),
-        method_version: MethodVersion::V1,
-        params: ParamsValue::new(CanonicalValue::bytes(vec![
-            0u8;
-            preauth::MAX_PREAUTH_FRAME_LEN
-        ])),
+    let claim = offered_as(&client, candidate_device_id());
+    writer.write_message(&claim).await.expect("sent");
+    let HelloReply::Selected(selection) = read_frame::<HelloReply>(&mut reader).await else {
+        panic!("a hello is answered with a selection whoever sent it");
     };
-    writer.write_message(&oversized).await.expect("sent");
-
-    let (_connection, outcome) = tokio::time::timeout(Duration::from_secs(10), serving)
+    let proof = ConnectProof {
+        signature: sign_connect(
+            &client.keys.authorisation,
+            &claim,
+            &selection,
+            &client.record.endpoint_id,
+            &host_endpoint_id,
+        )
+        .expect("a proof"),
+    };
+    writer.write_message(&proof).await.expect("sent");
+    let reply: Result<Option<ConnectReply>, _> =
+        tokio::time::timeout(Duration::from_secs(30), reader.read_message())
+            .await
+            .expect("the host ended the exchange within the bound");
+    assert!(
+        !matches!(reply, Ok(Some(ConnectReply::Refused(_)))),
+        "the host did not check a proof: {:?}",
+        reply.map(|_| ())
+    );
+    let outcome = tokio::time::timeout(Duration::from_secs(30), serving)
         .await
         .expect("the host stopped serving")
         .expect("the host task");
     assert!(
-        matches!(outcome, Err(TransportError::Frame(_))),
-        "an oversized request ends the exchange: {outcome:?}"
-    );
-    assert!(
-        surface.calls().is_empty(),
-        "nothing reached the pairing surface"
+        outcome.is_err(),
+        "a proof is no pairing request, so the exchange ends"
     );
 }
 
