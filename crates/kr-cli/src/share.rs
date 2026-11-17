@@ -1575,10 +1575,6 @@ fn finish_revocation(
     if json {
         let mut document = Document::new().with("grant_id", closed(&grant_id));
         document.merge(crate::device::revocation_document(revoked));
-        // The member this document carried before it listed each worker. A script written against
-        // it keeps reading it until a release that changes the command line's JSON removes it;
-        // `ok` and `barrier.workers[].state` say the same.
-        document.set("barrier_holds", revoked.barrier.holds());
         match &error {
             None => output::document(&document),
             Some(error) => output::document(&report::with_failure(document, error)),
@@ -1921,11 +1917,7 @@ fn finish_transfer(
             .with("session_id", closed(&descriptor.session_id))
             .with("from_grant_id", closed(&from))
             .with("new_grant_id", closed(&new_grant_id))
-            .with("to_device_id", closed(&receiver.device_id))
-            .with(
-                "barrier_holds",
-                result.map(|result| result.revoked.barrier.holds()),
-            );
+            .with("to_device_id", closed(&receiver.device_id));
         // The revocation of the giving device's grant, in the shape a revocation is answered in.
         if let Some(result) = result {
             document.merge(crate::device::revocation_document(&result.revoked));

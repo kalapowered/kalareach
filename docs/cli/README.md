@@ -2227,12 +2227,11 @@ list of workers, it listed those still waiting first, so the command says "at le
 count of them, and `barrier.workers_total` gives how many workers were affected in all. Asking again
 is a new revocation. What the device already saw stays with it. With `--json` it returns `grant_id`
 and the revocation result: `authority_revision`, `revoked_grants`, `revoked_grants_total` and the
-`barrier`, which lists each affected worker with its session and state. It also returns
-`barrier_holds`, true when every worker has fenced the revocation. That member is kept for scripts
-written before the `barrier` listed workers, and a release that changes the command line's JSON
-removes it; read `ok` and `barrier.workers[].state` instead. When the host's answer was not read,
-the document has only `grant_id` and the failure, and the command says it does not know whether
-each worker has fenced the revocation.
+`barrier`, which lists each affected worker with its session and state. `ok` is true when every
+worker has fenced the revocation, and `barrier.workers[].state` says which have; the document has
+no `barrier_holds` member, so a script that read it has to read those two. When the host's answer
+was not read, the document has only `grant_id` and the failure, and the command says it does not
+know whether each worker has fenced the revocation.
 
 `kr share transfer` hands a session's control to another device. The host describes the transfer
 from its own records, an owner device confirms exactly that plan, and the command then sends the
@@ -2244,7 +2243,7 @@ it says the revocation is pending, names the sessions as above and exits with 1.
 answer was not read, it says that the receiving device was handed the session and that whether the
 giving grant is fenced is not known. With `--json` the document carries `authority_revision`,
 `revoked_grants`, `revoked_grants_total` and the `barrier` beside the session, the two grants and
-the receiving device, and `barrier_holds` as before.
+the receiving device, and carries no `barrier_holds` member.
 
 While it waits for the owner device, the command reads the host's list of pending confirmations
 once a second. Each read is given thirty seconds, and never past the end of the challenge, which is
