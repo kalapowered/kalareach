@@ -759,3 +759,100 @@ async fn nothing_the_ended_record_held_carries_over_to_the_record_that_replaces_
     assert_eq!(rows_of(&host, "host_owner"), owner_rows);
     host.stop().await;
 }
+
+/// What a connection that is admitted answers to a read every paired device may make.
+async fn is_served(session: &kr_client::session::Session) -> bool {
+    let read: Result<kr_protocol::hostinfo::HostDoctorResult, _> =
+        session.read(Method::HostDoctor, &()).await;
+    read.is_ok()
+}
+
+/// KR-REQ-10.08: a connection is the record it was admitted under for its whole life. One device
+/// has its grant run out while its connection stays open, and one has its record revoked while
+/// its connection is open; both pair again. The expired device's old connection stays open and
+/// is refused every request, because its checks read the old record by its identifier and never
+/// the new one; the revoked device's old connection is ended by the barrier. The new connections
+/// are served and count toward the new identifiers from zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_record() {
+    let (moved, clocks) = Moved::new();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let ran_out = Device::create().await;
+    let first_ran_out = pair_with(&host, &ran_out, &owner, rights()).await;
+    let old_ran_out = within(
+        "the connection",
+        BOUND,
+        connect(&host, &ran_out, &first_ran_out),
+    )
+    .await;
+    assert!(
+        is_served(&old_ran_out).await,
+        "served while its grant stands"
+    );
+    moved.past_the_grant();
+    let path = host.registry_database();
+    let device_id = first_ran_out.device_id;
+    until("the end of the grant being on record", move || {
+        expired(&path, device_id)
+    })
+    .await;
+
+    let revoked = Device::create().await;
+    let first_revoked = pair_with(&host, &revoked, &owner, grant_past_the_moved_clocks()).await;
+    let old_revoked = within(
+        "the connection",
+        BOUND,
+        connect(&host, &revoked, &first_revoked),
+    )
+    .await;
+    assert!(is_served(&old_revoked).await, "served while it stands");
+    let barrier = within(
+        "the revocation",
+        BOUND,
+        host.network().revoke_device(first_revoked.device_id),
+    )
+    .await
+    .expect("the device is revoked");
+    assert!(barrier.holds(), "{barrier:?}");
+
+    let second_ran_out = within(
+        "the second pairing",
+        BOUND,
+        pair_with(&host, &ran_out, &owner, grant_past_the_moved_clocks()),
+    )
+    .await;
+    let second_revoked = within(
+        "the second pairing",
+        BOUND,
+        pair_with(&host, &revoked, &owner, grant_past_the_moved_clocks()),
+    )
+    .await;
+
+    assert!(
+        !is_served(&old_ran_out).await,
+        "the connection of the record that ran out is refused every request"
+    );
+    assert!(
+        !is_served(&old_revoked).await,
+        "the connection of the revoked record was ended"
+    );
+    for (device, second) in [(&ran_out, &second_ran_out), (&revoked, &second_revoked)] {
+        let session = within("the connection", BOUND, connect(&host, device, second)).await;
+        assert!(is_served(&session).await, "the new connection is served");
+        within("the host counting the connection", BOUND, async {
+            while host.connections_of(second) != 1 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        session.close();
+    }
+    assert_eq!(
+        host.connections_of(&first_revoked),
+        0,
+        "nothing is counted for the revoked record"
+    );
+    old_ran_out.close();
+    host.stop().await;
+}
