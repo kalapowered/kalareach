@@ -1092,13 +1092,14 @@ async fn ask(
     environment_id: EnvironmentId,
     json: bool,
     progress: &Progress,
+    launch_only: bool,
 ) -> Asked {
     let composed = client
         .compose(
             Method::HostStop,
             ActionId::new(kr_ipc::new_uuid()),
             ActionTarget::environment(environment_id),
-            &HostStopParams { launch_only: false },
+            &HostStopParams { launch_only },
         )
         .await;
     let mutation = match composed {
@@ -1108,20 +1109,22 @@ async fn ask(
         }
     };
     // Set before the request is written: an interrupt from here on may find it taken.
-    progress.enter(Stage::Asked);
+    if !launch_only {
+        progress.enter(Stage::Asked);
+    }
     let request_id = mutation.request_id;
     if let Err(error) = client
         .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
     {
         let failed = after_the_write_failed(error);
-        if matches!(failed, Asked::NotComposed { .. }) {
+        if matches!(failed, Asked::NotComposed { .. }) && !launch_only {
             // Nothing left, so an interrupt from here on has no request to speak of.
             progress.enter(Stage::BeforeAsking);
         }
         return failed;
     }
-    if !json {
+    if !json && !launch_only {
         report::say(&shown!(
             "Asked the control daemon for environment {} to stop. It waits up to {} seconds for \
              session creates under way, and an interrupt does not cancel the stop.",
@@ -1288,7 +1291,7 @@ async fn stop_the_daemon(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marker);
 
-    let (request, pid, unsettled) = match ask(&mut client, id, json, progress).await {
+    let (request, pid, unsettled) = match ask(&mut client, id, json, progress, false).await {
         Asked::Taken(result) => {
             progress.enter(Stage::Told);
             (
@@ -5019,17 +5022,23 @@ mod tests {
             environment_id: id,
             earlier: Mutex::new(Vec::new()),
         };
-        match ask(&mut client, id, true, &progress).await {
+        match ask(&mut client, id, true, &progress, false).await {
             Asked::NotComposed { error } => closed_by_the_daemon(&error),
             _ => panic!("the request could be composed"),
         }
     }
 
-    /// The request that `ask` writes for a stop is the one composed by hand with `launch_only`
-    /// false, whatever its identifiers: the same method, version, target, preconditions, window,
-    /// lifetime and parameters, read off a real connection.
-    #[tokio::test]
-    async fn the_request_a_stop_writes_is_the_one_composed_with_launch_only_false() {
+    /// What `ask` writes on a real connection for `launch_only`, with the same request composed by
+    /// hand on the same connection for `launch_only` and for its opposite, and the stage that the
+    /// command is at afterwards.
+    async fn request_written_for(
+        launch_only: bool,
+    ) -> (
+        kr_protocol::envelope::MutationRequest,
+        kr_protocol::envelope::MutationRequest,
+        kr_protocol::envelope::MutationRequest,
+        Stage,
+    ) {
         use kr_ipc::client::LocalClient;
         use kr_protocol::local::LocalClientKind;
 
@@ -5049,7 +5058,7 @@ mod tests {
             };
             writer
                 .write_message(&ControlFrame::Response(kr_protocol::envelope::Response {
-                    request_id: request.request_id.clone(),
+                    request_id: request.request_id,
                     outcome: Outcome::Error(ProtocolError::new(
                         ErrorCode::PermissionDenied,
                         "refused for the case",
@@ -5068,20 +5077,57 @@ mod tests {
             environment_id: id,
             earlier: Mutex::new(Vec::new()),
         };
-        let mut composed = client
+        let mut same = client
             .compose(
                 Method::HostStop,
                 ActionId::new(kr_ipc::new_uuid()),
                 ActionTarget::environment(id),
-                &HostStopParams { launch_only: false },
+                &HostStopParams { launch_only },
             )
             .await
             .expect("composes");
-        let _ = ask(&mut client, id, true, &progress).await;
+        let mut other = client
+            .compose(
+                Method::HostStop,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(id),
+                &HostStopParams {
+                    launch_only: !launch_only,
+                },
+            )
+            .await
+            .expect("composes");
+        let _ = ask(&mut client, id, true, &progress, launch_only).await;
         let written = daemon.await.expect("the daemon read the request");
-        composed.action_id = written.action_id.clone();
-        composed.request_id = written.request_id.clone();
-        assert_eq!(written, composed);
+        for composed in [&mut same, &mut other] {
+            composed.action_id = written.action_id;
+            composed.request_id = written.request_id;
+        }
+        (written, same, other, progress.stage())
+    }
+
+    /// The request that `ask` writes for a stop is the one composed by hand with `launch_only`
+    /// false, whatever its identifiers: the same method, version, target, preconditions, window,
+    /// lifetime and parameters, and not the request for the launch alone. The command is at the
+    /// stage that says it asked.
+    #[tokio::test]
+    async fn the_request_a_stop_writes_is_the_one_composed_with_launch_only_false() {
+        let (written, same, other, stage) = request_written_for(false).await;
+        assert_eq!(written, same);
+        assert_ne!(written, other, "the control: the other request differs");
+        assert_eq!(stage, Stage::Asked);
+    }
+
+    /// The request that `ask` writes for the launch alone is the one composed by hand with
+    /// `launch_only` true, and it enters no stage: nothing is asked to stop, so an interrupt has no
+    /// request to speak of.
+    #[tokio::test]
+    async fn the_request_for_the_launch_alone_is_composed_with_launch_only_true_and_enters_no_stage()
+     {
+        let (written, same, other, stage) = request_written_for(true).await;
+        assert_eq!(written, same);
+        assert_ne!(written, other, "the control: the other request differs");
+        assert_eq!(stage, Stage::BeforeAsking);
     }
 
     /// A connection that the daemon closed is a closed connection, as the command reads the failure
