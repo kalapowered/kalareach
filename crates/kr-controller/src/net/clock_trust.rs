@@ -2447,6 +2447,60 @@ mod tests {
         );
     }
 
+    /// KR-REQ-09.17, KR-REQ-09.18: whether a reading is new proof is decided at the earlier of the
+    /// two readings of the continuous clock, as the anchor is taken there. The wall clock steps
+    /// 150 ms forward and the reading is held up for a fifth of a second
+    /// after it was read, inside the bracket: at the earlier reading the wall is 156 ms past the
+    /// projection and moves the anchor, at the later reading it is 44 ms short of it and would
+    /// not. The wall clock is then put back until it stands 5,050 ms behind the anchor that the
+    /// earlier reading made, which is 4,894 ms behind the anchor it would have been measured
+    /// against otherwise; the durable mark, which holds the highest wall read, shows 4,050 ms.
+    #[test]
+    fn a_step_forward_inside_the_bracket_moves_the_anchor_where_the_earlier_reading_projects_it() {
+        let devices = DeviceDirectory::in_memory().expect("a directory");
+        let machine = Machine::new();
+        let continuous = ManualClock::new();
+        let pause = Pause::new(&machine, &continuous, Duration::from_millis(200));
+        let after_the_wall = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trust = {
+            let wall = Arc::clone(&machine.wall);
+            let arming = pause.clone();
+            let after_the_wall = Arc::clone(&after_the_wall);
+            ClockTrust::new(
+                crate::service::WallClock::from_fn(move || {
+                    let reading = wall.load(Ordering::SeqCst);
+                    if after_the_wall.swap(false, Ordering::SeqCst) {
+                        arming.arm(1);
+                    }
+                    reading
+                }),
+                Arc::new(UtcFloor::at(0)),
+                Arc::new(Slipping {
+                    inner: continuous.clone(),
+                    pause: pause.clone(),
+                }),
+                Arc::new(machine.boot_clock.clone()),
+                machine.boot.clone(),
+            )
+        };
+        let run = Run {
+            machine: machine.clone(),
+            continuous,
+            trust,
+        };
+        assert!(proven(&run, &devices));
+        run.pass(MINUTE);
+        machine.set_wall(machine.wall() + 150);
+        after_the_wall.store(true, Ordering::SeqCst);
+        assert!(proven(&run, &devices), "the held-up reading is trusted");
+        run.pass(Duration::from_millis(800));
+        machine.set_wall(machine.wall() - 5_050);
+        assert!(
+            !proven(&run, &devices),
+            "the step back is found against the anchor that the step forward moved"
+        );
+    }
+
     /// KR-REQ-09.17, KR-REQ-09.18: three tries that are all held up give no reading: a refusal
     /// to try again, no distrust, and nothing owed. The only write is the raise of the durable
     /// mark that a stored reading makes at the reading itself, to the highest wall the tries read:
