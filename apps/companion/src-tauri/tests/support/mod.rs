@@ -1179,6 +1179,8 @@ pub async fn phone_paired_with(host: &Host, owner: &DeviceKeys, rights: &[Action
 pub struct LinkControl {
     /// How many connections to a paired host were asked for.
     asked: std::sync::atomic::AtomicUsize,
+    /// How many of them each host was asked for.
+    asked_of: Mutex<std::collections::BTreeMap<kr_protocol::scalars::EndpointKey, usize>>,
     /// The pool that the connections of the device this governs stand on.
     pool: Mutex<Option<Arc<kr_client::pairing::link::EndpointPool>>>,
     /// What a case looks at when the link is told to forget a host, before the link goes on.
@@ -1382,6 +1384,16 @@ impl LinkControl {
         for sender in waiting {
             let _ = sender.send(());
         }
+    }
+
+    /// How many connections have been asked for `host`, held ones included.
+    pub fn asked_of(&self, host: &kr_protocol::scalars::EndpointKey) -> usize {
+        self.asked_of
+            .lock()
+            .expect("the record")
+            .get(host)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// How many connections have been asked for, held ones included.
@@ -1979,6 +1991,13 @@ impl ControlledLink {
         self.control
             .asked
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self
+            .control
+            .asked_of
+            .lock()
+            .expect("the record")
+            .entry(host.host_endpoint_id)
+            .or_default() += 1;
         let held = {
             let mut state = self.control.state.lock().expect("the record");
             let visiting = VISITING.try_with(|()| ()).is_ok();
