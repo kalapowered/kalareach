@@ -523,6 +523,76 @@ async fn kr_req_17_48_when_a_request_ends_the_next_dial_asks_and_the_answers_are
     );
 }
 
+/// KR-REQ-10.54, KR-REQ-17.40, KR-REQ-17.48: one request for an entry is alive at a time in the order
+/// of two dials too, where one has counted its ask and started its request and has not returned: a
+/// dial that reads the entry then finds that request alive and starts none. The answer comes at 0 s
+/// and is kept to 60. At 52 the dial of one candidate counts its ask and starts the second request,
+/// whose call to the service stays behind its gate, and the cache's testing hook holds that dial just
+/// after its locked step. The dial of another candidate then reads the same entry. The service has
+/// been asked twice when that dial has returned, and twice, in all, when the held one has too.
+#[tokio::test]
+async fn kr_req_17_48_a_dial_that_reads_the_entry_while_another_holds_its_new_request_starts_none()
+{
+    let clock = AdmissionClock::default();
+    let (service, gate) = Scripted::gated_script(vec![unable(None), no_answer()]);
+    let (reached, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let held = key(0x33);
+    let admissions = scripted_admissions(Arc::clone(&service), &clock)
+        .waiting(Duration::from_millis(20))
+        .after_the_locked_step({
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            move |candidate| {
+                let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+                Box::pin(async move {
+                    if candidate == held {
+                        reached.notify_one();
+                        release.notified().await;
+                    }
+                })
+            }
+        });
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+
+    gate.notify_one();
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    service.answered_to(1).await;
+    clock.advance(Duration::from_secs(52));
+
+    let held_dial = tokio::spawn({
+        let (admissions, relays) = (admissions.clone(), relays.clone());
+        async move { admissions.before_dial(&relays, &host, held).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), reached.notified())
+        .await
+        .expect("the dial reaches the hook");
+    service.asked_to(2).await;
+    assert_eq!(
+        service.asks(),
+        2,
+        "the held dial has started the second request"
+    );
+
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        service.asks(),
+        2,
+        "the dial that reads the entry beside the held one starts no third request"
+    );
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), held_dial)
+        .await
+        .expect("the held dial returns")
+        .expect("the held dial's task");
+    gate.notify_one();
+    service.answered_to(2).await;
+    assert_eq!(service.asks(), 2, "two requests in all");
+}
+
 /// KR-REQ-17.48: a failure of the service itself stands as the lack of capacity does while the next
 /// request is on its way, and is lifted by that request's failure. The answer at 0 s names no path
 /// and is kept to 60; the request at 52 fails at 90.
@@ -948,6 +1018,17 @@ impl Scripted {
 
     fn asks(&self) -> usize {
         self.asked.load(Ordering::SeqCst)
+    }
+
+    /// Waits until `count` requests have been made of the service, answered or not.
+    async fn asked_to(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while self.asks() < count {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request is made");
     }
 
     /// Waits until `count` requests have been answered, and so kept by the cache.

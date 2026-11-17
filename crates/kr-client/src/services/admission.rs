@@ -500,6 +500,15 @@ struct State {
     suspended_until: Option<Instant>,
 }
 
+/// What a test hangs on a dial just after its locked step: it is given the candidate the dial was
+/// made with, and the dial waits for what it returns.
+#[cfg(feature = "testing")]
+type DialHook = Arc<
+    dyn Fn(EndpointKey) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The managed service's admissions for the relays a device dials, asked for as it dials.
 ///
 /// See this module's note on what is kept and for how long.
@@ -510,6 +519,9 @@ pub struct PairingAdmissions {
     clock: AdmissionClock,
     wait: Duration,
     state: Arc<Mutex<State>>,
+    /// The hook a test set, if any. It is in this crate's test builds alone.
+    #[cfg(feature = "testing")]
+    after_locked_step: Option<DialHook>,
 }
 
 impl std::fmt::Debug for PairingAdmissions {
@@ -542,6 +554,8 @@ impl PairingAdmissions {
             clock: AdmissionClock::default(),
             wait: ANSWER_WAIT,
             state: Arc::new(Mutex::new(State::default())),
+            #[cfg(feature = "testing")]
+            after_locked_step: None,
         })
     }
 
@@ -556,6 +570,24 @@ impl PairingAdmissions {
     #[must_use]
     pub fn on_clock(mut self, clock: AdmissionClock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// The same, with `hook` awaited by each dial just after the locked step in which it counts its
+    /// ask and starts its request (once for each relay it asks about), given the candidate the dial
+    /// was made with. A test holds one dial there while another dial reads the same entry. It is in
+    /// this crate's test builds alone: a build without the `testing` feature has no hook and no wait
+    /// at that place.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn after_the_locked_step(
+        mut self,
+        hook: impl Fn(EndpointKey) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.after_locked_step = Some(Arc::new(hook));
         self
     }
 
@@ -660,6 +692,12 @@ impl PairingAdmissions {
                 }
                 asked
             };
+            #[cfg(feature = "testing")]
+            {
+                if let Some(hook) = &self.after_locked_step {
+                    hook(candidate).await;
+                }
+            }
             started.extend(asked);
         }
 
