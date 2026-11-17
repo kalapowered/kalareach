@@ -28,11 +28,12 @@
 //! each switch the case waits until every pump of the front waits at the gate, and it judges the
 //! stop by the questions that were asked from then until the resume. It fails unless every
 //! connection stays open, each is answered again within [`RECOVERY`] after each resume, every
-//! question to them is answered, every pump waits at the gate within [`STAND`] of each switch, no
-//! question that was asked after every pump waited at the gate is answered before the relay
-//! resumes, and the healthy host stays under the limit through every stop. It prints how many
-//! datagrams the relay actor dropped for the stopped relay's queue in each stop and outside the
-//! stops, and asserts no count of them: a short stop can end before the queue is full.
+//! question to them is answered, every pump waits at the gate within [`STAND`] of each switch, at
+//! least one question is asked in each stop's window, none of the questions asked in a window is
+//! answered before the relay resumes, and the healthy host stays under the limit through every
+//! stop. The windows are judged once every question has ended. It prints how many datagrams the
+//! relay actor dropped for the stopped relay's queue in each stop and outside the stops, and
+//! asserts no count of them: a short stop can end before the queue is full.
 //!
 //! Both are outside the default suite: each runs for minutes, so they are asked for by name with
 //! `--ignored --nocapture`, which prints what they measured. They run with one test thread
@@ -608,20 +609,6 @@ impl Asker {
             .min()
     }
 
-    /// How many questions were asked from `from` up to `before` and ended, and how many of those
-    /// were answered before `before`.
-    fn asked_between(&self, from: Instant, before: Instant) -> (usize, usize) {
-        let slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
-        let (mut asked, mut early) = (0, 0);
-        for (began, outcome) in slots.iter().flatten() {
-            if *began >= from && *began < before {
-                asked += 1;
-                early += usize::from(matches!(outcome, Ok(rtt) if *began + *rtt < before));
-            }
-        }
-        (asked, early)
-    }
-
     /// Stops asking, waits for every question to end, and returns when each was asked and how it
     /// ended, in the order they were asked.
     async fn finish(self) -> Vec<(Instant, Result<Duration, String>)> {
@@ -962,9 +949,10 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
 /// The recovery arrangement: `hosts` hosts with [`CONNECTIONS_PER_HOST`] connections each on the
 /// relay that stops `stops` times for `stop_for`, a small question every [`HOST_INTERVAL`] on each of
 /// those connections, and the next stop only once every one of them has answered a question that
-/// was asked after the resume, or at the deadline of that wait. Each stop is checked: no question
-/// that was asked after every pump of the front waited at the gate, and before the resume, may have
-/// been answered before the resume. Returns the lines it printed, and the conditions it failed.
+/// was asked after the resume, or at the deadline of that wait. Each stop is checked once every
+/// question has ended: no question that was asked after every pump of the front waited at the gate,
+/// and before the resume, may have been answered before the resume. Returns the lines it printed,
+/// and the conditions it failed.
 async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String>, Vec<String>) {
     let seen = capture();
     let world = World::start(hosts, Load::Questions).await;
@@ -1055,29 +1043,6 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
                 "stop {stop}: {late} of {connections} connections were answered again later than {RECOVERY:?} after the resume"
             ));
         }
-        // The stop's own effect. A stopped front passes no byte either way, so a question that was asked
-        // once every pump waited at the gate gets no answer before the resume.
-        if let Some(stood) = stood[stop - 1] {
-            let (mut asked_in_stop, mut answered_early) = (0, 0);
-            for asker in &asking {
-                let (asked, early) = asker.asked_between(stood, resumed);
-                asked_in_stop += asked;
-                answered_early += early;
-            }
-            lines.push(format!(
-                "STOPPED stop {stop}: {answered_early} of {asked_in_stop} questions asked after every pump of the front waited at the gate and before the resume were answered before the resume"
-            ));
-            if asked_in_stop == 0 {
-                failures.push(format!(
-                    "stop {stop}: no question that was asked after every pump of the front waited at the gate had ended by the resume, so the stop was not checked"
-                ));
-            }
-            if answered_early != 0 {
-                failures.push(format!(
-                    "stop {stop}: {answered_early} of {asked_in_stop} questions asked after every pump of the front waited at the gate and before the resume were answered before the resume: the relay was not stopped"
-                ));
-            }
-        }
     }
     let before_last = healthy.started();
     until("the questions after the last resume", || {
@@ -1108,12 +1073,14 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
         ));
     }
     let (mut asked, mut unanswered, mut slowest) = (0, 0, Duration::ZERO);
+    let mut by_connection: Vec<Vec<(Instant, Result<Duration, String>)>> = Vec::new();
     for asker in asking {
         let outcomes = asker.finish().await;
         let (_, none, longest) = tally(&outcomes);
         asked += outcomes.len();
         unanswered += none;
         slowest = slowest.max(longest);
+        by_connection.push(outcomes);
     }
     lines.push(format!(
         "FIGURE connections to the hosts on the stopped relay: connections {connections}, questions {asked}, unanswered {unanswered}, longest {} ms",
@@ -1123,6 +1090,34 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
         failures.push(format!(
             "{unanswered} questions to the hosts on the stopped relay were not answered"
         ));
+    }
+    // The stops' own effect, judged now that every question has ended. A stopped front passes no byte
+    // either way, so a question that was asked once every pump waited at the gate gets no answer
+    // before the resume.
+    for (number, ((_, resumed), stood)) in windows.iter().zip(&stood).enumerate() {
+        let Some(stood) = stood else { continue };
+        let (mut in_window, mut answered_early) = (0, 0);
+        for (began, outcome) in by_connection.iter().flatten() {
+            if began >= stood && began < resumed {
+                in_window += 1;
+                answered_early +=
+                    usize::from(matches!(outcome, Ok(rtt) if *began + *rtt < *resumed));
+            }
+        }
+        let stop = number + 1;
+        lines.push(format!(
+            "STOPPED stop {stop}: {answered_early} of {in_window} questions asked after every pump of the front waited at the gate and before the resume were answered before the resume"
+        ));
+        if in_window == 0 {
+            failures.push(format!(
+                "stop {stop}: no question was asked after every pump of the front waited at the gate and before the resume, so the stop was not checked"
+            ));
+        }
+        if answered_early != 0 {
+            failures.push(format!(
+                "stop {stop}: {answered_early} of {in_window} questions asked after every pump of the front waited at the gate and before the resume were answered before the resume: the relay was not stopped"
+            ));
+        }
     }
     let in_stops: usize = windows
         .iter()
