@@ -152,12 +152,14 @@ impl RelayFront {
     /// Starts a front that passes every byte to `relay` and back until it is told to stall, with
     /// a receive buffer of a few KiB of its own.
     ///
-    /// Stalled, it starts no read and no write on any connection that it holds, so the sockets stay
-    /// open and the device's side of each fills. A write that is under way when the switch is made
-    /// can end after it. It goes on accepting connections that are made after the switch and leaves
-    /// each of them alone, so that a client dialling it again meets a connection that never
-    /// completes its handshake and not a refusal. On resume it passes again, bytes and new
-    /// connections alike; what it held was never read, so no byte is lost.
+    /// Stalled, it starts no pass of its copy loop on any connection that it holds, so the sockets
+    /// stay open and the device's side of each fills. The switch does not stop a pass that is under
+    /// way: a read that is ready when the switch is made can still be taken, its chunk is then
+    /// written, and that write can end after the switch. It goes on accepting connections that are
+    /// made after the switch and leaves each of them alone, so that a client dialling it again
+    /// meets a connection that never completes its handshake and not a refusal. On resume it
+    /// passes again, bytes and new connections alike; a chunk that was read is written and the
+    /// rest was never read, so no byte is lost.
     pub fn stalling(relay: &LocalRelay) -> Self {
         let upstream = authority(&relay.url);
         let (switch, gate) = watch::channel(false);
@@ -204,7 +206,8 @@ impl RelayFront {
         }
     }
 
-    /// Stops a stalling front starting a read or a write; a write that is under way can end after
+    /// Stops a stalling front after the pass that is under way in each direction: a read that is
+    /// ready at the switch can still be taken and its chunk written, and that write can end after
     /// the switch.
     pub fn stall(&self) {
         self.switch
@@ -278,9 +281,10 @@ async fn carry(
     );
 }
 
-/// Copies `from` to `to` a chunk at a time, and starts no read while the front is stalled. A read
-/// that the switch interrupts has taken nothing, so the stream continues intact on resume; a write
-/// of a chunk that was already read is not interrupted and can end after the switch.
+/// Copies `from` to `to` a chunk at a time, and starts no pass while the front is stalled. The
+/// `select!` that races a read against the switch is not biased, so a read that is ready when the
+/// switch is made can win it and its chunk is then written after the switch; a read that the
+/// switch wins has taken nothing, so the stream continues intact on resume.
 async fn pump(
     mut from: OwnedReadHalf,
     mut to: OwnedWriteHalf,
