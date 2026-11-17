@@ -4,13 +4,15 @@
 # function, the checks they call directly, the pure readers of the clocks and the gate, and the
 # broker's checks, the three wrappers of a lock that the pure readers call, and the helpers that
 # those reach by a name that this crate declares once, which the scan reads and follows as well. A
-# name that several functions declare has to be a scoped function, an `outside` one or allowed for
-# the one body that calls it.
+# name that several functions declare has to be a scoped function, an `outside` one, allowed for the
+# one body that calls it (a method of the standard library or of another crate) or given the file of
+# its definition by a `calls` row (a function of this crate).
 #
 # scope <file> <function>
 # site <file> <function> <callee> <how many calls>
 # outside <file> <function>
 # allow <file> <function> <name> ...
+# calls <file> <function> <name> <file of the definition>
 # caller <callee> <file> <function> <count>
 # only <callee> <file> <function> <count>
 # held <file> <function> <callee> <guards>
@@ -195,15 +197,18 @@ supplies crates/kr-worker/src/broker/mod.rs commit_dispatch checks 0 against
 supplies crates/kr-worker/src/broker/mod.rs commit_dispatch checks 3 crate::broker::methods::Ask::Again
 supplies crates/kr-worker/src/broker/mod.rs admit_mutation_in checks 0 &against
 
-# The base's own takes that the follow shows below the pass, each as at the base: the expiry sweep
-# (the first mode's) asks the agents' view whether a question's binding is current, which takes the
-# broker's lock through `binding_state` while the question ledger's lock is held (the ledger's lock,
-# then the broker's); the presented-token detach reaches the input domain's lock through the
-# session's fence (`detach_for_token`, `fence`), under the barrier and the session.
+# Takes that the follow shows below the pass: the expiry sweep (the first mode's) asks the agents'
+# view whether a question's binding is current, which takes the broker's lock through
+# `binding_state` while the question ledger's lock is held (the ledger's lock, then the broker's);
+# the presented-token detach takes the input domain's lock itself (`Session::detach_for_token`),
+# reads the input domain's fence through that guard (`InputDomain::fence`) and compares the token
+# in the fence driver (`FenceDriver::detach_for_token`), which takes nothing, under the barrier and
+# the session.
 site crates/kr-worker/src/broker/mod.rs binding_state state 1
 site crates/kr-worker/src/session.rs detach_for_token lock 1
-# The same sweep's check that a binding still attests its thread takes the bridge's own state lock
-# (`attested_thread`), one leaf under the broker's lock: as at the base.
+# The same sweep's check that a binding still attests its thread takes the broker's lock through
+# `Broker::state` (`attested_thread`), under the ledger's lock as `binding_state` does: the ledger's
+# lock, then the broker's.
 site crates/kr-worker/src/broker/bridge.rs attested_thread state 1
 
 # The two functions that call the dispatch of an accepted action, each once: the first admission's

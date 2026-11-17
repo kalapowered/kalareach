@@ -7,7 +7,9 @@
 //! text, and what it does not see, is in `standing_scan/mod.rs`: it reads the body of every helper
 //! that a listed body calls by a name that this crate declares once, and the helpers those call in
 //! turn, so a helper that takes a lock is found where it stands; a name that several functions
-//! declare has to be a scoped function, an `outside` one or allowed for the one body that calls it.
+//! declare has to be a scoped function, an `outside` one, allowed for the one body that calls it (a
+//! method of the standard library or of another crate) or given the file of its definition by a
+//! `calls` row (a function of this crate).
 //!
 //! Beside the takes the roster holds the call sites of the pass: the functions that call a piece,
 //! the checks that each piece calls, the guards (the dispatch barrier and the session) that a
@@ -17,8 +19,13 @@
 //! The cases after the first plant a fault in the real source and show the scan reporting it with
 //! the finding that names the place: a take in a function that may take none, a clock reader that
 //! is not pure, a take in a helper that no row declares or that a listed body calls (the time
-//! contract's lock function, the attachment list's check), a new caller of a piece, a check made
-//! with the wrong guard held, a call that hands on the wrong session, and a call that is gone.
+//! contract's lock function, the attachment list's check), a take in a function that a `calls` row
+//! reaches (the journal's count, the fence driver's detach, the input domain's fence, the
+//! questions' store's read, the binder's count of open work), a new caller of a piece, a check
+//! made with the wrong guard held, a call that hands on the wrong session or the wrong record, and
+//! a call that is gone. Two cases plant a reading kept under the contract's lock in the proven or
+//! the wall reader; the take that they find is the lock of the helper that keeps the reading
+//! (`wall_reading`), so their finding names that helper and not the call that reaches it.
 
 #[path = "standing_scan/mod.rs"]
 mod scan;

@@ -4,13 +4,15 @@
 # function, the checks they call directly, the pure readers of the clocks and the gate, and the
 # broker's checks, the three wrappers of a lock that the pure readers call, and the helpers that
 # those reach by a name that this crate declares once, which the scan reads and follows as well. A
-# name that several functions declare has to be a scoped function, an `outside` one or allowed for
-# the one body that calls it.
+# name that several functions declare has to be a scoped function, an `outside` one, allowed for the
+# one body that calls it (a method of the standard library or of another crate) or given the file of
+# its definition by a `calls` row (a function of this crate).
 #
 # scope <file> <function>
 # site <file> <function> <callee> <how many calls>
 # outside <file> <function>
 # allow <file> <function> <name> ...
+# calls <file> <function> <name> <file of the definition>
 # caller <callee> <file> <function> <count>
 # only <callee> <file> <function> <count>
 # held <file> <function> <callee> <guards>

@@ -9,20 +9,27 @@
 //! out. A call is a name that an opening parenthesis follows; a counted call is one that follows a
 //! `.` or a `::`.
 //!
-//! What it does not see. It reads names and not types: a name that two functions declare is
-//! judged for each place it is called, and a row for one of the two covers the other, so a change
-//! of receiver is not seen. It does not see a call through a function pointer or a closure that is
-//! passed in, a macro's expansion, a call to a name that no function of this crate declares (the
-//! standard library and other crates), a helper below a name that several functions declare and
-//! that no `scope` row names, or what a guard is, beyond the two names it knows (a `let` that
-//! calls `session` or locks the service's `dispatch`, and a parameter of the session's type).
+//! What it does not see. It reads names and not types: where a name is declared by several
+//! functions, a `calls` row or an `allow` row says which definition a body calls, and the row is
+//! the author's reading of the receiver's type, not a proof. It does not see a call through a
+//! function pointer or a closure that is passed in, a macro's expansion, a call to a name that no
+//! function of this crate declares (the standard library and other crates), what a guard is beyond
+//! the two names it knows (a `let` that calls `session` or locks the service's `dispatch`, and a
+//! parameter of the session's type), or an `allow`ed name's body. A `calls` row reads every
+//! function of that name in the file it names, so a type that shares a name with another in that
+//! file is read together with it.
 //!
 //! What it follows. A call from a function that the scan reads to a name that this crate declares
 //! once is followed: the callee's body is read, and so are the bodies that it calls in turn, and a
-//! counted call found in any of them needs its own `site` row. The scan therefore reads every
-//! helper that a listed body reaches by such a name, whether a row declares it or not.
+//! counted call found in any of them needs its own `site` row. A call to a name that several
+//! functions declare is followed into the file that a `calls` row names. The scan therefore reads
+//! every helper that a listed body reaches, whether a row declares it or not. A name that this
+//! crate declares once and that is really a method of the standard library or of another crate
+//! needs an `allow` row, or the scan reads the crate's function of that name.
 //!
-//! The roster has these kinds of row, one to a line, with `#` for a comment:
+//! The roster has these kinds of row, one to a line, with `#` for a comment. A kind that holds one
+//! value for a key (`site`, `caller` and `only`, `held`, `supplies`) refuses a second row for the
+//! same key, so that a later row never replaces an earlier one:
 //!
 //! * `scope <file> <function>`: a function whose body is read, and a name that is judged by that
 //!   row wherever it is called.
@@ -30,10 +37,13 @@
 //!   that the scan reads, scoped or followed.
 //! * `outside <file> <function>`: a function that is declared and not read, and not followed,
 //!   which has to exist, so that a rename does not leave a stale statement.
-//! * `allow <file> <function> <name> ...`: names that this function calls and the scan does not
-//!   follow: the standard library's method, or a name that several functions of the crate declare.
-//!   The row counts for that function alone. A name that the function does not call fails, so the
-//!   list cannot go stale.
+//! * `allow <file> <function> <name> ...`: names that this function calls where the receiver is a
+//!   type of the standard library or of another crate, and the scan does not follow. The row
+//!   counts for that function alone. A name that the function does not call fails, so the list
+//!   cannot go stale, and a name that the function also has a `calls` row for fails too.
+//! * `calls <file> <function> <name> <file of the definition>`: the definition that this function
+//!   calls where several functions of the crate declare `name` and the receiver is a type of this
+//!   crate. The scan reads it. A body that calls two definitions has one row for each file.
 //! * `caller <callee> <file> <function> <count>`: a call of `callee` from `function`; in each file
 //!   that a row of `callee` names, no other function calls it and the count is exact. A counted
 //!   call inside a function that the scan reads is judged by its site row.
@@ -41,13 +51,16 @@
 //! * `held <file> <function> <callee> <guards>`: the guards that `function` holds where it calls
 //!   `callee`, as a comma list of `BAR` (the dispatch barrier), `SES` (the session) or `none`.
 //! * `supplies <file> <function> <callee> <position> <text>`: the argument at `position` (from
-//!   zero) of every call of `callee` from `function`, with its white space taken out, is `text`.
-//!   It reads what a call hands on where `held` reads what is live there.
+//!   zero) of every call of `callee` from `function`, with its white space taken out, is `text`. A
+//!   row for each argument of one call stands beside the others. It reads what a call hands on
+//!   where `held` reads what is live there.
 //!
-//! The boundary. A call from a scoped body to a name that several functions of this crate declare
-//! fails unless the name is one the scan counts, a scoped function, an `outside` function, a name
-//! allowed for that body or the callee of a `caller` or `only` row. A name that this crate
-//! declares once is read instead, as above.
+//! The boundary. A call from any body that the scan reads, scoped or followed, to a name that
+//! several functions of this crate declare fails unless the name is one the scan counts, an
+//! `outside` function, a name allowed for that body or one that a `calls` row for that body
+//! declares. A counted name called without a path is a free function: it is followed like any
+//! helper when it is declared once. A stale `allow` row or `calls` row fails, and so does a `calls`
+//! row whose file declares no function of that name.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
