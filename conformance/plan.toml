@@ -1166,6 +1166,14 @@ reading = 'cargo'
 command = ['cargo', 'test', '--locked', '-p', 'kr-client', '--test', 'shown_rule']
 
 [[step]]
+id = 'rust-the-client-s-session-over-the-local-connection'
+group = 'rust'
+what = '''the client's session over the local connection'''
+platforms = ['windows']
+reading = 'cargo'
+command = ['cargo', 'test', '--locked', '-p', 'kr-client', '--test', 'session']
+
+[[step]]
 id = 'rust-the-shared-directory-flush'
 group = 'rust'
 what = 'the shared directory flush'
