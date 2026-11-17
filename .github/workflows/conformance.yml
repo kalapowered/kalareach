@@ -75,6 +75,7 @@ jobs:
       # The runner fetches the action that keeps the evidence when the first step that calls it
       # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
       - name: Load the action that keeps the evidence
+        timeout-minutes: 2
         uses: ./.github/actions/keep-evidence
         with:
           only-load: "true"
@@ -246,6 +247,7 @@ jobs:
       # The runner fetches the action that keeps the evidence when the first step that calls it
       # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
       - name: Load the action that keeps the evidence
+        timeout-minutes: 2
         uses: ./.github/actions/keep-evidence
         with:
           only-load: "true"
@@ -511,6 +513,7 @@ jobs:
       # The runner fetches the action that keeps the evidence when the first step that calls it
       # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
       - name: Load the action that keeps the evidence
+        timeout-minutes: 2
         uses: ./.github/actions/keep-evidence
         with:
           only-load: "true"
