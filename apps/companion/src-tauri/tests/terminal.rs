@@ -4678,9 +4678,8 @@ async fn a_launch_is_pressed_on_the_views_link_and_a_moved_prompt_is_refused() {
         buffer_revision: kr_protocol::root::EditorBufferRevision::new(4),
     };
     link.answer(&launch, &installed).await;
-    let told = pressing
+    let told = answered(pressing, "the launch pressed on the view's link")
         .await
-        .expect("joins")
         .expect("the launch is installed");
     assert_eq!(
         told,
@@ -4699,9 +4698,8 @@ async fn a_launch_is_pressed_on_the_views_link_and_a_moved_prompt_is_refused() {
         "the prompt moved on before the launch was installed",
     )
     .await;
-    let refused = pressing
+    let refused = answered(pressing, "the launch quoting a prompt that moved")
         .await
-        .expect("joins")
         .expect_err("the prompt moved");
     assert_eq!(refused["code"], "DRAFT_CONFLICT", "{refused}");
 }
@@ -4716,8 +4714,8 @@ async fn a_press_that_names_more_than_the_command_and_its_quote_is_refused_unrea
     let mut lease = WorkerLease::default();
     let (view, mut link) =
         controlling(&page, &mut worker, 3, &reporting(Mouse::Sgr), &mut lease).await;
-    let refused = page
-        .invoke_later(
+    let refused = answered(
+        page.invoke_later(
             "terminal_view_launch",
             json!({ "view": view, "press": {
                 "session_id": kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string(),
@@ -4725,10 +4723,11 @@ async fn a_press_that_names_more_than_the_command_and_its_quote_is_refused_unrea
                 "expected_prompt_generation": "12",
                 "expected_buffer_revision": "3",
             }}),
-        )
-        .await
-        .expect("joins")
-        .expect_err("refused");
+        ),
+        "the launch press that names a session of its own",
+    )
+    .await
+    .expect_err("refused");
     assert_eq!(refused["code"], "INVALID_ARGUMENT", "{refused}");
     // The next call on the link is the person's own input: no launch went out before it.
     page.paste(&view, 1, "ok").expect("taken");
@@ -4761,21 +4760,21 @@ async fn a_launch_still_waiting_when_its_view_ends_is_an_unknown_outcome() {
         } else {
             page.close(&view);
         }
-        let told = pressing
+        let told = answered(pressing, "the launch pressed when the view ends")
             .await
-            .expect("joins")
             .expect_err("the view ended before the session answered");
         assert_eq!(code(&told), "OUTCOME_UNKNOWN", "{ending}: {told}");
         page.held_becomes(0).await;
 
-        let late = page
-            .invoke_later(
+        let late = answered(
+            page.invoke_later(
                 "terminal_view_launch",
                 json!({ "view": view, "press": press }),
-            )
-            .await
-            .expect("joins")
-            .expect_err("the view has ended");
+            ),
+            "the launch pressed after the view has ended",
+        )
+        .await
+        .expect_err("the view has ended");
         assert_eq!(code(&late), "LEASE_LOST", "{ending}: {late}");
     }
 }
@@ -4893,9 +4892,8 @@ async fn a_launch_goes_after_the_key_before_it_and_not_before_the_worker_answers
     lease.answer(&mut link, &key).await;
     link.expect(Method::ShellLaunch).await;
     page.close(&view);
-    let told = pressing
+    let told = answered(pressing, "the launch behind a key when the view closes")
         .await
-        .expect("joins")
         .expect_err("the view ended before the session answered");
     assert_eq!(code(&told), "OUTCOME_UNKNOWN");
 }
@@ -4921,10 +4919,12 @@ async fn a_launch_behind_an_unanswered_key_is_told_unknown_when_the_close_ends_t
         "the launch stands behind the key: nothing of it is on the wire"
     );
     page.close(&view);
-    let told = pressing
-        .await
-        .expect("joins")
-        .expect_err("the view ended before the launch was written");
+    let told = answered(
+        pressing,
+        "the launch behind an unanswered key when the view closes",
+    )
+    .await
+    .expect_err("the view ended before the launch was written");
     assert_eq!(code(&told), "OUTCOME_UNKNOWN");
     let sent = link.closed().await;
     assert!(sent.is_empty(), "{sent:?}");
