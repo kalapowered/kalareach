@@ -7520,6 +7520,37 @@ fn a_listener_that_never_answers_the_hello_is_not_an_environment_with_no_daemon(
     silent.end();
 }
 
+/// KR-REQ-07.12 (a definite refusal of the restart's request): a daemon answers the request with
+/// a refusal that is no lack of a right, so that the daemon did not take it. The restart says the
+/// daemon's words and that nothing was stopped, with the code of the refusal and the stop
+/// `refused`.
+#[test]
+fn a_restart_whose_request_the_daemon_refused_says_that_nothing_was_stopped() {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerTheStopWithError {
+            code: an_error_code_of(kr_protocol::error::RetryCategory::NoRetry),
+            end: false,
+        },
+        true,
+    );
+    let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
+    let said = failure_of(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(8), "{said}");
+    assert_eq!(stop_of(&said), "refused", "{said}");
+    let message = said["message"].as_str().expect("a message");
+    assert!(
+        message.ends_with(". Nothing was stopped."),
+        "the refusal's words, then that nothing was stopped: {message}"
+    );
+    assert!(host.answers(), "the daemon was not stopped");
+    daemon.end();
+}
+
 /// KR-REQ-07.12 (a lock that could not be looked at): a daemon that closes the connection with no
 /// answer leaves an unknown outcome, and the check of the lock then fails (a directory stands where
 /// the lock file is). The text says that the daemon did not show whether it took the stop and that
