@@ -647,6 +647,22 @@ pub struct WorkerService {
     /// every shipped build.
     #[cfg(feature = "testing")]
     after_the_hold_stall: crate::testing::Stall,
+    /// A stop in the end of a connection, before it takes the attachments it still owns, which
+    /// this host's own tests arm to see what a withdrawal and an acknowledgement leave in the
+    /// session while the end has not yet detached anything. It is compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    connection_end_stall: crate::testing::Stall,
+    /// A stop in a mutation inside the dispatch boundary and the session, after the lease and the
+    /// deadline were checked and before the marker is committed, which this host's own tests arm to
+    /// have a lease end in between. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_the_deadline_check_stall: crate::testing::Stall,
+    /// How many times an answer to a statement of what the local owner may do has found a detach
+    /// pending and waited for it, which this host's own tests read. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    detach_waits: std::sync::atomic::AtomicUsize,
     /// The highest restriction count of the local gate whose withdrawal of local connections is
     /// owed.
     withdrawals_owed: std::sync::atomic::AtomicU64,
@@ -1363,6 +1379,12 @@ impl WorkerService {
             after_the_dispatch_check_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             after_the_hold_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            connection_end_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            after_the_deadline_check_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            detach_waits: std::sync::atomic::AtomicUsize::new(0),
             withdrawals_owed: std::sync::atomic::AtomicU64::new(0),
             withdrawals_done: std::sync::atomic::AtomicU64::new(0),
             withdrawals_running: std::sync::atomic::AtomicUsize::new(0),
@@ -2391,6 +2413,54 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.after_the_hold_stall.arm()
+    }
+
+    /// Stops the next mutation after its lease and its deadline were checked inside the session and
+    /// before its marker is committed, for this host's own tests. The session is let go while it
+    /// stands and taken again when it is let go.
+    ///
+    /// Returns the end that says the mutation has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_a_mutation_after_its_deadline_check(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.after_the_deadline_check_stall.arm()
+    }
+
+    /// Stops the next connection that ends, before it takes the attachments it still owns, for this
+    /// host's own tests.
+    ///
+    /// Returns the end that says the connection has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_a_connection_at_its_end(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.connection_end_stall.arm()
+    }
+
+    /// How many times an answer to a statement of what the local owner may do has found a detach
+    /// pending and waited for it, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn detach_waits_for_tests(&self) -> usize {
+        self.detach_waits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many holds of the dispatch boundary have ended so far, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn releases_of_the_dispatch_boundary_for_tests(&self) -> u64 {
+        self.dispatch.releases()
     }
 
     /// Stops the next mutation that passes the dispatch boundary's check of the local owner's
@@ -4219,6 +4289,8 @@ impl WorkerService {
         if let Some(task) = state.page_task.take() {
             task.abort();
         }
+        #[cfg(feature = "testing")]
+        self.connection_end_stall.stand();
         let attachments = state.facts.take_attachments();
         // Counted until each is detached, here or by the service's own pass, so that a statement's
         // acknowledgement does not go out while a detach under the earlier statement is owed.
@@ -5853,6 +5925,9 @@ impl WorkerService {
             {
                 return answer;
             }
+            #[cfg(feature = "testing")]
+            self.detach_waits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             tokio::time::sleep(BOUNDARY_FIRST_RETRY).await;
         }
     }
@@ -8110,10 +8185,10 @@ impl WorkerService {
     /// its receipt still `accepted`; the second time, called with the preparation, it is
     /// revalidated against the present, as any accepted intent is before its marker.
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_accepted(
-        &self,
+    fn dispatch_accepted<'a>(
+        &'a self,
         holding: crate::trace::Acquisition<'_>,
-        mut session: std::sync::MutexGuard<'_, Session>,
+        mut session: std::sync::MutexGuard<'a, Session>,
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         method: Method,
@@ -8151,6 +8226,15 @@ impl WorkerService {
             // precondition the caller stated or a deadline this host accepted. For a mutation the
             // broker owns, what comes back is the admission itself.
             .and_then(|()| self.decidable(&session, mutation, method, caller, preparation));
+        // The stop lets the session go while it stands, so that the frames of a stream that the
+        // attach's own hold does not delay can reach their writer; the checks above were made
+        // under the lock, and the session is taken again before anything is pushed.
+        #[cfg(feature = "testing")]
+        if self.after_the_deadline_check_stall.is_armed() {
+            drop(session);
+            self.after_the_deadline_check_stall.stand();
+            session = self.runtime.session();
+        }
         let prepared = match revalidated {
             Ok(prepared) => prepared,
             Err(error) => {

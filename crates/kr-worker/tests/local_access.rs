@@ -1025,6 +1025,46 @@ async fn holds_by(
     .unwrap_or(false)
 }
 
+/// Waits on a thread of the blocking pool for a message on `end`, until `deadline`.
+async fn received_by<T: Send + 'static>(
+    deadline: std::time::Instant,
+    end: std::sync::mpsc::Receiver<T>,
+) -> Option<T> {
+    tokio::task::spawn_blocking(move || {
+        end.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Sends the daemon's statement `access` on a task of its own. Returns the flag that says the
+/// daemon has its acknowledgement, and the end that gives the daemon's connection back.
+fn start_the_statement(
+    daemon: BoundLink,
+    access: LocalAccess,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    std::sync::mpsc::Receiver<BoundLink>,
+) {
+    let acknowledged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&acknowledged);
+    let (given_back, daemon_end) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let mut daemon = daemon;
+        tell(&mut daemon, access).await;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = given_back.send(daemon);
+    });
+    (acknowledged, daemon_end)
+}
+
+/// Whether the flag is set.
+fn is_set(flag: &std::sync::atomic::AtomicBool) -> bool {
+    flag.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// What the meeting of a withdrawal and a delivery's start came to.
 struct Meeting {
     withdrawal_ended: bool,
@@ -1178,6 +1218,9 @@ struct Landing {
     attach_ended: bool,
     at_the_acknowledgement: Held,
     afterwards: Held,
+    /// Whether the attach's own answer, which came after the acknowledgement, is its receipt:
+    /// applied.
+    receipt_applied: bool,
 }
 
 /// One window whose attach has passed the dispatch boundary's check of the local owner's access
@@ -1205,31 +1248,7 @@ async fn the_meeting_of_an_attach_and_a_statement() -> Result<Landing, &'static 
 
     // The window attaches and claims a size of its own. Its attach passes the check under the
     // open host and stops before the session.
-    let target = world.target();
-    let session_id = world.session_id;
-    let (attach_done, attach_ended) = std::sync::mpsc::channel();
-    tokio::spawn(async move {
-        let mut requested = CanonicalSet::new();
-        requested.insert(AttachmentCapability::ObserveTerminal);
-        requested.insert(AttachmentCapability::Input);
-        requested.insert(AttachmentCapability::Geometry);
-        let _ = window
-            .mutate(
-                Method::SessionAttach,
-                ActionId::new(kr_ipc::new_uuid()),
-                target,
-                &SessionAttachParams {
-                    session_id,
-                    mode: AttachMode::Terminal,
-                    claim_geometry: true,
-                    dimensions: Nullable::some(Dimensions::new(100, 30)),
-                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
-                    requested,
-                },
-            )
-            .await;
-        let _ = attach_done.send(window);
-    });
+    let (attach_ended, applied) = start_the_geometry_attach(&world, window);
     if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
         return Err("the attach never passed the dispatch boundary's check");
     }
@@ -1299,12 +1318,14 @@ async fn the_meeting_of_an_attach_and_a_statement() -> Result<Landing, &'static 
         .expect("the record is not poisoned")
         .take()
         .expect("the acknowledgement was recorded");
+    let receipt_applied = is_set(&applied);
     drop(window);
     world.close();
     Ok(Landing {
         attach_ended,
         at_the_acknowledgement,
         afterwards,
+        receipt_applied,
     })
 }
 
@@ -1346,6 +1367,10 @@ fn an_attach_checked_before_the_host_restricts_its_owner_does_not_land_after_the
     assert_eq!(
         landing.afterwards, landing.at_the_acknowledgement,
         "the attach changed the session after the statement was acknowledged"
+    );
+    assert!(
+        landing.receipt_applied,
+        "the attach's receipt does not say applied"
     );
 }
 
@@ -1396,16 +1421,22 @@ async fn the_requests_of_a_window_while_a_statement_waits() {
     .unwrap_or(false);
     assert!(holding, "the boundary was never held");
 
-    // The statement closes the host, and waits for the hold.
-    let (told, told_end) = std::sync::mpsc::channel();
-    tokio::spawn(async move {
-        tell(&mut daemon, closed(2)).await;
-        let _ = told.send(daemon);
-    });
+    // The statement closes the host, and waits for the hold. Either it waits, or it is
+    // acknowledged: the first step that can tell which is where the state is read.
+    let (acknowledged, told_end) = start_the_statement(daemon, closed(2));
     let waiting = Arc::clone(&world.service);
+    let answered = Arc::clone(&acknowledged);
     assert!(
-        holds_by(deadline, move || waiting.statements_waiting_for_tests() > 0).await,
-        "the statement never waited for the hold"
+        holds_by(deadline, move || {
+            waiting.statements_waiting_for_tests() > 0 || is_set(&answered)
+        })
+        .await,
+        "the statement neither waited for the hold nor was acknowledged"
+    );
+    assert!(
+        !is_set(&acknowledged),
+        "the statement was acknowledged while a hold of the dispatch boundary that may have checked \
+         under the earlier statement stood"
     );
 
     // Held, the window's requests meet the host that is closed: they are refused while the hold
@@ -1434,16 +1465,8 @@ async fn the_requests_of_a_window_while_a_statement_waits() {
 
     // Let the hold go: the statement is acknowledged, and the window holds nothing.
     let _ = let_go.send(());
-    let acknowledged = tokio::task::spawn_blocking(move || {
-        told_end
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            .ok()
-    })
-    .await
-    .ok()
-    .flatten();
     assert!(
-        acknowledged.is_some(),
+        received_by(deadline, told_end).await.is_some(),
         "the statement was never acknowledged"
     );
     let nothing = Arc::clone(&world);
@@ -1523,48 +1546,71 @@ fn a_connection_that_a_restriction_withdrew_does_not_attach_again_when_the_host_
 }
 
 /// Starts the window's attach, which claims the geometry with a size of its own, on a task, and
-/// returns the end that gives the window back when the attach has been answered.
+/// returns the end that gives the window back when the attach has been answered, and the flag that
+/// says the answer was the attach's receipt, applied.
 fn start_the_geometry_attach(
     world: &World,
     window: LocalClient,
-) -> std::sync::mpsc::Receiver<LocalClient> {
+) -> (
+    std::sync::mpsc::Receiver<LocalClient>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
     let target = world.target();
-    let session_id = world.session_id;
+    let params = geometry_attach_params(world.session_id);
+    let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let noted = Arc::clone(&applied);
     let (attach_done, attach_ended) = std::sync::mpsc::channel();
     tokio::spawn(async move {
         let mut window = window;
-        let mut requested = CanonicalSet::new();
-        requested.insert(AttachmentCapability::ObserveTerminal);
-        requested.insert(AttachmentCapability::Input);
-        requested.insert(AttachmentCapability::Geometry);
-        let _ = window
+        let answer = window
             .mutate(
                 Method::SessionAttach,
                 ActionId::new(kr_ipc::new_uuid()),
                 target,
-                &SessionAttachParams {
-                    session_id,
-                    mode: AttachMode::Terminal,
-                    claim_geometry: true,
-                    dimensions: Nullable::some(Dimensions::new(100, 30)),
-                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
-                    requested,
-                },
+                &params,
             )
             .await;
+        if matches!(answer, Ok(Ok(_))) {
+            noted.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let _ = attach_done.send(window);
     });
-    attach_ended
+    (attach_ended, applied)
+}
+
+/// The parameters of an attach that claims the geometry with a size of its own.
+fn geometry_attach_params(session_id: SessionId) -> SessionAttachParams {
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    requested.insert(AttachmentCapability::Geometry);
+    SessionAttachParams {
+        session_id,
+        mode: AttachMode::Terminal,
+        claim_geometry: true,
+        dimensions: Nullable::some(Dimensions::new(100, 30)),
+        terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+        requested,
+    }
+}
+
+/// What the meeting of a second statement and a pending withdrawal came to.
+struct SecondMeeting {
+    /// The first statement was acknowledged while the hold that may have checked under the earlier
+    /// statement still stood, so nothing after it was scheduled.
+    first_answered_while_held: bool,
+    at_the_answer: Held,
 }
 
 /// A statement that waits for the hold of an attach that was checked before it, the answer to it
 /// stopped once the hold has ended, and then a second statement from another connection: the host
 /// repeats the first one on a replacement connection, or a newer daemon says its first. Returns
-/// what the session held when the second statement was answered.
+/// whether the first statement was acknowledged while the hold stood, and what the session held
+/// when the second statement was answered.
 async fn the_second_statement_meets_a_pending_withdrawal(
     generation: u64,
     repeated: bool,
-) -> Result<Held, &'static str> {
+) -> Result<SecondMeeting, &'static str> {
     let world = Arc::new(world("exec cat", true).await);
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
@@ -1576,19 +1622,35 @@ async fn the_second_statement_meets_a_pending_withdrawal(
     let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
     let (at_the_hold, go_statement) = world.service.stall_a_statement_after_its_hold();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
-    let attach_ended = start_the_geometry_attach(&world, window);
+    let (attach_ended, _applied) = start_the_geometry_attach(&world, window);
     if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
         return Err("the attach never passed the dispatch boundary's check");
     }
 
     // The host closes it: the statement has changed the gate and waits for the hold.
     let first = world.machine.lease(2, FAR_MS, FAR_MS);
-    tokio::spawn(async move {
-        let _ = daemon.announce_local_access(first).await;
-    });
+    let (acknowledged, _daemon_end) = start_the_statement(daemon, first);
     let waiting = Arc::clone(&world.service);
-    if !holds_by(deadline, move || waiting.statements_waiting_for_tests() > 0).await {
-        return Err("the statement never waited for the hold");
+    let answered = Arc::clone(&acknowledged);
+    if !holds_by(deadline, move || {
+        waiting.statements_waiting_for_tests() > 0 || is_set(&answered)
+    })
+    .await
+    {
+        return Err("the first statement neither waited for the hold nor was acknowledged");
+    }
+    if is_set(&acknowledged) {
+        // Acknowledged while the hold stood: the case is decided, and nothing more is scheduled.
+        let _ = go_attach.send(());
+        let reader = Arc::clone(&world);
+        let at_the_answer = tokio::task::spawn_blocking(move || held(&reader))
+            .await
+            .expect("the session is read");
+        world.close();
+        return Ok(SecondMeeting {
+            first_answered_while_held: true,
+            at_the_answer,
+        });
     }
     go_attach.send(()).expect("lets the attach go");
     if ends_by(deadline, async move { at_the_hold.await.is_ok() }).await != Some(true) {
@@ -1625,7 +1687,10 @@ async fn the_second_statement_meets_a_pending_withdrawal(
     .flatten();
     drop(window);
     world.close();
-    Ok(at_the_answer)
+    Ok(SecondMeeting {
+        first_answered_while_held: false,
+        at_the_answer,
+    })
 }
 
 /// KR-REQ-17.54: a repeat of a statement on a replacement connection is not answered while the
@@ -1637,11 +1702,16 @@ async fn the_second_statement_meets_a_pending_withdrawal(
 /// withdrawal is complete, so the window holds nothing when it comes.
 #[test]
 fn a_repeated_statement_is_not_answered_while_the_withdrawal_the_first_owes_is_pending() {
-    let held = on_a_runtime(the_second_statement_meets_a_pending_withdrawal(1, true))
+    let meeting = on_a_runtime(the_second_statement_meets_a_pending_withdrawal(1, true))
         .expect("the schedule came about");
     assert!(
-        held.attachments.is_empty(),
-        "the repeat was answered while the window's attachment was in the session: {held:?}"
+        !meeting.first_answered_while_held,
+        "the first statement was acknowledged while the hold of the attach stood"
+    );
+    assert!(
+        meeting.at_the_answer.attachments.is_empty(),
+        "the repeat was answered while the window's attachment was in the session: {:?}",
+        meeting.at_the_answer
     );
 }
 
@@ -1649,90 +1719,612 @@ fn a_repeated_statement_is_not_answered_while_the_withdrawal_the_first_owes_is_p
 /// statement owes is pending, even though it changes nothing the gate holds.
 #[test]
 fn a_newer_daemons_first_statement_is_not_answered_while_an_earlier_withdrawal_is_pending() {
-    let held = on_a_runtime(the_second_statement_meets_a_pending_withdrawal(2, false))
+    let meeting = on_a_runtime(the_second_statement_meets_a_pending_withdrawal(2, false))
         .expect("the schedule came about");
     assert!(
-        held.attachments.is_empty(),
-        "the statement was answered while the window's attachment was in the session: {held:?}"
+        !meeting.first_answered_while_held,
+        "the first statement was acknowledged while the hold of the attach stood"
     );
+    assert!(
+        meeting.at_the_answer.attachments.is_empty(),
+        "the statement was answered while the window's attachment was in the session: {:?}",
+        meeting.at_the_answer
+    );
+}
+
+/// How a window's connection comes to be withdrawn by its own writer.
+#[derive(Clone, Copy)]
+enum Ends {
+    /// The host takes access away by a statement.
+    ByStatement,
+    /// The lease the host gave ends on the continuous clock, and no statement follows.
+    ByClock,
+}
+
+/// What a writer's withdrawal of a window whose attach is in flight came to.
+struct WriterOrder {
+    /// The first attachment of the window.
+    first: AttachmentId,
+    /// The statement was acknowledged while the hold of the attach stood.
+    answered_while_held: bool,
+    /// How many answers and withdrawals waited, and what the session held, at the first step that
+    /// can tell whether the writer's withdrawal waits for the hold.
+    waiting_at_the_hold: usize,
+    at_the_hold: Held,
+    /// What the session held when the withdrawal and the acknowledgement were complete, the end of
+    /// the window's connection being stopped before it detached anything.
+    when_complete: Held,
 }
 
 /// A window with a live stream whose second attach was checked before the host took access away,
 /// and the writer of its connection, which stops the stream's next frame and withdraws the window
-/// itself. Returns what the session held when the statement was answered.
-async fn the_writer_withdraws_a_window_whose_attach_is_in_flight() -> Result<Held, &'static str> {
+/// itself. The host takes access away by a statement, or by the lease ending on the clock.
+///
+/// The end of the window's connection is stopped before it detaches anything: the attach's
+/// reply is a frame the withdrawal refuses, and a connection whose reply is refused ends and
+/// detaches what its list holds by itself, which would hide what the writer's withdrawal left.
+async fn the_writer_withdraws_a_window_whose_attach_is_in_flight(
+    ends: Ends,
+) -> Result<WriterOrder, &'static str> {
     let world = Arc::new(world("while true; do printf 'line\\n'; sleep 0.1; done", true).await);
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
-    tell(&mut daemon, open(1)).await;
+    match ends {
+        Ends::ByStatement => {
+            tell(&mut daemon, open(1)).await;
+        }
+        Ends::ByClock => {
+            tell(&mut daemon, world.machine.lease(1, 1_000, FAR_MS)).await;
+        }
+    }
     let first = world.attach(&mut window).await;
     world.subscribe(&mut window, first).await;
-    let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
+    // A lease that ends is caught by the attach's own check of its lease and deadline, so the
+    // clock's order stops the attach after those and before its marker.
+    let (checked, go_attach) = match ends {
+        Ends::ByStatement => world.service.stall_a_mutation_after_its_dispatch_check(),
+        Ends::ByClock => world.service.stall_a_mutation_after_its_deadline_check(),
+    };
+    let (_at_the_end, go_end) = world.service.stall_a_connection_at_its_end();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
-    let attach_ended = start_the_geometry_attach(&world, window);
+    let before = Arc::new(held(&world));
+    let (attach_ended, _applied) = start_the_geometry_attach(&world, window);
     if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
         return Err("the second attach never passed the dispatch boundary's check");
     }
 
-    // The host closes: the gate changes at once, the next frame of the stream is refused, and both
-    // the statement and the writer's withdrawal wait for the attach's hold.
-    let (told, told_end) = std::sync::mpsc::channel();
-    tokio::spawn(async move {
-        tell(&mut daemon, closed(2)).await;
-        let _ = told.send(daemon);
-    });
-    // Either both wait for the hold, or the writer's withdrawal has gone ahead and taken the
-    // window's first attachment out of the session.
+    // The host takes access away: the gate changes at once, the next frame of the stream is
+    // refused, and the writer's withdrawal, and a statement's answer, wait for the attach's hold.
+    let (statement, daemon_kept, wanted) = match ends {
+        Ends::ByStatement => (Some(start_the_statement(daemon, closed(2))), None, 2),
+        Ends::ByClock => {
+            world.machine.runs(Duration::from_millis(1_001));
+            (None, Some(daemon), 1)
+        }
+    };
+    let acknowledged = statement
+        .as_ref()
+        .map(|(acknowledged, _)| Arc::clone(acknowledged));
+    // Either they wait for the hold, or the writer's withdrawal has gone ahead and taken the
+    // window's first attachment out of the session, or the statement was acknowledged.
     let waiting = Arc::clone(&world);
+    let answered = acknowledged.clone();
     if !holds_by(deadline, move || {
-        waiting.service.statements_waiting_for_tests() >= 2 || waiting.holds_nothing()
+        waiting.service.statements_waiting_for_tests() >= wanted
+            || waiting.holds_nothing()
+            || answered.as_ref().is_some_and(|flag| is_set(flag))
     })
     .await
     {
-        return Err("the statement and the writer's withdrawal did not both wait for the hold");
+        return Err("the withdrawal did not wait for the hold, and nothing else came about");
     }
+    let answered_while_held = acknowledged.as_ref().is_some_and(|flag| is_set(flag));
+    let waiting_at_the_hold = world.service.statements_waiting_for_tests();
+    let at_the_hold = {
+        let reader = Arc::clone(&world);
+        tokio::task::spawn_blocking(move || held(&reader))
+            .await
+            .expect("the session is read")
+    };
+
     go_attach.send(()).expect("lets the attach go");
-    let acknowledged = tokio::task::spawn_blocking(move || {
-        told_end
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            .ok()
-    })
-    .await
-    .ok()
-    .flatten();
-    if acknowledged.is_none() {
-        return Err("the statement was never acknowledged");
-    }
-    let reader = Arc::clone(&world);
-    let at_the_answer = tokio::task::spawn_blocking(move || held(&reader))
-        .await
-        .expect("the session is read");
-    let window = tokio::task::spawn_blocking(move || {
-        attach_ended
-            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-            .ok()
-    })
-    .await
-    .ok()
-    .flatten();
-    drop(window);
+    let when_complete = match statement {
+        Some((_, daemon_end)) => {
+            if received_by(deadline, daemon_end).await.is_none() {
+                return Err("the statement was never acknowledged");
+            }
+            let reader = Arc::clone(&world);
+            tokio::task::spawn_blocking(move || held(&reader))
+                .await
+                .expect("the session is read")
+        }
+        None => {
+            // The attach has landed once the geometry has moved, whatever the withdrawal does to
+            // its attachment, and the writer's withdrawal is complete once nothing waits.
+            let landed = Arc::clone(&world);
+            let from = Arc::clone(&before);
+            if !holds_by(deadline, move || held(&landed).geometry != from.geometry).await {
+                return Err("the attach never landed");
+            }
+            let idle = Arc::clone(&world);
+            if !holds_by(deadline, move || {
+                idle.service.statements_waiting_for_tests() == 0
+            })
+            .await
+            {
+                return Err("the writer's withdrawal never ended");
+            }
+            let reader = Arc::clone(&world);
+            tokio::task::spawn_blocking(move || held(&reader))
+                .await
+                .expect("the session is read")
+        }
+    };
+    let _ = go_end.send(());
+    drop(received_by(deadline, attach_ended).await);
+    drop(daemon_kept);
     world.close();
-    Ok(at_the_answer)
+    Ok(WriterOrder {
+        first,
+        answered_while_held,
+        waiting_at_the_hold,
+        at_the_hold,
+        when_complete,
+    })
 }
 
 /// KR-REQ-17.54: the writer's own withdrawal of a window waits for the hold of an attach that was
 /// checked before the restriction, so the attach's attachment is withdrawn with the window's.
 ///
 /// The window's stream has frames. The attach is stopped after its check, the host takes access
-/// away, and the writer meets the next frame under the new statement. A withdrawal that ran at
-/// once would take the window out of the registry before the attach pushed, and nothing would look
-/// at the window again.
+/// away by a statement, and the writer meets the next frame under the new statement. A withdrawal
+/// that ran at once would take the window out of the registry before the attach pushed, and
+/// nothing would look at the window again: the attachment would stay until the connection's own
+/// end, which the case holds, so that the acknowledgement is read before it.
 #[test]
 fn a_window_the_writer_withdraws_does_not_keep_the_attach_that_was_in_flight() {
-    let held = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight())
+    let order = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight(
+        Ends::ByStatement,
+    ))
+    .expect("the schedule came about");
+    assert!(
+        order.when_complete.attachments.is_empty(),
+        "the statement was acknowledged while an attachment of the window was in the session: {:?}",
+        order.when_complete
+    );
+}
+
+/// KR-REQ-17.54: the writer's withdrawal does not run while the hold that may have checked under
+/// the earlier statement stands, and the statement is not acknowledged either.
+#[test]
+fn a_window_the_writer_withdraws_waits_for_the_hold_of_the_attach_that_was_in_flight() {
+    let order = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight(
+        Ends::ByStatement,
+    ))
+    .expect("the schedule came about");
+    assert!(
+        !order.answered_while_held,
+        "the statement was acknowledged while the hold of the attach stood"
+    );
+    assert!(
+        order.waiting_at_the_hold >= 2,
+        "the statement and the writer's withdrawal did not both wait for the hold: {}",
+        order.waiting_at_the_hold
+    );
+    assert_eq!(
+        order.at_the_hold.attachments,
+        vec![order.first],
+        "the writer's withdrawal ran while the hold of the attach stood"
+    );
+}
+
+/// KR-REQ-17.54: a lease that ends on the clock while an attach is between its check and its push
+/// leaves no attachment behind once the writer's withdrawal is complete.
+///
+/// No statement follows: the lease the host gave ends, the writer meets the next frame of the
+/// window's stream, and its withdrawal waits for the hold the attach is in. A withdrawal that ran
+/// at once would leave the attach's attachment in a connection that no registry holds.
+#[test]
+fn a_window_the_writer_withdraws_when_its_lease_ends_does_not_keep_the_attach_that_was_in_flight() {
+    let order = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight(
+        Ends::ByClock,
+    ))
+    .expect("the schedule came about");
+    assert!(
+        order.when_complete.attachments.is_empty(),
+        "the writer's withdrawal was complete while an attachment of the window was in the session: {:?}",
+        order.when_complete
+    );
+}
+
+/// KR-REQ-17.54: the writer's withdrawal that the end of a lease asks for waits for the hold of
+/// the attach that was checked under the lease.
+#[test]
+fn a_window_the_writer_withdraws_when_its_lease_ends_waits_for_the_hold_of_the_attach_that_was_in_flight()
+ {
+    let order = on_a_runtime(the_writer_withdraws_a_window_whose_attach_is_in_flight(
+        Ends::ByClock,
+    ))
+    .expect("the schedule came about");
+    assert!(
+        order.waiting_at_the_hold >= 1,
+        "the writer's withdrawal did not wait for the hold: {}",
+        order.waiting_at_the_hold
+    );
+    assert_eq!(
+        order.at_the_hold.attachments,
+        vec![order.first],
+        "the writer's withdrawal ran while the hold of the attach stood"
+    );
+}
+
+/// What a window's requests, and a stream's frame, came to while the attach of another window was
+/// held after its check and a statement had taken access away.
+struct WhileHeld {
+    answered_while_held: bool,
+    waiting_at_the_hold: usize,
+    read: Result<(), ProtocolError>,
+    typed: Result<(), ProtocolError>,
+    when_complete: Held,
+}
+
+/// One window that holds an attachment, the input lease and a subscription to a shell that prints
+/// on its own, another window whose attach has passed the dispatch boundary's check and stands
+/// before the session, and a statement that takes access away.
+///
+/// While the attach stays held, the first window's read and input write are asked. Returns what
+/// they were answered, how many answers and withdrawals waited (the writer's withdrawal of the
+/// first window waits once the writer has met a frame of its stream under the new statement), and
+/// what the session held when the statement was acknowledged after the attach was let go.
+async fn the_requests_of_a_window_while_the_attach_of_another_is_held()
+-> Result<WhileHeld, &'static str> {
+    let world = Arc::new(world("while true; do printf 'line\\n'; sleep 0.1; done", true).await);
+    let mut first = world.window().await;
+    let second = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let attachment = world.attach(&mut first).await;
+    let epoch = world.acquire(&mut first, attachment).await;
+    world.subscribe(&mut first, attachment).await;
+    let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    let (attach_ended, _applied) = start_the_geometry_attach(&world, second);
+    if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
+        return Err("the attach never passed the dispatch boundary's check");
+    }
+
+    let (acknowledged, daemon_end) = start_the_statement(daemon, closed(2));
+    let waiting = Arc::clone(&world.service);
+    let answered = Arc::clone(&acknowledged);
+    if !holds_by(deadline, move || {
+        waiting.statements_waiting_for_tests() >= 2 || is_set(&answered)
+    })
+    .await
+    {
+        return Err("the statement and the writer's withdrawal did not both wait for the hold");
+    }
+    let answered_while_held = is_set(&acknowledged);
+    let waiting_at_the_hold = world.service.statements_waiting_for_tests();
+
+    // The attach stays held. The window's requests meet the host that is closed.
+    let asking = Arc::clone(&world);
+    let Some((first, read)) = ends_by(deadline, async move {
+        let answer = asking.read(&mut first).await;
+        (first, answer)
+    })
+    .await
+    else {
+        return Err("the read was never answered");
+    };
+    let typing = Arc::clone(&world);
+    let Some((first, typed)) = ends_by(deadline, async move {
+        let mut first = first;
+        let answer = typing.type_as(&mut first, attachment, epoch, 1, b"x").await;
+        (first, answer)
+    })
+    .await
+    else {
+        return Err("the input was never answered");
+    };
+
+    go_attach.send(()).expect("lets the attach go");
+    if received_by(deadline, daemon_end).await.is_none() {
+        return Err("the statement was never acknowledged");
+    }
+    let reader = Arc::clone(&world);
+    let when_complete = tokio::task::spawn_blocking(move || held(&reader))
+        .await
+        .expect("the session is read");
+    drop(received_by(deadline, attach_ended).await);
+    drop(first);
+    world.close();
+    Ok(WhileHeld {
+        answered_while_held,
+        waiting_at_the_hold,
+        read,
+        typed,
+        when_complete,
+    })
+}
+
+/// KR-REQ-17.54: while an attach that was checked under the earlier statement is held, a read, an
+/// input write and a frame of a stream of another window meet the statement that took access away,
+/// and the acknowledgement comes only after every detach.
+///
+/// The attach stays paused after its check. The statement has changed the gate: the first
+/// window's read and input write are refused with the permission refusal, and the writer of its
+/// stream has met a frame under the new statement and holds it back (it waits to withdraw the
+/// window, which is counted). When the attach is let go, the acknowledgement follows the
+/// withdrawal of both windows.
+#[test]
+fn a_read_an_input_write_and_a_stream_frame_meet_the_statement_while_an_attach_is_held() {
+    let outcome = on_a_runtime(the_requests_of_a_window_while_the_attach_of_another_is_held())
         .expect("the schedule came about");
     assert!(
-        held.attachments.is_empty(),
-        "the statement was answered while an attachment of the window was in the session: {held:?}"
+        !outcome.answered_while_held,
+        "the statement was acknowledged while the hold of the attach stood"
     );
+    assert!(
+        outcome.waiting_at_the_hold >= 2,
+        "the stream's frame was not held back under the new statement: {}",
+        outcome.waiting_at_the_hold
+    );
+    let error = outcome
+        .read
+        .expect_err("a read is refused while the attach is held");
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    let error = outcome
+        .typed
+        .expect_err("input is refused while the attach is held");
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(
+        outcome.when_complete.attachments.is_empty(),
+        "the statement was acknowledged while an attachment was in the session: {:?}",
+        outcome.when_complete
+    );
+}
+
+/// Holds the dispatch boundary on a thread of its own, as a mutation between its check and its
+/// outcome holds it. Returns the end that lets it go, once the boundary is held.
+async fn hold_the_boundary(
+    world: &Arc<World>,
+    deadline: std::time::Instant,
+) -> Option<std::sync::mpsc::Sender<()>> {
+    let (held, held_end) = std::sync::mpsc::channel();
+    let (let_go, go) = std::sync::mpsc::channel::<()>();
+    let holder = Arc::clone(world);
+    std::thread::spawn(move || {
+        let _boundary = holder.service.hold_the_dispatch_boundary();
+        let _ = held.send(());
+        let _ = go.recv();
+    });
+    received_by(deadline, held_end).await.map(|()| let_go)
+}
+
+/// What the maintenance pass did to a withdrawal that a statement owes.
+struct Maintenance {
+    answered_while_held: bool,
+    held_before_the_pass: bool,
+    held_after_the_pass: bool,
+    answered_by_the_pass: bool,
+}
+
+/// A statement that took access away while the boundary was held, whose answer is stopped once the
+/// hold has ended and before it runs the withdrawal it owes, as an answer is whose connection has
+/// gone: the maintenance pass runs the withdrawal under its own hold of the boundary.
+async fn the_maintenance_pass_and_a_withdrawal_that_a_statement_owes()
+-> Result<Maintenance, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let _attachment = world.attach(&mut window).await;
+    let (at_the_hold, go_statement) = world.service.stall_a_statement_after_its_hold();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    let Some(let_go) = hold_the_boundary(&world, deadline).await else {
+        return Err("the boundary was never held");
+    };
+
+    let (acknowledged, daemon_end) = start_the_statement(daemon, closed(2));
+    let waiting = Arc::clone(&world.service);
+    let answered = Arc::clone(&acknowledged);
+    if !holds_by(deadline, move || {
+        waiting.statements_waiting_for_tests() > 0 || is_set(&answered)
+    })
+    .await
+    {
+        return Err("the statement neither waited for the hold nor was acknowledged");
+    }
+    let answered_while_held = is_set(&acknowledged);
+
+    // The hold ends, and the statement stands before the withdrawal it owes.
+    let _ = let_go.send(());
+    if ends_by(deadline, async move { at_the_hold.await.is_ok() }).await != Some(true) {
+        return Err("the statement never reached the end of its wait");
+    }
+    let looking = Arc::clone(&world);
+    let held_before_the_pass = !tokio::task::spawn_blocking(move || looking.holds_nothing())
+        .await
+        .expect("the session is read");
+
+    // The pass runs the withdrawal that the statement owes, with the statement still stopped.
+    let service = Arc::clone(&world.service);
+    tokio::task::spawn_blocking(move || service.maintain_now())
+        .await
+        .expect("the pass ends");
+    let looking = Arc::clone(&world);
+    let held_after_the_pass = !tokio::task::spawn_blocking(move || looking.holds_nothing())
+        .await
+        .expect("the session is read");
+    let answered_by_the_pass = is_set(&acknowledged);
+
+    let _ = go_statement.send(());
+    if received_by(deadline, daemon_end).await.is_none() {
+        return Err("the statement was never acknowledged");
+    }
+    drop(window);
+    world.close();
+    Ok(Maintenance {
+        answered_while_held,
+        held_before_the_pass,
+        held_after_the_pass,
+        answered_by_the_pass,
+    })
+}
+
+/// KR-REQ-17.54: the maintenance pass runs a withdrawal that a restriction owes, under its own
+/// hold of the dispatch boundary, so that a statement whose task is gone leaves nothing owed.
+#[test]
+fn the_maintenance_pass_runs_the_withdrawal_that_a_statement_owes() {
+    let pass = on_a_runtime(the_maintenance_pass_and_a_withdrawal_that_a_statement_owes())
+        .expect("the schedule came about");
+    assert!(
+        !pass.answered_while_held,
+        "the statement was acknowledged while the boundary was held"
+    );
+    assert!(
+        pass.held_before_the_pass,
+        "the window held nothing before the pass: the statement had run its withdrawal"
+    );
+    assert!(
+        !pass.held_after_the_pass,
+        "the pass left the window's attachment in the session"
+    );
+    assert!(
+        !pass.answered_by_the_pass,
+        "the statement was acknowledged by the pass, not by its own answer"
+    );
+}
+
+/// What the end of a connection owed while the session was held.
+struct EndOwes {
+    answered_with_a_detach_pending: bool,
+    waits: usize,
+    when_answered: Held,
+    settled_by_the_service: u64,
+}
+
+/// A window with an attachment whose connection ends while the session is held by somebody else,
+/// so the end owes the detach to the service, and a statement that takes access away after it.
+async fn the_end_of_a_connection_that_owes_a_detach() -> Result<EndOwes, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let _attachment = world.attach(&mut window).await;
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    // The session is held on a thread of its own, so that no detach can be made.
+    let (session_held, session_held_end) = std::sync::mpsc::channel();
+    let (release_session, go) = std::sync::mpsc::channel::<()>();
+    let holder = Arc::clone(&world);
+    std::thread::spawn(move || {
+        let _session = holder.runtime.session();
+        let _ = session_held.send(());
+        let _ = go.recv();
+    });
+    if received_by(deadline, session_held_end).await.is_none() {
+        return Err("the session was never held");
+    }
+
+    // The window goes away: its connection ends, and the detach of its attachment is owed.
+    drop(window);
+    let ended = Arc::clone(&world);
+    if !holds_by(deadline, move || {
+        ended.service.connections_held_for_tests() == 1
+    })
+    .await
+    {
+        return Err("the window's connection never ended");
+    }
+
+    let (acknowledged, daemon_end) = start_the_statement(daemon, closed(2));
+    let waiting = Arc::clone(&world.service);
+    let answered = Arc::clone(&acknowledged);
+    if !holds_by(deadline, move || {
+        waiting.detach_waits_for_tests() > 0 || is_set(&answered)
+    })
+    .await
+    {
+        return Err("the statement neither waited for the detach nor was acknowledged");
+    }
+    let answered_with_a_detach_pending = is_set(&acknowledged);
+    let waits = world.service.detach_waits_for_tests();
+
+    let _ = release_session.send(());
+    if received_by(deadline, daemon_end).await.is_none() {
+        return Err("the statement was never acknowledged");
+    }
+    let reader = Arc::clone(&world);
+    let when_answered = tokio::task::spawn_blocking(move || held(&reader))
+        .await
+        .expect("the session is read");
+    let settled_by_the_service = world.service.owed_done_for_tests().1;
+    world.close();
+    Ok(EndOwes {
+        answered_with_a_detach_pending,
+        waits,
+        when_answered,
+        settled_by_the_service,
+    })
+}
+
+/// KR-REQ-17.54: a statement is not acknowledged while the end of a connection still owes the
+/// detach of an attachment the connection made under the earlier statement.
+///
+/// The window's connection ends while somebody holds the session, which leaves its detach to the
+/// service's own pass. The statement that takes access away is answered only when the pass has
+/// made it.
+#[test]
+fn a_statement_is_not_acknowledged_while_the_end_of_a_connection_owes_a_detach() {
+    let owed = on_a_runtime(the_end_of_a_connection_that_owes_a_detach())
+        .expect("the schedule came about");
+    assert!(
+        !owed.answered_with_a_detach_pending,
+        "the statement was acknowledged while a detach of the connection's end was owed"
+    );
+    assert!(
+        owed.waits > 0,
+        "the statement did not wait for the detach: {}",
+        owed.waits
+    );
+    assert!(
+        owed.when_answered.attachments.is_empty(),
+        "the statement was acknowledged while the attachment was in the session: {:?}",
+        owed.when_answered
+    );
+    assert_eq!(
+        owed.settled_by_the_service, 1,
+        "the service's own pass did not make the owed detach"
+    );
+}
+
+/// KR-REQ-17.54: the count that a hold of the dispatch boundary leaves when it ends is raised
+/// before the lock goes, so a statement that waits for that hold is not made to wait for the next
+/// one.
+///
+/// A second taker waits for the boundary while the first holds it. The moment the second has it,
+/// it reads the count, which already includes the first hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_of_the_dispatch_boundary_is_counted_before_the_next_holder_has_the_boundary() {
+    let world = Arc::new(world("exec cat", true).await);
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    let first = world.service.hold_the_dispatch_boundary();
+    let before = world.service.releases_of_the_dispatch_boundary_for_tests();
+    let second = Arc::clone(&world);
+    let (seen, seen_end) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _boundary = second.service.hold_the_dispatch_boundary();
+        let _ = seen.send(second.service.releases_of_the_dispatch_boundary_for_tests());
+    });
+    drop(first);
+    let counted = received_by(deadline, seen_end)
+        .await
+        .expect("the second holder took the boundary");
+    assert_eq!(
+        counted,
+        before + 1,
+        "the second holder had the boundary and the first hold was not counted"
+    );
+    world.close();
 }
