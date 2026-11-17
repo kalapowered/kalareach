@@ -288,10 +288,14 @@ impl Fixture {
             .saturating_add_signed(self.moved.load(Ordering::SeqCst))
     }
 
-    /// Both clocks pass `by`, as time does.
+    /// Both clocks pass `by`, as time does: no reader of the daemon reads between the two steps,
+    /// which would pair one clock as it is with the other as it was and be recorded as a clock
+    /// that went backwards.
     pub fn pass(&self, by: Duration) {
-        self.pass_continuous(by);
-        self.pass_wall(by);
+        kr_controller::testing::while_no_reader_of_the_clocks_reads(self.host.controller(), || {
+            self.pass_continuous(by);
+            self.pass_wall(by);
+        });
     }
 
     /// Only the continuous clock passes `by`: a host that slept with its wall clock held.

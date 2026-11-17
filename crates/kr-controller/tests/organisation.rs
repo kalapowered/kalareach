@@ -1915,10 +1915,15 @@ async fn a_stored_organisation_grant_that_ran_out_admits_no_lease() {
         !grants.lapsed(&presenting[0].2, T).expect("decided"),
         "anchored in this boot"
     );
-    continuous.advance(std::time::Duration::from_millis(MINUTE_MS + 1_000));
-    // UTC lags the continuous clock by four seconds, which a wall clock may: it stays before the
-    // grant's expiry while the anchor has run out.
-    wall.fetch_add(MINUTE_MS - 3_000, Ordering::SeqCst);
+    // Both clocks move where no reader of the daemon reads: one that read between the two steps
+    // would pair the continuous clock as it is with UTC as it was, and the host would keep that
+    // as a clock that went backwards.
+    kr_controller::testing::while_no_reader_of_the_clocks_reads(&controller, || {
+        continuous.advance(std::time::Duration::from_millis(MINUTE_MS + 1_000));
+        // UTC lags the continuous clock by four seconds, which a wall clock may: it stays before
+        // the grant's expiry while the anchor has run out.
+        wall.fetch_add(MINUTE_MS - 3_000, Ordering::SeqCst);
+    });
     // The second grant's end is on record from an earlier reader, before anything in this daemon
     // anchored it.
     grants
