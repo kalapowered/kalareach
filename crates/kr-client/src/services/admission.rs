@@ -25,7 +25,10 @@
 //! twenty seconds. No entry is asked about more than three times between connections, and the
 //! count starts again ten minutes after the last request, which is when what that request got has
 //! ended. Until then a refusal from the service goes on explaining a failed dial, though the minute
-//! it is kept for has passed, because nothing asks again to renew it.
+//! it is kept for has passed, because nothing asks again to renew it. It also goes on explaining
+//! one while the request that was made as it stood is on its way, for as long as an exchange with
+//! the service may take and a second more at most, so that a dial lost in that time is not told the
+//! host is out of reach for want of an answer that the request is about to confirm or replace.
 //!
 //! What a kept answer explains is one of two things, told apart by what the service named. An answer
 //! that names the paths that still work is exhausted capacity, and the list and the delay are kept
@@ -51,6 +54,7 @@ use kr_protocol::service::GatewayOrigin;
 use serde::{Deserialize, Serialize};
 
 use super::alternatives::Alternatives;
+use super::http::DEFAULT_TOTAL_DEADLINE;
 use super::matrix::ReleaseGate;
 use super::relay::{ManagedRelayLeaseService, ServiceHttp, ServiceSigner};
 use super::{ServiceFuture, relay};
@@ -100,6 +104,16 @@ const KEEP_NOT_MANAGED: Duration = Duration::from_secs(10 * 60);
 
 /// How long every request stops for when the service says it does not serve them.
 const SUSPEND: Duration = Duration::from_secs(10 * 60);
+
+/// The longest a request that is on its way is believed to be: the longest an exchange with the
+/// service may take ([`DEFAULT_TOTAL_DEADLINE`], which the client of the managed service is built
+/// with), and a second more, for the time between the cache's reading of its clock and the start of
+/// the exchange. A request that fails at its deadline therefore fails while it is still believed to
+/// be on its way.
+///
+/// The bound exists because the mark that a request is on its way is cleared only by the request's
+/// own end, and a mark that is never cleared must not keep an answer standing for ever.
+const REQUEST_BOUND: Duration = DEFAULT_TOTAL_DEADLINE.saturating_add(Duration::from_secs(1));
 
 /// What a device asks the service for.
 #[derive(Clone, PartialEq, Eq)]
@@ -395,7 +409,7 @@ enum Held {
 #[derive(Clone, Debug)]
 struct Entry {
     held: Held,
-    /// Whether a request for this entry is on its way.
+    /// Whether a request for this entry is on its way, one that was made at `asked_at`.
     pending: bool,
     /// When it was last asked, if it has been.
     asked_at: Option<Instant>,
@@ -423,17 +437,30 @@ impl Entry {
     }
 
     /// Whether the entry holds an answer that the service is unable and that still explains a
-    /// failed dial: for as long as it is kept, and for as long as the cache will not ask again
-    /// (three requests with no connection, until the ten minutes after the last), because nothing
-    /// renews it while no request is made. A request that is made while the answer has stopped drops
-    /// it, so the count of asks only keeps an answer that stood when the last request was made.
+    /// failed dial: for as long as it is kept, for as long as the cache will not ask again (three
+    /// requests with no connection, until the ten minutes after the last), because nothing renews it
+    /// while no request is made, and for as long as the request that was made while it stood is on
+    /// its way, to [`REQUEST_BOUND`] at most. That request decides what the entry holds next, and a
+    /// dial that is lost before then is told no less than the entry said a moment before. A request
+    /// that is made while the answer has stopped drops it, so what is kept, counted or awaited here
+    /// is an answer that stood when the last request was made.
     fn answer_stands(&self, now: Instant) -> bool {
         match self.held {
             Held::Unavailable { kept_until, .. } => {
-                now < kept_until || (self.asks >= MOST_ASKS && !self.window_passed(now))
+                now < kept_until
+                    || (self.asks >= MOST_ASKS && !self.window_passed(now))
+                    || self.request_on_its_way(now)
             }
             _ => false,
         }
+    }
+
+    /// Whether a request is on its way that was made less than [`REQUEST_BOUND`] ago.
+    fn request_on_its_way(&self, now: Instant) -> bool {
+        self.pending
+            && self
+                .asked_at
+                .is_some_and(|asked| now.saturating_duration_since(asked) < REQUEST_BOUND)
     }
 
     /// Whether a dial that starts `now` asks for this entry again.
@@ -837,4 +864,16 @@ fn kept_for(named: Option<u64>) -> Duration {
         .map(named_time)
         .unwrap_or_default()
         .max(KEEP_UNAVAILABLE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The service's client gives an exchange at most [`DEFAULT_TOTAL_DEADLINE`], so a request that
+    /// is believed to be on its way for less than that would stop being believed before it ended.
+    #[test]
+    fn a_request_is_believed_to_be_on_its_way_for_longer_than_the_http_deadline() {
+        assert!(REQUEST_BOUND > DEFAULT_TOTAL_DEADLINE);
+    }
 }
