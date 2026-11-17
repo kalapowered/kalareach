@@ -57,6 +57,34 @@ struct Page {
     /// Holds the page's publication, and so the view's own task, while a case needs the view slower
     /// than the host.
     gate: Arc<Gate>,
+    /// The waits of the input lanes this page's views open, when a case takes them from its own
+    /// deadlines: the page ends them, and closes its views, when it is dropped.
+    deadlines: Option<Arc<BarrierDeadlines>>,
+    /// The handle of every view this page opened.
+    opened: Mutex<Vec<String>>,
+}
+
+/// A case that ends, by passing or by failing at one of its bounds, ends what its page left waiting:
+/// a page call that waits for a barrier which never expires holds a blocking thread of the case's
+/// runtime, and the runtime does not end until that thread does, which it does only when the view
+/// answers the call. The page ends every wait of its bounded lanes for good and closes its views,
+/// so that a case that fails at its own bound ends there, whatever platform it runs on.
+impl Drop for Page {
+    fn drop(&mut self) {
+        let Some(deadlines) = &self.deadlines else {
+            return;
+        };
+        deadlines.finish();
+        let views = self.app.state::<companion_tauri::terminal::TerminalViews>();
+        for view in self
+            .opened
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .iter()
+        {
+            views.closer(view)();
+        }
+    }
 }
 
 /// A gate in the page's publication. Open, a state passes at once. Closed, a state the view
@@ -175,6 +203,8 @@ impl Page {
             windows,
             published,
             gate,
+            deadlines: None,
+            opened: Mutex::default(),
         }
     }
 
@@ -260,7 +290,12 @@ impl Page {
                 }),
             )
             .expect("the view opens");
-        answer.as_str().expect("the view's handle").to_owned()
+        let handle = answer.as_str().expect("the view's handle").to_owned();
+        self.opened
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .push(handle.clone());
+        handle
     }
 
     fn resize(&self, view: &str, columns: u64, rows: u64) {
@@ -5886,7 +5921,8 @@ impl Page {
     /// As [`Self::over`], with the waits of the view's input lane taken from `deadlines`: a
     /// barrier's wait of the lane ends when the case ends it and not with time.
     fn over_bounded(host: &mut ScriptedHost, deadlines: &Arc<BarrierDeadlines>) -> Self {
-        let page = Self::over(host);
+        let mut page = Self::over(host);
+        page.deadlines = Some(Arc::clone(deadlines));
         page.app
             .state::<companion_tauri::terminal::TerminalViews>()
             .bound_lanes_by(Arc::clone(deadlines) as Arc<dyn kr_transport::deadlines::Deadlines>);
@@ -5904,6 +5940,8 @@ impl Page {
 struct BarrierDeadlines {
     expired: tokio::sync::watch::Sender<u64>,
     armed: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set once the case is over: every wait, in force or not yet started, ends at once.
+    finished: std::sync::atomic::AtomicBool,
     timers: kr_transport::deadlines::TimerDeadlines,
 }
 
@@ -5921,11 +5959,19 @@ impl BarrierDeadlines {
         Arc::new(Self {
             expired: tokio::sync::watch::channel(0).0,
             armed: Arc::default(),
+            finished: std::sync::atomic::AtomicBool::new(false),
             timers: kr_transport::deadlines::TimerDeadlines {
                 header: kr_client::input::INPUT_OPEN_WAIT,
                 ..kr_transport::deadlines::TimerDeadlines::default()
             },
         })
+    }
+
+    /// Ends every wait of a barrier, in force now or started later: the case is over.
+    fn finish(&self) {
+        self.finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.expired.send_modify(|count| *count += 1);
     }
 
     /// Waits, under [`STATE_BOUND`], until a barrier's wait is in force, which is the lane having
@@ -5953,6 +5999,9 @@ impl kr_transport::deadlines::Deadlines for BarrierDeadlines {
     ) -> futures_util::future::BoxFuture<'static, ()> {
         if !matches!(kind, kr_transport::deadlines::DeadlineKind::Admission) {
             return kr_transport::deadlines::Deadlines::start(&self.timers, kind);
+        }
+        if self.finished.load(std::sync::atomic::Ordering::SeqCst) {
+            return Box::pin(async {});
         }
         let mut expired = self.expired.subscribe();
         let seen = *expired.borrow();
