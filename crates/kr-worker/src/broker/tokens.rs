@@ -69,6 +69,9 @@ struct Unspent {
 #[derive(Debug, Default)]
 pub struct TokenStore {
     unspent: BTreeMap<ActionTokenId, Unspent>,
+    /// How many tokens this store has issued in all, for this host's own tests.
+    #[cfg(feature = "testing")]
+    issued: u64,
 }
 
 impl TokenStore {
@@ -82,6 +85,13 @@ impl TokenStore {
     #[must_use]
     pub fn outstanding(&self) -> usize {
         self.unspent.len()
+    }
+
+    /// Returns how many tokens this store has issued in all, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn issued(&self) -> u64 {
+        self.issued
     }
 
     /// Checks that there is room to issue one more token.
@@ -144,6 +154,10 @@ impl TokenStore {
                 capability: invocation.capability.clone(),
             },
         );
+        #[cfg(feature = "testing")]
+        {
+            self.issued += 1;
+        }
         Ok(token)
     }
 

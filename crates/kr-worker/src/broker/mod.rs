@@ -967,6 +967,10 @@ struct BrokerState {
     /// The bindings whose component is failing: counted once as a failure of its adapter when it
     /// began to, and not again however often the runtime is asked and says no, until it runs.
     failing_components: std::collections::BTreeSet<BrokerBindingId>,
+    /// How many plugin actions each binding admitted that nothing has sent or given up yet. The
+    /// counter is shared with the permit of each such action, which counts itself out when it is
+    /// dropped, so no lock is taken to do it.
+    open_actions: BTreeMap<BrokerBindingId, Arc<std::sync::atomic::AtomicUsize>>,
     /// Woken when the set of bindings the plugin runtime is wanted for may have changed.
     component_changes: Arc<component::ComponentChanges>,
     /// Woken when what the session's application is doing may have changed: a transition of a
@@ -1182,6 +1186,7 @@ impl Broker {
                 component_states: BTreeMap::new(),
                 component_notes: BTreeMap::new(),
                 failing_components: std::collections::BTreeSet::new(),
+                open_actions: BTreeMap::new(),
                 component_changes: Arc::new(component::ComponentChanges::new(Arc::clone(
                     &decoding,
                 ))),
@@ -2873,6 +2878,13 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<ActionToken> {
         self.state().issue_token_in(binding_id, invocation, now)
+    }
+
+    /// Returns how many action tokens this broker has issued in all, for this host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn tokens_issued(&self) -> u64 {
+        self.state().tokens.issued()
     }
 
     /// Spends an action token against a returned effect plan.
@@ -5774,6 +5786,33 @@ impl BrokerState {
         )
     }
 
+    /// Checks that a binding holds every grant a plugin action's admission required of it, from
+    /// the binding's grants alone.
+    ///
+    /// The first admission asks it at the token's spend and in the effect's validation, and every
+    /// later ask of the same admission asks it again, because a narrower installation removes a
+    /// grant at once and moves no revision. It reads no component state and no capability, so it
+    /// is the same question each time. A binding that is gone holds no grant: it is refused, never
+    /// passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] for a binding this broker does not hold, and
+    /// [`BrokerError::Grant`] for the first required grant it does not hold.
+    pub(crate) fn check_package_grants(
+        &self,
+        package: &crate::broker::methods::PackageGrants,
+    ) -> Result<()> {
+        let binding = self
+            .bindings
+            .get(&package.binding_id())
+            .ok_or_else(|| unknown_binding(package.binding_id()))?;
+        for grant in package.required().iter() {
+            binding.grants.require(grant)?;
+        }
+        Ok(())
+    }
+
     /// Checks everything an invocation depends on against what this broker holds now.
     fn check_invocation(
         &self,
@@ -5793,7 +5832,10 @@ impl BrokerState {
         if let Some(reason) = binding.rich_disabled.as_ref() {
             return Err(BrokerError::binding_disabled(reason));
         }
-        binding.grants.require(invocation.grant)?;
+        self.check_package_grants(&crate::broker::methods::PackageGrants::requiring(
+            binding_id,
+            invocation.grant,
+        ))?;
         let instance = self
             .instances
             .get(&invocation.application_instance_id)
