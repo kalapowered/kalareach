@@ -757,3 +757,107 @@ fn the_member_client_knows_every_rule_the_host_refuses_a_lease_by() {
         "the client names a rule the host does not"
     );
 }
+
+/// KR-REQ-10.08: the organisation binding of an ended record is not the new record's. A member's
+/// device is bound by the lease it presented; its record is revoked, which removes the binding, and
+/// the device pairs again under a grant that answers to the same organisation. The new identifier
+/// has no binding and is refused every read until it presents a lease of its own; the event the
+/// first binding wrote is as it was, and the binding the new record gets is its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_pairs_again_is_bound_to_no_organisation_until_it_presents_a_lease() {
+    let fixture = Fixture::start().await;
+    let ada = fixture.member("ada", SERVED).await;
+    let raw = ada.connect(&fixture).await;
+    ada.present(&fixture, &raw, fixture.lease(2, &ada, SERVED), None)
+        .await
+        .expect("the host installs the lease");
+    read_host_info(&raw).await.expect("the member is served");
+    let store = fixture.host.controller().sharing().grants();
+    let bound = fixture.listed().await.enrolments[0]
+        .members
+        .iter()
+        .map(|member| member.device_id)
+        .collect::<Vec<_>>();
+    assert_eq!(bound, [ada.record.device_id], "the first record is bound");
+    let events = store.organisation_events().expect("readable");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].device_id, ada.record.device_id);
+
+    // The owner revokes the record, which removes its binding.
+    let mut client = fixture.host.client().await;
+    let revoked: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        fixture.host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: ada.record.device_id,
+        },
+    )
+    .await
+    .expect("the owner revokes the device");
+    assert!(revoked.barrier.holds(), "{:?}", revoked.barrier);
+    fixture.until_the_fence_is_retired().await;
+    raw.close();
+    assert!(
+        fixture.listed().await.enrolments[0].members.is_empty(),
+        "the revoked record is bound to no organisation"
+    );
+
+    // The same device pairs again under a grant that answers to the same organisation.
+    let again = {
+        let device = net_support::Device::with_keys(ada.device.keys().clone()).await;
+        let grant = kr_protocol::pairing::ProposedGrant {
+            organisation: Nullable::some(kr_protocol::grant::OrganisationRequirement {
+                organisation_id: fixture.organisation.organisation_id,
+                policy_revision: fixture.revision,
+            }),
+            ..net_support::proposal(SERVED)
+        };
+        let record =
+            net_support::pair_with(&fixture.host, &device, &fixture.owner, grant).await;
+        Member {
+            device,
+            record,
+            account: ada.account.clone(),
+        }
+    };
+    assert_ne!(again.record.device_id, ada.record.device_id);
+    assert!(
+        fixture.listed().await.enrolments[0].members.is_empty(),
+        "no member is bound before the new record presents a lease"
+    );
+    assert_eq!(
+        store.organisation_events().expect("readable"),
+        events,
+        "the first binding's event is as it was, and the new record has none"
+    );
+    let raw = again.connect(&fixture).await;
+    assert!(
+        denied(&net_support::refusal(read_host_info(&raw).await)),
+        "a read under the new record before it presents a lease"
+    );
+
+    // Its own lease binds it, and that binding is its own: the old identifier stays unbound.
+    again
+        .present(&fixture, &raw, fixture.lease(2, &again, SERVED), None)
+        .await
+        .expect("the host installs the new record's lease");
+    read_host_info(&raw).await.expect("the new record is served");
+    let bound = fixture.listed().await.enrolments[0]
+        .members
+        .iter()
+        .map(|member| member.device_id)
+        .collect::<Vec<_>>();
+    assert_eq!(bound, [again.record.device_id]);
+    let events = store.organisation_events().expect("readable");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.device_id)
+            .collect::<Vec<_>>(),
+        [ada.record.device_id, again.record.device_id],
+        "the first record's event stays, and the new record has one of its own"
+    );
+    raw.close();
+    fixture.host.stop().await;
+}
