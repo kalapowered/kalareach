@@ -622,6 +622,19 @@ enum Load {
     Questions,
 }
 
+impl Load {
+    /// The receive buffer of the front before the relay that stops. The case that keeps the relay's
+    /// queue full gives the front a few KiB, so that a stopped front takes almost nothing; the case
+    /// that asks questions leaves the system's default, so that the bytes a stop holds back drain
+    /// at once after the resume.
+    const fn front_buffer(self) -> Option<u32> {
+        match self {
+            Self::Bulk => Some(support::front::STALLED_RECEIVE_BUFFER),
+            Self::Questions => None,
+        }
+    }
+}
+
 /// What one arrangement holds alive: the two relays, the front before the one that stops, the
 /// hosts, the device's endpoint and the connections that the device keeps to them.
 struct World {
@@ -651,7 +664,7 @@ impl World {
         let seen = capture();
         let connections = hosts * CONNECTIONS_PER_HOST;
         let (healthy, stopping) = (LocalRelay::spawn().await, LocalRelay::spawn().await);
-        let front = RelayFront::stalling(&stopping);
+        let front = RelayFront::stalling(&stopping, load.front_buffer());
         let a = Responder::on(&healthy, 1).await;
         let mut stalled = Vec::new();
         for index in 0..hosts {
