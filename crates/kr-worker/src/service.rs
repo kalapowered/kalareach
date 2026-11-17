@@ -674,6 +674,18 @@ pub struct WorkerService {
     /// for. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     largest_boundary_step_ms: std::sync::atomic::AtomicU64,
+    /// The first pause, in milliseconds, of a wait for the dispatch boundary that is made from now
+    /// on, which this host's own tests set. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    first_boundary_pause_ms: std::sync::atomic::AtomicU64,
+    /// How many waits for the dispatch boundary ended because the boundary was let go. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    boundary_wakes: std::sync::atomic::AtomicU64,
+    /// How many waits for the dispatch boundary ended because their pause ran out. It is compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    boundary_pauses_run_out: std::sync::atomic::AtomicU64,
     /// A pause inside the dispatch boundary before the look at the peer, for the next mutation or
     /// prepared action that takes it, which this host's own tests arm. It is compiled away in every
     /// shipped build.
@@ -729,6 +741,11 @@ struct DispatchBoundary {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// How many presentations have found the boundary held since its last release, which this
+    /// host's own tests read: each release starts the count again, so a presentation that is woken
+    /// and tries once is counted once. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    presentation_tries_since_release: std::sync::atomic::AtomicU64,
 }
 
 impl DispatchBoundary {
@@ -738,6 +755,8 @@ impl DispatchBoundary {
             released: tokio::sync::Notify::new(),
             #[cfg(feature = "testing")]
             pause_after_unlock: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            presentation_tries_since_release: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -808,6 +827,10 @@ impl Drop for DispatchGuard<'_> {
         drop(self.guard.take());
         #[cfg(feature = "testing")]
         self.boundary.wait_after_the_unlock();
+        #[cfg(feature = "testing")]
+        self.boundary
+            .presentation_tries_since_release
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.boundary.released.notify_waiters();
     }
 }
@@ -1325,6 +1348,14 @@ impl WorkerService {
             ],
             #[cfg(feature = "testing")]
             largest_boundary_step_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            first_boundary_pause_ms: std::sync::atomic::AtomicU64::new(
+                u64::try_from(BOUNDARY_FIRST_RETRY.as_millis()).unwrap_or(u64::MAX),
+            ),
+            #[cfg(feature = "testing")]
+            boundary_wakes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            boundary_pauses_run_out: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
             look_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -1901,6 +1932,46 @@ impl WorkerService {
             self.largest_boundary_step_ms
                 .load(std::sync::atomic::Ordering::SeqCst),
         )
+    }
+
+    /// Sets the first pause of every wait for the dispatch boundary that begins from now on, for
+    /// this host's own tests. A wait that is woken by a release keeps it, so a long first pause
+    /// leaves a wait with nothing but a release to end it.
+    #[cfg(feature = "testing")]
+    pub fn set_first_boundary_pause_for_tests(&self, pause: std::time::Duration) {
+        self.first_boundary_pause_ms.store(
+            u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// How many times a presentation has found the dispatch boundary held since the boundary was
+    /// last let go, for this host's own tests. A release starts the count again, so the presentation
+    /// that it wakes and that tries once is counted once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn presentation_tries_since_release_for_tests(&self) -> u64 {
+        self.dispatch
+            .presentation_tries_since_release
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many waits for the dispatch boundary have ended because it was let go, for this host's
+    /// own tests. It counts a wait that a release woke, and no wait that its pause ended.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn boundary_wakes_for_tests(&self) -> u64 {
+        self.boundary_wakes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many waits for the dispatch boundary have ended because their pause ran out, for this
+    /// host's own tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn boundary_pauses_run_out_for_tests(&self) -> u64 {
+        self.boundary_pauses_run_out
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Stops the next mutation or prepared action inside the dispatch boundary, the moment it
@@ -5204,7 +5275,13 @@ impl WorkerService {
     /// waits is a timer on the connection's own task. The `Notified` is created before each try, so
     /// a release between the try and the wait is not missed.
     async fn wait_for_the_boundary<T>(&self, mut once: impl FnMut() -> Tried<T>) -> Option<T> {
+        #[cfg(not(feature = "testing"))]
         let mut pause = BOUNDARY_FIRST_RETRY;
+        #[cfg(feature = "testing")]
+        let mut pause = std::time::Duration::from_millis(
+            self.first_boundary_pause_ms
+                .load(std::sync::atomic::Ordering::SeqCst),
+        );
         loop {
             let released = self.dispatch.released();
             tokio::pin!(released);
@@ -5219,8 +5296,15 @@ impl WorkerService {
                 std::sync::atomic::Ordering::SeqCst,
             );
             tokio::select! {
-                () = &mut released => {}
+                () = &mut released => {
+                    #[cfg(feature = "testing")]
+                    self.boundary_wakes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 () = tokio::time::sleep(pause) => {
+                    #[cfg(feature = "testing")]
+                    self.boundary_pauses_run_out
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     pause = (pause * 2).min(BOUNDARY_RETRY_CAP);
                 }
             }
@@ -5273,8 +5357,13 @@ impl WorkerService {
     ) -> Tried<ControlFrame> {
         let Some(_barrier) = self.try_boundary() else {
             #[cfg(feature = "testing")]
-            self.presentation_tries
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            {
+                self.presentation_tries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.dispatch
+                    .presentation_tries_since_release
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             return Self::after_a_failed_try(state);
         };
         // Only the decision can wait, for the authority record and for the journal, so only it
