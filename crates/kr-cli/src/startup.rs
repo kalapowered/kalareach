@@ -1248,6 +1248,27 @@ fn asked_and_unanswered(
     refusal
 }
 
+/// What a start says where the service manager did not give a daemon. A manager that could not be
+/// asked, or refused at once, started none. One that was asked (`asked`) and gave no answer in time
+/// may still start it, so nothing says that it was not started.
+#[cfg(unix)]
+fn manager_gave_no_start(id: kr_protocol::ids::EnvironmentId, why: &Shown, asked: bool) -> Shown {
+    if asked {
+        shown!(
+            "the service manager was asked to start the control daemon for environment {} and \
+             gave no answer: {}",
+            id,
+            *why
+        )
+    } else {
+        shown!(
+            "the service manager did not start the control daemon for environment {}: {}",
+            id,
+            *why
+        )
+    }
+}
+
 /// Asks this user's service manager to start the daemon from the definition kr wrote, and waits
 /// for it to answer.
 ///
@@ -1266,13 +1287,16 @@ async fn managed(
 ) -> Result<(Listed, Option<Started>)> {
     let refused = |refusal| match refusal {
         service_manager::Refusal::NotSetUp(why) => resolve::not_running(environment, error, why),
-        service_manager::Refusal::Failed(why) | service_manager::Refusal::NoAnswer(why) => {
-            unanswered(shown!(
-                "the service manager did not start the control daemon for environment {}: {}",
-                environment.environment_id(),
-                why
-            ))
-        }
+        service_manager::Refusal::Failed(why) => unanswered(manager_gave_no_start(
+            environment.environment_id(),
+            &why,
+            false,
+        )),
+        service_manager::Refusal::NoAnswer(why) => unanswered(manager_gave_no_start(
+            environment.environment_id(),
+            &why,
+            true,
+        )),
     };
     let blocked = |error: tokio::task::JoinError| {
         CliError::Other(shown!(
@@ -1440,6 +1464,7 @@ async fn start_by_task(
         bounds.start,
         &last,
         &log,
+        launched,
     ))
 }
 
@@ -2410,12 +2435,18 @@ mod windows {
         bound: Duration,
         last: &Shown,
         log: &super::Log,
+        launched: &std::sync::atomic::AtomicBool,
     ) -> CliError {
         let environment_id = environment.environment_id();
         let name = task::name(environment_id);
         let said = log.said("its log holds nothing since the request was left");
         match kr_ipc::starter::withdraw_claim(environment, asked.request) {
-            Ok(Withdrawal::Withdrawn) => not_taken(environment, bound, asked),
+            // The request is withdrawn and no starter took it: no daemon was started for it, so
+            // none may still start.
+            Ok(Withdrawal::Withdrawn) => {
+                launched.store(false, std::sync::atomic::Ordering::SeqCst);
+                not_taken(environment, bound, asked)
+            }
             Ok(Withdrawal::Taken) => super::unanswered(shown!(
                 "the starter of this user's scheduled task {} took the request to start the \
                  control daemon for environment {}, and no daemon answered within {} seconds: {}; \
@@ -2635,6 +2666,31 @@ mod tests {
                 .join(LOG_FILE)
                 .exists(),
             "and nothing was started for it"
+        );
+    }
+
+    /// What a start says of a manager that gave no daemon: that it did not start one where it could
+    /// not be asked or refused at once, and only that it was asked and gave no answer where it was
+    /// asked and did not answer in time, since the daemon may still start.
+    #[cfg(unix)]
+    #[test]
+    fn a_manager_that_was_asked_and_gave_no_answer_is_not_said_to_have_started_none() {
+        let id = kr_ipc::testing::TempHost::create().environment_id();
+        let why = Shown::said("`systemctl --user start x` did not answer within 30 seconds");
+        assert_eq!(
+            manager_gave_no_start(id, &why, true).to_string(),
+            format!(
+                "the service manager was asked to start the control daemon for environment {id} \
+                 and gave no answer: `systemctl --user start x` did not answer within 30 seconds"
+            )
+        );
+        let why = Shown::said("`systemctl --user start x` ended with status 1");
+        assert_eq!(
+            manager_gave_no_start(id, &why, false).to_string(),
+            format!(
+                "the service manager did not start the control daemon for environment {id}: \
+                 `systemctl --user start x` ended with status 1"
+            )
         );
     }
 

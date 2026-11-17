@@ -27,6 +27,7 @@ worker directly for what a session owns.
 | `kr host terminal-profile` | — | Show, add or take out the optional `KalaReach` profile in one terminal application, so each window or tab opened through it is a session of its own |
 | `kr host startup` | — | Show or choose how `kr new` starts this environment's control daemon when none is running |
 | `kr host stop` | — | Ask this installation's control daemon to stop, wait until it has ended, and say what that left |
+| `kr host restart` | — | Stop this installation's control daemon as `kr host stop` does, start one the way `kr new` does, and say which daemon answers |
 | `kr host network` | — | Show which network and services this host selects, join the service that publishes a description of itself, or leave it |
 | `kr host descriptions` | — | Show what session descriptions offer on this host, turn them on or off, and fetch the model's files |
 | `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
@@ -2525,6 +2526,27 @@ The command ends with one of these results, which `--json` keeps apart as `stop`
 A message that tells how to end a holder names a process only where it is a process named `kr-controller`: the one the command waited for, or the one the lock file names. `kill -KILL` with that number ends it, and the next daemon recovers as it does after a crash. On Windows the lock file cannot be read while a daemon holds the lock, so these messages then name no process and point to the Task Manager. Where the last look finds the lock free and the lock file names a live process named `kr-controller`, they name it with `taskkill /F /PID` and its number. A message about a record of an earlier attempt names the `kr host stop` that wrote it, on every platform, with its number and the time of its last record. The number can belong to another process now, and no message tells you to end it. Where no control daemon runs, the command says so and exits 0. A daemon that accepts the connection and does not answer within 10 seconds is a holder that does not answer: the command asks for no stop and exits 1. A daemon of another build that takes no stop request is not stopped; the command says that and how to switch this host to another release.
 
 `kr host stop --json` returns `{"ok": true, "stop": "ended", "pid": 4242, "unsettled": 0}`. In a result that follows the wait for the end, `pid` is the process in the daemon's answer, or, where no answer arrived, the process the lock file named before the request, where that process could be read; `unsettled` is the answer's count, and is null where the answer did not arrive. In every other result both are null, except that an `ended` result of a request that could not be made carries as `pid` the process the lock file named, where that process could be read. A failure carries `ok` false, the failure's code, message and exit code beside the same members. `records` lists, as sentences, what earlier attempts recorded that the command said, where there were any.
+
+## `kr host restart`
+
+```sh
+kr host restart           # stop the control daemon, start one the way `kr new` does, and say what answers
+kr host restart --json    # the same, as a document
+```
+
+The command stops this installation's control daemon as `kr host stop` does, starts one the way `kr new` does under the start that `kr host startup` shows, and reads which daemon answers. Where no daemon runs it starts one. It stops no session: a session's worker keeps running, a local attach keeps working, and the new daemon finds the sessions again. Paired devices' connections to the old daemon close, and their pairings stand. The command refuses where `KR_SESSION` or `KR_ATTACHMENT` is set, and where a live session's worker says the process is inside its session, as `kr host stop` does.
+
+Nothing is stopped where no start is chosen, where the program the start runs or its log cannot be used, or where the daemon was started with arguments, or with other values of the variables that name where it looks for files, than this command's start gives. The refusal says what differs, and `kr host stop` still works.
+
+The standalone start gives the new daemon this shell's whole environment, and later sessions take their search path, home, user name, language, time zone, temporary folder and locale from it; a service manager gives its own.
+
+Every text says what the command read and what it did. Where the daemon took the stop, the text says that it stopped the daemon. Where the request could not be made and the daemon ended, or the request was written and the daemon did not show whether it took it, the text opens with `kr host stop`'s own words for that state and goes on to what the start did. The text then says one of: this command started the daemon that answers (it states the process this command started, and a newer generation than the daemon that was stopped); another control daemon answers and is not this command's own start; a control daemon answers and nothing shows whether it is the one the start made, because the start names no process or the generation of the stopped daemon was not read (the text says what answers and which start was asked); or the start failed (the text says what was stopped, what the start said, and that no session was stopped).
+
+Where a daemon answers but does not complete the exchange that proves which daemon it is, the command starts nothing more, waits up to 30 seconds for a whole exchange, and says that no control daemon gave a whole answer when none did. A held environment whose daemon does not answer is waited for within the same bound; this command then stops none and starts none.
+
+`kr host restart --json` returns the `stop` member of `kr host stop` (`ended`, `told`, `maybe_asked`, `refused`, `not_asked`), `pid`, `unsettled`, and: `started`, which is `{"start": "standalone", "pid": 4242}` only where the daemon that answers is proved to be the one this command started and is null otherwise; `serving`, the process the daemon that answers states, or null; and `launched`, what this command launched (`{"start", "pid"}`, with a null `pid` where the start names none), or null where it launched none. A launch that was not proved is `launched` set and `started` null. A failure adds `ok` false, `code`, `message` and `exit_code`.
+
+Exit 0: the old daemon ended or none ran and a control daemon answers, or a holder that did not answer gave way to a daemon. Exit 1: the start failed after the stop, a daemon that answers is of the stopped generation, states no process or gives no whole answer in 30 seconds, the old daemon had not ended after 30 seconds, a holder does not answer, a daemon of another build takes no stop request, or an interrupt. Exit 3: no start can be made or the daemon's launch differs from it (nothing was stopped), or the start could not be set up after the stop. Exit 8: the refusal inside a session, or a refusal of the stop request that says it was not allowed. An interrupt after the stop request has left does not cancel the stop.
 
 ## `kr host power`
 

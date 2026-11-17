@@ -183,7 +183,7 @@ pub(super) async fn prove<O: Operations>(
 /// have been stopped by another command, whose own start comes up next. It waits, within `bound`
 /// counted from here, for a daemon to give a whole exchange, and gives what that daemon says on
 /// its connection. A wait that runs out is the failure of a proof that was cut, which says that
-/// the command could not read which daemon serves the environment and that none answered within
+/// the command could not read which daemon serves the environment and that none gave a whole answer within
 /// the bound.
 async fn after_a_cut<O: Operations>(
     operations: &O,
@@ -221,13 +221,13 @@ fn cut_failed_said(started: Option<Started>, bound: Duration) -> Shown {
     match started {
         Some(started) => shown!(
             "this command started a control daemon{} but could not read which control daemon \
-             serves the environment, and no control daemon answered within {} seconds",
+             serves the environment, and no control daemon gave a whole answer within {} seconds",
             super::process_said(started.pid.map(u64::from)),
             bound.as_secs()
         ),
         None => shown!(
             "this command could not read which control daemon serves the environment, and no \
-             control daemon answered within {} seconds",
+             control daemon gave a whole answer within {} seconds",
             bound.as_secs()
         ),
     }
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(
             said,
             "this command started a control daemon (process 100) but could not read which control \
-             daemon serves the environment, and no control daemon answered within 30 seconds"
+             daemon serves the environment, and no control daemon gave a whole answer within 30 seconds"
         );
         assert!(!launched, "a daemon answered, so none may still start");
         let cut_at = Duration::from_secs(7);
@@ -615,6 +615,62 @@ mod tests {
             calls.get(2),
             Some(&(cut_at, Call::Connect(BOUND))),
             "the first attempt is at the cut with the whole bound"
+        );
+    }
+
+    /// A daemon that answers the information request and withholds the answer to the launch-only
+    /// request, on every connection, as a host does that owes a fence it has not yet raised: the
+    /// proof never has a whole exchange, and ends at the bound with a failure that says that no
+    /// control daemon gave a whole answer, which is true, and not that none answered, which is not.
+    /// The failure is an unfinished command (exit 1) and names the process this command launched.
+    #[tokio::test(start_paused = true)]
+    async fn an_information_request_answered_and_a_launch_only_answer_withheld_fails_at_the_bound()
+    {
+        let withheld = Says {
+            generation: Ok(5),
+            process: Err("the answer is withheld as an unknown outcome"),
+            hangs: false,
+        };
+        let supplied = Supplied::new(
+            Duration::ZERO,
+            started(100),
+            vec![withheld.clone()],
+            vec![at_once(Some(0))],
+        );
+        let proved = prove(
+            &supplied,
+            Old::Generation(ControllerGeneration::new(4)),
+            BOUND,
+        )
+        .await;
+        let Err(failed) = proved else {
+            panic!("the proof should have failed");
+        };
+        assert!(
+            matches!(
+                &failed.error,
+                CliError::Unfinished {
+                    code: ErrorCode::EnvironmentUnavailable,
+                    ..
+                }
+            ),
+            "an unfinished command, which ends with exit 1"
+        );
+        assert_eq!(
+            failed.error.said().to_string(),
+            "this command started a control daemon (process 100) but could not read which control \
+             daemon serves the environment, and no control daemon gave a whole answer within 30 seconds"
+        );
+        assert!(
+            !failed.launched,
+            "a daemon answered, so none may still start"
+        );
+        assert!(
+            supplied
+                .calls()
+                .iter()
+                .any(|(_, call)| matches!(call, Call::Generation(0))),
+            "the information request was answered on the connection the start gave"
         );
     }
 
@@ -645,7 +701,7 @@ mod tests {
             assert_eq!(
                 said,
                 "this command started a control daemon (process 100) but could not read which \
-                 control daemon serves the environment, and no control daemon answered within \
+                 control daemon serves the environment, and no control daemon gave a whole answer within \
                  30 seconds"
             );
             assert!(!launched);
@@ -662,7 +718,7 @@ mod tests {
         assert_eq!(
             said,
             "this command could not read which control daemon serves the environment, and no \
-             control daemon answered within 30 seconds"
+             control daemon gave a whole answer within 30 seconds"
         );
         assert!(!launched);
     }
@@ -688,7 +744,7 @@ mod tests {
         assert_eq!(
             said,
             "this command started a control daemon but could not read which control daemon \
-             serves the environment, and no control daemon answered within 30 seconds"
+             serves the environment, and no control daemon gave a whole answer within 30 seconds"
         );
     }
 
@@ -732,7 +788,7 @@ mod tests {
             .await,
         );
         assert!(
-            said.contains("no control daemon answered within 30 seconds"),
+            said.contains("no control daemon gave a whole answer within 30 seconds"),
             "{said}"
         );
         assert_eq!(supplied.began.elapsed(), BOUND);

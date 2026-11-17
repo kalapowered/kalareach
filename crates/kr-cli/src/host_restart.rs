@@ -931,7 +931,7 @@ impl Proved {
 /// daemon that this command started answers: the stop's own words for that state, then the start.
 fn unmade_then_started_said(first: &Shown, started: &Started) -> Shown {
     shown!(
-        "{} This command then started a control daemon{} under the {} start. No session was stopped.",
+        "{} This command then started a control daemon{} under the {} start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
         *first,
         process_said(started.pid.map(u64::from)),
         start_said(started)
@@ -950,27 +950,27 @@ fn unmade_and_another_serves_said(
 ) -> Shown {
     if successor {
         return shown!(
-            "{} This command sent nothing and started none. No session was stopped.",
+            "{} This command sent nothing and started none. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
             *first
         );
     }
     match launched {
         None => shown!(
             "{} A control daemon already serves the environment{}. This command started none. No \
-             session was stopped.",
+             session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
             *first,
             process_said(serving)
         ),
         Some(started) if cut => shown!(
             "{} A control daemon now serves the environment{}. This command's own start{} does not \
-             serve it. No session was stopped.",
+             serve it. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
             *first,
             process_said(serving),
             process_said(started.pid.map(u64::from))
         ),
         Some(started) => shown!(
             "{} A control daemon already serves the environment{}. The control daemon that answers \
-             is not this command's own start{}. No session was stopped.",
+             is not this command's own start{}. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
             *first,
             process_said(serving),
             process_said(started.pid.map(u64::from))
@@ -988,7 +988,7 @@ fn unmade_and_start_failed_said(first: &Shown, own: Shown, launched: bool) -> Sh
     };
     shown!(
         "{} This command's start failed: {}.{} No session was stopped: its workers keep running and \
-         a local attach still works. Fix the cause and run kr host restart again.",
+         a local attach still works. Paired devices cannot connect until a control daemon runs. Fix the cause and run kr host restart again.",
         *first,
         own,
         still
@@ -1006,7 +1006,7 @@ fn restarted_said(id: EnvironmentId, old: Option<u64>, started: &Started, create
     };
     shown!(
         "Restarted the control daemon for environment {}{} under the {} start. No session was \
-         stopped.{}",
+         stopped. Paired devices' connections to the old daemon closed; their pairings stand.{}",
         id,
         processes,
         start_said(started),
@@ -1046,7 +1046,7 @@ fn stopped_and_unproven_said(
     creates: Shown,
 ) -> Shown {
     shown!(
-        "{}; a {}.{} No session was stopped.{}",
+        "{}; a {}.{} No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.{}",
         *clause,
         answers_now(serving, newer),
         asked_and_cannot_tell(started),
@@ -1062,7 +1062,7 @@ fn unmade_and_unproven_said(
     newer: bool,
 ) -> Shown {
     shown!(
-        "{} A {}.{} No session was stopped.",
+        "{} A {}.{} No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.",
         *first,
         answers_now(serving, newer),
         asked_and_cannot_tell(started)
@@ -1102,7 +1102,7 @@ fn stopped_and_another_already_serves_said(
         launched => Proved::own_start_said(launched),
     };
     shown!(
-        "{}; a control daemon already serves it{}.{} No session was stopped.{}",
+        "{}; a control daemon already serves it{}.{} No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.{}",
         *clause,
         process_said(serving),
         own,
@@ -1155,7 +1155,7 @@ fn stopped_and_another_serves_after_a_cut(
 ) -> Shown {
     shown!(
         "{}; a control daemon now serves it{}. This command's own start{} does not serve it. No \
-         session was stopped.{}",
+         session was stopped. Paired devices' connections to the old daemon closed; their pairings stand.{}",
         *clause,
         process_said(serving),
         process_said(started.pid.map(u64::from)),
@@ -1219,7 +1219,8 @@ fn start_failed_said(id: EnvironmentId, had: Had, own: Shown, launched: bool) ->
     let sessions = match had {
         Had::NoDaemon => Shown::said("Nothing was stopped."),
         Had::Daemon(_) => Shown::said(
-            "No session was stopped: its workers keep running and a local attach still works.",
+            "No session was stopped: its workers keep running and a local attach still works. \
+             Paired devices cannot connect until a control daemon runs.",
         ),
     };
     shown!(
@@ -1687,7 +1688,7 @@ mod tests {
             format!(
                 "Stopped the control daemon for environment {id} (process 30); a control daemon \
                  now serves it (process 41). This command's own start (process 40) does not \
-                 serve it. No session was stopped."
+                 serve it. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         let creates = host_stop::creates_under_way(Some(2));
@@ -1701,7 +1702,7 @@ mod tests {
             said.to_string().starts_with(&format!(
                 "Stopped the control daemon for environment {id}; a control daemon now serves it \
                  (process 41). This command's own start (process 40) does not serve it. No \
-                 session was stopped. 2 session creates were still under way"
+                 session was stopped. Paired devices' connections to the old daemon closed; their pairings stand. 2 session creates were still under way"
             )),
             "{said}"
         );
@@ -1762,14 +1763,14 @@ mod tests {
             restarted_said(id, Some(30), &started(Some(40)), Shown::said("")).to_string(),
             format!(
                 "Restarted the control daemon for environment {id} (process 30 ended, process 40 \
-                 started) under the {start} start. No session was stopped."
+                 started) under the {start} start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             restarted_said(id, None, &started(None), Shown::said("")).to_string(),
             format!(
                 "Restarted the control daemon for environment {id} under the {start} start. \
-                 No session was stopped."
+                 No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
@@ -1801,7 +1802,7 @@ mod tests {
             format!(
                 "Stopped the control daemon for environment {id} (process 30); a control daemon \
                  already serves it (process 41). The control daemon that answers is not this \
-                 command's own start (process 40). No session was stopped."
+                 command's own start (process 40). No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
@@ -1815,7 +1816,7 @@ mod tests {
             .to_string(),
             format!(
                 "Stopped the control daemon for environment {id} (process 30); a control daemon \
-                 already serves it. No session was stopped."
+                 already serves it. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
@@ -1876,7 +1877,7 @@ mod tests {
             format!(
                 "The control daemon for environment {id} (process 30) was stopped and the start \
                  failed: the daemon did not answer. The requested daemon may still start. No \
-                 session was stopped: its workers keep running and a local attach still works. \
+                 session was stopped: its workers keep running and a local attach still works. Paired devices cannot connect until a control daemon runs. \
                  Fix the cause and run kr host restart again."
             )
         );
@@ -2105,7 +2106,7 @@ mod tests {
             said(&Proved::Ours(started(Some(40)))),
             format!(
                 "{x} This command then started a control daemon (process 40) under the {start} \
-                 start. No session was stopped."
+                 start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
@@ -2113,21 +2114,21 @@ mod tests {
             format!(
                 "{x} A control daemon already serves the environment (process 50). The control \
                  daemon that answers is not this command's own start (process 40). No session was \
-                 stopped."
+                 stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said(&another(Some(50), None, false)),
             format!(
                 "{x} A control daemon already serves the environment (process 50). This command \
-                 started none. No session was stopped."
+                 started none. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said(&another(Some(50), Some(started(Some(40))), true)),
             format!(
                 "{x} A control daemon now serves the environment (process 50). This command's own \
-                 start (process 40) does not serve it. No session was stopped."
+                 start (process 40) does not serve it. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         let (id, first, successor) =
@@ -2140,7 +2141,9 @@ mod tests {
                 Shown::said("")
             )
             .to_string(),
-            format!("{first} This command sent nothing and started none. No session was stopped.")
+            format!(
+                "{first} This command sent nothing and started none. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
+            )
         );
         for (launched, still) in [
             (false, ""),
@@ -2157,7 +2160,7 @@ mod tests {
                 .to_string(),
                 format!(
                     "{x} This command's start failed: the log could not be used.{still} No session \
-                     was stopped: its workers keep running and a local attach still works. Fix the \
+                     was stopped: its workers keep running and a local attach still works. Paired devices cannot connect until a control daemon runs. Fix the \
                      cause and run kr host restart again."
                 )
             );
@@ -2232,42 +2235,42 @@ mod tests {
             said(&taken, &Proved::Ours(started(Some(40)))),
             format!(
                 "Restarted the control daemon for environment {id} (process 4000 ended, process \
-                 40 started) under the {start} start. No session was stopped."
+                 40 started) under the {start} start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said(&unknown, &Proved::Ours(started(Some(40)))),
             format!(
                 "{s}. This command then started a control daemon (process 40) under the {start} \
-                 start. No session was stopped."
+                 start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said(&unknown, &another(Some(50), Some(started(Some(40))), false)),
             format!(
                 "{s}; a control daemon already serves it (process 50). The control daemon that \
-                 answers is not this command's own start (process 40). No session was stopped."
+                 answers is not this command's own start (process 40). No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said(&unknown, &another(Some(50), Some(started(Some(40))), true)),
             format!(
                 "{s}; a control daemon now serves it (process 50). This command's own start \
-                 (process 40) does not serve it. No session was stopped."
+                 (process 40) does not serve it. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said(&unknown, &another(Some(50), None, false)),
             format!(
                 "{s}; a control daemon already serves it (process 50). This command started \
-                 none. No session was stopped."
+                 none. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said(&taken, &another(Some(50), None, false)),
             format!(
                 "Stopped the control daemon for environment {id} (process 4000); a control daemon \
-                 already serves it (process 50). No session was stopped."
+                 already serves it (process 50). No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
@@ -2282,7 +2285,7 @@ mod tests {
             format!(
                 "{s}. This command's start failed: the log could not be used. The requested \
                  daemon may still start. No session was stopped: its workers keep running and a \
-                 local attach still works. Fix the cause and run kr host restart again."
+                 local attach still works. Paired devices cannot connect until a control daemon runs. Fix the cause and run kr host restart again."
             )
         );
         let Err(not_ended) = stopped_by_the_request(
@@ -2328,21 +2331,21 @@ mod tests {
                 .to_string(),
             format!(
                 "Stopped the control daemon for environment {id} (process 30); a control daemon \
-                 of a newer generation now answers (process 41). {asked} No session was stopped."
+                 of a newer generation now answers (process 41). {asked} No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said_after_the_proof(id, &taken, &unproven(None, false), Shown::said("")).to_string(),
             format!(
                 "Stopped the control daemon for environment {id} (process 30); a control daemon \
-                 now answers. {asked} No session was stopped."
+                 now answers. {asked} No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(
             said_after_the_proof(id, &unmade, &unproven(Some(41), false), Shown::said(""))
                 .to_string(),
             format!(
-                "{first} A control daemon now answers (process 41). {asked} No session was stopped."
+                "{first} A control daemon now answers (process 41). {asked} No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         assert_eq!(

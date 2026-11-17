@@ -1729,20 +1729,22 @@ fn not_shown(which: Which, id: EnvironmentId, not_known: Option<&Shown>) -> Show
             "The control daemon for environment {} was told to stop. After {} seconds the lock was \
              free, and the last look at the endpoint showed neither that the daemon still runs nor \
              that it had gone, so the command could not confirm the end. Run {} again in \
-             a moment; it looks again.",
+             a moment; it looks again.{}",
             id,
             END_BOUND.as_secs(),
-            which.command()
+            which.command(),
+            which.no_start()
         ),
         Some(failure) => shown!(
             "The control daemon for environment {} did not show whether it took the stop ({}). \
              After {} seconds the lock was free, and the last look at the endpoint showed neither \
              that the daemon still runs nor that it had gone, so the command could not confirm the \
-             end. Run {} again in a moment; it looks again.",
+             end. Run {} again in a moment; it looks again.{}",
             id,
             *failure,
             END_BOUND.as_secs(),
-            which.command()
+            which.command(),
+            which.no_start()
         ),
     }
 }
@@ -2274,20 +2276,22 @@ fn held_not_shown(which: Which, id: EnvironmentId, not_known: Option<&Shown>) ->
         None => shown!(
             "The control daemon for environment {} was told to stop. After {} seconds the \
              environment was still held, and the command could not show what holds it, so it \
-             could not confirm the end. Run {} again in a moment; it looks again.",
+             could not confirm the end. Run {} again in a moment; it looks again.{}",
             id,
             END_BOUND.as_secs(),
-            which.command()
+            which.command(),
+            which.no_start()
         ),
         Some(failure) => shown!(
             "The control daemon for environment {} did not show whether it took the stop ({}). \
              After {} seconds the environment was still held, and the command could not show \
              what holds it, so it could not confirm the end. Run {} again in a \
-             moment; it looks again.",
+             moment; it looks again.{}",
             id,
             *failure,
             END_BOUND.as_secs(),
-            which.command()
+            which.command(),
+            which.no_start()
         ),
     }
 }
