@@ -1020,16 +1020,36 @@ fn a_rebuild_that_fails_leaves_the_registry_as_it_was() {
     );
 }
 
-/// No release wrote schema version 17, so a registry that records it is refused as such.
+/// Every object of the file's schema, in a fixed order.
+fn schema_of(path: &Path) -> Vec<(String, String, String)> {
+    let connection = rusqlite::Connection::open(path).expect("the registry opens");
+    let mut statement = connection
+        .prepare("SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name")
+        .expect("the schema");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("every row")
+}
+
+/// No release wrote schema version 17, so a registry that records it is refused as such, and the
+/// file is left exactly as it was: no writer brings a table or a column forward in it.
 #[test]
 fn a_registry_at_17_is_refused_as_a_version_no_release_wrote() {
     let temp = tempfile::tempdir().expect("a directory on the internal disk");
     let path = temp.path().join("registry.db");
     registry_left_at(&path, 17, false);
+    let before = schema_of(&path);
     let error = match open_registry(&path) {
         Err(error) => error.to_string(),
         Ok(_) => panic!("a registry at 17 is refused"),
     };
-    assert!(error.contains("schema version 17"), "{error}");
+    assert!(error.contains("no release wrote"), "{error}");
     assert_eq!(recorded_version(&path), 17, "nothing was changed");
+    assert_eq!(
+        schema_of(&path),
+        before,
+        "the refused file's schema is unchanged"
+    );
 }
