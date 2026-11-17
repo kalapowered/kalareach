@@ -442,6 +442,9 @@ the daemon asks again, no oftener than once a minute, and believes it only after
 once the longest a lease can live has passed since the first, because the service gives the same
 answer when a revocation raced a refill.
 
+A relay lease belongs to the pair of endpoints and its payer, not to one pairing: it can continue
+when a device is paired again, and it ends when the device is unpaired or the payer changes.
+
 It may happen that a request results in a lease without the answer arriving. The same holds for a
 refill that the service answers with another lease, as it does when the lease has run out at the
 service. Since the daemon won't have written down the lease in either case, it will at some point
@@ -1297,9 +1300,22 @@ for such a host, and no step removes or moves a key. Three facts apply:
 1. Find the devices that no longer reach the host. A device that pinned the credential store's set
    no longer reaches it, because the host's endpoint identity is now the directory set's. A device
    that pinned the directory's set is not affected.
-2. A device that no longer reaches the host cannot pair with it again with the keys that it holds.
-   The host keeps that device's record and refuses a second record for the same device endpoint.
-   Forgetting the host on the device does not change this: do not forget the host as a repair.
+2. A device that no longer reaches the host can be paired with it again, in this order. First the
+   host's owner ends the device's pairing: with `kr device revoke <device>` at the host's machine,
+   or from an owner device's companion, which reaches the host through its authority feed ("Revoking
+   a device on a host you own" in the companion guide); or the pairing runs out. Then the person
+   forgets the host on the device, because the device refuses a new pairing while it holds any
+   record of that host. Then the person pairs with a new invitation, which an owner device confirms.
+   The new pairing is a new device with a new identity and none of the old pairing's rights. Until
+   the old pairing has ended the host refuses the new one and says so. Just after it has ended the
+   host may say that it is still finishing an earlier withdrawal of access and cannot add the device
+   yet. Nothing bounds that time: the person asks for a new confirmation after the host has
+   finished, and `kr device revoke <device>`, run again at the host's machine, says how far the
+   revocation has got. Add another owner device before the only owner device forgets or loses the
+   host: afterwards no device can confirm a new pairing, because a new owner device needs an owner
+   device's confirmation and the host's terminal confirms nothing once the host has an owner, and
+   this product gives no recovery for such a host. Revoking a device ends its pairing; the host
+   keeps the record, and a new pairing of the same device makes a new record.
 3. Keep both sets of keys. This build does not read the credential store's items for such a host,
    and they are the only copy of the identity that those devices pinned. Never copy keys from one
    store to the other: a copy of the credential store's set over the directory's would break each
