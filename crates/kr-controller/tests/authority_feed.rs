@@ -8866,3 +8866,163 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         assert!(is_served(raw).await, "no other connection was withdrawn");
     }
 }
+
+/// KR-REQ-10.46: an owner device's record was revoked and the device paired again with the same
+/// key. A request that names the revoked record as its issuer is decided on that record alone,
+/// which is revoked, so the new record's standing does not carry it. A request whose issuer
+/// identifier no record holds is refused before and after the device paired again: the key the new
+/// record holds does not stand in for an identifier. (A request the feed shows complete, which a
+/// host that lost the withdrawal replays, is judged by the key when its issuer identifier is
+/// unknown; that path is a case of its own.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_naming_a_revoked_owner_record_is_decided_on_it_alone_when_the_device_paired_again()
+ {
+    let rig = Rig::start().await;
+    let both = [ActionRight::HostManage, ActionRight::SessionView];
+    let (owner_phone, first) = rig.pairs(&both).await;
+    let (_a, one) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_b, other) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    let mut local = rig.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut local,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: first.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the owner device");
+    rig.until_the_carrier_is_idle().await;
+    let key = owner_phone.keys().authorisation.clone();
+    let unknown = || DeviceId::new(kr_ipc::new_uuid());
+
+    // Control: with the key held by the revoked record alone, a request that no record issued is
+    // refused.
+    let before = rig.request_of(&key, unknown(), 0xc0, devices(one.device_id));
+    rig.published_as(&key, &before).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &before).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority)
+    );
+    assert!(rig.host.record_of(one.device_id).is_paired());
+
+    // The device pairs again, with the same key, under a record of its own.
+    let second = within(
+        "the owner device pairs again",
+        Box::pin(pair_with(
+            &rig.host,
+            &owner_phone,
+            &rig.owner,
+            proposal(&both),
+        )),
+    )
+    .await;
+    assert_ne!(second.device_id, first.device_id);
+    rig.until_the_carrier_is_idle().await;
+
+    // The request names the revoked record as its issuer: that record decides, and is revoked.
+    let by_the_old_record = rig.request_of(&key, first.device_id, 0xc1, devices(other.device_id));
+    rig.published_as(&key, &by_the_old_record).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &by_the_old_record).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "the revoked record decides its own request"
+    );
+    assert!(
+        rig.host.record_of(other.device_id).is_paired(),
+        "what the request named was not withdrawn"
+    );
+
+    // The request names an issuer identifier that no record holds: a request is decided by the
+    // record of the identifier it names, so the new record's key does not make it good.
+    let by_the_key = rig.request_of(&key, unknown(), 0xc2, devices(one.device_id));
+    rig.published_as(&key, &by_the_key).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &by_the_key).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "no record holds the identifier the request names"
+    );
+    assert!(rig.host.record_of(one.device_id).is_paired());
+    assert!(rig.host.record_of(second.device_id).is_paired());
+}
+
+/// KR-REQ-10.46: as the case above, for an owner device whose grant ran out and was never
+/// revoked, and which paired again. The ended record is not revoked, but a request that names it as
+/// its issuer is refused, and so is a request that names an identifier no record holds, before and
+/// after the device paired again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_naming_an_owner_record_that_ran_out_is_decided_on_it_alone_when_the_device_paired_again()
+ {
+    let rig = Rig::start().await;
+    let both = [ActionRight::HostManage, ActionRight::SessionView];
+    let (owner_phone, first) = rig.pairs(&both).await;
+    let (_a, one) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_b, other) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.until_the_carrier_is_idle().await;
+    // The end of the first record's grant is on record, and it was never revoked.
+    rusqlite::Connection::open(rig.host.registry_database())
+        .expect("the registry opens")
+        .execute(
+            "UPDATE network_devices SET expired_at_ms = ?1 WHERE device_id = ?2",
+            rusqlite::params![
+                i64::try_from(kr_ipc::now_ms().get()).expect("a moment"),
+                first.device_id.get().as_bytes().as_slice()
+            ],
+        )
+        .expect("the end of the grant is recorded");
+    let key = owner_phone.keys().authorisation.clone();
+    let unknown = || DeviceId::new(kr_ipc::new_uuid());
+
+    // Control: the ended record alone holds the key, and a request that no record issued is
+    // refused.
+    let before = rig.request_of(&key, unknown(), 0xc3, devices(one.device_id));
+    rig.published_as(&key, &before).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &before).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority)
+    );
+    assert!(rig.host.record_of(one.device_id).is_paired());
+
+    let second = within(
+        "the owner device pairs again",
+        Box::pin(pair_with(
+            &rig.host,
+            &owner_phone,
+            &rig.owner,
+            proposal(&both),
+        )),
+    )
+    .await;
+    assert_ne!(second.device_id, first.device_id);
+    rig.until_the_carrier_is_idle().await;
+
+    // The request names the ended record: it decides, and it no longer stands.
+    let by_the_old_record = rig.request_of(&key, first.device_id, 0xc4, devices(other.device_id));
+    rig.published_as(&key, &by_the_old_record).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &by_the_old_record).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "the ended record decides its own request"
+    );
+    assert!(rig.host.record_of(other.device_id).is_paired());
+
+    // The request names an issuer identifier that no record holds: the new record's key does not
+    // make it good.
+    let by_the_key = rig.request_of(&key, unknown(), 0xc5, devices(one.device_id));
+    rig.published_as(&key, &by_the_key).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held_as(&key, &by_the_key).await.rejected.0,
+        Some(RejectionReason::NoOwnerAuthority),
+        "no record holds the identifier the request names"
+    );
+    assert!(rig.host.record_of(one.device_id).is_paired());
+    assert!(rig.host.record_of(second.device_id).is_paired());
+}
