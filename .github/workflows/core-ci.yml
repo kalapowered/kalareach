@@ -79,6 +79,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        timeout-minutes: 2
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
+
       # rust-toolchain.toml pins the exact toolchain; rustup installs it on first use.
       # libsodium-sys-stable builds libsodium from the source archive it ships, so the native
       # library is compiled and its length constants are checked against this wrapper on every run.
@@ -584,6 +592,14 @@ jobs:
 
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        timeout-minutes: 2
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
 
       - name: Install the pinned toolchain
         run: |
@@ -1633,6 +1649,14 @@ jobs:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        timeout-minutes: 2
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
+
       - name: Install the pinned toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -2049,6 +2073,14 @@ jobs:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        timeout-minutes: 2
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
+
       - name: Install pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
@@ -2235,6 +2267,14 @@ jobs:
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        timeout-minutes: 2
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
+
       - name: What the disk holds
         continue-on-error: true
         timeout-minutes: 5
@@ -2390,6 +2430,14 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        timeout-minutes: 2
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
 
       # The disk as the image arrives, and from here to the last report the lowest free space in
       # each stretch of the job, on the macOS leg.
@@ -2599,6 +2647,14 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        timeout-minutes: 2
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
 
       # The disk as the image arrives and what takes the room on it, and from here to the last
       # report the lowest free space in each stretch of the job, sampled every two seconds: the
@@ -3381,6 +3437,14 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The runner fetches the action that keeps the evidence when the first step that calls it
+      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
+      - name: Load the action that keeps the evidence
+        timeout-minutes: 2
+        uses: ./.github/actions/keep-evidence
+        with:
+          only-load: "true"
 
       # The disk as the image arrives, and from here to the last report the lowest free space in
       # each stretch of the job.
