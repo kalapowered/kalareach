@@ -157,23 +157,21 @@ only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
 # The guards held where a call is made, from the text before it: `SES` is the session that a
 # function is given or takes before the call. A binding `_` holds nothing, and a `let` that `if`,
 # `while` or `&&` precedes is not read.
-# The compiler holds the dispatch barrier's guard. The first admission, the prepared path, the
-# accept's hold, the dispatch after it and the pass take a borrow of a guard as a parameter, the
-# pass keeps it, and only the module that holds the boundary can make a guard or take a boundary,
-# so a caller that holds no guard does not compile. The compiler does not say whose boundary the
-# guard holds (the two entries check that when they run) or who calls these private methods: an
-# `only` row, not a `caller` row, keeps a call from any other function out. A `caller` row reads
-# only the file that it names, and a function of a child module of the service can call these
-# private methods; an `only` row reads every file of this crate's `src`, so a second caller in any
-# file fails it.
-# The reader adds one narrow reading of the barrier, `TAKE`: a call of `take_boundary` or
-# `try_take_boundary` before a `held` row's call, in the same function, bound or not, dropped or
-# not. A row that says `none` refuses it, so no second take stands under the held barrier (it would
-# wait on itself), and refuses a session held there: the two rows of the entries' callers say so.
+# The compiler holds the dispatch barrier's guard for nine functions: the first admission, the
+# prepared path, the accept's hold, the dispatch after it and the pass take a borrow of a guard as a
+# parameter and the pass keeps it, and so do four of the bodies that the other takers run
+# (`revalidate_time`, `accept_generation`, `fence` and `fence_what_is_owed`); only the module that
+# holds the boundary can make a guard or take a boundary, so a caller that holds no guard does not
+# compile. The compiler does not say whose boundary the guard holds (the two entries check that
+# when they run), who calls these private methods (an `only` row, not a `caller` row, keeps a call
+# from any other function out: a `caller` row reads only the file that it names, and a function of a
+# child module of the service can call these private methods, while an `only` row reads every file
+# of this crate's `src`), or what the rest of the work under the boundary does with its guard (the
+# expiry task's release, the maintenance pass's session work, the storage recovery and the answers:
+# scope alone holds them).
 # The first admission asks the authority and the limits under no guard that the reader sees, the
 # envelope under a session of its own, and takes the session for the limits itself.
 only receipted crates/kr-worker/src/service.rs receipt_once 1
-held crates/kr-worker/src/service.rs receipt_once receipted none
 only admit_and_dispatch crates/kr-worker/src/service.rs receipted 1
 held crates/kr-worker/src/service.rs receipted authority none
 held crates/kr-worker/src/service.rs receipted envelope SES
@@ -247,7 +245,6 @@ site crates/kr-worker/src/broker/bridge.rs attested_thread state 1
 only dispatch_accepted crates/kr-worker/src/service.rs admit_and_dispatch 1
 only dispatch_accepted crates/kr-worker/src/service.rs continue_prepared 1
 only continue_prepared crates/kr-worker/src/service.rs prepared_once 1
-held crates/kr-worker/src/service.rs prepared_once continue_prepared none
 held crates/kr-worker/src/service.rs continue_prepared dispatch_accepted SES
 supplies crates/kr-worker/src/service.rs admit_and_dispatch dispatch_accepted 1 session
 supplies crates/kr-worker/src/service.rs continue_prepared dispatch_accepted 1 session
@@ -461,3 +458,37 @@ calls crates/kr-worker/src/session.rs detach_for_token get crates/kr-worker/src/
 calls crates/kr-worker/src/session.rs geometry geometry crates/kr-worker/src/attachments.rs
 calls crates/kr-worker/src/session.rs lease lease crates/kr-worker/src/input_domain.rs
 calls crates/kr-worker/src/session.rs output_cursor next_cursor crates/kr-worker/src/history.rs
+
+# The takes of the dispatch boundary, by enumeration. A take under the held boundary waits on itself,
+# and every reading of the shape of a take (before a call, in a binding, in a body that the scan
+# reads) was found too narrow. So the roster lists, by hand, every function that takes the boundary
+# (the functions of the nine take sites) and the two methods that take it, and for each name the
+# number of times that it stands in the code of each file of the crate: a declaration, a call, an
+# argument, a statement after a call, a function value. A number that differs fails the main case
+# wherever the new mention stands. What to do: read the new text (the lock audit's table of takers is
+# the record of who may take the boundary, and where), then set the row; a new function that takes
+# the boundary is added as a `taker` row first, with its mentions. The one limit, which the crate
+# does not hold: a take that is reached with none of these names in the text (a name that a macro
+# makes, or a function that a macro writes).
+taker take_boundary
+taker try_take_boundary
+taker try_boundary
+taker hold_the_dispatch_boundary
+taker fence_what_is_owed_for_tests
+taker hold_the_boundary_for_this_announcement
+taker release_expired_grants
+taker maintain_once
+taker recover_storage_now
+taker acknowledge_revision
+mention acknowledge_revision crates/kr-worker/src/service.rs 2
+mention fence_what_is_owed_for_tests crates/kr-worker/src/service.rs 1
+mention hold_the_boundary_for_this_announcement crates/kr-worker/src/service.rs 2
+mention hold_the_dispatch_boundary crates/kr-worker/src/service.rs 1
+mention maintain_once crates/kr-worker/src/service.rs 2
+mention recover_storage_now crates/kr-worker/src/service.rs 1
+mention release_expired_grants crates/kr-worker/src/service.rs 2
+mention take_boundary crates/kr-worker/src/service.rs 7
+mention take_boundary crates/kr-worker/src/service/boundary.rs 1
+mention try_boundary crates/kr-worker/src/service.rs 4
+mention try_take_boundary crates/kr-worker/src/service.rs 2
+mention try_take_boundary crates/kr-worker/src/service/boundary.rs 1
