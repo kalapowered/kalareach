@@ -4786,14 +4786,14 @@ impl WorkerService {
     /// mutation always waits. The case
     /// `a_living_presentation_is_decided_in_a_gap_shorter_than_its_pause` shows the wake, and the
     /// case `a_living_presentation_keeps_trying_through_mutations_and_is_decided_when_they_stop`
-    /// shows that the presentation keeps trying through a stream and is decided when it stops. A
+    /// shows that the presentation keeps trying through a stream and is decided once it stops. A
     /// peer that has gone ends the presentation there. No acceptance runs for it, and its
     /// connection is read to its end at once and its place in the worker's count of connections is
     /// given back, where a blocking wait would keep both, and a thread, until the hold ended. A
-    /// peer that is there waits for the whole hold, however long, and tries for the boundary as
-    /// soon as the holder lets go. The try, the question to the system and the acceptance are one
-    /// step that returns no guard, so nothing is held across a pause. Once the boundary is taken,
-    /// the question is asked once more before anything is changed.
+    /// peer that is there waits for the whole hold, however long, and is woken when the holder lets
+    /// go. The try, the question to the system and the acceptance are one step that returns no
+    /// guard, so nothing is held across a pause. Once the boundary is taken, the question is asked
+    /// once more before anything is changed.
     ///
     /// What this leaves open, as limits to know:
     ///
