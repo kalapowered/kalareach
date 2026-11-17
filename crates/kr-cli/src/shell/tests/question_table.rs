@@ -476,17 +476,6 @@ const CASE_BOUND: std::time::Duration = std::time::Duration::from_secs(600);
 /// it, which waits for it to exit, fails on that and not on its own bound.
 const CHILD_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The most runs of the helper that the case where this host's wait fails makes to get one in which
-/// the reaping thread took the program's end before this host's own poll did. The poll comes first
-/// only where the reaping thread, woken by the program's end, is not scheduled for part of the
-/// poll's interval of 25 milliseconds, so eight runs in a row that it loses are a fault and not a
-/// loaded machine.
-const REAPER_TRIALS: usize = 8;
-
-/// How long the helper waits, once its install has ended, for the reaping thread to say that it took
-/// the program's end.
-const REAPER_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// How long a case that only reads text is given.
 const TEXT_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -655,35 +644,24 @@ fn the_install_in_a_process_of_its_own() {
         ) else {
             return;
         };
-        use std::sync::atomic::{AtomicI32, Ordering};
-        // The number of the first child that the reaping thread below takes the end of, or 0.
-        static FIRST_CHILD_REAPED: AtomicI32 = AtomicI32::new(0);
         let question = QUESTIONS
             .into_iter()
             .find(|question| question_name(*question) == named)
             .expect("a question of the table");
-        if std::env::var_os("KR_WALK_REAP").is_some() {
-            // A thread that takes the end of every child of this process, as a program that waits for
-            // any child does. This host's wait for its program then finds no such child (`ECHILD`),
-            // which is the way that a wait for a child that this host started can fail. Nothing else
-            // runs in this process, so no other child is taken.
-            std::thread::spawn(|| {
-                loop {
-                    match rustix::process::wait(rustix::process::WaitOptions::empty()) {
-                        Ok(Some((child, _))) => {
-                            let _ = FIRST_CHILD_REAPED.compare_exchange(
-                                0,
-                                child.as_raw_nonzero().get(),
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            );
-                        }
-                        Ok(None) | Err(_) => {
-                            std::thread::sleep(std::time::Duration::from_millis(5))
-                        }
-                    }
-                }
-            });
+        if std::env::var_os("KR_WALK_IGNORE_CHILDREN").is_some() {
+            // With `SIGCHLD` ignored the system takes the end of each child of this process as it
+            // comes, so this host's wait for its program finds no such child (`ECHILD`): the way a
+            // wait for a child that this host started can fail. Nothing else runs in this process,
+            // so no other wait is affected. An ignored signal that is only inherited does not do
+            // this on macOS, so the process sets it itself, before the install starts anything.
+            #[expect(
+                unsafe_code,
+                reason = "a signal's disposition has no safe form in the standard library"
+            )]
+            // SAFETY: `SIG_IGN` is a disposition, not a handler function, so nothing runs in a
+            // signal context; the call has no other effect on this process.
+            let previous = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+            assert_ne!(previous, libc::SIG_ERR, "SIGCHLD is set to be ignored");
         }
         let ground = Ground {
             _root: tempfile::tempdir_in(&root).expect("a directory"),
@@ -699,23 +677,6 @@ fn the_install_in_a_process_of_its_own() {
         let said = the_install_says(&ground, question, &root.join("pwsh"), &paths, dry_run)
             .unwrap_or_default();
         std::fs::write(root.join("said.txt"), said).expect("writes what was said");
-        if std::env::var_os("KR_WALK_REAP").is_some() {
-            // The number of the first child that the reaping thread took the end of. The install may
-            // start the program more than once, and the thread takes the end of a later start where
-            // this host's own poll took the first: the case compares this number with the one that
-            // the first start wrote. The thread says so a moment after this host's wait has failed,
-            // and never where this host's own poll took the end first.
-            let began = std::time::Instant::now();
-            while FIRST_CHILD_REAPED.load(Ordering::Acquire) == 0 && began.elapsed() < REAPER_GRACE
-            {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            std::fs::write(
-                root.join("reaped.txt"),
-                FIRST_CHILD_REAPED.load(Ordering::Acquire).to_string(),
-            )
-            .expect("writes which child the reaper took the end of first");
-        }
     });
 }
 
@@ -727,11 +688,12 @@ fn the_install_in_a_process_of_its_own() {
 /// - `not_prepared`: the temporary folder is a regular file, so the call's folder cannot be made.
 ///   The install's writers' lock is taken before the first question of a real run, so the run holds
 ///   it in folders outside the temporary folder;
-/// - `wait_failed`: another thread of the process takes the end of every child before this host's
-///   wait sees it (`KR_WALK_REAP`), so the wait for the program fails with `ECHILD`. The program
-///   answers rightly after a second and ends with code 0, so a wait that is read as a time-out
-///   would show the sentence for a PowerShell that did not answer, with a complete answer in the
-///   file.
+/// - `wait_failed`: the run's process ignores `SIGCHLD` (`KR_WALK_IGNORE_CHILDREN`) before the
+///   install starts the program, so the system takes the end of each child of the run as it comes
+///   and this host's wait for the program fails with `ECHILD`, in every run. The program
+///   answers rightly and then lasts a second (`exec sleep 1`), so that the poll first finds it
+///   running, and ends with code 0, so a wait that is read as a time-out would show the sentence
+///   for a PowerShell that did not answer, with a complete answer in the file.
 ///
 /// What no case of this suite shows is that no kill follows a failed wait: the program is not this
 /// host's child to find then, so nothing observable tells a kill from none. A system-call trace of
@@ -752,96 +714,63 @@ fn a_call_that_this_host_cannot_make_says_the_path_and_the_error() {
                         question_name(stand.question),
                         stand.way
                     );
-                    let mut trials = 0;
-                    // A run of the helper that the case may have to make again: see below.
-                    loop {
-                        trials += 1;
-                        let ground = ground();
-                        let body = if stand.way == "wait_failed" {
-                            format!(
-                                "echo $$ >> \"$KR_WALK_STARTS\"\nsleep 1\n{}",
-                                the_right_answers(&ground.home)
-                            )
-                        } else {
-                            stand.body.clone()
-                        };
-                        let program = a_program_that(&ground.root, &body);
-                        assert!(program.is_file());
-                        let temporary = ground.root.join("not-a-folder");
-                        let mut run = std::process::Command::new(
-                            std::env::current_exe().expect("this program"),
-                        );
-                        if stand.way == "wait_failed" {
-                            run.env("KR_WALK_REAP", "1")
-                                .env("KR_WALK_STARTS", ground.root.join("starts.txt"));
-                        } else {
-                            std::fs::write(&temporary, "").expect("a file");
-                            run.env("TMPDIR", &temporary);
-                        }
-                        let before = held_under(&ground.home);
-                        let ran = run
-                            .args([
-                                "--exact",
-                                "shell::tests::question_table::the_install_in_a_process_of_its_own",
-                                "--ignored",
-                                "--test-threads=1",
-                            ])
-                            .env("KR_WALK_ROOT", &ground.root)
-                            .env("KR_WALK_QUESTION", question_name(stand.question))
-                            .env("KR_WALK_DRY", if dry_run { "1" } else { "0" })
-                            .stdin(std::process::Stdio::null())
-                            .output()
-                            .expect("starts this test program");
-                        assert!(
-                            ran.status.success(),
-                            "{name}: {}",
-                            String::from_utf8_lossy(&ran.stdout)
-                        );
-                        // This host's wait fails only where the reaping thread of the helper takes the
-                        // program's end before this host's own poll of 25 milliseconds does, and a poll
-                        // that comes first, which a loaded machine lets happen, collects the end and
-                        // answers rightly: that run has not made the way. The first start of the
-                        // program wrote its own number, and the helper wrote the number of the first
-                        // child that its reaping thread took the end of: they are the same child where
-                        // the thread came first. A run that did not make the way is made again, and the
-                        // case fails if none of `REAPER_TRIALS` made it; a run that made it must say
-                        // what the table says, and one whose wait failed and was not said so fails at
-                        // once.
-                        let first_start = std::fs::read_to_string(ground.root.join("starts.txt"))
-                            .ok()
-                            .and_then(|starts| starts.lines().next().map(str::to_owned));
-                        let first_reaped =
-                            std::fs::read_to_string(ground.root.join("reaped.txt")).ok();
-                        let made_the_way = matches!(
-                            (first_start.as_deref(), first_reaped.as_deref()),
-                            (Some(start), Some(reaped)) if start.trim() == reaped.trim()
-                        );
-                        if stand.way == "wait_failed" && !made_the_way {
-                            assert!(
-                                trials < REAPER_TRIALS,
-                                "{name}: in none of {REAPER_TRIALS} runs did the reaping thread take the program's end before this host's own poll did, so the wait never failed"
-                            );
-                            continue;
-                        }
-                        let said = std::fs::read_to_string(ground.root.join("said.txt"))
-                            .expect("what was said");
-                        let temporary = if stand.way == "wait_failed" {
-                            std::env::temp_dir()
-                        } else {
-                            temporary
-                        };
-                        assert_eq!(
-                            as_the_table_says(&said, &ground, &temporary),
-                            cell(stand.question, stand.way),
-                            "{name}"
-                        );
-                        assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
-                        assert!(
-                            stand.question != Question::Profiles
-                                || !ground.state.join("state").exists(),
-                            "{name}: a record was written"
-                        );
-                        break;
+                    let ground = ground();
+                    let body = if stand.way == "wait_failed" {
+                        format!("{}\nexec sleep 1", the_right_answers(&ground.home))
+                    } else {
+                        stand.body.clone()
+                    };
+                    let program = a_program_that(&ground.root, &body);
+                    assert!(program.is_file());
+                    let temporary = ground.root.join("not-a-folder");
+                    let mut run =
+                        std::process::Command::new(std::env::current_exe().expect("this program"));
+                    if stand.way == "wait_failed" {
+                        run.env("KR_WALK_IGNORE_CHILDREN", "1");
+                    } else {
+                        std::fs::write(&temporary, "").expect("a file");
+                        run.env("TMPDIR", &temporary);
+                    }
+                    let before = held_under(&ground.home);
+                    let ran = run
+                        .args([
+                            "--exact",
+                            "shell::tests::question_table::the_install_in_a_process_of_its_own",
+                            "--ignored",
+                            "--test-threads=1",
+                        ])
+                        .env("KR_WALK_ROOT", &ground.root)
+                        .env("KR_WALK_QUESTION", question_name(stand.question))
+                        .env("KR_WALK_DRY", if dry_run { "1" } else { "0" })
+                        .stdin(std::process::Stdio::null())
+                        .output()
+                        .expect("starts this test program");
+                    assert!(
+                        ran.status.success(),
+                        "{name}: {}",
+                        String::from_utf8_lossy(&ran.stdout)
+                    );
+                    let said = std::fs::read_to_string(ground.root.join("said.txt"))
+                        .expect("what was said");
+                    let temporary = if stand.way == "wait_failed" {
+                        std::env::temp_dir()
+                    } else {
+                        temporary
+                    };
+                    assert_eq!(
+                        as_the_table_says(&said, &ground, &temporary),
+                        cell(stand.question, stand.way),
+                        "{name}"
+                    );
+                    assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
+                    assert!(
+                        stand.question != Question::Profiles
+                            || !ground.state.join("state").exists(),
+                        "{name}: a record was written"
+                    );
+                    if stand.way == "wait_failed" {
+                        // Shown by `--nocapture`: each run in which the install reported its failed wait.
+                        eprintln!("wait failed and said so: {name}");
                     }
                 }
             }
