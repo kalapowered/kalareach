@@ -1869,8 +1869,8 @@ impl Progress {
 }
 
 /// One local client that attaches a terminal and detaches it again, back to back, until `stop` is
-/// set: each is a mutation, and each takes the dispatch boundary. It counts what it started and what
-/// was answered.
+/// set: each is a mutation, and each takes the dispatch boundary. It counts what it started and
+/// what was answered.
 async fn mutating(
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: kr_protocol::ids::EnvironmentId,
