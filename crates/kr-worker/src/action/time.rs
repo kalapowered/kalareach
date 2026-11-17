@@ -297,10 +297,42 @@ impl Validity {
     }
 }
 
+/// How many times the clocks are read together before a contract gives up taking a reading.
+const BRACKET_TRIES: usize = 3;
+
+/// One reading of the clocks, taken between two readings of the continuous clock that are no more
+/// than [`DISCONTINUITY_TOLERANCE`] apart, so that no pause of the host lies between the pair.
+///
+/// A mark is taken at the first reading and a comparison is made at the second: each error of a
+/// narrow bracket is then toward distrust and no larger than the tolerance.
+#[derive(Clone, Copy, Debug)]
+struct Taken {
+    /// The continuous clock before the others were read: where a mark is taken.
+    first_ms: u64,
+    /// The continuous clock after: where a comparison is made.
+    second_ms: u64,
+    active_ms: u64,
+    wall_ms: u64,
+}
+
+/// What a caller is told when this host could take no narrow bracket in three tries.
+///
+/// It finds nothing wrong with the clock, so it is not the clock's distrust: a caller may try
+/// again.
+fn clocks_not_read() -> WorkerError {
+    WorkerError::ResourceUnavailable {
+        detail: "this host could not read its clocks together just now: it was held up between \
+                 the readings in all three tries, so it decided nothing from them and its \
+                 clock trust has not changed; try again"
+            .to_owned(),
+    }
+}
+
 /// What an observation of the clocks found.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Discontinuity {
-    /// The machine was asleep between the two observations.
+    /// The machine was asleep between the two observations, or this host could not read its
+    /// clocks together in three tries and owes the revalidation a sleep would.
     pub suspended: bool,
     /// The boot identity changed, so this is a different boot from the one checkpointed.
     pub rebooted: bool,
@@ -774,7 +806,9 @@ impl TimeContract {
         contract.sample();
         if contract.lock().checkpoint.is_none() {
             let reading = contract.adapter.read();
-            contract.checkpoint_at(reading);
+            if contract.checkpoint_at(reading).is_none() {
+                contract.lock().revalidation_owed = true;
+            }
         }
         contract
     }
@@ -793,9 +827,18 @@ impl TimeContract {
     /// The wall clock's reading is published in the host's floor all the same, as every reading
     /// this contract takes is.
     fn sample(&self) {
-        let continuous_ms = self.continuous.boot_elapsed_ms();
-        let active_ms = self.active.active_elapsed_ms();
-        let wall_ms = self.wall_reading();
+        let Some(Taken {
+            first_ms: continuous_ms,
+            active_ms,
+            wall_ms,
+            ..
+        }) = self.take()
+        else {
+            // No narrow bracket: nothing is remembered from a reading a pause may lie in, and the
+            // host owes the revalidation a suspension would.
+            self.lock().revalidation_owed = true;
+            return;
+        };
         self.publish(wall_ms);
         let mut state = self.lock();
         state.last = Some(Reading {
@@ -861,12 +904,20 @@ impl TimeContract {
     /// beyond the tolerance marks wall-clock trust unresolved, and an ordinary observation renews
     /// the checkpoint the next one is compared against.
     pub fn observe(&self) -> Discontinuity {
-        // The continuous clock first and the wall clock after it, so an observation that is
-        // interrupted between the two readings attributes the pause to the wall clock rather than
-        // hiding it. Attributing it that way can only make a rollback look larger, never smaller.
-        let continuous_ms = self.continuous.boot_elapsed_ms();
-        let active_ms = self.active.active_elapsed_ms();
-        let wall_ms = self.wall_reading();
+        // The continuous clock is read before the others and again after them, and the reading
+        // is used only where the two are no further apart than the tolerance: a pause between the
+        // pair would otherwise move the mark wrongly and show as a step back at the next look.
+        // The mark is taken at the first reading and the rollback is measured at the second, so
+        // each error of a narrow bracket is toward a rollback and no larger than the tolerance.
+        let Some(Taken {
+            first_ms: continuous_ms,
+            second_ms,
+            active_ms,
+            wall_ms,
+        }) = self.take()
+        else {
+            return self.held_up();
+        };
         // Published before anything is decided from it. The raw sample is still what the rollback
         // detection below compares: the floor only moves forward, so it cannot show that the wall
         // clock went back.
@@ -912,7 +963,7 @@ impl TimeContract {
         } else {
             MAX_WALL_CLOCK_ROLLBACK_MS
         };
-        let reference = self.reference(&state, continuous_ms);
+        let reference = self.reference(&state, second_ms);
         if let Some(reference) = reference {
             found.rolled_back = reference.wall_ms.saturating_sub(wall_ms) > tolerance;
         }
@@ -1000,17 +1051,33 @@ impl TimeContract {
             state.trust = WallClockTrust::Unresolved;
             state.critical = state.critical.saturating_add(1);
         }
-        self.follow_the_owner(&mut state, &reading);
+        let followed = self.follow_the_owner(&mut state, &reading);
         let trust = state.trust;
         drop(state);
 
         // The checkpoint is renewed only while the clock is still evidence. Renewing it after a
         // rollback would record the rolled-back reading as the mark everything later is compared
         // against, which is precisely how a rollback would erase itself.
-        if trust == WallClockTrust::Trusted {
-            self.checkpoint_at(reading);
+        let checkpointed =
+            trust != WallClockTrust::Trusted || self.checkpoint_at(reading).is_some();
+        if !followed || !checkpointed {
+            // A later reading in this look was held up in each of its tries: what it would have
+            // decided is decided at the next look, and the revalidation is owed meanwhile.
+            found.suspended = true;
+            self.lock().revalidation_owed = true;
         }
         found
+    }
+
+    /// What a look finds when it could take no narrow bracket: no rollback is decided and no mark
+    /// moves, and the look owes the revalidation a suspension would, because a host held up in
+    /// each of three tries was stopped for at least that long.
+    fn held_up(&self) -> Discontinuity {
+        self.lock().revalidation_owed = true;
+        Discontinuity {
+            suspended: true,
+            ..Discontinuity::default()
+        }
     }
 
     /// Returns what a rollback is measured against, if this contract has anything.
@@ -1324,20 +1391,15 @@ impl TimeContract {
                 ));
             }
         }
-        let continuous_ms = self.continuous.boot_elapsed_ms();
-        let wall_clock_ms = TimestampMs::new(self.wall_reading());
+        let Some(taken) = self.take() else {
+            return Err(clocks_not_read());
+        };
         let owner = matches!(
             evidence,
             kr_protocol::action::RetrustEvidence::OwnerRetrust { .. }
         );
         let mut state = self.lock();
-        Ok(self.trust_again(
-            &mut state,
-            continuous_ms,
-            wall_clock_ms.get(),
-            reading,
-            owner,
-        ))
+        Ok(self.trust_again(&mut state, taken.first_ms, taken.wall_ms, reading, owner))
     }
 
     /// Returns the clock to trusted at the reading taken at `continuous_ms` and `wall_ms`, with
@@ -1422,21 +1484,34 @@ impl TimeContract {
     /// looked at a confirmation, that found a rollback, or that restored a record, spends it
     /// without following it: a restatement over a withdrawal whose distrust the daemon lost clears
     /// nothing a worker found.
-    fn follow_the_owner(&self, state: &mut TimeState, reading: &TimeAdapterReading) {
+    fn follow_the_owner(&self, state: &mut TimeState, reading: &TimeAdapterReading) -> bool {
         let Some(established) = self.floor.as_ref().and_then(|floor| floor.established()) else {
-            return;
+            return true;
         };
-        let adopting = std::mem::take(&mut state.adopting);
+        let adopting = state.adopting;
         if established.count == state.followed {
-            return;
+            state.adopting = false;
+            return true;
         }
-        state.followed = established.count;
         if established.restated && !adopting {
-            return;
+            state.adopting = false;
+            state.followed = established.count;
+            return true;
         }
-        let continuous_ms = self.continuous.boot_elapsed_ms();
-        let wall_ms = self.wall_reading();
-        let reference = self.reference(state, continuous_ms);
+        let Some(Taken {
+            first_ms: continuous_ms,
+            second_ms,
+            wall_ms,
+            ..
+        }) = self.take()
+        else {
+            // No narrow bracket: nothing is spent, and the confirmation is met again at the next
+            // look.
+            return false;
+        };
+        state.adopting = false;
+        state.followed = established.count;
+        let reference = self.reference(state, second_ms);
         let behind_its_reference = reference.filter(|reference| {
             reference.wall_ms.saturating_sub(wall_ms) > MAX_WALL_CLOCK_ROLLBACK_MS
         });
@@ -1458,7 +1533,7 @@ impl TimeContract {
                 state.owner_confirmed = false;
                 state.critical = state.critical.saturating_add(1);
             }
-            return;
+            return true;
         }
         self.trust_again(state, continuous_ms, wall_ms, reading.clone(), true);
         // A restatement adds nothing to what the worker has proved, so it does not lower it: a
@@ -1468,6 +1543,7 @@ impl TimeContract {
         {
             mark.wall_ms = mark.wall_ms.max(reference.wall_ms);
         }
+        true
     }
 
     /// Returns what a host has to write down to keep its promises, and which change it is.
@@ -1515,18 +1591,20 @@ impl TimeContract {
     }
 
     /// Writes a checkpoint of what the clocks read now, over a reading already taken.
-    fn checkpoint_at(&self, reading: TimeAdapterReading) -> TimeCheckpoint {
-        let continuous_ms = self.continuous.boot_elapsed_ms();
+    ///
+    /// `None` when no narrow bracket could be taken: the checkpoint stays as it was.
+    fn checkpoint_at(&self, reading: TimeAdapterReading) -> Option<TimeCheckpoint> {
+        let taken = self.take()?;
         let trust = self.lock().trust;
         let checkpoint = TimeCheckpoint {
             boot_identity: self.boot_identity.clone(),
-            wall_clock_ms: TimestampMs::new(self.wall_reading()),
-            continuous_ms: U64::new(continuous_ms),
+            wall_clock_ms: TimestampMs::new(taken.wall_ms),
+            continuous_ms: U64::new(taken.first_ms),
             reading,
             trust,
         };
         self.lock().checkpoint = Some(checkpoint.clone());
-        checkpoint
+        Some(checkpoint)
     }
 
     fn tombstone(&self, object: &ExpiringObject, reason: ExpiryReason) -> ExpirationTombstone {
@@ -1541,17 +1619,43 @@ impl TimeContract {
         }
     }
 
-    /// Reads the wall clock, and keeps the reading: every reading this contract takes of it comes
-    /// through here. The continuous clock is read after the wall clock, so a pause between the two
-    /// puts the reading later, which errs toward refusing a confirmation.
+    /// Reads the clocks together, between two readings of the continuous clock, and keeps the
+    /// wall reading against the owner's confirmation: every reading this contract takes of the
+    /// wall clock comes through here.
+    ///
+    /// A try is used only where the two readings of the continuous clock are no further apart than
+    /// [`DISCONTINUITY_TOLERANCE`], and the clocks are read again, at most three times in all,
+    /// where they are. A try that was held up decides nothing and keeps nothing, so a pause
+    /// between the pair cannot put a reading wrongly ahead of or behind the continuous clock.
+    /// The wall reading is kept at the second reading, which errs toward refusing a confirmation.
+    fn take(&self) -> Option<Taken> {
+        for _ in 0..BRACKET_TRIES {
+            let first_ms = self.continuous.boot_elapsed_ms();
+            let active_ms = self.active.active_elapsed_ms();
+            let wall_ms = self.wall.now_ms().get();
+            let second_ms = self.continuous.boot_elapsed_ms();
+            if second_ms.saturating_sub(first_ms) <= millis(DISCONTINUITY_TOLERANCE) {
+                self.readings
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .keep(second_ms, wall_ms);
+                return Some(Taken {
+                    first_ms,
+                    second_ms,
+                    active_ms,
+                    wall_ms,
+                });
+            }
+        }
+        None
+    }
+
+    /// Reads the wall clock for a caller that needs the reading and no clock beside it: a stamp, a
+    /// deadline, a comparison with another host's reading. A reading no narrow bracket could be
+    /// taken for is not kept against the owner's confirmation.
     fn wall_reading(&self) -> u64 {
-        let wall_ms = self.wall.now_ms().get();
-        let continuous_ms = self.continuous.boot_elapsed_ms();
-        self.readings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .keep(continuous_ms, wall_ms);
-        wall_ms
+        self.take()
+            .map_or_else(|| self.wall.now_ms().get(), |taken| taken.wall_ms)
     }
 
     /// Whether the readings this contract took refuse `established` ([`Readings::refute`]).
@@ -3195,5 +3299,369 @@ mod tests {
         );
         drop((contract, mapped, created));
         std::fs::remove_dir_all(&root).expect("removed");
+    }
+
+    /// A wall clock a pause of the host lands in. Armed, it lets `by` pass on every clock the host
+    /// reads, awake: either before its reading returns or, with `after`, just before the continuous
+    /// clock is next read, as a host stopped between the two readings finds them.
+    #[derive(Debug)]
+    struct Holdup {
+        wall: ManualWallClock,
+        continuous: ManualSharedClock,
+        active: ManualActiveClock,
+        by: Duration,
+        /// How many readings go by before the pause lands, and how many readings it lands in.
+        skip: std::sync::atomic::AtomicI64,
+        times: std::sync::atomic::AtomicI64,
+        after: bool,
+        slip: std::sync::atomic::AtomicBool,
+    }
+
+    impl Holdup {
+        fn new(by: Duration, after: bool) -> Arc<Self> {
+            let continuous = ManualSharedClock::new();
+            continuous.advance(Duration::from_secs(3_600));
+            let active = ManualActiveClock::new();
+            active.advance(Duration::from_secs(3_600));
+            Arc::new(Self {
+                wall: ManualWallClock::new(WALL),
+                continuous,
+                active,
+                by,
+                skip: std::sync::atomic::AtomicI64::new(0),
+                times: std::sync::atomic::AtomicI64::new(0),
+                after,
+                slip: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+
+        fn arm(&self, skip: i64, times: i64) {
+            self.skip.store(skip, std::sync::atomic::Ordering::SeqCst);
+            self.times.store(times, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// The host is awake and nothing holds it up: every clock moves on.
+        fn pass(&self, by: Duration) {
+            self.continuous.advance(by);
+            self.active.advance(by);
+            self.wall.advance(by);
+        }
+
+        fn contract(
+            self: &Arc<Self>,
+            floor: Option<Arc<kr_ipc::floor::SharedFloor>>,
+        ) -> TimeContract {
+            TimeContract::new(
+                boot(1),
+                AUTHORITY,
+                TimeSources {
+                    continuous: Arc::new(Slipping {
+                        held: Arc::clone(self),
+                    }),
+                    active: Arc::new(self.active.clone()),
+                    wall: Arc::clone(self) as Arc<dyn WallClock>,
+                    adapter: Arc::new(RecordedTimeAdapter::new(qualified())),
+                    floor,
+                },
+            )
+        }
+    }
+
+    impl WallClock for Holdup {
+        fn now_ms(&self) -> TimestampMs {
+            use std::sync::atomic::Ordering::SeqCst;
+            let lands = if self.skip.load(SeqCst) > 0 {
+                self.skip.fetch_sub(1, SeqCst);
+                false
+            } else {
+                self.times
+                    .fetch_update(SeqCst, SeqCst, |left| (left > 0).then_some(left - 1))
+                    .is_ok()
+            };
+            if lands && !self.after {
+                self.pass(self.by);
+            }
+            let reading = self.wall.now_ms();
+            if lands && self.after {
+                self.slip.store(true, SeqCst);
+            }
+            reading
+        }
+    }
+
+    /// The continuous clock of a [`Holdup`], which a pause that is due after a wall reading lands
+    /// in just before it is read.
+    #[derive(Debug)]
+    struct Slipping {
+        held: Arc<Holdup>,
+    }
+
+    impl kr_ipc::clock::SharedClock for Slipping {
+        fn boot_elapsed_ms(&self) -> u64 {
+            if self
+                .held
+                .slip
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.held.pass(self.held.by);
+            }
+            self.held.continuous.boot_elapsed_ms()
+        }
+    }
+
+    const HELD_UP: Duration = Duration::from_secs(10);
+
+    /// What a person is told when the worker could take no reading of its clocks.
+    const NOT_READ: &str = "this host could not read its clocks together just now: it was held \
+        up between the readings in all three tries, so it decided nothing from them and its \
+        clock trust has not changed; try again";
+
+    fn owner_retrust() -> RetrustEvidence {
+        RetrustEvidence::OwnerRetrust {
+            action_digest: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+        }
+    }
+
+    /// KR-REQ-09.18: a pause of the host inside a look at its clocks is no rollback, at that look
+    /// or the next. Ten seconds pass on every clock in the middle of the look's reading, and the
+    /// look takes it again.
+    #[test]
+    fn a_pause_inside_an_observation_is_no_rollback_at_that_look_or_the_next() {
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(30));
+        contract.observe();
+        held.pass(Duration::from_secs(30));
+        held.arm(0, 1);
+        let found = contract.observe();
+        assert!(!found.rolled_back, "the pause is no rollback at that look");
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+        held.pass(Duration::from_secs(30));
+        let found = contract.observe();
+        assert!(!found.rolled_back, "and none at the next");
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+    }
+
+    /// KR-REQ-09.18: a pause in the first try cannot hide a real step back: the wall clock is put
+    /// back eight seconds and ten seconds pass in the look's reading, which read once shows the
+    /// clock two seconds ahead.
+    #[test]
+    fn a_step_back_is_found_at_the_look_a_pause_was_in() {
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 8_000);
+        held.arm(0, 1);
+        assert!(contract.observe().rolled_back);
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+    }
+
+    /// KR-REQ-09.18: the sample a contract begins with is not ahead of the clocks by a pause in it.
+    #[test]
+    fn a_pause_inside_the_first_sample_is_no_rollback_at_the_first_look() {
+        let held = Holdup::new(HELD_UP, false);
+        held.arm(0, 1);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(30));
+        let found = contract.observe();
+        assert!(!found.rolled_back);
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+    }
+
+    /// KR-REQ-09.18: the reading a worker follows the owner's confirmation on is not ahead of the
+    /// clocks by a pause in it.
+    #[test]
+    fn a_pause_inside_the_following_of_the_owner_is_no_rollback_at_the_next_look() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(30));
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        held.arm(1, 1);
+        let found = contract.observe();
+        assert!(!found.rolled_back);
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+        held.pass(Duration::from_secs(30));
+        assert!(!contract.observe().rolled_back, "and none at the next look");
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+    }
+
+    /// KR-REQ-09.18: the checkpoint a look writes is one instant on both clocks, whatever pause
+    /// lands in its reading.
+    #[test]
+    fn a_pause_inside_a_checkpoint_leaves_one_instant_on_both_clocks() {
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(30));
+        held.arm(1, 1);
+        contract.observe();
+        let checkpoint = contract.checkpoint().expect("a checkpoint");
+        assert_eq!(
+            checkpoint.wall_clock_ms.get() - WALL,
+            checkpoint.continuous_ms.get() - 3_600_000
+        );
+    }
+
+    /// KR-REQ-09.18: a reading a pause lands in after its wall clock was read is not kept against
+    /// the owner's confirmation as if it were ten seconds behind it: a worker that trusts its clock
+    /// does not distrust it for that.
+    #[test]
+    fn a_pause_after_a_wall_reading_does_not_refuse_the_owners_confirmation() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, true);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(30));
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        held.arm(0, 1);
+        contract.observe();
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+    }
+
+    /// KR-REQ-09.18: a retrust leaves a mark that is not ahead of the clocks by a pause in its
+    /// reading, so the look after it finds no rollback.
+    #[test]
+    fn a_pause_inside_a_retrust_is_no_rollback_at_the_next_look() {
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 86_400_000);
+        contract.observe();
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+        held.arm(0, 1);
+        contract.retrust(&owner_retrust()).expect("a retrust");
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+        held.pass(Duration::from_secs(30));
+        assert!(!contract.observe().rolled_back);
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+    }
+
+    /// KR-REQ-09.18: three tries that are all held up give a look no reading: it owes a
+    /// revalidation and decides no rollback, moves no mark and renews no checkpoint, and a step
+    /// back made between the tries is found by the next clean look.
+    #[test]
+    fn three_wide_tries_owe_a_revalidation_and_decide_no_rollback() {
+        for step_back in [false, true] {
+            let held = Holdup::new(HELD_UP, false);
+            let contract = held.contract(None);
+            held.pass(Duration::from_secs(60));
+            contract.observe();
+            held.pass(Duration::from_secs(60));
+            if step_back {
+                held.wall.set(held.wall.now_ms().get() - 8_000);
+            }
+            let checkpoint = contract.checkpoint().map(|checkpoint| {
+                (
+                    checkpoint.wall_clock_ms.get(),
+                    checkpoint.continuous_ms.get(),
+                )
+            });
+            held.arm(0, 3);
+            let found = contract.observe();
+            assert!(
+                found.suspended,
+                "the look owes the revalidation of a suspension"
+            );
+            assert!(!found.rolled_back, "and decides no rollback");
+            assert!(contract.revalidation_owed());
+            assert_eq!(contract.trust(), WallClockTrust::Trusted);
+            assert_eq!(
+                contract.checkpoint().map(|checkpoint| (
+                    checkpoint.wall_clock_ms.get(),
+                    checkpoint.continuous_ms.get()
+                )),
+                checkpoint,
+                "no checkpoint is renewed"
+            );
+            contract.leases_revalidated();
+            assert_eq!(
+                contract.observe().rolled_back,
+                step_back,
+                "the next clean look finds a step back made between the tries, and only that"
+            );
+        }
+    }
+
+    /// KR-REQ-09.18: a contract that can take no first sample owes a revalidation.
+    #[test]
+    fn three_wide_tries_at_the_first_sample_owe_a_revalidation() {
+        let held = Holdup::new(HELD_UP, false);
+        held.arm(0, 3);
+        let contract = held.contract(None);
+        assert!(contract.revalidation_owed());
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+        contract.leases_revalidated();
+        held.pass(Duration::from_secs(30));
+        assert!(!contract.observe().rolled_back);
+    }
+
+    /// KR-REQ-09.18: a confirmation that three held-up tries could not be followed on is not
+    /// spent: the worker stays as it was, and the next clean look follows it.
+    #[test]
+    fn three_wide_tries_following_the_owner_spend_no_confirmation() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 8_000);
+        assert!(contract.observe().rolled_back);
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        held.arm(1, 3);
+        let found = contract.observe();
+        assert!(found.suspended, "the look owes a revalidation");
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the confirmation is not followed"
+        );
+        contract.leases_revalidated();
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Trusted,
+            "and it is still there for the next look"
+        );
+    }
+
+    /// KR-REQ-09.18: a retrust that can take no narrow bracket refuses, with the refusal a caller
+    /// may try again and not the clock's distrust, and the worker stays as it was.
+    #[test]
+    fn a_retrust_with_no_narrow_bracket_refuses_and_can_be_tried_again() {
+        use kr_protocol::error::{ErrorCode, RetryCategory};
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(None);
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 86_400_000);
+        contract.observe();
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+        held.arm(0, 3);
+        let error = contract
+            .retrust(&owner_retrust())
+            .expect_err("no reading is taken");
+        let shown = error.to_protocol_error();
+        assert_eq!(shown.code, ErrorCode::ResourceUnavailable);
+        assert_eq!(shown.retry, RetryCategory::Transient);
+        assert_eq!(shown.message, NOT_READ);
+        assert_eq!(contract.trust(), WallClockTrust::Unresolved);
+        contract
+            .retrust(&owner_retrust())
+            .expect("the next try retrusts");
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
     }
 }
