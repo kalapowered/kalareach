@@ -743,7 +743,8 @@ fn reads(
 /// A call to a name that no function of this crate declares is a call into the standard library or
 /// another crate, which this boundary does not judge. An `allow` or `calls` row that its function
 /// does not use, and a `calls` row whose file declares no such function, fail, so the lists cannot
-/// go stale.
+/// go stale. A name that a body has both an `allow` row and a `calls` row for fails too: the follow
+/// skips an allowed name, so the `calls` row would read nothing.
 fn boundary(
     files: &[(String, String)],
     roster: &Roster,
@@ -786,6 +787,15 @@ fn boundary(
                     declared.get(&name).cloned().unwrap_or_default()
                 ));
             }
+        }
+    }
+    for row in &roster.allowed {
+        if roster.calls.contains_key(row) {
+            let (file, function, name) = row;
+            problems.insert(format!(
+                "allow {file} {function} {name} and calls {file} {function} {name}: a name that \
+                 the body allows is not followed, so its `calls` row reads nothing"
+            ));
         }
     }
     for (file, function, name) in &roster.allowed {
