@@ -653,6 +653,11 @@ pub struct WorkerService {
     /// build.
     #[cfg(feature = "testing")]
     connection_end_stall: crate::testing::Stall,
+    /// A stop in a withdrawal of one connection, right after its registration has left the
+    /// registry, which this host's own tests arm to have a statement's answer meet it there. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    withdrawal_gap_stall: crate::testing::Stall,
     /// A stop in a mutation inside the dispatch boundary and the session, after the lease and the
     /// deadline were checked and before the marker is committed, which this host's own tests arm to
     /// have a lease end in between. It is compiled away in every shipped build.
@@ -1381,6 +1386,8 @@ impl WorkerService {
             after_the_hold_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             connection_end_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            withdrawal_gap_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             after_the_deadline_check_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
@@ -2430,6 +2437,22 @@ impl WorkerService {
         std::sync::mpsc::Sender<()>,
     ) {
         self.after_the_deadline_check_stall.arm()
+    }
+
+    /// Stops the next withdrawal of one connection right after its registration has left the
+    /// registry, for this host's own tests.
+    ///
+    /// Returns the end that says the withdrawal has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_a_withdrawal_after_its_remove(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.withdrawal_gap_stall.arm()
     }
 
     /// Stops the next connection that ends, before it takes the attachments it still owns, for this
@@ -6507,6 +6530,8 @@ impl WorkerService {
         let Some(registration) = held else {
             return;
         };
+        #[cfg(feature = "testing")]
+        self.withdrawal_gap_stall.stand();
         // Counted from the moment the registration is gone from the registry until the last
         // attachment is detached, so that a statement's acknowledgement does not go out while
         // this withdrawal is still detaching what a restriction asked it to take back.
