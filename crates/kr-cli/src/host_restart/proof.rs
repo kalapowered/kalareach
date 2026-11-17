@@ -16,7 +16,7 @@ use kr_client::shown::{Said, Shown};
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::ControllerGeneration;
+use kr_protocol::ids::{ControllerGeneration, EnvironmentId};
 
 use super::{Answering, Old, Proved, StartFailed, judge};
 use crate::error::{CliError, Result};
@@ -89,33 +89,11 @@ impl Operations for Real<'_> {
         }
     }
 
-    /// The process comes from a request for the launch alone, which answers the daemon's process
-    /// and stops nothing.
     async fn process(
         &self,
         connection: &mut LocalClient,
     ) -> std::result::Result<Option<u64>, Shown> {
-        match host_stop::ask(
-            connection,
-            self.environment.environment_id,
-            false,
-            self.progress,
-            true,
-        )
-        .await
-        {
-            Asked::Taken(result) => Ok(Some(result.pid.get())),
-            // A daemon that refuses the request states no process.
-            Asked::Refused(_) => Ok(None),
-            Asked::Unknown(why) => Err(shown!(
-                "a control daemon answered and its process could not be read: {}",
-                why
-            )),
-            Asked::NotComposed { error } => Err(shown!(
-                "a control daemon answered and its process could not be read: {}",
-                Shown::ipc(&error)
-            )),
-        }
+        process_stated(connection, self.environment.environment_id, self.progress).await
     }
 
     async fn connect(&self, within: Duration) -> Option<LocalClient> {
@@ -128,6 +106,29 @@ impl Operations for Real<'_> {
 
     async fn pause(&self, time: Duration) {
         tokio::time::sleep(time).await;
+    }
+}
+
+/// The process the daemon states on `connection`. It comes from a request for the launch alone,
+/// which answers the daemon's process and stops nothing: none where the daemon refuses the
+/// request, and an error where the exchange was cut.
+pub(super) async fn process_stated(
+    connection: &mut LocalClient,
+    id: EnvironmentId,
+    progress: &Progress,
+) -> std::result::Result<Option<u64>, Shown> {
+    match host_stop::ask(connection, id, false, progress, true).await {
+        Asked::Taken(result) => Ok(Some(result.pid.get())),
+        // A daemon that refuses the request states no process.
+        Asked::Refused(_) => Ok(None),
+        Asked::Unknown(why) => Err(shown!(
+            "a control daemon answered and its process could not be read: {}",
+            why
+        )),
+        Asked::NotComposed { error } => Err(shown!(
+            "a control daemon answered and its process could not be read: {}",
+            Shown::ipc(&error)
+        )),
     }
 }
 

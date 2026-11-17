@@ -30,8 +30,8 @@ use kr_protocol::ids::{ControllerGeneration, EnvironmentId};
 
 use crate::error::{CliError, Result};
 use crate::host_stop::{
-    self, Answer, Asked, AtStart, Before, Begun, Cut, End, Facts, Knows, Looked, Operations,
-    Progress, Real, Settled, Stage, Start, StartedFact, Which,
+    self, Answer, Asked, AtStart, Before, Begun, Cut, End, Facts, Knows, Looked, Progress, Real,
+    Settled, Stage, Start, StartedFact, Which,
 };
 use crate::report::Completion;
 use crate::resolve::KnownEnvironment;
@@ -240,13 +240,13 @@ async fn wait_for_the_holder(
     let operations = Real::of(host, &environment.paths, Some(ControllerGeneration::new(0)));
     match holder::wait(&operations, startup::START_BOUND).await {
         holder::Holder::Answers => {
-            let named = operations.named_daemon();
+            let serving = serving_now(environment, progress).await;
             host_stop::done(
-                &holder_answers_said(id, named),
+                &holder_answers_said(id, serving),
                 &Facts {
-                    pid: named,
+                    pid: serving,
                     answer: Some(Answer {
-                        serving: named,
+                        serving,
                         launched: None,
                     }),
                     ..begun.none.clone()
@@ -260,6 +260,32 @@ async fn wait_for_the_holder(
         }
         holder::Holder::Silent => host_stop::failed(holder_silent(environment), &begun.none, json),
     }
+}
+
+/// The process that the daemon at the environment's endpoint states now, read on one connection
+/// that it answers and never from the lock file, which may name an earlier daemon: none where
+/// nothing answers, the daemon states none, or its answer is cut.
+async fn serving_now(environment: &KnownEnvironment, progress: &Progress) -> Option<u64> {
+    let endpoint = environment.paths.controller_endpoint().ok()?;
+    match startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await {
+        startup::Reached::Answered(listed) => {
+            stated_by(*listed, environment.environment_id, progress).await
+        }
+        startup::Reached::Silent | startup::Reached::Refused(_) => None,
+    }
+}
+
+/// The process that the daemon on the connection `listed` states, read on that connection.
+async fn stated_by(
+    listed: kr_ipc::client::Listed,
+    id: EnvironmentId,
+    progress: &Progress,
+) -> Option<u64> {
+    let mut client = startup::ours(listed).ok()?;
+    proof::process_stated(&mut client, id, progress)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// What the restart says where a process held the environment and did not answer, and a daemon
@@ -668,7 +694,7 @@ async fn after_the_end(
     };
     let proved = match stopped.successor {
         // Another daemon holds the environment: nothing is started beside it.
-        Some(successor) => match wait_for_the_successor(environment, successor).await {
+        Some(successor) => match wait_for_the_successor(environment, successor, progress).await {
             Ok(proved) => Ok(proved),
             Err(error) => return host_stop::failed(error, &facts, json),
         },
@@ -794,17 +820,20 @@ fn said_after_the_proof(
 }
 
 /// Another daemon holds the environment after the one that was stopped ended: waits for it to
-/// answer, and starts nothing beside it.
+/// answer, and starts nothing beside it. The process of the daemon that answers is read on the
+/// connection that answered; `successor`, the process the lock file named when the end was seen,
+/// is said only as that earlier reading.
 async fn wait_for_the_successor(
     environment: &KnownEnvironment,
     successor: Option<u64>,
+    progress: &Progress,
 ) -> std::result::Result<Proved, CliError> {
     let id = environment.environment_id;
     let endpoint = environment.paths.controller_endpoint()?;
     let deadline = tokio::time::Instant::now() + startup::START_BOUND;
     match startup::answered_by(&endpoint, deadline, &[], || {}).await {
-        Ok(_) => Ok(Proved::Another {
-            serving: successor,
+        Ok(listed) => Ok(Proved::Another {
+            serving: stated_by(listed, id, progress).await,
             launched: None,
             cut: false,
         }),
