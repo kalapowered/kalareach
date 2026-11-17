@@ -896,13 +896,14 @@ impl Drop for DispatchGuard<'_> {
 /// count back. What needs a lock is entered here, and the service's own tasks do it when the lock
 /// comes free. A detach and an unbind are entered when the lock is held by somebody else; the
 /// rejection of an accepted action is always entered, since the connection's path reads no journal
-/// and commits nothing. The two kinds are kept apart by the lock each waits for,
-/// so that a long hold of one never delays the other. Each kind is a set, so an entry owed twice is
-/// done once, and each has a wake that keeps its permit, so an entry made while a pass runs is
-/// not left until some other entry is made. A pass is one thread of the blocking pool, and the
-/// next pass begins when it ends: a kind waits with one thread at most, whatever the number of
-/// entries. Entries are in this service's memory, so they end with it, and a session that starts
-/// again has none: a restart rejects what it finds accepted by itself.
+/// and commits nothing. The two kinds are kept apart by the lock each waits for, so that a long
+/// hold of one never delays the other. Each kind is a set, so an entry owed twice is done once,
+/// except a detach entry: it carries the ticket of its own detach, which is unique, so two detach
+/// entries never merge, and each ends its ticket. Each kind has a wake that keeps its permit, so an
+/// entry made while a pass runs is not left until some other entry is made. A pass is one thread of
+/// the blocking pool, and the next pass begins when it ends: a kind waits with one thread at most,
+/// whatever the number of entries. Entries are in this service's memory, so they end with it, and a
+/// session that starts again has none: a restart rejects what it finds accepted by itself.
 #[derive(Debug, Default)]
 struct CleanUpOwed {
     /// What waits for the session.
