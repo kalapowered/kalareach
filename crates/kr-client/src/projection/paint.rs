@@ -680,16 +680,19 @@ impl<'a> Writer<'a> {
     /// resets are written for a screen with none on too, because the destination's own tracking is
     /// not known here.
     ///
-    /// A screen read from a worker of an earlier build can have more than one on, and the order they
-    /// were set in is lost; a delta from such a worker carries only the mode that changed, so it can
-    /// leave two on as well. The widest is taken: the usual history that leaves two on is an
-    /// application asking for a narrower tracking and then a wider one (`?1000h ?1002h`). It is
-    /// wrong for `?1003h ?1000h` (a terminal has 1000) and for `?1000h ?1002h ?1003h ?1003l` (a
-    /// terminal has none), which an earlier worker cannot tell from it.
-    /// Remove the choice when no worker of an earlier build can still be running: when the lowest
-    /// package version `check_build` accepts in `kr-cli`'s `attach.rs` is at or above the first
-    /// release that holds the one-state tracking in `kr-term`'s `ModeState`; a screen then holds at
-    /// most one of the three.
+    /// A screen read from a worker of one of the first 29 releases of level 0.78 can have more than
+    /// one on, and the order they were set in is lost; a delta from such a worker carries only the
+    /// mode that changed, so it can leave two on as well. The widest is taken: the usual history
+    /// that leaves two on is an application asking for a narrower tracking and then a wider one
+    /// (`?1000h ?1002h`). It is wrong for `?1003h ?1000h` (a terminal has 1000) and for `?1000h
+    /// ?1002h ?1003h ?1003l` (a terminal has none), which such a worker cannot tell from it.
+    ///
+    /// Remove the choice when the lowest retained level is 0.79, and not before: a daemon of 0.79
+    /// still runs workers of the first 29 of the 41 releases of level 0.78, which lack the
+    /// one-state tracking in `kr-term`'s `ModeState`, and their screens reach this projection. A
+    /// screen then holds at most one of the three. The floor of `check_build` in `kr-cli`'s
+    /// `attach.rs` does not show it: it limits which workers the `kr attach` command reads, not
+    /// which workers the daemon runs.
     fn mouse_tracking(&mut self, tracking: Option<u16>) {
         for mode in MOUSE_TRACKING_MODES {
             self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
@@ -710,13 +713,17 @@ impl<'a> Writer<'a> {
     /// known here and xterm resets only the one that is in force, and the one that is on is set
     /// last.
     ///
-    /// A screen read from a worker of an earlier build can have both flags on, and the order they
-    /// were set in is lost; a delta from such a worker carries only the mode that changed, so it can
-    /// leave both on as well. 1006 is taken, as the last word of the earlier worker's own frame was.
-    /// Remove the choice when no worker of an earlier build can still be running: when the lowest
-    /// package version `check_build` accepts in `kr-cli`'s `attach.rs` is at or above the first
-    /// release that holds the one-state encoding in `kr-term`'s `ModeState`; a screen then holds at
-    /// most one of the two.
+    /// A screen read from a worker of one of the first 29 releases of level 0.78 can have both flags
+    /// on, and the order they were set in is lost; a delta from such a worker carries only the mode
+    /// that changed, so it can leave both on as well. 1006 is taken, as the last word of such a
+    /// worker's own frame was.
+    ///
+    /// Remove the choice when the lowest retained level is 0.79, and not before: a daemon of 0.79
+    /// still runs workers of the first 29 of the 41 releases of level 0.78, which lack the
+    /// one-state encoding in `kr-term`'s `ModeState`, and their screens reach this projection. A
+    /// screen then holds at most one of the two. The floor of `check_build` in `kr-cli`'s
+    /// `attach.rs` does not show it: it limits which workers the `kr attach` command reads, not
+    /// which workers the daemon runs.
     fn mouse_encoding(&mut self, encoding: Option<u16>) {
         for mode in MOUSE_ENCODING_MODES {
             self.mode_of(super::ProjectedModeSpelling::Dec, *mode, false);
