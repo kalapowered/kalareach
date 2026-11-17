@@ -520,7 +520,8 @@ pub struct PairingAdmissions {
     clock: AdmissionClock,
     wait: Duration,
     state: Arc<Mutex<State>>,
-    /// The hook a test set, if any. It is in this crate's test builds alone.
+    /// The hook a test set, if any. It is in builds with the `testing` feature alone, which no
+    /// shipped build turns on.
     #[cfg(feature = "testing")]
     after_locked_step: Option<DialHook>,
 }
@@ -574,11 +575,11 @@ impl PairingAdmissions {
         self
     }
 
-    /// The same, with `hook` awaited by each dial just after the locked step in which it counts its
-    /// ask and starts its request (once for each relay it asks about), given the candidate the dial
-    /// was made with. A test holds one dial there while another dial reads the same entry. It is in
-    /// this crate's test builds alone: a build without the `testing` feature has no hook and no wait
-    /// at that place.
+    /// The same, with `hook` awaited by each dial just after its locked step for each of the
+    /// service's relays, whether or not that step asks, given the candidate the dial was made with.
+    /// A test holds one dial there while another dial reads the same entry. It is in builds with the
+    /// `testing` feature alone, which no shipped build turns on: a build without it has no hook and
+    /// no wait at that place.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn after_the_locked_step(
