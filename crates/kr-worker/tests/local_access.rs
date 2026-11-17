@@ -1520,9 +1520,13 @@ async fn the_attach_of_a_withdrawn_connection() {
         "the restriction did not withdraw the window"
     );
     tell(&mut daemon, open(3)).await;
+    let geometry_before = world.runtime.session().geometry();
 
+    // The attach claims the geometry with a size of its own, which a refusal at the push would
+    // already have applied: only a refusal before the dispatch marker leaves the session as it was.
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Geometry);
     let target = world.target();
     let session_id = world.session_id;
     let attaching = ends_by(deadline, async move {
@@ -1534,8 +1538,8 @@ async fn the_attach_of_a_withdrawn_connection() {
                 &SessionAttachParams {
                     session_id,
                     mode: AttachMode::Terminal,
-                    claim_geometry: false,
-                    dimensions: Nullable::some(Dimensions::new(80, 24)),
+                    claim_geometry: true,
+                    dimensions: Nullable::some(Dimensions::new(100, 30)),
                     terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
                     requested,
                 },
@@ -1551,6 +1555,11 @@ async fn the_attach_of_a_withdrawn_connection() {
         panic!("a withdrawn connection attached again after the host opened");
     }
     assert!(world.holds_nothing(), "the session holds an attachment");
+    assert_eq!(
+        world.runtime.session().geometry(),
+        geometry_before,
+        "the refused attach changed the session's geometry"
+    );
     world.close();
 }
 
