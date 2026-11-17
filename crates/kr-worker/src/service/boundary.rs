@@ -96,6 +96,11 @@ pub(super) struct DispatchBoundary {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// How many presentations have found the boundary held since its last release, which this
+    /// host's own tests read: each release starts the count again, so a presentation that is woken
+    /// and tries once is counted once. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub(super) presentation_tries_since_release: std::sync::atomic::AtomicU64,
 }
 
 impl DispatchBoundary {
@@ -106,6 +111,8 @@ impl DispatchBoundary {
             holder: AtomicU64::new(0),
             #[cfg(feature = "testing")]
             pause_after_unlock: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            presentation_tries_since_release: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -193,6 +200,10 @@ impl Drop for DispatchGuard<'_> {
         drop(self.guard.take());
         #[cfg(feature = "testing")]
         self.boundary.wait_after_the_unlock();
+        #[cfg(feature = "testing")]
+        self.boundary
+            .presentation_tries_since_release
+            .store(0, std::sync::atomic::Ordering::SeqCst);
         self.boundary.released.notify_waiters();
     }
 }
