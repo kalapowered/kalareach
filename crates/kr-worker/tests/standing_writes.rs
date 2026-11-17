@@ -351,3 +351,48 @@ fn a_free_function_that_raises_the_floor_is_followed_and_reported() {
         "action/time.rs note_floor calls raise 1 time(s) and no row lists it",
     );
 }
+
+const JOURNAL: &str = "crates/kr-worker/src/journal.rs";
+const DRIVER: &str = "crates/kr-worker/src/fence/driver.rs";
+const INPUT_DOMAIN: &str = "crates/kr-worker/src/input_domain.rs";
+
+#[test]
+fn a_write_planted_in_the_journals_outstanding_count_is_reported() {
+    // The limits read the journal's count of outstanding actions: the body can record a fault, and
+    // a write planted beside that note is reported.
+    let found = planted(
+        JOURNAL,
+        "    pub fn outstanding(&self, actor_id: &ActorId) -> Result<usize> {\n",
+        "    pub fn outstanding(&self, actor_id: &ActorId) -> Result<usize> {\n        self.note_fault();\n",
+    );
+    only_finding(
+        &found,
+        "journal.rs outstanding calls note_fault 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_write_planted_in_the_fence_drivers_detach_is_reported() {
+    let found = planted(
+        DRIVER,
+        "    pub fn detach_for_token(&self, presented: &str) -> Option<AttachmentId> {\n",
+        "    pub fn detach_for_token(&self, presented: &str) -> Option<AttachmentId> {\n        self.tokens.insert(0, 0);\n",
+    );
+    only_finding(
+        &found,
+        "fence/driver.rs detach_for_token calls insert 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_write_planted_in_the_input_domains_fence_is_reported() {
+    let found = planted(
+        INPUT_DOMAIN,
+        "    pub const fn fence(&self) -> Option<&FenceDriver> {\n",
+        "    pub const fn fence(&self) -> Option<&FenceDriver> {\n        self.note_fenced();\n",
+    );
+    only_finding(
+        &found,
+        "input_domain.rs fence calls note_fenced 1 time(s) and no row lists it",
+    );
+}
