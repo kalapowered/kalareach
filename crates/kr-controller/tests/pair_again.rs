@@ -475,3 +475,54 @@ async fn a_replacement_waits_for_the_barrier_and_a_first_pairing_does_not() {
     );
     host.stop().await;
 }
+
+/// KR-REQ-10.06: the owner's local client carries a proof that an owner device signed, as the
+/// owner's does in every pairing here. The confirmation is recorded under the device whose record
+/// answered it, though the caller is the host's own account, and the pairing spends it. A rule that
+/// matched the confirmation's caller to the standing record would refuse this flow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_local_caller_carrying_an_owner_devices_proof_spends_it_and_the_row_names_the_device() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let owner_device = host
+        .owner
+        .as_ref()
+        .expect("the host's owner device")
+        .device_id;
+    let phone = Device::create().await;
+    within(
+        "the pairing",
+        BOUND,
+        pair_with(&host, &phone, &owner, rights()),
+    )
+    .await;
+
+    let rows: Vec<(Option<Vec<u8>>, String, bool)> = registry(&host)
+        .prepare(
+            "SELECT signer_device_id, answered_by, consumed_at_ms IS NOT NULL
+             FROM owner_confirmations WHERE signer_device_id IS NOT NULL",
+        )
+        .expect("prepares")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("every row");
+    assert_eq!(
+        rows.len(),
+        2,
+        "the invitation's confirmation and the device's, both answered by the owner device: {rows:?}"
+    );
+    for (signer, answered_by, spent) in rows {
+        assert_eq!(
+            signer.as_deref(),
+            Some(owner_device.get().as_bytes().as_slice()),
+            "the row names the owner device that answered"
+        );
+        assert!(
+            answered_by.starts_with("local:"),
+            "the caller is the host's own account: {answered_by}"
+        );
+        assert!(spent, "the pairing spent the confirmation");
+    }
+    host.stop().await;
+}
