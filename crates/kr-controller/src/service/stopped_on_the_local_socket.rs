@@ -56,8 +56,7 @@ struct Serving {
     controller: Arc<Controller>,
     endpoint: Endpoint,
     serving: tokio::task::JoinHandle<crate::error::Result<()>>,
-    /// Declared last: the fields drop in the order of their declaration, and the daemon's files are
-    /// in this tree.
+    /// Declared last: the folder is removed after every field above has let go of its files.
     temp: kr_ipc::testing::TempHost,
 }
 
