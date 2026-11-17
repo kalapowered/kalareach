@@ -27,7 +27,7 @@ mod view;
 mod window;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_ipc::paths::EnvironmentPaths;
@@ -88,10 +88,9 @@ struct Held {
     commands: tokio::sync::mpsc::UnboundedSender<view::Command>,
     /// Becomes true once the view's task has ended.
     ended: tokio::sync::watch::Receiver<bool>,
-    /// The most items the view's queue of what it heard has held at one time.
-    queue_peak: Arc<AtomicUsize>,
-    /// How many barriers the view has taken from its input lane.
-    barriers: Arc<AtomicUsize>,
+    /// What a test reads of the view while it runs.
+    #[cfg(feature = "testing")]
+    probe: view::Probe,
 }
 
 /// The raw terminal views this application holds open.
@@ -102,6 +101,9 @@ pub struct TerminalViews {
     /// The connections that tests made for the next views, which each open of a view takes in turn.
     #[cfg(feature = "testing")]
     over: Mutex<std::collections::VecDeque<Arc<dyn kr_client::transport::ControlTransport>>>,
+    /// Where the input lane's waits come from for the views that open, when a test gave them.
+    #[cfg(feature = "testing")]
+    lane_bounds: Mutex<Option<Arc<dyn kr_transport::deadlines::Deadlines>>>,
 }
 
 impl TerminalViews {
@@ -125,6 +127,8 @@ impl TerminalViews {
             next: AtomicU64::new(1),
             #[cfg(feature = "testing")]
             over: Mutex::default(),
+            #[cfg(feature = "testing")]
+            lane_bounds: Mutex::default(),
         }
     }
 
@@ -198,8 +202,15 @@ impl TerminalViews {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (ending, ended) = tokio::sync::watch::channel(false);
-        let queue_peak = Arc::new(AtomicUsize::new(0));
-        let barriers = Arc::new(AtomicUsize::new(0));
+        #[cfg(feature = "testing")]
+        let probe = view::Probe {
+            lane_bounds: self
+                .lane_bounds
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
+            ..view::Probe::default()
+        };
         // Held before the task starts, so a close that arrives at once finds it.
         self.lock().insert(
             id,
@@ -207,8 +218,8 @@ impl TerminalViews {
                 page: page.to_owned(),
                 commands,
                 ended,
-                queue_peak: Arc::clone(&queue_peak),
-                barriers: Arc::clone(&barriers),
+                #[cfg(feature = "testing")]
+                probe: probe.clone(),
             },
         );
         let held = Arc::clone(&self.held);
@@ -220,7 +231,13 @@ impl TerminalViews {
                 Source::Over(transport) => view::Reach::Over(transport),
             };
             let cause = view::run(
-                reach, session_id, dimensions, receiver, &publish, queue_peak, barriers,
+                reach,
+                session_id,
+                dimensions,
+                receiver,
+                &publish,
+                #[cfg(feature = "testing")]
+                probe,
             )
             .await;
             // Before the view is told over, so whoever waits for its end finds it done.
@@ -268,26 +285,78 @@ impl TerminalViews {
 
     /// The most items a view's queue of what it heard has held at one time, or none for a view that
     /// has ended or was never open. For a test of the queue's bound.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     #[must_use]
     pub fn queue_peak(&self, view: &str) -> Option<usize> {
-        let id = view.parse::<u64>().ok()?;
-        self.lock()
-            .get(&id)
-            .map(|entry| entry.queue_peak.load(Ordering::Relaxed))
+        self.probe(view)
+            .map(|probe| probe.queue_peak.load(Ordering::Relaxed))
     }
 
     /// How many barriers a view has taken from its input lane so far: one for each request that
     /// waits for a paired host to have the typing before it (a launch or a release), and one for
     /// the close's detach. A barrier is counted once the lane has it, before the view waits for the
     /// host to reach it. For a test of what the view does while it waits for a barrier.
+    #[cfg(feature = "testing")]
     #[doc(hidden)]
     #[must_use]
     pub fn barriers_taken(&self, view: &str) -> Option<usize> {
+        self.probe(view)
+            .map(|probe| probe.barriers.load(Ordering::Relaxed))
+    }
+
+    /// The last event sequence that the view's session has read from `stream`, whether or not the
+    /// view has taken it, or none before the session has read any, for a view that has ended, or
+    /// for one that was never open. The session's reader records it before it hands the event on.
+    /// For a test of what the reader has read while the view is held.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub async fn read_through(
+        &self,
+        view: &str,
+        stream: &kr_protocol::ids::StreamId,
+    ) -> Option<kr_protocol::ids::EventSequence> {
+        let session = self
+            .probe(view)?
+            .session
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        session.cursors().await.received(stream)
+    }
+
+    /// Whether the view's input lane has ended, as the lane records it, or none while the lane is
+    /// not open or for a view that has ended. For a test of what a close does before the view has
+    /// read the lane's end.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn lane_ended(&self, view: &str) -> Option<bool> {
+        let ended = self
+            .probe(view)?
+            .lane_ended
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()?;
+        Some(ended())
+    }
+
+    /// Takes the input lane's waits of the views that open after this from `bounds` in place of the
+    /// shipped ones. For a test of what a view does while a wait of the lane stands or after it
+    /// ended, with the end given by the test and not by time.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub fn bound_lanes_by(&self, bounds: Arc<dyn kr_transport::deadlines::Deadlines>) {
+        *self
+            .lane_bounds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(bounds);
+    }
+
+    #[cfg(feature = "testing")]
+    fn probe(&self, view: &str) -> Option<view::Probe> {
         let id = view.parse::<u64>().ok()?;
-        self.lock()
-            .get(&id)
-            .map(|entry| entry.barriers.load(Ordering::Relaxed))
+        self.lock().get(&id).map(|entry| entry.probe.clone())
     }
 
     /// Tells a view the page's grid is now `dimensions`. A view that has ended takes nothing.
@@ -497,8 +566,8 @@ mod tests {
                 page: "main".to_owned(),
                 commands,
                 ended,
-                queue_peak: Arc::default(),
-                barriers: Arc::default(),
+                #[cfg(feature = "testing")]
+                probe: view::Probe::default(),
             },
         );
         (views, receiver)
