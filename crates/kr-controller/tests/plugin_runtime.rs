@@ -32,6 +32,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::ProcessState;
 use kr_ipc::paths::EnvironmentPaths;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
@@ -905,7 +906,13 @@ impl World {
             .expect("opens the daemon's log");
         let child = {
             use std::os::unix::process::CommandExt as _;
-            std::process::Command::new(std::env::current_exe().expect("this test's own binary"))
+            let mut command = std::process::Command::new(
+                std::env::current_exe().expect("this test's own binary"),
+            );
+            // The daemon's sessions run a login shell: they are given a home inside the tree, not
+            // the person's.
+            StartedEnvironment::within(self.tree.root()).apply(&mut command);
+            command
                 .args([
                     "--exact",
                     DAEMON_HALF,
@@ -978,6 +985,9 @@ impl World {
         })
         .await
         .expect("the daemon starts");
+        // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+        controller
+            .set_host_environment(StartedEnvironment::within(self.tree.root()).host_variables());
         let listener = Listener::bind(&self.endpoint).expect("binds the endpoint");
         self.serving.push(tokio::spawn(
             Arc::clone(&controller).serve_clients(listener),

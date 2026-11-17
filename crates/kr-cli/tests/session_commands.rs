@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_protocol::ids::{BuildId, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
@@ -83,7 +84,11 @@ impl Host {
         let controller = copy_into(&controller, &bin);
         let worker = copy_into(&worker, &bin);
         let log = std::fs::File::create(temp.root().join("daemon.log")).expect("the daemon's log");
-        let child = std::process::Command::new(&controller)
+        let mut command = std::process::Command::new(&controller);
+        // The daemon's sessions run a login shell: they are given a home inside the tree, not the
+        // person's.
+        StartedEnvironment::within(temp.root()).apply(&mut command);
+        let child = command
             .current_dir(temp.root())
             .arg("--runtime-dir")
             .arg(temp.root().join("r"))
@@ -124,10 +129,10 @@ impl Host {
 
     /// Runs `kr` against this host with nothing of this test's own environment.
     fn kr(&self, arguments: &[&str]) -> std::process::Output {
-        std::process::Command::new(kr())
+        let mut command = std::process::Command::new(kr());
+        StartedEnvironment::within(self.temp.root()).apply(&mut command);
+        command
             .args(arguments)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
             .env(
                 "KR_RUNTIME_DIR",
                 self.temp.paths().runtime_root().display().to_string(),

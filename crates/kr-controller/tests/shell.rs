@@ -17,6 +17,7 @@ use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
@@ -697,6 +698,8 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
     })
     .await
     .expect("the daemon starts");
+    // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+    controller.set_host_environment(StartedEnvironment::within(temp.root()).host_variables());
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let serving = tokio::spawn(Arc::clone(&controller).serve_clients(listener));

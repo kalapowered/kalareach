@@ -26,6 +26,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
 use kr_ipc::identity::ProcessState;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
@@ -254,6 +255,9 @@ impl Hosted {
         })
         .await
         .expect("the daemon starts");
+        // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+        controller
+            .set_host_environment(StartedEnvironment::within(self.tree.root()).host_variables());
         let listener = Listener::bind(&self.endpoint).expect("binds the endpoint");
         self.serving.push(tokio::spawn(
             Arc::clone(&controller).serve_clients(listener),

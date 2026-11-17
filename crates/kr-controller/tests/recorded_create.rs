@@ -25,6 +25,7 @@ use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::{Connection, Listener};
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::error::ErrorCode;
@@ -289,7 +290,11 @@ impl Host {
             .append(true)
             .open(environment.state_dir().join("controller.log"))
             .expect("opens the daemon's log");
-        let child = std::process::Command::new(&self.program)
+        let mut command = std::process::Command::new(&self.program);
+        // The daemon's sessions run a login shell: they are given a home inside the tree, not the
+        // person's.
+        StartedEnvironment::within(self.tree.root()).apply(&mut command);
+        let child = command
             .arg("--runtime-dir")
             .arg(environment.runtime_root())
             .arg("--state-dir")
