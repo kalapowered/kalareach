@@ -957,7 +957,8 @@ impl Registry {
         // a step. The engine may first recover a hot rollback journal into the main file, as it
         // does at the first read of the open. For a write-ahead log that read writes only the
         // index, and the log's frames reach the main file at the checkpoint that the close of the
-        // refused connection runs. Both engine writes occur at the base as well, and neither
+        // refused connection may run, which it does only when that connection is the last one on
+        // the file. Both engine writes occur at the base as well, and neither
         // changes what the file records. A read of the main file alone would see it stale or torn.
         if let Some(version) = recorded_schema_version(&connection)?
             && !is_read_or_brought_forward(version)
