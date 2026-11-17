@@ -25,7 +25,9 @@
 //! recorded and the time of that phase, a record and not a claim of what happened after it.
 //!
 //! A file that cannot be read or parsed is read as none: no release needs another's file, and a
-//! file holds no text or data of a person.
+//! file holds no text or data of a person. A file that names a command or a phase that a release
+//! does not have is such a file: a release that has no restart reads a restart's file as none,
+//! and neither says anything of it nor removes it.
 
 use std::path::{Path, PathBuf};
 
@@ -52,6 +54,8 @@ pub const CLEAN_LIMIT: usize = 64;
 pub enum Command {
     /// `kr host stop`.
     Stop,
+    /// `kr host restart`.
+    Restart,
 }
 
 /// How far an attempt had come when it last wrote its file.
@@ -63,6 +67,10 @@ pub enum Phase {
     /// The daemon answered that it takes the stop, or the answer is unknown and the daemon is
     /// waited for as one that does.
     Told,
+    /// A restart has asked for a new daemon, or is about to: the old one has ended, or none ran.
+    Starting,
+    /// A restart stopped the daemon, or found none, and its start failed.
+    StartFailed,
 }
 
 /// What an attempt's file holds.
@@ -128,6 +136,29 @@ impl Marker {
     /// Returns the failure to write the file.
     pub fn told(&mut self) -> kr_ipc::Result<()> {
         self.attempt.phase = Phase::Told;
+        self.attempt.at_ms = kr_ipc::now_ms().get();
+        self.write()
+    }
+
+    /// Records that a restart is about to ask for a new daemon, with the time.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure to write the file.
+    pub fn starting(&mut self) -> kr_ipc::Result<()> {
+        self.attempt.phase = Phase::Starting;
+        self.attempt.at_ms = kr_ipc::now_ms().get();
+        self.write()
+    }
+
+    /// Records that the start a restart asked for failed, with the time. The file is written
+    /// again if a daemon that started has removed it meanwhile.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure to write the file.
+    pub fn start_failed(&mut self) -> kr_ipc::Result<()> {
+        self.attempt.phase = Phase::StartFailed;
         self.attempt.at_ms = kr_ipc::now_ms().get();
         self.write()
     }
@@ -394,6 +425,84 @@ mod tests {
         let removed = remove_those_that_stop_another_daemon(&environment, &this_daemon);
         assert_eq!(removed, CLEAN_LIMIT);
         assert_eq!(recorded(&environment).len(), 5, "the rest is left");
+    }
+
+    /// A restart's file goes through its phases in one file, a daemon that serves removes it, and a
+    /// failed start writes it again.
+    #[test]
+    fn a_restarts_file_goes_through_its_phases_and_is_written_again_after_a_daemon_removed_it() {
+        let host = temp();
+        let environment = host.environment();
+        let mut marker =
+            Marker::begin(&environment, Command::Restart, Some(another(7))).expect("begins");
+        marker.told().expect("told");
+        marker.starting().expect("starting");
+        let found = recorded(&environment);
+        assert_eq!(found.len(), 1, "every phase rewrites the one file");
+        assert_eq!(found[0].attempt.command, Command::Restart);
+        assert_eq!(found[0].attempt.phase, Phase::Starting);
+        let removed = remove_those_that_stop_another_daemon(&environment, &another(100));
+        assert_eq!(
+            removed, 1,
+            "a daemon that serves removes the restart's file"
+        );
+        marker
+            .start_failed()
+            .expect("a failed start is written again");
+        let found = recorded(&environment);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].attempt.phase, Phase::StartFailed);
+        marker.remove();
+        assert!(recorded(&environment).is_empty());
+    }
+
+    /// Each value that a restart added is written by its own name, and a record of that form is
+    /// read as written.
+    #[test]
+    fn the_values_a_restart_added_are_written_by_their_names_and_read_back() {
+        let process = ProcessStartIdentity::new(
+            4242,
+            kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+            99,
+        );
+        for (command, phase, bytes) in [
+            (
+                Command::Restart,
+                Phase::Asking,
+                r#"{"command":"restart","phase":"asking","process":{"pid":"4242","source":"linux_proc_stat","start_value":"99"},"at_ms":1700000000000,"daemon":null}"#,
+            ),
+            (
+                Command::Restart,
+                Phase::Told,
+                r#"{"command":"restart","phase":"told","process":{"pid":"4242","source":"linux_proc_stat","start_value":"99"},"at_ms":1700000000000,"daemon":null}"#,
+            ),
+            (
+                Command::Restart,
+                Phase::Starting,
+                r#"{"command":"restart","phase":"starting","process":{"pid":"4242","source":"linux_proc_stat","start_value":"99"},"at_ms":1700000000000,"daemon":null}"#,
+            ),
+            (
+                Command::Restart,
+                Phase::StartFailed,
+                r#"{"command":"restart","phase":"start_failed","process":{"pid":"4242","source":"linux_proc_stat","start_value":"99"},"at_ms":1700000000000,"daemon":null}"#,
+            ),
+        ] {
+            let attempt = Attempt {
+                command,
+                phase,
+                process: process.clone(),
+                at_ms: 1_700_000_000_000,
+                daemon: None,
+            };
+            assert_eq!(
+                String::from_utf8(serde_json::to_vec(&attempt).expect("encodes")).expect("text"),
+                bytes
+            );
+            assert_eq!(
+                serde_json::from_str::<Attempt>(bytes).expect("a record of that form is read"),
+                attempt
+            );
+        }
     }
 
     /// A file that cannot be parsed is none, and is not removed by reading it.

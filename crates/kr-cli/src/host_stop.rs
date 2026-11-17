@@ -782,6 +782,7 @@ fn record_said(recorded: &attempt::Recorded, id: EnvironmentId) -> Shown {
     let process = recorded.attempt.process.pid.get();
     let command = match recorded.attempt.command {
         attempt::Command::Stop => "kr host stop",
+        attempt::Command::Restart => "kr host restart",
     };
     if recorded.standing() == Standing::UnderWay {
         return shown!(
@@ -804,6 +805,22 @@ fn record_said(recorded: &attempt::Recorded, id: EnvironmentId) -> Shown {
         attempt::Phase::Told => shown!(
             "The last record of a {} (process {}) is at {}: the control daemon for environment {} \
              had been told to stop. What happened after that is not recorded.",
+            command,
+            process,
+            at,
+            id
+        ),
+        attempt::Phase::Starting => shown!(
+            "The last record of a {} (process {}) is at {}: it was asking for a new control daemon \
+             for environment {}. What happened after that is not recorded.",
+            command,
+            process,
+            at,
+            id
+        ),
+        attempt::Phase::StartFailed => shown!(
+            "The last record of a {} (process {}) is at {}: its start of a control daemon for \
+             environment {} had failed. Run kr host restart to try again.",
             command,
             process,
             at,
@@ -2859,6 +2876,104 @@ mod tests {
             "said, so it goes"
         );
     }
+    /// What a record of an earlier attempt says, for each command and phase that a record can hold,
+    /// and for one whose process is still running: the stop's words stay as they are, and a
+    /// restart's say its own command and its two phases.
+    #[test]
+    fn a_record_of_an_earlier_attempt_says_its_command_and_phase_in_whole() {
+        let at = crate::shown::utc_moment(1);
+        let pid = std::process::id();
+        for (command, phase, name, tail) in [
+            (
+                attempt::Command::Stop,
+                attempt::Phase::Asking,
+                "kr host stop",
+                "it was asking the control daemon for environment {id} to stop. What happened after that is not recorded.",
+            ),
+            (
+                attempt::Command::Stop,
+                attempt::Phase::Told,
+                "kr host stop",
+                "the control daemon for environment {id} had been told to stop. What happened after that is not recorded.",
+            ),
+            (
+                attempt::Command::Restart,
+                attempt::Phase::Asking,
+                "kr host restart",
+                "it was asking the control daemon for environment {id} to stop. What happened after that is not recorded.",
+            ),
+            (
+                attempt::Command::Restart,
+                attempt::Phase::Told,
+                "kr host restart",
+                "the control daemon for environment {id} had been told to stop. What happened after that is not recorded.",
+            ),
+            (
+                attempt::Command::Restart,
+                attempt::Phase::Starting,
+                "kr host restart",
+                "it was asking for a new control daemon for environment {id}. What happened after that is not recorded.",
+            ),
+            (
+                attempt::Command::Restart,
+                attempt::Phase::StartFailed,
+                "kr host restart",
+                "its start of a control daemon for environment {id} had failed. Run kr host restart to try again.",
+            ),
+        ] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let environment = temp.environment();
+            let id = environment.environment_id();
+            let directory = environment.state_dir().join(attempt::DIRECTORY);
+            kr_ipc::paths::create_private_directory(&directory).expect("the directory");
+            let record = attempt::Attempt {
+                command,
+                phase,
+                process: identity::ended_process_identity(pid),
+                at_ms: 1,
+                daemon: None,
+            };
+            kr_ipc::paths::write_owner_only_file(
+                &directory.join("an-earlier-attempt"),
+                &serde_json::to_vec(&record).expect("encodes"),
+            )
+            .expect("writes the record");
+            let tail = tail.replace("{id}", &id.to_string());
+            assert_eq!(
+                records_said(&environment).to_string(),
+                format!(" The last record of a {name} (process {pid}) is at {at}: {tail}"),
+            );
+        }
+        for (command, name) in [
+            (attempt::Command::Stop, "kr host stop"),
+            (attempt::Command::Restart, "kr host restart"),
+        ] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let environment = temp.environment();
+            let id = environment.environment_id();
+            let directory = environment.state_dir().join(attempt::DIRECTORY);
+            kr_ipc::paths::create_private_directory(&directory).expect("the directory");
+            let record = attempt::Attempt {
+                command,
+                phase: attempt::Phase::Told,
+                process: identity::current_process_start_identity().expect("an identity"),
+                at_ms: 1,
+                daemon: None,
+            };
+            kr_ipc::paths::write_owner_only_file(
+                &directory.join("an-attempt-under-way"),
+                &serde_json::to_vec(&record).expect("encodes"),
+            )
+            .expect("writes the record");
+            assert_eq!(
+                records_said(&environment).to_string(),
+                format!(
+                    " A {name} is under way for environment {id} (process {pid}, last recorded at {at}); wait for it."
+                ),
+            );
+        }
+    }
+
     /// The text for a lock that could not be looked at takes what the request came to: after a stop
     /// that was taken it says that the daemon was told, and after a request whose taking is not
     /// known it says that, with the request's failure, and never that the daemon was told.
