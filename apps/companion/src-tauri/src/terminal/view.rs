@@ -1805,10 +1805,12 @@ impl View {
         // the lease is told now that none of them waits for an answer it will read: their request
         // numbers leave the lease's `writes` at once. Without this they would stay there until a
         // later acceptance or refusal covers their keys (`accepted`, `refused`). One epoch change
-        // leaves at most the frames that its begin dropped unsent (the lane's bound of 1,024);
-        // several changes with no acceptance between them add up, as the `keys` entries do. No
-        // decision and no shown text depends on it: no refusal of an older epoch reaches the lease,
-        // and nothing else reads `writes` for a key of the lane.
+        // leaves at most the frames that its begin dropped unsent and the frames in flight at the
+        // change, which give no event either; the lane's bound of 1,024 covers both together.
+        // Several changes with no acceptance between them add up, as the `keys` entries do. No
+        // decision and no shown text depends on it: a refusal of an older epoch that the lane
+        // emitted before the change is removed by this loop, and without it the lease's own epoch
+        // test stops it; nothing else reads `writes` for a key of the lane.
         for tag in self.keys.range_mut(..(epoch.get(), 0)).map(|(_, tag)| tag) {
             if let Some(tag) = tag.take() {
                 self.lease.answered(tag, Ok(ParamsValue::empty()));
