@@ -2413,7 +2413,17 @@ async fn the_doctor_counts_only_the_workers_that_are_still_out_after_a_late_adop
         "the start left both workers out"
     );
     assert_eq!(at_the_start.0, DoctorStatus::Warning);
-    assert!(at_the_start.2.is_some(), "the warning names what to do");
+    assert_eq!(
+        at_the_start.2.as_deref(),
+        Some(
+            "A worker that was busy when the daemon started returns when the next read of its \
+             session, the session list, a local caller's prompt or a device's link looks for it. \
+             A descriptor that is still counted after that is never used: remove it once its \
+             session is known to be gone."
+        ),
+        "the warning names the lookers that bring a busy worker back and what to do with a \
+         descriptor that stays"
+    );
     assert_eq!(
         after_the_first.1, "1 verified, 1 quarantined",
         "the adopted worker leaves the count and the one still out stays in it"
