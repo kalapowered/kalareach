@@ -593,6 +593,39 @@ async fn kr_req_17_48_a_dial_that_reads_the_entry_while_another_holds_its_new_re
     assert_eq!(service.asks(), 2, "two requests in all");
 }
 
+/// KR-REQ-17.48: one request for an entry is alive at a time on a first ask too, when the cache holds
+/// nothing for the entry yet: the first request stays behind its gate, and a dial that starts while it
+/// is alive asks nothing, at the same moment and 25 s later (when a held answer would be asked
+/// again). The service has been asked once, in all, and the answer to that request is kept.
+#[tokio::test]
+async fn kr_req_17_48_while_the_first_request_for_an_entry_is_alive_no_other_dial_asks() {
+    let clock = AdmissionClock::default();
+    let (service, gate) = Scripted::gated_script(vec![unable(None)]);
+    let admissions =
+        scripted_admissions(Arc::clone(&service), &clock).waiting(Duration::from_millis(20));
+    let (host, relays) = (key(0x11), network(&[MANAGED]));
+
+    admissions.before_dial(&relays, &host, key(0x22)).await;
+    service.asked_to(1).await;
+    assert_eq!(service.asks(), 1, "the first request is on its way");
+    for advance in [0, 25] {
+        clock.advance(Duration::from_secs(advance));
+        admissions.before_dial(&relays, &host, key(0x22)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            service.asks(),
+            1,
+            "a dial that starts {advance} s on asks nothing while the first request is alive"
+        );
+    }
+
+    gate.notify_one();
+    service.answered_to(1).await;
+    let told = reported_as(admissions.refusal(&relays, &host));
+    assert!(is_no_capacity(&told), "the answer is kept: {told:?}");
+    assert_eq!(service.asks(), 1, "one request in all");
+}
+
 /// KR-REQ-17.48: a failure of the service itself stands as the lack of capacity does while the next
 /// request is on its way, and is lifted by that request's failure. The answer at 0 s names no path
 /// and is kept to 60; the request at 52 fails at 90.
