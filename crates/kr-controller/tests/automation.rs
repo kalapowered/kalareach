@@ -5806,7 +5806,13 @@ async fn a_workflow_grant_whose_end_could_not_be_written_is_not_answered_as_expi
              BEGIN SELECT RAISE(ABORT, 'no room'); END;",
         )
         .expect("the fault is in place");
-    continuous.advance(std::time::Duration::from_secs(61));
+    // Both clocks move where no reader of the daemon reads, and UTC lags the continuous clock by
+    // four seconds, which a wall clock may: it stays before the grant's expiry while the grant's
+    // anchor has run out. A reader that found UTC a minute behind would distrust the clock.
+    kr_controller::testing::while_no_reader_of_the_clocks_reads(&host.controller, || {
+        continuous.advance(std::time::Duration::from_secs(61));
+        wall.store(T + 57_000, Ordering::SeqCst);
+    });
     let refused = grants
         .grant(grant.grant_id, T)
         .expect_err("the grant ran out on the continuous clock");
