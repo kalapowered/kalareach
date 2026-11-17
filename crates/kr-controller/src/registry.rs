@@ -1626,7 +1626,7 @@ impl Registry {
     /// found and never names the column, so the rows it writes carry no record, and the statements
     /// that keep an answer leave an answer that already has one as it is. That release describes 16
     /// as schema 15 whose copy of the accepted document can be at version 4, with no table or
-    /// column added, which is not what 16 is here: the document's next version takes 17. A release
+    /// column added, which is not what 16 is here: the document's next version takes 19. A release
     /// that reads 15 only refuses a registry at 16, so a rollback to it is refused.
     ///
     /// This migration goes in the first release after every install has opened the registry at

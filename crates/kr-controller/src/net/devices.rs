@@ -759,7 +759,7 @@ impl DeviceDirectory {
     ///
     /// SQLite has no conditional `ADD COLUMN`, and a duplicate is the ordinary case on every start
     /// after the first, so that one failure is the success case and anything else is not.
-    pub(super) fn add_column(&self, table: &str, definition: &str) -> Result<()> {
+    fn add_column(&self, table: &str, definition: &str) -> Result<()> {
         let statement = format!("ALTER TABLE {table} ADD COLUMN {definition}");
         let outcome = self.with(|connection| connection.execute(&statement, []));
         match outcome {
@@ -1731,12 +1731,6 @@ pub(crate) fn establish_clock_in(
     Ok(())
 }
 
-/// Only a paired record answers a lookup.
-///
-/// A revoked device is not an unpaired candidate that may pair again through the same endpoint: it
-/// reaches the pre-authorisation surface, where pairing's own rules decide, and it reaches nothing
-/// else. What matters here is that it can never be *authorised*, and the handshake asks this
-/// exactly once for that purpose.
 /// Writes one device row inside a transaction the caller holds.
 ///
 /// The device record and its grant are one row, written in one statement: section 10 commits them
@@ -2027,6 +2021,13 @@ pub(crate) fn rebuild_for_one_live_record_per_endpoint(
 }
 
 impl PairedDirectory for DeviceDirectory {
+    /// Returns the record of an endpoint identity that has been neither revoked nor expired, and
+    /// nothing for an identity whose record ended or that has none.
+    ///
+    /// A device whose record ended is not authorised and is not a paired peer: the handshake takes
+    /// it as an unpaired candidate, and pairing's own rules decide whether it is paired again,
+    /// under a new record of its own. The handshake asks this when it starts and again as late as
+    /// the exchange allows, and refuses a record that changed between the two.
     fn paired_peer(&self, endpoint_id: &EndpointKey) -> Option<PairedPeer> {
         self.record_for_endpoint(endpoint_id)
             .ok()
