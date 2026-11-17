@@ -465,9 +465,11 @@ fn as_the_table_says(text: &str, ground: &Ground, temporary: &Path) -> String {
 }
 
 /// How long a case that starts stand-ins is given. The longest of them ends in seconds on a busy
-/// machine, and every wait of the install for a program is bounded, so a case that has not ended in
-/// this time is not waiting for a program: it is stood at, and says so.
-const CASE_BOUND: std::time::Duration = std::time::Duration::from_secs(300);
+/// machine. Every wait of the install for a program is bounded by the few seconds of the ask, and
+/// the first start of a stand-in by the five minutes that the helper placing it allows, which fails
+/// the case with the helper's own message. This bound is longer than that wait, so a case that has
+/// not ended in this time is not waiting at any one program: it is stood at, and says so.
+const CASE_BOUND: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// How long the helper that a case starts in a process of its own is given. It is shorter than the
 /// case's, so that a helper that does not end fails with its own message and the case that started
