@@ -6723,3 +6723,186 @@ async fn a_retirement_that_cannot_write_its_debt_leaves_the_credential_unusable_
     assert_eq!(owed(&environment).len(), 1);
     assert!(stored_credential(&environment, sender).is_none());
 }
+
+/// Pairs the device of `phone` again after its record was revoked, and connects it under the new
+/// record.
+async fn paired_again(environment: &Environment, phone: &Phone) -> Phone {
+    // The same device, with the keys it was paired with, as it starts again.
+    let device = Device::with_keys(phone.device.keys().clone()).await;
+    let record = pair_with(
+        &environment.host,
+        &device,
+        &environment.owner,
+        proposal(&[ActionRight::SessionView]),
+    )
+    .await;
+    let connection = RawDevice::connect(&environment.host, &device, &record).await;
+    Phone {
+        device,
+        record,
+        connection,
+    }
+}
+
+/// KR-REQ-10.08: the push destination a device registered stays with the record it registered under.
+/// The record is revoked, which ends its destination, and the device pairs again: the new identifier
+/// has no destination until the device registers one, the ended one is as the revocation left it
+/// and no longer delivers, and when the new record registers, the old destination is not touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_device_that_pairs_again_has_no_push_destination_until_it_registers_one() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let first_sender = PushSenderRecordId::new(uuid(0x81));
+    let credential = environment.gateway.issue(
+        first_sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the record registers its destination");
+    let live = environment
+        .destination(phone.device_id())
+        .expect("the destination of the record that stands");
+    assert!(live.enabled && live.rule.is_some(), "it delivers: {live:?}");
+
+    unpair(&environment, phone.device_id()).await;
+    // The destination is out of service: gone, or kept without a rule as the name of what was sent.
+    let ended = environment.destination(phone.device_id());
+    assert!(
+        ended
+            .as_ref()
+            .is_none_or(|record| !record.enabled && record.rule.is_none()),
+        "the revocation ended it: {ended:?}"
+    );
+
+    let again = paired_again(&environment, &phone).await;
+    assert_ne!(again.device_id(), phone.device_id());
+    assert!(
+        environment.destination(again.device_id()).is_none(),
+        "the new identifier has no destination before it registers one"
+    );
+    assert_eq!(
+        environment.destination(phone.device_id()),
+        ended,
+        "the old identifier's destination is as the revocation left it"
+    );
+
+    let second_sender = PushSenderRecordId::new(uuid(0x82));
+    let credential = environment.gateway.issue(
+        second_sender,
+        again.installation(),
+        environment.host_signing_key(),
+    );
+    again
+        .register(&environment, &credential)
+        .await
+        .expect("the new record registers its own destination");
+    let registered = environment
+        .destination(again.device_id())
+        .expect("the new record's destination");
+    assert!(registered.enabled && registered.rule.is_some());
+    assert_eq!(
+        registered.as_push().map(|push| push.sender_record_id),
+        Some(second_sender),
+        "it is the new registration's"
+    );
+    assert_eq!(
+        environment.destination(phone.device_id()),
+        ended,
+        "the old destination is still as the revocation left it"
+    );
+}
+
+/// KR-REQ-10.08: a push registration whose gateway answer arrives after its record was ended and
+/// replaced writes nothing: the gateway's answer is held while the record is revoked and the device
+/// pairs again, and when it is let go the registration is refused, the new identifier has no
+/// destination, the old destination is as the revocation left it, and the credential it carried is
+/// not kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_push_registration_answered_after_its_record_was_replaced_writes_nothing() {
+    let environment = Environment::start().await;
+    let phone = environment.phone().await;
+    let first_sender = PushSenderRecordId::new(uuid(0x83));
+    let credential = environment.gateway.issue(
+        first_sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the record registers its destination");
+
+    // A second credential for the record that stands, whose registration waits for the gateway.
+    let late_sender = PushSenderRecordId::new(uuid(0x84));
+    let late = environment.gateway.issue(
+        late_sender,
+        phone.installation(),
+        environment.host_signing_key(),
+    );
+    let held = environment.gateway.hold(STATUS_ROUTE, 0);
+    // The record is revoked while this waits, so the host may end the connection it came on
+    // instead of answering: what the host writes is what the case reads, not the answer.
+    let late_params = DevicePushRegisterParams {
+        credential: late,
+        previews_enabled: true,
+    };
+    let late_registration = phone.connection.try_mutate(
+        Method::DevicePushRegister,
+        ActionId::new(kr_ipc::new_uuid()),
+        ActionTarget::environment(environment.environment_id()),
+        &late_params,
+    );
+    let replacing = async {
+        held.reached().await;
+        unpair(&environment, phone.device_id()).await;
+        let again = paired_again(&environment, &phone).await;
+        let ended = environment.destination(phone.device_id());
+        assert!(
+            ended
+                .as_ref()
+                .is_none_or(|record| !record.enabled && record.rule.is_none()),
+            "{ended:?}"
+        );
+        held.release();
+        (again, ended)
+    };
+    let (_answer, (again, ended)) = tokio::join!(late_registration, replacing);
+
+    // The new record registers its own destination, which the late registration, were it to write,
+    // would have written before.
+    let second_sender = PushSenderRecordId::new(uuid(0x85));
+    let credential = environment.gateway.issue(
+        second_sender,
+        again.installation(),
+        environment.host_signing_key(),
+    );
+    again
+        .register(&environment, &credential)
+        .await
+        .expect("the new record registers its own destination");
+
+    assert_eq!(
+        environment.destination(phone.device_id()),
+        ended,
+        "the old destination is neither renewed nor changed by the late registration"
+    );
+    assert_eq!(
+        environment
+            .destination(again.device_id())
+            .and_then(|record| record.as_push().map(|push| push.sender_record_id)),
+        Some(second_sender),
+        "the new destination is the new record's own registration, not the late one's"
+    );
+    assert!(
+        environment
+            .controller()
+            .delivery_runtime()
+            .credentials()
+            .held(late_sender)
+            .is_none(),
+        "the credential of the late registration is not kept"
+    );
+}
