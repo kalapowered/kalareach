@@ -447,6 +447,17 @@ pub(crate) struct StartedFact {
     pub(crate) pid: Option<u32>,
 }
 
+/// What a restart's result says in `--json` of the daemon that answers and of what this command
+/// launched: absent for a stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Answer {
+    /// The process the daemon that answers states, where it states one.
+    pub(crate) serving: Option<u64>,
+    /// What this command launched, where it launched something, whether or not the daemon that
+    /// answers is the one it made.
+    pub(crate) launched: Option<StartedFact>,
+}
+
 /// The facts a result carries in `--json`.
 #[derive(Clone)]
 pub(crate) struct Facts {
@@ -457,6 +468,8 @@ pub(crate) struct Facts {
     pub(crate) records: Vec<Shown>,
     /// What a restart started: absent for a stop, and null where the restart started no daemon.
     pub(crate) started: Option<Option<StartedFact>>,
+    /// The daemon that answers a restart and what the restart launched: absent for a stop.
+    pub(crate) answer: Option<Answer>,
 }
 
 impl Facts {
@@ -468,6 +481,7 @@ impl Facts {
             unsettled: None,
             records,
             started: None,
+            answer: None,
         }
     }
 
@@ -491,6 +505,17 @@ impl Facts {
                     Document::new()
                         .with("start", started.start)
                         .with("pid", started.pid)
+                }),
+            );
+        }
+        if let Some(answer) = self.answer {
+            document.set("serving", answer.serving);
+            document.set(
+                "launched",
+                answer.launched.map(|launched| {
+                    Document::new()
+                        .with("start", launched.start)
+                        .with("pid", launched.pid)
                 }),
             );
         }
@@ -1622,6 +1647,7 @@ pub(crate) fn say_the_stop(
         unsettled,
         records: none.records.clone(),
         started: none.started,
+        answer: none.answer,
     };
     conclude(said.exit, message, &facts, json, earlier)
 }
@@ -2027,6 +2053,7 @@ pub(crate) fn ended_by(
                 unsettled: None,
                 records: none.records.clone(),
                 started: none.started,
+                answer: none.answer,
             };
             Ok(conclude(said.exit, words, &facts, json, earlier))
         }
@@ -6556,6 +6583,7 @@ mod tests {
                 unsettled: None,
                 records: Vec::new(),
                 started: None,
+                answer: None,
             };
             assert!(
                 matches!(done(&said, &facts, true, &earlier), Completion::Done),

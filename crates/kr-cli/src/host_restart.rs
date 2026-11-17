@@ -30,8 +30,8 @@ use kr_protocol::ids::{ControllerGeneration, EnvironmentId};
 
 use crate::error::{CliError, Result};
 use crate::host_stop::{
-    self, Asked, AtStart, Before, Begun, Cut, End, Facts, Knows, Looked, Operations, Progress,
-    Real, Settled, Stage, Start, StartedFact, Which,
+    self, Answer, Asked, AtStart, Before, Begun, Cut, End, Facts, Knows, Looked, Operations,
+    Progress, Real, Settled, Stage, Start, StartedFact, Which,
 };
 use crate::report::Completion;
 use crate::resolve::KnownEnvironment;
@@ -245,6 +245,10 @@ async fn wait_for_the_holder(
                 &holder_answers_said(id, named),
                 &Facts {
                     pid: named,
+                    answer: Some(Answer {
+                        serving: named,
+                        launched: None,
+                    }),
                     ..begun.none.clone()
                 },
                 json,
@@ -326,8 +330,8 @@ struct Stopped {
     unsettled: Option<u64>,
     /// Another daemon that holds the environment since the end, and the process the lock names.
     successor: Option<Option<u64>>,
-    /// The generation of the daemon that was stopped, where the command read it.
-    generation: Option<ControllerGeneration>,
+    /// What the command read of the generation of the daemon that was stopped.
+    generation: Old,
     /// The stop's own words, where its request could not be made and the daemon was seen to end:
     /// the restart did not stop it, and says so before it says what its start did.
     first: Option<Shown>,
@@ -497,7 +501,7 @@ fn stopped_by_the_request(
         pid,
         unsettled,
         successor,
-        generation: Some(generation),
+        generation: Old::Generation(generation),
         first: None,
         unknown,
     };
@@ -598,8 +602,8 @@ fn stopped_unmade(
     (first, pid, end): (Shown, Option<u64>, End),
 ) -> (Stopped, Option<kr_protocol::identity::ProcessStartIdentity>) {
     let (generation, old) = match read {
-        Some((generation, old)) => (Some(generation), old),
-        None => (None, None),
+        Some((generation, old)) => (Old::Generation(generation), old),
+        None => (Old::Unread, None),
     };
     let stopped = Stopped {
         named: pid,
@@ -670,14 +674,7 @@ async fn after_the_end(
         Ok(proved) => {
             progress.remove_marker();
             let said = said_after_the_proof(id, &stopped, &proved, creates);
-            let facts = match proved {
-                Proved::Ours(started) => Facts {
-                    started: Some(Some(started_fact(&started))),
-                    ..facts
-                },
-                Proved::Another { .. } => facts,
-            };
-            host_stop::done(&said, &facts, json, &begun.earlier)
+            host_stop::done(&said, &answered_facts(&proved, facts), json, &begun.earlier)
         }
         Err(failed) => {
             failed
@@ -694,6 +691,40 @@ async fn after_the_end(
     }
 }
 
+/// The facts of a result in which a daemon answers after the restart's look or start: `started` is
+/// set only where the proof holds, and `serving` and `launched` say what answers and what this
+/// command launched, so that none launched and a launch that was not proved differ.
+fn answered_facts(proved: &Proved, facts: Facts) -> Facts {
+    match proved {
+        Proved::Ours(started) => Facts {
+            started: Some(Some(started_fact(started))),
+            answer: Some(Answer {
+                serving: started.pid.map(u64::from),
+                launched: Some(started_fact(started)),
+            }),
+            ..facts
+        },
+        Proved::Unproven {
+            serving, started, ..
+        } => Facts {
+            answer: Some(Answer {
+                serving: *serving,
+                launched: Some(started_fact(started)),
+            }),
+            ..facts
+        },
+        Proved::Another {
+            serving, launched, ..
+        } => Facts {
+            answer: Some(Answer {
+                serving: *serving,
+                launched: launched.as_ref().map(started_fact),
+            }),
+            ..facts
+        },
+    }
+}
+
 /// What the restart says where its start came to `proved` after a stop that came to `stopped`: the
 /// stop's words come first (that the daemon was stopped, or what the stop's own words say where its
 /// request could not be made or its outcome is not known), then what the start did.
@@ -707,6 +738,16 @@ fn said_after_the_proof(
         Proved::Ours(started) => match stopped.opening(id) {
             None => restarted_said(id, stopped.named, started, creates),
             Some(first) => unmade_then_started_said(&first, started),
+        },
+        Proved::Unproven {
+            serving,
+            started,
+            newer,
+        } => match &stopped.first {
+            Some(first) => unmade_and_unproven_said(first, *serving, started, *newer),
+            None => {
+                stopped_and_unproven_said(&stopped.clause(id), *serving, started, *newer, creates)
+            }
         },
         Proved::Another {
             serving,
@@ -789,41 +830,26 @@ async fn start_where_none_ran(
             json,
         );
     }
-    let result = start_and_prove(host, environment, None, progress, past).await;
+    let result = start_and_prove(host, environment, Old::None, progress, past).await;
     match result {
-        Ok(Proved::Ours(started)) => {
+        Ok(proved) => {
             progress.remove_marker();
-            host_stop::done(
-                &none_ran_started_said(id, &started, host_stop::under_way_said(environment)),
-                &Facts {
-                    started: Some(Some(started_fact(&started))),
-                    ..none
-                },
-                json,
-                &begun.earlier,
-            )
-        }
-        Ok(Proved::Another {
-            serving,
-            launched,
-            cut,
-        }) => {
-            progress.remove_marker();
-            let said = match launched {
-                Some(started) if cut => none_ran_and_another_serves_after_a_cut(
-                    id,
+            let under_way = host_stop::under_way_said(environment);
+            let said = match &proved {
+                Proved::Ours(started) => none_ran_started_said(id, started, under_way),
+                Proved::Unproven {
+                    serving, started, ..
+                } => none_ran_and_unproven_said(id, *serving, started, under_way),
+                Proved::Another {
                     serving,
-                    &started,
-                    host_stop::under_way_said(environment),
-                ),
-                launched => none_ran_and_another_already_serves_said(
-                    id,
-                    serving,
-                    launched,
-                    host_stop::under_way_said(environment),
-                ),
+                    launched: Some(started),
+                    cut: true,
+                } => none_ran_and_another_serves_after_a_cut(id, *serving, started, under_way),
+                Proved::Another {
+                    serving, launched, ..
+                } => none_ran_and_another_already_serves_said(id, *serving, *launched, under_way),
             };
-            host_stop::done(&said, &none, json, &begun.earlier)
+            host_stop::done(&said, &answered_facts(&proved, none), json, &begun.earlier)
         }
         Err(failed) => {
             failed
@@ -852,6 +878,17 @@ pub(crate) enum Proved {
         /// whether it was the one this command launched.
         cut: bool,
     },
+    /// A control daemon answers, and what it states does not show whether it is the one this
+    /// command started: the start names no process, or the generation of the daemon that was
+    /// stopped was not read to hold it against. The command says what it read and what it asked.
+    Unproven {
+        /// The process that the answering daemon states, where it states one.
+        serving: Option<u64>,
+        /// What this command launched.
+        started: Started,
+        /// Whether a stopped generation was read and the daemon that answers is of a newer one.
+        newer: bool,
+    },
 }
 
 impl Proved {
@@ -874,12 +911,12 @@ impl Proved {
     }
 
     /// What a result says where another daemon serves: that this command's own start, where it
-    /// made one, did not take the environment.
+    /// made one, is not the daemon that answers.
     fn own_start_said(launched: Option<Started>) -> Shown {
         match launched {
             None => Shown::said(""),
             Some(started) => shown!(
-                " This command's own start{} did not take the environment.",
+                " The control daemon that answers is not this command's own start{}.",
                 process_said(started.pid.map(u64::from))
             ),
         }
@@ -928,8 +965,8 @@ fn unmade_and_another_serves_said(
             process_said(started.pid.map(u64::from))
         ),
         Some(started) => shown!(
-            "{} A control daemon already serves the environment{}. This command's own start{} did \
-             not take the environment. No session was stopped.",
+            "{} A control daemon already serves the environment{}. The control daemon that answers \
+             is not this command's own start{}. No session was stopped.",
             *first,
             process_said(serving),
             process_said(started.pid.map(u64::from))
@@ -970,6 +1007,78 @@ fn restarted_said(id: EnvironmentId, old: Option<u64>, started: &Started, create
         processes,
         start_said(started),
         creates
+    )
+}
+
+/// What a result says of a daemon that answers where nothing shows whether it is the one this
+/// command's start made: that a control daemon (of a newer generation where a stopped generation
+/// was read) now answers, with its process where read.
+fn answers_now(serving: Option<u64>, newer: bool) -> Shown {
+    let generation = if newer { " of a newer generation" } else { "" };
+    shown!(
+        "control daemon{} now answers{}",
+        generation,
+        process_said(serving)
+    )
+}
+
+/// What a result says this command did where nothing shows whether the daemon that answers is the
+/// one its start made: it asked the start for a daemon, and cannot tell.
+fn asked_and_cannot_tell(started: &Started) -> Shown {
+    shown!(
+        " This command asked the {} start for a daemon and cannot tell whether the daemon that \
+         answers is that one.",
+        start_said(started)
+    )
+}
+
+/// What a restart says where the daemon ended and a control daemon answers that nothing shows to
+/// be the one its start made: the stop's words (`clause`), what answers, and what it asked.
+fn stopped_and_unproven_said(
+    clause: &Shown,
+    serving: Option<u64>,
+    started: &Started,
+    newer: bool,
+    creates: Shown,
+) -> Shown {
+    shown!(
+        "{}; a {}.{} No session was stopped.{}",
+        *clause,
+        answers_now(serving, newer),
+        asked_and_cannot_tell(started),
+        creates
+    )
+}
+
+/// The same after a request that could not be made, with the stop's words first.
+fn unmade_and_unproven_said(
+    first: &Shown,
+    serving: Option<u64>,
+    started: &Started,
+    newer: bool,
+) -> Shown {
+    shown!(
+        "{} A {}.{} No session was stopped.",
+        *first,
+        answers_now(serving, newer),
+        asked_and_cannot_tell(started)
+    )
+}
+
+/// What a restart says where no daemon ran and a control daemon answers that nothing shows to be
+/// the one its start made.
+fn none_ran_and_unproven_said(
+    id: EnvironmentId,
+    serving: Option<u64>,
+    started: &Started,
+    under_way: Shown,
+) -> Shown {
+    shown!(
+        "No control daemon was running for environment {}; a {}.{}{}",
+        id,
+        answers_now(serving, false),
+        asked_and_cannot_tell(started),
+        under_way
     )
 }
 
@@ -1200,16 +1309,30 @@ struct Answering {
     pid: Option<u64>,
 }
 
+/// What the proof knows of the daemon that was stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Old {
+    /// No daemon ran, so none is older than the one that answers.
+    None,
+    /// A daemon was stopped, and this was its generation.
+    Generation(ControllerGeneration),
+    /// A daemon was stopped, and its generation was not read.
+    Unread,
+}
+
 /// Whether the daemon that answered is the one that was started, from what one connection said of
 /// it. `started` is what the start made, and none where its look found a daemon already there.
 ///
-/// The daemon is the one that was started where it is of a newer generation than the one that was
-/// stopped and its process is the started one. Where the start has no process to name (the
-/// scheduled task, a manager that does not say), a newer generation alone is the proof, and that is
-/// a named limit.
+/// Three strengths of evidence. The daemon is the one that was started where the start knows its
+/// process, the daemon states that process, and the daemon is of a newer generation than the one
+/// that was stopped (where none ran there is none to be newer than). Where the start has no process
+/// to name (the scheduled task, a manager that does not say), or the generation of the daemon that
+/// was stopped was not read, a daemon answers and nothing shows whether it is the one that was
+/// started: that is [`Proved::Unproven`], and it says only what was read. A daemon of another
+/// process than the one the start made is another daemon whatever else is known.
 fn judge(
     started: Option<Started>,
-    stopped: Option<ControllerGeneration>,
+    old: Old,
     answering: &Answering,
 ) -> std::result::Result<Proved, &'static str> {
     // The look found a daemon: another restart's, or a manager's.
@@ -1220,19 +1343,27 @@ fn judge(
             cut: false,
         });
     };
-    if !stopped.is_none_or(|old| answering.generation > old) {
+    if let Old::Generation(stopped) = old
+        && answering.generation <= stopped
+    {
         return Err("the control daemon that answers is of the generation that was told to stop");
     }
+    let unproven = |newer| Proved::Unproven {
+        serving: answering.pid,
+        started,
+        newer,
+    };
     match (started.pid, answering.pid) {
-        (None, _) => Ok(Proved::Ours(started)),
-        (Some(process), Some(answered)) if answered == u64::from(process) => {
-            Ok(Proved::Ours(started))
-        }
+        (None, _) => Ok(unproven(matches!(old, Old::Generation(_)))),
         // The child that was started lost the environment to another daemon, which answers.
-        (Some(_), Some(answered)) => Ok(Proved::Another {
+        (Some(process), Some(answered)) if u64::from(process) != answered => Ok(Proved::Another {
             serving: Some(answered),
             launched: Some(started),
             cut: false,
+        }),
+        (Some(_), Some(_)) => Ok(match old {
+            Old::Unread => unproven(false),
+            Old::None | Old::Generation(_) => Proved::Ours(started),
         }),
         (Some(_), None) => Err(
             "the control daemon that answers did not state its process, so it \
@@ -1250,7 +1381,7 @@ fn judge(
 async fn start_and_prove(
     host: &HostPaths,
     environment: &KnownEnvironment,
-    stopped: Option<ControllerGeneration>,
+    stopped: Old,
     progress: &Progress,
     past: &Past,
 ) -> std::result::Result<Proved, StartFailed> {
@@ -1407,7 +1538,13 @@ mod tests {
         stopped: Option<u64>,
         answering: &Answering,
     ) -> std::result::Result<Proved, &'static str> {
-        judge(started, stopped.map(ControllerGeneration::new), answering)
+        judge(
+            started,
+            stopped.map_or(Old::None, |generation| {
+                Old::Generation(ControllerGeneration::new(generation))
+            }),
+            answering,
+        )
     }
 
     /// The daemon that answers is the started one only where the connection that answered says the
@@ -1449,11 +1586,19 @@ mod tests {
         assert!(proof(Some(started(Some(40))), Some(3), &answering(4, None)).is_err());
         assert!(matches!(
             proof(Some(started(None)), Some(3), &answering(4, None)),
-            Ok(Proved::Ours(_))
+            Ok(Proved::Unproven {
+                serving: None,
+                newer: true,
+                ..
+            })
         ));
         assert!(matches!(
             proof(Some(started(None)), Some(3), &answering(4, Some(9))),
-            Ok(Proved::Ours(_))
+            Ok(Proved::Unproven {
+                serving: Some(9),
+                newer: true,
+                ..
+            })
         ));
     }
 
@@ -1475,6 +1620,39 @@ mod tests {
                 serving: None,
                 launched: None,
                 cut: false
+            })
+        ));
+    }
+
+    /// Where a daemon was stopped and its generation was not read, the answer holds nothing to be
+    /// newer than: the same process proves nothing, and another process is another's whatever else
+    /// is known. Where none ran and the start has no process to name, nothing shows either.
+    #[test]
+    fn where_the_stopped_generation_was_not_read_the_process_alone_proves_nothing() {
+        let unread = |started, answering: &Answering| judge(started, Old::Unread, answering);
+        assert!(matches!(
+            unread(Some(started(Some(40))), &answering(1, Some(40))),
+            Ok(Proved::Unproven {
+                serving: Some(40),
+                newer: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            unread(Some(started(Some(40))), &answering(1, Some(41))),
+            Ok(Proved::Another {
+                serving: Some(41),
+                cut: false,
+                ..
+            })
+        ));
+        assert!(unread(Some(started(Some(40))), &answering(1, None)).is_err());
+        assert!(matches!(
+            proof(Some(started(None)), None, &answering(1, Some(9))),
+            Ok(Proved::Unproven {
+                serving: Some(9),
+                newer: false,
+                ..
             })
         ));
     }
@@ -1618,8 +1796,8 @@ mod tests {
             .to_string(),
             format!(
                 "Stopped the control daemon for environment {id} (process 30); a control daemon \
-                 already serves it (process 41). This command's own start (process 40) did not \
-                 take the environment. No session was stopped."
+                 already serves it (process 41). The control daemon that answers is not this \
+                 command's own start (process 40). No session was stopped."
             )
         );
         assert_eq!(
@@ -1646,8 +1824,8 @@ mod tests {
             .to_string(),
             format!(
                 "No control daemon was running for environment {id}, and one serves it now \
-                 (process 41). This command's own start (process 40) did not take the \
-                 environment."
+                 (process 41). The control daemon that answers is not this command's own \
+                 start (process 40)."
             )
         );
         assert_eq!(
@@ -1742,7 +1920,7 @@ mod tests {
         assert!(
             judge(
                 Some(started(Some(40))),
-                Some(ControllerGeneration::new(3)),
+                Old::Generation(ControllerGeneration::new(3)),
                 &answering(3, Some(40))
             )
             .is_err_and(|said| said
@@ -1751,7 +1929,7 @@ mod tests {
         assert!(
             judge(
                 Some(started(Some(40))),
-                Some(ControllerGeneration::new(3)),
+                Old::Generation(ControllerGeneration::new(3)),
                 &answering(4, None)
             )
             .is_err_and(|said| said
@@ -1760,7 +1938,7 @@ mod tests {
         );
         assert_eq!(
             Proved::own_start_said(Some(started(Some(40)))).to_string(),
-            " This command's own start (process 40) did not take the environment."
+            " The control daemon that answers is not this command's own start (process 40)."
         );
         assert_eq!(Proved::own_start_said(None).to_string(), "");
     }
@@ -1929,8 +2107,9 @@ mod tests {
         assert_eq!(
             said(&another(Some(50), Some(started(Some(40))), false)),
             format!(
-                "{x} A control daemon already serves the environment (process 50). This command's \
-                 own start (process 40) did not take the environment. No session was stopped."
+                "{x} A control daemon already serves the environment (process 50). The control \
+                 daemon that answers is not this command's own start (process 40). No session was \
+                 stopped."
             )
         );
         assert_eq!(
@@ -2062,8 +2241,8 @@ mod tests {
         assert_eq!(
             said(&unknown, &another(Some(50), Some(started(Some(40))), false)),
             format!(
-                "{s}; a control daemon already serves it (process 50). This command's own start \
-                 (process 40) did not take the environment. No session was stopped."
+                "{s}; a control daemon already serves it (process 50). The control daemon that \
+                 answers is not this command's own start (process 40). No session was stopped."
             )
         );
         assert_eq!(
@@ -2112,5 +2291,62 @@ mod tests {
             panic!("a daemon that was not seen to end is the stop's");
         };
         assert!(matches!(not_ended.ended, End::NotEnded(..)));
+    }
+
+    /// Where a control daemon answers and nothing shows whether it is the one the start made, the
+    /// restart says what it read (that a control daemon answers, of a newer generation only where
+    /// the stopped generation was read, with its process where read) and what it asked (the start),
+    /// and never that the daemon is its own start's or another's.
+    #[test]
+    fn a_daemon_that_nothing_shows_to_be_the_started_one_is_said_with_what_was_read_and_asked() {
+        let (id, first, unmade) = a_stop_whose_request_could_not_be_made(End::Gone);
+        let taken = Stopped {
+            named: Some(30),
+            pid: Some(30),
+            unsettled: None,
+            successor: None,
+            generation: Old::Generation(ControllerGeneration::new(3)),
+            first: None,
+            unknown: None,
+        };
+        let unproven = |serving, newer| Proved::Unproven {
+            serving,
+            started: started(None),
+            newer,
+        };
+        let start = start_said(&started(None));
+        let asked = format!(
+            "This command asked the {start} start for a daemon and cannot tell whether the daemon \
+             that answers is that one."
+        );
+        assert_eq!(
+            said_after_the_proof(id, &taken, &unproven(Some(41), true), Shown::said(""))
+                .to_string(),
+            format!(
+                "Stopped the control daemon for environment {id} (process 30); a control daemon \
+                 of a newer generation now answers (process 41). {asked} No session was stopped."
+            )
+        );
+        assert_eq!(
+            said_after_the_proof(id, &taken, &unproven(None, false), Shown::said("")).to_string(),
+            format!(
+                "Stopped the control daemon for environment {id} (process 30); a control daemon \
+                 now answers. {asked} No session was stopped."
+            )
+        );
+        assert_eq!(
+            said_after_the_proof(id, &unmade, &unproven(Some(41), false), Shown::said(""))
+                .to_string(),
+            format!(
+                "{first} A control daemon now answers (process 41). {asked} No session was stopped."
+            )
+        );
+        assert_eq!(
+            none_ran_and_unproven_said(id, Some(41), &started(None), Shown::said("")).to_string(),
+            format!(
+                "No control daemon was running for environment {id}; a control daemon now \
+                 answers (process 41). {asked}"
+            )
+        );
     }
 }
