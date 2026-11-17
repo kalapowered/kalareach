@@ -2621,6 +2621,149 @@ mod tests {
         );
     }
 
+    /// What `reported` reads picks what a failed start says of a control daemon: a failure that came
+    /// after an answer says so where none answers now, and a failure of a start that no daemon
+    /// answered keeps the sentence that tells what to fix. (A daemon that answers now is read at
+    /// the endpoint, and a start-up case covers it.)
+    #[tokio::test]
+    async fn a_failed_start_says_by_what_answered_it_what_is_known_of_a_daemon() {
+        use kr_client::shown::Said as _;
+        let (_temp, environment) = an_environment();
+        let id = environment.environment_id;
+        let sessions = " No session was stopped: its workers keep running and a local attach still works. Paired devices cannot connect until a control daemon runs.";
+        for (answered, tail) in [
+            (
+                false,
+                format!("{sessions} Fix the cause and run kr host restart again."),
+            ),
+            (
+                true,
+                format!(
+                    " A control daemon answered during the start, and none answers now.{sessions} Run kr host restart again."
+                ),
+            ),
+        ] {
+            let progress = Progress::new(id);
+            let failed = StartFailed {
+                error: CliError::Other(Shown::said("the daemon did not answer")),
+                launched: false,
+                answered,
+            };
+            let reported = failed
+                .reported(
+                    &environment,
+                    Had::Daemon(Some(30)),
+                    None,
+                    true,
+                    &progress,
+                    &Facts::none(Vec::new()),
+                )
+                .await;
+            let Completion::Reported(error) = reported else {
+                panic!("a failure is reported");
+            };
+            assert_eq!(
+                error.said().to_string(),
+                format!(
+                    "The control daemon for environment {id} (process 30) was stopped and the start failed: the daemon did not answer.{tail}"
+                ),
+                "answered {answered}"
+            );
+        }
+    }
+
+    /// The daemon's side of one greeting at the environment's endpoint: accepts the next
+    /// connection, reads its hello and answers it, and keeps the connection open.
+    async fn answer_one_hello(
+        listener: &kr_ipc::endpoint::Listener,
+        id: EnvironmentId,
+    ) -> (kr_ipc::framed::FrameReader, kr_ipc::framed::FrameWriter) {
+        use kr_protocol::envelope::ControlFrame;
+        use kr_protocol::scalars::CanonicalSet;
+
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let boot_epoch = kr_ipc::identity::boot_epoch(&boot).expect("a boot epoch");
+        let (connection, peer) = listener.accept().await.expect("a connection");
+        let (mut reader, mut writer) =
+            kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+        let connection_id = kr_protocol::ids::ConnectionId::new(kr_ipc::new_uuid());
+        let hello = reader
+            .read_message::<ControlFrame>()
+            .await
+            .expect("a hello");
+        assert!(matches!(hello, ControlFrame::Hello(_)), "a hello");
+        let ack = kr_protocol::local::LocalHelloAck {
+            selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+            role: kr_protocol::local::LocalRole::Controller,
+            connection_id,
+            environment_id: id,
+            boot_identity: boot,
+            peer: peer.to_wire(),
+            action_window: kr_protocol::hello::ActionWindow {
+                action_window_id: kr_protocol::ids::ActionWindowId::new("test-daemon")
+                    .expect("a window identifier"),
+                connection_id,
+                boot_epoch,
+                issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                valid_for_ms: kr_protocol::scalars::DurationMs::new(600_000),
+            },
+            capabilities: CanonicalSet::new(),
+            max_receive: kr_protocol::hello::ReceiveLimits::default(),
+            build: Some(kr_protocol::local::LocalBuild {
+                build_id: crate::build_id(),
+                protocol_version: kr_protocol::hello::PACKAGE_VERSION,
+            }),
+        };
+        writer
+            .write_message(&ControlFrame::HelloAck(Box::new(ack)))
+            .await
+            .expect("the ack");
+        (reader, writer)
+    }
+
+    /// A failed start where a control daemon answers at the endpoint when the failure is reported
+    /// says so, whether or not one answered during the start and whether or not the start's
+    /// process was seen to end: it does not say that a requested daemon may still start or that
+    /// paired devices cannot connect.
+    #[tokio::test]
+    async fn a_failed_start_says_that_a_daemon_answers_where_one_answers_now() {
+        use kr_client::shown::Said as _;
+        let (_temp, environment) = an_environment();
+        let id = environment.environment_id;
+        let endpoint = environment
+            .paths
+            .controller_endpoint()
+            .expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let daemon = tokio::spawn(async move { answer_one_hello(&listener, id).await });
+        let progress = Progress::new(id);
+        let failed = StartFailed {
+            error: CliError::Other(Shown::said("the daemon did not answer")),
+            launched: true,
+            answered: false,
+        };
+        let reported = failed
+            .reported(
+                &environment,
+                Had::Daemon(Some(30)),
+                None,
+                true,
+                &progress,
+                &Facts::none(Vec::new()),
+            )
+            .await;
+        let Completion::Reported(error) = reported else {
+            panic!("a failure is reported");
+        };
+        assert_eq!(
+            error.said().to_string(),
+            format!(
+                "The control daemon for environment {id} (process 30) was stopped and the start failed: the daemon did not answer. A control daemon answers now. No session was stopped: its workers keep running and a local attach still works. Run kr host restart again if that daemon must be replaced."
+            )
+        );
+        let _connection = daemon.await.expect("the daemon answered once");
+    }
+
     /// A start that asked for no stop writes its record as `starting` from the first write, so
     /// that a command killed between that write and the next leaves no record that says it was
     /// asking a daemon to stop.
