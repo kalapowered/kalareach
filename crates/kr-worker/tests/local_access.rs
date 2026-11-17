@@ -2952,3 +2952,360 @@ fn a_sweep_that_waits_for_a_lock_does_not_stop_the_refusals_of_the_other_windows
         "the first window still holds something after the acknowledgement"
     );
 }
+
+/// Ends the connection of `window`, which holds an attachment, and stops the end right after it
+/// has taken the attachments it owns and before it has detached any: those detaches are pending.
+/// Returns the end that lets the connection's end go on.
+async fn end_a_window_at_its_take(
+    world: &World,
+    window: LocalClient,
+    deadline: std::time::Instant,
+) -> Result<std::sync::mpsc::Sender<()>, &'static str> {
+    let (at_the_take, release) = world
+        .service
+        .stall_a_connection_after_its_attachments_are_taken();
+    drop(window);
+    if ends_by(deadline, async move { at_the_take.await.is_ok() }).await != Some(true) {
+        return Err("a window's connection never reached the end of its take");
+    }
+    Ok(release)
+}
+
+/// Whether, by `deadline`, a statement has either waited for a detach that is pending or been
+/// acknowledged.
+async fn waits_or_is_answered(
+    world: &Arc<World>,
+    acknowledged: &Arc<std::sync::atomic::AtomicBool>,
+    deadline: std::time::Instant,
+) -> bool {
+    let waiting = Arc::clone(&world.service);
+    let answered = Arc::clone(acknowledged);
+    holds_by(deadline, move || {
+        waiting.detach_waits_for_tests() > 0 || is_set(&answered)
+    })
+    .await
+}
+
+/// Asks to attach a terminal in `window` and gives what the worker answered.
+async fn try_to_attach(
+    world: &World,
+    window: &mut Client<impl Codec>,
+) -> Result<(), ProtocolError> {
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    window
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            world.target(),
+            &SessionAttachParams {
+                session_id: world.session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .map(|_| ())
+}
+
+/// What the session held when a statement was acknowledged while the detach of a window's end that
+/// came after the statement had looked was still to be made.
+struct LaterEnd {
+    answered_before_the_first_detach: bool,
+    at_the_answer: Held,
+    second: AttachmentId,
+}
+
+/// Two windows that hold an attachment each, the end of the first stopped before its detach, a
+/// statement that waits for that detach, and then the end of the second, stopped before its detach
+/// too. The first detach is made: the statement must be acknowledged then, with the second end's
+/// detach still to be made, since the second end began after the statement had looked.
+///
+/// Under a count of every running detach the acknowledgement does not come while ends of
+/// connections go on; the wait for it is the case's own bound.
+async fn a_statement_meets_the_end_of_a_connection_that_comes_after_it()
+-> Result<LaterEnd, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let mut first_window = world.window().await;
+    let _first = world.attach(&mut first_window).await;
+    let mut second_window = world.window().await;
+    let second = world.attach(&mut second_window).await;
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    let release_first = end_a_window_at_its_take(&world, first_window, deadline).await?;
+    let (acknowledged, daemon_end) = start_the_statement(daemon, open(2));
+    if !waits_or_is_answered(&world, &acknowledged, deadline).await {
+        let _ = release_first.send(());
+        return Err("the statement neither waited for the first end's detach nor was acknowledged");
+    }
+    let answered_before_the_first_detach = is_set(&acknowledged);
+
+    let release_second = match end_a_window_at_its_take(&world, second_window, deadline).await {
+        Ok(release) => release,
+        Err(step) => {
+            let _ = release_first.send(());
+            return Err(step);
+        }
+    };
+    let _ = release_first.send(());
+    if received_by(deadline, daemon_end).await.is_none() {
+        let _ = release_second.send(());
+        return Err(
+            "the statement was never acknowledged while the detach of a later end was still to be made",
+        );
+    }
+    let reader = Arc::clone(&world);
+    let at_the_answer = tokio::task::spawn_blocking(move || held(&reader))
+        .await
+        .expect("the session is read");
+    let _ = release_second.send(());
+    let nothing = Arc::clone(&world);
+    if !holds_by(deadline, move || nothing.holds_nothing()).await {
+        return Err("the second end never detached its attachment");
+    }
+    world.close();
+    Ok(LaterEnd {
+        answered_before_the_first_detach,
+        at_the_answer,
+        second,
+    })
+}
+
+/// KR-REQ-17.54: a statement is acknowledged when the detaches that were pending when it looked
+/// are made, however many connections end after that.
+///
+/// The statement answers for what the earlier statement left. A window that ends after the
+/// statement has looked made its attachment under the statement that is in force, and the statement
+/// that follows is the one to wait for it.
+#[test]
+fn a_statement_is_acknowledged_while_the_detach_of_a_connection_that_ended_after_it_is_pending() {
+    let landed = on_a_runtime(a_statement_meets_the_end_of_a_connection_that_comes_after_it())
+        .expect("the schedule came about");
+    assert!(
+        !landed.answered_before_the_first_detach,
+        "the statement was acknowledged while the first end's detach was pending"
+    );
+    assert_eq!(
+        landed.at_the_answer.attachments,
+        vec![landed.second],
+        "the statement was acknowledged with the first window's attachment in the session, or without the second's: {:?}",
+        landed.at_the_answer
+    );
+}
+
+/// What came of an `Open` statement under ends of connections and of the `Closed` statement that
+/// follows it.
+struct OpenThenClosed {
+    closed_answered_with_a_detach_pending: bool,
+    attach_after_the_closed: Result<(), ProtocolError>,
+    nothing_held_at_the_end: bool,
+}
+
+/// The order of a worker that reconnects to its daemon while windows attach and end. The end of
+/// the first window is stopped before its detach, the daemon's `Open` statement waits for it, and
+/// the end of the second window comes after. When the `Open` statement is acknowledged the daemon
+/// tells `Closed`: the gate must change at once, a third window's attach is refused, and the
+/// statement is acknowledged when the second end's detach, which it waits for, is made.
+async fn an_open_statement_under_churn_and_the_closed_that_follows()
+-> Result<OpenThenClosed, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let mut first_window = world.window().await;
+    let _first = world.attach(&mut first_window).await;
+    let mut second_window = world.window().await;
+    let _second = world.attach(&mut second_window).await;
+    let third_window = world.window().await;
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    let release_first = end_a_window_at_its_take(&world, first_window, deadline).await?;
+    let (acknowledged, daemon_end) = start_the_statement(daemon, open(2));
+    if !waits_or_is_answered(&world, &acknowledged, deadline).await {
+        let _ = release_first.send(());
+        return Err(
+            "the Open statement neither waited for the first end's detach nor was acknowledged",
+        );
+    }
+    let release_second = match end_a_window_at_its_take(&world, second_window, deadline).await {
+        Ok(release) => release,
+        Err(step) => {
+            let _ = release_first.send(());
+            return Err(step);
+        }
+    };
+    let _ = release_first.send(());
+    let Some(daemon) = received_by(deadline, daemon_end).await else {
+        let _ = release_second.send(());
+        return Err(
+            "the Open statement was never acknowledged while later ends of connections went on",
+        );
+    };
+
+    // The host's policy has changed to Closed meanwhile: the daemon tells it.
+    let (closed_acknowledged, closed_end) = start_the_statement(daemon, closed(3));
+    let waiting = Arc::clone(&world.service);
+    let answered = Arc::clone(&closed_acknowledged);
+    if !holds_by(deadline, move || {
+        waiting.statements_waiting_for_tests() > 0 || is_set(&answered)
+    })
+    .await
+    {
+        let _ = release_second.send(());
+        return Err(
+            "the Closed statement never reached the worker's gate: it was never acknowledged nor waiting",
+        );
+    }
+    let closed_answered_with_a_detach_pending = is_set(&closed_acknowledged);
+    let attaching = Arc::clone(&world);
+    let attach_after_the_closed = ends_by(deadline, async move {
+        let mut window = third_window;
+        let answer = try_to_attach(&attaching, &mut window).await;
+        drop(window);
+        answer
+    })
+    .await;
+    let _ = release_second.send(());
+    let Some(attach_after_the_closed) = attach_after_the_closed else {
+        return Err("the third window's attach was never answered");
+    };
+    if received_by(deadline, closed_end).await.is_none() {
+        return Err("the Closed statement was never acknowledged");
+    }
+    let nothing = Arc::clone(&world);
+    let nothing_held_at_the_end = holds_by(deadline, move || nothing.holds_nothing()).await;
+    world.close();
+    Ok(OpenThenClosed {
+        closed_answered_with_a_detach_pending,
+        attach_after_the_closed,
+        nothing_held_at_the_end,
+    })
+}
+
+/// KR-REQ-17.54: an `Open` statement is acknowledged while windows end, and the `Closed` statement
+/// that follows reaches the gate and is applied: the local owner cannot hold a restriction away
+/// from the worker by making windows attach and end.
+#[test]
+fn an_open_statement_under_churn_is_acknowledged_and_the_closed_that_follows_is_applied() {
+    let order = on_a_runtime(an_open_statement_under_churn_and_the_closed_that_follows())
+        .expect("the schedule came about");
+    let error = order
+        .attach_after_the_closed
+        .expect_err("a local attach is refused once the Closed statement is applied");
+    assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    assert!(
+        !order.closed_answered_with_a_detach_pending,
+        "the Closed statement was acknowledged while the detach of the second window's end was pending"
+    );
+    assert!(
+        order.nothing_held_at_the_end,
+        "the session holds an attachment or a lease after the Closed statement was acknowledged"
+    );
+}
+
+/// What the session held when a statement was acknowledged by the service's own pass, and how many
+/// detaches that pass made.
+struct OwedAndLater {
+    at_the_answer: Held,
+    second: AttachmentId,
+    settled_by_the_service: u64,
+}
+
+/// Two windows that hold an attachment each; the session is held, so the end of the first owes its
+/// detach to the service, whose pass waits for the session. A statement waits for that owed detach,
+/// and the end of the second window, stopped before its detach, comes after it. The session is
+/// let go: the pass makes the owed detach and the statement must be acknowledged then, with the
+/// second end's detach still to be made.
+async fn a_statement_meets_a_detach_that_a_connections_end_owed()
+-> Result<OwedAndLater, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let mut first_window = world.window().await;
+    let _first = world.attach(&mut first_window).await;
+    let mut second_window = world.window().await;
+    let second = world.attach(&mut second_window).await;
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    let (session_held, session_held_end) = std::sync::mpsc::channel();
+    let (release_session, go) = std::sync::mpsc::channel::<()>();
+    let holder = Arc::clone(&world);
+    std::thread::spawn(move || {
+        let _session = holder.runtime.session();
+        let _ = session_held.send(());
+        let _ = go.recv();
+    });
+    if received_by(deadline, session_held_end).await.is_none() {
+        return Err("the session was never held");
+    }
+
+    drop(first_window);
+    let ended = Arc::clone(&world);
+    if !holds_by(deadline, move || {
+        ended.service.connections_held_for_tests() == 2
+    })
+    .await
+    {
+        let _ = release_session.send(());
+        return Err("the first window's connection never ended");
+    }
+    let (acknowledged, daemon_end) = start_the_statement(daemon, open(2));
+    if !waits_or_is_answered(&world, &acknowledged, deadline).await {
+        let _ = release_session.send(());
+        return Err("the statement neither waited for the owed detach nor was acknowledged");
+    }
+    let release_second = match end_a_window_at_its_take(&world, second_window, deadline).await {
+        Ok(release) => release,
+        Err(step) => {
+            let _ = release_session.send(());
+            return Err(step);
+        }
+    };
+    let _ = release_session.send(());
+    if received_by(deadline, daemon_end).await.is_none() {
+        let _ = release_second.send(());
+        return Err(
+            "the statement was never acknowledged after the owed detach was made while the detach of a later end was still to be made",
+        );
+    }
+    let reader = Arc::clone(&world);
+    let at_the_answer = tokio::task::spawn_blocking(move || held(&reader))
+        .await
+        .expect("the session is read");
+    let settled_by_the_service = world.service.owed_done_for_tests().1;
+    let _ = release_second.send(());
+    let nothing = Arc::clone(&world);
+    if !holds_by(deadline, move || nothing.holds_nothing()).await {
+        return Err("the second end never detached its attachment");
+    }
+    world.close();
+    Ok(OwedAndLater {
+        at_the_answer,
+        second,
+        settled_by_the_service,
+    })
+}
+
+/// KR-REQ-17.54: the ticket of a detach that the end of a connection owed to the service is
+/// completed by the service's own pass, and the statement that waited for it is acknowledged then,
+/// whatever other connections have ended since.
+#[test]
+fn a_statement_is_acknowledged_when_the_service_makes_the_detach_that_a_connections_end_owed() {
+    let landed = on_a_runtime(a_statement_meets_a_detach_that_a_connections_end_owed())
+        .expect("the schedule came about");
+    assert_eq!(
+        landed.settled_by_the_service, 1,
+        "the service's own pass did not make the owed detach"
+    );
+    assert_eq!(
+        landed.at_the_answer.attachments,
+        vec![landed.second],
+        "the statement was acknowledged with the first window's attachment in the session, or without the second's: {:?}",
+        landed.at_the_answer
+    );
+}
