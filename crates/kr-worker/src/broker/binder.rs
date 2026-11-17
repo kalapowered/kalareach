@@ -34,6 +34,7 @@
 //! meanwhile: no decision reads a binding row back.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_plugin_sdk::matching::{Candidate, Resolution};
@@ -918,12 +919,30 @@ impl BrokerState {
         self.forget(closing, now);
     }
 
-    /// Returns true while a request one binding admitted is still open: a resource its decoder
-    /// interpreted that is not settled.
+    /// Returns true while work one binding admitted is still open: a resource its decoder
+    /// interpreted that is not settled, or a plugin action that nothing has sent or given up yet.
+    ///
+    /// An approval is counted by its resource alone, and an action by its permit alone, so
+    /// nothing is counted twice. The action is counted because its repeat asks the binding's
+    /// grants, and a binding that closed in between has none.
     fn admitted_open(&self, binding_id: BrokerBindingId) -> bool {
         self.arbitration.iter().any(|pending| {
             pending.decoder == Some(binding_id) && !pending.resource.state.is_terminal()
-        })
+        }) || self
+            .open_actions
+            .get(&binding_id)
+            .is_some_and(|open| open.load(std::sync::atomic::Ordering::SeqCst) > 0)
+    }
+
+    /// Counts one plugin action of one binding as open work, from the token's spend until the
+    /// permit it is held in is dropped.
+    pub(super) fn count_open_action(
+        &mut self,
+        binding_id: BrokerBindingId,
+    ) -> crate::broker::methods::OpenAction {
+        crate::broker::methods::OpenAction::counted_in(Arc::clone(
+            self.open_actions.entry(binding_id).or_default(),
+        ))
     }
 
     /// Binds each registered instance that has no binding to the admitted package that now
@@ -978,6 +997,7 @@ impl BrokerState {
             if let Some(binding) = self.bindings.remove(&binding_id) {
                 #[cfg(feature = "testing")]
                 crate::plugin_link_trace::forgot(binding_id, binding.application_instance_id);
+                self.open_actions.remove(&binding_id);
                 self.owed_rows.insert(binding_id);
                 self.revoked_settled(&binding.plugin_id, binding_id);
                 self.component_states.remove(&binding_id);
