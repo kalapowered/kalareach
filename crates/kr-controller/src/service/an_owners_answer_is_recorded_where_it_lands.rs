@@ -110,10 +110,10 @@ fn is_the_closed_refusal(refusal: &ControllerError) -> bool {
 }
 
 struct Parts {
-    temp: kr_ipc::testing::TempHost,
     controller: Arc<Controller>,
     continuous: kr_transport::clock::ManualClock,
     presenter: Option<Presenter>,
+    temp: kr_ipc::testing::TempHost,
 }
 
 async fn parts(world: World) -> Parts {

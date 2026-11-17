@@ -107,7 +107,6 @@ fn told(list: &[PendingConfirmation]) -> ControlFrame {
 /// connection's two ends, the answer and the standing the writer is handed, and the two lists that
 /// could be written.
 struct Staged {
-    _temp: kr_ipc::testing::TempHost,
     controller: Arc<crate::service::Controller>,
     continuous: kr_transport::clock::ManualClock,
     presenter: super::a_result_the_lease_ended_over::Presenter,
@@ -119,6 +118,7 @@ struct Staged {
     under: WrittenUnder,
     full: ControlFrame,
     closed: ControlFrame,
+    _temp: kr_ipc::testing::TempHost,
 }
 
 /// Reads the list through the door and makes the standing the writer is handed.
