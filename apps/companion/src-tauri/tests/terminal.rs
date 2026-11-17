@@ -6712,6 +6712,13 @@ async fn a_launch_waiting_for_its_barrier_when_the_lane_ends_is_not_started_at_o
         told["message"],
         "The launch was not started: the session had not accepted all the typing before it."
     );
+    // The end of the stream also ended control, so the view gives the lease back: that release is
+    // the one call on the wire, and no launch follows it.
+    let release = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the lease was given back within the bound");
+    assert_eq!(release.method, Method::InputRelease.to_string());
     assert!(
         link.call_within(QUIET).await.is_none(),
         "no launch is on the wire"
