@@ -371,3 +371,31 @@ fn a_broker_take_planted_in_the_decisions_check_is_reported() {
         "service.rs check_decision_reached calls require_rich_work, which several functions of the crate declare",
     );
 }
+
+#[test]
+fn the_barrier_dropped_on_the_prepared_path_is_reported() {
+    // The prepared path takes the barrier and the session before the pass, as the first admission
+    // does; a barrier let go first would leave the pass asking under the session alone.
+    let found = planted(
+        SERVICE,
+        "        holding.held();\n        self.dispatch_accepted(\n            holding,\n            session,\n            state,\n            mutation,\n            method,\n            caller,\n            pending.deadline,",
+        "        holding.held();\n        drop(_barrier);\n        self.dispatch_accepted(\n            holding,\n            session,\n            state,\n            mutation,\n            method,\n            caller,\n            pending.deadline,",
+    );
+    only_finding(
+        &found,
+        "service.rs continue_prepared calls dispatch_accepted holding {\"SES\"} and its held row says {\"BAR\", \"SES\"}",
+    );
+}
+
+#[test]
+fn a_new_caller_of_the_dispatch_of_an_accepted_action_is_reported() {
+    let found = planted(
+        SERVICE,
+        "    fn dispatch_accepted(",
+        "    fn rogue(&self) {\n        let _ = self.dispatch_accepted();\n    }\n\n    fn dispatch_accepted(",
+    );
+    only_finding(
+        &found,
+        "service.rs rogue calls dispatch_accepted 1 time(s) and no row lists the caller",
+    );
+}
