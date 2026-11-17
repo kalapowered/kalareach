@@ -743,6 +743,23 @@ pub struct WorkerService {
     evidence_forgotten: Mutex<std::collections::BTreeSet<u64>>,
 }
 
+#[cfg(feature = "testing")]
+impl DispatchBoundary {
+    /// Waits at the pause between the unlock and the wake, where one is armed. Compiled away in
+    /// every shipped build.
+    fn wait_after_the_unlock(&self) {
+        let armed = self
+            .pause_after_unlock
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+}
+
 /// What clean-ups of connections whose peers have gone owe to the service.
 ///
 /// A connection whose peer has gone does what it can at once and gives its place in the worker's
@@ -1745,6 +1762,31 @@ impl WorkerService {
     pub fn hold_the_dispatch_boundary(&self) -> DispatchGuard<'_> {
         self.take_boundary()
             .expect("the dispatch barrier is not poisoned")
+    }
+
+    /// Stops the next release of the dispatch boundary between its unlock and its wake of the
+    /// requests that wait for it, for this host's own tests.
+    ///
+    /// Returns the end that says the release has reached the pause, with the boundary unlocked and
+    /// nothing woken, and the end that lets it go on to the wake. The pause fires once, for the
+    /// first release that reaches it, and holds the thread that drops the guard: a case drops the
+    /// guard it holds on a thread of its own, and does not wait for that thread on a thread of the
+    /// runtime.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_the_boundary_is_unlocked(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .dispatch
+            .pause_after_unlock
+            .lock()
+            .expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
     }
 
     /// Runs the fence this worker owes for a revision whose announcement it refused, as its own

@@ -86,6 +86,16 @@ pub(super) struct DispatchBoundary {
     /// thread compares it with a number that only that thread's own earlier store can equal, so
     /// relaxed loads and stores are enough; the mutex orders the holders.
     holder: AtomicU64,
+    /// A pause between the unlock and the wake of the next release, which this host's own tests
+    /// arm. It is compiled away in every shipped build, and the service's file holds the function
+    /// that waits at it, so that this file holds the takes of the boundary's own mutex and no other.
+    #[cfg(feature = "testing")]
+    pub(super) pause_after_unlock: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 impl DispatchBoundary {
@@ -94,6 +104,8 @@ impl DispatchBoundary {
             lock: Mutex::new(()),
             released: tokio::sync::Notify::new(),
             holder: AtomicU64::new(0),
+            #[cfg(feature = "testing")]
+            pause_after_unlock: Mutex::new(None),
         }
     }
 
@@ -179,6 +191,8 @@ impl Drop for DispatchGuard<'_> {
         self.boundary.holder.store(0, Ordering::Relaxed);
         // The lock goes next, so that a woken presentation finds it free.
         drop(self.guard.take());
+        #[cfg(feature = "testing")]
+        self.boundary.wait_after_the_unlock();
         self.boundary.released.notify_waiters();
     }
 }
