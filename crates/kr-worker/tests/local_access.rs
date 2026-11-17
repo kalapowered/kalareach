@@ -2328,3 +2328,98 @@ async fn a_hold_of_the_dispatch_boundary_is_counted_before_the_next_holder_has_t
     );
     world.close();
 }
+
+/// What the meeting of a statement's answer and a writer's withdrawal that has taken its
+/// registration out of the registry came to.
+struct InTheGap {
+    /// The statement was acknowledged while that withdrawal had not detached anything.
+    answered_while_undetached: bool,
+    /// How many times the answer found a detach pending and waited for it.
+    waits: usize,
+    when_complete: Held,
+}
+
+/// A window with a live stream and an attachment, a statement that takes access away and is
+/// stopped once its hold has ended and before it sweeps, and the writer's withdrawal of the
+/// window, which is stopped right after it took the window out of the registry.
+///
+/// The statement is let go there: its sweep finds no registration, and what it may answer is
+/// decided by whether the withdrawal that is under way is counted. Returns whether it answered
+/// at once, and what the session held when the withdrawal was let go and the statement answered.
+async fn a_statement_meets_a_withdrawal_that_has_left_the_registry()
+-> Result<InTheGap, &'static str> {
+    let world = Arc::new(world("while true; do printf 'line\\n'; sleep 0.1; done", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    let attachment = world.attach(&mut window).await;
+    world.subscribe(&mut window, attachment).await;
+    let (at_the_hold, go_statement) = world.service.stall_a_statement_after_its_hold();
+    let (at_the_gap, go_gap) = world.service.stall_a_withdrawal_after_its_remove();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+
+    let (acknowledged, daemon_end) = start_the_statement(daemon, closed(2));
+    if ends_by(deadline, async move { at_the_hold.await.is_ok() }).await != Some(true) {
+        return Err("the statement never reached the end of its wait");
+    }
+    if ends_by(deadline, async move { at_the_gap.await.is_ok() }).await != Some(true) {
+        return Err("the writer's withdrawal never reached the registry's remove");
+    }
+
+    // The statement sweeps now: the registry holds no window, and a withdrawal is under way.
+    let _ = go_statement.send(());
+    let waiting = Arc::clone(&world.service);
+    let answered = Arc::clone(&acknowledged);
+    if !holds_by(deadline, move || {
+        waiting.detach_waits_for_tests() > 0 || is_set(&answered)
+    })
+    .await
+    {
+        return Err("the statement neither waited for the withdrawal nor was acknowledged");
+    }
+    let answered_while_undetached = is_set(&acknowledged);
+    let waits = world.service.detach_waits_for_tests();
+
+    let _ = go_gap.send(());
+    if received_by(deadline, daemon_end).await.is_none() {
+        return Err("the statement was never acknowledged");
+    }
+    let reader = Arc::clone(&world);
+    let when_complete = tokio::task::spawn_blocking(move || held(&reader))
+        .await
+        .expect("the session is read");
+    drop(window);
+    world.close();
+    Ok(InTheGap {
+        answered_while_undetached,
+        waits,
+        when_complete,
+    })
+}
+
+/// KR-REQ-17.54: a statement is not acknowledged while a withdrawal that its own sweep cannot see
+/// is under way.
+///
+/// The writer's withdrawal has taken the window out of the registry and has not detached its
+/// attachment. The statement's sweep finds no registration; the withdrawal is counted from before
+/// the registry's remove, so the answer waits for it.
+#[test]
+fn a_statement_is_not_acknowledged_while_a_withdrawal_it_cannot_sweep_is_under_way() {
+    let meeting = on_a_runtime(a_statement_meets_a_withdrawal_that_has_left_the_registry())
+        .expect("the schedule came about");
+    assert!(
+        !meeting.answered_while_undetached,
+        "the statement was acknowledged while a withdrawal had taken the window out of the \
+         registry and detached nothing"
+    );
+    assert!(
+        meeting.waits > 0,
+        "the statement did not wait for the withdrawal: {}",
+        meeting.waits
+    );
+    assert!(
+        meeting.when_complete.attachments.is_empty(),
+        "the statement was acknowledged while the attachment was in the session: {:?}",
+        meeting.when_complete
+    );
+}
