@@ -146,6 +146,17 @@ pub enum ControllerError {
         /// What is wrong with the clock.
         detail: String,
     },
+    /// This host could not take a reading of its clocks that it may decide from.
+    ///
+    /// The two readings of the continuous clock that bracket a reading of the others were too far
+    /// apart in each of three tries, so a pause could lie between the pair. It finds nothing wrong
+    /// with the clock: it sets no distrust and moves and writes nothing, and a later try takes a
+    /// new reading.
+    #[error("{detail}")]
+    ClockNotRead {
+        /// What happened, and what was and was not changed.
+        detail: String,
+    },
     /// A subject this daemon forwarded to refused the request, in its own words.
     ///
     /// The code is the subject's. A worker that refuses a reused action identifier with
@@ -360,6 +371,7 @@ impl ControllerError {
             Self::Supervision { .. }
             | Self::WorkInAnotherSession { .. }
             | Self::ResourceShort { .. }
+            | Self::ClockNotRead { .. }
             | Self::ConnectionsInUse => ErrorCode::ResourceUnavailable,
             Self::RendezvousRefused { .. } | Self::Verification(_) | Self::WindowExpired { .. } => {
                 ErrorCode::PermissionDenied
