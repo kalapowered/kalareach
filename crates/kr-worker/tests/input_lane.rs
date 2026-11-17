@@ -319,7 +319,6 @@ fn refusal(outcome: &Outcome) -> Option<ErrorCode> {
 /// A worker with a session whose application keeps what it receives, the control daemon's proxy
 /// link to it, and the identities that the daemon speaks for.
 struct Rig {
-    _temp: kr_ipc::testing::TempHost,
     _kept: tempfile::TempDir,
     received: std::path::PathBuf,
     /// The pipe that an application which waits to read its terminal is let go through.
@@ -335,6 +334,8 @@ struct Rig {
     proxy_connection: ConnectionId,
     grant: GrantId,
     device: DeviceId,
+    /// The runtime directory, declared last so that it is removed after the files in it are closed.
+    _temp: kr_ipc::testing::TempHost,
 }
 
 impl Rig {

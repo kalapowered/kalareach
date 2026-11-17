@@ -3973,11 +3973,12 @@ async fn a_forwarded_batch_made_of_two_writes_is_dropped_by_the_tighter_deadline
 /// whose lease holder is about to hand over the batch that closes it under an authority that runs
 /// out.
 struct PasteLeftOpen {
-    _host: kr_ipc::testing::TempHost,
     runtime: Arc<SessionRuntime>,
     clock: kr_ipc::clock::ManualSharedClock,
     id: AttachmentId,
     epoch: u64,
+    /// The runtime directory, declared last so that it is removed after the files in it are closed.
+    _host: kr_ipc::testing::TempHost,
 }
 
 impl PasteLeftOpen {
