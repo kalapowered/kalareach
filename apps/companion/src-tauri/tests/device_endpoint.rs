@@ -15,8 +15,11 @@ mod support;
 
 use std::sync::Arc;
 
+use companion_platform::notify::{Permission, PreviewKeys};
+use companion_platform::push::PendingRegistration;
 use companion_tauri::AppState;
 use companion_tauri::inbox::{HostInbox, InboxDesk};
+use companion_tauri::push::{HostLine, Native, PushDesk, PushFuture, Reach, Registrar, Wiring};
 use companion_tauri::settings::Hosts as _;
 use companion_tauri::settings::connected::ConnectedHosts;
 use kr_client::pairing::BoxFuture;
@@ -24,7 +27,7 @@ use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
 use kr_client::pairing::paired::PairedHost;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretStore, store_device_keys};
-use kr_protocol::ids::{DeviceId, SessionId};
+use kr_protocol::ids::{ActionId, DeviceId, SessionId};
 use kr_protocol::invitation::InviteGrantKind;
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -627,9 +630,11 @@ fn visit_started(
 /// evidence, for it enters the map only when the host is introduced.
 ///
 /// (a) The forget returns before the visit's dial reaches the endpoint: the dial is refused and does
-/// not even reach the introduction. (b) The forget lands after the dial's first look at its pairing
-/// and before it introduces the host: the second look takes the host out again. (c) The forget lands
-/// after the dial reached the endpoint: the forget takes the host out.
+/// not even reach the introduction. (b) The forget begins while the dial is held between its decision
+/// and its introduction: the forget waits for the introduction and then takes the host out. (c) The
+/// forget lands after the dial reached the endpoint and before its connection is made: the forget
+/// takes the host out, and the connection that is made afterwards puts nothing back, for it is made
+/// with the endpoint the dial was given and asks the pool for nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     const SHARED: &str = "https://127.0.0.1:11";
@@ -691,8 +696,10 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
         "the forgotten host's own relay was not put back"
     );
 
-    // (b) The visit's dial is let through to the endpoint and held between its first look and the
-    // introduction, the person forgets the host, and the dial goes on.
+    // (b) The visit's dial is let through to the endpoint and held between its decision and the
+    // introduction, and the person forgets the host while it is held. The forget waits for the
+    // introduction, so the dial is let go when the link is told to forget, and the forget then takes
+    // the host out.
     pair(&phone, &second, &owner, &[ActionRight::SessionView]).await;
     let at_the_introduction =
         Arc::new(control.hold_next_introduce_of(&record_of(&device, &second).host_endpoint_id));
@@ -710,9 +717,11 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
         move || at_the_introduction.is_reached()
     })
     .await;
+    control.at_the_forget({
+        let at_the_introduction = Arc::clone(&at_the_introduction);
+        move || at_the_introduction.release()
+    });
     forget(&second);
-    assert_eq!(control.relay_urls().await, relays(&[SHARED]));
-    at_the_introduction.release();
     let found = visit.await.expect("the visit ran");
     assert!(
         found.is_empty(),
@@ -721,7 +730,7 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     assert_eq!(
         control.relay_urls().await,
         relays(&[SHARED]),
-        "the dial's second look took the host out again"
+        "the forget took out the host that the dial introduced while it waited"
     );
 
     // (c) The visit's connection is held after the endpoint took its host in, the person forgets the
@@ -783,5 +792,145 @@ async fn a_visit_that_began_before_the_forget_does_not_put_the_host_back() {
     assert!(
         control.dial_as(&old).await.is_err(),
         "the dial of the forgotten pairing is refused"
+    );
+}
+
+/// A push desk's registrar that remembers which hosts it was told to forget.
+#[derive(Default)]
+struct Registrations {
+    forgotten: std::sync::Mutex<Vec<DeviceId>>,
+}
+
+impl Registrar for Registrations {
+    fn connect<'a>(
+        &'a self,
+        _host: &'a PairedHost,
+        _reach: Reach,
+    ) -> PushFuture<'a, Box<dyn HostLine + 'a>> {
+        Box::pin(async { Err("this case registers nothing".to_owned()) })
+    }
+
+    fn can_ask(&self, _host: DeviceId, _action: ActionId) -> bool {
+        false
+    }
+
+    fn forgotten(&self, host: DeviceId) {
+        self.forgotten.lock().expect("the record").push(host);
+    }
+}
+
+/// A platform that gives the desk no notifications: the case runs no registration.
+struct NoNotifications;
+
+impl Native for NoNotifications {
+    fn permission(&self) -> PushFuture<'_, Permission> {
+        Box::pin(async { Err("no notifications here".to_owned()) })
+    }
+
+    fn ask_permission(&self) -> PushFuture<'_, Permission> {
+        Box::pin(async { Err("no notifications here".to_owned()) })
+    }
+
+    fn token(&self) -> PushFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn pending_set<'a>(&'a self, _record: &'a PendingRegistration) -> PushFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn pending_get(&self) -> PushFuture<'_, Option<PendingRegistration>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn preview_keys<'a>(&'a self, _keys: &'a PreviewKeys) -> PushFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn route(&self) -> PushFuture<'_, Option<String>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+/// The forget command's local cleanup is done when the link is told to forget the host, and the
+/// link's forget, which may wait, comes after it: the push desk's registrar has been told to forget
+/// the host, and the inbox has closed the connection it kept to it. The case reads both at the link's
+/// own forget call, which a command that does its cleanup after the wait would fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_local_cleanup_is_done_when_the_link_is_told_to_forget_the_host() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let kept = host_on(&owner, &["https://127.0.0.1:11"], FIRST_RESOLVER).await;
+    let visited = host_on(&owner, &["https://127.0.0.1:12"], SECOND_RESOLVER).await;
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&kept, &control);
+    let companion = &phone.companion;
+    let device = companion.device();
+    pair(&phone, &kept, &owner, &[ActionRight::SessionView]).await;
+    pair(&phone, &visited, &owner, &[ActionRight::SessionView]).await;
+    let used = companion
+        .call(
+            "hosts_use",
+            json!({ "reference": reference_for(companion, &kept) }),
+        )
+        .expect("the kept host is chosen");
+    assert_eq!(used["connected"], true, "{used}");
+
+    // The desk remembers what its registrar is told, and the inbox keeps a connection to the host
+    // that is not in use after it has visited it.
+    let registrations = Arc::new(Registrations::default());
+    let data = tempfile::tempdir().expect("a directory");
+    let state = companion.app.state::<AppState>();
+    state.push_opened(PushDesk::open(
+        data.path(),
+        Arc::clone(&device),
+        Arc::new(NoNotifications),
+        Arc::clone(&registrations) as Arc<dyn Registrar>,
+        Wiring::product().expect("the product's wiring"),
+        |_| {},
+    ));
+    state.inbox().visit(&device).await;
+    let record = record_of(&device, &visited);
+    assert!(
+        registrations
+            .forgotten
+            .lock()
+            .expect("the record")
+            .is_empty(),
+        "the control: nothing was forgotten before the command"
+    );
+
+    let (closed_before, seen) = (
+        control.closed(),
+        Arc::new(std::sync::Mutex::new(Vec::new())),
+    );
+    control.at_the_forget({
+        let (control, registrations, seen) = (
+            Arc::clone(&control),
+            Arc::clone(&registrations),
+            Arc::clone(&seen),
+        );
+        let host = record.host_device_id;
+        move || {
+            seen.lock().expect("the record").push((
+                registrations
+                    .forgotten
+                    .lock()
+                    .expect("the record")
+                    .contains(&host),
+                control.closed() > closed_before,
+            ));
+        }
+    });
+    companion
+        .call(
+            "hosts_forget",
+            json!({ "reference": reference_for(companion, &visited) }),
+        )
+        .expect("the host is forgotten");
+
+    assert_eq!(
+        *seen.lock().expect("the record"),
+        vec![(true, true)],
+        "at the link's forget call the push desk was told and the inbox had closed its connection"
     );
 }

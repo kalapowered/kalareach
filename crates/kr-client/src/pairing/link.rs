@@ -20,15 +20,17 @@
 //! A host the person forgets is taken out of the endpoint ([`HostLink::forget_host`]): its lookups
 //! are no longer asked and the relays that no other host names leave the map. A connection that
 //! is open stays open until whoever holds it closes it. The pool marks the forgotten pairing by the
-//! identity its host gave the device, and refuses a dial under that pairing, so a visit that began
-//! before the forget does not put the host back whenever it reaches the endpoint. A new pairing
-//! with the same host has an identity of its own and is not refused.
+//! identity its host gave the device, and refuses a dial under that pairing. A host's introduction
+//! and its removal never overlap, because each holds the host's own lock, so no dial that began
+//! before the forget puts the host back, however its caller ends. A new pairing with the same host
+//! has an identity of its own and is not refused, and the host stays in the endpoint until the last
+//! pairing that introduced it has been forgotten.
 //!
 //! [`HostLink`] is the whole of what the pairing flows ask of the network, so a test can put a
 //! dialler that reaches another host, or a layer that alters an answer, in its place. [`IrohLink`]
 //! is the product's.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -399,7 +401,54 @@ pub enum Standing {
     Paired(DeviceId),
 }
 
+/// An endpoint of the pool, with what the pool knows of the hosts that were introduced to it.
+struct Bound {
+    endpoint: DeviceEndpoint,
+    /// For each host introduced to this endpoint by a pairing, the pairings that introduced it and
+    /// have not been forgotten. It describes this endpoint and no other, so a close takes it along,
+    /// and the endpoint that the next request binds starts with none. Only a path that holds the
+    /// host's own lock reads or changes a host's set; the mutex is never held across an await.
+    introduced: std::sync::Mutex<BTreeMap<EndpointKey, BTreeSet<DeviceId>>>,
+}
+
+impl Bound {
+    fn introduced(&self) -> std::sync::MutexGuard<'_, BTreeMap<EndpointKey, BTreeSet<DeviceId>>> {
+        self.introduced
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records that `pairing` introduced `host`.
+    fn introduced_by(&self, host: &EndpointKey, pairing: DeviceId) {
+        self.introduced().entry(*host).or_default().insert(pairing);
+    }
+
+    /// Records that `pairing` has left `host`, and says whether no pairing is left that introduced
+    /// it, so that the host's entry goes.
+    fn left_by(&self, host: &EndpointKey, pairing: DeviceId) -> bool {
+        let mut introduced = self.introduced();
+        let Some(pairings) = introduced.get_mut(host) else {
+            return true;
+        };
+        pairings.remove(&pairing);
+        let last = pairings.is_empty();
+        if last {
+            introduced.remove(host);
+        }
+        last
+    }
+}
+
 /// This device's one dialling endpoint, bound at the first request and kept for the run.
+///
+/// Every introduction of a host and every removal of one holds that host's own lock, which a dial
+/// takes before it decides, so the two never overlap: a dial that began before a forget either
+/// finishes its introduction before the forget removes the host, or waits for the forget and then
+/// meets its mark. A caller that stops waiting releases the lock where it stands, and what it
+/// introduced is in the transport's table already, so the forget that follows removes it.
+///
+/// The locks are taken in one order on every path: a host's own lock, then the device lock.
+/// [`Self::close`] and every other path that holds the device lock take no host's lock.
 pub struct EndpointPool {
     transport: TransportIdentityKeyPair,
     bind: Option<SocketAddr>,
@@ -410,13 +459,18 @@ pub struct EndpointPool {
     relay_only: bool,
     /// The endpoint, once one is bound. The lock is held while one binds and while one closes,
     /// and never while a host is introduced or forgotten.
-    device: Mutex<Option<Arc<DeviceEndpoint>>>,
+    device: Mutex<Option<Arc<Bound>>>,
     /// The pairings the person forgot in this run, each by the identity its host gave this device.
     /// The set belongs to the pool, so a close and a new bind leave it as it is. It holds one
     /// identity for each forget of a run and nothing removes one: a new pairing with the same host
-    /// has an identity of its own. The lock is never held across an await.
+    /// has an identity of its own. The mutex is never held across an await.
     forgotten: std::sync::Mutex<BTreeSet<DeviceId>>,
-    /// The hold a test puts on a dial between its first look at the pairing and the introduction.
+    /// The host's own locks, one for each host key that this process dialled or forgot. A lock is
+    /// never replaced or removed: a second lock for one host while a dial holds or awaits the first
+    /// would end the exclusion. The table is as large as the number of host keys that the person
+    /// pairs with or invites in a run, one `Arc` each. The mutex is never held across an await.
+    hosts: std::sync::Mutex<BTreeMap<EndpointKey, Arc<Mutex<()>>>>,
+    /// The hold a test puts on a dial between its decision and the introduction.
     #[cfg(feature = "testing")]
     gate: gate::Gate,
 }
@@ -441,6 +495,7 @@ impl EndpointPool {
             relay_only: false,
             device: Mutex::new(None),
             forgotten: std::sync::Mutex::new(BTreeSet::new()),
+            hosts: std::sync::Mutex::new(BTreeMap::new()),
             #[cfg(feature = "testing")]
             gate: gate::Gate::default(),
         }
@@ -477,11 +532,15 @@ impl EndpointPool {
     /// relays go into the relay map. Asking again for a host that is already there changes
     /// nothing, and a changed configuration for the same identity replaces what it had.
     ///
-    /// A pairing that the person forgot ([`Self::forget`]) is refused, and so is one that is
-    /// forgotten while its host is being introduced: the pool looks at the pairing before it
-    /// introduces the host and again after, and takes the host out again when the second look finds
-    /// the pairing forgotten. A dial that began before the forget therefore never leaves its host in
-    /// the endpoint.
+    /// A pairing that the person forgot ([`Self::forget`]) is refused. The dial takes the host's own
+    /// lock first and looks at the pairing's mark after it holds the lock, so a dial that waited
+    /// behind a forget meets the mark, and one that the forget waits for has finished its
+    /// introduction before the forget removes the host. The lock is held through the introduction
+    /// and no longer: the connection that the caller makes with the endpoint it gets is its own,
+    /// and the pool is not asked again.
+    ///
+    /// A dial of a host that is already introduced, with the same services, holds the host's lock
+    /// across no await but the device lock that [`Self::bound`] takes.
     ///
     /// # Errors
     ///
@@ -503,36 +562,64 @@ impl EndpointPool {
             Standing::Paired(pairing) => Some(pairing),
             Standing::Invited => None,
         };
+        let lock = self.lock_of(host);
+        #[cfg(feature = "testing")]
+        self.gate.pass(host, gate::Point::BeforeTheLock).await;
+        let _held = lock.lock().await;
+        // The decision: made with the lock held, after any forget that held it first.
         if pairing.is_some_and(|pairing| self.is_forgotten(pairing)) {
             return Err(not_established());
         }
         let device = self.bound().await?;
         #[cfg(feature = "testing")]
-        self.gate.pass(host).await;
-        device.introduce(services).await?;
-        // The forget sets its mark before it takes the host out, so a forget that came while the host
-        // was being introduced either took the host out after it, or left a mark that this look finds.
-        if pairing.is_some_and(|pairing| self.is_forgotten(pairing)) {
-            let _ = device.forget(host).await;
-            return Err(not_established());
+        self.gate
+            .pass(host, gate::Point::BeforeTheIntroduction)
+            .await;
+        device.endpoint.introduce(services).await?;
+        if let Some(pairing) = pairing {
+            device.introduced_by(host, pairing);
         }
-        Ok(device.endpoint().clone())
+        Ok(device.endpoint.endpoint().clone())
     }
 
-    /// Takes `host` out of the endpoint: its lookups, and each relay that no other host names.
-    /// Nothing changes for a host the endpoint was never introduced to, or before an endpoint is
-    /// bound. `pairing` is the identity the host gave this device in the pairing the person forgot:
-    /// it is marked first, so that no dial that began under it puts the host back.
+    /// Takes `host` out of the endpoint when `pairing`, the identity the host gave this device in
+    /// the pairing the person forgot, was the last pairing that introduced it: its lookups, and
+    /// each relay that no other host names. A host that another pairing introduced stays. Nothing
+    /// changes for a host the endpoint was never introduced to, or before an endpoint is bound.
+    ///
+    /// The pairing is marked first, so that no dial that begins under it is let through, and then
+    /// the forget takes the host's own lock and removes the host while it holds it. It waits for
+    /// what holds that lock: a dial of the same host, or another forget of it, that is between its
+    /// decision and the end of its introduction. That dial waits for the device lock when a close
+    /// or a first bind holds it, which a forget waits for in any case, and for the transport's
+    /// change of the relay map, which takes the transport's own turn and the library's sends to its
+    /// socket task. Nothing in it waits on the network but the library's own close, which the
+    /// library bounds. A dial of another host and a forget of another host do not wait for it.
     pub async fn forget(&self, host: &EndpointKey, pairing: DeviceId) {
         self.forgotten
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(pairing);
+        let lock = self.lock_of(host);
+        let _held = lock.lock().await;
         let device = self.device.lock().await.clone();
-        if let Some(device) = device {
+        if let Some(device) = device
+            && device.left_by(host, pairing)
+        {
             // A host that is not a public key was never introduced, so it has nothing to leave.
-            let _ = device.forget(host).await;
+            let _ = device.endpoint.forget(host).await;
         }
+    }
+
+    /// The lock of `host`, made at the first request that names it and kept.
+    fn lock_of(&self, host: &EndpointKey) -> Arc<Mutex<()>> {
+        Arc::clone(
+            self.hosts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(*host)
+                .or_default(),
+        )
     }
 
     /// Whether the person forgot the pairing `pairing` in this run.
@@ -546,7 +633,7 @@ impl EndpointPool {
     /// The relays in the endpoint's relay map now: none before the endpoint is bound.
     pub async fn relay_urls(&self) -> BTreeSet<iroh::RelayUrl> {
         match &*self.device.lock().await {
-            Some(device) => device.relay_urls(),
+            Some(device) => device.endpoint.relay_urls(),
             None => BTreeSet::new(),
         }
     }
@@ -556,20 +643,27 @@ impl EndpointPool {
     ///
     /// A caller awaits it to its end. One that drops it part way leaves the endpoint closing, and
     /// the next request binds another beside it.
+    ///
+    /// It takes no host's lock. The pairings that introduced each host belong to the endpoint and
+    /// go with it, so a dial that waited for the device lock through a close binds a new endpoint,
+    /// introduces its host there and records itself there alone.
     pub async fn close(&self) {
         let mut device = self.device.lock().await;
         if let Some(open) = device.take() {
-            open.close().await;
+            open.endpoint.close().await;
         }
     }
 
     /// The open endpoint, bound now if there is none.
-    async fn bound(&self) -> Result<Arc<DeviceEndpoint>, LinkError> {
+    async fn bound(&self) -> Result<Arc<Bound>, LinkError> {
         let mut device = self.device.lock().await;
         if let Some(open) = &*device {
             return Ok(Arc::clone(open));
         }
-        let open = Arc::new(DeviceEndpoint::bind(&self.config()?, &self.transport).await?);
+        let open = Arc::new(Bound {
+            endpoint: DeviceEndpoint::bind(&self.config()?, &self.transport).await?,
+            introduced: std::sync::Mutex::new(BTreeMap::new()),
+        });
         *device = Some(Arc::clone(&open));
         Ok(open)
     }
@@ -799,9 +893,10 @@ impl Preauth for Unpaired {
     }
 }
 
-/// The hold a test puts on the next dial of a host that has looked at its pairing and is about to
-/// introduce the host to the endpoint, which [`EndpointPool::hold_next_introduce_of`] arms. A test
-/// waits for the dial on a thread of its own, by asking [`Self::is_reached`].
+/// The hold a test puts on the next dial of a host at one of two places, which
+/// [`EndpointPool::hold_next_dial_of`] (before the dial asks for its host's lock) and
+/// [`EndpointPool::hold_next_introduce_of`] (after it decided, before it introduces the host) arm. A
+/// test waits for the dial on a thread of its own, by asking [`Self::is_reached`].
 #[cfg(feature = "testing")]
 pub struct IntroduceHold {
     reached: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -844,13 +939,20 @@ impl IntroduceHold {
 
 #[cfg(feature = "testing")]
 impl EndpointPool {
-    /// Arms a hold on the next dial of `host` that has passed the pool's first look at its pairing
-    /// and is about to introduce the host: it stops there until the hold is released. For the
+    /// Arms a hold on the next dial of `host` that has decided, with its host's lock held, and is
+    /// about to introduce the host: it stops there until the hold is released. For the
     /// cases of this crate and of the companion, as the transport's hold on its map task is for
     /// that crate's.
     #[must_use]
     pub fn hold_next_introduce_of(&self, host: &EndpointKey) -> IntroduceHold {
-        self.gate.arm(*host)
+        self.gate.arm(*host, gate::Point::BeforeTheIntroduction)
+    }
+
+    /// Arms a hold on the next dial of `host`, before it asks for the host's lock and so before it
+    /// decides: it stops there until the hold is released.
+    #[must_use]
+    pub fn hold_next_dial_of(&self, host: &EndpointKey) -> IntroduceHold {
+        self.gate.arm(*host, gate::Point::BeforeTheLock)
     }
 }
 
@@ -863,22 +965,35 @@ mod gate {
 
     use super::IntroduceHold;
 
-    /// The one hold that is armed, if any: the next dial of its host that reaches the gate takes it.
+    /// Where in a dial a hold stands.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Point {
+        /// Before the dial asks for its host's lock.
+        BeforeTheLock,
+        /// After the dial decided, before it introduces the host.
+        BeforeTheIntroduction,
+    }
+
+    /// The one hold that is armed, if any: the next dial of its host that reaches its point takes it.
     #[derive(Default)]
     pub(super) struct Gate(Mutex<Option<Armed>>);
 
     struct Armed {
         host: EndpointKey,
+        point: Point,
         reached: mpsc::Sender<()>,
         release: oneshot::Receiver<()>,
     }
 
     impl Gate {
-        /// Holds the calling dial of `host` if a hold is armed for that host.
-        pub(super) async fn pass(&self, host: &EndpointKey) {
+        /// Holds the calling dial of `host` if a hold is armed for that host at `point`.
+        pub(super) async fn pass(&self, host: &EndpointKey, point: Point) {
             let armed = {
                 let mut armed = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-                if armed.as_ref().is_some_and(|armed| armed.host == *host) {
+                if armed
+                    .as_ref()
+                    .is_some_and(|armed| armed.host == *host && armed.point == point)
+                {
                     armed.take()
                 } else {
                     None
@@ -890,11 +1005,12 @@ mod gate {
             }
         }
 
-        pub(super) fn arm(&self, host: EndpointKey) -> IntroduceHold {
+        pub(super) fn arm(&self, host: EndpointKey, point: Point) -> IntroduceHold {
             let (reached, reaching) = mpsc::channel();
             let (release, releasing) = oneshot::channel();
             *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(Armed {
                 host,
+                point,
                 reached,
                 release: releasing,
             });
@@ -1121,69 +1237,144 @@ mod tests {
         pool.close().await;
     }
 
-    /// A dial that began under a pairing the person forgot is refused, whether it reaches the pool
-    /// after the forget or the forget lands while its host is being introduced, and another pairing
-    /// with the same host is not refused.
-    #[tokio::test]
-    async fn a_forgotten_pairing_puts_its_host_back_in_no_order_and_a_new_pairing_is_reached() {
-        let pool = Arc::new(
+    /// The resolver the cases give a host, where nothing listens: a host that is in the transport's
+    /// table is one whose lookups the registry asks, and the service's error shows it.
+    const RESOLVER: &str = "http://127.0.0.1:9/pkarr";
+
+    fn key() -> EndpointKey {
+        *TransportIdentityKeyPair::generate()
+            .expect("a key")
+            .public()
+    }
+
+    fn loopback_pool() -> Arc<EndpointPool> {
+        Arc::new(
             EndpointPool::new(TransportIdentityKeyPair::generate().expect("a key"))
                 .bound_to(loopback()),
-        );
-        let host = *TransportIdentityKeyPair::generate()
-            .expect("a key")
-            .public();
-        let own = "https://127.0.0.1:10";
-        let config = network(&[own], None, &[]);
+        )
+    }
 
-        // The forget returns before the dial reaches the pool: refused, and nothing enters the map.
-        pool.endpoint(&config, &host, Standing::Paired(pairing(1)))
-            .await
-            .expect("the pairing is reached");
-        pool.forget(&host, pairing(1)).await;
-        assert!(pool.relay_urls().await.is_empty());
-        assert!(
-            pool.endpoint(&config, &host, Standing::Paired(pairing(1)))
-                .await
-                .is_err(),
-            "the forgotten pairing is refused"
-        );
-        assert!(pool.relay_urls().await.is_empty(), "nothing was put back");
-
-        // The forget lands after the dial's first look and before its introduction: the second look
-        // takes the host out again.
-        let hold = Arc::new(pool.hold_next_introduce_of(&host));
-        let dialling = tokio::spawn({
-            let (pool, config) = (Arc::clone(&pool), config.clone());
-            async move {
-                pool.endpoint(&config, &host, Standing::Paired(pairing(2)))
-                    .await
-                    .map(|_| ())
-            }
-        });
-        let waiting = Arc::clone(&hold);
+    /// Waits, on a thread of its own, until `ready` holds. A hold stands on the path that is waited
+    /// on, so the wait is made by a blocking thread and no timer of the runtime.
+    async fn until(what: &'static str, ready: impl Fn() -> bool + Send + 'static) {
         tokio::task::spawn_blocking(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !waiting.is_reached() {
+            while !ready() {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "a dial reached the hold within the bound"
+                    "gave up waiting: {what}"
                 );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         })
         .await
         .expect("the wait ran");
-        pool.forget(&host, pairing(2)).await;
-        hold.release();
+    }
+
+    /// Runs `work` as a task of its own: the task, which a case can abort, and the receiver that
+    /// hears the result once the work returned.
+    fn running<T: Send + 'static>(
+        work: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> (tokio::task::JoinHandle<()>, std::sync::mpsc::Receiver<T>) {
+        let (done, receiver) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            let _ = done.send(work.await);
+        });
+        (task, receiver)
+    }
+
+    /// The result of work started by [`running`], awaited on a blocking thread.
+    async fn heard<T: Send + 'static>(
+        what: &'static str,
+        receiver: std::sync::mpsc::Receiver<T>,
+    ) -> T {
+        tokio::task::spawn_blocking(move || {
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!("gave up waiting: {what}"))
+        })
+        .await
+        .expect("the wait ran")
+    }
+
+    /// A dial of `host` under the pairing `number`, as a task: whether it reached the host.
+    fn dialling(
+        pool: &Arc<EndpointPool>,
+        config: &NetworkConfig,
+        host: EndpointKey,
+        number: u8,
+    ) -> (tokio::task::JoinHandle<()>, std::sync::mpsc::Receiver<bool>) {
+        let (pool, config) = (Arc::clone(pool), config.clone());
+        running(async move {
+            pool.endpoint(&config, &host, Standing::Paired(pairing(number)))
+                .await
+                .is_ok()
+        })
+    }
+
+    /// The forget of the pairing `number` of `host`, as a task.
+    fn forgetting(
+        pool: &Arc<EndpointPool>,
+        host: EndpointKey,
+        number: u8,
+    ) -> (tokio::task::JoinHandle<()>, std::sync::mpsc::Receiver<()>) {
+        let pool = Arc::clone(pool);
+        running(async move { pool.forget(&host, pairing(number)).await })
+    }
+
+    /// The pool's endpoint, which the case knows is bound.
+    async fn the_bound(pool: &EndpointPool) -> Arc<Bound> {
+        pool.device
+            .lock()
+            .await
+            .clone()
+            .expect("the endpoint is bound")
+    }
+
+    /// Whether the transport's table holds `host`: the registry asks its lookups for it, and a
+    /// host that is not in the table gives "no results" and no service's error.
+    async fn table_holds(pool: &EndpointPool, host: &EndpointKey) -> bool {
+        let endpoint = the_bound(pool).await.endpoint.endpoint().clone();
+        !registry_knows_nothing(&registry_yields(&endpoint, host).await)
+    }
+
+    /// A dial under a pairing the person forgot is refused, and nothing that it does puts the host
+    /// back, in the relay map or in the transport's table. Another pairing with the same host has an
+    /// identity of its own and is reached, and the marks outlast a close and a new bind.
+    #[tokio::test]
+    async fn a_forgotten_pairing_is_refused_and_a_new_pairing_with_its_host_is_reached() {
+        let pool = loopback_pool();
+        let host = key();
+        let own = "https://127.0.0.1:10";
+        let config = network(&[own], Some(RESOLVER), &[]);
+
+        pool.endpoint(&config, &host, Standing::Paired(pairing(1)))
+            .await
+            .expect("the pairing is reached");
         assert!(
-            dialling.await.expect("the dial ran").is_err(),
-            "the pairing forgotten meanwhile is refused"
+            table_holds(&pool, &host).await,
+            "the control: the host that was reached is in the table"
+        );
+        pool.forget(&host, pairing(1)).await;
+        assert!(pool.relay_urls().await.is_empty());
+        assert!(!table_holds(&pool, &host).await);
+        assert!(
+            pool.endpoint(&config, &host, Standing::Paired(pairing(1)))
+                .await
+                .is_err(),
+            "the forgotten pairing is refused"
         );
         assert!(
             pool.relay_urls().await.is_empty(),
-            "the second look took the host out again"
+            "the refused dial put nothing in the map"
         );
+        assert!(
+            !table_holds(&pool, &host).await,
+            "the refused dial put nothing in the table"
+        );
+
+        // A pairing that was forgotten before it ever dialled is refused too.
+        pool.forget(&host, pairing(2)).await;
 
         // A new pairing with the same host has an identity of its own and is reached at once.
         pool.endpoint(&config, &host, Standing::Paired(pairing(3)))
@@ -1194,21 +1385,330 @@ mod tests {
             BTreeSet::from([relay(own)]),
             "the new pairing's relay is in the map"
         );
+        assert!(table_holds(&pool, &host).await);
         assert!(
             pool.endpoint(&config, &host, Standing::Paired(pairing(1)))
                 .await
                 .is_err(),
-            "the old pairing stays refused after the close and the new pairing"
+            "the old pairing stays refused beside the new one"
         );
         pool.close().await;
         pool.endpoint(&config, &host, Standing::Paired(pairing(3)))
             .await
             .expect("the new pairing is reached through a new endpoint");
+        for forgotten in [1, 2] {
+            assert!(
+                pool.endpoint(&config, &host, Standing::Paired(pairing(forgotten)))
+                    .await
+                    .is_err(),
+                "the marks outlast a close and a new bind"
+            );
+        }
+        pool.close().await;
+    }
+
+    /// A dial whose caller stops waiting, at each of the three places where it waits, leaves its
+    /// host out of the table and the map once the forget returned, and after the transport's held
+    /// change of the map has run. The third is the order that matters most: the forget begins before
+    /// the dial introduces, and the caller stops after the table took the host in.
+    #[tokio::test]
+    async fn a_dial_that_is_dropped_leaves_its_host_out_once_the_forget_returned() {
+        let pool = loopback_pool();
+        let own = "https://127.0.0.1:10";
+        let config = network(&[own], Some(RESOLVER), &[]);
+
+        // At the endpoint's lock: a dial waits for it with its host's lock in hand, and the drop
+        // releases the host's lock.
+        let first = key();
+        let endpoint_lock = pool.device.lock().await;
+        let (dial, _) = dialling(&pool, &config, first, 1);
+        until("the dial holds its host's lock", {
+            let lock = pool.lock_of(&first);
+            move || lock.try_lock().is_err()
+        })
+        .await;
+        dial.abort();
+        assert!(dial.await.is_err(), "the dial was dropped");
         assert!(
-            pool.endpoint(&config, &host, Standing::Paired(pairing(2)))
-                .await
-                .is_err(),
-            "the marks outlast a close and a new bind"
+            pool.lock_of(&first).try_lock().is_ok(),
+            "the dropped dial let its host's lock go"
+        );
+        drop(endpoint_lock);
+        let (_, forgotten) = forgetting(&pool, first, 1);
+        heard("the forget returns", forgotten).await;
+        assert!(pool.relay_urls().await.is_empty());
+
+        // At the pool's test gate, between its decision and the introduction.
+        let second = key();
+        let gate = Arc::new(pool.hold_next_introduce_of(&second));
+        let (dial, _) = dialling(&pool, &config, second, 2);
+        until("the dial is held at the gate", {
+            let gate = Arc::clone(&gate);
+            move || gate.is_reached()
+        })
+        .await;
+        dial.abort();
+        assert!(dial.await.is_err(), "the dial was dropped");
+        assert!(
+            pool.lock_of(&second).try_lock().is_ok(),
+            "the dropped dial let its host's lock go"
+        );
+        let (_, forgotten) = forgetting(&pool, second, 2);
+        heard("the forget returns", forgotten).await;
+        assert!(pool.relay_urls().await.is_empty());
+        assert!(!table_holds(&pool, &second).await);
+
+        // At the introduction: the forget begins while the dial is held before it, the dial puts
+        // the host into the table and waits for the transport's change of the map, which is held, and
+        // its caller stops.
+        let third = key();
+        let gate = Arc::new(pool.hold_next_introduce_of(&third));
+        let (dial, _) = dialling(&pool, &config, third, 3);
+        until("the dial is held at the gate", {
+            let gate = Arc::clone(&gate);
+            move || gate.is_reached()
+        })
+        .await;
+        let mut map_task = the_bound(&pool).await.endpoint.hold_next_map_task();
+        let (_, forgotten) = forgetting(&pool, third, 3);
+        until("the forget has marked its pairing", {
+            let pool = Arc::clone(&pool);
+            move || pool.is_forgotten(pairing(3))
+        })
+        .await;
+        gate.release();
+        map_task.reached().await;
+        assert!(
+            table_holds(&pool, &third).await,
+            "the control: the dial's introduction put the host in the table"
+        );
+        dial.abort();
+        assert!(dial.await.is_err(), "the dial was dropped");
+        heard("the forget returns once the dropped dial let go", forgotten).await;
+        assert!(
+            !table_holds(&pool, &third).await,
+            "the host is out of the table when the forget returns"
+        );
+        assert!(
+            pool.relay_urls().await.is_empty(),
+            "the host's relay is not in the map when the forget returns"
+        );
+        map_task.release().await;
+        assert!(
+            !table_holds(&pool, &third).await && pool.relay_urls().await.is_empty(),
+            "the held change of the map left the host out"
+        );
+        pool.close().await;
+    }
+
+    /// A forget waits for the introduction of its own host and for nothing else: while a dial of one
+    /// host is held, a dial of another host returns, and so does a forget of another host. A dial that
+    /// began before the forget still returns its endpoint, and the host is out when both have ended.
+    #[tokio::test]
+    async fn a_forget_waits_for_the_introduction_of_its_host_and_no_other_host_waits() {
+        let pool = loopback_pool();
+        let (held_host, other, unknown) = (key(), key(), key());
+        let held_relay = "https://127.0.0.1:10";
+        let other_relay = "https://127.0.0.1:11";
+        let held_config = network(&[held_relay], Some(RESOLVER), &[]);
+        let other_config = network(&[other_relay], Some(RESOLVER), &[]);
+        pool.endpoint(&other_config, &other, Standing::Paired(pairing(5)))
+            .await
+            .expect("the other host is reached and the endpoint is bound");
+
+        let gate = Arc::new(pool.hold_next_introduce_of(&held_host));
+        let (dial, dialled) = dialling(&pool, &held_config, held_host, 1);
+        until("the dial is held at the gate", {
+            let gate = Arc::clone(&gate);
+            move || gate.is_reached()
+        })
+        .await;
+        let (_, forgotten) = forgetting(&pool, held_host, 1);
+        until("the forget has marked its pairing", {
+            let pool = Arc::clone(&pool);
+            move || pool.is_forgotten(pairing(1))
+        })
+        .await;
+
+        // The dial held, and the forget behind it: a dial of another host returns at once, and so
+        // does a forget of a host that was never introduced.
+        let (_, again) = dialling(&pool, &other_config, other, 5);
+        assert!(
+            heard(
+                "a dial of another host returns while the dial is held",
+                again
+            )
+            .await,
+            "the other host is reached"
+        );
+        let (_, unrelated) = forgetting(&pool, unknown, 7);
+        heard(
+            "a forget of another host returns while the dial is held",
+            unrelated,
+        )
+        .await;
+
+        gate.release();
+        assert!(
+            heard("the dial ends", dialled).await,
+            "the dial that began before the forget returns its endpoint"
+        );
+        heard("the forget returns after the introduction ended", forgotten).await;
+        dial.await.expect("the dial ran");
+        assert!(
+            !table_holds(&pool, &held_host).await,
+            "the forget took out the host that the dial introduced"
+        );
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(other_relay)]),
+            "only the other host's relay is left in the map"
+        );
+        assert!(table_holds(&pool, &other).await, "the other host stays");
+        pool.close().await;
+    }
+
+    /// A dial that waited behind a forget meets its mark. The forget's removal is held at the
+    /// transport's gate while it holds the host's lock, a dial of the forgotten pairing waits for the
+    /// lock, and when the removal is let go the dial is refused and puts nothing in the table or the
+    /// map. A mark set after the removal would let the dial through in between. So does a dial that
+    /// began before the forget and asks for the lock only after the forget ended: a decision made
+    /// before the lock would let it through.
+    #[tokio::test]
+    async fn a_dial_that_waited_behind_the_forget_is_refused() {
+        let pool = loopback_pool();
+        let host = key();
+        let own = "https://127.0.0.1:10";
+        let config = network(&[own], Some(RESOLVER), &[]);
+        pool.endpoint(&config, &host, Standing::Paired(pairing(1)))
+            .await
+            .expect("the pairing is reached");
+        let mut removal = the_bound(&pool).await.endpoint.hold_next_map_task();
+
+        let (_, forgotten) = forgetting(&pool, host, 1);
+        removal.reached().await;
+        let (_, dialled) = dialling(&pool, &config, host, 1);
+        // The forget holds the lock and the dial holds a copy of it: the dial is waiting for it.
+        until("the dial waits for the host's lock", {
+            let lock = pool.lock_of(&host);
+            move || Arc::strong_count(&lock) >= 4
+        })
+        .await;
+        removal.release().await;
+
+        heard("the forget returns", forgotten).await;
+        assert!(
+            !heard("the dial ends", dialled).await,
+            "the dial that waited behind the forget is refused"
+        );
+        assert!(!table_holds(&pool, &host).await);
+        assert!(pool.relay_urls().await.is_empty());
+
+        // A dial that began before the forget and asks for the lock after it meets the mark too: it
+        // is held before the lock, the forget runs to its end, and the dial is let go.
+        let early = key();
+        pool.endpoint(&config, &early, Standing::Paired(pairing(2)))
+            .await
+            .expect("the pairing is reached");
+        let before_the_lock = Arc::new(pool.hold_next_dial_of(&early));
+        let (_, dialled) = dialling(&pool, &config, early, 2);
+        until("the dial is held before the lock", {
+            let before_the_lock = Arc::clone(&before_the_lock);
+            move || before_the_lock.is_reached()
+        })
+        .await;
+        let (_, forgotten) = forgetting(&pool, early, 2);
+        heard("the forget returns", forgotten).await;
+        before_the_lock.release();
+        assert!(
+            !heard("the dial ends", dialled).await,
+            "the dial that began before the forget is refused when it asks for the lock after it"
+        );
+        assert!(!table_holds(&pool, &early).await);
+        assert!(pool.relay_urls().await.is_empty());
+        pool.close().await;
+    }
+
+    /// The overlap of a new pairing with a stale dial of the old one keeps the new pairing's entry,
+    /// in both orders. (a) The new pairing introduced the host first and the old pairing's dial,
+    /// begun before its forget, introduces it again: when the forget returns the host is still in
+    /// the table and the map, and the host goes when the new pairing is forgotten too. (b) The
+    /// new pairing's dial waits behind the old pairing's forget and introduces the host after it: its
+    /// entry is there when the dial returns.
+    #[tokio::test]
+    async fn a_new_pairing_keeps_its_hosts_entry_beside_a_stale_dial_of_the_old_pairing() {
+        let pool = loopback_pool();
+        let own = "https://127.0.0.1:10";
+        let config = network(&[own], Some(RESOLVER), &[]);
+
+        // (a) The new pairing (2) first, the old pairing's (1) stale dial and its forget after.
+        let host = key();
+        pool.endpoint(&config, &host, Standing::Paired(pairing(2)))
+            .await
+            .expect("the new pairing is reached");
+        let gate = Arc::new(pool.hold_next_introduce_of(&host));
+        let (_, dialled) = dialling(&pool, &config, host, 1);
+        until("the stale dial is held at the gate", {
+            let gate = Arc::clone(&gate);
+            move || gate.is_reached()
+        })
+        .await;
+        let (_, forgotten) = forgetting(&pool, host, 1);
+        until("the forget has marked the old pairing", {
+            let pool = Arc::clone(&pool);
+            move || pool.is_forgotten(pairing(1))
+        })
+        .await;
+        gate.release();
+        assert!(
+            heard("the stale dial ends", dialled).await,
+            "the dial that began before the forget returns its endpoint"
+        );
+        heard("the forget returns", forgotten).await;
+        assert!(
+            table_holds(&pool, &host).await,
+            "the new pairing's entry is in the table when the forget returns"
+        );
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(own)]),
+            "the new pairing's relay is in the map when the forget returns"
+        );
+        pool.forget(&host, pairing(2)).await;
+        assert!(
+            !table_holds(&pool, &host).await && pool.relay_urls().await.is_empty(),
+            "the host goes when the last pairing that introduced it is forgotten"
+        );
+
+        // (b) The old pairing (3) is forgotten with its removal held, and the new pairing (4)
+        // dials meanwhile.
+        let host = key();
+        pool.endpoint(&config, &host, Standing::Paired(pairing(3)))
+            .await
+            .expect("the old pairing is reached");
+        let mut removal = the_bound(&pool).await.endpoint.hold_next_map_task();
+        let (_, forgotten) = forgetting(&pool, host, 3);
+        removal.reached().await;
+        let (_, dialled) = dialling(&pool, &config, host, 4);
+        until("the new pairing's dial waits for the host's lock", {
+            let lock = pool.lock_of(&host);
+            move || Arc::strong_count(&lock) >= 4
+        })
+        .await;
+        removal.release().await;
+        heard("the forget returns", forgotten).await;
+        assert!(
+            heard("the new pairing's dial ends", dialled).await,
+            "the new pairing is reached"
+        );
+        assert!(
+            table_holds(&pool, &host).await,
+            "the new pairing's entry is in the table when its dial returns"
+        );
+        assert_eq!(
+            pool.relay_urls().await,
+            BTreeSet::from([relay(own)]),
+            "the new pairing's relay is in the map when its dial returns"
         );
         pool.close().await;
     }
@@ -1239,7 +1739,7 @@ mod tests {
             .await
             .clone()
             .expect("the endpoint is bound");
-        let mut hold = device.hold_next_map_task();
+        let mut hold = device.endpoint.hold_next_map_task();
         let introducing = tokio::spawn({
             let pool = Arc::clone(&pool);
             async move {
