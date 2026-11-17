@@ -22,6 +22,8 @@ struct Admissions {
     /// The sessions the relay let in, and the ones of those that have ended.
     admitted: u64,
     ended: u64,
+    /// The sessions the relay let each endpoint open.
+    by_endpoint: std::collections::BTreeMap<iroh::EndpointId, u64>,
 }
 
 /// Whether the relay turns away the endpoints that open a session with it, while it goes on
@@ -53,7 +55,7 @@ impl Refusal {
 impl iroh_relay::server::AccessControl for Refusal {
     async fn on_connect(
         &self,
-        _request: &iroh_relay::server::ClientRequest,
+        request: &iroh_relay::server::ClientRequest,
     ) -> iroh_relay::server::Access {
         let mut state = self.state();
         if state.asked || state.stopping {
@@ -62,6 +64,7 @@ impl iroh_relay::server::AccessControl for Refusal {
             }
         } else {
             state.admitted += 1;
+            *state.by_endpoint.entry(request.endpoint_id()).or_default() += 1;
             iroh_relay::server::Access::Allow
         }
     }
@@ -146,6 +149,16 @@ impl LocalRelay {
         self.server
             .as_ref()
             .map_or(0, |server| server.metrics().server.bytes_sent.get())
+    }
+
+    /// How many sessions the relay has let `endpoint` open in this run of its server.
+    pub fn sessions_of(&self, endpoint: &iroh::EndpointId) -> u64 {
+        self.refusal
+            .state()
+            .by_endpoint
+            .get(endpoint)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Has the relay turn away every endpoint that opens a session with it, or take them again. It
