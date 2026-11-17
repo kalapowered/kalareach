@@ -1521,3 +1521,138 @@ async fn the_attach_of_a_withdrawn_connection() {
 fn a_connection_that_a_restriction_withdrew_does_not_attach_again_when_the_host_opens() {
     on_a_runtime(the_attach_of_a_withdrawn_connection());
 }
+
+/// Starts the window's attach, which claims the geometry with a size of its own, on a task, and
+/// returns the end that gives the window back when the attach has been answered.
+fn start_the_geometry_attach(
+    world: &World,
+    window: LocalClient,
+) -> std::sync::mpsc::Receiver<LocalClient> {
+    let target = world.target();
+    let session_id = world.session_id;
+    let (attach_done, attach_ended) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let mut window = window;
+        let mut requested = CanonicalSet::new();
+        requested.insert(AttachmentCapability::ObserveTerminal);
+        requested.insert(AttachmentCapability::Input);
+        requested.insert(AttachmentCapability::Geometry);
+        let _ = window
+            .mutate(
+                Method::SessionAttach,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &SessionAttachParams {
+                    session_id,
+                    mode: AttachMode::Terminal,
+                    claim_geometry: true,
+                    dimensions: Nullable::some(Dimensions::new(100, 30)),
+                    terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                    requested,
+                },
+            )
+            .await;
+        let _ = attach_done.send(window);
+    });
+    attach_ended
+}
+
+/// A statement that waits for the hold of an attach that was checked before it, the answer to it
+/// stopped once the hold has ended, and then a second statement from another connection: the host
+/// repeats the first one on a replacement connection, or a newer daemon says its first. Returns
+/// what the session held when the second statement was answered.
+async fn the_second_statement_meets_a_pending_withdrawal(
+    generation: u64,
+    repeated: bool,
+) -> Result<Held, &'static str> {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut window = world.window().await;
+    let mut daemon = world.authority(1).await;
+    tell(&mut daemon, open(1)).await;
+    world
+        .read(&mut window)
+        .await
+        .expect("the window is served under an open host");
+    let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
+    let (at_the_hold, go_statement) = world.service.stall_a_statement_after_its_hold();
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    let attach_ended = start_the_geometry_attach(&world, window);
+    if ends_by(deadline, async move { checked.await.is_ok() }).await != Some(true) {
+        return Err("the attach never passed the dispatch boundary's check");
+    }
+
+    // The host closes it: the statement has changed the gate and waits for the hold.
+    let first = world.machine.lease(2, FAR_MS, FAR_MS);
+    tokio::spawn(async move {
+        let _ = daemon.announce_local_access(first).await;
+    });
+    let waiting = Arc::clone(&world.service);
+    if !holds_by(deadline, move || waiting.statements_waiting_for_tests() > 0).await {
+        return Err("the statement never waited for the hold");
+    }
+    go_attach.send(()).expect("lets the attach go");
+    if ends_by(deadline, async move { at_the_hold.await.is_ok() }).await != Some(true) {
+        return Err("the statement never reached the end of its wait");
+    }
+
+    // The second statement arrives while the first has not run its withdrawal.
+    let (second, statement) = if repeated {
+        (world.authority(generation).await, first)
+    } else {
+        (world.authority(generation).await, closed(1))
+    };
+    let answered = ends_by(deadline, async move {
+        let mut second = second;
+        tell(&mut second, statement).await;
+        second
+    })
+    .await;
+    if answered.is_none() {
+        return Err("the second statement was never answered");
+    }
+    let reader = Arc::clone(&world);
+    let at_the_answer = tokio::task::spawn_blocking(move || held(&reader))
+        .await
+        .expect("the session is read");
+    go_statement.send(()).expect("lets the first statement go");
+    let window = tokio::task::spawn_blocking(move || {
+        attach_ended
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    drop(window);
+    world.close();
+    Ok(at_the_answer)
+}
+
+/// KR-REQ-17.54: a repeat of a statement on a replacement connection is not answered while the
+/// withdrawal the first one owes is pending.
+///
+/// The first statement waits for the hold of an attach that was checked before it; once the hold
+/// has ended its answer is stopped before it runs the withdrawal. The host's replacement
+/// connection repeats the statement, which the worker already holds. Its answer says the
+/// withdrawal is complete, so the window holds nothing when it comes.
+#[test]
+fn a_repeated_statement_is_not_answered_while_the_withdrawal_the_first_owes_is_pending() {
+    let held = on_a_runtime(the_second_statement_meets_a_pending_withdrawal(1, true))
+        .expect("the schedule came about");
+    assert!(
+        held.attachments.is_empty(),
+        "the repeat was answered while the window's attachment was in the session: {held:?}"
+    );
+}
+
+/// KR-REQ-17.54: a newer daemon's first statement is not answered while the withdrawal an earlier
+/// statement owes is pending, even though it changes nothing the gate holds.
+#[test]
+fn a_newer_daemons_first_statement_is_not_answered_while_an_earlier_withdrawal_is_pending() {
+    let held = on_a_runtime(the_second_statement_meets_a_pending_withdrawal(2, false))
+        .expect("the schedule came about");
+    assert!(
+        held.attachments.is_empty(),
+        "the statement was answered while the window's attachment was in the session: {held:?}"
+    );
+}
