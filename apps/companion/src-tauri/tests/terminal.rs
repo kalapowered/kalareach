@@ -355,6 +355,24 @@ impl Page {
         );
     }
 
+    /// Waits, under [`STATE_BOUND`], until the view has served `count` ends of its input lane: the
+    /// lane's own record (see [`Self::lane_ends`]) says that it ended, and this says that the view
+    /// read the end and acted on it.
+    async fn lane_ends_served(&self, view: &str, count: usize) {
+        let views = self.app.state::<companion_tauri::terminal::TerminalViews>();
+        let served = tokio::time::timeout(STATE_BOUND, async {
+            while views.lane_ends_served(view).is_none_or(|ends| ends < count) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            served.is_ok(),
+            "the view had not served {count} ends of its input lane within the bound: it served {:?}",
+            views.lane_ends_served(view)
+        );
+    }
+
     /// How many views the application holds open.
     fn held(&self) -> usize {
         self.app
@@ -7285,4 +7303,146 @@ async fn a_take_on_a_view_granted_no_right_to_type_is_refused_at_once_and_asks_t
         );
     }
     nothing_asked_for_control(&page, 3, &host, &mut link).await;
+}
+
+/// What the page is told when the session grants a take after the view's input stream ended.
+const NOT_TAKEN_FOR_AN_ENDED_STREAM: &str = "This view could not take control: its input stream ended before the host answered. Take control again to retry.";
+
+/// The release that the view gives the lease back with, which names no position because the stream it
+/// would have named it on is gone: the case reads it from the control stream and checks that it is
+/// of `epoch`.
+async fn release_of_the_epoch_within_the_bound(
+    link: &mut Link,
+    epoch: u64,
+) -> scripted_worker::Call {
+    let release = link
+        .call_within(AFTER_BARRIER)
+        .await
+        .expect("the lease was given back within the bound");
+    assert_eq!(release.method, Method::InputRelease.to_string());
+    assert_eq!(
+        release.params::<InputReleaseParams>().epoch.get(),
+        epoch,
+        "the epoch that the host granted is the one given back"
+    );
+    assert_eq!(
+        position(&release),
+        None,
+        "no stream is left to name a position on"
+    );
+    release
+}
+
+/// The page was never shown the view as controlling.
+fn never_controlling(page: &Page, channel: u32) -> bool {
+    page.states(channel)
+        .iter()
+        .all(|state| state["control"]["state"] != "controlling")
+}
+
+/// A take whose acquire is answered after the view served the end of its input stream: the lease
+/// the host grants has no stream to type on, so control ends as the answer is read, with the words
+/// of a take that could not be made, and the epoch is given back with no position. The page never
+/// shows the view as controlling. The next take opens a new stream and takes a new epoch, and the
+/// typing goes on it from 0. The case answers the acquire only once the view has served the end.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acquire_answered_after_the_view_served_the_lanes_end_ends_control_and_gives_the_epoch_back()
+ {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = paired(&page, &mut host, 3, &reporting(Mouse::Sgr)).await;
+    page.take(&view, 1);
+    let acquire = acquire_within_the_bound(&mut link).await;
+    host.script.say(Out::Reset);
+    page.lane_ends_served(&view, 1).await;
+    lease.answer(&mut link, &acquire).await;
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the take ended within the bound");
+    assert_eq!(
+        ended["control"]["ended"], NOT_TAKEN_FOR_AN_ENDED_STREAM,
+        "the view's sentence for a take whose stream ended first, whole"
+    );
+    assert!(never_controlling(&page, 3), "{:?}", page.states(3));
+    let release = release_of_the_epoch_within_the_bound(&mut link, lease.epoch).await;
+    lease.answer(&mut link, &release).await;
+    let first_epoch = lease.epoch;
+    page.take(&view, 2);
+    takes_the_stream_when_asked(&mut link).await;
+    host.script
+        .until("the second input stream's header", |seen| {
+            seen.headers.len() == 2
+        })
+        .await;
+    let acquire = acquire_within_the_bound(&mut link).await;
+    lease.answer(&mut link, &acquire).await;
+    page.newest_within(3, |state| control(state) == (2, "controlling".to_owned()))
+        .await
+        .expect("the second take took control within the bound");
+    assert!(lease.epoch > first_epoch, "a new stream has a new epoch");
+    page.text(&view, 2, "b").expect("the key is taken");
+    host.script
+        .until_soon("the key on the new stream", |seen| seen.frames.len() == 1)
+        .await;
+    assert_eq!(read_by(&host), vec![(lease.epoch, 0, "b".to_owned())]);
+}
+
+/// The other order: the view is held inside a state while the lane ends and the host answers the
+/// acquire, and when it is let on, it reads the answer first, which it cannot begin an epoch on the
+/// ended lane for, and then the end: control, shown for the moment between them, ends with the
+/// stream's words, and the epoch is given back with no position. The case lets the view on only
+/// once the session has the answer, and checks that the view had served no end of its lane until
+/// then.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_acquire_answered_in_the_look_that_has_the_lanes_end_ends_control_with_the_streams_words()
+ {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) = paired(&page, &mut host, 3, &Frame::live((10, 2), (10, 2), 0)).await;
+    page.take(&view, 1);
+    let acquire = acquire_within_the_bound(&mut link).await;
+    let first = page.states(3).len();
+    let held = Held::new(&page.gate);
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(1, 40, 52, 10, 2, 0, vec![row(1, "one")]),
+    )
+    .await;
+    // The view is inside the state of the first update, and takes nothing.
+    page.state(3, first).await;
+    host.script.say(Out::Reset);
+    page.lane_ends(&view).await;
+    lease.answer(&mut link, &acquire).await;
+    link.push(
+        PROJECTION_DELTA_EVENT,
+        &delta(1, 52, 64, 10, 2, 0, vec![row(1, "two")]),
+    )
+    .await;
+    // The second update came after the answer on the connection, so the session has the answer.
+    page.reader_reaches(&view, link.next_sequence() - 1).await;
+    let views = page.app.state::<companion_tauri::terminal::TerminalViews>();
+    assert_eq!(
+        views.lane_ends_served(&view),
+        Some(0),
+        "the view has served no end of its lane while it is held"
+    );
+    drop(held);
+    page.lane_ends_served(&view, 1).await;
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the end of the stream ended control within the bound");
+    assert_eq!(
+        ended["control"]["ended"], "Control ended: this view's input stream ended.",
+        "the stream's words, whole"
+    );
+    assert!(
+        !never_controlling(&page, 3),
+        "the answer was read first, so the page showed the take as controlling for a moment: {:?}",
+        page.states(3)
+    );
+    release_of_the_epoch_within_the_bound(&mut link, lease.epoch).await;
 }

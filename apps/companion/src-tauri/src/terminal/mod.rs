@@ -305,6 +305,17 @@ impl TerminalViews {
             .map(|probe| probe.barriers.load(Ordering::Relaxed))
     }
 
+    /// How many ends of its input lane a view has served so far: the lane records its end itself,
+    /// and the view has read it and acted on it only once this counts it. For a test of what a view
+    /// does with an answer that comes before or after it has served the end.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn lane_ends_served(&self, view: &str) -> Option<usize> {
+        self.probe(view)
+            .map(|probe| probe.lane_ends.load(Ordering::Relaxed))
+    }
+
     /// The last event sequence that the view's session has read from `stream`, whether or not the
     /// view has taken it, or none before the session has read any, for a view that has ended, or
     /// for one that was never open. The session's reader records it before it hands the event on.
