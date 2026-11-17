@@ -272,6 +272,21 @@ async fn attempt(
     let InviteEntry::Direct { qr_text } = &invited.entry else {
         panic!("a direct invitation was issued: {:?}", invited.entry);
     };
+    // The screen still shows how the last attempt ended until the person returns it to its start,
+    // as the page's "Done" does: the new attempt is read from a screen that holds nothing.
+    took(
+        "returning the pairing screen to its start",
+        phone.companion.call("pairing_stop", json!({})),
+    );
+    until("the pairing screen holding no attempt", || {
+        phone
+            .companion
+            .call("pairing_view", json!({}))
+            .is_ok_and(|view| {
+                view["state"]["state"] != "paired" && view["state"]["state"] != "ended"
+            })
+    })
+    .await;
     phone.paste.copy(qr_text.as_str(), false);
     let id = invited.invitation_id;
     if let Err(error) = phone.companion.call("pairing_paste", json!({})) {
