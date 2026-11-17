@@ -1094,3 +1094,150 @@ async fn a_mutate_dropped_while_it_waits_for_its_answer_is_settled_by_the_hosts_
         "a late definite answer left the action of a dropped mutate on the book"
     );
 }
+
+/* ---------------------------------------------------------------------------------------- */
+/* The keys a local lane has not settled                                                      */
+/* ---------------------------------------------------------------------------------------- */
+
+/// A lane on an ordered session with its first epoch begun.
+async fn local_lane() -> (
+    Arc<Scripted>,
+    Arc<Session>,
+    OrderedEvents,
+    kr_client::input::InputLane,
+    kr_client::input::InputEvents,
+) {
+    let (transport, session, events) = ordered(4);
+    let lane =
+        within(session.input_lane(InputTarget::new(environment(), session_id(), attachment())))
+            .await
+            .expect("a lane");
+    let lane_events = lane.events().expect("the lane's events");
+    lane.begin_epoch(InputLeaseEpoch::new(1)).expect("an epoch");
+    (transport, session, events, lane, lane_events)
+}
+
+/// Queues a request among the lane's keys, as a release or a detach is.
+async fn queue_request(lane: &kr_client::input::InputLane, session: &Arc<Session>, number: u8) {
+    let request = Arc::new(composed(session, number).await);
+    let session = Arc::clone(session);
+    let _ = lane
+        .after_keys(move |limit| async move { session.send_written(&request, &limit).await })
+        .expect("the lane queues the request");
+}
+
+fn accepted(sequence: u64) -> Result<ParamsValue, ProtocolError> {
+    Ok(typed(&InputWriteResult {
+        sequence: InputSequence::new(sequence),
+        forwarded_bytes: U64::new(1),
+        held_prefix_bytes: U64::new(0),
+    }))
+}
+
+/// A frame the writer has not taken yet is pending, behind a request that holds the writer.
+#[tokio::test]
+async fn a_queued_frame_is_pending_before_the_writer_takes_it() {
+    let (transport, session, _events, lane, _lane_events) = local_lane().await;
+    assert!(
+        !lane.keys_pending(),
+        "a lane with no frame has none pending"
+    );
+    transport.park();
+    queue_request(&lane, &session, 1).await;
+    transport.write_entered().await;
+    lane.try_send(b"a").expect("the lane takes a key");
+    assert!(
+        lane.keys_pending(),
+        "a frame queued behind the request in the writer's hands is pending"
+    );
+    transport.unpark();
+}
+
+/// A frame the host has not answered is pending until the lane reads the answer.
+#[tokio::test]
+async fn a_frame_in_flight_is_pending_until_the_host_answers_it() {
+    let (transport, _session, _events, lane, mut lane_events) = local_lane().await;
+    lane.try_send(b"a").expect("the lane takes a key");
+    let key = transport.written_at_least(1).await;
+    assert!(
+        lane.keys_pending(),
+        "a frame on the wire that the host has not answered is pending"
+    );
+    transport.feed(answer(key, accepted(0)));
+    match within(lane_events.recv()).await.expect("a lane event") {
+        InputEvent::Accepted { through, .. } => assert_eq!(through, InputSequence::new(0)),
+        _ => panic!("the lane's first event was not the key's acceptance"),
+    }
+    assert!(
+        !lane.keys_pending(),
+        "the lane still counts a key that the host accepted"
+    );
+}
+
+/// What the host answers for a key of an epoch that a new epoch has replaced.
+enum OlderAnswer {
+    Accepted,
+    Refused,
+}
+
+/// A key of an older epoch that is in flight when a new epoch begins is pending until the host
+/// answers it, though the lane says nothing of that answer.
+async fn an_older_epochs_key_is_pending_until_it_is_answered(answers: OlderAnswer) {
+    let (transport, session, _events, lane, _lane_events) = local_lane().await;
+    lane.try_send(b"a").expect("the lane takes a key");
+    let key = transport.written_at_least(1).await;
+    lane.begin_epoch(InputLeaseEpoch::new(2))
+        .expect("a new epoch");
+    assert!(
+        lane.keys_pending(),
+        "a key of the older epoch that the host has not answered is pending"
+    );
+    transport.feed(answer(
+        key,
+        match answers {
+            OlderAnswer::Accepted => accepted(0),
+            OlderAnswer::Refused => Err(ProtocolError::new(ErrorCode::LeaseLost, "lost")),
+        },
+    ));
+    // The writer takes the next work only after it has read the answer: the request is written
+    // behind it.
+    queue_request(&lane, &session, 2).await;
+    transport.written_at_least(2).await;
+    assert!(
+        !lane.keys_pending(),
+        "the lane still counts a key of an older epoch that the host answered"
+    );
+}
+
+#[tokio::test]
+async fn an_older_epochs_key_is_pending_until_the_host_accepts_it() {
+    an_older_epochs_key_is_pending_until_it_is_answered(OlderAnswer::Accepted).await;
+}
+
+#[tokio::test]
+async fn an_older_epochs_key_is_pending_until_the_host_refuses_it() {
+    an_older_epochs_key_is_pending_until_it_is_answered(OlderAnswer::Refused).await;
+}
+
+/// A frame that a new epoch's begin dropped unsent is not pending, and the requests that wait
+/// among the keys are not keys.
+#[tokio::test]
+async fn a_frame_a_new_epoch_dropped_unsent_is_not_pending() {
+    let (transport, session, _events, lane, _lane_events) = local_lane().await;
+    transport.park();
+    queue_request(&lane, &session, 1).await;
+    transport.write_entered().await;
+    queue_request(&lane, &session, 2).await;
+    lane.try_send(b"a").expect("the lane takes a key");
+    assert!(lane.keys_pending());
+    let sets = lane
+        .begin_epoch(InputLeaseEpoch::new(2))
+        .expect("a new epoch")
+        .expect("the old epoch's sets");
+    assert_eq!(sets.unsent.frames, 1, "the begin dropped the queued frame");
+    assert!(
+        !lane.keys_pending(),
+        "a dropped frame, or a request that waits among the keys, is counted pending"
+    );
+    transport.unpark();
+}
