@@ -3437,6 +3437,118 @@ mod tests {
         EnvironmentId::new(Uuid::from_bytes([7; 16]))
     }
 
+    /// Every object of the file's schema, in a fixed order.
+    fn schema_objects(connection: &Connection) -> Vec<(String, String, String)> {
+        let mut statement = connection
+            .prepare("SELECT type, name, COALESCE(sql, '') FROM sqlite_master ORDER BY type, name")
+            .expect("the schema");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("rows")
+            .collect::<std::result::Result<_, _>>()
+            .expect("every row")
+    }
+
+    /// Every device row, as stored.
+    fn device_rows(connection: &Connection) -> Vec<(Vec<u8>, Vec<u8>, Option<i64>)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT device_id, endpoint_id, revoked_at_ms FROM network_devices
+                 ORDER BY device_id",
+            )
+            .expect("the device rows");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("rows")
+            .collect::<std::result::Result<_, _>>()
+            .expect("every row")
+    }
+
+    fn recorded_version(connection: &Connection) -> i64 {
+        connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("a version")
+    }
+
+    /// The step from 16 to 18 that fails after it began rolls itself back, on the connection it ran
+    /// on, which is the one a retry uses: the connection is in autocommit mode, the version, the
+    /// schema and the rows are what they were, and once the fault is gone the step runs again on
+    /// that same connection. A connection that is closed after the error would roll the
+    /// transaction back whatever the step did, so the case keeps it.
+    #[test]
+    fn a_step_from_16_to_18_that_fails_rolls_back_on_its_own_connection_and_runs_again() {
+        let temp = tempfile::tempdir().expect("a directory on the internal disk");
+        let path = temp.path().join("registry.db");
+        drop(Registry::open(&path, environment()).expect("a registry"));
+        let connection = open_connection(&path, None).expect("the registry opens");
+        for (device, endpoint, revoked) in [(0xa1_u8, 0x31_u8, None), (0xa2, 0x32, Some(5_i64))] {
+            connection
+                .execute(
+                    "INSERT INTO network_devices (device_id, endpoint_id, device_key_revision,
+                         authorisation_key, device_name, platform, grant_id, grant, paired_at_ms,
+                         revoked_at_ms)
+                     VALUES (?1, ?2, 1, ?3, 'a phone', 'android', ?4, x'00', 1, ?5)",
+                    rusqlite::params![
+                        [device; 16].as_slice(),
+                        [endpoint; 32].as_slice(),
+                        [endpoint.wrapping_add(1); 32].as_slice(),
+                        [device; 16].as_slice(),
+                        revoked,
+                    ],
+                )
+                .expect("a device row");
+        }
+        connection
+            .execute("UPDATE schema_version SET version = 16", [])
+            .expect("the earlier version");
+        // The last statement of the rebuild makes an index of the table under this name, after the
+        // rows were copied and the old table dropped: another table already holds the name.
+        connection
+            .execute_batch(
+                "DROP INDEX network_devices_endpoint;
+                 CREATE TABLE in_the_way (endpoint BLOB);
+                 CREATE INDEX network_devices_endpoint ON in_the_way (endpoint);",
+            )
+            .expect("the fault");
+        let registry = Registry {
+            connection,
+            environment_id: environment(),
+            current_process: kr_ipc::identity::current_process,
+            #[cfg(feature = "testing")]
+            read_stall: crate::attention::Pause::default(),
+        };
+        let schema = schema_objects(&registry.connection);
+        let rows = device_rows(&registry.connection);
+        assert_eq!(rows.len(), 2);
+
+        assert!(
+            registry.migrate_16_to_18().is_err(),
+            "the step fails after it began"
+        );
+        assert!(
+            registry.connection.is_autocommit(),
+            "the failed step left no transaction open on its connection"
+        );
+        assert_eq!(recorded_version(&registry.connection), 16);
+        assert_eq!(
+            schema_objects(&registry.connection),
+            schema,
+            "the schema is as it was: the earlier table, and no table of the rebuild left behind"
+        );
+        assert_eq!(device_rows(&registry.connection), rows);
+
+        registry
+            .connection
+            .execute_batch("DROP INDEX network_devices_endpoint; DROP TABLE in_the_way;")
+            .expect("the fault goes");
+        registry
+            .migrate_16_to_18()
+            .expect("the step runs again on the same connection");
+        assert!(registry.connection.is_autocommit());
+        assert_eq!(recorded_version(&registry.connection), 18);
+        assert_eq!(device_rows(&registry.connection), rows);
+    }
+
     /// Hundreds of nanoseconds in one second.
     const PER_SECOND: u64 = 10_000_000;
 
