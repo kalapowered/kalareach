@@ -79,14 +79,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
-
       # rust-toolchain.toml pins the exact toolchain; rustup installs it on first use.
       # libsodium-sys-stable builds libsodium from the source archive it ships, so the native
       # library is compiled and its length constants are checked against this wrapper on every run.
@@ -446,8 +438,28 @@ jobs:
       # which the upload says and does not count as a second failure. It is eligible at the same
       # events as the two steps above, and at no other.
       - name: Keep the deployment legs' logs
+        id: keep-the-deployment-legs-logs
         if: ${{ always() && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.deployment_legs)) }}
-        uses: ./.github/actions/keep-evidence
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deployment-legs
+          path: |
+            /tmp/kr-test-artifacts/deployment-*
+            /tmp/kr-test-artifacts/m1b-*
+          if-no-files-found: warn
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the deployment legs' logs, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-deployment-legs-logs.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the deployment legs' logs, second try
+        if: ${{ !cancelled() && steps.keep-the-deployment-legs-logs.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: deployment-legs
           path: |
@@ -535,8 +547,29 @@ jobs:
       # targets: a run that fell short is the evidence for how far short it fell, and on which
       # processor. The deployment legs' logs are kept once, by their own step above.
       - name: Keep the performance evidence
+        id: keep-the-performance-evidence
         if: ${{ !cancelled() }}
-        uses: ./.github/actions/keep-evidence
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-evidence
+          path: |
+            /tmp/kr-test-artifacts
+            !/tmp/kr-test-artifacts/deployment-*
+            !/tmp/kr-test-artifacts/m1b-*
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the performance evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-performance-evidence.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the performance evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-performance-evidence.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: performance-evidence
           path: |
@@ -592,14 +625,6 @@ jobs:
 
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
 
       - name: Install the pinned toolchain
         run: |
@@ -1600,8 +1625,26 @@ jobs:
       # failure on this platform is the only evidence of how it failed here. A run whose tests
       # wrote nothing there keeps nothing.
       - name: Keep the test evidence
+        id: keep-the-test-evidence
         if: ${{ !cancelled() }}
-        uses: ./.github/actions/keep-evidence
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-${{ matrix.name }}
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the test evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-test-evidence.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the test evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-test-evidence.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-evidence-${{ matrix.name }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
@@ -1648,14 +1691,6 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
 
       - name: Install the pinned toolchain
         run: |
@@ -1815,7 +1850,25 @@ jobs:
              /tmp/kr-shell-packages/shells/psreadline/
 
       - name: Publish the patch sets and identity records
-        uses: ./.github/actions/keep-evidence
+        id: publish-the-patch-sets-and-identity-records
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shell-packages
+          path: /tmp/kr-shell-packages
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Publish the patch sets and identity records, pause before the second try
+        if: ${{ steps.publish-the-patch-sets-and-identity-records.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Publish the patch sets and identity records, second try
+        if: ${{ steps.publish-the-patch-sets-and-identity-records.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: shell-packages
           path: /tmp/kr-shell-packages
@@ -2073,14 +2126,6 @@ jobs:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
-
       - name: Install pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
@@ -2242,8 +2287,26 @@ jobs:
 
       # The screenshot of the started application, and the logs of the device.
       - name: Keep the Android evidence
+        id: keep-the-android-evidence
         if: ${{ !cancelled() }}
-        uses: ./.github/actions/keep-evidence
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-android
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the Android evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-android-evidence.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the Android evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-android-evidence.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-evidence-android
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
@@ -2266,14 +2329,6 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
 
       - name: What the disk holds
         continue-on-error: true
@@ -2405,8 +2460,26 @@ jobs:
           xcrun simctl delete "$KR_SIMULATOR"
 
       - name: Keep the iOS evidence
+        id: keep-the-ios-evidence
         if: ${{ !cancelled() }}
-        uses: ./.github/actions/keep-evidence
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-ios
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the iOS evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-ios-evidence.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the iOS evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-ios-evidence.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-evidence-ios
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
@@ -2430,14 +2503,6 @@ jobs:
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
 
       # The disk as the image arrives, and from here to the last report the lowest free space in
       # each stretch of the job, on the macOS leg.
@@ -2593,8 +2658,26 @@ jobs:
       # The figures, the traces and the screenshots the run produced, kept whether it passed or not.
       # A run that kept nothing fails: the guard above names the pictures a browser run must leave.
       - name: Keep the end-to-end evidence
+        id: keep-the-end-to-end-evidence
         if: ${{ !cancelled() }}
-        uses: ./.github/actions/keep-evidence
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: companion-evidence-${{ matrix.os }}
+          path: /tmp/kr-test-artifacts
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the end-to-end evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-end-to-end-evidence.outcome == 'failure' }}
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the end-to-end evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-end-to-end-evidence.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: companion-evidence-${{ matrix.os }}
           path: /tmp/kr-test-artifacts
@@ -2647,14 +2730,6 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
 
       # The disk as the image arrives and what takes the room on it, and from here to the last
       # report the lowest free space in each stretch of the job, sampled every two seconds: the
@@ -2900,7 +2975,7 @@ jobs:
       # The step builds the workspace's tests and then runs them, and it grows with the tests. On a
       # hosted runner it has taken 108 to 141 minutes when it passed, and on a runner 15 to 30 per
       # cent slower in every suite it ran into a limit of 145 minutes with 38 suites not started.
-      # Its limit is 197 minutes: the limits of the part add up to 344 of the job's 355 minutes.
+      # Its limit is 197 minutes: the limits of the part add up to 351 of the job's 355 minutes.
       # That is under twice the longest it has taken.
       - name: Test
         if: ${{ !cancelled() && matrix.part == 'tests' }}
@@ -3123,9 +3198,29 @@ jobs:
       # The figures and whatever else the steps above wrote to the artefact directory, kept whether
       # or not the run passed: on this platform they are the only record of how a failure looked.
       - name: Keep the test evidence
+        id: keep-the-test-evidence
         if: ${{ !cancelled() }}
+        continue-on-error: true
         timeout-minutes: 5
-        uses: ./.github/actions/keep-evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-${{ matrix.name }}
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the test evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-test-evidence.outcome == 'failure' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the test evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-test-evidence.outcome == 'failure' }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-evidence-${{ matrix.name }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
@@ -3165,7 +3260,7 @@ jobs:
   # The PowerShell package's cases on the macOS runner. The package's reader counts the input the
   # runtime has taken through .NET internals that differ by platform, and the shell-packages job
   # runs these cases on Linux only. They take far longer than the macos job has left to give: its
-  # limits add up to 344 of its 355 minutes. So they run here, in a job that has the Rust
+  # limits add up to 351 of its 355 minutes. So they run here, in a job that has the Rust
   # toolchain and PowerShell and nothing else of that one. PowerShell is the release the
   # shell-packages job pins, from the macOS archive and checked against the digest its release
   # publishes: the package refuses a release that a published advisory affects, and the .NET
@@ -3292,7 +3387,7 @@ jobs:
   # shell-packages job runs these cases on Linux only, and how an editor draws and how a terminal
   # answers depend on the platform's C library, so a change to a package or to its bridge is run
   # on macOS at the landing and not first at a release. The cases are not steps of the macos job:
-  # it is the longest job of the run, and its limits add up to 344 of its 355 minutes. This job
+  # it is the longest job of the run, and its limits add up to 351 of its 355 minutes. This job
   # holds one runner for the length of its own steps and takes nothing from that budget. Every
   # step has a limit of its own, and the limits add up to less than the job's.
   #
@@ -3431,20 +3526,12 @@ jobs:
     # first of its two commands took from 47 to 120 minutes, the longest on two runners of one run,
     # and the second had run 40 more without ending. Every step has a limit of its own, and the
     # limits add up to less than this one: the build's 240 minutes, twice the 120, and the other
-    # steps' 111 make 351, and this limit of 355 is under the 360 at which GitHub ends a hosted job.
+    # steps' 114 make 354, and this limit of 355 is under the 360 at which GitHub ends a hosted job.
     timeout-minutes: 355
     steps:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
 
       # The disk as the image arrives, and from here to the last report the lowest free space in
       # each stretch of the job.
@@ -3518,9 +3605,29 @@ jobs:
         run: bash scripts/disk-report.sh report "what the disk has left"
 
       - name: Keep the test evidence
+        id: keep-the-test-evidence
         if: ${{ !cancelled() }}
-        timeout-minutes: 5
-        uses: ./.github/actions/keep-evidence
+        continue-on-error: true
+        timeout-minutes: 3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-evidence-macos-reference
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: ignore
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the test evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-test-evidence.outcome == 'failure' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the test evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-test-evidence.outcome == 'failure' }}
+        timeout-minutes: 3
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-evidence-macos-reference
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}

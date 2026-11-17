@@ -7,7 +7,7 @@
 //! directories; a job for each class of test on the runner the workflow gives it, whose step is not
 //! disabled and runs under the condition the workflow gives it, with the matrix leg that condition
 //! names still in the matrix; the landing workflow's triggers; the evidence check and the strict
-//! uploads, neither disabled, each made by the evidence action of the directory the tests write to,
+//! uploads, neither disabled, each made by the upload action of the directory the tests write to,
 //! after the step that writes last, none of them cut short or kept for less than the repository's
 //! default; and the table of those jobs in the conformance document. It reads the workflow as text,
 //! line by line, which holds its layout (jobs at two spaces, steps at six, a trigger or a key on a
@@ -641,19 +641,39 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
             !is_disabled(&header(&text)),
             "the {job_name} job is disabled or lets its failure pass"
         );
-        for upload in steps_holding(&text, &format!("name: {artefact}")) {
+        // The first try and the second one: the form of both is held for every upload by the case
+        // below; this one holds what these three jobs' evidence needs of each.
+        let uploads = steps_holding(&text, &format!("name: {artefact}"));
+        assert_eq!(
+            uploads.len(),
+            2,
+            "the {job_name} job's upload of {artefact} is not a first try and a second one"
+        );
+        let id = value_at(&uploads[0], 8, "id")
+            .unwrap_or_else(|| panic!("the first try of {artefact} has no id"));
+        for (upload, second) in uploads.iter().zip([false, true]) {
             assert_eq!(
-                value_at(&upload, 10, "if-no-files-found").as_deref(),
+                value_at(upload, 10, "if-no-files-found").as_deref(),
                 Some("error"),
                 "the {job_name} job's upload of {artefact} does not fail when it kept nothing"
             );
+            // The first try lets its failure pass to the second, and nothing else is disabled.
             assert!(
-                !is_disabled(&upload),
+                if second {
+                    !is_disabled(upload)
+                } else {
+                    value_at(upload, 8, "continue-on-error").as_deref() == Some("true")
+                        && !is_disabled(&upload.replace("continue-on-error: true", ""))
+                },
                 "the {job_name} job's upload of {artefact} is disabled or lets its failure pass"
             );
             assert_eq!(
-                step_condition(&upload),
-                Some(compact("${{ !cancelled() }}")),
+                step_condition(upload),
+                Some(compact(&if second {
+                    format!("${{{{ !cancelled() && steps.{id}.outcome == 'failure' }}}}")
+                } else {
+                    "${{ !cancelled() }}".to_owned()
+                })),
                 "the {job_name} job's upload of {artefact} does not run on every runner whether \
                  the job passed or failed"
             );
@@ -673,13 +693,13 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
                  {writer}, which writes after it"
             );
             // The action that uploads, and the directory it uploads: the one the tests write to.
-            assert_eq!(
-                value_at(&upload, 8, "uses").as_deref(),
-                Some("./.github/actions/keep-evidence"),
-                "the {job_name} job's upload of {artefact} is not made by the evidence action"
+            assert!(
+                value_at(upload, 8, "uses")
+                    .is_some_and(|action| action.starts_with("actions/upload-artifact@")),
+                "the {job_name} job's upload of {artefact} is not made by the upload action"
             );
             assert_eq!(
-                value_at(&upload, 10, "path").map(|found| compact(&found)),
+                value_at(upload, 10, "path").map(|found| compact(&found)),
                 Some(compact(path)),
                 "the {job_name} job's upload of {artefact} keeps a directory other than {path}"
             );
@@ -700,233 +720,209 @@ fn each_class_of_test_has_a_job_that_runs_its_tool_on_a_runner_that_has_it() {
     );
 }
 
-/// KR-REQ-21.01, the action that the landing and conformance workflows keep their evidence
-/// through: it makes the upload twice and no more, each time by the pinned upload action with
-/// the name, the path and the rule it was given and no input of its own (no `overwrite`, which
-/// would delete another artifact of the name, and no retention), the first with its failure let
-/// pass and the second the same, so that the step that follows decides; and that step fails when
-/// the second try did not keep the evidence, whatever the rule for a path that holds nothing.
-#[test]
-fn the_evidence_action_makes_the_upload_twice_and_fails_when_both_tries_fail() {
-    let action = fs::read_to_string(repository().join(".github/actions/keep-evidence/action.yml"))
-        .expect("the evidence action");
-    let text: String = action
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#'))
-        .flat_map(|line| [line, "\n"])
-        .collect();
-    let steps: Vec<&str> = text.split("\n    - name: ").skip(1).collect();
-    let tries: Vec<&str> = steps
-        .iter()
-        .copied()
-        .filter(|step| step.contains("\n      uses: "))
-        .collect();
-    assert_eq!(tries.len(), 2, "the action makes two tries and no more");
-    let conditions = [
-        "${{ always() && inputs.only-load != 'true' }}",
-        "${{ !cancelled() && steps.first.outcome == 'failure' }}",
-    ];
-    let mut pins = Vec::new();
-    for ((step, id), condition) in tries.iter().zip(["first", "second"]).zip(conditions) {
-        assert_eq!(
-            value_at(step, 6, "id").as_deref(),
-            Some(id),
-            "the {id} try has another id"
-        );
-        let uses = value_at(step, 6, "uses").expect("a try is made by an action");
-        let (name, pin) = uses
-            .split_once('@')
-            .expect("an action is named with its pin");
-        assert_eq!(
-            name, "actions/upload-artifact",
-            "the {id} try is made by another action"
-        );
-        assert!(
-            pin.len() == 40 && pin.chars().all(|c| c.is_ascii_hexdigit()),
-            "the {id} try's action is not pinned by its full commit"
-        );
-        pins.push(pin.to_owned());
-        assert_eq!(
-            value_at(step, 6, "continue-on-error").as_deref(),
-            Some("true"),
-            "the {id} try lets its failure pass to the step that decides"
-        );
-        assert_eq!(
-            own_condition(step, 6),
-            Some(compact(condition)),
-            "the {id} try runs under another condition than {condition}"
-        );
-        for input in ["name", "path", "if-no-files-found"] {
-            assert_eq!(
-                value_at(step, 8, input).as_deref(),
-                Some(format!("${{{{ inputs.{input} }}}}").as_str()),
-                "the {id} try does not pass {input} on as it was given"
-            );
-        }
-        let inputs = step
-            .lines()
-            .filter(|line| key_value(line).is_some_and(|(at, _, _)| at == 8))
-            .count();
-        assert_eq!(
-            inputs, 3,
-            "the {id} try sets an input beyond the three it was given"
-        );
-    }
-    assert_eq!(
-        pins[0], pins[1],
-        "the two tries call different versions of the upload action"
-    );
-    // The pause stands between the two tries, and is the one step that waits.
-    let position_of = |id: &str| {
-        steps
-            .iter()
-            .position(|step| value_at(step, 6, "id").as_deref() == Some(id))
-            .unwrap_or_else(|| panic!("the action has no step with the id {id}"))
-    };
-    let pauses: Vec<usize> = (0..steps.len())
-        .filter(|&at| {
-            steps[at]
-                .lines()
-                .any(|line| line.trim().starts_with("sleep "))
-        })
-        .collect();
-    assert_eq!(pauses.len(), 1, "one step of the action waits");
-    assert!(
-        position_of("first") < pauses[0] && pauses[0] < position_of("second"),
-        "the pause does not stand between the first try and the second"
-    );
-    assert!(
-        steps[pauses[0]]
-            .lines()
-            .any(|line| line.trim() == "sleep 60"),
-        "the pause is not 60 seconds"
-    );
-    // Every step after the first try waits on that try having failed, so that a call that only
-    // loads the action (the first try skips) runs none of them.
-    for step in steps
-        .iter()
-        .filter(|step| value_at(step, 6, "id").as_deref() != Some("first"))
-    {
-        assert!(
-            own_condition(step, 6)
-                .is_some_and(|condition| condition.contains("steps.first.outcome=='failure'")),
-            "a step after the first try runs whether or not the first try failed: {step}"
-        );
-    }
-    assert!(
-        text.lines().any(|line| line.trim()
-            == "value: ${{ steps.first.outcome == 'success' && '1' || (steps.second.outcome == 'success' && '2' || '') }}"),
-        "the output `tries` is not 1 for the first try, 2 for the second and empty for neither"
-    );
-    let letting_pass = text
-        .lines()
-        .filter(|line| key_value(line).is_some_and(|(_, key, _)| key == "continue-on-error"))
-        .count();
-    assert_eq!(
-        letting_pass, 2,
-        "a step other than the two tries lets its failure pass"
-    );
-    let failing: Vec<&str> = steps
-        .iter()
-        .copied()
-        .filter(|step| step.contains("exit 1"))
-        .collect();
-    assert_eq!(failing.len(), 1, "one step fails the action");
-    assert_eq!(
-        own_condition(failing[0], 6),
-        Some(compact(
-            "${{ always() && steps.first.outcome == 'failure' && steps.second.outcome != 'success' }}"
-        )),
-        "the step that fails the action runs under another condition than both tries failing"
-    );
+/// The inputs of a step: its `with:` block, without the blank line that ends the step.
+fn inputs_of(step: &str) -> Option<&str> {
+    step.split_once("\n        with:\n")
+        .map(|(_, inputs)| inputs.trim_end())
 }
 
-/// KR-REQ-21.01, where the evidence action is fetched: the runner fetches the upload action that
-/// the evidence action calls when the first step that calls the evidence action starts, which
-/// would be after the hours of work that the evidence comes from. So a job that keeps evidence
-/// through it calls it once in its `only-load` mode, right after its checkout and before any step
-/// that builds or tests, by a step that has no condition and does not let its failure pass, and
-/// keeps its evidence by calls that name an artifact and a path, after it.
+/// The keys that stand at `indent` in a step, in the order they are written.
+fn keys_at(step: &str, indent: usize) -> Vec<String> {
+    step.lines()
+        .filter_map(key_value)
+        .filter(|(at, ..)| *at == indent)
+        .map(|(_, key, _)| key)
+        .collect()
+}
+
+/// KR-REQ-21.01, the second try of every evidence upload: the landing and conformance workflows
+/// keep a job's evidence by the upload action, and a name lookup or a connection that fails for
+/// a moment would fail a job whose every other step passed, hours of tests included. Each upload
+/// is three steps of the workflow, the upload action named in the workflow so that the runner
+/// fetches it when the job is set up: the first try, with its failure let pass; a pause of 60
+/// seconds that runs only where the first try failed; and the second try, the same pinned action
+/// with the same inputs, that runs only there too and whose failure fails the job. Twelve copies
+/// of that cannot drift: this holds the form of every one of them, in the two workflows and in
+/// the proof workflow that exercises it: the three steps in that order, the keys each one has and
+/// no other (so no `overwrite`, no retention, no second `continue-on-error`), the same full pin
+/// and the same inputs in both tries, the conditions, the pause's length, and a limit on all three
+/// steps or on none, equal on the two tries and long enough on the pause.
 #[test]
-fn every_job_that_keeps_evidence_loads_the_evidence_action_right_after_its_checkout() {
-    const ACTION: &str = "./.github/actions/keep-evidence";
-    let mut jobs_that_keep = 0;
-    for file in ["core-ci.yml", "conformance.yml"] {
+fn every_evidence_upload_has_a_second_try_after_a_pause_and_fails_the_job_when_both_fail() {
+    let mut counted = Vec::new();
+    for (file, expected) in [
+        ("core-ci.yml", 9),
+        ("conformance.yml", 3),
+        ("keep-evidence-test.yml", 3),
+    ] {
         let workflow = fs::read_to_string(repository().join(".github/workflows").join(file))
             .expect("a workflow");
+        let mut sites = 0;
         for name in jobs_of(&workflow) {
             let steps = steps_of(&job(&workflow, &name));
-            let calls: Vec<usize> = (0..steps.len())
-                .filter(|&at| value_at(&steps[at], 8, "uses").as_deref() == Some(ACTION))
-                .collect();
-            if calls.is_empty() {
-                continue;
-            }
-            jobs_that_keep += 1;
-            let loading: Vec<usize> = calls
-                .iter()
-                .copied()
+            let uploads: Vec<usize> = (0..steps.len())
                 .filter(|&at| {
-                    value_at(&steps[at], 10, "only-load")
-                        .is_some_and(|value| value.trim_matches('"') == "true")
+                    value_at(&steps[at], 8, "uses")
+                        .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"))
                 })
                 .collect();
-            assert_eq!(
-                loading.len(),
-                1,
-                "{file}: the {name} job does not call the evidence action once to load it"
-            );
-            let at = loading[0];
-            let checkout = steps
-                .iter()
-                .position(|step| {
-                    value_at(step, 8, "uses")
-                        .is_some_and(|action| action.starts_with("actions/checkout@"))
-                })
-                .unwrap_or_else(|| panic!("{file}: the {name} job has no checkout"));
-            assert_eq!(
-                at,
-                checkout + 1,
-                "{file}: the {name} job does not load the evidence action right after its checkout"
-            );
             assert!(
-                own_condition(&steps[at], 8).is_none() && !is_disabled(&steps[at]),
-                "{file}: the {name} job's load of the evidence action has a condition that can \
-                 skip it, or lets its failure pass"
+                uploads.len() % 2 == 0,
+                "{file}: the {name} job has an upload that is not a first try and a second one"
             );
-            for step in &steps[..at] {
-                for word in ["cargo ", "pnpm ", "scripts/"] {
-                    assert!(
-                        !step.contains(word),
-                        "{file}: a step of the {name} job that builds or tests comes before the \
-                         load of the evidence action: {step}"
-                    );
+            let mut ids = Vec::new();
+            for pair in uploads.chunks(2) {
+                let (at, second_at) = (pair[0], pair[1]);
+                let here = format!("{file}: the {name} job's upload at step {at}");
+                assert_eq!(
+                    second_at,
+                    at + 2,
+                    "{here} is not followed by the pause and then the second try"
+                );
+                let (first, pause, second) = (&steps[at], &steps[at + 1], &steps[at + 2]);
+                let allowed =
+                    |keys: Vec<String>, permitted: &[&str], required: &[&str], what: &str| {
+                        assert!(
+                            keys.iter().all(|key| permitted.contains(&key.as_str())),
+                            "{here}: the {what} has a key beyond {permitted:?}: {keys:?}"
+                        );
+                        assert!(
+                            required
+                                .iter()
+                                .all(|key| keys.iter().any(|found| found == key)),
+                            "{here}: the {what} lacks one of {required:?}: {keys:?}"
+                        );
+                    };
+
+                // The first try.
+                allowed(
+                    keys_at(first, 8),
+                    &[
+                        "name",
+                        "id",
+                        "if",
+                        "continue-on-error",
+                        "timeout-minutes",
+                        "uses",
+                        "with",
+                    ],
+                    &["name", "id", "continue-on-error", "uses", "with"],
+                    "first try",
+                );
+                assert_eq!(
+                    value_at(first, 8, "continue-on-error").as_deref(),
+                    Some("true"),
+                    "{here}: the first try does not let its failure pass to the second"
+                );
+                let id = value_at(first, 8, "id").expect("the first try has an id");
+                assert!(
+                    !ids.contains(&id),
+                    "{here}: the id {id} is used twice in the job"
+                );
+                ids.push(id.clone());
+                let uses = value_at(first, 8, "uses").expect("the first try is made by an action");
+                let (action, pin) = uses
+                    .split_once('@')
+                    .expect("an action is named with its pin");
+                assert_eq!(action, "actions/upload-artifact", "{here}: another action");
+                assert!(
+                    pin.len() == 40 && pin.chars().all(|c| c.is_ascii_hexdigit()),
+                    "{here}: the upload action is not pinned by its full commit"
+                );
+                assert_eq!(
+                    keys_at(inputs_of(first).expect("a with"), 10),
+                    ["name", "path", "if-no-files-found"],
+                    "{here}: the first try's inputs are not the name, the path and the rule"
+                );
+
+                // The pause and the second try run only where the first try failed, and only
+                // while the run is not cancelled where the first try ran under a condition.
+                let retry = match own_condition(first, 8) {
+                    None => format!("${{{{ steps.{id}.outcome == 'failure' }}}}"),
+                    Some(_) => {
+                        format!("${{{{ !cancelled() && steps.{id}.outcome == 'failure' }}}}")
+                    }
+                };
+
+                // The pause.
+                allowed(
+                    keys_at(pause, 8),
+                    &["name", "id", "if", "timeout-minutes", "shell", "run"],
+                    &["name", "if", "shell", "run"],
+                    "pause",
+                );
+                assert_eq!(
+                    own_condition(pause, 8),
+                    Some(compact(&retry)),
+                    "{here}: the pause's condition"
+                );
+                assert_eq!(
+                    value_at(pause, 8, "shell").as_deref(),
+                    Some("bash"),
+                    "{here}: the pause's shell"
+                );
+                let run: Vec<&str> = pause.trim_end().lines().rev().take(2).collect();
+                assert!(
+                    run[0].trim() == "sleep 60"
+                        && run[1]
+                            .trim()
+                            .starts_with("echo \"::warning title=Evidence not kept::"),
+                    "{here}: the pause is not a warning and then sleep 60: {run:?}"
+                );
+
+                // The second try: the same action and the same inputs.
+                allowed(
+                    keys_at(second, 8),
+                    &["name", "id", "if", "timeout-minutes", "uses", "with"],
+                    &["name", "if", "uses", "with"],
+                    "second try",
+                );
+                assert_eq!(
+                    own_condition(second, 8),
+                    Some(compact(&retry)),
+                    "{here}: the second try's condition"
+                );
+                assert_eq!(
+                    value_at(second, 8, "uses"),
+                    Some(uses),
+                    "{here}: the second try calls another action or pin"
+                );
+                assert_eq!(
+                    inputs_of(second),
+                    inputs_of(first),
+                    "{here}: the second try's inputs are not the first try's"
+                );
+
+                // Limits: on all three or on none, the same on the two tries, and the pause long
+                // enough for its sleep.
+                let limit = |step: &str| {
+                    value_at(step, 8, "timeout-minutes")
+                        .map(|value| value.parse::<u32>().expect("minutes"))
+                };
+                match (limit(first), limit(pause), limit(second)) {
+                    (None, None, None) => {}
+                    (Some(tries), Some(waits), Some(again)) => {
+                        assert_eq!(tries, again, "{here}: the two tries have different limits");
+                        assert!(
+                            waits >= 2,
+                            "{here}: the pause's limit would cut its sleep of 60 seconds"
+                        );
+                    }
+                    other => panic!(
+                        "{here}: a limit on some of the three steps and not on all: {other:?}"
+                    ),
                 }
-            }
-            let keeping: Vec<usize> = calls.iter().copied().filter(|&call| call != at).collect();
-            assert!(
-                !keeping.is_empty(),
-                "{file}: the {name} job loads the evidence action and keeps nothing through it"
-            );
-            for call in keeping {
-                assert!(
-                    call > at,
-                    "{file}: the {name} job keeps evidence before it loads"
-                );
-                assert!(
-                    value_at(&steps[call], 10, "name").is_some()
-                        && value_at(&steps[call], 10, "path").is_some()
-                        && value_at(&steps[call], 10, "only-load").is_none(),
-                    "{file}: a call of the evidence action in the {name} job names no artifact \
-                     or no path"
-                );
+                sites += 1;
             }
         }
+        counted.push((file, sites, expected));
     }
-    assert!(
-        jobs_that_keep > 0,
-        "no job keeps evidence through the action"
-    );
+    for (file, sites, expected) in counted {
+        assert_eq!(
+            sites, expected,
+            "{file}: the number of evidence uploads with a second try"
+        );
+    }
 }
 
 /// KR-REQ-27.02, the WSL2 run: the release's WSL2 acceptance has a workflow of its own, started by
@@ -1340,7 +1336,7 @@ const LIST: &[Listed] = &[
         ".github/workflows/conformance.yml",
         &[
             ("KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence", 2),
-            ("path: ${{ env.KR_TEST_ARTIFACTS_DIR }}", 3),
+            ("path: ${{ env.KR_TEST_ARTIFACTS_DIR }}", 6),
             (
                 r#""KR_TEST_ARTIFACTS_DIR=$temporary\kr-conformance-evidence" >> $env:GITHUB_ENV"#,
                 1,
@@ -1360,7 +1356,7 @@ const LIST: &[Listed] = &[
                 r#""KR_TEST_ARTIFACTS_DIR=$temporary\kr-test-artifacts" >> $env:GITHUB_ENV"#,
                 1,
             ),
-            ("path: ${{ env.KR_TEST_ARTIFACTS_DIR }}", 5),
+            ("path: ${{ env.KR_TEST_ARTIFACTS_DIR }}", 10),
             ("KR_TEST_ARTIFACTS_DIR: /tmp/kr-shell-qualification", 1),
             (
                 r#"export KR_TEST_ARTIFACTS_DIR="$RUNNER_TEMP/kr-shell-qualification-second""#,

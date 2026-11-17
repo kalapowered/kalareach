@@ -72,14 +72,6 @@ jobs:
         timeout-minutes: 3
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
-
       - name: Install the pinned toolchain
         timeout-minutes: 5
         run: |
@@ -205,9 +197,29 @@ jobs:
           key: conformance-applications-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/conformance/applications.lock', 'scripts/run-conformance.sh') }}
 
       - name: Keep the result and the evidence
+        id: keep-the-result-and-the-evidence
         if: ${{ !cancelled() }}
+        continue-on-error: true
         timeout-minutes: 5
-        uses: ./.github/actions/keep-evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-linux
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the result and the evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-result-and-the-evidence.outcome == 'failure' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the result and the evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-result-and-the-evidence.outcome == 'failure' }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: conformance-linux
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
@@ -243,14 +255,6 @@ jobs:
       - name: Check out
         timeout-minutes: 3
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
 
       # The disk as the image arrives and what takes the room on it, and from here to the last
       # report the lowest free space, sampled every two seconds. The report below is one step of
@@ -463,9 +467,29 @@ jobs:
         run: bash scripts/disk-report.sh end "what the disk has left"
 
       - name: Keep the result and the evidence
+        id: keep-the-result-and-the-evidence
         if: ${{ !cancelled() }}
+        continue-on-error: true
         timeout-minutes: 5
-        uses: ./.github/actions/keep-evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-macos-part-${{ matrix.part }}
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the result and the evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-result-and-the-evidence.outcome == 'failure' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the result and the evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-result-and-the-evidence.outcome == 'failure' }}
+        timeout-minutes: 5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: conformance-macos-part-${{ matrix.part }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
@@ -509,14 +533,6 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      # The runner fetches the action that keeps the evidence when the first step that calls it
-      # starts. This call fetches it now, with the job's other downloads, and keeps nothing.
-      - name: Load the action that keeps the evidence
-        timeout-minutes: 2
-        uses: ./.github/actions/keep-evidence
-        with:
-          only-load: "true"
 
       # The drives as the job starts and, in the step after the report, as it ends. The hosted
       # Windows runner's figures for the workspace drive are not documented, and the run that filled
@@ -650,9 +666,29 @@ jobs:
           }
 
       - name: Keep the result and the evidence
+        id: keep-the-result-and-the-evidence
         if: ${{ !cancelled() }}
+        continue-on-error: true
         timeout-minutes: 10
-        uses: ./.github/actions/keep-evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: conformance-windows-part-${{ matrix.part }}
+          path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
+          if-no-files-found: error
+
+      # The first try failed: wait, then try once more. A second failure fails the job.
+      - name: Keep the result and the evidence, pause before the second try
+        if: ${{ !cancelled() && steps.keep-the-result-and-the-evidence.outcome == 'failure' }}
+        timeout-minutes: 2
+        shell: bash
+        run: |
+          echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
+          sleep 60
+
+      - name: Keep the result and the evidence, second try
+        if: ${{ !cancelled() && steps.keep-the-result-and-the-evidence.outcome == 'failure' }}
+        timeout-minutes: 10
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: conformance-windows-part-${{ matrix.part }}
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
