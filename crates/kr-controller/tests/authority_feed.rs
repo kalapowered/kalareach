@@ -9026,3 +9026,118 @@ async fn a_request_naming_an_owner_record_that_ran_out_is_decided_on_it_alone_wh
     assert!(rig.host.record_of(one.device_id).is_paired());
     assert!(rig.host.record_of(second.device_id).is_paired());
 }
+
+/// KR-REQ-10.46: a request the feed shows complete, which a host that lost the withdrawal replays,
+/// is judged by the record of the identifier it names when the registry holds one, and by the
+/// records that hold its key and have not been revoked when the registry holds none. An owner
+/// device whose record ended, by a revocation or by the end of its grant, and which paired again
+/// with the same key, has two records for the key. The request that names the old record is
+/// decided on that record alone: a revoked one carries nothing out, one that only ran out still
+/// does, as it did before the device paired again. The request that names an identifier no record
+/// holds is carried out through the record that stands, and never raises a refusal for a
+/// withdrawal the host cannot verify.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_completed_request_is_replayed_by_the_record_that_decides_it_when_the_device_paired_again()
+ {
+    for (ended, by_the_old_record, carried_out) in [
+        ("revoked", true, false),
+        ("revoked", false, true),
+        ("ran out", true, true),
+        ("ran out", false, true),
+    ] {
+        let rig = Rig::start().await;
+        let both = [ActionRight::HostManage, ActionRight::SessionView];
+        let (owner_phone, first) = rig.pairs(&both).await;
+        let (_victim_device, victim) = rig.pairs(&[ActionRight::SessionView]).await;
+        let (_spare_device, spare) = rig.pairs(&[ActionRight::SessionView]).await;
+        rig.until_the_carrier_is_idle().await;
+        let key = owner_phone.keys().authorisation.clone();
+
+        // The owner device's record ends, and the device pairs again with the same key.
+        if ended == "revoked" {
+            rig.revokes_at_the_machine(first.device_id).await;
+        } else {
+            rusqlite::Connection::open(rig.host.registry_database())
+                .expect("the registry opens")
+                .execute(
+                    "UPDATE network_devices SET expired_at_ms = ?1 WHERE device_id = ?2",
+                    rusqlite::params![
+                        i64::try_from(kr_ipc::now_ms().get()).expect("a moment"),
+                        first.device_id.get().as_bytes().as_slice()
+                    ],
+                )
+                .expect("the end of the grant is recorded");
+            // One revocation at the machine, so that the registry stands at the revision the feed
+            // is given below, as the revocation of the first record does in the other setup.
+            rig.revokes_at_the_machine(spare.device_id).await;
+        }
+        let second = within(
+            "the owner device pairs again",
+            Box::pin(pair_with(
+                &rig.host,
+                &owner_phone,
+                &rig.owner,
+                proposal(&both),
+            )),
+        )
+        .await;
+        assert_ne!(second.device_id, first.device_id);
+        rig.until_the_carrier_is_idle().await;
+        assert_eq!(
+            rig.host
+                .controller()
+                .authority_revision()
+                .await
+                .expect("a revision")
+                .get(),
+            1,
+            "{ended}: the registry stands at the revision the feed is given"
+        );
+
+        // A request of the owner device that an earlier run carried out and acknowledged: the host
+        // has not taken it, finds it complete in the feed and replays it.
+        let issuer = if by_the_old_record {
+            first.device_id
+        } else {
+            DeviceId::new(kr_ipc::new_uuid())
+        };
+        let request = rig.request_of(&key, issuer, 0xe1, devices(victim.device_id));
+        rig.published_as(&key, &request).await;
+        rig.an_earlier_run_carried_out(&request, 0, 1).await;
+        rig.until_the_carrier_is_idle().await;
+
+        let why = format!(
+            "{ended}, {}",
+            if by_the_old_record {
+                "naming the old record"
+            } else {
+                "naming an identifier no record holds"
+            }
+        );
+        if carried_out {
+            within("the replay carries the withdrawal out", async {
+                while !rig.has_revoked(victim.device_id).await {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+        } else {
+            assert!(
+                !rig.has_revoked(victim.device_id).await,
+                "{why}: a revoked issuer's request is not carried out"
+            );
+        }
+        assert!(
+            !rig.host.controller().policy().withdrawal_unverified(),
+            "{why}: no refusal for a withdrawal the host cannot verify"
+        );
+        assert!(
+            rig.host.record_of(second.device_id).is_paired(),
+            "{why}: the record that stands is untouched"
+        );
+        assert!(
+            !rig.has_revoked(second.device_id).await,
+            "{why}: the record that stands is not revoked"
+        );
+    }
+}
