@@ -1424,6 +1424,14 @@ impl PairingHost {
                 verification_value: locked.verification_value.clone(),
             });
         }
+        // The host's list of devices is read before anything changes, so a read that fails ends
+        // this request with that failure and leaves the invitation as it was: the same request can
+        // be made again. The list is read for the peer's own endpoint, which the transport
+        // authenticated, and it is acted on only once the proofs below held.
+        let listed = self
+            .rows
+            .listed_device(peer.endpoint_id())
+            .map_err(protocol_refusal)?;
         let locked = match offer.invitation.finish(request, peer as &dyn LivePeer) {
             Ok(locked) => locked,
             Err(error) => {
@@ -1433,11 +1441,7 @@ impl PairingHost {
         };
         // After the code proof and the endpoint proof, and before the owner is shown a candidate:
         // a device that this host still lists as paired is refused, and the invitation ends.
-        if let Some(device_id) = self
-            .rows
-            .listed_device(peer.endpoint_id())
-            .map_err(protocol_refusal)?
-        {
+        if let Some(device_id) = listed {
             return Err(protocol_refusal(
                 offer.invitation.refuse_endpoint_paired(device_id),
             ));
@@ -1722,20 +1726,26 @@ impl PairingHost {
             }
             PairRedeemParams::Direct(proof) => {
                 // A redemption that repeats one that already locked the candidate is answered as
-                // it was, and is not asked about the endpoint again.
+                // it was, and is not asked about the endpoint again. The first one reads the
+                // host's list of devices before it changes anything, so a read that fails ends
+                // this request with that failure and leaves the invitation open: the same request
+                // can be made again. The list is read for the peer's own endpoint, which the
+                // transport authenticated, and it is acted on only once the proofs below held.
                 let first = invitation.record().state == InvitationState::Open;
+                let listed = if first {
+                    self.rows
+                        .listed_device(peer.endpoint_id())
+                        .map_err(protocol_refusal)?
+                } else {
+                    None
+                };
                 let refused_for = invitation.record().refused_for;
                 let candidate = invitation
                     .redeem(proof, peer.endpoint_id(), peer as &dyn LivePeer)
                     .map_err(|error| self.refusal_to(peer.endpoint_id(), refused_for, error))?;
                 // After both proofs, and before the owner is shown a candidate: a device that this
                 // host still lists as paired is refused, and the invitation ends.
-                if first
-                    && let Some(device_id) = self
-                        .rows
-                        .listed_device(peer.endpoint_id())
-                        .map_err(protocol_refusal)?
-                {
+                if let Some(device_id) = listed {
                     return Err(protocol_refusal(
                         invitation.refuse_endpoint_paired(device_id),
                     ));

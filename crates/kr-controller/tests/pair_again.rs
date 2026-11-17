@@ -1971,6 +1971,38 @@ fn first_name(host: &Host, device_id: DeviceId) -> String {
     host.record_of(device_id).device_name.as_str().to_owned()
 }
 
+/// Makes the host's record of `device_id` unreadable, as a registry that fails a read does, and
+/// returns what the record held so that [`readable_again`] puts it back.
+fn unreadable(host: &Host, device_id: DeviceId) -> String {
+    let connection = registry(host);
+    let platform: String = connection
+        .query_row(
+            "SELECT platform FROM network_devices WHERE device_id = ?1",
+            [device_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the record's platform");
+    let changed = connection
+        .execute(
+            "UPDATE network_devices SET platform = 'not a platform' WHERE device_id = ?1",
+            [device_id.get().as_bytes().as_slice()],
+        )
+        .expect("the record is made unreadable");
+    assert_eq!(changed, 1, "one record was made unreadable");
+    platform
+}
+
+/// Puts back what [`unreadable`] returned.
+fn readable_again(host: &Host, device_id: DeviceId, platform: &str) {
+    let changed = registry(host)
+        .execute(
+            "UPDATE network_devices SET platform = ?2 WHERE device_id = ?1",
+            rusqlite::params![device_id.get().as_bytes().as_slice(), platform],
+        )
+        .expect("the record is made readable");
+    assert_eq!(changed, 1, "one record was made readable");
+}
+
 /// KR-REQ-10.08: the host's refusal of a device it lists is the same whether the request is
 /// the first or a repeat, on the same connection or on a new one, so a device whose first answer
 /// was lost reads the same code. The invitation's status says the same thing.
@@ -2048,6 +2080,87 @@ async fn a_repeated_redemption_of_a_listed_device_gets_the_first_refusals_code()
         PairStatus::Consumed {
             reason: PairingConsumedReason::EndpointPaired
         }
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the host reads its list of devices before the redemption locks the invitation. A
+/// read that fails there answers the candidate with the failure and changes nothing: no lock, no
+/// candidate, no prompt for the owner. The same request, made again, completes the check and is
+/// refused for the listed device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_failed_read_of_the_list_at_the_redemption_locks_nothing_and_the_repeat_completes_the_check()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let listed = row_of(&host, first.device_id);
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("an invitation");
+
+    let platform = unreadable(&host, first.device_id);
+    let mut redeemed = within(
+        "the redemption while the list cannot be read",
+        BOUND,
+        calls::try_redeem(&phone.candidate(), &invited),
+    )
+    .await;
+    readable_again(&host, first.device_id, &platform);
+    assert_eq!(
+        refusal_code(redeemed.outcome.as_ref().expect_err("the read failed")),
+        "STORAGE_UNAVAILABLE",
+        "the candidate is told that the host could not read its list"
+    );
+
+    let status = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    assert!(
+        matches!(status.status, PairStatus::Open { .. }),
+        "nothing is locked after the failed read: {:?}",
+        status.status
+    );
+    let view = status.owner.0.expect("an owner view");
+    assert!(
+        view.candidate.0.is_none(),
+        "the owner is shown no candidate after the failed read"
+    );
+
+    let again: Result<kr_protocol::preauth::PairRedeemResult, _> = within(
+        "the same request again",
+        BOUND,
+        redeemed
+            .candidate
+            .call(Method::PairRedeem, &redeemed.request),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(&again.expect_err("the repeat completes the check and is refused")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+    let ended = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    assert_eq!(
+        ended.status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::EndpointPaired
+        },
+        "the invitation ended for the device that is listed"
+    );
+    assert_eq!(
+        row_of(&host, first.device_id),
+        listed,
+        "the listed record is as it was"
     );
     host.stop().await;
 }
@@ -2447,6 +2560,78 @@ async fn a_room_admission_after_the_invitation_ended_for_a_listed_device_gets_th
         code,
         ErrorCode::PairingRejected,
         "an admission is not told that the host lists a device"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: as for a direct invitation, the host reads its list of devices before `pair.finish`
+/// moves the attempt on. A read that fails there answers the candidate with the failure and changes
+/// nothing: the invitation stays locked to the candidate's attempt that proved the code, no device
+/// is bound and the owner is shown no candidate. The same finish, made again, completes the check
+/// and is refused for the listed device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_failed_read_of_the_list_at_the_code_finish_moves_nothing_and_the_repeat_completes_the_check()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let listed = row_of(&host, first.device_id);
+    let mut client = host.client().await;
+    let (invited, mut candidate) = code_candidate(&host, &phone, &mut client, &owner).await;
+
+    let platform = unreadable(&host, first.device_id);
+    let mut failed = within(
+        "the finish while the list cannot be read",
+        BOUND,
+        candidate.try_finish(),
+    )
+    .await;
+    readable_again(&host, first.device_id, &platform);
+    assert_eq!(
+        refusal_code(failed.outcome.as_ref().expect_err("the read failed")),
+        "STORAGE_UNAVAILABLE",
+        "the candidate is told that the host could not read its list"
+    );
+
+    let status = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    assert!(
+        matches!(status.status, PairStatus::Locked { .. }),
+        "the attempt has not moved on: {:?}",
+        status.status
+    );
+    let view = status.owner.0.expect("an owner view");
+    assert!(
+        view.candidate.0.is_none(),
+        "the owner is shown no candidate and no approval is asked for after the failed read"
+    );
+
+    let again = within(
+        "the same finish again",
+        BOUND,
+        candidate.finish_over(&mut failed.session),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(&again.expect_err("the repeat completes the check and is refused")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+    let ended = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view");
+    assert_eq!(
+        ended.status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::EndpointPaired
+        },
+        "the invitation ended for the device that is listed"
+    );
+    assert_eq!(
+        row_of(&host, first.device_id),
+        listed,
+        "the listed record is as it was"
     );
     host.stop().await;
 }
