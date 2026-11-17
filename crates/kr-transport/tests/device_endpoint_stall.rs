@@ -480,7 +480,14 @@ async fn send_loop(connection: Connection, sent: Arc<AtomicUsize>) {
 /// One question to the healthy host: when it started, and how long the answer took, or why none came.
 type Outcome = Option<(Instant, Result<Duration, String>)>;
 
-fn spawn_question(connection: Connection, slots: &Arc<Mutex<Vec<Outcome>>>) -> JoinHandle<()> {
+/// Asks one question on a task of its own. The task takes the question's start right before it
+/// asks and the answer's arrival right after the answer comes, so both are recorded by the task
+/// that sends and receives. `began` is set once the start is taken.
+fn spawn_question(
+    connection: Connection,
+    slots: &Arc<Mutex<Vec<Outcome>>>,
+    began: Option<Arc<AtomicBool>>,
+) -> JoinHandle<()> {
     let index = {
         let mut slots = slots.lock().unwrap_or_else(PoisonError::into_inner);
         slots.push(None);
@@ -489,6 +496,9 @@ fn spawn_question(connection: Connection, slots: &Arc<Mutex<Vec<Outcome>>>) -> J
     let slots = Arc::clone(slots);
     tokio::spawn(async move {
         let started = Instant::now();
+        if let Some(began) = began {
+            began.store(true, Ordering::SeqCst);
+        }
         let outcome = match tokio::time::timeout(PATIENCE, ask(&connection)).await {
             Ok(Ok(())) => Ok(started.elapsed()),
             Ok(Err(reason)) => Err(reason),
@@ -562,9 +572,12 @@ fn tally(outcomes: &[(Instant, Result<Duration, String>)]) -> (usize, usize, Dur
 /// One question every `interval` to one connection, each on a task of its own, until
 /// [`Asker::finish`].
 struct Asker {
+    connection: Connection,
     slots: Arc<Mutex<Vec<Outcome>>>,
     stop: Arc<AtomicBool>,
     task: JoinHandle<()>,
+    /// The questions that the case asked itself, outside the ticks, by [`Asker::ask_now`].
+    extra: Mutex<Vec<JoinHandle<()>>>,
 }
 
 impl Asker {
@@ -580,14 +593,40 @@ impl Asker {
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 while !stop.load(Ordering::SeqCst) {
                     tick.tick().await;
-                    tasks.push(spawn_question(connection.clone(), &slots));
+                    tasks.push(spawn_question(connection.clone(), &slots, None));
                 }
                 for task in tasks {
                     let _ = task.await;
                 }
             })
         };
-        Self { slots, stop, task }
+        Self {
+            connection: connection.clone(),
+            slots,
+            stop,
+            task,
+            extra: Mutex::default(),
+        }
+    }
+
+    /// Asks one more question now, outside the ticks, and returns once the question's task has
+    /// taken its start. The start is recorded by that task, so it is later than anything that
+    /// happened before this call and earlier than anything that happens after it returns.
+    async fn ask_now(&self) {
+        let began = Arc::new(AtomicBool::new(false));
+        let task = spawn_question(
+            self.connection.clone(),
+            &self.slots,
+            Some(Arc::clone(&began)),
+        );
+        self.extra
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(task);
+        until("the case's own question to start", || {
+            began.load(Ordering::SeqCst)
+        })
+        .await;
     }
 
     fn started(&self) -> usize {
@@ -613,6 +652,10 @@ impl Asker {
     async fn finish(self) -> Vec<(Instant, Result<Duration, String>)> {
         self.stop.store(true, Ordering::SeqCst);
         let _ = self.task.await;
+        let extra = std::mem::take(&mut *self.extra.lock().unwrap_or_else(PoisonError::into_inner));
+        for task in extra {
+            let _ = task.await;
+        }
         self.slots
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -984,22 +1027,28 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
     )];
     let mut failures = Vec::new();
     let mut windows: Vec<(Instant, Instant)> = Vec::new();
-    // When every pump of the front waited at the gate in each stop, or none if one did not.
+    // When every pump of the front waited at the gate in each stop, or none if one did not. The
+    // front takes this instant, and the instant of each resume, at the event under its own lock.
     let mut stood: Vec<Option<Instant>> = Vec::new();
     for stop in 1..=stops {
         front.stall();
         let switched = Instant::now();
         // The stop is judged from the moment that every pump waits at the gate: no pause decides it.
         match front.confirm_stopped(STAND).await {
-            Ok(()) => stood.push(Some(Instant::now())),
+            Ok(at) => {
+                stood.push(Some(at));
+                // One question of the case's own in each window, so that no delay of the others'
+                // tasks can leave the window empty: its start is taken after the front's instant
+                // and before the resume.
+                asking[0].ask_now().await;
+            }
             Err(reason) => {
                 failures.push(format!("stop {stop}: {reason}"));
                 stood.push(None);
             }
         }
         tokio::time::sleep(stop_for.saturating_sub(switched.elapsed())).await;
-        let resumed = Instant::now();
-        front.resume();
+        let resumed = front.resume();
         windows.push((switched, resumed));
         let deadline = resumed + RECOVERY * 2;
         while Instant::now() < deadline
@@ -1092,7 +1141,10 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
     }
     // The stops' own effect, judged now that every question has ended. A stopped front passes no byte
     // either way, so a question that was asked once every pump waited at the gate gets no answer
-    // before the resume.
+    // before the resume. Every instant compared here is taken where its event happens, at the event,
+    // and no instant of the case's own task is used: the stop's confirmation and the resume by the
+    // front under its lock, a question's start and its answer's arrival by the question's own task.
+    // A delay of any task can only move the question's recorded start or arrival later.
     for (number, ((_, resumed), stood)) in windows.iter().zip(&stood).enumerate() {
         let Some(stood) = stood else { continue };
         let (mut in_window, mut answered_early) = (0, 0);
