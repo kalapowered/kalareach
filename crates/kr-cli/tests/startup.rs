@@ -8238,3 +8238,96 @@ fn a_restart_that_waits_for_a_holder_names_the_process_the_answering_daemon_stat
     drop(held);
     daemon.end();
 }
+
+/// The restart's successor time-out after a stop: the daemon that was asked goes (the greeting is
+/// answered, and the request cannot be made or its answer is cut), its process ends, another process
+/// holds the environment and nothing ever answers. The command waits out its bound and fails with
+/// exit 1. Its text opens with the stop's own words for what the stop came to (`opening_of` gives
+/// their beginning and their end, from the environment, the old process and the successor), and then
+/// says what was read of the successor as an earlier reading.
+fn a_successor_never_answers_after(
+    on_stop: OnStop,
+    opening_of: impl Fn(&str, u32, u32) -> (String, &'static str),
+) {
+    let host = Standalone::create();
+    host.run_the_daemon_as_the_started_process();
+    host.select_standalone();
+    let lock = host.tree.environment().singleton_lock();
+    let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
+        .expect("takes the lock");
+    let mut old = a_process_named_kr_controller(&host, "old");
+    let mut successor = a_process_named_kr_controller(&host, "successor");
+    std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
+    let mut daemon = TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop, true, 0);
+    let running = start(host.kr(&["--json", "host", "restart"]));
+    let looked_for = Instant::now() + Duration::from_secs(60);
+    while daemon.stopped_listening_at().is_none() {
+        assert!(
+            Instant::now() < looked_for,
+            "the daemon that was asked never ended"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The old daemon ends, and the lock is held again by the one that replaces it, which never
+    // answers: nothing listens.
+    old.kill().expect("ends the old daemon");
+    old.wait().expect("collects it");
+    std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
+    let output = running.finish("kr host restart");
+    let said = document(&output, "kr host restart");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    let message = said["message"].as_str().expect("a message");
+    let id = host.tree.environment_id();
+    let (opening, closing) = opening_of(&id.to_string(), old.id(), successor.id());
+    let after = format!(
+        " After it ended, a control daemon (process {}) held environment {id}, and no control daemon answered within 30 seconds: ",
+        successor.id()
+    );
+    assert!(
+        message.starts_with(&opening) && message.contains(&format!("{closing}{after}")),
+        "the stop's words, then the earlier reading of the successor: {message}"
+    );
+    assert!(
+        message.ends_with(". No new daemon was started. Run kr host restart again."),
+        "{message}"
+    );
+    assert!(
+        !message.contains("the daemon that was stopped ended"),
+        "{message}"
+    );
+    assert!(host.running().is_empty(), "nothing was started");
+    let _ = successor.kill();
+    let _ = successor.wait();
+    drop(held);
+    daemon.end();
+}
+
+/// KR-REQ-07.12 (a successor that never answers, after a request that could not be made): the
+/// failure opens with the stop's own words for a daemon that ended with another process holding the
+/// environment, where no request was made, and never says that the daemon was stopped.
+#[test]
+fn a_successor_that_never_answers_after_a_request_that_could_not_be_made_keeps_the_stops_words() {
+    a_successor_never_answers_after(OnStop::CloseAfterTheLookAndEnd, |id, old, successor| {
+        (
+            format!(
+                "The control daemon (process {old}) ended; process {successor} now holds environment {id}, so something started it again."
+            ),
+            "",
+        )
+    });
+}
+
+/// KR-REQ-07.12 (a successor that never answers, after a request whose outcome is not known): the
+/// failure opens with the stop's own words for an unknown outcome and never says that the daemon was
+/// stopped.
+#[test]
+fn a_successor_that_never_answers_after_an_unknown_stop_keeps_the_stops_words() {
+    a_successor_never_answers_after(OnStop::AnswerTheLaunchThenCut, |id, old, _successor| {
+        (
+            format!(
+                "The control daemon for environment {id} (process {old}) did not show whether it took the stop ("
+            ),
+            "), and it has ended.",
+        )
+    });
+}
