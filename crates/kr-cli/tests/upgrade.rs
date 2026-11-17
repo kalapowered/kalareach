@@ -2204,9 +2204,9 @@ async fn a_mutation_of_a_paired_device_is_performed_by_the_worker_of_the_release
 /// KR-REQ-26.06, KR-REQ-08.53, KR-REQ-20.23: a device paired with the updated host types into the
 /// session of the release before through the new daemon. That worker reads the same input as this
 /// build's, so the daemon gives it a bytes write as it is and a write of console key records as it
-/// is, and the session's shell runs the line of each, in the order the writes were numbered. The
-/// bytes go through the device's input lane and the key records, which that lane does not carry,
-/// as the raw request a device of an earlier release sends.
+/// is, and the session's shell runs the line of each. The bytes go through the device's input lane
+/// and the key records, which that lane does not carry, as the raw request a device of an earlier
+/// release sends.
 ///
 /// Each line the shell runs makes a file named by an arithmetic expansion the typed text does not
 /// contain, so a file shows that the line was run and not that it was typed. The files are waited
@@ -2356,7 +2356,8 @@ async fn a_paired_device_types_bytes_and_key_records_into_the_session_of_the_rel
         );
     }
 
-    // The shell ran the lines it was given, in order.
+    // The shell ran each of the lines it was given: each file exists, and the case does not check
+    // the order in which the lines ran.
     for name in ["kept-42", "keys-42", "after-42"] {
         let file = marks.join(name);
         until(
