@@ -797,8 +797,9 @@ launch sends, which is the command alone. A package gives the command its manife
 command integration, whether or not the installation holds the capability that lets it run, and
 otherwise the file stem of its first match rule that names no directory. Nothing says the
 executable is installed: the shell reports that when the command runs. A worker states
-`shell.launch.surface/1` in its hello answer when it serves the read, and a caller asks only a
-worker that states it.
+`shell.launch.surface/1` in its hello answer when it serves the read. A client on the same machine
+asks only a worker that states it, as a daemon of an earlier release did; this release's daemon
+forwards the read to every worker, because every worker of a level it retains states it.
 
 `EditorFence` is the ownership proof the whole group rests on: the root process with the kernel's
 record of when it started, the prompt generation, the reader revision, the input-lease epoch and

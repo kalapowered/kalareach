@@ -6,10 +6,11 @@
 //! file, and a row here that the result does not vouch for is never served.
 //!
 //! The record is a database of its own, and not a table of the change-set store: that store's
-//! schema is one every release before this one has to be able to read, and a report nothing before
-//! this release asks for is not a reason to move it. A release that does not name this file leaves
-//! it alone and records its results without a report, and a host rolled back to it loses nothing
-//! it protected: the reports are an account of what a suite wrote, not a restriction.
+//! schema is one every release before this one has to be able to read, and a report, which no
+//! release before the reports feature asks for, is not a reason to move it. A release that does
+//! not name this file leaves it alone and records its results without a report, and a host rolled
+//! back to it loses nothing it protected: the reports are an account of what a suite wrote, not a
+//! restriction.
 //!
 //! A row is kept for as long as the run's result is: a result is never deleted while the version it
 //! names exists, so the store forgets a run only when the change-set store holds no result for it

@@ -333,8 +333,7 @@ fn diagnostics_with(metrics: Option<Value>) -> ParamsValue {
     ))
 }
 
-/// A host of the level before this one sends no `metrics` member, and a client at this level reads
-/// what it sends: the answer decodes, and says it carries no metrics.
+/// A diagnostics answer with no `metrics` member decodes, and says it carries no metrics.
 #[test]
 fn an_older_hosts_diagnostics_without_metrics_decode() {
     let decoded = diagnostics_with(None)
