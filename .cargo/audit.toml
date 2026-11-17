@@ -5,9 +5,11 @@
 # reports a vulnerability, unsound code or an unmaintained crate. A crate that the lock takes from
 # Git is not checked, because `cargo audit` matches an advisory only to a crate from the advisory's
 # own source; docs/README.md lists those crates. An advisory is let through only by naming it below,
-# with the reason it is accepted and the condition for taking it out again. An informational notice
-# is printed and does not fail the check, because `cargo audit` has no setting that would make it. A
-# yanked release is not an advisory, and the check does not look for one.
+# with the reason it is accepted and the condition for taking it out again. The tool ignores an
+# advisory by its identifier, for every version of the crate and every route to it, so only the
+# review of a lock change guards against a new route to a crate named below. An informational
+# notice is printed and does not fail the check, because `cargo audit` has no setting that would
+# make it. A yanked release is not an advisory, and the check does not look for one.
 
 [advisories]
 ignore = [
@@ -48,38 +50,51 @@ ignore = [
     # zip 8.6.0 has eight advisories about reading an archive that an attacker made. Its one user
     # here is the build script of libsodium-sys-stable, which for a Windows (MSVC) target unpacks
     # libsodium's prebuilt libraries from an archive on libsodium's download host. The crate does
-    # not ship that archive: the build reads it from SODIUM_DIST_DIR, where continuous integration
-    # places it, or else downloads it over plain HTTP. Either way the script unpacks it only after
-    # checking its minisign signature against libsodium's public key, which the script holds, so
-    # only an archive that upstream's key signed reaches extraction. The script's only calls into
-    # zip are `ZipArchive::new` and `ZipArchive::extract`. 0546 is about `extract`, so the script
+    # not ship that archive. The build script reads it from one of three places: SODIUM_DIST_DIR,
+    # where continuous integration places it; a copy that an earlier download left in the crate's
+    # source folder; or a download over plain HTTP. Continuous integration places it with
+    # scripts/place-libsodium-archive.sh, which fixes the archive's size and SHA-256 digest and
+    # refuses any other bytes before the build reads the archive. From all three places the build
+    # script unpacks the archive only after checking its minisign signature against libsodium's
+    # public key, which the build script holds, on the same bytes that it passes to zip, so only an
+    # archive that upstream's key signed reaches extraction. The build script's only calls into zip
+    # are `ZipArchive::new` and `ZipArchive::extract`. 0546 is about `extract`, so the build script
     # reaches it, behind that signature check. 0545 needs the zip crate's `aes-crypto` feature and
-    # 0547 its `legacy-zip` feature. The script asks for `deflate` alone, and the lock's entry for
-    # zip 8.6.0 holds none of the crates that those two features add (aes, hmac, pbkdf2, sha1 and
-    # bitstream-io). 0548 is about `ZipStreamReader`, which the script does not call. The fixes
-    # are in zip 9.0.0, and in 9.0.5 for 0548. The pinned crate, libsodium-sys-stable 1.24.0,
-    # asks for zip 8. Its release 1.24.5 allows zip 9 but bundles a snapshot of libsodium's
-    # unreleased stable branch instead of the 1.0.22 release, and this workspace builds
-    # libsodium's source only at a release tag. The host's own reader of a Windows release
-    # archive, in kr-cli, uses zip 9. Remove these once the lock carries no zip older than 9.0.5.
+    # 0547 its `legacy-zip` feature. The build script asks for `deflate` alone, and the lock's entry
+    # for zip 8.6.0 holds none of the crates that those two features add (aes, constant_time_eq,
+    # getrandom, hmac, pbkdf2, sha1 and zeroize for the first, bitstream-io for the second). 0545 is
+    # about an AES entry whose data ends early or is empty. 0548 is about the stream functions
+    # `ZipStreamReader::visit`, `ZipStreamReader::extract` and `read_zipfile_from_stream`, which
+    # neither the build script nor any crate of ours calls. Its fix in 9.0.5 is an opt-in check,
+    # `ZipStreamReader::enforce_header_consistency(true)`, that is off by default, so a later use of
+    # the stream reader in a crate of ours must turn it on. The other seven fixes are in zip 9.0.0.
+    # The pinned crate, libsodium-sys-stable 1.24.0, asks for zip 8. Its releases 1.24.4, 1.24.5 and
+    # 1.24.6 ask for zip 9.4 or a later 9.x. The source of 1.24.5 alone was checked: it bundles a
+    # snapshot of libsodium's unreleased stable branch instead of the 1.0.22 release, and this
+    # workspace builds libsodium's source only at a release tag. The host's own reader of a Windows
+    # release archive, in kr-cli, uses zip 9. Remove these once the lock carries no zip older than
+    # 9.0.5.
     "RUSTSEC-2026-0367", # set-user-ID and set-group-ID bits kept
     "RUSTSEC-2026-0368", # symbolic links whose targets leave the destination
     "RUSTSEC-2026-0369", # permissions applied through a symbolic link
     "RUSTSEC-2026-0429", # an abort on a symbolic link entry that declares a large size
-    "RUSTSEC-2026-0545", # AES entries read without checking their authentication code
+    "RUSTSEC-2026-0545", # AES entries unchecked when the data ends early or is empty
     "RUSTSEC-2026-0546", # `extract` writes outside the destination through symbolic links
     "RUSTSEC-2026-0547", # legacy Shrink, Reduce and Implode decoders preallocate a declared size
-    "RUSTSEC-2026-0548", # `ZipStreamReader` trusts the names in the local headers
+    "RUSTSEC-2026-0548", # stream functions trust local-header names; the fix is opt-in
     # chrono 0.4.45 is unmaintained. The advisory names no defect and lists no patched version, and
-    # it names `jiff` and `time` as alternatives. No crate of ours names chrono. A build of the
-    # workspace reaches it by two routes. On every platform it comes with rmcp 3.9.0, the
+    # it names `jiff` and `time` as alternatives. No crate of ours names chrono. The programs that
+    # we ship reach it by two routes. On every platform it comes with rmcp 3.9.0, the
     # tool-protocol crate that the command line (kr-cli) and the hook (kr-hook) use, and with the
     # `chrono04` feature that rmcp's `schemars` feature turns on in schemars 1.2.2. On Windows
     # alone it comes with wmi 0.18.4, which the transport library's network watcher (netwatch
     # 0.19.3, under iroh 1.4.1 and portmapper 0.19.3) uses. The lock lists it under two more
-    # crates, serde_with 3.23.0 and tokio-rustls-acme 0.9.1, but a build with the workspace's
-    # default features does not take it through either. Remove this once the lock carries no
-    # chrono.
+    # crates. serde_with 3.23.0 names it only in weak features that no build turns on.
+    # tokio-rustls-acme 0.9.1 comes with iroh-relay's `server` feature, which no normal or build
+    # dependency of the workspace turns on: only the dev-dependencies of kr-transport and
+    # kr-controller do, so only their test builds take chrono through it. No program that we ship
+    # takes it through either. Remove this once the lock carries no chrono or the notice is
+    # withdrawn.
     "RUSTSEC-2026-0543",
     # zvariant 5.15.0, zbus_names 4.3.4 and zvariant_derive 5.15.0 are unmaintained: each was merged
     # into zbus 6.0.0, as its wire module, its names module and its derive macros. They come with
