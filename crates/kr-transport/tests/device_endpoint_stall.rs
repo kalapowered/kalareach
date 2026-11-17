@@ -26,9 +26,12 @@
 //! that was asked after the last resume, or, if one has not answered by twice [`RECOVERY`] after
 //! that resume, at that time. After each switch the case waits until every pump of the front waits
 //! at the gate, and it judges the stop by the questions that were asked from then until the resume.
-//! It fails unless every connection stays open, each is answered again within [`RECOVERY`] after
-//! each resume, every question to them is answered, every pump waits at the gate within [`STAND`]
-//! of each switch, at least one question is asked in each stop's window, none of the questions
+//! The two ends of that window are instants that the front takes itself, under its lock, when its
+//! last pump goes to the gate and when it resumes, and the case asks one question of its own in
+//! each window, so a window cannot be empty by a delay of the case. It fails unless every
+//! connection stays open, each is answered again within [`RECOVERY`] after each resume, every
+//! question to them is answered, every pump waits at the gate within [`STAND`] of the start of the
+//! case's wait for it, at least one question is asked in each stop's window, none of the questions
 //! asked in a window is answered before the relay resumes, and the healthy host stays under the
 //! limit through every stop. The windows are judged once every question has ended. It prints how
 //! many datagrams the relay actor dropped for the stopped relay's queue in each stop and outside
@@ -81,10 +84,13 @@ const HOST_INTERVAL: Duration = Duration::from_millis(500);
 const STOPS: usize = 3;
 const STOP_FOR: Duration = Duration::from_secs(5);
 
-/// The longest that the recovery case waits after a switch for every pump of the front to wait at
-/// the gate. A pump has at most one read and one write to finish, which takes milliseconds; a pump
-/// that still runs after this is stuck, and the case fails with a line of its own. It is shorter
-/// than a stop, so each stop keeps a window.
+/// The longest that the blocking wait of the recovery case for the front's pumps runs, counted
+/// from the moment that the wait starts on its own thread. A pump has at most one read and one write
+/// to finish, which takes milliseconds on a host that is not loaded, and the wait ends as soon as
+/// the last pump waits at the gate. This bounds the wait only: it does not bound the dispatch of
+/// the blocking thread or the case's next poll, and a pump that misses it is not necessarily stuck,
+/// because a host under load can delay a pump past it. The case then fails the stop with a line of
+/// its own and judges no window for it. It is shorter than a stop, so each stop keeps a window.
 const STAND: Duration = Duration::from_secs(3);
 
 /// The longest that a connection to a host on the relay that resumed may take to answer a question
@@ -990,11 +996,11 @@ async fn arrangement(hosts: usize) -> (Vec<String>, Vec<String>) {
 
 /// The recovery arrangement: `hosts` hosts with [`CONNECTIONS_PER_HOST`] connections each on the
 /// relay that stops `stops` times for `stop_for`, a small question every [`HOST_INTERVAL`] on each of
-/// those connections, and the next stop only once every one of them has answered a question that
-/// was asked after the resume, or at the deadline of that wait. Each stop is checked once every
-/// question has ended: no question that was asked after every pump of the front waited at the gate,
-/// and before the resume, may have been answered before the resume. Returns the lines it printed,
-/// and the conditions it failed.
+/// those connections, and the next stop once every one of them has answered a question that was
+/// asked after the resume, or at twice [`RECOVERY`] after that resume. Each stop is checked once
+/// every question has ended: no question that was asked after every pump of the front waited at
+/// the gate, and before the resume, may have been answered before the resume. Returns the lines it
+/// printed, and the conditions it failed.
 async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String>, Vec<String>) {
     let seen = capture();
     let world = World::start(hosts, Load::Questions).await;
@@ -1023,7 +1029,8 @@ async fn recovery(hosts: usize, stops: usize, stop_for: Duration) -> (Vec<String
 
     let connections = world.held.len();
     let mut lines = vec![format!(
-        "ARRANGEMENT RECOVERY K={hosts} N={connections}: {stops} stops of {stop_for:?}, a question to each connection every {HOST_INTERVAL:?}, the next stop only after every connection answered a question asked after the resume (within {RECOVERY:?})"
+        "ARRANGEMENT RECOVERY K={hosts} N={connections}: {stops} stops of {stop_for:?}, a question to each connection every {HOST_INTERVAL:?}, the next stop follows once every connection answered a question asked after the resume (within {RECOVERY:?}), or at {:?} after the resume",
+        RECOVERY * 2
     )];
     let mut failures = Vec::new();
     let mut windows: Vec<(Instant, Instant)> = Vec::new();
