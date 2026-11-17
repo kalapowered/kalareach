@@ -257,8 +257,9 @@ impl RelayFront {
     /// hold of the lock in which the last pump went to the gate, or at the switch if every pump
     /// already waited, so it does not depend on when the blocking thread or the caller runs: a
     /// byte that the device sends after that instant cannot cross the front before the resume.
-    /// A front that is not stopped has no stop to confirm: it returns at once with the instant of
-    /// the call.
+    /// A front that is not stopped has no stop to confirm: it returns an error at once, with words
+    /// of its own, and no instant, so a check that needs the stop cannot pass on a front that
+    /// never stopped.
     ///
     /// What it shows: once it returns, no pump takes another read or writes another chunk before
     /// the next resume, so a byte that the device sends after it returns cannot cross the front. A
@@ -446,8 +447,8 @@ impl Stop {
 
     /// Waits while the front is stopped and a pump runs outside the gate, for at most `bound`.
     /// Returns the instant at which the stop was confirmed, which a pump took in the hold of the
-    /// lock in which it went to the gate; a front that is not stopped has none, and the instant is
-    /// then that of the call.
+    /// lock in which it went to the gate. A front that is not stopped has no such record: it is an
+    /// error, with words of its own, and no instant.
     fn wait_until_standing(&self, bound: Duration) -> Result<Instant, String> {
         let (state, waited) = self
             .changed
@@ -457,11 +458,13 @@ impl Stop {
             .unwrap_or_else(PoisonError::into_inner);
         if waited.timed_out() {
             Err(format!(
-                "{} pumps of the front did not wait at the gate within {bound:?} of the switch",
+                "{} pumps of the front did not wait at the gate within {bound:?} of the start of the wait",
                 state.running
             ))
         } else {
-            Ok(state.confirmed.unwrap_or_else(Instant::now))
+            state.confirmed.ok_or_else(|| {
+                "the front is not stopped, so there is no stop to confirm".to_owned()
+            })
         }
     }
 }
