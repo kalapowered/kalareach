@@ -6,16 +6,19 @@
 //! by file, function and callee, with how many there are. A write with no row, a row with no
 //! write, a different number of writes, a scope row with no function and a row outside the scope
 //! each fail the case. The reader of source text, and what it does not see, is in
-//! `standing_scan/mod.rs`: it does not follow a call into another function, but it holds a
-//! boundary at each scoped body: a call to a function of this crate that the roster neither reads,
-//! declares outside the scope nor allows fails, so a helper cannot hide a write. The functions
-//! that make the time contract's writes (the full check, the second raise, the kept reading) are
-//! listed by caller across the whole crate.
+//! `standing_scan/mod.rs`: it reads the body of every helper that a listed body calls by a name
+//! that this crate declares once, and the helpers those call in turn, so a helper cannot hide a
+//! write; a name that several functions declare has to be a scoped function, an `outside` one or
+//! allowed for the one body that calls it. The functions that make the time contract's writes
+//! (the full check, the second raise, the kept reading) are listed by caller across the whole
+//! crate.
 //!
 //! The cases after the first plant a fault in the real source and show the scan reporting it with
 //! the one finding that names the place: a write in a function that may make none, each of the
 //! time contract's writers called from a pure reader or from the gate's standing comparison, a
-//! call to a helper that no row declares, and a new caller of a time-contract writer.
+//! write in a helper that no row declares, in a helper that a listed body calls (the time
+//! contract's lock function; the question that checks a resolvable request), a name allowed for
+//! one body and called by another, and a new caller of a time-contract writer.
 
 #[path = "standing_scan/mod.rs"]
 mod scan;
@@ -177,22 +180,77 @@ fn a_note_of_a_fault_planted_in_the_limits_piece_is_reported() {
         "        self.service\n            .check_admission_limits(held, caller, state, mutation, method, subject, shown)",
         "        self.service.runtime.session().note_journal_failure(1.to_string());\n        self.service\n            .check_admission_limits(held, caller, state, mutation, method, subject, shown)",
     );
-    only_finding(
-        &found,
-        "service/standing.rs limits calls note_journal_failure 1 time(s)",
+    // The note itself, and the session that the plant takes to make it.
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .any(|line| line
+                .contains("service/standing.rs limits calls note_journal_failure 1 time(s)")),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|line| line.contains("service/standing.rs limits calls session,")),
+        "{found:?}"
     );
 }
 
 #[test]
-fn a_call_to_a_helper_that_no_row_declares_is_reported() {
+fn a_write_planted_in_a_helper_that_no_row_declares_is_reported() {
+    // The helper is new and no row names it: it is read all the same, and what it writes is found.
     let found = planted(
         GATE,
         "    pub fn check_bound(&self) -> Result<(), Refused> {\n        let bound = self.lock().bound;",
-        "    fn hidden_reader(&self) {}\n\n    pub fn check_bound(&self) -> Result<(), Refused> {\n        let bound = self.lock().bound;\n        self.hidden_reader();",
+        "    fn hidden_reader(&self) {\n        self.time.raise(0);\n    }\n\n    pub fn check_bound(&self) -> Result<(), Refused> {\n        let bound = self.lock().bound;\n        self.hidden_reader();",
     );
     only_finding(
         &found,
-        "local_gate.rs check_bound calls hidden_reader, which is neither counted, in the scope, outside it nor allowed",
+        "local_gate.rs hidden_reader calls raise 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_floor_raise_planted_in_the_time_contracts_lock_function_is_reported() {
+    // `pure_proven_ms` calls `lock`, which the roster reads as a function of its own.
+    let found = planted(
+        TIME,
+        "    fn lock(&self) -> std::sync::MutexGuard<'_, TimeState> {\n        self.state",
+        "    fn lock(&self) -> std::sync::MutexGuard<'_, TimeState> {\n        if let Some(floor) = &self.floor {\n            floor.raise(0);\n        }\n        self.state",
+    );
+    only_finding(
+        &found,
+        "action/time.rs lock calls raise 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_sweep_planted_in_the_question_that_checks_a_resolvable_request_is_reported() {
+    // `validate` reaches `check_resolvable_reaching` through `check_resolvable`, in the pass's
+    // second mode too: a sweep there is a write that the pass does not make.
+    let found = planted(
+        "crates/kr-worker/src/questions/mod.rs",
+        "        let question = self.locked()?.read(question_id)?;\n        if !reaches(&question) {",
+        "        let _swept = self.locked()?.expire_due(now, self.agents.as_deref())?;\n        let question = self.locked()?.read(question_id)?;\n        if !reaches(&question) {",
+    );
+    only_finding(
+        &found,
+        "questions/mod.rs check_resolvable_reaching calls expire_due 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_name_allowed_for_one_body_and_called_by_another_is_reported() {
+    // `contains` is allowed for the subject's check and for no other body.
+    let found = planted(
+        GATE,
+        "    pub fn check_bound(&self) -> Result<(), Refused> {\n        let bound = self.lock().bound;",
+        "    pub fn check_bound(&self) -> Result<(), Refused> {\n        let bound = self.lock().bound;\n        let _ = [0_u8].contains(&0);",
+    );
+    only_finding(
+        &found,
+        "local_gate.rs check_bound calls contains, which several functions of the crate declare",
     );
 }
 
@@ -212,13 +270,15 @@ fn a_new_caller_of_a_time_contract_writer_is_reported() {
 #[test]
 fn an_allow_row_that_no_scoped_body_uses_is_reported() {
     let text = format!(
-        "{}\nallow no_such_helper\n",
+        "{}\nallow {SERVICE} validate no_such_helper\n",
         include_str!("standing_writes.txt")
     );
     let found = scan::violations(&scan::tree(), &scan::parse(&text), WRITES);
     assert_eq!(
         found,
-        vec!["allow no_such_helper: no scoped function calls it".to_owned()]
+        vec![format!(
+            "allow {SERVICE} validate no_such_helper: no function that the scan reads makes the call"
+        )]
     );
 }
 

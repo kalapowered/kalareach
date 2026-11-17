@@ -2,17 +2,19 @@
 #
 # Held in both directions by the scan of the same name. The scope is the four pieces of the
 # function, the checks they call directly, the pure readers of the clocks and the gate, and the
-# broker's checks, and the helpers that those checks call and that this list reads. A function of
-# this crate that a scoped body calls has to be a scoped one, an `outside` one or an `allow` name,
-# and a helper that is not read is not followed: what it calls is not seen.
+# broker's checks, the three wrappers of a lock that the pure readers call, and the helpers that
+# those reach by a name that this crate declares once, which the scan reads and follows as well. A
+# name that several functions declare has to be a scoped function, an `outside` one or allowed for
+# the one body that calls it.
 #
 # scope <file> <function>
 # site <file> <function> <callee> <how many calls>
 # outside <file> <function>
-# allow <name> ...
+# allow <file> <function> <name> ...
 # caller <callee> <file> <function> <count>
 # only <callee> <file> <function> <count>
 # held <file> <function> <callee> <guards>
+# supplies <file> <function> <callee> <position> <text>
 
 scope crates/kr-worker/src/service/standing.rs authority
 scope crates/kr-worker/src/service/standing.rs envelope
@@ -41,6 +43,9 @@ scope crates/kr-worker/src/action/time.rs utc_end_reached
 scope crates/kr-worker/src/broker/methods.rs checks
 scope crates/kr-worker/src/broker/mod.rs check_responsible
 scope crates/kr-worker/src/broker/mod.rs recheck_answer_trust
+scope crates/kr-worker/src/action/time.rs lock
+scope crates/kr-worker/src/local_gate.rs lock
+scope crates/kr-worker/src/input_domain.rs lock
 outside crates/kr-worker/src/service.rs decidable
 
 # The writes. The pass changes nothing but this one, and it stands behind the mode that is the
@@ -56,62 +61,53 @@ site crates/kr-worker/src/service.rs check_admission_limits insert 1
 # through it.
 site crates/kr-worker/src/service.rs check_admission_limits &mut 1
 site crates/kr-worker/src/service/standing.rs limits &mut 1
+# The accessor that hands out the journal the limits read through: a `&mut` parameter, as the
+# limits' own (the writes are the caller's, which are listed).
+site crates/kr-worker/src/session.rs journal_mut &mut 1
 
-# The helpers that a scoped body calls and the scan does not read. Each definition was read for the
-# calls this roster counts (the list of names in the case), and none makes one, except where a name
+# The names that a body calls and the scan does not follow, one row to a body. Each is the standard
+# library's method here or a name that several functions of the crate declare, and was read for
+# the calls this roster counts (the list of names in the case); none makes one, except where a name
 # is shared with a function that does:
 #
 # * `drop` is the standard function; the crate's `Drop` impls cannot be called by name.
-# * `expect` is the standard method of an `Option` or a `Result`; the one function of that name in
-#   the crate (a broker test double) is not called here.
+# * `expect`, `filter` and `map` are the standard methods of an `Option`, a `Result` or an
+#   iterator; the crate declares one function of each name that these bodies do not call.
 # * `require_rich_work`: the call is the volatile state's read of the fence; the broker's own
 #   function of that name notes a fence and is called by none of the scoped bodies.
 #
-# A function that an `allow` name calls is not read, so a write one call below is not seen.
-# called from action/time.rs pure_proven_ms
-allow lock projected
-# called from action/time.rs pure_wall_ms
-allow get now_ms
-# called from action/time.rs utc_deadline_standing
-allow load named recorded
-# called from broker/methods.rs checks
-allow application_instance_id binding_revision check_turn mutations_suspended recheck
-allow require_in_time require_rich_work resource_id suspension_reason unknown_instance
-# called from broker/mod.rs check_responsible
-allow all component_disabled denied filter unknown_binding
-# called from broker/mod.rs recheck_answer_trust
-allow trusted_to_encode unknown
-# called from service.rs check_accepted_deadline
-allow now
-# called from service.rs check_admission_limits
-allow bounded_by_outstanding check_outstanding check_supersession drop is_storage_failure
-allow journal_mut map outstanding outstanding_limit parse revision session
-allow survives_a_journal_fault work_class
-# called from service.rs check_authority
-allow expect
-# called from service.rs check_dispatch_lease
-allow input permits refused
-# called from service.rs check_envelope
-allow contains epoch id is_remote params_application_instance
-# called from service.rs check_local_standing
-allow assert_not_held detail holds_local off_the_executor
-# called from service.rs check_preconditions
-allow as_str geometry lease output_cursor state
-# called from service.rs check_restrictions
-allow restrictions
-# called from service.rs sweep_questions
-allow question_clock
-# called from service.rs uncertain_outcome_in_the_way
-allow clone uncertain_for_subject
-# called from service.rs uncertain_with_identity
-allow holds_back identity_of uncertain_for_subject_matching
-# called from service.rs validate
-allow any attachment_capabilities bound_source check_attachment check_capability check_create
-allow check_decision_reached check_own check_resolvable check_resolvable_reaching
-allow check_screen_reach check_session config detach_subject disclosure is_local_owner iter
-allow launching_attachment params_attachment question reaches_question
-# called from service/standing.rs subject
-allow question_sweep
+# A name that a row allows is not followed: what it calls is not seen.
+allow crates/kr-worker/src/action/time.rs pure_proven_ms lock projected
+allow crates/kr-worker/src/action/time.rs pure_wall_ms get now_ms
+allow crates/kr-worker/src/action/time.rs utc_deadline_standing load named recorded
+allow crates/kr-worker/src/broker/methods.rs checks application_instance_id binding_revision recheck
+allow crates/kr-worker/src/broker/methods.rs checks require_rich_work resource_id
+allow crates/kr-worker/src/broker/mod.rs check_responsible all filter
+allow crates/kr-worker/src/broker/mod.rs recheck_answer_trust unknown
+allow crates/kr-worker/src/service.rs check_accepted_deadline now
+allow crates/kr-worker/src/service.rs check_admission_limits drop
+allow crates/kr-worker/src/service.rs check_admission_limits map outstanding parse revision session
+allow crates/kr-worker/src/service.rs check_authority expect
+allow crates/kr-worker/src/service.rs check_dispatch_lease input refused
+allow crates/kr-worker/src/service.rs check_envelope contains epoch id
+allow crates/kr-worker/src/service.rs check_local_standing assert_not_held
+allow crates/kr-worker/src/service.rs check_preconditions as_str geometry lease output_cursor state
+allow crates/kr-worker/src/service.rs uncertain_outcome_in_the_way clone
+allow crates/kr-worker/src/service.rs uncertain_with_identity holds_back identity_of
+allow crates/kr-worker/src/service.rs validate any
+allow crates/kr-worker/src/service.rs validate iter
+# More names that a body calls and the scan does not follow, one row to a body (a name allowed
+# for one body is not allowed for another):
+allow crates/kr-worker/src/broker/methods.rs checks get
+allow crates/kr-worker/src/broker/mod.rs check_responsible get
+allow crates/kr-worker/src/broker/mod.rs recheck_answer_trust get
+allow crates/kr-worker/src/service.rs check_admission_limits get filter
+allow crates/kr-worker/src/service.rs check_dispatch_lease now revision expect
+allow crates/kr-worker/src/service.rs check_preconditions get parse
+allow crates/kr-worker/src/service.rs check_validated_revision input
+allow crates/kr-worker/src/service.rs validate as_str contains parse
+allow crates/kr-worker/src/input_domain.rs lock expect new with
+allow crates/kr-worker/src/service.rs holds_attachment expect
 
 # The functions that make the time contract's writes. The full check and the second raise stand
 # with the first admission's local owner check and the writer's; the kept reading stands with the

@@ -9,34 +9,45 @@
 //! out. A call is a name that an opening parenthesis follows; a counted call is one that follows a
 //! `.` or a `::`.
 //!
-//! What it does not see. It does not follow a call into another function: a function that a scoped
-//! body calls is read only when it is in the scope itself, and a helper that is declared outside
-//! the scope or allowed is not read, so what it calls is not seen. It reads names and not types,
-//! so a name that two types share is judged for each place it is called, and a row for one of the
-//! two covers the other. It does not see a call through a function pointer or a closure that is
+//! What it does not see. It reads names and not types: a name that two functions declare is
+//! judged for each place it is called, and a row for one of the two covers the other, so a change
+//! of receiver is not seen. It does not see a call through a function pointer or a closure that is
 //! passed in, a macro's expansion, a call to a name that no function of this crate declares (the
-//! standard library and other crates), or what a guard is, beyond the two names it knows (a `let`
-//! that calls `session` or locks the service's `dispatch`, and a parameter of the session's type).
+//! standard library and other crates), a helper below a name that several functions declare and
+//! that no `scope` row names, or what a guard is, beyond the two names it knows (a `let` that
+//! calls `session` or locks the service's `dispatch`, and a parameter of the session's type).
+//!
+//! What it follows. A call from a function that the scan reads to a name that this crate declares
+//! once is followed: the callee's body is read, and so are the bodies that it calls in turn, and a
+//! counted call found in any of them needs its own `site` row. The scan therefore reads every
+//! helper that a listed body reaches by such a name, whether a row declares it or not.
 //!
 //! The roster has these kinds of row, one to a line, with `#` for a comment:
 //!
-//! * `scope <file> <function>`: a function whose body is read.
-//! * `site <file> <function> <callee> <how many calls>`: the counted calls found in it.
-//! * `outside <file> <function>`: a function the scoped ones call that is not read, which has to
-//!   exist, so that a rename does not leave a stale statement.
-//! * `allow <name> ...`: functions of this crate that a scoped body calls and the scan does not
-//!   read. A name that no scoped body calls fails, so the list cannot go stale.
+//! * `scope <file> <function>`: a function whose body is read, and a name that is judged by that
+//!   row wherever it is called.
+//! * `site <file> <function> <callee> <how many calls>`: the counted calls found in a function
+//!   that the scan reads, scoped or followed.
+//! * `outside <file> <function>`: a function that is declared and not read, and not followed,
+//!   which has to exist, so that a rename does not leave a stale statement.
+//! * `allow <file> <function> <name> ...`: names that this function calls and the scan does not
+//!   follow: the standard library's method, or a name that several functions of the crate declare.
+//!   The row counts for that function alone. A name that the function does not call fails, so the
+//!   list cannot go stale.
 //! * `caller <callee> <file> <function> <count>`: a call of `callee` from `function`; in each file
 //!   that a row of `callee` names, no other function calls it and the count is exact. A counted
-//!   call inside a scoped function is judged by its site row.
+//!   call inside a function that the scan reads is judged by its site row.
 //! * `only <callee> <file> <function> <count>`: as `caller`, in every file of the crate.
 //! * `held <file> <function> <callee> <guards>`: the guards that `function` holds where it calls
 //!   `callee`, as a comma list of `BAR` (the dispatch barrier), `SES` (the session) or `none`.
+//! * `supplies <file> <function> <callee> <position> <text>`: the argument at `position` (from
+//!   zero) of every call of `callee` from `function`, with its white space taken out, is `text`.
+//!   It reads what a call hands on where `held` reads what is live there.
 //!
-//! The boundary. A call from a scoped body to a function that this crate declares fails unless the
-//! name is one the scan counts, a scoped function, an `outside` function, an `allow` name or the
-//! callee of a `caller` or `only` row. A new helper in a listed body therefore has to be declared,
-//! with its row, before the case passes.
+//! The boundary. A call from a scoped body to a name that several functions of this crate declare
+//! fails unless the name is one the scan counts, a scoped function, an `outside` function, a name
+//! allowed for that body or the callee of a `caller` or `only` row. A name that this crate
+//! declares once is read instead, as above.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -306,8 +317,12 @@ pub struct Roster {
     pub scope: BTreeSet<(String, String)>,
     pub sites: BTreeMap<(String, String, String), usize>,
     pub outside: BTreeSet<(String, String)>,
-    /// Functions of this crate that a scoped body may call and that the scan does not read.
-    pub allowed: BTreeSet<String>,
+    /// The names a function that the scan reads may call without the scan following them, by file
+    /// and function: an allowed name counts for the body that lists it and for no other.
+    pub allowed: BTreeSet<(String, String, String)>,
+    /// The argument that a call hands on, by file, function and callee: its position and its text
+    /// with the white space taken out.
+    pub supplies: BTreeMap<(String, String, String), (usize, String)>,
     /// The functions that call a watched function, by the watched function, the file and the
     /// caller, with how many calls each makes.
     pub callers: BTreeMap<(String, String, String), usize>,
@@ -323,7 +338,7 @@ pub struct Roster {
 ///
 /// # Panics
 ///
-/// Panics on a row that is not one of the three kinds, which is a fault of the roster.
+/// Panics on a row that is not one of the eight kinds, which is a fault of the roster.
 pub fn parse(roster: &str) -> Roster {
     let mut rows = Roster::default();
     for line in roster.lines() {
@@ -351,9 +366,24 @@ pub fn parse(roster: &str) -> Roster {
                 rows.outside
                     .insert(((*file).to_owned(), (*function).to_owned()));
             }
-            ["allow", names @ ..] if !names.is_empty() => {
-                rows.allowed
-                    .extend(names.iter().map(|name| (*name).to_owned()));
+            ["allow", file, function, names @ ..] if !names.is_empty() => {
+                rows.allowed.extend(names.iter().map(|name| {
+                    (
+                        (*file).to_owned(),
+                        (*function).to_owned(),
+                        (*name).to_owned(),
+                    )
+                }));
+            }
+            ["supplies", file, function, callee, position, text @ ..] if !text.is_empty() => {
+                rows.supplies.insert(
+                    (
+                        (*file).to_owned(),
+                        (*function).to_owned(),
+                        (*callee).to_owned(),
+                    ),
+                    (position.parse().expect("a position"), text.concat()),
+                );
             }
             ["caller", callee, file, function, count] => {
                 rows.callers.insert(
@@ -391,7 +421,7 @@ pub fn parse(roster: &str) -> Roster {
                     domains,
                 );
             }
-            other => panic!("a roster row that is none of the seven kinds: {other:?}"),
+            other => panic!("a roster row that is none of the eight kinds: {other:?}"),
         }
     }
     rows
@@ -474,13 +504,11 @@ pub fn violations(files: &[(String, String)], roster: &Roster, callees: &[&str])
             ));
         }
     }
+    let read = reads(files, roster, callees);
     let mut found: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     for (file, source) in files {
         for site in sites(file, source, callees) {
-            if roster
-                .scope
-                .contains(&(site.file.clone(), site.function.clone()))
-            {
+            if read.contains(&(site.file.clone(), site.function.clone())) {
                 *found
                     .entry((site.file, site.function, site.callee))
                     .or_default() += 1;
@@ -492,7 +520,7 @@ pub fn violations(files: &[(String, String)], roster: &Roster, callees: &[&str])
             let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
             for span in spans(&text) {
                 let count = mut_parameters(&text[span.at..span.open]);
-                if count > 0 && roster.scope.contains(&(file.clone(), span.name.clone())) {
+                if count > 0 && read.contains(&(file.clone(), span.name.clone())) {
                     *found
                         .entry((file.clone(), span.name, MUT_PARAMETER.to_owned()))
                         .or_default() += count;
@@ -516,9 +544,9 @@ pub fn violations(files: &[(String, String)], roster: &Roster, callees: &[&str])
         }
     }
     for (file, function, callee) in roster.sites.keys() {
-        if !roster.scope.contains(&(file.clone(), function.clone())) {
+        if !read.contains(&(file.clone(), function.clone())) {
             problems.push(format!(
-                "site {file} {function} {callee}: the function is not in the scope"
+                "site {file} {function} {callee}: the function is not read"
             ));
         } else if !found.contains_key(&(file.clone(), function.clone(), callee.clone())) {
             problems.push(format!(
@@ -526,9 +554,10 @@ pub fn violations(files: &[(String, String)], roster: &Roster, callees: &[&str])
             ));
         }
     }
-    problems.extend(boundary(files, roster, callees));
-    problems.extend(callers(files, roster, callees));
+    problems.extend(boundary(files, roster, callees, &read));
+    problems.extend(callers(files, roster, callees, &read));
     problems.extend(held(files, roster));
+    problems.extend(supplied(files, roster));
     problems
 }
 
@@ -577,8 +606,19 @@ pub fn calls(text: &[char]) -> Vec<(usize, String)> {
     found
 }
 
-/// The names that a `fn` declares in `source`, outside its test modules.
-pub fn defined_functions(source: &str) -> BTreeSet<String> {
+/// Where each function of this crate is declared: its name, with the file of each declaration.
+fn definitions(files: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (file, source) in files {
+        for name in defined_functions(source) {
+            found.entry(name).or_default().push(file.clone());
+        }
+    }
+    found
+}
+
+/// The names that a `fn` declares in `source`, outside its test modules, once for each `fn`.
+fn defined_functions(source: &str) -> Vec<String> {
     let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
     idents(&text)
         .windows(2)
@@ -587,22 +627,89 @@ pub fn defined_functions(source: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// The declared helper boundary. A call from a scoped body to a function of this crate that is
-/// none of the names the scan counts, a function in the scope, a function declared outside it and
-/// a function allowed, fails: a helper that is not read cannot hide a call that the scan forbids.
-/// A call to a name that no function of this crate declares is a call into the standard library
-/// or another crate, which this boundary does not judge.
-fn boundary(files: &[(String, String)], roster: &Roster, callees: &[&str]) -> Vec<String> {
-    let defined: BTreeSet<String> = files
+/// What a read body calls that the scan follows into: the crate functions that are declared once,
+/// by name, in the whole crate. A call to a name that is counted, allowed for this body, declared
+/// outside, declared more than once (the scan cannot tell which one is called) or declared by no
+/// function of the crate is not followed.
+fn followed_from(
+    file: &str,
+    function: &str,
+    text: &[char],
+    inside: &[Option<String>],
+    roster: &Roster,
+    callees: &[&str],
+    declared: &BTreeMap<String, Vec<String>>,
+) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (at, name) in calls(text) {
+        if inside[at].as_deref() != Some(function)
+            || listed(callees, &name)
+            || roster
+                .allowed
+                .contains(&(file.to_owned(), function.to_owned(), name.clone()))
+            || roster.outside.iter().any(|(_, outside)| *outside == name)
+        {
+            continue;
+        }
+        if let Some([only]) = declared.get(&name).map(Vec::as_slice) {
+            found.push((only.clone(), name));
+        }
+    }
+    found
+}
+
+/// The functions whose bodies a scan reads: the scoped ones, and every function that a read body
+/// calls by a name that this crate declares once, and the ones those call in turn. A helper that
+/// nothing declares is read all the same, so a new helper cannot hide a call that the scan counts.
+fn reads(
+    files: &[(String, String)],
+    roster: &Roster,
+    callees: &[&str],
+) -> BTreeSet<(String, String)> {
+    let declared = definitions(files);
+    let texts: BTreeMap<&str, (Vec<char>, Vec<Option<String>>)> = files
         .iter()
-        .flat_map(|(_, source)| defined_functions(source))
+        .map(|(file, source)| {
+            let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
+            let inside = function_at(&text);
+            (file.as_str(), (text, inside))
+        })
         .collect();
-    let mut known: BTreeSet<&str> = roster.allowed.iter().map(String::as_str).collect();
-    known.extend(roster.scope.iter().map(|(_, function)| function.as_str()));
+    let mut read: BTreeSet<(String, String)> = roster.scope.clone();
+    let mut queue: Vec<(String, String)> = read.iter().cloned().collect();
+    while let Some((file, function)) = queue.pop() {
+        let Some((text, inside)) = texts.get(file.as_str()) else {
+            continue;
+        };
+        for next in followed_from(&file, &function, text, inside, roster, callees, &declared) {
+            if read.insert(next.clone()) {
+                queue.push(next);
+            }
+        }
+    }
+    read
+}
+
+/// The declared helper boundary. A call from a scoped body to a function of this crate that is
+/// none of the names the scan counts, a function in the scope, a function declared outside it, a
+/// function allowed for that body, a function that this crate declares once (which the scan reads
+/// as well, [`reads`]) and the callee of a `caller` or `only` row, fails: the name is declared more
+/// than once, so the scan cannot tell which function is called, and none of its declarations is
+/// read. A call to a name that no function of this crate declares is a call into the standard
+/// library or another crate, which this boundary does not judge. An allowed name that its function
+/// does not call fails, so the list cannot go stale.
+fn boundary(
+    files: &[(String, String)],
+    roster: &Roster,
+    callees: &[&str],
+    read: &BTreeSet<(String, String)>,
+) -> Vec<String> {
+    let declared = definitions(files);
+    let mut known: BTreeSet<&str> = roster.scope.iter().map(|(_, f)| f.as_str()).collect();
     known.extend(roster.outside.iter().map(|(_, function)| function.as_str()));
     known.extend(roster.callers.keys().map(|(callee, _, _)| callee.as_str()));
     let mut problems = BTreeSet::new();
-    let mut used: BTreeSet<&str> = BTreeSet::new();
+    let mut used: BTreeSet<(String, String, String)> = BTreeSet::new();
     for (file, source) in files {
         let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
         let inside = function_at(&text);
@@ -610,32 +717,136 @@ fn boundary(files: &[(String, String)], roster: &Roster, callees: &[&str]) -> Ve
             let Some(function) = inside[at].clone() else {
                 continue;
             };
-            if !roster.scope.contains(&(file.clone(), function.clone())) {
+            if !read.contains(&(file.clone(), function.clone())) {
                 continue;
             }
-            if let Some(allowed) = roster.allowed.get(&name) {
-                used.insert(allowed.as_str());
+            let row = (file.clone(), function.clone(), name.clone());
+            let allowed = roster.allowed.contains(&row);
+            if allowed {
+                used.insert(row);
             }
-            if defined.contains(&name) && !listed(callees, &name) && !known.contains(name.as_str())
+            let scoped = roster.scope.contains(&(file.clone(), function.clone()));
+            let several = declared.get(&name).is_some_and(|files| files.len() > 1);
+            if scoped
+                && several
+                && !allowed
+                && !listed(callees, &name)
+                && !known.contains(name.as_str())
             {
                 problems.insert(format!(
-                    "{file} {function} calls {name}, which is neither counted, in the scope, \
-                     outside it nor allowed: add a scope, outside or allow row for {name}"
+                    "{file} {function} calls {name}, which several functions of the crate declare \
+                     and which is neither counted, in the scope, outside it nor allowed for this \
+                     function: add a scope, outside or allow row for {name}"
                 ));
             }
         }
     }
-    for name in &roster.allowed {
-        if !used.contains(name.as_str()) {
-            problems.insert(format!("allow {name}: no scoped function calls it"));
+    for (file, function, name) in &roster.allowed {
+        if !used.contains(&(file.clone(), function.clone(), name.clone())) {
+            problems.insert(format!(
+                "allow {file} {function} {name}: no function that the scan reads makes the call"
+            ));
         }
     }
     problems.into_iter().collect()
 }
 
+/// The arguments of the calls of `callee` that stand in `function`, each with its white space taken
+/// out, one list for each call. An argument ends at a comma outside every bracket.
+fn arguments_of(
+    text: &[char],
+    inside: &[Option<String>],
+    function: &str,
+    callee: &str,
+) -> Vec<Vec<String>> {
+    let mut found = Vec::new();
+    for (at, name) in calls(text) {
+        if name != callee || inside[at].as_deref() != Some(function) {
+            continue;
+        }
+        let open = text[at + name.len()..]
+            .iter()
+            .position(|c| *c == '(')
+            .map(|offset| at + name.len() + offset)
+            .expect("a call has an opening parenthesis");
+        let mut depth = 0_i32;
+        let mut argument = String::new();
+        let mut list = Vec::new();
+        for &c in &text[open..] {
+            match c {
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    if depth == 1 {
+                        continue;
+                    }
+                }
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if c == ',' && depth == 1 {
+                list.push(std::mem::take(&mut argument));
+            } else if !c.is_whitespace() {
+                argument.push(c);
+            }
+        }
+        if !argument.is_empty() {
+            list.push(argument);
+        }
+        found.push(list);
+    }
+    found
+}
+
+/// What a call hands on: for each `supplies` row, every call of the callee from the function hands
+/// the row's text as the argument at the row's position, so that a piece which is given the
+/// session, or none, is handed what the row says and not what the guard that is live there would
+/// have the caller believe.
+fn supplied(files: &[(String, String)], roster: &Roster) -> Vec<String> {
+    let mut problems = Vec::new();
+    for ((file, function, callee), (position, expected)) in &roster.supplies {
+        let Some((_, source)) = files.iter().find(|(name, _)| name == file) else {
+            problems.push(format!(
+                "supplies {file} {function} {callee}: there is no such file"
+            ));
+            continue;
+        };
+        let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
+        let inside = function_at(&text);
+        let calls = arguments_of(&text, &inside, function, callee);
+        if calls.is_empty() {
+            problems.push(format!(
+                "supplies {file} {function} {callee}: the call is not there"
+            ));
+        }
+        for arguments in calls {
+            match arguments.get(*position) {
+                Some(actual) if actual == expected => {}
+                Some(actual) => problems.push(format!(
+                    "{file} {function} calls {callee} handing {actual} as argument {position} \
+                     and its supplies row says {expected}"
+                )),
+                None => problems.push(format!(
+                    "{file} {function} calls {callee} with no argument {position}"
+                )),
+            }
+        }
+    }
+    problems
+}
+
 /// The call sites of the watched functions: every function that calls one, with how many calls,
 /// and no other.
-fn callers(files: &[(String, String)], roster: &Roster, callees: &[&str]) -> Vec<String> {
+fn callers(
+    files: &[(String, String)],
+    roster: &Roster,
+    callees: &[&str],
+    scanned: &BTreeSet<(String, String)>,
+) -> Vec<String> {
     let watched: BTreeSet<&str> = roster
         .callers
         .keys()
@@ -654,9 +865,9 @@ fn callers(files: &[(String, String)], roster: &Roster, callees: &[&str]) -> Vec
                         .any(|(callee, row_file, _)| *callee == name && row_file == file));
             // A counted call in a scoped function is judged by its site row.
             let counted = listed(callees, &name)
-                && inside[at].as_ref().is_some_and(|function| {
-                    roster.scope.contains(&(file.clone(), function.clone()))
-                });
+                && inside[at]
+                    .as_ref()
+                    .is_some_and(|function| scanned.contains(&(file.clone(), function.clone())));
             if read && !counted {
                 let function = inside[at].clone().unwrap_or_else(|| "(top)".to_owned());
                 *found.entry((name, file.clone(), function)).or_default() += 1;
