@@ -293,6 +293,37 @@ impl Interrupts {
 /// Returns the failures that are not the command's own result: this installation's environment
 /// cannot be found.
 pub async fn run(paths: &HostPaths, json: bool) -> Result<Completion> {
+    run_with(
+        paths,
+        json,
+        async |environment, progress| stop(Which::Stop, paths, environment, json, progress).await,
+        interrupted,
+        hangup_ignored_by_a_stop,
+    )
+    .await
+}
+
+/// Whether a stop ignores a hangup at `stage`: once the request has left, the report may print into
+/// a closed terminal, which the record covers.
+const fn hangup_ignored_by_a_stop(stage: Stage) -> bool {
+    !matches!(stage, Stage::BeforeAsking)
+}
+
+/// Runs a command with the handlers from its first line. `interrupted` says what an interrupt at a
+/// stage came to, and `hangup_ignored` says at which stages a hangup is ignored: the report may
+/// print into a closed terminal, which the record covers.
+///
+/// # Errors
+///
+/// Returns the failures that are not the command's own result: this installation's environment
+/// cannot be found.
+async fn run_with(
+    paths: &HostPaths,
+    json: bool,
+    work: impl AsyncFnOnce(&KnownEnvironment, &Progress) -> Result<Completion>,
+    interrupted: impl FnOnce(&Progress, Stage, bool) -> Completion,
+    hangup_ignored: impl Fn(Stage) -> bool,
+) -> Result<Completion> {
     let mut interrupts = Interrupts::catch();
     let environment = installation(paths)?;
     let progress = Progress {
@@ -301,16 +332,14 @@ pub async fn run(paths: &HostPaths, json: bool) -> Result<Completion> {
         environment_id: environment.environment_id,
         earlier: Mutex::new(Vec::new()),
     };
-    let work = stop(Which::Stop, paths, &environment, json, &progress);
+    let work = work(&environment, &progress);
     tokio::pin!(work);
     loop {
         tokio::select! {
             done = &mut work => return done,
             interrupt = interrupts.next() => {
                 let stage = progress.stage();
-                // A hangup after the request left is ignored: the report may print into a closed
-                // terminal, which the record covers.
-                if interrupt == Interrupt::Hangup && stage != Stage::BeforeAsking {
+                if interrupt == Interrupt::Hangup && hangup_ignored(stage) {
                     continue;
                 }
                 return Ok(interrupted(&progress, stage, json));
@@ -680,14 +709,23 @@ fn said_at_the_start(start: &Start, lock: impl FnOnce() -> Lock) -> Said<AtStart
     }
 }
 
-/// The command, from the guard to the daemon's end.
-async fn stop(
+/// What the command has read before it reaches the daemon: the result so far, and the records of
+/// earlier attempts.
+struct Begun {
+    none: Facts,
+    earlier: Earlier,
+}
+
+/// The command's start, up to the first reach of the endpoint: the guard, and what earlier attempts
+/// recorded and whose process has gone, said at the start (in the document under `--json`) and
+/// removed only by `done`, after the result that put it out has been written. A refused guard is
+/// the completion that the command ends with.
+async fn begin(
     which: Which,
-    host: &HostPaths,
     environment: &KnownEnvironment,
     json: bool,
     progress: &Progress,
-) -> Result<Completion> {
+) -> std::result::Result<Begun, Completion> {
     let id = environment.environment_id;
     let none = Facts::none(Vec::new());
     if let Err(error) = crate::bind::require_outside_to_end_a_daemon(
@@ -697,11 +735,8 @@ async fn stop(
     )
     .await
     {
-        return Ok(failed(error, &none, json));
+        return Err(failed(error, &none, json));
     }
-    // What earlier attempts recorded and whose process has gone is said at the start (in the
-    // document under `--json`), and removed only by `done`, after the result that put it out has
-    // been written.
     let mut earlier = Earlier::read(&environment.paths);
     let none = Facts::none(earlier.said(id));
     *progress
@@ -711,58 +746,86 @@ async fn stop(
     if !json {
         earlier.say(id);
     }
+    Ok(Begun { none, earlier })
+}
+
+/// What the first reach of the endpoint found.
+enum Looked {
+    /// A daemon of this build's public major answered the hello.
+    Daemon(Box<LocalClient>),
+    /// The reach ends the command with no wait.
+    Said(Start),
+    /// The greeting failed for a reason other than nothing listening: what that failure came to.
+    Refused {
+        before: Before,
+        error: kr_ipc::IpcError,
+    },
+}
+
+/// The first reach of the daemon's endpoint. A failure to find the endpoint is the command's own
+/// error.
+async fn look(host: &HostPaths, environment: &KnownEnvironment) -> Result<Looked> {
+    let id = environment.environment_id;
     let endpoint = environment.paths.controller_endpoint()?;
-    match startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await {
-        Reached::Answered(listed) => {
-            let Listed::Ours(client) = *listed else {
-                return Ok(at_the_start(
-                    which,
-                    &Start::OtherMajor,
-                    environment,
-                    &none,
-                    json,
-                    &earlier,
-                    startup::ANSWER_BOUND,
-                ));
-            };
-            Ok(stop_the_daemon(which, host, environment, *client, json, progress, &earlier).await)
+    Ok(
+        match startup::reach(&endpoint, startup::ANSWER_BOUND, &[]).await {
+            Reached::Answered(listed) => match *listed {
+                Listed::Ours(client) => Looked::Daemon(client),
+                _ => Looked::Said(Start::OtherMajor),
+            },
+            Reached::Silent => Looked::Said(Start::Silent),
+            Reached::Refused(error) if startup::nothing_listening(&error) => {
+                Looked::Said(Start::NothingListening)
+            }
+            Reached::Refused(error) => {
+                let operations = Real::of(host, &environment.paths, None);
+                let before = greeting_failed(
+                    &operations,
+                    &error,
+                    lock_holder(&environment.paths).as_ref(),
+                    id,
+                    tokio::time::Instant::now() + END_BOUND,
+                )
+                .await;
+                Looked::Refused { before, error }
+            }
+        },
+    )
+}
+
+/// The command, from the guard to the daemon's end.
+async fn stop(
+    which: Which,
+    host: &HostPaths,
+    environment: &KnownEnvironment,
+    json: bool,
+    progress: &Progress,
+) -> Result<Completion> {
+    let id = environment.environment_id;
+    let Begun { none, earlier } = match begin(which, environment, json, progress).await {
+        Ok(begun) => begun,
+        Err(completion) => return Ok(completion),
+    };
+    Ok(match look(host, environment).await? {
+        Looked::Daemon(client) => {
+            stop_the_daemon(which, host, environment, *client, json, progress, &earlier).await
         }
-        Reached::Silent => Ok(at_the_start(
+        Looked::Said(start) => at_the_start(
             which,
-            &Start::Silent,
+            &start,
             environment,
             &none,
             json,
             &earlier,
             startup::ANSWER_BOUND,
-        )),
-        Reached::Refused(error) if startup::nothing_listening(&error) => Ok(at_the_start(
-            which,
-            &Start::NothingListening,
-            environment,
-            &none,
-            json,
-            &earlier,
-            startup::ANSWER_BOUND,
-        )),
-        Reached::Refused(error) => {
-            let operations = Real::of(host, &environment.paths, None);
-            let before = greeting_failed(
-                &operations,
-                &error,
-                lock_holder(&environment.paths).as_ref(),
-                id,
-                tokio::time::Instant::now() + END_BOUND,
-            )
-            .await;
-            Ok(
-                match ended_by(which, before, environment, &none, json, &earlier) {
-                    Ok(completion) => completion,
-                    Err(cause) => failed(unreached(which, id, &error, cause), &none, json),
-                },
-            )
+        ),
+        Looked::Refused { before, error } => {
+            match ended_by(which, before, environment, &none, json, &earlier) {
+                Ok(completion) => completion,
+                Err(cause) => failed(unreached(which, id, &error, cause), &none, json),
+            }
         }
-    }
+    })
 }
 
 /// What earlier attempts recorded whose process is no longer the one that recorded it.
@@ -2957,6 +3020,61 @@ mod tests {
             "said, so it goes"
         );
     }
+    /// A stop ignores a hangup at every stage after the request was written, and not before it.
+    #[test]
+    fn a_stop_ignores_a_hangup_only_once_its_request_was_written() {
+        for (stage, ignored) in [
+            (Stage::BeforeAsking, false),
+            (Stage::Asked, true),
+            (Stage::Told, true),
+            (Stage::Refused, true),
+        ] {
+            assert_eq!(hangup_ignored_by_a_stop(stage), ignored, "{stage:?}");
+        }
+    }
+
+    /// The command's start reads the records of earlier attempts into the result and into the
+    /// progress that an interrupt reads, and says them at once only where the output is text: under
+    /// `--json` they go in the document.
+    #[tokio::test]
+    async fn the_start_reads_the_earlier_records_and_says_them_only_in_text() {
+        for json in [false, true] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let paths = temp.environment();
+            let id = paths.environment_id();
+            let directory = paths.state_dir().join(attempt::DIRECTORY);
+            kr_ipc::paths::create_private_directory(&directory).expect("the directory");
+            let record = attempt::Attempt {
+                command: attempt::Command::Stop,
+                phase: attempt::Phase::Told,
+                process: identity::ended_process_identity(std::process::id()),
+                at_ms: 1,
+                daemon: None,
+            };
+            kr_ipc::paths::write_owner_only_file(
+                &directory.join("an-earlier-attempt"),
+                &serde_json::to_vec(&record).expect("encodes"),
+            )
+            .expect("writes the record");
+            let environment = KnownEnvironment {
+                environment_id: id,
+                paths,
+            };
+            let progress = Progress {
+                stage: AtomicU8::new(Stage::BeforeAsking as u8),
+                marker: Mutex::new(None),
+                environment_id: id,
+                earlier: Mutex::new(Vec::new()),
+            };
+            let Ok(begun) = begin(Which::Stop, &environment, json, &progress).await else {
+                panic!("outside a session the guard lets the command begin");
+            };
+            assert_eq!(begun.none.records.len(), 1);
+            assert_eq!(progress.said_earlier().len(), 1);
+            assert_eq!(begun.earlier.written, !json, "json {json}");
+        }
+    }
+
     /// What a record of an earlier attempt says, for each command and phase that a record can hold,
     /// and for one whose process is still running: the stop's words stay as they are, and a
     /// restart's say its own command and its two phases.
