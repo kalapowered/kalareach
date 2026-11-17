@@ -113,13 +113,38 @@ impl Marker {
         command: Command,
         daemon: Option<ProcessStartIdentity>,
     ) -> kr_ipc::Result<Self> {
+        Self::begin_in(environment, command, daemon, Phase::Asking)
+    }
+
+    /// Writes a restart's file for a start that is about to be asked for where no stop was asked:
+    /// its first write is already the phase `starting`, so that no file says that the command was
+    /// asking a daemon to stop when it asked none. `daemon` is the daemon that ended before the
+    /// start, where it is known.
+    ///
+    /// # Errors
+    ///
+    /// Returns the failure to write it, or to read this process's own start identity.
+    pub fn begin_start(
+        environment: &EnvironmentPaths,
+        daemon: Option<ProcessStartIdentity>,
+    ) -> kr_ipc::Result<Self> {
+        Self::begin_in(environment, Command::Restart, daemon, Phase::Starting)
+    }
+
+    /// Writes a command's file in the phase that its first write records.
+    fn begin_in(
+        environment: &EnvironmentPaths,
+        command: Command,
+        daemon: Option<ProcessStartIdentity>,
+        phase: Phase,
+    ) -> kr_ipc::Result<Self> {
         let directory = directory(environment);
         kr_ipc::paths::create_private_directory(&directory)?;
         let marker = Self {
             path: directory.join(kr_ipc::new_uuid().to_string()),
             attempt: Attempt {
                 command,
-                phase: Phase::Asking,
+                phase,
                 process: kr_ipc::identity::current_process_start_identity()?,
                 at_ms: kr_ipc::now_ms().get(),
                 daemon,
@@ -425,6 +450,26 @@ mod tests {
         let removed = remove_those_that_stop_another_daemon(&environment, &this_daemon);
         assert_eq!(removed, CLEAN_LIMIT);
         assert_eq!(recorded(&environment).len(), 5, "the rest is left");
+    }
+
+    /// A restart that only starts, because it asked no daemon to stop, writes its file as
+    /// `starting` from its first write, and the file goes through the later phases as any
+    /// restart's does.
+    #[test]
+    fn a_restart_that_asked_for_no_stop_begins_its_file_as_starting() {
+        let host = temp();
+        let environment = host.environment();
+        let mut marker = Marker::begin_start(&environment, Some(another(7))).expect("begins");
+        let found = recorded(&environment);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].attempt.command, Command::Restart);
+        assert_eq!(found[0].attempt.phase, Phase::Starting);
+        assert_eq!(found[0].attempt.daemon, Some(another(7)));
+        assert_eq!(found[0].attempt, *marker.attempt());
+        marker.start_failed().expect("a failed start is written");
+        assert_eq!(recorded(&environment)[0].attempt.phase, Phase::StartFailed);
+        marker.remove();
+        assert!(recorded(&environment).is_empty());
     }
 
     /// A restart's file goes through its phases in one file, a daemon that serves removes it, and a
