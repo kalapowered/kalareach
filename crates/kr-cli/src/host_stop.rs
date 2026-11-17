@@ -1285,26 +1285,102 @@ fn process_waited_for(holder: Option<&ProcessStartIdentity>, answered: Option<u6
     }
 }
 
-/// A daemon answered the hello: asks it to stop, and waits for it to end.
+/// What ended the command before the daemon's end was waited for.
+enum Cut {
+    /// The command's own words, said: a read of the daemon that was refused, the record that could
+    /// not be made, or the daemon's refusal of the request.
+    Said(Completion),
+    /// A daemon that accepted the connection did not answer `host.info` within the bound: a holder
+    /// that is silent. The caller says what that comes to, at once.
+    Silent,
+    /// The connection failed before the request was made, in the read of `host.info` or in making
+    /// the request: how that came out, decided on its own deadline.
+    Unmade {
+        before: Before,
+        error: kr_ipc::IpcError,
+    },
+}
+
+/// What a request that was made and the wait for the daemon's end came to.
+struct Settled {
+    /// What the request came to.
+    request: Request,
+    /// How the wait for the daemon's end came out.
+    ended: End,
+    /// The process that `--json` shows: the one that the answer named, and otherwise the one that
+    /// the lock file named.
+    pid: Option<u64>,
+    /// The sessions' creates that the daemon said were still under way when it went on with its
+    /// stop, where it answered.
+    unsettled: Option<u64>,
+    /// The process that the wait was for by its start identity, owned: the one that the lock file
+    /// named before the request, where the answer named the same process or none.
+    old: Option<ProcessStartIdentity>,
+}
+
+/// A daemon answered the hello: reads what it says of itself, asks it to stop, waits for it to end
+/// and says what that came to.
 async fn stop_the_daemon(
     which: Which,
     host: &HostPaths,
     environment: &KnownEnvironment,
-    mut client: LocalClient,
+    client: LocalClient,
     json: bool,
     progress: &Progress,
     earlier: &Earlier,
 ) -> Completion {
     let id = environment.environment_id;
     let none = Facts::none(earlier.said(id));
-    // A daemon that answered the hello and does not answer this is a holder that is silent.
-    let info = match tokio::time::timeout(
+    let settled = async {
+        let (client, info) = read_the_daemon(host, environment, client, json, &none).await?;
+        ask_and_wait(
+            which,
+            host,
+            environment,
+            client,
+            &info,
+            json,
+            progress,
+            &none,
+        )
+        .await
+    }
+    .await;
+    match settled {
+        Ok(settled) => say_the_stop(which, settled, environment, &none, json, progress, earlier),
+        Err(Cut::Said(completion)) => completion,
+        Err(Cut::Silent) => at_the_start(
+            which,
+            &Start::Silent,
+            environment,
+            &none,
+            json,
+            earlier,
+            startup::ANSWER_BOUND,
+        ),
+        Err(Cut::Unmade { before, error }) => {
+            unmade_ended(which, before, &error, id, environment, &none, json, earlier)
+        }
+    }
+}
+
+/// Reads what a daemon that answered the hello says of itself. A daemon that answered the hello and
+/// does not answer this is a holder that is silent.
+async fn read_the_daemon(
+    host: &HostPaths,
+    environment: &KnownEnvironment,
+    mut client: LocalClient,
+    json: bool,
+    none: &Facts,
+) -> std::result::Result<(LocalClient, HostInfoResult), Cut> {
+    let id = environment.environment_id;
+    match tokio::time::timeout(
         startup::ANSWER_BOUND,
         host_info(&mut client, &environment.paths),
     )
     .await
     {
-        Ok(Ok(info)) => info,
+        Ok(Ok(info)) => Ok((client, info)),
         Ok(Err(CliError::Ipc(error))) => {
             let operations = Real::of(host, &environment.paths, None);
             let before = host_info_failed(
@@ -1316,37 +1392,45 @@ async fn stop_the_daemon(
                 tokio::time::Instant::now() + END_BOUND,
             )
             .await;
-            return unmade_ended(which, before, &error, id, environment, &none, json, earlier);
+            Err(Cut::Unmade { before, error })
         }
-        Ok(Err(error)) => return failed(error, &none, json),
-        Err(_) => {
-            return at_the_start(
-                which,
-                &Start::Silent,
-                environment,
-                &none,
-                json,
-                earlier,
-                startup::ANSWER_BOUND,
-            );
-        }
-    };
+        Ok(Err(error)) => Err(Cut::Said(failed(error, none, json))),
+        Err(_) => Err(Cut::Silent),
+    }
+}
+
+/// Records the attempt, asks the daemon to stop and waits for it to end. What ends the command
+/// before the wait is a [`Cut`].
+// The command, the paths, the environment, the connection, what the daemon said of itself, the
+// output form, the progress and the result so far.
+#[allow(clippy::too_many_arguments)]
+async fn ask_and_wait(
+    which: Which,
+    host: &HostPaths,
+    environment: &KnownEnvironment,
+    mut client: LocalClient,
+    info: &HostInfoResult,
+    json: bool,
+    progress: &Progress,
+    none: &Facts,
+) -> std::result::Result<Settled, Cut> {
+    let id = environment.environment_id;
     // Who holds the environment, and which process that is, before anything is asked: a process
     // that has ended and not been collected is read as gone, and its number may be reused.
     let holder = lock_holder(&environment.paths);
     let marker = match Marker::begin(&environment.paths, which.attempt(), holder.clone()) {
         Ok(marker) => marker,
         Err(error) => {
-            return failed(
+            return Err(Cut::Said(failed(
                 CliError::Other(shown!(
                     "{} could not record its attempt: {}. {}",
                     which.command(),
                     Shown::ipc(&error),
                     which.nothing_asked()
                 )),
-                &none,
+                none,
                 json,
-            );
+            )));
         }
     };
     *progress
@@ -1387,7 +1471,7 @@ async fn stop_the_daemon(
                 deadline,
             )
             .await;
-            return unmade_ended(which, before, &error, id, environment, &none, json, earlier);
+            return Err(Cut::Unmade { before, error });
         }
         Asked::Refused(error) => {
             // Nothing was taken, so an interrupt from here on has nothing to say but that.
@@ -1395,9 +1479,11 @@ async fn stop_the_daemon(
             progress.remove_marker();
             let refusal = Facts {
                 knows: Knows::Refused,
-                ..none
+                ..none.clone()
             };
-            return refused(&mut client, id, &info, error, &refusal, json).await;
+            return Err(Cut::Said(
+                refused(&mut client, id, info, error, &refusal, json).await,
+            ));
         }
     };
     if marker_told(&request) {
@@ -1412,14 +1498,41 @@ async fn stop_the_daemon(
     let Waited { old, pid } = process_waited_for(holder.as_ref(), pid);
     let operations = Real::of(host, &environment.paths, Some(info.generation));
     let ended = wait_for_the_end(&operations, old, END_BOUND).await;
+    Ok(Settled {
+        request,
+        ended,
+        pid,
+        unsettled,
+        old: old.cloned(),
+    })
+}
+
+/// What the command says of a stop that was made and waited for, and the record of the attempt
+/// removed where the end is shown.
+fn say_the_stop(
+    which: Which,
+    settled: Settled,
+    environment: &KnownEnvironment,
+    none: &Facts,
+    json: bool,
+    progress: &Progress,
+    earlier: &Earlier,
+) -> Completion {
+    let Settled {
+        request,
+        ended,
+        pid,
+        unsettled,
+        old,
+    } = settled;
     let said = said_after_the_request(ended, &request);
     let message = words_after_the_request(
         which,
         &said.sentence,
         &request,
         &environment.paths,
-        id,
-        old,
+        environment.environment_id,
+        old.as_ref(),
         unsettled,
     );
     // The record of the attempt is removed where the end is shown.
@@ -3072,6 +3185,276 @@ mod tests {
             assert_eq!(begun.none.records.len(), 1);
             assert_eq!(progress.said_earlier().len(), 1);
             assert_eq!(begun.earlier.written, !json, "json {json}");
+        }
+    }
+
+    /// What a stand-in daemon does with the connection that `ask_and_wait` is given.
+    #[derive(Clone, Copy)]
+    enum StandIn {
+        /// It takes the stop and answers, and ends once the command has let go of the connection.
+        TakesTheStop,
+        /// It refuses the request, and the check that follows it, and ends with the connection.
+        RefusesTheStop,
+        /// It closes the connection after its hello, so that no request can be composed, and ends.
+        ClosesAndEnds,
+    }
+
+    /// The attempts that the records of an environment hold.
+    fn attempts_of(environment: &EnvironmentPaths) -> Vec<attempt::Attempt> {
+        attempt::recorded(environment)
+            .into_iter()
+            .map(|recorded| recorded.attempt)
+            .collect()
+    }
+
+    /// What `ask_and_wait` gave on a real connection, and the attempts that the stand-in daemon
+    /// found where the request reached it and where the command let go of the connection.
+    struct Observed {
+        environment: KnownEnvironment,
+        progress: Progress,
+        result: std::result::Result<Settled, Cut>,
+        at_the_request: Vec<attempt::Attempt>,
+        at_the_close: Vec<attempt::Attempt>,
+        _temp: kr_ipc::testing::TempHost,
+    }
+
+    /// A progress for a case, at the first stage with nothing recorded.
+    fn progress_of(id: EnvironmentId) -> Progress {
+        Progress {
+            stage: AtomicU8::new(Stage::BeforeAsking as u8),
+            marker: Mutex::new(None),
+            environment_id: id,
+            earlier: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Runs `ask_and_wait` against a stand-in daemon that does `standing`, from the real client on a
+    /// real link.
+    async fn ask_and_wait_against(standing: StandIn) -> Observed {
+        use kr_ipc::client::LocalClient;
+        use kr_protocol::local::LocalClientKind;
+        use kr_protocol::scalars::{Nullable, U64};
+
+        let temp = kr_ipc::testing::TempHost::create();
+        let paths = temp.environment();
+        let id = paths.environment_id();
+        let host = HostPaths::new(paths.runtime_root(), paths.state_root())
+            .expect("the roots of the environment");
+        let endpoint = paths.controller_endpoint().expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let seen = temp.environment();
+        let daemon = tokio::spawn(async move {
+            let (mut reader, mut writer) = greet(&listener, id).await;
+            if matches!(standing, StandIn::ClosesAndEnds) {
+                return (Vec::new(), Vec::new());
+            }
+            let ControlFrame::Mutation(request) = reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the read request")
+            else {
+                panic!("the command writes a mutation");
+            };
+            let at_the_request = attempts_of(&seen);
+            let outcome = if matches!(standing, StandIn::TakesTheStop) {
+                Outcome::Ok(
+                    kr_protocol::envelope::ParamsValue::from_typed(&HostStopResult {
+                        pid: U64::new(4242),
+                        unsettled: U64::new(2),
+                        launch: Nullable::null(),
+                    })
+                    .expect("a stop result"),
+                )
+            } else {
+                refused(false)
+            };
+            write_outcome(&mut writer, request.request_id, outcome).await;
+            // Whatever else the command writes here is refused too. The loop ends where the command
+            // lets go of the connection, and the daemon ends with the listener after it.
+            while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+                let next = match frame {
+                    ControlFrame::Mutation(next) => next.request_id,
+                    ControlFrame::Request(next) => next.request_id,
+                    _ => continue,
+                };
+                write_outcome(&mut writer, next, refused(false)).await;
+            }
+            let at_the_close = attempts_of(&seen);
+            drop(listener);
+            (at_the_request, at_the_close)
+        });
+        let client = LocalClient::connect(&endpoint, LocalClientKind::Cli, crate::build_id())
+            .await
+            .expect("connects");
+        let mut daemon = Some(daemon);
+        if matches!(standing, StandIn::ClosesAndEnds) {
+            // The connection and the listener are closed before the command writes anything.
+            daemon
+                .take()
+                .expect("spawned")
+                .await
+                .expect("the daemon has closed the connection");
+        }
+        let environment = KnownEnvironment {
+            environment_id: id,
+            paths,
+        };
+        let progress = progress_of(id);
+        let info = host_info_of(ControllerGeneration::new(1));
+        let none = Facts::none(Vec::new());
+        let result = ask_and_wait(
+            Which::Stop,
+            &host,
+            &environment,
+            client,
+            &info,
+            true,
+            &progress,
+            &none,
+        )
+        .await;
+        let (at_the_request, at_the_close) = match daemon {
+            Some(daemon) => daemon.await.expect("the daemon saw the command's request"),
+            None => (Vec::new(), Vec::new()),
+        };
+        Observed {
+            environment,
+            progress,
+            result,
+            at_the_request,
+            at_the_close,
+            _temp: temp,
+        }
+    }
+
+    /// A stop that the daemon takes is recorded as asking where the request reaches the daemon and
+    /// as told before the command lets go of the connection, and the command lets go of it before
+    /// the wait for the daemon's end can end: the daemon ends only when it sees that. What the
+    /// command settled is what the daemon answered, and the record stays until the stop is said.
+    #[tokio::test]
+    async fn a_stop_the_daemon_takes_is_recorded_asking_then_told_and_the_connection_goes_before_the_end()
+     {
+        let observed = ask_and_wait_against(StandIn::TakesTheStop).await;
+        let Ok(settled) = observed.result else {
+            panic!("a daemon that takes the stop and ends settles it");
+        };
+        assert!(matches!(settled.request, Request::Told));
+        assert_eq!(settled.pid, Some(4242));
+        assert_eq!(settled.unsettled, Some(2));
+        assert!(
+            matches!(settled.ended, End::Gone),
+            "the daemon ended once the connection was let go: {:?}",
+            settled.ended
+        );
+        assert!(settled.old.is_none());
+        for (when, attempts, phase) in [
+            (
+                "where the request arrived",
+                &observed.at_the_request,
+                attempt::Phase::Asking,
+            ),
+            (
+                "where the connection was let go",
+                &observed.at_the_close,
+                attempt::Phase::Told,
+            ),
+            (
+                "where the wait ended",
+                &attempts_of(&observed.environment.paths),
+                attempt::Phase::Told,
+            ),
+        ] {
+            assert_eq!(attempts.len(), 1, "one record {when}");
+            assert_eq!(attempts[0].command, attempt::Command::Stop, "{when}");
+            assert_eq!(attempts[0].phase, phase, "{when}");
+        }
+        assert_eq!(observed.progress.stage(), Stage::Told);
+    }
+
+    /// A stop that the daemon refuses is recorded as asking where the request arrives, and the
+    /// record is removed before anything more is asked of the daemon: the command is at the stage
+    /// that says it was refused, and nothing was told.
+    #[tokio::test]
+    async fn a_refused_stop_removes_its_record_before_the_check_and_stays_at_the_refused_stage() {
+        let observed = ask_and_wait_against(StandIn::RefusesTheStop).await;
+        assert!(matches!(observed.result, Err(Cut::Said(_))));
+        assert_eq!(observed.at_the_request.len(), 1);
+        assert_eq!(observed.at_the_request[0].phase, attempt::Phase::Asking);
+        assert!(
+            observed.at_the_close.is_empty(),
+            "the record was removed before the check on the connection: {:?}",
+            observed.at_the_close
+        );
+        assert!(attempts_of(&observed.environment.paths).is_empty());
+        assert_eq!(observed.progress.stage(), Stage::Refused);
+    }
+
+    /// A request that cannot be composed leaves no record, and the command is back at the first
+    /// stage: nothing was asked, and its end is decided as for any failure before the request.
+    #[tokio::test]
+    async fn a_request_that_cannot_be_composed_leaves_no_record_and_the_first_stage() {
+        let observed = ask_and_wait_against(StandIn::ClosesAndEnds).await;
+        let Err(Cut::Unmade { before, error }) = observed.result else {
+            panic!("a request on a closed connection is not made");
+        };
+        assert!(closed_by_the_daemon(&error), "{error}");
+        assert!(
+            matches!(before, Before::Ended { .. }),
+            "the daemon ended with its connection"
+        );
+        assert!(attempts_of(&observed.environment.paths).is_empty());
+        assert_eq!(observed.progress.stage(), Stage::BeforeAsking);
+    }
+
+    /// The stop is said with the record of the attempt removed where the end is shown, and kept
+    /// where it is not: a daemon that has not ended may still be stopping.
+    #[test]
+    fn a_settled_stop_is_said_with_its_record_removed_only_where_the_end_is_shown() {
+        for (ended, shown) in [
+            (End::Gone, true),
+            (End::Successor(Some(4343)), true),
+            (End::NotEnded(Why::Running, None), false),
+        ] {
+            let temp = kr_ipc::testing::TempHost::create();
+            let paths = temp.environment();
+            let environment = KnownEnvironment {
+                environment_id: paths.environment_id(),
+                paths,
+            };
+            let progress = progress_of(environment.environment_id);
+            let marker = Marker::begin(&environment.paths, attempt::Command::Stop, None)
+                .expect("the record");
+            *progress
+                .marker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(marker);
+            let _ = progress.with_marker(|marker| marker.told());
+            let settled = Settled {
+                request: Request::Told,
+                ended: ended.clone(),
+                pid: Some(4242),
+                unsettled: Some(0),
+                old: None,
+            };
+            let completion = say_the_stop(
+                Which::Stop,
+                settled,
+                &environment,
+                &Facts::none(Vec::new()),
+                true,
+                &progress,
+                &Earlier::read(&environment.paths),
+            );
+            assert_eq!(
+                matches!(completion, Completion::Done),
+                shown,
+                "{ended:?} ends the command as a success only where the daemon ended"
+            );
+            assert_eq!(
+                attempts_of(&environment.paths).len(),
+                usize::from(!shown),
+                "{ended:?}"
+            );
         }
     }
 
