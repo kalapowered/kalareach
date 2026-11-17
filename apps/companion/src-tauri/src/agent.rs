@@ -340,8 +340,8 @@ impl WorkerLinks {
     ///
     /// On this machine the snapshot is `events.snapshot` on the worker. On a host this device is
     /// paired with it is `agent.instances`, which carries no screen and so is served to a share
-    /// that does not include the live screen; a worker of an earlier build does not serve it, and
-    /// where the grant includes the screen the snapshot is read instead.
+    /// that does not include the live screen; a worker of level 0.71 or earlier does not serve it,
+    /// and where the grant includes the screen the snapshot is read instead.
     ///
     /// # Errors
     ///
@@ -354,8 +354,8 @@ impl WorkerLinks {
     ) -> Result<SessionAgents> {
         let paired = state.paired_context().is_some();
         let mut restarts = 0;
-        // Whether a page of the instances read was refused for an earlier worker, in which case
-        // the snapshot is what is read.
+        // Whether a page of the instances read was refused for a worker of level 0.71 or earlier,
+        // in which case the snapshot is what is read.
         let mut snapshot_instead = !paired;
         let mut fell_back = false;
         'snapshot: loop {

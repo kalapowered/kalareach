@@ -4730,7 +4730,7 @@
         },
         "reach": {
           "$ref": "#/$defs/RevisionReach",
-          "description": "Whose authority the revisions up to this one withdrew, when the host can name it.\n\nIt is absent from the wire when it is the whole host, which is what a worker that does not\nstate [`crate::local::AUTHORITY_REVISION_REACH`] is always sent."
+          "description": "Whose authority the revisions up to this one withdrew, when the host can name it.\n\nIt is absent from the wire when it is the whole host, which is what a daemon of level 0.74\nor earlier always sent a worker that did not state\n[`crate::local::AUTHORITY_REVISION_REACH`]. This release's daemon names the reach to every\nworker, because every worker of a level it retains states it."
         },
         "revision": {
           "$ref": "#/$defs/AuthorityRevision",
@@ -13044,7 +13044,7 @@
         },
         {
           "const": "windows_session_logon",
-          "description": "Windows: the time the system records for the interactive session's user to have logged on,\nin 100 ns ticks since 1601, which the account reads for its own session. A host of some\nearlier releases at this level sends the start value of the session's logon process under\nthis source instead, so compare the value and do not read it as a logon time.",
+          "description": "Windows: the time the system records for the interactive session's user to have logged on,\nin 100 ns ticks since 1601, which the account reads for its own session. A host of one of\nthe first seven releases of level 0.78 sends the start value of the session's logon process\nunder this source instead, so compare the value and do not read it as a logon time.",
           "type": "string"
         },
         {
@@ -17699,7 +17699,7 @@
               "type": "null"
             }
           ],
-          "description": "The history scope of the grant the host decided this mutation under.\n\nSection 10 narrows a grant's history in one place, the shared host-side filter, and the\nworker applies it to the answer it gives the caller: the first answer to a question, and\nthe retained answer to a duplicate. The worker holds no grants, so the scope travels with\nthe mutation. It is absent for a caller acting under no grant. Absence never widens what a\ncaller is shown: a worker shows retained content without a scope only to a caller it can\nsee is the local owner.\n\nIt is absent from the wire when it is absent, so a mutation without one is byte for byte\nwhat a worker built before scopes travelled with mutations reads, and the daemon's own link\nfor a local caller's action never writes one. A daemon sends one only to a worker that states\n[`FORWARDED_RESULT_SCOPE`]."
+          "description": "The history scope of the grant the host decided this mutation under.\n\nSection 10 narrows a grant's history in one place, the shared host-side filter, and the\nworker applies it to the answer it gives the caller: the first answer to a question, and\nthe retained answer to a duplicate. The worker holds no grants, so the scope travels with\nthe mutation. It is absent for a caller acting under no grant. Absence never widens what a\ncaller is shown: a worker shows retained content without a scope only to a caller it can\nsee is the local owner.\n\nIt is absent from the wire when it is absent, so a mutation without one is byte for byte\nwhat a worker built before scopes travelled with mutations reads, and the daemon's own link\nfor a local caller's action never writes one. A daemon sends one to every worker, because\nevery worker of a level this release retains states [`FORWARDED_RESULT_SCOPE`]; a daemon of\nlevel 0.74 or earlier sent one only to a worker that stated it."
         },
         "lease": {
           "anyOf": [
@@ -17725,7 +17725,7 @@
               "type": "null"
             }
           ],
-          "description": "The kind of grant the host decided this mutation under, for a `session.attach` only.\n\nAn attachment decided under a share is drawn the screen the share's issuer was shown: the\ntext and how it is drawn, and no window title, no title stack and no link target, which the\npreview did not show. One decided under a device's pairing grant is drawn the live screen.\nA frame that says nothing is drawn as a share's is, because the worker cannot tell which it\nis and the narrower reading discloses nothing the other does not.\n\nIt is absent from the wire when it is absent, so a frame without one is byte for byte what a\nworker built before it read, and a daemon sends it only to a worker that states\n[`FORWARDED_SCREEN_BASIS`]."
+          "description": "The kind of grant the host decided this mutation under, for a `session.attach` only.\n\nAn attachment decided under a share is drawn the screen the share's issuer was shown: the\ntext and how it is drawn, and no window title, no title stack and no link target, which the\npreview did not show. One decided under a device's pairing grant is drawn the live screen.\nA frame that says nothing is drawn as a share's is, because the worker cannot tell which it\nis and the narrower reading discloses nothing the other does not.\n\nIt is absent from the wire when it is absent, so a frame without one is byte for byte what a\nworker built before it read, and a daemon sends it to every worker, because every worker of\na level this release retains states [`FORWARDED_SCREEN_BASIS`]; a daemon of level 0.74 or\nearlier sent it only to a worker that stated it."
         },
         "workflow_run_id": {
           "anyOf": [
@@ -17775,7 +17775,7 @@
               "type": "null"
             }
           ],
-          "description": "The history scope of the grant the host decided this read under.\n\nSection 10 narrows a grant's history in one place, the shared host-side filter, and the\nworker applies that filter to what it retains: an agent's semantic history, an approval's\nrecord and the session's questions. The worker holds no grants, so the scope travels with\nthe read. It is absent for a caller acting under no grant. Absence never widens what a\ncaller reads: a worker serves retained history without a scope only to a caller it can see\nis the local owner, and refuses anybody else.\n\nIt is absent from the wire when it is absent, so a read without one is byte for byte what a\nworker built before scopes travelled reads. A daemon sends one only to a worker that states\n[`FORWARDED_HISTORY_SCOPE`], and a question read with one only to a worker that also states\n[`FORWARDED_QUESTION_SCOPE`]."
+          "description": "The history scope of the grant the host decided this read under.\n\nSection 10 narrows a grant's history in one place, the shared host-side filter, and the\nworker applies that filter to what it retains: an agent's semantic history, an approval's\nrecord and the session's questions. The worker holds no grants, so the scope travels with\nthe read. It is absent for a caller acting under no grant. Absence never widens what a\ncaller reads: a worker serves retained history without a scope only to a caller it can see\nis the local owner, and refuses anybody else.\n\nIt is absent from the wire when it is absent, so a read without one is byte for byte what a\nworker built before scopes travelled reads. A daemon sends one, and a question read with\none, to every worker, because every worker of a level this release retains states\n[`FORWARDED_HISTORY_SCOPE`] and [`FORWARDED_QUESTION_SCOPE`]; a daemon of level 0.74 or\nearlier sent one only to a worker that stated the first, and a question read with one only\nto a worker that stated both."
         },
         "request": {
           "$ref": "#/$defs/Request",
@@ -21910,7 +21910,7 @@
     },
     "LocalAccess": {
       "additionalProperties": false,
-      "description": "The control daemon's statement of [`LocalBound`], on its authority connection to a worker.\n\nSent only to a worker that states [`crate::local::LOCAL_ACCESS`]: a worker of an earlier build\nends a connection that carries a frame it cannot read. The sequence rises within one controller\ngeneration, and a frame of a newer generation replaces the state whatever its sequence.",
+      "description": "The control daemon's statement of [`LocalBound`], on its authority connection to a worker.\n\nSent to every worker of a level this release retains, each of which states\n[`crate::local::LOCAL_ACCESS`]: a worker built before the statement ends a connection that\ncarries a frame it cannot read, so a daemon of level 0.74 or earlier sent it only to a worker\nthat stated it. The sequence rises within one controller generation, and a frame of a newer\ngeneration replaces the state whatever its sequence.",
       "properties": {
         "bound": {
           "$ref": "#/$defs/LocalBound",

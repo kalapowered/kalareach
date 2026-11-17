@@ -784,11 +784,11 @@ the session's terminal, with the reason that the session closed. This behaviour 
 local sessions, and will involve starting the kr control daemon in the environment if necessary
 (which `kr attach` may do).
 
-A bridge to a daemon, worker or helper of an earlier release is refused with a sentence that names
-both builds and says what to do. An earlier helper cannot read the opening frame, so the command
-says to update kr there; an earlier daemon or worker answers an ordinary connection but not the one
-a bridge makes, so the command says to restart it or to attach from inside the environment with the
-kr of its own build.
+A bridge to a daemon, worker or helper that does not read a bridge's opening frame is refused with
+a sentence that names both builds and says what to do. A helper that cannot read the opening frame
+gets the advice to update kr there; a daemon or worker that answers an ordinary connection but not
+the one a bridge makes gets the advice to restart it or to attach from inside the environment with
+the kr of its own build.
 
 A terminal that falls behind does not end the attachment. When what the bridge holds for it passes 8
 MiB, the output and screen frames are dropped, and one resynchronise marker is left in their place.
@@ -2043,7 +2043,7 @@ Moving the reference back is another apply that names the earlier value as `--re
 later one as `--reference-at`. If the host stops during the move, or Git reports a failure and the
 reference then holds the object `--reference-to` names, read the reference to see where it stands
 before you run the command again: each run is a new action, and it finds the reference moved, which
-is `DRAFT_CONFLICT`, or not moved, and moves it. A host of an earlier release
+is `DRAFT_CONFLICT`, or not moved, and moves it. A host of level 0.77 or earlier
 refuses a request that carries `--reference-to`. Windows refuses every repository
 operation, so this destination is not available there. `working-tree` writes the workspace's own
 files in place. Every destination but a bare proposal names `--workspace`.
@@ -2913,7 +2913,7 @@ member's account name is shown as the organisation signed it.
 
 To withdraw a host from an organisation, use `kr organisation withdraw <id>`, where `<id>` is the identifier `kr organisation list` shows. This operation, being only a restriction, does not need any confirmation. It is also the way past a refused `kr host rollback` when the organisation's policy states an adapter list that the release being rolled back to would not apply; it ends every grant that requires the organisation and every lease, and a later enrolment needs an owner device again. The host refuses an organisation it is not enrolled in, and its last one while exclusive management is on. The command reports the authority revision the host is fenced at and how far each affected session's worker has got, and it fails with a pending result when a worker has not fenced it yet. With `--json` it returns the revocation result: `authority_revision`, `revoked_grants`, `revoked_grants_total` and the `barrier`.
 
-`kr organisation exclusive on` makes the host exclusively organisation-managed, and `kr organisation exclusive off` ends that. An owner device confirms either, as it confirms an enrolment: `kr` says so, says what that device is asked to confirm, and asks the host again every second until the confirmation arrives or the challenge times out. The host refuses `on` when it is enrolled in no organisation, or when no owner device is left that could confirm for it, and it refuses `off` when exclusive management is not on, in both cases before anyone is asked. It also refuses `on` while a session worker cannot be told what the local owner may do, as a worker that an earlier release started cannot; `kr close` ends that session.
+`kr organisation exclusive on` makes the host exclusively organisation-managed, and `kr organisation exclusive off` ends that. An owner device confirms either, as it confirms an enrolment: `kr` says so, says what that device is asked to confirm, and asks the host again every second until the confirmation arrives or the challenge times out. The host refuses `on` when it is enrolled in no organisation, or when no owner device is left that could confirm for it, and it refuses `off` when exclusive management is not on, in both cases before anyone is asked. It also refuses `on` while a session worker cannot be told what the local owner may do, as a worker the host has not reached cannot; `kr close` ends that session.
 
 When exclusive management is on and no owner device is left that could confirm for the host, the host tells `kr organisation exclusive off` that the terminal can confirm it. `kr` then asks the person to type `end` at the controlling terminal, which must be interactive and outside every KalaReach session, as for `kr host clock --establish`. The terminal confirms nothing else in that state. With `--json`, `on` and `off` return `ok`, `exclusive`, `authority_revision` and, for `on`, `barrier_workers_total`.
 

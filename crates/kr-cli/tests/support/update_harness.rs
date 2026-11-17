@@ -2003,8 +2003,8 @@ impl Drop for Second {
     }
 }
 
-/// The store record format the build before this one wrote, which this build reads and writes again
-/// in its own.
+/// The store record format one below the one this build writes, which this build reads and writes
+/// again in its own.
 const EARLIER_RECORD_FORMAT: u32 = kr_cli::update::RECORD_FORMAT - 1;
 
 /// A store's record that holds nothing, in the format this build writes.

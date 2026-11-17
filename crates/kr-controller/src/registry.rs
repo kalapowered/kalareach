@@ -3914,9 +3914,9 @@ mod tests {
         .expect("encodes")
     }
 
-    /// Writes a registry as the build before this one left it, schema version 6, with a
-    /// reservation recording each of `intents` (none for a reservation an older schema made
-    /// without one), each moved through two phases so that the row is written more than once.
+    /// Writes a registry at schema version 6, with a reservation recording each of `intents`
+    /// (none for a reservation an older schema made without one), each moved through two phases
+    /// so that the row is written more than once.
     fn registry_at_version_6(path: &std::path::Path, intents: &[Option<Vec<u8>>]) {
         let mut registry = opened(path, kernel);
         for intent in intents {
@@ -3988,7 +3988,7 @@ mod tests {
             .expect("reads the version")
     }
 
-    /// A registry the build before this one wrote opens at the current version with every recorded
+    /// A registry written at schema version 6 opens at the current version with every recorded
     /// request emptied of the creator's environment and still a create request, and none of the
     /// old bytes are in the file, its write-ahead log or its shared-memory file.
     #[test]

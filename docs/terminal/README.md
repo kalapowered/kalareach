@@ -696,8 +696,10 @@ the commands that change its colours. The pieces that remain keep the positions 
 they started at, so a gap between two of them shows how many bytes were left out and not what they
 said. The daemon says that an attach was decided under a share, and the worker draws that attachment
 this screen; a device under its pairing grant, whose pairing no preview described, is drawn the live
-screen with its titles and link targets, as the owner's own terminal is drawn the whole screen. A
-worker that does not state it narrows an attachment this way is not asked to attach a share.
+screen with its titles and link targets, as the owner's own terminal is drawn the whole screen. Every
+worker of a level this release retains states that it narrows an attachment this way, and the
+daemon asks every worker to attach a share; a daemon of level 0.74 or earlier did not ask a worker
+that did not state it.
 
 The cursor a snapshot names is the committed output cursor, not the read offset: it is the point
 every delivered event has reached. Taking a snapshot settles the held cell, and `Engine::snapshot`

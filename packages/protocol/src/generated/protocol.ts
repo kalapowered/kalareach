@@ -7179,8 +7179,10 @@ export interface AuthorityRevisionNotice {
   /**
    * Whose authority the revisions up to this one withdrew, when the host can name it.
    *
-   * It is absent from the wire when it is the whole host, which is what a worker that does not
-   * state [`crate::local::AUTHORITY_REVISION_REACH`] is always sent.
+   * It is absent from the wire when it is the whole host, which is what a daemon of level 0.74
+   * or earlier always sent a worker that did not state
+   * [`crate::local::AUTHORITY_REVISION_REACH`]. This release's daemon names the reach to every
+   * worker, because every worker of a level it retains states it.
    */
   reach?:
     | 'host'
@@ -9272,9 +9274,11 @@ export interface GenerationAccepted {
 /**
  * The control daemon's statement of [`LocalBound`], on its authority connection to a worker.
  *
- * Sent only to a worker that states [`crate::local::LOCAL_ACCESS`]: a worker of an earlier build
- * ends a connection that carries a frame it cannot read. The sequence rises within one controller
- * generation, and a frame of a newer generation replaces the state whatever its sequence.
+ * Sent to every worker of a level this release retains, each of which states
+ * [`crate::local::LOCAL_ACCESS`]: a worker built before the statement ends a connection that
+ * carries a frame it cannot read, so a daemon of level 0.74 or earlier sent it only to a worker
+ * that stated it. The sequence rises within one controller generation, and a frame of a newer
+ * generation replaces the state whatever its sequence.
  */
 export interface LocalAccess {
   /**
@@ -9978,8 +9982,9 @@ export interface ForwardedMutation {
    *
    * It is absent from the wire when it is absent, so a mutation without one is byte for byte
    * what a worker built before scopes travelled with mutations reads, and the daemon's own link
-   * for a local caller's action never writes one. A daemon sends one only to a worker that states
-   * [`FORWARDED_RESULT_SCOPE`].
+   * for a local caller's action never writes one. A daemon sends one to every worker, because
+   * every worker of a level this release retains states [`FORWARDED_RESULT_SCOPE`]; a daemon of
+   * level 0.74 or earlier sent one only to a worker that stated it.
    */
   history?: HistoryScope | null
   /**
@@ -10003,8 +10008,9 @@ export interface ForwardedMutation {
    * is and the narrower reading discloses nothing the other does not.
    *
    * It is absent from the wire when it is absent, so a frame without one is byte for byte what a
-   * worker built before it read, and a daemon sends it only to a worker that states
-   * [`FORWARDED_SCREEN_BASIS`].
+   * worker built before it read, and a daemon sends it to every worker, because every worker of
+   * a level this release retains states [`FORWARDED_SCREEN_BASIS`]; a daemon of level 0.74 or
+   * earlier sent it only to a worker that stated it.
    */
   screen_basis?: ScreenBasis | null
   /**
@@ -10207,9 +10213,11 @@ export interface ForwardedRequest {
    * is the local owner, and refuses anybody else.
    *
    * It is absent from the wire when it is absent, so a read without one is byte for byte what a
-   * worker built before scopes travelled reads. A daemon sends one only to a worker that states
-   * [`FORWARDED_HISTORY_SCOPE`], and a question read with one only to a worker that also states
-   * [`FORWARDED_QUESTION_SCOPE`].
+   * worker built before scopes travelled reads. A daemon sends one, and a question read with
+   * one, to every worker, because every worker of a level this release retains states
+   * [`FORWARDED_HISTORY_SCOPE`] and [`FORWARDED_QUESTION_SCOPE`]; a daemon of level 0.74 or
+   * earlier sent one only to a worker that stated the first, and a question read with one only
+   * to a worker that stated both.
    */
   history?: HistoryScope | null
   request: Request1

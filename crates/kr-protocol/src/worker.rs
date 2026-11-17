@@ -488,8 +488,10 @@ pub struct AuthorityRevisionNotice {
     pub revision: AuthorityRevision,
     /// Whose authority the revisions up to this one withdrew, when the host can name it.
     ///
-    /// It is absent from the wire when it is the whole host, which is what a worker that does not
-    /// state [`crate::local::AUTHORITY_REVISION_REACH`] is always sent.
+    /// It is absent from the wire when it is the whole host, which is what a daemon of level 0.74
+    /// or earlier always sent a worker that did not state
+    /// [`crate::local::AUTHORITY_REVISION_REACH`]. This release's daemon names the reach to every
+    /// worker, because every worker of a level it retains states it.
     #[serde(default, skip_serializing_if = "RevisionReach::is_host")]
     pub reach: RevisionReach,
     /// How many names of this revision's fence evidence the daemon already has.
@@ -696,9 +698,11 @@ pub enum LocalBound {
 
 /// The control daemon's statement of [`LocalBound`], on its authority connection to a worker.
 ///
-/// Sent only to a worker that states [`crate::local::LOCAL_ACCESS`]: a worker of an earlier build
-/// ends a connection that carries a frame it cannot read. The sequence rises within one controller
-/// generation, and a frame of a newer generation replaces the state whatever its sequence.
+/// Sent to every worker of a level this release retains, each of which states
+/// [`crate::local::LOCAL_ACCESS`]: a worker built before the statement ends a connection that
+/// carries a frame it cannot read, so a daemon of level 0.74 or earlier sent it only to a worker
+/// that stated it. The sequence rises within one controller generation, and a frame of a newer
+/// generation replaces the state whatever its sequence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct LocalAccess {
