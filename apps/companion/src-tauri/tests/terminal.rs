@@ -6809,3 +6809,37 @@ async fn a_launch_waiting_for_its_barrier_when_the_view_ends_is_not_started() {
     );
     drop(link);
 }
+
+/// The host says on the input stream that the epoch the view holds is over: control ends as a lost
+/// lease ends it, the page is told in the view's sentence for a lost lease, whole, and the input of
+/// the take is refused after it. Nothing is given back, since the lease is not the view's any more.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_hosts_notice_that_the_held_epoch_ended_ends_control_and_tells_the_page_why() {
+    let mut host = ScriptedHost::start(lane_window(8)).await;
+    let page = Page::over(&mut host);
+    let mut lease = WorkerLease::default();
+    let (view, mut link) =
+        paired_controlling(&page, &mut host, 3, &reporting(Mouse::Sgr), &mut lease).await;
+    host.script.epoch_ended(1, 0);
+    let ended = page
+        .newest_within(3, |state| control(state) == (1, "watching".to_owned()))
+        .await
+        .expect("the notice ended control within the bound");
+    assert_eq!(
+        ended["control"]["ended"],
+        "Control ended: another view took it, or the program changed how it reads keys.",
+        "the sentence for a lost lease"
+    );
+    assert_eq!(
+        code(
+            &page
+                .text(&view, 1, "late")
+                .expect_err("an input of the ended take")
+        ),
+        "LEASE_LOST"
+    );
+    assert!(
+        link.call_within(QUIET).await.is_none(),
+        "no release is sent for a lease that is not the view's any more"
+    );
+}
