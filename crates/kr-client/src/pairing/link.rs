@@ -1571,9 +1571,7 @@ mod tests {
     /// A dial that waited behind a forget meets its mark. The forget's removal is held at the
     /// transport's gate while it holds the host's lock, a dial of the forgotten pairing waits for the
     /// lock, and when the removal is let go the dial is refused and puts nothing in the table or the
-    /// map. A mark set after the removal would let the dial through in between. So does a dial that
-    /// began before the forget and asks for the lock only after the forget ended: a decision made
-    /// before the lock would let it through.
+    /// map. A mark set after the removal would let the dial through in between.
     #[tokio::test]
     async fn a_dial_that_waited_behind_the_forget_is_refused() {
         let pool = loopback_pool();
@@ -1603,9 +1601,17 @@ mod tests {
         );
         assert!(!table_holds(&pool, &host).await);
         assert!(pool.relay_urls().await.is_empty());
+        pool.close().await;
+    }
 
-        // A dial that began before the forget and asks for the lock after it meets the mark too: it
-        // is held before the lock, the forget runs to its end, and the dial is let go.
+    /// A dial that began before the forget and asks for the lock only after the forget ended meets
+    /// the mark: it is held before the lock, the forget runs to its end, and the dial is let go and
+    /// refused. A decision made before the lock would let it through.
+    #[tokio::test]
+    async fn a_dial_that_began_before_the_forget_is_refused_when_it_asks_for_the_lock_after_it() {
+        let pool = loopback_pool();
+        let own = "https://127.0.0.1:10";
+        let config = network(&[own], Some(RESOLVER), &[]);
         let early = key();
         pool.endpoint(&config, &early, Standing::Paired(pairing(2)))
             .await
