@@ -11420,7 +11420,7 @@ async fn the_lock_names_every_store_at_the_version_and_digest_the_code_has() {
 }
 
 /// KR-REQ-26.10, KR-REQ-26.13, KR-REQ-12.06, KR-REQ-24.29: the release lists the backup store at
-/// schema version 9, the registry at schema version 17, the configuration document at version 4 and
+/// schema version 9, the registry at schema version 19, the configuration document at version 4 and
 /// the transfers journal at version 6 as read through, and no other store. The release after this one
 /// writes the backup store's widened rule, the registry and the document, so a rollback to this one
 /// is not refused for a store at those versions; the journal at version 6 is what a build before this
@@ -11437,7 +11437,7 @@ fn the_release_reads_through_the_backup_store_the_registry_the_configuration_doc
         vec![
             ("backup".to_owned(), 9),
             ("configuration".to_owned(), 4),
-            ("registry".to_owned(), 17),
+            ("registry".to_owned(), 19),
             ("transfers".to_owned(), 6),
         ]
     );

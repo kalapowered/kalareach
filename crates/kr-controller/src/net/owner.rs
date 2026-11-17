@@ -50,8 +50,8 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Digest256, EndpointKe
 
 use super::devices::{CommitFn, DeviceDirectory, DeviceRecord};
 use super::invitations::{
-    ActionSubject, InvitationRows, PairingAction, TerminalStanding, another_subject, claim_effect,
-    consume, noted_as_a_copy,
+    AcceptanceRow, ActionSubject, InvitationRows, PairingAction, TerminalStanding, another_subject,
+    claim_effect, consume, noted_as_a_copy,
 };
 use super::lifetimes::GrantLifetimes;
 use super::pairing::HostPairingClock;
@@ -323,6 +323,9 @@ struct Entry {
 struct Answer {
     proof: OwnerConfirmationProof,
     signer: AuthorisationKey,
+    /// The owner device whose record answered: the standing the answer is spent under is that
+    /// record's, not any record that holds the same key. A bootstrap answer has none.
+    signer_device: Option<DeviceId>,
 }
 
 /// The challenges this host has issued: kr-pairing's ledger, which consumes each once, and what
@@ -1307,7 +1310,7 @@ impl OwnerAuthority {
         if !caller.may_confirm_display(&entry.display) {
             return Err(caller.refusal_to_confirm());
         }
-        let signer = self.signer_for(caller, proof, entry, enrolment, params)?;
+        let (signer, signer_device) = self.signer_for(caller, proof, entry, enrolment, params)?;
         verify_confirmation(&self.clock, &entry.request, proof, &signer, enrolment)
             .map_err(refusal)?;
         let already = entry.answer.as_ref().map(|answer| &answer.proof == proof);
@@ -1344,12 +1347,14 @@ impl OwnerAuthority {
                 subject: ActionSubject::Completed(proof.request.confirmation_id),
             },
             kr_ipc::now_ms(),
+            signer_device,
             &in_the_record,
         )?;
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.answer = Some(Answer {
                 proof: proof.clone(),
                 signer,
+                signer_device,
             });
         }
         Ok(OwnerConfirmationCompleteResult {
@@ -1407,10 +1412,10 @@ impl OwnerAuthority {
         // authority has gone is passed over, never spent, and the oldest answer that still stands
         // is the one taken. The store checks once more inside the transaction that records the
         // effect.
-        let owner_keys: Vec<KeyId> = self
+        let owner_records: Vec<(KeyId, DeviceId)> = self
             .owner_devices()?
             .iter()
-            .map(|device| key_id(&device.authorisation))
+            .map(|device| (key_id(&device.authorisation), device.device_id))
             .collect();
         let mut chosen = None;
         for entry in candidates {
@@ -1421,7 +1426,11 @@ impl OwnerAuthority {
             let enrolment = self.standing_of(entry)?;
             let standing = match answer.proof.channel {
                 ConfirmationChannel::LocalBootstrapTerminal => enrolment.terminal_confirms(),
-                _ => owner_keys.contains(&answer.proof.signer_key_id),
+                // An answer is taken only while the record that answered it stands, not while some
+                // record holds the same key.
+                _ => answer.signer_device.is_some_and(|device| {
+                    owner_records.contains(&(answer.proof.signer_key_id, device))
+                }),
             };
             if standing {
                 chosen = Some((entry.request.clone(), answer.clone(), enrolment));
@@ -1574,6 +1583,7 @@ impl OwnerAuthority {
                         "establish this host's clock",
                         established,
                         TerminalStanding::Bootstrap,
+                        AcceptanceRow::Optional,
                     )?;
                     claim_effect(transaction, &claimed)?;
                     self.still_covers(&state, &spendable, &expectation)?;
@@ -1681,7 +1691,7 @@ impl OwnerAuthority {
         entry: &Entry,
         enrolment: HostEnrolment,
         params: &OwnerConfirmationCompleteParams,
-    ) -> Result<AuthorisationKey> {
+    ) -> Result<(AuthorisationKey, Option<DeviceId>)> {
         match proof.channel {
             ConfirmationChannel::LocalBootstrapTerminal => {
                 if !enrolment.terminal_confirms() {
@@ -1709,7 +1719,7 @@ impl OwnerAuthority {
                         "the bootstrap proof was signed with another key",
                     ));
                 }
-                Ok(signer)
+                Ok((signer, None))
             }
             ConfirmationChannel::OwnerDevicePresence | ConfirmationChannel::PairedOwnerDevice => {
                 if params.bootstrap_signer.is_present() {
@@ -1733,7 +1743,7 @@ impl OwnerAuthority {
                         "a device completes the confirmations it signed itself",
                     ));
                 }
-                Ok(owner.authorisation)
+                Ok((owner.authorisation, Some(owner.device_id)))
             }
             ConfirmationChannel::EnrolledPresenceSigner => Err(confirmation_required(
                 "this host has no enrolled presence signer",
