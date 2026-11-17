@@ -3199,9 +3199,11 @@ async fn an_acquire_answered_after_looking_around_is_released_and_restores_nothi
 /// A release and a take made one after the other each go in order under their own epochs: the
 /// take's acquire goes while the release stands behind the key that the worker has not answered, and
 /// when the worker has answered the acquire and the page is told that the take controls, a late
-/// refusal of the old epoch's key and the release of that older epoch change nothing. An input made
-/// under the old take is refused once the new one controls the program, and one made under the new
-/// take is written under the new epoch.
+/// refusal of the old epoch's key and the release of that older epoch change nothing, the release's
+/// second send included: the view's second release, which it sends only after it has served the
+/// first one's answer, is the checkpoint after which the states are read. An input made under the
+/// old take is refused once the new one controls the program, and one made under the new take is
+/// written under the new epoch.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_release_and_a_new_take_keep_their_epochs_apart() {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
@@ -3231,7 +3233,24 @@ async fn a_release_and_a_new_take_keep_their_epochs_apart() {
         .await;
     let release = link.expect(Method::InputRelease).await;
     assert_eq!(release.params::<InputReleaseParams>().epoch.get(), 5);
-    lease.answer(&mut link, &release).await;
+    // The worker refuses it for the typing before it, which the view answers by sending the
+    // release once more with no position. It does that only once it has served this answer, so the
+    // second release on the wire is the checkpoint after which the states can be read: the view
+    // has taken the older release's answer.
+    link.refuse_with(
+        &release,
+        ErrorCode::DraftConflict,
+        "the typing before it was not taken",
+    )
+    .await;
+    let again = link.expect(Method::InputRelease).await;
+    let again_asked: InputReleaseParams = again.params();
+    assert_eq!(again_asked.epoch.get(), 5);
+    assert!(
+        again_asked.after_input.is_none(),
+        "the second release names no position"
+    );
+    lease.answer(&mut link, &again).await;
     assert_eq!(
         code(
             &page_view
@@ -3240,9 +3259,7 @@ async fn a_release_and_a_new_take_keep_their_epochs_apart() {
         ),
         "LEASE_LOST"
     );
-    // The lane writes the new take's key after the release's answer, so the key on the wire shows
-    // that the view has taken both answers, and what it was told since the take controlled is the
-    // same state of control.
+    // A key of the new take is written under the new epoch, so the lane still stands.
     page_view.text(&view, 3, "b").expect("the text is taken");
     let write = link.expect(Method::InputWrite).await;
     let asked: InputWriteParams = write.params();
@@ -4901,41 +4918,63 @@ async fn a_restarted_delivery_drops_the_old_streams_frames_until_its_first_at_ze
 
 /// A view that is slower than the host loses no notification: the page holds the view inside its
 /// first state while the host writes 262 notifications, more than the 256 that the session's
-/// channel holds, so the session's reader waits for room. The few frames beyond the channel's are
-/// what the socket holds: a host that writes more than about 268 while the view is held waits for
-/// the view with no end. Every screen the host sent is then shown, in order, and when the host's
-/// connection goes the view ends with the words it always had.
+/// channel holds, so the session's reader waits for room. The host writes from a task of its own,
+/// which the case joins, under a bound, once the page lets the view go. While the view is held the
+/// case waits only until the host has written what the view, the channel and the reader hold
+/// between them (one, 256 and one), which needs no room in the socket: nothing here depends on how
+/// much a socket holds, and a host that cannot write the rest yet waits for the view. Every screen
+/// the host sent is then shown, in order, and when the host's connection goes the view ends with
+/// the words it always had.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_view_loses_no_notification_and_ends_with_its_words() {
     const SCREENS: u64 = 262;
+    // What the view, the session's channel and the session's reader hold between them.
+    const HELD: u64 = 1 + 256 + 1;
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
-    let (_view, mut link) = showing(&page, &mut worker, 3).await;
+    let (_view, link) = showing(&page, &mut worker, 3).await;
     let shown = page.states(3).len();
     let held = Held::new(&page.gate);
-    for number in 0..SCREENS {
-        link.push(
-            PROJECTION_DELTA_EVENT,
-            &delta(
-                1,
-                40 + number,
-                41 + number,
-                10,
-                2,
-                0,
-                vec![row(1, &format!("screen {number}"))],
-            ),
-        )
-        .await;
-    }
-    drop(link);
+    let (progress, mut written) = tokio::sync::watch::channel(0_u64);
+    let host = tokio::spawn(async move {
+        let mut link = link;
+        for number in 0..SCREENS {
+            link.push(
+                PROJECTION_DELTA_EVENT,
+                &delta(
+                    1,
+                    40 + number,
+                    41 + number,
+                    10,
+                    2,
+                    0,
+                    vec![row(1, &format!("screen {number}"))],
+                ),
+            )
+            .await;
+            progress.send_replace(number + 1);
+        }
+        drop(link);
+    });
+    let reached = tokio::time::timeout(STATE_BOUND, written.wait_for(|count| *count >= HELD))
+        .await
+        .is_ok_and(|count| count.is_ok());
+    assert!(
+        reached,
+        "the host did not write what the view, the channel and the reader hold within the bound"
+    );
     page.state(3, shown).await;
     assert_eq!(
         page.states(3).len(),
         shown + 1,
-        "the page held the view inside the first state while the host wrote all of them"
+        "the page held the view inside the first state while the host wrote"
     );
     drop(held);
+    let joined = tokio::time::timeout(STATE_BOUND, host).await;
+    assert!(
+        joined.is_ok_and(|host| host.is_ok()),
+        "the host did not finish writing within the bound once the view was let on"
+    );
     let ended = page.newest(3, |state| state["state"] == "ended").await;
     assert_eq!(ended["reason"], "The connection to this session ended.");
     let expected: Vec<String> = (0..SCREENS)
@@ -5086,18 +5125,23 @@ fn flood_texts(states: &[Value], from: usize) -> Vec<String> {
 /// was ready in one look.
 ///
 /// The page is held by the gate of its publication: the view's own task waits inside a state until
-/// the case lets it pass. The host writes 262 screens, the answer to the take's acquire, ten
-/// notices that draw nothing, the answer to a launch surface read, and then ten notices and one
-/// screen more: the channel holds 256, the first answer waits behind it, and the second answer is
-/// read only once the first look has made room, so it is ready while the queue is still full.
+/// the case lets it pass. While it is held the host writes only what the view, the session's
+/// channel and the session's reader hold between them: 258 notifications (one, 256 and one), the
+/// answer to the take's acquire after the first 150 screens, and the answer to a launch surface
+/// read after ten notices that draw nothing and 87 screens more, then ten notices and one screen.
+/// The answers take no place in the channel, so both are read while the channel is full and are
+/// ready in the first look, with all of the channel. Nothing the host writes needs room in the
+/// socket, so nothing here depends on how much a socket holds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_command() {
-    const FLOOD: u64 = 262;
-    // The notices between the answers and after them draw nothing, and are small enough for the
-    // socket to hold while the channel is full.
+    const BEFORE_ACQUIRE: u64 = 150;
     const BETWEEN_NOTICES: u64 = 10;
+    const BEFORE_SURFACE: u64 = 87;
     const AFTER_NOTICES: u64 = 10;
+    const FLOOD: u64 = BEFORE_ACQUIRE + BEFORE_SURFACE;
     const CHANNEL: usize = 256;
+    // The view holds one, the channel 256 and the session's reader one.
+    const _: () = assert!(FLOOD + BETWEEN_NOTICES + AFTER_NOTICES + 1 == 1 + CHANNEL as u64 + 1);
     const CALLS_IN_FLIGHT: usize = 3;
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
@@ -5113,25 +5157,27 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
     let surface = link.expect(Method::ShellLaunchSurface).await;
     let first = page.states(3).len();
     let held = Held::new(&page.gate);
-    for number in 0..FLOOD {
-        link.push(
-            PROJECTION_DELTA_EVENT,
-            &delta(
-                1,
-                40 + number,
-                41 + number,
-                10,
-                2,
-                0,
-                vec![row(1, &format!("flood {number}"))],
-            ),
+    let flood = |number: u64| {
+        delta(
+            1,
+            40 + number,
+            41 + number,
+            10,
+            2,
+            0,
+            vec![row(1, &format!("flood {number}"))],
         )
-        .await;
+    };
+    for number in 0..BEFORE_ACQUIRE {
+        link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
     }
     lease.answer(&mut link, &acquire).await;
     let notice = json!({"requested_cursor": "10", "oldest_retained_cursor": "20"});
     for _ in 0..BETWEEN_NOTICES {
         link.push("session.gap", &notice).await;
+    }
+    for number in BEFORE_ACQUIRE..FLOOD {
+        link.push(PROJECTION_DELTA_EVENT, &flood(number)).await;
     }
     link.answer(&surface, &a_surface_held_here(worker.session_id))
         .await;
@@ -5162,9 +5208,9 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
     page.resize(&view, 12, 3);
     held.let_pass(1);
     page.state(3, recorded).await;
-    let report = link
-        .call_now()
-        .expect("the size report is on the wire while the page still holds the view");
+    let report = link.call_within(STATE_BOUND).await.expect(
+        "the size report was not on the wire within the bound while the page still holds the view",
+    );
     assert_eq!(report.method, Method::AttachmentViewport.to_string());
     assert_eq!(
         report
@@ -5174,7 +5220,7 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
         "the report is the command's"
     );
     assert!(
-        link.call_now().is_none(),
+        link.quiet_for(QUIET).await,
         "the command made one request, and nothing else was owed"
     );
     drop(held);
@@ -5197,7 +5243,8 @@ async fn a_flood_the_page_takes_slowly_keeps_the_hosts_order_and_holds_back_no_c
         .position(|state| control(state) == (1, "controlling".to_owned()))
         .expect("the acquire's answer is served");
     assert!(
-        flood_texts(&states[..controlling], first).contains(&format!("flood {}", FLOOD - 1)),
+        flood_texts(&states[..controlling], first)
+            .contains(&format!("flood {}", BEFORE_ACQUIRE - 1)),
         "every screen the host sent before the answer is shown before the answer's effect"
     );
     let peak = views.queue_peak(&view).expect("the view is open");
