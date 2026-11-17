@@ -7,9 +7,11 @@
 //! write, a different number of writes, a scope row with no function and a row outside the scope
 //! each fail the case. The reader of source text, and what it does not see, is in
 //! `standing_scan/mod.rs`: it reads the body of every helper that a listed body calls by a name
-//! that this crate declares once, and the helpers those call in turn, so a helper cannot hide a
-//! write; a name that several functions declare has to be a scoped function, an `outside` one or
-//! allowed for the one body that calls it. The functions that make the time contract's writes
+//! that this crate declares once, and the helpers those call in turn, and a name that several
+//! functions declare has to be allowed for the one body that calls it (the standard library's) or
+//! declared with the file of the definition that the body calls, which is read as well; so a
+//! helper that a listed body reaches by either is held to the same rows. What the scan does not
+//! follow is named in the header of the reader. The functions that make the time contract's writes
 //! (the full check, the second raise, the kept reading) are listed by caller across the whole
 //! crate.
 //!
@@ -290,4 +292,62 @@ fn a_mutable_parameter_planted_in_a_piece_of_the_pass_is_reported() {
         "        session: &mut Session,\n        state: &ConnectionState,",
     );
     only_finding(&found, "service/standing.rs subject calls &mut 1 time(s)");
+}
+
+#[test]
+fn a_notify_planted_in_the_locked_body_of_the_questions_is_reported() {
+    // `locked` is a name that several functions declare: the roster declares which one the
+    // questions' checks call, and the scan reads it.
+    let found = planted(
+        "crates/kr-worker/src/questions/mod.rs",
+        "    fn locked(&self) -> Result<std::sync::MutexGuard<'_, Store>> {\n        self.store",
+        "    fn locked(&self) -> Result<std::sync::MutexGuard<'_, Store>> {\n        self.changed.notify_waiters();\n        self.store",
+    );
+    only_finding(
+        &found,
+        "questions/mod.rs locked calls notify_waiters 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_write_planted_in_the_stores_read_below_a_shared_name_is_reported() {
+    let found = planted(
+        "crates/kr-worker/src/questions/store.rs",
+        "    pub fn read(&self, question_id: QuestionId) -> Result<Question> {\n        self.row(question_id)?",
+        "    pub fn read(&self, question_id: QuestionId) -> Result<Question> {\n        self.connection.execute(\"\", [])?;\n        self.row(question_id)?",
+    );
+    only_finding(
+        &found,
+        "questions/store.rs read calls execute 1 time(s) and no row lists it",
+    );
+}
+
+#[test]
+fn a_call_to_a_shared_name_in_a_followed_body_that_no_row_declares_is_reported() {
+    // The decision's check is read by the follow, and the boundary holds in it: a call to a name
+    // that two functions declare (the broker's fence check and its note) has no row.
+    let found = planted(
+        SERVICE,
+        "        let reach = caller.disclosure(true);\n        Ok(self\n            .broker",
+        "        self.broker.require_rich_work()?;\n        let reach = caller.disclosure(true);\n        Ok(self\n            .broker",
+    );
+    only_finding(
+        &found,
+        "service.rs check_decision_reached calls require_rich_work, which several functions of the crate declare",
+    );
+}
+
+#[test]
+fn a_free_function_that_raises_the_floor_is_followed_and_reported() {
+    // A counted name called without a path is no counted call, and it is read like any helper: the
+    // function that it names is declared once, and what it writes is found where it stands.
+    let found = planted(
+        TIME,
+        "    pub fn utc_deadline_standing(&self, deadline_ms: u64) -> UtcDeadline {\n",
+        "    pub fn utc_deadline_standing(&self, deadline_ms: u64) -> UtcDeadline {\n        fn note_floor(time: &TimeContract) {\n            time.floor.raise(0);\n        }\n        note_floor(self);\n",
+    );
+    only_finding(
+        &found,
+        "action/time.rs note_floor calls raise 1 time(s) and no row lists it",
+    );
 }
