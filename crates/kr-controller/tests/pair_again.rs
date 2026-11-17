@@ -1119,3 +1119,492 @@ async fn an_old_connection_is_served_nothing_under_the_record_that_replaced_its_
     }
     host.stop().await;
 }
+
+/// Revokes `first` as its owner does, through `device.revoke`, which withdraws every grant the
+/// device holds and waits for the withdrawal to finish its barrier, and pairs `device` again under
+/// `proposed`: what the cases below do once they have put something in the ended record's name.
+/// Returns the new record and what the revocation answered.
+async fn replaced_after_a_revocation(
+    host: &Host,
+    device: &Device,
+    owner: &DeviceKeys,
+    first: &DeviceRecord,
+    proposed: ProposedGrant,
+) -> (DeviceRecord, kr_protocol::sharing::RevocationResult) {
+    let mut client = host.client().await;
+    let revoked: kr_protocol::sharing::RevocationResult = within(
+        "the revocation",
+        BOUND,
+        calls::mutate(
+            host.environment_id,
+            &mut client,
+            Method::DeviceRevoke,
+            &kr_protocol::sharing::DeviceRevokeParams {
+                device_id: first.device_id,
+            },
+        ),
+    )
+    .await
+    .expect("the device is revoked");
+    assert!(revoked.barrier.holds(), "{:?}", revoked.barrier);
+    let second = within(
+        "the second pairing",
+        BOUND,
+        pair_with(host, device, owner, proposed),
+    )
+    .await;
+    (second, revoked)
+}
+
+/// The registry's rows of `table` whose `column` holds `device_id`, as stored.
+fn rows_naming(
+    host: &Host,
+    table: &str,
+    column: &str,
+    device_id: DeviceId,
+) -> Vec<Vec<rusqlite::types::Value>> {
+    let connection = registry(host);
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT * FROM {table} WHERE {column} = ?1 ORDER BY 1"
+        ))
+        .expect("prepares");
+    let columns = statement.column_count();
+    statement
+        .query_map([device_id.get().as_bytes().as_slice()], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })
+        .expect("rows")
+        .collect::<Result<_, _>>()
+        .expect("every row")
+}
+
+/// The action identifier the worker's own seed gives its first intent.
+fn seeded_action() -> kr_protocol::ids::ActionId {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&1_u64.to_be_bytes());
+    kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes(bytes))
+}
+
+/// What the worker's journal holds for one action of one actor.
+fn worker_receipt(
+    worker: &net_support::worker::Worker,
+    actor: &kr_protocol::ids::ActorId,
+    action: kr_protocol::ids::ActionId,
+) -> Option<kr_protocol::receipt::Receipt> {
+    let mut session = worker.runtime().session();
+    session
+        .journal_mut()
+        .expect("a journal")
+        .read(actor.clone(), action)
+        .expect("readable")
+}
+
+/// KR-REQ-10.08: the answers kept for the ended record's actions stay under its identifier. The
+/// host keeps an answer to an action of the ended record's actor, and so does the worker; after
+/// the device pairs again, a retry of that action under the old identifier is given the answer it
+/// was given, as it stood, and the same action under the new identifier finds none in either
+/// store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_answers_kept_for_the_ended_record_are_found_under_its_identifier_and_not_under_the_new_one()
+ {
+    use kr_controller::grants::{ActionClaim, ActionRecord, GrantDirectory};
+    use kr_protocol::scalars::Digest256;
+
+    let Adopted {
+        host,
+        owner,
+        workers,
+    } = Adopted::start(1).await;
+    let worker = &workers[0];
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let old_actor = kr_transport::listener::device_principal(&first.device_id);
+    let action = seeded_action();
+    let digest = Digest256::from_bytes([3; 32]);
+    let now = kr_ipc::now_ms().get();
+
+    // The host keeps an answer to the action, and the worker holds a receipt for it.
+    let store = GrantDirectory::open(host.registry_database()).expect("the grant store");
+    let ActionClaim::Claimed { hold } = store
+        .claim_action(&old_actor, action, &digest, now)
+        .expect("claimed")
+    else {
+        panic!("a first claim of the action");
+    };
+    store
+        .retain_result(&hold, b"the answer the ended record was given", now)
+        .expect("retained");
+    drop(hold);
+    worker.seed_undispatched_intents(&old_actor, 1);
+    assert!(
+        worker_receipt(worker, &old_actor, action).is_some(),
+        "the worker holds a receipt for the old actor's action"
+    );
+
+    let (second, _) = replaced_after_a_revocation(&host, &phone, &owner, &first, rights()).await;
+    let new_actor = kr_transport::listener::device_principal(&second.device_id);
+
+    // The old identifier still finds the host's answer, the bytes it was given.
+    assert!(
+        matches!(
+            store
+                .recorded_action(&old_actor, action, &digest)
+                .expect("readable"),
+            Some(ActionRecord::Answered { ref result, .. })
+                if result == b"the answer the ended record was given"
+        ),
+        "a retry under the old identifier is given the kept answer"
+    );
+    // The old identifier still finds the worker's receipt.
+    assert_eq!(
+        worker_receipt(worker, &old_actor, action).map(|receipt| receipt.actor_id),
+        Some(old_actor.clone()),
+        "the worker's receipt is still the old actor's"
+    );
+    // The new identifier finds nothing in either store.
+    assert_eq!(
+        store
+            .recorded_action(&new_actor, action, &digest)
+            .expect("readable"),
+        None,
+        "the host holds no answer for the new identifier"
+    );
+    assert_eq!(
+        worker_receipt(worker, &new_actor, action),
+        None,
+        "the worker holds no receipt for the new identifier"
+    );
+    host.stop().await;
+}
+
+/// A grant of the host's own store: held by `recipient`, issued by `issuer`, under `parent`.
+fn stored_grant(
+    byte: u8,
+    parent: Option<kr_protocol::ids::GrantId>,
+    issuer: DeviceId,
+    recipient: DeviceId,
+) -> kr_controller::grants::GrantRecord {
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::scalars::{CanonicalSet, Nullable};
+    kr_controller::grants::GrantRecord {
+        grant: Grant {
+            grant_id: kr_protocol::ids::GrantId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [byte; 16],
+            )),
+            parent_grant_id: Nullable(parent),
+            issuer_device_id: issuer,
+            recipient_device_id: recipient,
+            authority_revision: kr_protocol::ids::AuthorityRevision::new(1),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: [ActionRight::SessionView].into_iter().collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::Never,
+            organisation: Nullable::null(),
+        },
+        session_id: Some(kr_protocol::ids::SessionId::new(
+            kr_protocol::scalars::Uuid::from_bytes([0xa0; 16]),
+        )),
+        issued_at_ms: kr_ipc::now_ms().get(),
+        activated_at_ms: Some(kr_ipc::now_ms().get()),
+        revoked_at_ms: None,
+        revoked_by_parent: None,
+    }
+}
+
+/// KR-REQ-10.08: the grants of the ended record are withdrawn with it and none of them is the new
+/// record's. The ended record holds a grant and a grant it delegated to a third device; the
+/// revocation withdraws both; after the device pairs again the host's store of grants is as the
+/// revocation left it, holds none for the new identifier, and the new record's own grant is
+/// exactly the one the invitation proposed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_grants_of_the_ended_record_are_withdrawn_and_the_new_record_holds_only_the_grant_it_was_proposed()
+ {
+    use kr_controller::grants::GrantDirectory;
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let host_device = host.owner.clone().expect("the owner device").device_id;
+    let third = DeviceId::new(kr_ipc::new_uuid());
+
+    let store = GrantDirectory::open(host.registry_database()).expect("the grant store");
+    let held = stored_grant(0x41, None, host_device, first.device_id);
+    let delegated = stored_grant(0x42, Some(held.grant.grant_id), first.device_id, third);
+    store.issue(&held, || Ok(())).expect("the grant");
+    store.issue(&delegated, || Ok(())).expect("its descendant");
+
+    let proposed = rights();
+    let (second, revoked) =
+        replaced_after_a_revocation(&host, &phone, &owner, &first, proposed.clone()).await;
+
+    // The revocation withdrew both grants, and the pairing wrote nothing to the store of grants.
+    for grant_id in [held.grant.grant_id, delegated.grant.grant_id] {
+        let record = store
+            .record(grant_id)
+            .expect("readable")
+            .expect("the grant is kept");
+        assert!(record.revoked_at_ms.is_some(), "{record:?}");
+        assert!(
+            revoked.revoked_grants.contains(&grant_id),
+            "the revocation names the grant it withdrew"
+        );
+    }
+    assert!(
+        store
+            .records_for_device(second.device_id)
+            .expect("readable")
+            .is_empty(),
+        "no grant of the store is the new record's"
+    );
+    assert_eq!(
+        store.records().expect("readable").len(),
+        2,
+        "the store holds the two grants of the ended record and nothing else"
+    );
+    assert!(
+        store
+            .records()
+            .expect("readable")
+            .iter()
+            .all(|record| record.grant.grant_id != second.grant.grant_id),
+        "the new record's grant is not in the store of grants"
+    );
+    // The new record's grant is the one proposed, held by the new identifier and by nothing under
+    // the old one.
+    let given = &second.grant;
+    assert_eq!(given.recipient_device_id, second.device_id);
+    assert_ne!(given.grant_id, first.grant.grant_id);
+    assert_eq!(given.parent_grant_id, proposed.parent_grant_id);
+    assert_eq!(given.environment_selector, proposed.environment_selector);
+    assert_eq!(given.session_selector, proposed.session_selector);
+    assert_eq!(given.actions, proposed.actions);
+    // The proposal names no first moment of history, so the commit fixes it at the moment the
+    // new record was made: never the ended record's.
+    assert_eq!(
+        given.history.include_live_screen,
+        proposed.history.include_live_screen
+    );
+    assert_eq!(
+        given.history.named_questions,
+        proposed.history.named_questions
+    );
+    assert_eq!(
+        given.history.named_approvals,
+        proposed.history.named_approvals
+    );
+    assert!(proposed.history.lower_bound_ms.0.is_none());
+    assert!(
+        given.history.lower_bound_ms.0.map(|moment| moment.get())
+            >= first
+                .grant
+                .history
+                .lower_bound_ms
+                .0
+                .map(|moment| moment.get()),
+        "the new record's history starts at its own moment"
+    );
+    assert_eq!(
+        given.history.lower_bound_ms.0.map(|moment| moment.get()),
+        Some(second.paired_at_ms.get()),
+        "and that moment is the one the new record was made at"
+    );
+    assert_eq!(given.expiry, proposed.expiry);
+    assert_eq!(given.organisation, proposed.organisation);
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the voice delegations the ended record spent and the session invitations it
+/// issued stay under its identifier. After the device pairs again the old identifier still holds
+/// its spent delegation and its invitation, as the revocation left them, and the new identifier
+/// holds neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_voice_delegations_and_invitations_of_the_ended_record_stay_under_its_identifier() {
+    use kr_controller::grants::GrantDirectory;
+    use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let host_device = host.owner.clone().expect("the owner device").device_id;
+    let third = DeviceId::new(kr_ipc::new_uuid());
+    let now = kr_ipc::now_ms().get();
+
+    let store = GrantDirectory::open(host.registry_database()).expect("the grant store");
+    // The ended record spent a voice delegation.
+    assert!(
+        store
+            .spend_delegation(
+                first.device_id,
+                "the delegation",
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                now,
+                None,
+            )
+            .expect("spent"),
+        "a first spend"
+    );
+    // And it issued a session invitation to a third device, under the grant it holds.
+    let held = stored_grant(0x51, None, host_device, first.device_id);
+    store.issue(&held, || Ok(())).expect("the grant");
+    let mut proposal = stored_grant(0x52, Some(held.grant.grant_id), first.device_id, third);
+    proposal.activated_at_ms = None;
+    let invitation_id = InvitationId::new(kr_ipc::new_uuid());
+    let preview = kr_protocol::sharing::InvitationPreview {
+        invitation_id,
+        session_id: proposal.session_id.expect("a session"),
+        environment_id: host.environment_id,
+        role: kr_protocol::sharing::SessionRole::Viewer,
+        actions: proposal.grant.actions.clone(),
+        history: proposal.grant.history.clone(),
+        expires_at_ms: TimestampMs::new(now + 60 * 60 * 1000),
+        live_screen: Nullable::null(),
+        named_questions: Vec::new(),
+        named_approvals: Vec::new(),
+        notices: CanonicalSet::new(),
+        historical_attachment_keys: false,
+        single_use: true,
+    };
+    store
+        .issue_shared(&proposal, &preview, first.device_id, now, || Ok(()))
+        .expect("the invitation");
+    let old_delegations = rows_naming(&host, "voice_delegations", "device_id", first.device_id);
+    assert_eq!(old_delegations.len(), 1);
+    assert_eq!(
+        rows_naming(
+            &host,
+            "session_invitations",
+            "issuer_device_id",
+            first.device_id
+        )
+        .len(),
+        1
+    );
+
+    let (second, _) = replaced_after_a_revocation(&host, &phone, &owner, &first, rights()).await;
+
+    // The old identifier holds its delegation as it was, and its invitation, which the
+    // revocation withdrew with the grant it was issued under.
+    assert_eq!(
+        rows_naming(&host, "voice_delegations", "device_id", first.device_id),
+        old_delegations,
+        "the old identifier's spent delegation is as it was"
+    );
+    assert_eq!(
+        rows_naming(
+            &host,
+            "session_invitations",
+            "issuer_device_id",
+            first.device_id
+        )
+        .len(),
+        1,
+        "the old identifier's invitation is kept"
+    );
+    // The new identifier holds none of it, as a delegation or as an invitation's issuer or
+    // recipient.
+    assert!(
+        rows_naming(&host, "voice_delegations", "device_id", second.device_id).is_empty(),
+        "the new identifier has spent no delegation"
+    );
+    for column in ["issuer_device_id", "recipient_device_id"] {
+        assert!(
+            rows_naming(&host, "session_invitations", column, second.device_id).is_empty(),
+            "the new identifier is not the invitation's {column}"
+        );
+    }
+    assert!(
+        store
+            .spend_delegation(
+                second.device_id,
+                "the delegation",
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                now,
+                None,
+            )
+            .expect("spent"),
+        "the same delegation under the new identifier is a first spend"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the deadline of a grant is the record's own. The ended record's grant has a
+/// deadline once its device connected. Right after the device pairs again, and before the new
+/// record connects, the host holds no deadline for the new identifier and the old one is as it
+/// was; once the new record connects, its grant has a deadline of its own and the old one is still
+/// as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_deadline_of_the_ended_records_grant_is_not_the_new_records_and_the_new_record_gets_its_own()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let directory = host.network().devices();
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+
+    // Connecting anchors the grant in this boot, and its deadline is written down.
+    let session = within("the connection", BOUND, connect(&host, &phone, &first)).await;
+    {
+        let (directory, boot) = (std::sync::Arc::clone(directory), boot.clone());
+        let device_id = first.device_id;
+        until("the old deadline being on record", move || {
+            directory
+                .grant_deadline_in(device_id, &boot)
+                .is_ok_and(|deadline| deadline.is_some())
+        })
+        .await;
+    }
+    session.close();
+    let old_deadline = directory
+        .grant_deadline_in(first.device_id, &boot)
+        .expect("readable")
+        .expect("the ended record's deadline");
+
+    let (second, _) = replaced_after_a_revocation(&host, &phone, &owner, &first, rights()).await;
+    assert_eq!(
+        directory
+            .grant_deadline_in(second.device_id, &boot)
+            .expect("readable"),
+        None,
+        "right after the commit the new identifier has no deadline"
+    );
+    assert_eq!(
+        directory
+            .grant_deadline_in(first.device_id, &boot)
+            .expect("readable"),
+        Some(old_deadline),
+        "the old deadline is as it was"
+    );
+
+    let session = within("the connection", BOUND, connect(&host, &phone, &second)).await;
+    {
+        let (directory, boot) = (std::sync::Arc::clone(directory), boot.clone());
+        let device_id = second.device_id;
+        until("the new deadline being on record", move || {
+            directory
+                .grant_deadline_in(device_id, &boot)
+                .is_ok_and(|deadline| deadline.is_some())
+        })
+        .await;
+    }
+    session.close();
+    assert_eq!(
+        directory
+            .grant_deadline_in(first.device_id, &boot)
+            .expect("readable"),
+        Some(old_deadline),
+        "the old deadline is still as it was"
+    );
+    host.stop().await;
+}
