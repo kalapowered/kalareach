@@ -1608,3 +1608,122 @@ async fn the_deadline_of_the_ended_records_grant_is_not_the_new_records_and_the_
     );
     host.stop().await;
 }
+
+/// KR-REQ-10.08: a request of the new record that names the old identifier is decided on the old
+/// record alone and never reaches the new one. The device holds a share of a session under its new
+/// record and asks the host to share it with the old identifier, whose record was revoked or ran
+/// out. The host refuses: the old record decides, and it no longer stands. No grant is made for the
+/// old identifier, the old record is as it was, the new record's row and its share are as they
+/// were, and the new connection is served afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_share_naming_the_old_identifier_is_decided_on_the_old_record_alone() {
+    use kr_protocol::grant::SessionSelector;
+    use kr_protocol::scalars::{DurationMs, TimestampMs};
+    use kr_protocol::sharing::{
+        AuthorityNotice, GrantCreateParams, RoleSelection, SessionRole,
+    };
+
+    let reaching_no_session = || {
+        let mut grant = rights();
+        grant.session_selector = SessionSelector::None;
+        grant
+    };
+    for ended in ["revoked", "ran out"] {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let host = Host::start(&owner).await;
+        let phone = Device::create().await;
+        let session_id = net_support::an_open_session(&host).0;
+        let first = pair_with(&host, &phone, &owner, reaching_no_session()).await;
+        if ended == "revoked" {
+            let barrier = within(
+                "the revocation",
+                BOUND,
+                host.network().revoke_device(first.device_id),
+            )
+            .await
+            .expect("the device is revoked");
+            assert!(barrier.holds(), "{barrier:?}");
+        } else {
+            host.network()
+                .devices()
+                .record_expiry(first.device_id, TimestampMs::new(kr_ipc::now_ms().get()))
+                .expect("the end of the grant is recorded");
+        }
+        let second = within(
+            "the second pairing",
+            BOUND,
+            pair_with(&host, &phone, &owner, reaching_no_session()),
+        )
+        .await;
+        let (above, raw) = within(
+            "the share and the connection",
+            BOUND,
+            net_support::owned_by(&host, session_id, &phone, &second),
+        )
+        .await;
+        let old_before = row_of(&host, first.device_id);
+        let new_before = row_of(&host, second.device_id);
+        let store = host.controller().sharing().grants();
+        let grants_before = store.records().expect("readable").len();
+
+        let selection = RoleSelection::plain(SessionRole::Viewer);
+        let params = GrantCreateParams {
+            session_id,
+            recipient_device_id: first.device_id,
+            parent_grant_id: kr_protocol::scalars::Nullable::some(above.grant.grant_id),
+            accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+            selection,
+            lifetime_ms: kr_protocol::scalars::Nullable::some(DurationMs::new(600_000)),
+            owner_confirmation: kr_protocol::scalars::Nullable::null(),
+        };
+        let answer = within(
+            "the answer",
+            BOUND,
+            raw.try_mutate(
+                Method::GrantCreate,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                net_support::on_the_session(&host, session_id),
+                &params,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(answer, Some(Err(_))),
+            "{ended}: a share to the identifier of an ended record is refused: {answer:?}"
+        );
+        assert_eq!(
+            store.records().expect("readable").len(),
+            grants_before,
+            "{ended}: no grant was made"
+        );
+        assert!(
+            store
+                .records_for_device(first.device_id)
+                .expect("readable")
+                .is_empty(),
+            "{ended}: the old identifier holds no grant"
+        );
+        assert_eq!(
+            row_of(&host, first.device_id),
+            old_before,
+            "{ended}: the old record is as it was"
+        );
+        assert_eq!(
+            row_of(&host, second.device_id),
+            new_before,
+            "{ended}: the new record is as it was"
+        );
+        assert!(
+            net_support::holds(&host, above.grant.grant_id),
+            "{ended}: the new record's own share stands"
+        );
+        assert!(
+            within("the read", BOUND, raw.try_read(Method::HostInfo, &()))
+                .await
+                .is_some_and(|read| read.is_ok()),
+            "{ended}: the new connection is served after the request"
+        );
+        raw.close();
+        host.stop().await;
+    }
+}
