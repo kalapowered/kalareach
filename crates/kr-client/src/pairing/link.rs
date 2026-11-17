@@ -418,7 +418,10 @@ impl Bound {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Records that `pairing` introduced `host`.
+    /// Records that `pairing` introduces `host`. The record is made before the introduction's
+    /// first await, where the table's insert is made, so that an entry the table took in stays
+    /// covered when its dial stops: the record says that the pairing may have an entry, and it
+    /// stands until the pairing is forgotten.
     fn introduced_by(&self, host: &EndpointKey, pairing: DeviceId) {
         self.introduced().entry(*host).or_default().insert(pairing);
     }
@@ -575,10 +578,13 @@ impl EndpointPool {
         self.gate
             .pass(host, gate::Point::BeforeTheIntroduction)
             .await;
-        device.endpoint.introduce(services).await?;
+        // The record is made here, with no await between it and the table's insert, which the
+        // first poll of `introduce` makes: a caller that stops waiting inside the introduction
+        // leaves the entry in the table, and the record stays with it.
         if let Some(pairing) = pairing {
             device.introduced_by(host, pairing);
         }
+        device.endpoint.introduce(services).await?;
         Ok(device.endpoint.endpoint().clone())
     }
 
@@ -1715,6 +1721,57 @@ mod tests {
             pool.relay_urls().await,
             BTreeSet::from([relay(own)]),
             "the new pairing's relay is in the map when its dial returns"
+        );
+        pool.close().await;
+    }
+
+    /// The record of the pairing that introduced a host is made with the table's insert, so an entry
+    /// that outlives its dial is covered. Pairing 1 introduced the host. Pairing 2's dial changes the
+    /// host's relays, the table takes its entry in, and the dial is dropped while the transport's
+    /// change of the map is held. Forgetting pairing 1 leaves the host, which pairing 2 still has;
+    /// forgetting pairing 2 then takes it out of the table and the map.
+    #[tokio::test]
+    async fn a_dial_that_is_dropped_after_its_insert_keeps_its_pairings_record() {
+        let pool = loopback_pool();
+        let first_relay = "https://127.0.0.1:10";
+        let second_relay = "https://127.0.0.1:20";
+        let host = key();
+        pool.endpoint(
+            &network(&[first_relay], Some(RESOLVER), &[]),
+            &host,
+            Standing::Paired(pairing(1)),
+        )
+        .await
+        .expect("pairing 1 is reached");
+        let mut map_task = the_bound(&pool).await.endpoint.hold_next_map_task();
+        let (dial, _) = dialling(
+            &pool,
+            &network(&[second_relay], Some(RESOLVER), &[]),
+            host,
+            2,
+        );
+        map_task.reached().await;
+        assert!(
+            table_holds(&pool, &host).await,
+            "the control: pairing 2's dial put its entry in the table"
+        );
+        dial.abort();
+        assert!(dial.await.is_err(), "the dial was dropped");
+
+        pool.forget(&host, pairing(1)).await;
+        assert!(
+            table_holds(&pool, &host).await,
+            "the host stays when pairing 1 is forgotten, since pairing 2 is not"
+        );
+        pool.forget(&host, pairing(2)).await;
+        assert!(
+            !table_holds(&pool, &host).await && pool.relay_urls().await.is_empty(),
+            "the host goes when the last pairing that introduced it is forgotten"
+        );
+        map_task.release().await;
+        assert!(
+            !table_holds(&pool, &host).await && pool.relay_urls().await.is_empty(),
+            "the held change of the map left the host out"
         );
         pool.close().await;
     }
