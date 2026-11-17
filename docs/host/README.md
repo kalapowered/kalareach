@@ -6643,6 +6643,14 @@ not the clock reads right again by the worker's second reading of the look. A wo
 on a journal that records its clock as distrusted answers only to a confirmation made after it
 restarted. A later action of the owner ends that distrust.
 
+A session's worker reads its clocks inside a short bracket, two readings of the continuous clock
+around the others. When a reading is held up for more than 250 ms and the owner's confirmation
+falls inside it, the command reports success and the worker stays unresolved, because the held-up
+reading counts from its end, after the confirmation. No command prints this. The session stops
+pruning by age, and a session export counts the output it timed meanwhile as
+`output_clock_unproven`. The owner confirms again, and that confirmation holds unless the clock
+steps again.
+
 A restatement answers to a different rule, because it adds nothing to what the worker knows. A
 worker that began with nothing recorded, such as a new session, and has met no confirmation and
 found no rollback follows the first confirmation it meets, whether the owner made it or the daemon
