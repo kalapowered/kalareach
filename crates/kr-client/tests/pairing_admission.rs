@@ -523,9 +523,9 @@ async fn kr_req_17_48_when_a_request_ends_the_next_dial_asks_and_the_answers_are
     );
 }
 
-/// KR-REQ-10.54, KR-REQ-17.40, KR-REQ-17.48: one request for an entry is alive at a time in the order
-/// of two dials too, where one has counted its ask and started its request and has not returned: a
-/// dial that reads the entry then finds that request alive and starts none. The answer comes at 0 s
+/// KR-REQ-17.48: one request for an entry is alive at a time in the order of two dials too, where
+/// one has counted its ask and started its request and has not returned: a dial that reads the
+/// entry then finds that request alive and starts none. The answer comes at 0 s
 /// and is kept to 60. At 52 the dial of one candidate counts its ask and starts the second request,
 /// whose call to the service stays behind its gate, and the cache's testing hook holds that dial just
 /// after its locked step. The dial of another candidate then reads the same entry. The service has
