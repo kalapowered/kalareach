@@ -42,6 +42,10 @@ pub struct RelayFront {
     runtime: Option<tokio::runtime::Runtime>,
 }
 
+/// How much one read of a front's pump takes at most. A stalled front starts no read, but a read that was under
+/// way when it stopped can end after the switch, so it can still take this much from each connection.
+pub const CHUNK: usize = 16 * 1024;
+
 /// The receive buffer of a stalling front's listener, which its accepted sockets inherit: a few
 /// KiB, so that a stalled front takes almost nothing of what the device sends.
 const STALLED_RECEIVE_BUFFER: u32 = 4096;
@@ -291,7 +295,7 @@ async fn pump(
     mut gate: watch::Receiver<bool>,
     count: Option<Arc<AtomicU64>>,
 ) {
-    let mut chunk = vec![0_u8; 16 * 1024];
+    let mut chunk = vec![0_u8; CHUNK];
     loop {
         if gate.wait_for(|stalled| !*stalled).await.is_err() {
             break;
