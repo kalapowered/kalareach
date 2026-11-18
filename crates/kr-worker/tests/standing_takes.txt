@@ -467,7 +467,8 @@ calls crates/kr-worker/src/session.rs output_cursor next_cursor crates/kr-worker
 # The takes of the dispatch boundary, listed for a person to read. The waiting take of the boundary
 # panics when the calling thread already holds it (`service/boundary.rs`), and that, not these rows,
 # is what ends a second waiting take. These rows show a person each new mention of a function that
-# takes the boundary, by file and function, so that new text that could take it twice is read.
+# takes the boundary, by file and function, so that new text that could take it twice is read, as
+# far as the scanner reads a take (the limits are stated below).
 #
 # What each kind says. `taker <name>` is a function that takes the boundary (one of the nine take
 # sites, a wrapper of one, or one of the two methods that take it); the lock audit's table of takers
@@ -478,19 +479,24 @@ calls crates/kr-worker/src/session.rs output_cursor next_cursor crates/kr-worker
 # in a taker or in an async function (a sync function that calls a taker takes the boundary too, so
 # it is a taker), and not in a function that takes a `DispatchGuard` parameter. `rawtake <file>
 # <function> <name> <count>` is the names of the boundary's own mutex's takes (`lock` and `try_lock`
-# after a `.` or a `::`, called or not) in the product text of `service/boundary.rs` and of its
-# child modules, by function; each function that has one is a taker too, bar the boundary's two
-# methods `lock` and `try_lock`. `reference <word> <file> <count>` is the
-# `include!`, the path attributes and the `block_on` in the code of a file (none but the worker
-# program's own `block_on`, which runs the whole program).
+# after a `.` or a `::`, called or not; `r#lock` reads as `lock`) in the product text of
+# `service/boundary.rs` and of its child modules, by function; each function that has one is a
+# taker too, bar the boundary's two methods `lock` and `try_lock`. `reference <word> <file> <count>`
+# is the `include!`, the path attributes and the `block_on` in the code of a file (none but the
+# worker program's own `block_on`, which runs the whole program).
 #
 # What to do when a row fails: read the new text, then set the row; a new function that takes the
 # boundary is added as a `taker` row first, with its mentions, and to the lock audit's table of
 # takers.
 #
-# What the rows do not see: a call that a macro writes (one mention at the definition, none at each
-# use), an async taker that a sync body runs to its end (the count of `block_on` shows a new such
-# body), and a take on a thread that the holder waits for. A take that moves inside one function
+# What the rows do not see: a call that a macro writes (a name that the macro's body spells counts
+# once, at the definition, and not at each use; a name that a use hands to an `ident` fragment
+# counts nowhere), a test module that a macro hands on as product code (the `rawtake` reading leaves
+# test modules out of the product text, so a take in one has no count; the `mention` rows count in
+# test modules), a take of the boundary's own mutex whose name is not written after a `.` or a `::`
+# (a struct pattern that binds the mutex's field and hands the mutex out), an async taker that a
+# sync body runs to its end (the count of `block_on` shows a new such body), and a take on a thread
+# that the holder waits for. A take that moves inside one function
 # keeps that function's number. The rule that a mention stands in a taker or an async function knows
 # an async function only by its name in the file, so a sync function that has the name of an async
 # function of its file passes it. A function named `lock` or `try_lock` in `service/boundary.rs` is
