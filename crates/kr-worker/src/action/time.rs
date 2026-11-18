@@ -5367,57 +5367,59 @@ mod tests {
         );
     }
 
-    /// A wall clock that stands inside one chosen reading of itself until it is let go: it says
-    /// on a channel that it has entered and waits for the release, with a bound.
+    /// A wall clock that asks the readings' lock of its contract whether it is held, from inside
+    /// the reading it was told to ask at. `try_lock` answers at once and waits for nothing, so
+    /// the answer is the state of the lock at that reading, and no thread, channel or timeout is
+    /// in the case.
     #[derive(Debug)]
-    struct Gated {
+    struct AsksTheLock {
         held: Arc<Holdup>,
-        stands_at: std::sync::atomic::AtomicI64,
-        entered: Mutex<std::sync::mpsc::Sender<()>>,
-        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        contract: std::sync::OnceLock<std::sync::Weak<TimeContract>>,
+        asks_at: std::sync::atomic::AtomicI64,
+        answer: std::sync::atomic::AtomicU8,
     }
 
-    impl WallClock for Gated {
+    impl AsksTheLock {
+        const NOT_ASKED: u8 = 0;
+        const HELD: u8 = 1;
+        const FREE: u8 = 2;
+        const UNREADABLE: u8 = 3;
+    }
+
+    impl WallClock for AsksTheLock {
         fn now_ms(&self) -> TimestampMs {
-            if self
-                .stands_at
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-                == 1
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.asks_at.fetch_sub(1, SeqCst) == 1
+                && let Some(contract) = self.contract.get().and_then(std::sync::Weak::upgrade)
             {
-                let _ = self
-                    .entered
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .send(());
-                let _ = self
-                    .release
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .recv_timeout(Duration::from_secs(30));
+                let answer = match contract.readings.try_lock() {
+                    Ok(_) => Self::FREE,
+                    Err(std::sync::TryLockError::WouldBlock) => Self::HELD,
+                    Err(std::sync::TryLockError::Poisoned(_)) => Self::UNREADABLE,
+                };
+                self.answer.store(answer, SeqCst);
             }
             self.held.now_ms()
         }
     }
 
-    /// Runs `read` on a thread of a contract whose wall clock stands inside its `stands_at`th
-    /// reading, and returns whether the readings' lock was held while it stood, and whether
-    /// `read`'s reading was noted when it was let go. `tries_held_up` of the readings before it
-    /// are held up.
-    fn the_readings_lock_while_a_reading_stands(
-        stands_at: i64,
+    /// Runs `read` on a contract whose wall clock asks the readings' lock at its `asks_at`th
+    /// reading, and returns what it found and how many entries the staircase of the highest
+    /// readings holds when `read` is done. `tries_held_up` of the first readings are held up.
+    fn the_readings_lock_at_a_reading(
+        asks_at: i64,
         tries_held_up: i64,
-        read: impl Fn(&TimeContract) + Sync,
-    ) -> (bool, usize) {
+        read: impl Fn(&TimeContract),
+    ) -> (u8, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
         let held = Holdup::new(HELD_UP, false);
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let gated = Arc::new(Gated {
+        let clock = Arc::new(AsksTheLock {
             held: Arc::clone(&held),
-            stands_at: std::sync::atomic::AtomicI64::new(0),
-            entered: Mutex::new(entered_tx),
-            release: Mutex::new(release_rx),
+            contract: std::sync::OnceLock::new(),
+            asks_at: std::sync::atomic::AtomicI64::new(0),
+            answer: std::sync::atomic::AtomicU8::new(AsksTheLock::NOT_ASKED),
         });
-        let contract = TimeContract::new(
+        let contract = Arc::new(TimeContract::new(
             boot(1),
             AUTHORITY,
             TimeSources {
@@ -5425,53 +5427,60 @@ mod tests {
                     held: Arc::clone(&held),
                 }),
                 active: Arc::new(held.active.clone()),
-                wall: Arc::clone(&gated) as Arc<dyn WallClock>,
+                wall: Arc::clone(&clock) as Arc<dyn WallClock>,
                 adapter: Arc::new(RecordedTimeAdapter::new(qualified())),
                 floor: None,
             },
-        );
-        gated
-            .stands_at
-            .store(stands_at, std::sync::atomic::Ordering::SeqCst);
+        ));
+        clock
+            .contract
+            .set(Arc::downgrade(&contract))
+            .expect("the clock is given its contract once");
+        clock.asks_at.store(asks_at, SeqCst);
         held.arm(0, tries_held_up);
-        let mut locked = false;
-        std::thread::scope(|scope| {
-            let reader = scope.spawn(|| read(&contract));
-            let entered = entered_rx.recv_timeout(Duration::from_secs(10));
-            locked = entered.is_ok() && contract.readings.try_lock().is_err();
-            let _ = release_tx.send(());
-            reader.join().expect("the reading thread ended");
-        });
+        read(&contract);
         let noted = contract
             .readings
             .try_lock()
             .expect("the lock is free when the reading ends")
             .highest
             .len();
-        (locked, noted)
+        (clock.answer.load(SeqCst), noted)
     }
 
     /// KR-REQ-09.18, KR-REQ-09.19: the clocks are read, and what they read is noted, in one hold of
-    /// the readings' lock. A reading that stands inside its wall clock holds the lock, so no
-    /// other reading is taken or noted until it is let go and noted. This holds for the attempt of
-    /// a look, whose first reading stands, and for the reading with no bracket that follows three
-    /// tries that were held up, whose fourth stands.
+    /// the readings' lock. The wall clock asks the lock, from inside a reading, whether it is held,
+    /// so no other reading is taken or noted while one stands. This holds for the attempt of a
+    /// look, whose first reading is asked, and for the reading with no bracket that follows three
+    /// tries that were held up, whose fourth reading is asked.
     #[test]
     fn the_clocks_are_read_and_noted_in_one_hold_of_the_readings_lock() {
-        let (locked, noted) = the_readings_lock_while_a_reading_stands(1, 0, |contract| {
+        let (asked, noted) = the_readings_lock_at_a_reading(1, 0, |contract| {
             contract.take();
         });
-        assert!(
-            locked,
-            "the lock is held while the first reading of an attempt stands"
+        assert_ne!(
+            asked,
+            AsksTheLock::NOT_ASKED,
+            "the attempt reached its first reading of the wall clock"
+        );
+        assert_eq!(
+            asked,
+            AsksTheLock::HELD,
+            "the lock is held while the first reading of an attempt is taken"
         );
         assert_eq!(noted, 1, "and the reading is noted when it ends");
-        let (locked, noted) = the_readings_lock_while_a_reading_stands(4, 3, |contract| {
+        let (asked, noted) = the_readings_lock_at_a_reading(4, 3, |contract| {
             contract.wall_reading();
         });
-        assert!(
-            locked,
-            "the lock is held while the reading with no bracket stands"
+        assert_ne!(
+            asked,
+            AsksTheLock::NOT_ASKED,
+            "the read reached its fourth reading of the wall clock, the one with no bracket"
+        );
+        assert_eq!(
+            asked,
+            AsksTheLock::HELD,
+            "the lock is held while the reading with no bracket is taken"
         );
         assert!(noted >= 1, "and the reading is noted when it ends");
     }
