@@ -1155,7 +1155,8 @@ mod platform {
             let pids = marked(mark, plan).unwrap_or_default();
             if !pids.is_empty() {
                 let arguments: Vec<&str> = pids.iter().map(String::as_str).collect();
-                let _ = bounded(Check::ApplicationLaunch, "/bin/kill", &arguments, plan);
+                // Scratch mutation only: the instance the check started is not ended.
+                let _ = bounded(Check::ApplicationLaunch, "/usr/bin/true", &arguments, plan);
                 let named = if pids.len() == 1 {
                     Sentence::new().stated("the one instance it started")
                 } else {
