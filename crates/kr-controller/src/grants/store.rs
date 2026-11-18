@@ -4226,8 +4226,9 @@ fn read_for_device(connection: &Connection, device_id: DeviceId) -> Result<Vec<G
     rows.into_iter().collect()
 }
 
-/// Every grant, listed under the grant it is delegated from, each list in the order of the grants'
-/// identifiers, on a connection the caller is already holding. One read of the whole store.
+/// Every delegated grant, listed under the grant it is delegated from, each list in the order of
+/// the grants' identifiers, on a connection the caller is already holding. One read of the whole
+/// store.
 fn children_by_parent(connection: &Connection) -> Result<BTreeMap<GrantId, Vec<GrantRecord>>> {
     let mut children: BTreeMap<GrantId, Vec<GrantRecord>> = BTreeMap::new();
     for record in read_all(connection)? {
@@ -4268,12 +4269,12 @@ fn subtree_within(connection: &Connection, grant_id: GrantId) -> Result<Vec<Gran
 
 #[cfg(feature = "testing")]
 thread_local! {
-    /// How many grant rows this thread has decoded, for the cases that bound what one change of
-    /// the store reads. Compiled away in every shipped build.
+    /// How many grant rows this thread has begun to decode, for the cases that bound what one
+    /// change of the store reads. Compiled away in every shipped build.
     static GRANT_ROWS_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many grant rows this thread has decoded so far ([`read_row`]).
+/// How many grant rows this thread has begun to decode so far ([`read_row`]).
 #[cfg(test)]
 pub(crate) fn grant_rows_read() -> u64 {
     GRANT_ROWS_READ.with(std::cell::Cell::get)
@@ -5263,7 +5264,8 @@ mod a_previous_holder_that_is_letting_go {
     }
 }
 
-/// What the revocation of one device's grants reads, for trees of every shape the device can hold.
+/// What the revocation of one device's grants reads and returns, for eight shapes of trees and for
+/// the stores an edit by hand leaves.
 #[cfg(test)]
 mod a_devices_revocation {
     use super::*;
@@ -5359,7 +5361,7 @@ mod a_devices_revocation {
         beforehand: Option<u32>,
     }
 
-    /// Every shape of grants one device can hold, `size` grants each: a tree or a chain the device
+    /// Eight shapes of grants one device can hold, `size` grants each: a tree or a chain the device
     /// holds whole, with its ancestors listed first and last; many roots; a tree the device holds a
     /// part of, whose root another device holds, so that the walk starts below a root that is not
     /// the device's and one grant the device holds lies below another it holds; and a tree held
@@ -5601,7 +5603,7 @@ mod a_devices_revocation {
                 );
                 if reads > 3 * rows {
                     failures.push(format!(
-                        "{}: {rows} grants held, {reads} rows decoded, more than three times the rows",
+                        "{}: {rows} grants in the store, {reads} rows decoded, more than three times the rows",
                         shape.name
                     ));
                 }
@@ -5756,8 +5758,9 @@ mod a_devices_revocation {
     }
 
     /// What is read to be withdrawn is what reading one root at a time read, grant for grant and
-    /// in the same order, whatever the order the device's grants are listed in and whatever the
-    /// shape they have: the first of the device's roots, in the order listed, that reaches a grant
+    /// in the same order, whatever the order the device's grants are listed in, for each store
+    /// built here (the eight shapes and the stores an edit by hand leaves): the first of the
+    /// device's roots, in the order listed, that reaches a grant
     /// keeps it, and the grants of a root come breadth first. Reading one root at a time also made
     /// an entry with no grant in it for each root an earlier root had taken; such an entry
     /// withdraws nothing (the case below shows the result and the rows are the same without it),
