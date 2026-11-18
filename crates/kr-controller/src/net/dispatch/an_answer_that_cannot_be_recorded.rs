@@ -21,7 +21,11 @@ use crate::service::a_close_a_worker_never_answers as fake;
 /// outcome is unknown, and the repository exists; with the store whole, the same request is answered.
 ///
 /// A repository is made with Git, which a Windows host does not run: there the request is refused
-/// before anything is made, as the next case shows, and the rule is shown by the close below.
+/// before anything is made, as the Windows case below shows, and the project service's own leg of
+/// this rule has no case on Windows. The rule that an action performed whose answer could not be
+/// kept is told as of an unknown outcome is shown on every platform by
+/// `kr_req_23_24_a_share_whose_result_cannot_be_kept_is_found_and_holds_its_subject` in
+/// `a_share_beside_one_that_runs`.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_project_action_performed_and_not_recorded_is_told_the_outcome_is_unknown() {
