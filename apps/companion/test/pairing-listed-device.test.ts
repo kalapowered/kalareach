@@ -27,7 +27,7 @@ describe('a pairing the host refuses because it still lists the device', () => {
   it('tells a device that holds a record of the host to forget the host first', () => {
     const words = failureWords({ kind: 'already_paired' }, 'rendezvous.example')
     expect(words.sentence).toBe(
-      "This device already holds a pairing with this host. If the host's owner removed this device or its pairing ran out, forget the host here first, then pair with a new invitation."
+      "This device already holds a pairing with this host. If the host's owner removed this device or its pairing has ended, forget the host here first, then pair with a new invitation."
     )
     expect(words.action).toBe('done')
   })

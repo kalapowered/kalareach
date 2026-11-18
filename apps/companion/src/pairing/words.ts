@@ -198,7 +198,7 @@ function codeWords(
     case 'already_paired':
       return {
         sentence:
-          "This device already holds a pairing with this host. If the host's owner removed this device or its pairing ran out, forget the host here first, then pair with a new invitation.",
+          "This device already holds a pairing with this host. If the host's owner removed this device or its pairing has ended, forget the host here first, then pair with a new invitation.",
         action: 'done'
       }
     case 'host_still_lists_device':
