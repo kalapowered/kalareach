@@ -29,8 +29,9 @@
 //!   check that before any work, and a test shows the check. A second waiting take under the held
 //!   barrier is ended by the waiting take itself, which panics when the calling thread holds the
 //!   boundary (`service/boundary.rs`); the `taker`, `mention`, `rawtake` and `reference` rows below
-//!   show a person each new mention of a function that takes the boundary, count names and read no
-//!   guard, and prove nothing about that;
+//!   show a person each new mention of a function that takes the boundary, as far as the scanner
+//!   reads the take (the limits are stated below), count names and read no guard, and prove
+//!   nothing about that;
 //! * what a guard is, beyond the names it knows: a `let` that calls `session` (SES) and a
 //!   parameter whose type names `Session` (SES, held or not: a `supplies` row tells two calls
 //!   apart). `let Some(x) =` and `let Ok(x) =` bind `x`, with the initialiser after the pattern,
@@ -124,8 +125,9 @@
 //!   the module of `file` (`service/boundary.rs`, whose mutex is private to it): `file` itself and
 //!   the files under the folder that is named like it without `.rs`, its child modules, which reach
 //!   the private mutex too, whether they have a row or none. Every function with such a name is a
-//!   `taker` as well, bar the two methods named `lock` and `try_lock` in `file`; a take that does
-//!   not go through a taker is a row too.
+//!   `taker` as well, bar the two methods named `lock` and `try_lock` in `file`; a take that the
+//!   scanner reads (a name after a `.` or a `::`, a raw identifier such as `r#lock` read as its
+//!   name) and that does not go through a taker is a row too.
 //! * `reference <word> <file> <count>`: how many times `include` (followed by `!`), a path
 //!   attribute (`path` after `[`, `(` or `,`, followed by `=`) or `block_on` stands in the code of
 //!   `file`; a file with no row has none. These bring in source that this reading does not see, or
@@ -135,9 +137,14 @@
 //!   row for each argument of one call stands beside the others. It reads what a call hands on
 //!   where `held` reads what is live there.
 //!
-//! What the `taker` and `mention` rows do not see: a call that a macro writes (one mention at the
-//! definition and none at each use), an async taker that a sync body runs to its end (the count of
-//! `block_on` shows a new such body), and a take on a thread that the holder waits for. A function
+//! What the `taker`, `mention` and `rawtake` rows do not see: a call that a macro writes (a name
+//! that the macro's body spells counts once, at the definition, and not at each use; a name that a
+//! use hands to an `ident` fragment counts nowhere), a test module that a macro hands on as product
+//! code (the `rawtake` reading leaves test modules out of the product text, so a take in one has no
+//! count; the `mention` rows count in test modules), a take of the boundary's own mutex whose name
+//! is not written after a `.` or a `::` (a struct pattern that binds the mutex's field and hands
+//! the mutex out), an async taker that a sync body runs to its end (the count of `block_on` shows a
+//! new such body), and a take on a thread that the holder waits for. A function
 //! is known by its name, so two functions of one name in a file share a number, and a take that
 //! moves inside one function keeps that function's number. The rule that a mention stands in a
 //! taker or an async function knows an async function only by its name in the file, so a sync
