@@ -8988,6 +8988,123 @@ async fn kr_req_24_01_the_catalogue_keeps_its_installation_state_durably_across_
     assert_eq!(installation.package_digest, generation.manifest_digest());
 }
 
+/// A receipt kept under a refusal code that a later build added is a record this build cannot
+/// read. The lookup and a claim of the same action both stop there, nothing is claimed over the
+/// record, and the record stays.
+#[tokio::test]
+async fn a_receipt_kept_under_a_code_this_build_lacks_stops_the_lookup_and_the_claim_and_stays() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(home.path(), GenerationSpec::default()).await;
+    let mut catalogue = installed_catalogue(home.path(), &generation).await;
+    let key = ReceiptKey::new("kr:local", "refused");
+    let claim = ReceiptClaim {
+        key: key.clone(),
+        digest: vec![7; 32],
+        method: "plugin.pin".to_owned(),
+        method_version: 1,
+        deadline_ms: None,
+    };
+    let rows =
+        |catalogue: &Catalogue| -> Vec<(String, String, i64, Option<Vec<u8>>, Option<String>)> {
+            let database = rusqlite::Connection::open(
+                catalogue
+                    .root()
+                    .join(kr_plugin_catalogue::db::DATABASE_FILE),
+            )
+            .expect("opens the database");
+            let mut statement = database
+                .prepare(
+                    "SELECT action, state, revision, result, error FROM receipts ORDER BY action",
+                )
+                .expect("selects the receipts");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .expect("reads the receipts")
+                .map(|row| row.expect("a receipt row"))
+                .collect()
+        };
+
+    // The catalogue's own writer keeps the refusal.
+    assert_eq!(
+        catalogue.claim(&claim, 1).expect("recorded"),
+        Claimed::Fresh
+    );
+    let owner = Owner::acting();
+    let refusal = Recording::new(&owner).failure(&kr_protocol::error::ProtocolError::new(
+        ErrorCode::InvalidArgument,
+        "it was refused",
+    ));
+    assert_eq!(refusal.state(), kr_protocol::receipt::ReceiptState::Refused);
+    catalogue
+        .settle_failure(&key, &refusal, 2)
+        .expect("the refusal is kept");
+    assert!(
+        catalogue.receipt(&key).expect("readable").is_some(),
+        "a refusal under a code this build knows reads"
+    );
+
+    // A later build added a code, and the refusal of this action was kept under it.
+    let word = "A_CODE_A_LATER_BUILD_ADDS";
+    assert!(
+        ErrorCode::from_wire(word).is_none(),
+        "this build lacks the word"
+    );
+    let changed = rusqlite::Connection::open(
+        catalogue
+            .root()
+            .join(kr_plugin_catalogue::db::DATABASE_FILE),
+    )
+    .expect("opens the database")
+    .execute(
+        "UPDATE receipts SET error = replace(error, ?1, ?2) WHERE action = 'refused'",
+        rusqlite::params![
+            format!("\"{}\"", ErrorCode::InvalidArgument.as_str()),
+            format!("\"{word}\""),
+        ],
+    )
+    .expect("the kept word is changed");
+    assert_eq!(changed, 1);
+    let before = rows(&catalogue);
+    assert!(
+        before[0]
+            .4
+            .as_deref()
+            .is_some_and(|error| error.contains(word)),
+        "the receipt holds the word"
+    );
+
+    // 1. The reader's answer. A kept refusal under an unknown word is told as unavailable here:
+    // the store holds a record this build cannot read.
+    let lookup = catalogue
+        .receipt(&key)
+        .expect_err("the receipt cannot be read");
+    let CatalogueError::StorageUnavailable { detail } = &lookup else {
+        panic!("{lookup:?}");
+    };
+    assert!(detail.contains("cannot read"), "{detail}");
+    assert_eq!(lookup.code(), ErrorCode::StorageUnavailable);
+
+    // 3. A claim of the same action stops at the same record. It claims nothing over it.
+    let claimed = catalogue
+        .claim(&claim, 3)
+        .expect_err("the claim cannot read the record it would take over");
+    assert!(
+        matches!(claimed, CatalogueError::StorageUnavailable { .. }),
+        "{claimed:?}"
+    );
+
+    // 2. The record stays: the same row, with the same revision and the same bytes.
+    assert_eq!(rows(&catalogue), before);
+}
+
 /// An action's claim, its effect and the answer it gave are one record, and an interrupted one is
 /// never reported as refused.
 #[tokio::test]
