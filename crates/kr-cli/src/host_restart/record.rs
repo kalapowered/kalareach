@@ -144,7 +144,10 @@ impl Record {
                 }
             }
         }
-        debug_assert!(reachable(self), "an unreachable record: {self:?}");
+        debug_assert!(
+            reachable(self),
+            "the record is in a state that no sequence of reads gives"
+        );
     }
 
     fn sight(&mut self, sight: Sight) {

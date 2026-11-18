@@ -12,7 +12,6 @@
 //! more. It waits, within the start's bound counted from the cut, for a daemon to give a whole
 //! exchange.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -71,11 +70,9 @@ impl Operations for Real<'_> {
         record: &Shared,
     ) -> Result<(LocalClient, Option<Started>)> {
         let told = record.clone();
-        let seen = Arc::new(move |sight| told.observe(Observation::Sight(sight)));
-        startup::telling_sights(
-            seen,
-            startup::open_or_start_telling(self.host, self.environment, launched),
-        )
+        startup::open_or_start_telling(self.host, self.environment, launched, &move |sight| {
+            told.observe(Observation::Sight(sight));
+        })
         .await
     }
 
