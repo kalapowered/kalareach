@@ -1002,8 +1002,13 @@ impl Companion {
     }
 
     /// Asks for the pairing screen's state until `until` accepts it, as the page would read it.
+    ///
+    /// An attempt that has ended gets nowhere more, so a state `until` does not accept that says
+    /// it ended fails the case there and then, with the words the attempt ended with, and not
+    /// after the watchdog. A watchdog that runs out says the state the screen was left in.
     pub async fn reached(&self, until: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
-        tokio::time::timeout(WATCHDOG, async {
+        let mut last = serde_json::Value::Null;
+        let waited = tokio::time::timeout(WATCHDOG, async {
             loop {
                 let view = self
                     .call("pairing_view", serde_json::json!({}))
@@ -1011,11 +1016,19 @@ impl Companion {
                 if until(&view["state"]) {
                     return view;
                 }
+                assert!(
+                    view["state"]["state"] != "ended",
+                    "the attempt ended before it got there: {}",
+                    view["state"]
+                );
+                last = view["state"].clone();
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
-        .await
-        .expect("the attempt gets there")
+        .await;
+        waited.unwrap_or_else(|_| {
+            panic!("the attempt did not get there within the watchdog; the screen shows {last}")
+        })
     }
 
     /// Asks for the owner confirmations until one `matching` accepts is listed, and returns it.
