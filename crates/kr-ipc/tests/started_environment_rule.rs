@@ -373,7 +373,7 @@ const SNAPSHOTS: &[Counted] = &[
     Counted {
         file: "crates/kr-cli/tests/update.rs",
         places: 2,
-        reason: "one place is the bytes of a recorded create that the case writes into a daemon's journal, to read back that its variables were not kept, and no session starts from them; the other is an invisible create, which the daemon refuses when it carries a variable",
+        reason: "one place is the bytes of a recorded create that a case writes into a daemon's journal, and no session starts from them; the other is an invisible create, which the daemon refuses when it carries a variable, so its session takes the host's environment of the daemon the case starts with `Host::start_daemon`: a child program started through the helper, whose environment is the home of the case's own tree. The cases that hand the daemon to the platform's service manager give it the manager's environment (see the row of kept real environments) and create no session through this function",
         removal: "none while the function only returns the recorded bytes and the daemon refuses a variable on an invisible create",
         holds: |text| {
             text.contains("fn recorded_create(secret: &str) -> Vec<u8>")
@@ -399,7 +399,7 @@ const SNAPSHOTS: &[Counted] = &[
     Counted {
         file: "crates/kr-controller/tests/automation.rs",
         places: 3,
-        reason: "every place is an invisible create (a create-session node, which the product also refuses when it carries a variable, and two creates from the client): the daemon refuses an invisible create that carries a variable, and the session takes the host environment that the harness gives the daemon",
+        reason: "every place is an invisible create (a create-session node, which the product also refuses when it carries a variable, and two creates from the client), so each session takes the host's environment of its file's daemon: the daemons that start workers are started by `working_host_on_clocks` and `working_host_apart_started_by`, and both call `set_host_environment` with the helper's variables, the home of the case's own tree; the daemons that do not call it have a worker program that does not exist",
         removal: INVISIBLE_CREATE_REMOVAL,
         holds: |text| text.contains("fn create_session_node(") && text.contains("fn session_in("),
     },
@@ -474,7 +474,7 @@ const SNAPSHOTS: &[Counted] = &[
     Counted {
         file: "crates/kr-controller/tests/shell.rs",
         places: 2,
-        reason: "the maker of the file's create parameters is invisible, which the daemon refuses when it carries a variable, and the one case that shows its create sets the presentation and the home itself; the other place is the snapshot a case of the real-worker daemon sends to see what reaches the shell, a placed script that reports its environment and then runs a shell that is not a login shell",
+        reason: "the maker of the file's create parameters is invisible, which the daemon refuses when it carries a variable; the harness without workers starts no session, and the real-worker harness gives its daemon the environment of each case on purpose, which may name the account's own home or none, so a session there can have the account's home; that session runs a placed script that reports its environment and then a shell that is not a login shell, so it reads no startup file even then. The one case that shows its create sets the presentation and the home itself. The other place is the snapshot such a case sends",
         removal: "none while the daemon refuses a variable on an invisible create, and while those cases are about which variables reach the worker",
         holds: |text| {
             text.contains("exec /bin/sh -i")
@@ -501,21 +501,21 @@ const SNAPSHOTS: &[Counted] = &[
     Counted {
         file: "crates/kr-controller/tests/binding.rs",
         places: 2,
-        reason: INVISIBLE_CREATE,
+        reason: "its places are invisible creates, which the daemon refuses when they carry a variable (a session started with the host's environment carries none), so each session takes the host's environment of its file's daemon: `Hosted::start` calls `set_host_environment` after the daemon starts, so the home is inside the case's own tree",
         removal: INVISIBLE_CREATE_REMOVAL,
         holds: |text| text.contains("Presentation::Invisible"),
     },
     Counted {
         file: "crates/kr-controller/tests/plugin_runtime.rs",
         places: 1,
-        reason: INVISIBLE_CREATE,
+        reason: "its places are invisible creates, which the daemon refuses when they carry a variable (a session started with the host's environment carries none), so each session takes the host's environment of its file's daemon: the in-process daemon calls `set_host_environment`, and the child daemon is started through the helper's `apply_keeping`, so the home is inside the case's own tree in both",
         removal: INVISIBLE_CREATE_REMOVAL,
         holds: |text| text.contains("Presentation::Invisible"),
     },
     Counted {
         file: "crates/kr-worker/tests/launchd_jobs.rs",
         places: 1,
-        reason: INVISIBLE_CREATE,
+        reason: "its places are invisible creates, which the daemon refuses when they carry a variable (a session started with the host's environment carries none), so each session takes the host's environment of its file's daemon: `Host::start_with` calls `set_host_environment` after the daemon starts, so the home is inside the case's own tree",
         removal: INVISIBLE_CREATE_REMOVAL,
         holds: |text| text.contains("Presentation::Invisible"),
     },
