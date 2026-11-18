@@ -219,19 +219,24 @@ pub fn device_in_boot(
     device
 }
 
-/// Waits until the device's attempt reaches a state `until` accepts, or ends.
+/// Waits until the device's attempt reaches a state `until` accepts, or ends. A watchdog that
+/// runs out says the state the attempt was left in.
 pub async fn reached(device: &Device, until: impl Fn(&AttemptState) -> bool) -> AttemptState {
-    tokio::time::timeout(WATCHDOG, async {
+    let mut last = None;
+    let waited = tokio::time::timeout(WATCHDOG, async {
         loop {
             let state = device.view().state;
             if until(&state) || matches!(state, AttemptState::Ended { .. }) {
                 return state;
             }
+            last = Some(state);
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .expect("the attempt gets there")
+    .await;
+    waited.unwrap_or_else(|_| {
+        panic!("the attempt did not get there within the watchdog; it was left at {last:?}")
+    })
 }
 
 /// This computer as the host's owner device: the owner's keys in its store and its record of
@@ -1018,8 +1023,9 @@ impl Companion {
                 }
                 assert!(
                     view["state"]["state"] != "ended",
-                    "the attempt ended before it got there: {}",
-                    view["state"]
+                    "the attempt ended before it got there: {} ({:?})",
+                    view["state"],
+                    self.device().view().state
                 );
                 last = view["state"].clone();
                 tokio::time::sleep(Duration::from_millis(100)).await;
