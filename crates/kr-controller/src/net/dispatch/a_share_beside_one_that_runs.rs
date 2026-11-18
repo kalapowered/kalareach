@@ -702,15 +702,29 @@ async fn kr_req_23_24_a_share_written_under_earlier_identities_is_not_called_unp
         kr_protocol::sharing::share_identities(&owner, first.action_id.get());
     let (earlier_grant, earlier_invitation) = earlier_identities(first.action_id.get());
     let registry = beside(&world);
+    let written: Vec<u8> = registry
+        .query_row(
+            "SELECT grant FROM grants WHERE grant_id = ?1",
+            rusqlite::params![grant_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the grant is written");
+    let mut carried: kr_protocol::grant::Grant =
+        kr_cbor::from_canonical_slice(&written, &kr_cbor::Limits::DEFAULT)
+            .expect("the grant decodes");
+    carried.grant_id = earlier_grant;
     registry
         .execute(
-            "UPDATE grants SET grant_id = ?1 WHERE grant_id = ?2",
+            "UPDATE grants SET grant_id = ?1, grant = ?3 WHERE grant_id = ?2",
             rusqlite::params![
                 earlier_grant.get().as_bytes().as_slice(),
-                grant_id.get().as_bytes().as_slice()
+                grant_id.get().as_bytes().as_slice(),
+                kr_cbor::to_canonical_vec(&carried).expect("the grant encodes"),
             ],
         )
-        .expect("the grant keeps the identity an earlier build gave it");
+        .expect(
+            "the grant keeps the identity an earlier build gave it, in its key and its payload",
+        );
     registry
         .execute(
             "UPDATE session_invitations SET invitation_id = ?1, grant_id = ?2
