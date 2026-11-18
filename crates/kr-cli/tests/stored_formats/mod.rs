@@ -330,7 +330,7 @@ pub fn digest(store: &Store, ddl: &[String]) -> Result<String, String> {
     let mut kept = BTreeMap::new();
     for item in &store.kept {
         let value = match item {
-            Kept::Protocol(_, schema, _) => normalise_schema(schema)?,
+            Kept::Protocol(_, schema, declared) => normalise_schema(schema, Some(*declared))?,
             Kept::Source(file, items) => {
                 let mut definitions = Vec::new();
                 for name in *items {
@@ -400,12 +400,25 @@ const SCHEMA_PROSE: [&str; 6] = [
 /// nullability, the `required` list, every other enumeration and the retry class stay in the
 /// input. The protocol's own schema carries no marker.
 ///
+/// `declared` is the Rust type the root is the schema of, as `std::any::type_name` spells it, or
+/// `None` where the root is no type of its own.
+///
 /// # Errors
 ///
 /// Returns what stops the code being told from a type that is not it: see
 /// [`normalise_with_code`].
-pub fn normalise_schema(root: &Value) -> Result<Value, String> {
-    normalise_with_code(root, &kr_protocol::schema::schema_for::<ErrorCode>())
+pub fn normalise_schema(root: &Value, declared: Option<&str>) -> Result<Value, String> {
+    normalise_with_code(
+        root,
+        &kr_protocol::schema::schema_for::<ErrorCode>(),
+        declared,
+    )
+}
+
+/// The Rust type of the protocol's error code, as a kept schema declares the type of its root.
+#[must_use]
+pub fn code_type() -> &'static str {
+    std::any::type_name::<ErrorCode>()
 }
 
 /// What stands for the protocol's error code in the input of a digest: a string, and a member
@@ -417,21 +430,45 @@ pub fn code_marker() -> Value {
 
 /// [`normalise_schema`] with `code`, the schema this build generates for the protocol's error code.
 ///
-/// A definition, or the root, is the code when what the normaliser makes of it equals what it
-/// makes of `code`, whatever the definition is called. One that is called what the code is called
-/// and is not equal to it fails: an identity that is not certain is never guessed. `code` must be
-/// a plain list of strings, since the marker says nothing of any other form.
+/// Only the code's own definition is the code. A definition is, when it is called what the code
+/// is called (or what the schema library calls a second type of that name, the name and a number)
+/// and what the normaliser makes of it equals what it makes of `code`. The root is, when `declared`
+/// is the code's Rust type. A definition that is equal to the code under any other name, two
+/// definitions that are both equal to it, a definition that has the code's name and is not equal,
+/// and a root that is equal and not declared as the code, fail: an identity that is not certain
+/// is never guessed, since a second enumeration with the same words would hide a word that is
+/// added to both. `code` must be a plain list of strings, since the marker says nothing of any
+/// other form.
 ///
 /// # Errors
 ///
-/// Returns that `code` is not a plain list of strings, or that a definition or the root has the
-/// code's name and is not the code.
-pub fn normalise_with_code(root: &Value, code: &Value) -> Result<Value, String> {
+/// Returns that `code` is not a plain list of strings, or what makes the code's identity not
+/// certain in `root`.
+pub fn normalise_with_code(
+    root: &Value,
+    code: &Value,
+    declared: Option<&str>,
+) -> Result<Value, String> {
     let code = Code::of(code)?;
     let definitions = root.get("$defs").cloned().unwrap_or_else(|| json!({}));
+    code.check_definitions(&definitions)?;
     let normal = inline(root, &definitions, &mut Vec::new(), false, Some(&code))?;
-    if normal == code.plain {
-        return Ok(code_marker());
+    let equal = normal == code.plain;
+    if declared == Some(code_type()) {
+        return if equal {
+            Ok(code_marker())
+        } else {
+            Err(format!(
+                "the root of a kept schema is declared as the protocol's error code, {}, and is not what this build generates for it",
+                code_type()
+            ))
+        };
+    }
+    if equal {
+        return Err(format!(
+            "the root of a kept schema is equal to the protocol's error code and is not declared as the code (it is declared as {}): a type that only has the words is not the code",
+            declared.unwrap_or("nothing")
+        ));
     }
     if root.get("title").and_then(Value::as_str) == Some(code.name.as_str()) {
         return Err(format!(
@@ -451,6 +488,51 @@ struct Code {
 }
 
 impl Code {
+    /// Whether a definition of this name may be the code: the name the schema library gives the
+    /// type, or that name and the number it adds to the second type of one name.
+    fn is_called_so(&self, name: &str) -> bool {
+        name.strip_prefix(self.name.as_str())
+            .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_digit()))
+    }
+
+    /// That the code stands in the definitions once, under its own name: a definition that is
+    /// equal to the code and called otherwise, a definition called as the code is and not equal
+    /// to it, and two definitions that are equal to it all fail.
+    fn check_definitions(&self, definitions: &Value) -> Result<(), String> {
+        let mut equal = Vec::new();
+        for (name, definition) in definitions.as_object().into_iter().flatten() {
+            let is_equal = inline(
+                definition,
+                definitions,
+                &mut vec![name.clone()],
+                false,
+                None,
+            )? == self.plain;
+            match (is_equal, self.is_called_so(name)) {
+                (true, true) => equal.push(name.as_str()),
+                (true, false) => {
+                    return Err(format!(
+                        "the definition {name} of a kept schema is equal to the protocol's error code and is not called {}: a second enumeration with the same words is not the code, and a word added to both would move no digest",
+                        self.name
+                    ));
+                }
+                (false, true) => {
+                    return Err(format!(
+                        "the definition {name} of a kept schema has the name of the protocol's error code and is not the code: a store keeps the code as its wire word, and a type that only has the name is not it"
+                    ));
+                }
+                (false, false) => {}
+            }
+        }
+        if equal.len() > 1 {
+            return Err(format!(
+                "two definitions of a kept schema ({}) are equal to the protocol's error code: which of them a type refers to is not certain",
+                equal.join(", ")
+            ));
+        }
+        Ok(())
+    }
+
     fn of(schema: &Value) -> Result<Self, String> {
         let name = schema
             .get("title")
@@ -546,16 +628,13 @@ fn inline(
                     open.push(name.to_owned());
                     let inlined = inline(definition, definitions, open, false, code)?;
                     open.pop();
+                    // A definition that is equal to the code has the code's name: the
+                    // definitions were checked for that before the schema was read.
                     match code {
                         Some(code) if inlined == code.plain => {
                             if let Value::Object(marker) = code_marker() {
                                 out.extend(marker);
                             }
-                        }
-                        Some(code) if name == code.name => {
-                            return Err(format!(
-                                "the definition {name} of a kept schema has the name of the protocol's error code and is not the code: a store keeps the code as its wire word, and a type that only has the name is not it"
-                            ));
                         }
                         _ => {
                             if let Value::Object(inlined) = inlined {
@@ -922,7 +1001,7 @@ pub fn levels_view(document: &Value, release: &Release) -> Result<ObservedLevels
                     .iter()
                     .find(|entry| entry.member == name)
                     .map(|entry| entry.level),
-                schema: normalise_schema(&root)?,
+                schema: normalise_schema(&root, None)?,
                 names: names.get(name).cloned().unwrap_or_default(),
                 unresolved,
             })
@@ -1677,7 +1756,7 @@ impl Known {
     /// Returns what stops a type being read from the source.
     pub fn now(&self) -> Result<String, String> {
         let basis = match &self.is {
-            KnownIs::Protocol(schema, _) => normalise_schema(schema)?,
+            KnownIs::Protocol(schema, declared) => normalise_schema(schema, Some(*declared))?,
             KnownIs::Source(file) => json!(definition(file, self.name)?),
             KnownIs::Words(words, anchor, enums) => {
                 words_basis(&repository(), words, *anchor, enums)?
@@ -1764,7 +1843,7 @@ pub fn code_forms_in(stores: &[Store], known: &[Known]) -> Vec<String> {
         let store = &kept.entry.store;
         for item in &kept.kept {
             match item {
-                Kept::Source(file, items) if items.iter().any(|item| *item == name) => found.push(format!(
+                Kept::Source(file, items) if items.contains(&name) => found.push(format!(
                     "the store {store} pins {name} by its source in {file}, which holds the macro that lists the codes and not the codes: declare the type by its schema"
                 )),
                 Kept::Words(label, words) => {
