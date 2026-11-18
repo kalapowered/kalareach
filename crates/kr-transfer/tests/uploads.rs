@@ -4147,6 +4147,134 @@ fn a_finish_does_not_end_an_upload_under_an_identifier_another_request_took() {
     assert!(staged.exists(), "and its payload was not removed");
 }
 
+/// A refusal kept under a word that a later build added is read as an unknown outcome on every
+/// path that reads a kept action: the repeat before the lock, the public lookup, and the
+/// transaction that finds its claim taken. On each the record stays, and the upload is not ended
+/// or finished a second time.
+///
+/// The journal keeps the word the writer was handed. The staged file here does not match its
+/// declaration, so a finish that owned its identifier would end the upload and remove the payload.
+#[test]
+fn a_refusal_kept_under_a_code_this_build_lacks_is_an_unknown_outcome_on_every_path_that_reads_it()
+{
+    let harness = Harness::create();
+    let bytes = pattern(256);
+    let begun = harness
+        .begin(&bytes, "application/octet-stream", "unknown_word.bin")
+        .expect("reserves the upload");
+    let transfer_id = begun.transfer_id;
+    harness
+        .send_all(transfer_id, &bytes)
+        .expect("sends the chunks");
+    let finish = action(&harness, "upload.finish", &bytes);
+    let (staged, _) = payload_paths(&harness, transfer_id, "unknown_word.bin");
+    rewrite_in_place(&staged, bytes.len());
+    let state = || {
+        harness
+            .service
+            .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
+            .expect("reads the status")
+            .state
+    };
+    let before = state();
+    let kept = || -> Vec<(String, Option<Vec<u8>>, Option<String>, Option<String>)> {
+        let journal = rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
+            &harness.host.environment(),
+        ))
+        .expect("opens the journal");
+        let mut statement = journal
+            .prepare("SELECT method, result, error_code, error_detail FROM actions")
+            .expect("selects the actions");
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("reads the actions")
+            .map(|row| row.expect("an action row"))
+            .collect()
+    };
+
+    // A later build added a code, and the refusal of this action was kept under it. The record
+    // appears after the finish read the identifier as free and before its file is verified.
+    let word = "A_CODE_A_LATER_BUILD_ADDS";
+    assert!(
+        ErrorCode::from_wire(word).is_none(),
+        "this build lacks the word"
+    );
+    let (actor_id, action_id, method, digest) = (
+        finish.actor_id.clone(),
+        finish.action_id,
+        finish.method.clone(),
+        finish.payload_digest,
+    );
+    harness.service.set_staged_open_race_hook(move |store, _| {
+        store
+            .record_action(
+                &actor_id,
+                action_id,
+                &kr_transfer::store::ActionRecord {
+                    method: method.clone(),
+                    payload_digest: digest,
+                    result: None,
+                    error_code: Some(word.to_owned()),
+                    error_detail: Some("it was refused".to_owned()),
+                    recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 2),
+                },
+            )
+            .expect("records the refusal under the word");
+    });
+
+    // The transaction that finds its claim taken is told the outcome is unknown, with the stored
+    // detail, and the upload it was for is left as it was.
+    let refusal = harness
+        .finish_as(transfer_id, &bytes, Some(&finish))
+        .expect_err("the kept refusal is the action's answer");
+    harness.service.clear_staged_open_race_hook();
+    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
+    assert!(refusal.to_string().contains("it was refused"), "{refusal}");
+    assert_eq!(state(), before, "the upload was not ended");
+    assert!(staged.exists(), "and its payload was not removed");
+    let record = kept();
+    assert_eq!(record.len(), 1, "one action, one row");
+    assert_eq!(record[0].2.as_deref(), Some(word), "the word stays as kept");
+
+    // The public lookup says the same.
+    let looked_up = harness
+        .service
+        .retained_action(
+            &harness.actor,
+            finish.action_id,
+            &finish.method,
+            finish.payload_digest,
+        )
+        .expect("the lookup reads")
+        .expect("the action is recorded");
+    assert_eq!(
+        looked_up,
+        kr_transfer::service::RetainedOutcome::Error {
+            code: ErrorCode::OutcomeUnknown,
+            detail: "it was refused".to_owned(),
+        }
+    );
+
+    // A repeat is answered from the record before it reaches the lock, and it does nothing.
+    let repeated = harness
+        .finish_as(transfer_id, &bytes, Some(&finish))
+        .expect_err("a repeat is told what is kept");
+    assert_eq!(repeated.code(), ErrorCode::OutcomeUnknown);
+    assert!(
+        repeated.to_string().contains("it was refused"),
+        "{repeated}"
+    );
+    assert_eq!(state(), before, "the repeat ended nothing");
+    assert!(staged.exists(), "and removed nothing");
+    assert_eq!(
+        kept(),
+        record,
+        "the record is the same row after every read"
+    );
+}
+
 /// KR-REQ-24.09: a finish whose completion lost to another copy's is answered with what that copy
 /// recorded, not with the result it computed.
 ///
