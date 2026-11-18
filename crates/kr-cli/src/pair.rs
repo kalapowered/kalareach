@@ -247,30 +247,11 @@ async fn approve(
             candidate,
             approval,
         } => (candidate, approval),
-        Found::Paired {
-            device_id,
-            grant_id,
-            candidate,
-        } => {
+        Found::Paired { document, line } => {
             if json {
-                let mut document = Document::new()
-                    .with("ok", true)
-                    .with("invitation_id", output::said(&invitation_id))
-                    .with("device_id", closed(&device_id))
-                    .with("grant_id", closed(&grant_id));
-                if let Some(candidate) = &candidate {
-                    document = document
-                        .with("device_name", device_name(candidate))
-                        .with("platform", crate::shown::platform(candidate.platform));
-                }
                 output::document(&document);
             } else {
-                output::line(&stdout_line!(
-                    "Invitation {} is approved already: paired as device {}, with grant {}.",
-                    invitation_id,
-                    device_id,
-                    grant_id
-                ));
+                output::line(&line);
             }
             return Ok(());
         }
@@ -1425,12 +1406,9 @@ enum Found {
         candidate: PairCandidateView,
         approval: PairingApproval,
     },
-    /// The invitation was approved already, and this is what the host recorded.
-    Paired {
-        device_id: DeviceId,
-        grant_id: GrantId,
-        candidate: Option<PairCandidateView>,
-    },
+    /// The invitation was approved already: the `--json` object and the line that say what the
+    /// host recorded.
+    Paired { document: Document, line: Line },
     /// Nothing waits for approval: the lines that `kr pair status` says of the invitation, which
     /// the command says first, and what the command ends with.
     Nothing { said: Vec<Line>, then: CliError },
@@ -1447,11 +1425,27 @@ fn found(invitation_id: InvitationId, status: &PairStatusResult, view: &PairOwne
         PairStatus::Committed {
             device_id,
             grant_id,
-        } => Found::Paired {
-            device_id: *device_id,
-            grant_id: *grant_id,
-            candidate: view.candidate.0.clone(),
-        },
+        } => {
+            let mut document = Document::new()
+                .with("ok", true)
+                .with("invitation_id", output::said(&invitation_id))
+                .with("device_id", closed(device_id))
+                .with("grant_id", closed(grant_id));
+            if let Some(candidate) = &view.candidate.0 {
+                document = document
+                    .with("device_name", device_name(candidate))
+                    .with("platform", crate::shown::platform(candidate.platform));
+            }
+            Found::Paired {
+                document,
+                line: stdout_line!(
+                    "Invitation {} is approved already: paired as device {}, with grant {}.",
+                    invitation_id,
+                    *device_id,
+                    *grant_id
+                ),
+            }
+        }
         PairStatus::Consumed { reason } => {
             let code = match reason {
                 PairingConsumedReason::Expired => ErrorCode::PairingExpired,
@@ -1994,9 +1988,10 @@ mod tests {
     }
 
     /// KR-REQ-10.08: an invitation that was approved already is the state a second run wants, so the
-    /// command ends with success and names what the host recorded: the device and the grant from the
-    /// status, and the device's name and platform where the view carries the candidate. Where the
-    /// view carries none, the command says the same and invents nothing.
+    /// command ends with success and says what the host recorded: the device and the grant from the
+    /// status, in its line and in its `--json` object, and the device's name and platform in the
+    /// object where the view carries the candidate. Where the view carries none, the object holds
+    /// the same members without those two, and invents nothing.
     #[test]
     fn confirming_an_invitation_approved_already_finds_what_the_host_recorded() {
         let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
@@ -2006,31 +2001,63 @@ mod tests {
             device_id,
             grant_id,
         };
+        let recorded = |device: &DeviceId, grant: &GrantId| {
+            serde_json::json!({
+                "ok": true,
+                "invitation_id": invitation_id.to_string(),
+                "device_id": serde_json::to_value(device).expect("an identifier"),
+                "grant_id": serde_json::to_value(grant).expect("an identifier"),
+            })
+        };
+
         let bare = status_without_a_device(committed.clone(), false);
-        let Found::Paired {
-            device_id: found_device,
-            grant_id: found_grant,
-            candidate,
-        } = found_in(invitation_id, &bare)
-        else {
+        let Found::Paired { document, line } = found_in(invitation_id, &bare) else {
             panic!("an approved invitation is found paired");
         };
-        assert_eq!(found_device, device_id);
-        assert_eq!(found_grant, grant_id);
-        assert!(candidate.is_none(), "the view carries no candidate");
+        assert_eq!(
+            document.json(),
+            recorded(&device_id, &grant_id),
+            "the view carries no candidate: the object names no device name and no platform"
+        );
+        assert_eq!(
+            line.text(),
+            format!(
+                "Invitation {invitation_id} is approved already: paired as device {device_id}, \
+                 with grant {grant_id}."
+            )
+        );
 
         let mut named = bare;
-        named.owner.0.as_mut().expect("a view").candidate = {
+        let view = named.owner.0.as_mut().expect("a view");
+        view.candidate = {
             use crate::output::planted::planted;
             planted::<PairStatusResult>()
                 .into_iter()
                 .find_map(|result| result.owner.0.and_then(|view| view.candidate.0))
                 .map_or_else(Nullable::null, Nullable::some)
         };
-        let Found::Paired { candidate, .. } = found_in(invitation_id, &named) else {
+        let candidate = view.candidate.0.clone().expect("a candidate");
+        let Found::Paired { document, line } = found_in(invitation_id, &named) else {
             panic!("an approved invitation is found paired");
         };
-        assert!(candidate.is_some(), "the view's candidate is kept");
+        let mut expected = recorded(&device_id, &grant_id);
+        expected["device_name"] = candidate.device_name.as_str().into();
+        expected["platform"] = crate::shown::platform(candidate.platform)
+            .into_string()
+            .into();
+        assert_eq!(
+            document.json(),
+            expected,
+            "the view's candidate names the device and its platform"
+        );
+        assert_eq!(
+            line.text(),
+            format!(
+                "Invitation {invitation_id} is approved already: paired as device {device_id}, \
+                 with grant {grant_id}."
+            ),
+            "the line is the same with a candidate"
+        );
     }
 
     /// KR-REQ-10.08: the issuing view of an invitation that ended because the device is already
