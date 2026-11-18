@@ -20,6 +20,35 @@ mod written {
 
     const MARKER: &str = "login item: ";
 
+    /// One lock for every copy of a program and every start of a process in this test program. A
+    /// process started while another thread holds a copy of `kr` open for writing keeps that
+    /// descriptor until it runs its own program, and running the copy then fails with "text file
+    /// busy".
+    static STARTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn spawn_lock() -> std::sync::MutexGuard<'static, ()> {
+        STARTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    trait Started {
+        fn output_locked(&mut self) -> std::io::Result<std::process::Output>;
+        fn spawn_locked(&mut self) -> std::io::Result<std::process::Child>;
+    }
+
+    impl Started for Command {
+        fn output_locked(&mut self) -> std::io::Result<std::process::Output> {
+            let _held = spawn_lock();
+            self.output()
+        }
+
+        fn spawn_locked(&mut self) -> std::io::Result<std::process::Child> {
+            let _held = spawn_lock();
+            self.spawn()
+        }
+    }
+
     struct Setup {
         _root: tempfile::TempDir,
         root: PathBuf,
@@ -56,7 +85,10 @@ mod written {
         fn layout(&self, directory: &Path) {
             std::fs::create_dir_all(directory).expect("a directory");
             let target = directory.join("kr");
-            std::fs::copy(support::kr(), &target).expect("a copy of kr");
+            {
+                let _held = spawn_lock();
+                std::fs::copy(support::kr(), &target).expect("a copy of kr");
+            }
             std::fs::write(
                 directory.join("kr-controller"),
                 format!("#!/bin/sh\necho started >> '{}'\n", self.stub_log.display()),
@@ -88,7 +120,7 @@ mod written {
 
         fn run_with(&self, kr: &Path, home: &Path, arguments: &[&str]) -> std::process::Output {
             self.command_in(kr, home, arguments)
-                .output()
+                .output_locked()
                 .expect("kr runs")
         }
 
@@ -216,7 +248,7 @@ mod written {
         let output = Command::new("/usr/bin/plutil")
             .args(["-convert", "json", "-o", "-"])
             .arg(file)
-            .output()
+            .output_locked()
             .expect("plutil reads a file of the test's own tree");
         assert!(output.status.success(), "plutil reads the file");
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
@@ -234,7 +266,7 @@ mod written {
         let output = Command::new("python3")
             .args(["-c", script])
             .arg(file)
-            .output()
+            .output_locked()
             .expect(
                 "python3 with GLib is installed: this case reads the entry with GLib's own parser",
             );
@@ -267,8 +299,22 @@ mod written {
     fn validator_is_installed() -> bool {
         Command::new("desktop-file-validate")
             .arg("--help")
-            .output()
+            .output_locked()
             .is_ok()
+    }
+
+    /// A path as the generator writes it in `WorkingDirectory=`: a single quote after a backslash
+    /// and every byte of a non-ASCII letter as a three-digit octal escape; every other character
+    /// as it is.
+    #[cfg(target_os = "linux")]
+    fn escaped_by_the_generator(path: &str) -> String {
+        path.bytes()
+            .map(|byte| match byte {
+                b'\'' => "\\'".to_owned(),
+                0x80.. => format!("\\{byte:03o}"),
+                _ => char::from(byte).to_string(),
+            })
+            .collect()
     }
 
     /// The unit the autostart generator makes from the entries under the setup's own
@@ -291,7 +337,7 @@ mod written {
             .env("HOME", &setup.home)
             .env("XDG_CONFIG_HOME", setup.home.join(".config"))
             .env("XDG_CONFIG_DIRS", &empty)
-            .output()
+            .output_locked()
             .expect("the autostart generator starts");
         assert!(
             output.status.success(),
@@ -633,7 +679,7 @@ mod written {
                 &["host", "login-item", argument],
             );
             command.env("PATH", format!("{}:/usr/bin:/bin", stand_ins.display()));
-            let output = command.output().expect("kr runs");
+            let output = command.output_locked().expect("kr runs");
             assert!(output.status.success(), "{argument} succeeds");
         }
         assert!(!calls.exists(), "no manager was asked");
@@ -873,7 +919,7 @@ mod written {
                 setup.command_in(&kr, &setup.home, &["host", "login-item", "install"]);
             command.env("KR_RUNTIME_DIR", &runtime);
             command.env("KR_STATE_DIR", &state);
-            let output = command.output().expect("kr runs");
+            let output = command.output_locked().expect("kr runs");
             let said = String::from_utf8_lossy(&output.stderr).into_owned();
             let Some(quoted) = quoted else {
                 assert!(
@@ -912,7 +958,7 @@ mod written {
             // The validator: the entry is valid, `TryExec` and `Path` included.
             let validated = Command::new("desktop-file-validate")
                 .arg(&entry)
-                .output()
+                .output_locked()
                 .expect("desktop-file-validate starts");
             assert!(
                 validated.status.success(),
@@ -952,7 +998,10 @@ mod written {
                 .map(|entry| entry.path())
                 .next()
                 .expect("an environment directory");
-            let working_directory = format!("WorkingDirectory=-{}", environment.display());
+            let working_directory = format!(
+                "WorkingDirectory=-{}",
+                escaped_by_the_generator(&environment.to_string_lossy())
+            );
             assert!(
                 unit.lines().any(|line| line == working_directory),
                 "the generator's working directory for the {position} path {name:?} is not {working_directory:?}: {unit}"
@@ -976,7 +1025,7 @@ mod written {
                 },
                 &root,
             );
-            let output = command.output().expect("kr runs");
+            let output = command.output_locked().expect("kr runs");
             let said = String::from_utf8_lossy(&output.stderr).into_owned();
             assert!(
                 !output.status.success(),
@@ -1022,7 +1071,7 @@ mod written {
                     &setup.home,
                     &["host", "login-item", "install"],
                 )
-                .spawn()
+                .spawn_locked()
                 .expect("starts");
             let remove = setup
                 .command_in(
@@ -1030,7 +1079,7 @@ mod written {
                     &setup.home,
                     &["host", "login-item", "remove"],
                 )
-                .spawn()
+                .spawn_locked()
                 .expect("starts");
             for mut child in [install, remove] {
                 let _ = child.wait();
