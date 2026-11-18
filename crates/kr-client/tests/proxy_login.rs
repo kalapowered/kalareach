@@ -312,3 +312,121 @@ async fn the_front_opens_its_tunnels_through_the_one_writer() {
         Some(TunnelRefusal::Failed)
     );
 }
+
+/// A request of a service client through a proxy that refuses the login ends with the kind and not
+/// as a transport failure, stops the proxy's login for every later request, and writes no login
+/// again; a proxy that asks for a login nobody holds is `Needed`, which keeps the retry the request
+/// had; a plain `http` address is not sent at all while a login is held.
+///
+/// Covers KR-REQ-10.02.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_request_that_meets_the_proxys_refusal_ends_with_its_kind() {
+    use kr_client::error::ClientError;
+    use kr_client::retry::{Recovery, RequestClass};
+    use kr_client::services::ServiceHttp;
+    use kr_client::services::http::{HttpDeadlines, HttpService, ResponseLimits};
+    use kr_protocol::service::GatewayOrigin;
+
+    let service = |proxy: &ProxyUrl, origin: &str| {
+        HttpService::through(
+            GatewayOrigin::new(origin).expect("an origin"),
+            HttpDeadlines {
+                connect: WATCHDOG,
+                read: WATCHDOG,
+                total: WATCHDOG,
+            },
+            ResponseLimits::new(1024),
+            Some(proxy),
+        )
+        .expect("a service client")
+    };
+    let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+
+    let wrong = credential("user", "wrong");
+    let url = proxy_of(&proxy.url, Some(&wrong));
+    let client = service(&url, "https://service.example");
+    let refused = client
+        .get_json("https://service.example/x", &[])
+        .await
+        .expect_err("a refusal");
+    assert!(matches!(
+        refused,
+        ClientError::ProxyLogin(ProxyLoginKind::Refused)
+    ));
+    assert_eq!(wrong.stopped(), Some(StopKind::Refused));
+    assert_eq!(
+        refused.decision(RequestClass::IdempotentRead).recovery,
+        Recovery::Stop,
+        "a refused login is not retried until the host restarts"
+    );
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains(ProxyLoginKind::Refused.clause())
+    );
+    let again = client
+        .get_json("https://service.example/x", &[])
+        .await
+        .expect_err("stopped");
+    assert!(matches!(
+        again,
+        ClientError::ProxyLogin(ProxyLoginKind::Refused)
+    ));
+    assert_eq!(proxy.logins(), vec![Login::Wrong], "no second login");
+
+    let none = proxy_of(&proxy.url, None);
+    let needed = service(&none, "https://service.example")
+        .get_json("https://service.example/x", &[])
+        .await
+        .expect_err("a login is needed");
+    assert!(matches!(
+        needed,
+        ClientError::ProxyLogin(ProxyLoginKind::Needed)
+    ));
+    assert_ne!(
+        needed.decision(RequestClass::IdempotentRead).recovery,
+        Recovery::Stop,
+        "Needed keeps the base's retry"
+    );
+
+    let held = credential("user", "password");
+    let plain = proxy_of(&proxy.url, Some(&held));
+    let before = proxy.logins().len();
+    let clear = service(&plain, "http://127.0.0.1:9")
+        .get_json("http://127.0.0.1:9/x", &[])
+        .await
+        .expect_err("plain http");
+    assert!(matches!(
+        clear,
+        ClientError::ProxyLogin(ProxyLoginKind::ClearTextTarget)
+    ));
+    assert_eq!(proxy.logins().len(), before, "nothing reached the proxy");
+}
+
+/// Every reader of a [`ClientError`] that sorts by variant takes a proxy login failure as a send
+/// that did not happen: the attempt's reply is `NotSent`, and an answer that was not written is
+/// settled.
+///
+/// Covers KR-REQ-10.02.
+#[test]
+fn the_readers_of_a_client_error_take_a_proxy_login_failure_as_not_sent() {
+    use kr_client::answers::AnswerFailure;
+    use kr_client::attempt::Reply;
+    use kr_client::error::ClientError;
+    use kr_client::session::Settled;
+
+    for kind in [
+        ProxyLoginKind::Needed,
+        ProxyLoginKind::Refused,
+        ProxyLoginKind::Unsupported,
+        ProxyLoginKind::ClearTextTarget,
+    ] {
+        let outcome: Result<Settled, ClientError> = Err(ClientError::ProxyLogin(kind));
+        assert_eq!(Reply::of(&outcome), Reply::NotSent, "{kind:?}");
+        assert!(AnswerFailure::from(ClientError::ProxyLogin(kind)).settled());
+    }
+}

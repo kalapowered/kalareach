@@ -537,7 +537,11 @@ impl SignedService {
                 self.http.post_bytes(url, content, &headers).await
             }
         }
-        .map_err(Unanswered::Sent)
+        .map_err(|error| match error {
+            // The gate or the connector refused it for the proxy's login: nothing was written.
+            ClientError::ProxyLogin(_) => Unanswered::NotSent(error),
+            other => Unanswered::Sent(other),
+        })
     }
 
     /// The bytes of one signed request: a push request's body under its own digest, or the document

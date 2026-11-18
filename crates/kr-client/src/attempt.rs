@@ -178,6 +178,7 @@ impl Reply {
                 | ClientError::StillAccounting
                 | ClientError::Withheld
                 | ClientError::ServiceNotConfigured(_)
+                | ClientError::ProxyLogin(_)
                 | ClientError::Draft(_),
             ) => Self::NotSent,
             // Anything else may have reached the host, and asking is what settles it.

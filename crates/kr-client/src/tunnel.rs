@@ -73,6 +73,15 @@ pub(crate) const REASONS: [&str; 9] = [
     NO_STATUS_LINE,
 ];
 
+/// The words of each kind of login failure, which a failure that composes a tunnel's reason says
+/// whole.
+pub(crate) const LOGIN_REASONS: [&str; 4] = [
+    ProxyLoginKind::Needed.clause(),
+    ProxyLoginKind::Refused.clause(),
+    ProxyLoginKind::Unsupported.clause(),
+    ProxyLoginKind::ClearTextTarget.clause(),
+];
+
 /// The connection a TLS session runs over: the server's own, or a tunnel through a proxy, which is
 /// itself TLS when the proxy's address is an `https` one.
 ///
@@ -182,13 +191,13 @@ pub enum TunnelFailure {
 
 impl TunnelFailure {
     /// The words that say why the tunnel did not open: this client's reason, or for a refusal the
-    /// status after the words that name it, or for a login the kind's sentence.
+    /// status after the words that name it, or for a login the kind's clause.
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
             Self::Reason(reason) => (*reason).to_owned(),
             Self::Refused(status) => format!("{REFUSED} {status}"),
-            Self::Login(kind) => kind.sentence(),
+            Self::Login(kind) => kind.clause().to_owned(),
         }
     }
 }
