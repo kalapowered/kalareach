@@ -2045,8 +2045,8 @@ async fn a_refusal_for_an_unusable_sign_in_names_the_sign_in_of_the_configured_s
          with `kr account sign-in`.",
     ];
     let self_hosted = [
-        "no account is signed in on this host. Sign this host in with `kr account sign-in \
-         --storage`.",
+        "this host is signed in to no account at the storage service its storage.origin names. \
+         Sign this host in with `kr account sign-in --storage`.",
         "the service ended the sign-in on this host. Sign this host in with `kr account sign-in \
          --storage`.",
         "a sign-in on this host is waiting to finish. Finish the sign-in at the address `kr \
@@ -2090,7 +2090,11 @@ async fn a_refusal_for_an_unusable_sign_in_names_the_sign_in_of_the_configured_s
             assert_eq!(named, cause);
             assert_eq!(named_policy, policy);
             assert_eq!(
-                format!("{}. {}", named.why(), named.remedy(named_policy)),
+                format!(
+                    "{}. {}",
+                    named.why(named_policy),
+                    named.remedy(named_policy)
+                ),
                 sentence
             );
             assert!(source.asked().is_empty(), "nothing was sent");

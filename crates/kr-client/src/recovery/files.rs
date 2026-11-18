@@ -110,11 +110,19 @@ pub enum SignInCause {
 }
 
 impl SignInCause {
-    /// Why no token is usable, in this program's words.
+    /// Why no token is usable, in this program's words. For a service the owner runs the
+    /// signed-out cause names that service, because the managed account can be signed in while the
+    /// storage account is not.
     #[must_use]
-    pub const fn why(self) -> &'static str {
+    pub const fn why(self, policy: RetrievalPolicy) -> &'static str {
         match self {
-            Self::SignedOut => "no account is signed in on this host",
+            Self::SignedOut => match policy {
+                RetrievalPolicy::Account => "no account is signed in on this host",
+                RetrievalPolicy::SelfHosted => {
+                    "this host is signed in to no account at the storage service its storage.origin \
+                     names"
+                }
+            },
             Self::Waiting => "a sign-in on this host is waiting to finish",
             Self::Ended => "the service ended the sign-in on this host",
             Self::WithoutScope => "the account signed in on this host lacks the backup.write scope",
@@ -403,11 +411,12 @@ pub enum RestoreError {
         /// The same, in words.
         why: Shown,
     },
-    /// The kit names no service this host is configured for.
+    /// The kit does not name the service the restore reads from.
     ///
-    /// The host reaches the one storage service it is configured for, the managed account service
-    /// or one its owner runs, and no other, so a kit that names only another service cannot be
-    /// restored here.
+    /// A restore through the daemon reads from the one storage service the host is configured for,
+    /// the managed account service or one its owner runs, and no other; a restore from an export
+    /// file reads from the service the file was made at. A kit that names only another service
+    /// cannot be restored from it.
     #[error("the recovery kit names no service this host is configured for")]
     OriginNotConfigured,
     /// The kit, the bundle or the service refused at the recovery layer.
@@ -1553,7 +1562,7 @@ async fn open_bundle(
         return Err(RestoreError::NotSignedIn {
             cause,
             policy,
-            why: Shown::said(cause.why()),
+            why: Shown::said(cause.why(policy)),
         });
     }
     let origin = kit_origin_for(&kit, &service.origin).ok_or(RestoreError::OriginNotConfigured)?;
