@@ -6172,11 +6172,23 @@ impl WorkerService {
     /// same link; a statement that waited would keep that link until the daemon's bound ran out,
     /// and the announcement would not be made.
     ///
-    /// Whether a withdrawal is owed is read once, before the wait, from two counters that no lock
-    /// guards. The count owed is raised only inside the hold of the authority lock that changes
-    /// the gate, to the count that hold captured. So the reading, made after this statement's own
-    /// hold of that lock, sees what every earlier tightening statement owed, and a later statement
-    /// raises the count only above this statement's `ceiling`, which caps the reading.
+    /// Whether a withdrawal is owed is read from two counters that no lock guards: once before the
+    /// wait, to tell whether to wait, and again at each pass of the loop that runs the withdrawal.
+    /// The count owed is raised only inside the hold of the authority lock that changes the gate,
+    /// to the count that hold captured, so the first reading, made after this statement's own hold
+    /// of that lock, sees what every earlier tightening statement owed. The reading is capped at
+    /// this statement's `ceiling`, so a restriction that a later statement made is never read as
+    /// this one's.
+    ///
+    /// The capped reading can rise while the statement runs. A presentation that takes the lease
+    /// raises the restriction count and not the count owed, since it withdraws inside its own
+    /// hold, so a statement made after it has a `ceiling` above what is owed; when a later
+    /// tightening statement raises the count owed, this reading rises to the `ceiling`. The cost is
+    /// one wait for a hold, by a statement that owes nothing, and one sweep that the presentation's
+    /// hold already made; that sweep can set the latch under an attach in flight that checked under
+    /// this statement, and that attach then ends unknown rather than applied. No withdrawal that
+    /// the `ceiling` covers is missed: an earlier statement records what it owes before this
+    /// statement's hold, and a presentation withdraws inside its own.
     ///
     /// The statement completes what it captured and no more: the withdrawal it runs, and the mark
     /// that says it is done, stop at the restriction count it was made under. A restriction a later
