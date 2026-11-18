@@ -1551,3 +1551,35 @@ describe('what is left of the sharing page when a control goes', () => {
     expect(document.body).not.toHaveFocus()
   })
 })
+
+describe('a sharing tab whose host lists no device', () => {
+  // A host whose every device was revoked lists none either, and the page cannot tell it from a
+  // host that has never paired one: the owner device that could confirm a new pairing may be gone,
+  // so the words say how things stand and send the person to no pairing.
+  it('says that no device is paired and tells the person to pair nothing', async () => {
+    const host = fakeHost()
+    const empty = {
+      ...host,
+      port: {
+        ...host.port,
+        deviceList: async (params: Parameters<typeof host.port.deviceList>[0]) => ({
+          ...(await host.port.deviceList(params)),
+          devices: []
+        })
+      }
+    }
+    render(
+      <AppProvider
+        port={empty.port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    await person.click(await screen.findByTestId('open-settings'))
+    await person.click(await screen.findByRole('button', { name: 'Sharing' }))
+    const said = await screen.findByTestId('no-devices')
+    expect(said.textContent).toBe('No device is paired with this host.')
+  })
+})

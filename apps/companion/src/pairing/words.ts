@@ -76,7 +76,7 @@ export function failureWords(
       }
     case 'did_not_finish':
       return {
-        sentence: `Pairing did not finish. ${bringItInAgain(reading)}, or ask the host for a new one.`,
+        sentence: `Pairing did not finish. ${bringItInAgain(reading)}, or ask the host for a new one. If the host still lists this device as paired, a new invitation works only after that pairing has ended.`,
         action: 'new_invitation'
       }
     default:

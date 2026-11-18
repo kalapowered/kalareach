@@ -2205,6 +2205,75 @@ async fn a_consumed_invitation_stays_consumed_across_a_host_restart() {
     host.stop().await;
 }
 
+/// KR-REQ-10.08: a device that forgot the host and brings in the direct invitation it already
+/// committed is refused for the invitation, with the rejection that the client reads as a pairing
+/// that did not finish. The host still lists the device, so neither remedy that the words offer
+/// works at once: the same invitation again is refused again, and a new invitation brought in by
+/// that device is refused as one for a device the host lists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_brings_in_the_invitation_it_already_committed_is_refused_while_the_host_lists_it()
+ {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let mut client = host.client().await;
+    let committed = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    let device = Device::create().await;
+    let (connection, _candidate, _value) = calls::redeem(&device.candidate(), &committed).await;
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, committed.invitation_id, &owner)
+            .await
+            .expect("committed");
+    connection.close(0u32.into(), b"paired");
+
+    // The device forgot the host, and brings the same invitation in again.
+    let refused = refused_challenge(&host, &device, committed.invitation_id).await;
+    assert_eq!(refused.code, ErrorCode::PairingRejected, "{refused:?}");
+    assert_eq!(
+        kr_client::pairing::failure::refused_by_host(refused.code, true),
+        kr_client::pairing::failure::FailureKind::DidNotFinish,
+        "a direct invitation's rejection is read as a pairing that did not finish"
+    );
+    assert!(
+        host.network()
+            .devices()
+            .record_for_device(confirmed.device_id)
+            .expect("the registry reads")
+            .expect("the device's record")
+            .is_paired(),
+        "the host still lists the device"
+    );
+
+    // A new invitation, brought in by the same device, is refused as one for a listed device.
+    let invited = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("a new invitation");
+    let redeemed = calls::try_redeem(&device.candidate(), &invited).await;
+    let Err(kr_transport::error::TransportError::Refused(again)) = &redeemed.outcome else {
+        panic!(
+            "the host refuses the new invitation: {:?}",
+            redeemed.outcome
+        );
+    };
+    assert_eq!(again.code, ErrorCode::PairingEndpointPaired, "{again:?}");
+    host.stop().await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // A terminal's catalogue decisions, confirmed on an owner device
 // ---------------------------------------------------------------------------------------------

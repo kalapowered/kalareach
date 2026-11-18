@@ -959,7 +959,7 @@ function SharingTab({
           {devices !== null && offered.length === 0 ? (
             <p className="small muted" data-testid="no-devices">
               {everyone.length === 0
-                ? 'No device is paired with this host. Pair the device first, from that device.'
+                ? 'No device is paired with this host.'
                 : 'No paired device can be given this session. The reasons are below.'}
             </p>
           ) : null}

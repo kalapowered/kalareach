@@ -32,3 +32,21 @@ describe('a pairing the host refuses because it still lists the device', () => {
     expect(words.action).toBe('done')
   })
 })
+
+describe('a direct invitation that did not finish', () => {
+  // The host refuses a new invitation for a device it still lists, so the same invitation again
+  // or a new one cannot pair a device that the host holds as paired.
+  it('offers the invitation again or a new one, and says a new one works only after the host ends the pairing', () => {
+    for (const [reading, again] of [
+      ['camera', 'Scan the invitation again'],
+      ['photo', 'Choose the picture again'],
+      ['pasteboard', 'Copy the invitation from the host again']
+    ] as const) {
+      const words = failureWords({ kind: 'did_not_finish' }, 'rendezvous.example', 'direct', reading)
+      expect(words.sentence).toBe(
+        `Pairing did not finish. ${again}, or ask the host for a new one. If the host still lists this device as paired, a new invitation works only after that pairing has ended.`
+      )
+      expect(words.action).toBe('new_invitation')
+    }
+  })
+})
