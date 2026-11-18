@@ -20,6 +20,8 @@ use kr_protocol::ids::RequestId;
 use kr_protocol::scalars::U64;
 use kr_protocol::session::Dimensions;
 
+use super::anchor::{Anchor, AnchorPlace, Note};
+
 /// How many times in a row a size the host did not take for now goes again with the host's next
 /// word. After that it waits for the page to measure or move, so a host that keeps refusing is not
 /// asked once for every word it says.
@@ -42,6 +44,16 @@ pub enum Move {
         /// The page's number for this move.
         number: u64,
     },
+}
+
+impl Move {
+    /// The page's number for the move.
+    #[must_use]
+    pub const fn number(self) -> u64 {
+        match self {
+            Self::Pan { number, .. } | Self::Live { number } => number,
+        }
+    }
 }
 
 /// Where a window starts, and its first column.
@@ -82,6 +94,17 @@ impl Record {
         }
     }
 
+    /// Where a window restored to `anchor` is, when it lands on the anchor's own place and column.
+    const fn from_anchor(anchor: &Anchor) -> Self {
+        Self {
+            place: match anchor.place() {
+                AnchorPlace::History(row) => Place::History(row),
+                AnchorPlace::Live(line) => Place::Live(line),
+            },
+            column: anchor.column(),
+        }
+    }
+
     /// The place a report names to leave the window where it is.
     const fn position(self) -> Option<ViewportPosition> {
         match self.place {
@@ -98,8 +121,15 @@ enum Run {
     /// Neighbouring moves that reverse on neither axis, and the number of the last of them.
     Pan { across: i64, down: i64, last: u64 },
     /// A return to the live screen. It joins nothing, so it is weighed only once every move before
-    /// it has settled.
-    Live { number: u64 },
+    /// it has settled. A return that supersedes a restore names the place it goes to, which it
+    /// reports whatever the record says: the host's window is not known to be where the record
+    /// says while the restore is unsettled.
+    Live {
+        number: u64,
+        absolute: Option<(Option<ViewportPosition>, u64)>,
+    },
+    /// A move that is not made, settled in its place in the order. It changed nothing.
+    Skip { last: u64 },
 }
 
 /// One viewport report to send.
@@ -118,10 +148,14 @@ pub struct Sending {
 pub enum Answer {
     /// Refused in the host's definite word: nothing changed, and the report is settled.
     Refused,
-    /// Not settled: the host refused for now, or could not say what became of the report. A size
-    /// is owed again, since a report states the size and place, and sending it again changes
-    /// nothing a first one did not. A move is the person's gesture: it is settled as not taken.
+    /// Not settled: the host refused for now. A size is owed again, since a report states the size
+    /// and place, and sending it again changes nothing a first one did not. A move is the person's
+    /// gesture: it is settled as not taken.
     NotSettled,
+    /// The host could not say what became of the report, or its answer could not be read. For a
+    /// size or a move that is the same as a refusal for now. A restore stays in flight: it may have
+    /// moved the window, and it is never sent again.
+    Unknown,
     /// Accepted.
     Accepted {
         /// The revision the report left the window at.
@@ -142,6 +176,13 @@ struct InFlight {
     /// Whether the page measured or moved after this report went: a word the view does not rest
     /// from, whatever the host answers.
     page_spoke: bool,
+    /// Whether it asks for the place the view was opened with.
+    restore: bool,
+    /// Whether it is the return to the live screen that took the restore's place.
+    superseding: bool,
+    /// Whether the host answered that it cannot say what became of it. It holds the way until a
+    /// screen settles it, and no answer is left to wait for.
+    unknown: bool,
 }
 
 /// A move that has settled inside the view, waiting to be told to the page.
@@ -154,14 +195,62 @@ struct Untold {
     revision: Option<u64>,
 }
 
+/// What a view opened with a place does about it. Nothing reaches the page until it is over.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Restore {
+    /// Over, or none was asked.
+    Done,
+    /// Not sent: it goes first, on the first screen, when that screen is of the anchor's buffer and
+    /// width.
+    Queued(Anchor),
+    /// The one report in flight, with the newest revision any answer or screen named when it went.
+    Sent { anchor: Anchor, seen: u64 },
+    /// The host could not say what became of it. It is in flight still, and a window revision above
+    /// `seen` is its own: the view never claims geometry, the window is at home before it, and
+    /// reports of one connection are taken in order.
+    Unknown { anchor: Anchor, seen: u64 },
+    /// Settled, and waiting for a complete screen to be judged.
+    Answered { anchor: Anchor, how: How },
+    /// A return to the live screen was taken before it was over: the person's word is final, no note
+    /// is made and no restore is ever made after it. It is over once that return settles and a
+    /// screen shows where the window is. `origin` is where the return puts the window.
+    Superseded { origin: Record, live: Live },
+}
+
+/// How a restore was answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum How {
+    /// Accepted: the window is at a revision at or above this.
+    Landed(u64),
+    /// Never made: refused, refused for now, not asked for or dropped.
+    NotMade,
+}
+
+/// The return to the live screen that took a restore's place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Live {
+    /// Not settled.
+    Settling,
+    /// Settled: the window is at this revision, or the host did not take it.
+    Settled(Option<u64>),
+}
+
+/// What the end of a restore says to the view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resolution {
+    /// What to say of the place the window landed at.
+    pub note: Option<Note>,
+}
+
 /// Where one view's window is, and the viewport reports it owes the session.
 ///
 /// Every report the view sends goes through here, one at a time. What goes next is one choice,
 /// asked after every event: the newest size if it is not the size last sent, or if a report of it
-/// was not settled, else the next run of moves. Nothing goes while a report is in flight, while a
-/// new subscription is being asked for, whose first screen is what says where the window then is,
-/// while a size the host did not take for now rests, or, once a screen has arrived, while the view
-/// holds no complete one; before the first, only a size goes, from where the attach put the window.
+/// was not settled, else the place the view was opened with, else the next run of moves. Nothing
+/// goes while a report is in flight, while a new subscription is being asked for, whose first screen
+/// is what says where the window then is, while a size the host did not take for now rests, or, once
+/// a screen has arrived, while the view holds no complete one; before the first, only a size goes,
+/// from where the attach put the window. No move goes while a restore is not over.
 #[derive(Debug)]
 pub struct WindowReports {
     /// Where the window is, from the newest complete screen naming at least `answered`, and at the
@@ -197,12 +286,17 @@ pub struct WindowReports {
     resting: bool,
     /// How many size reports in a row the host did not take for now.
     not_taken_in_a_row: u8,
+    /// The place the view was opened with, until it is settled.
+    restore: Restore,
+    /// How the restore ended, until the view has read it.
+    resolution: Option<Resolution>,
 }
 
 impl WindowReports {
-    /// A view that attached at this size and holds no screen yet.
+    /// A view that attached at this size and holds no screen yet, and the place it asks the host
+    /// for on its first screen.
     #[must_use]
-    pub const fn new(size: Dimensions) -> Self {
+    pub fn new(size: Dimensions, anchor: Option<Anchor>) -> Self {
         Self {
             record: Some(Record::ORIGIN),
             answered: 0,
@@ -218,6 +312,8 @@ impl WindowReports {
             size_owed: false,
             resting: false,
             not_taken_in_a_row: 0,
+            restore: anchor.map_or(Restore::Done, Restore::Queued),
+            resolution: None,
         }
     }
 
@@ -249,9 +345,7 @@ impl WindowReports {
     /// The page moved the window. A move whose number is not above the last one taken is not one
     /// the page made after it, and is ignored.
     pub fn take(&mut self, asked: Move) {
-        let number = match asked {
-            Move::Pan { number, .. } | Move::Live { number } => number,
-        };
+        let number = asked.number();
         if number <= self.taken {
             return;
         }
@@ -278,8 +372,175 @@ impl WindowReports {
                     });
                 }
             }
-            Move::Live { number } => self.runs.push_back(Run::Live { number }),
+            Move::Live { number } => self.take_live(number),
         }
+    }
+
+    /// The page asked for the live screen. A restore that is not over gives way to it: the pans the
+    /// person made against the place it was to restore are not made, since the window is not known
+    /// to be there, and the return goes to where the anchor would be after one, whatever the
+    /// restore did.
+    fn take_live(&mut self, number: u64) {
+        let anchor = match std::mem::replace(&mut self.restore, Restore::Done) {
+            Restore::Done => {
+                self.runs.push_back(Run::Live {
+                    number,
+                    absolute: None,
+                });
+                return;
+            }
+            superseded @ Restore::Superseded { .. } => {
+                self.restore = superseded;
+                self.runs.push_back(Run::Live {
+                    number,
+                    absolute: None,
+                });
+                return;
+            }
+            Restore::Queued(anchor) => {
+                // Nothing was asked for: a return to the start has nothing to send.
+                self.skip_pans();
+                let Some(live) = anchor.live_of() else {
+                    self.runs.push_back(Run::Skip { last: number });
+                    self.finish(None);
+                    return;
+                };
+                live
+            }
+            Restore::Sent { anchor, .. }
+            | Restore::Unknown { anchor, .. }
+            | Restore::Answered { anchor, .. } => {
+                self.skip_pans();
+                if let Some(flight) = self.in_flight
+                    && flight.restore
+                    && flight.unknown
+                {
+                    // The host has said all it will about it.
+                    self.in_flight = None;
+                }
+                anchor.live_of().unwrap_or(anchor)
+            }
+        };
+        let (origin, absolute) = if anchor.live_of().is_some() {
+            (
+                Record::from_anchor(&anchor),
+                (anchor.position(), anchor.column()),
+            )
+        } else {
+            (Record::ORIGIN, (None, 0))
+        };
+        self.restore = Restore::Superseded {
+            origin,
+            live: Live::Settling,
+        };
+        self.runs.push_back(Run::Live {
+            number,
+            absolute: Some(absolute),
+        });
+    }
+
+    /// A move that is not made is settled where it stands in the order.
+    fn skip_pans(&mut self) {
+        for run in &mut self.runs {
+            if let Run::Pan { last, .. } = *run {
+                *run = Run::Skip { last };
+            }
+        }
+        self.spend_skips();
+    }
+
+    /// Settles the moves not made that nothing stands before.
+    fn spend_skips(&mut self) {
+        while let Some(Run::Skip { last }) = self.runs.front().copied() {
+            self.runs.pop_front();
+            self.untold.push_back(Untold {
+                last,
+                revision: None,
+            });
+        }
+    }
+
+    /// The restore is over, and the view is to be told how.
+    fn finish(&mut self, note: Option<Note>) {
+        self.restore = Restore::Done;
+        self.resolution = Some(Resolution { note });
+    }
+
+    /// The person took control with no return to the live screen: a restore not yet sent is not
+    /// made, and the pans made against the place it was to restore are not either. A restore
+    /// already sent is not touched.
+    pub fn drop_queued_restore(&mut self) {
+        if matches!(self.restore, Restore::Queued(_)) {
+            self.skip_pans();
+            self.finish(None);
+        }
+    }
+
+    /// Whether the page is held back from every screen: the restore is not over, or the view has
+    /// not yet read how it ended.
+    #[must_use]
+    pub const fn holds_restore(&self) -> bool {
+        !matches!(self.restore, Restore::Done) || self.resolution.is_some()
+    }
+
+    /// Whether the report in flight is the restore's, so that an answer that cannot be read is not
+    /// taken for a refusal.
+    #[must_use]
+    pub fn restore_in_flight(&self) -> bool {
+        self.in_flight.is_some_and(|flight| flight.restore)
+    }
+
+    /// The number of the last move taken.
+    #[must_use]
+    pub const fn taken(&self) -> u64 {
+        self.taken
+    }
+
+    /// How the restore ended, once, when the view has not read it yet.
+    pub const fn take_resolution(&mut self) -> Option<Resolution> {
+        self.resolution.take()
+    }
+
+    /// Ends the restore when its outcome is known and `screen`, the newest complete one the view
+    /// holds, can be judged, and settles the pans made behind it: they stand or fall together with
+    /// it. A restore that landed on the anchor's own place and column, with no note, lets them go,
+    /// measured from there; every other end, and a return to the live screen that landed anywhere
+    /// but where it was to, does not, since the window is not where the person aimed them.
+    pub fn resolve(&mut self, screen: Option<&Screen>) {
+        let (note, pans_made) = match &self.restore {
+            Restore::Answered {
+                how: How::NotMade, ..
+            } => (Some(Note::Unavailable), false),
+            Restore::Answered {
+                anchor,
+                how: How::Landed(revision),
+            } => {
+                let Some(screen) = screen.filter(|screen| screen.window_revision >= *revision)
+                else {
+                    return;
+                };
+                let note = anchor.judge(screen);
+                let on_place = Record::of(screen) == Record::from_anchor(anchor);
+                (note, note.is_none() && on_place)
+            }
+            Restore::Superseded {
+                origin,
+                live: Live::Settled(landed),
+            } => {
+                // A screen older than the newest answer is drawn for a window the view has since
+                // moved, and says nothing of where it is.
+                let Some(screen) = screen.filter(|screen| screen.window_revision >= self.answered)
+                else {
+                    return;
+                };
+                (None, landed.is_some() && Record::of(screen) == *origin)
+            }
+            _ => return,
+        };
+        if !pans_made {
+            self.skip_pans();
+        }
+        self.finish(note);
     }
 
     /// A screen arrived whole: the revision of the window it is drawn for, and the screen.
@@ -289,6 +550,18 @@ impl WindowReports {
         // While a subscription replaces another, the one being replaced delivers nothing here, so a
         // screen that arrives is the new subscription's, and the recovery is over.
         self.recovering = false;
+        // A window revision above the one that was newest when a restore of unknown outcome went
+        // is the restore's own.
+        if let Restore::Unknown { anchor, seen } = &self.restore
+            && revision > *seen
+        {
+            self.restore = Restore::Answered {
+                anchor: anchor.clone(),
+                how: How::Landed(revision),
+            };
+            self.answered = self.answered.max(revision);
+            self.settle(Some(revision));
+        }
         if revision >= self.answered {
             self.record = Some(Record::of(screen));
         }
@@ -313,6 +586,7 @@ impl WindowReports {
             Some(InFlight {
                 request: Some(_),
                 awaiting: None,
+                unknown: false,
                 ..
             })
         ) && revision > self.answered
@@ -327,7 +601,12 @@ impl WindowReports {
 
     /// The report to send now, if any, measured against `screen`, the newest the view holds. It is
     /// in flight from here until it settles.
+    ///
+    /// A restore that is settled here, because the first screen is not of the anchor's buffer and
+    /// width, is not sent: the view reads how it ended with [`Self::take_resolution`] and is
+    /// not asked a thing.
     pub fn next(&mut self, screen: Option<&Screen>) -> Option<Sending> {
+        self.resolve(screen);
         if self.recovering || self.in_flight.is_some() || self.resting {
             return None;
         }
@@ -337,61 +616,132 @@ impl WindowReports {
         if screen.is_none() && self.installed.is_some() {
             return None;
         }
-        let (sending, carries) = if self.size == self.size_sent && !self.size_owed {
-            let screen = screen?;
-            loop {
-                let run = self.runs.front().copied()?;
-                self.runs.pop_front();
-                match run {
-                    Run::Live { number } => match record.place {
-                        Place::History(_) => {
+        let (sending, carries, restore, superseding) =
+            if self.size == self.size_sent && !self.size_owed {
+                let screen = screen?;
+                if let Restore::Queued(anchor) = &self.restore {
+                    if anchor.claims(screen) {
+                        let sending = Sending {
+                            dimensions: self.size_sent,
+                            position: anchor.position(),
+                            column: anchor.column(),
+                        };
+                        self.restore = Restore::Sent {
+                            anchor: anchor.clone(),
+                            seen: self.answered.max(self.installed.unwrap_or(0)),
+                        };
+                        self.in_flight = Some(InFlight {
+                            request: None,
+                            awaiting: None,
+                            carries: None,
+                            page_spoke: false,
+                            restore: true,
+                            superseding: false,
+                            unknown: false,
+                        });
+                        return Some(sending);
+                    }
+                    self.restore = Restore::Answered {
+                        anchor: anchor.clone(),
+                        how: How::NotMade,
+                    };
+                    self.resolve(Some(screen));
+                }
+                loop {
+                    let run = self.runs.front().copied()?;
+                    // Nothing goes behind a restore that is not over, but the return that took its
+                    // place.
+                    if !matches!(self.restore, Restore::Done)
+                        && !matches!(
+                            run,
+                            Run::Live {
+                                absolute: Some(_),
+                                ..
+                            }
+                        )
+                    {
+                        return None;
+                    }
+                    self.runs.pop_front();
+                    match run {
+                        Run::Live {
+                            number,
+                            absolute: Some((position, column)),
+                        } => {
                             break (
                                 Sending {
                                     dimensions: self.size_sent,
-                                    position: None,
-                                    column: record.column,
+                                    position,
+                                    column,
                                 },
                                 Some(number),
+                                false,
+                                true,
                             );
                         }
-                        // A window on the live screen stays where it is.
-                        Place::Live(_) => self.untold.push_back(Untold {
-                            last: number,
-                            revision: None,
-                        }),
-                    },
-                    Run::Pan { across, down, last } => {
-                        // A movement the window cannot make is spent here, inside the same choice,
-                        // so the run behind it goes now rather than waiting for something else.
-                        match moved(record, across, down, screen) {
-                            Some((position, column)) => {
+                        Run::Live {
+                            number,
+                            absolute: None,
+                        } => match record.place {
+                            Place::History(_) => {
                                 break (
                                     Sending {
                                         dimensions: self.size_sent,
-                                        position,
-                                        column,
+                                        position: None,
+                                        column: record.column,
                                     },
-                                    Some(last),
+                                    Some(number),
+                                    false,
+                                    false,
                                 );
                             }
-                            None => self.untold.push_back(Untold {
-                                last,
+                            // A window on the live screen stays where it is.
+                            Place::Live(_) => self.untold.push_back(Untold {
+                                last: number,
                                 revision: None,
                             }),
+                        },
+                        Run::Skip { last } => self.untold.push_back(Untold {
+                            last,
+                            revision: None,
+                        }),
+                        Run::Pan { across, down, last } => {
+                            // A movement the window cannot make is spent here, inside the same
+                            // choice, so the run behind it goes now rather than waiting for
+                            // something else.
+                            match moved(record, across, down, screen) {
+                                Some((position, column)) => {
+                                    break (
+                                        Sending {
+                                            dimensions: self.size_sent,
+                                            position,
+                                            column,
+                                        },
+                                        Some(last),
+                                        false,
+                                        false,
+                                    );
+                                }
+                                None => self.untold.push_back(Untold {
+                                    last,
+                                    revision: None,
+                                }),
+                            }
                         }
                     }
                 }
-            }
-        } else {
-            (
-                Sending {
-                    dimensions: self.size,
-                    position: record.position(),
-                    column: record.column,
-                },
-                None,
-            )
-        };
+            } else {
+                (
+                    Sending {
+                        dimensions: self.size,
+                        position: record.position(),
+                        column: record.column,
+                    },
+                    None,
+                    false,
+                    false,
+                )
+            };
         self.size_sent = sending.dimensions;
         self.size_owed = false;
         self.in_flight = Some(InFlight {
@@ -399,6 +749,9 @@ impl WindowReports {
             awaiting: None,
             carries,
             page_spoke: false,
+            restore,
+            superseding,
+            unknown: false,
         });
         Some(sending)
     }
@@ -419,22 +772,43 @@ impl WindowReports {
 
     /// The session answered the report in flight.
     ///
-    /// A definite refusal settles it and changes nothing. An answer that is neither that nor an
-    /// acceptance settles a move the same way, but not a size: the newest size is owed again, with
-    /// the next word from the host or the page, or at once when the page spoke while the report was
-    /// in flight. An acceptance settles it once a screen
-    /// naming its revision, or a later one, has arrived, whether that screen came before the answer
-    /// or comes after it.
+    /// A definite refusal settles it and changes nothing. A refusal for now, or an answer that
+    /// cannot say what became of the report, settles a move the same way, but not a size: the newest
+    /// size is owed again, with the next word from the host or the page, or at once when the page
+    /// spoke while the report was in flight. An acceptance settles it once a screen naming its
+    /// revision, or a later one, has arrived, whether that screen came before the answer or comes
+    /// after it.
+    ///
+    /// A restore is the person's place and not the person's gesture. A refusal of any kind means it
+    /// was not made, and it is never sent again. An answer that cannot say what became of it leaves
+    /// it in flight: a window revision above every one seen when it went is its own.
     pub fn answered(&mut self, answer: Answer) {
+        let restore = self.restore_in_flight();
         match answer {
             Answer::Refused => {
                 self.not_taken_in_a_row = 0;
+                self.restore_not_made();
+                self.settle(None);
+            }
+            Answer::NotSettled if restore => {
+                self.restore_not_made();
                 self.settle(None);
             }
             Answer::NotSettled => self.not_taken(),
+            Answer::Unknown if restore => self.restore_unknown(),
+            Answer::Unknown => self.not_taken(),
             Answer::Accepted { window_revision } => {
                 self.not_taken_in_a_row = 0;
                 self.answered = self.answered.max(window_revision);
+                if let Restore::Sent { anchor, .. } | Restore::Unknown { anchor, .. } =
+                    &self.restore
+                    && restore
+                {
+                    self.restore = Restore::Answered {
+                        anchor: anchor.clone(),
+                        how: How::Landed(window_revision),
+                    };
+                }
                 if self
                     .installed
                     .is_some_and(|installed| installed >= window_revision)
@@ -444,6 +818,48 @@ impl WindowReports {
                     in_flight.awaiting = Some(window_revision);
                 }
             }
+        }
+    }
+
+    /// The restore in flight was refused: it was not made.
+    fn restore_not_made(&mut self) {
+        if !self.restore_in_flight() {
+            return;
+        }
+        if let Restore::Sent { anchor, .. } | Restore::Unknown { anchor, .. } = &self.restore {
+            self.restore = Restore::Answered {
+                anchor: anchor.clone(),
+                how: How::NotMade,
+            };
+        }
+    }
+
+    /// The host could not say what became of the restore in flight.
+    fn restore_unknown(&mut self) {
+        match &self.restore {
+            Restore::Sent { anchor, seen } => {
+                let (anchor, seen) = (anchor.clone(), *seen);
+                match self.installed {
+                    // A screen of a newer revision arrived while the restore was in flight: that is
+                    // the restore's, and no further snapshot will come.
+                    Some(installed) if installed > seen => {
+                        self.restore = Restore::Answered {
+                            anchor,
+                            how: How::Landed(installed),
+                        };
+                        self.answered = self.answered.max(installed);
+                        self.settle(Some(installed));
+                    }
+                    _ => {
+                        self.restore = Restore::Unknown { anchor, seen };
+                        if let Some(in_flight) = self.in_flight.as_mut() {
+                            in_flight.unknown = true;
+                        }
+                    }
+                }
+            }
+            // The return that took its place has the host's last word on it: the report is over.
+            _ => self.in_flight = None,
         }
     }
 
@@ -466,17 +882,28 @@ impl WindowReports {
         self.size_owed = true;
         self.not_taken_in_a_row = self.not_taken_in_a_row.saturating_add(1);
         self.resting = !flight.page_spoke;
+        // A restore that has not been sent is not made on a size the host does not take: the
+        // window is not known to be where the restore would leave it.
+        if let Restore::Queued(anchor) = &self.restore {
+            self.restore = Restore::Answered {
+                anchor: anchor.clone(),
+                how: How::NotMade,
+            };
+        }
     }
 
     /// The report in flight settled: the moves it carried changed the window to `revision`, or
     /// changed nothing.
     fn settle(&mut self, revision: Option<u64>) {
-        if let Some(InFlight {
-            carries: Some(last),
-            ..
-        }) = self.in_flight
-        {
-            self.untold.push_back(Untold { last, revision });
+        if let Some(flight) = self.in_flight {
+            if let Some(last) = flight.carries {
+                self.untold.push_back(Untold { last, revision });
+            }
+            if flight.superseding
+                && let Restore::Superseded { live, .. } = &mut self.restore
+            {
+                *live = Live::Settled(revision);
+            }
         }
         self.in_flight = None;
     }

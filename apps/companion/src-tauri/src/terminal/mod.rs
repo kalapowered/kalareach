@@ -19,6 +19,7 @@
 //! | `input` | Control of the program, and the wheel turns, keys, text and pastes the view writes to it |
 //! | `keys` | The keys the page names, and the encoding the view spells them in |
 
+mod anchor;
 mod input;
 mod keys;
 pub mod screen;
@@ -38,6 +39,7 @@ use kr_protocol::session::Dimensions;
 
 use crate::launch::{LaunchSurfaceAnswer, Press};
 
+pub use anchor::{Anchor, Note};
 pub use input::{Input, Refused};
 pub use screen::TerminalViewState;
 pub use window::Move;
@@ -117,12 +119,14 @@ impl TerminalViews {
     }
 
     /// Opens a view of `session_id` for the page `page`, `dimensions` in size, whose states go to
-    /// `publish`, and returns its handle at once: everything after this arrives on `publish`.
+    /// `publish`, and returns its handle at once: everything after this arrives on `publish`. With
+    /// an `anchor` the view asks the host for that place before it shows anything.
     pub fn open(
         &self,
         page: &str,
         session_id: SessionId,
         dimensions: Dimensions,
+        anchor: Option<Anchor>,
         publish: Publish,
     ) -> String {
         self.start(
@@ -130,6 +134,7 @@ impl TerminalViews {
             Source::Local(Arc::clone(&self.locate)),
             session_id,
             dimensions,
+            anchor,
             publish,
             None,
         )
@@ -147,6 +152,7 @@ impl TerminalViews {
         paired: Paired,
         session_id: SessionId,
         dimensions: Dimensions,
+        anchor: Option<Anchor>,
         publish: Publish,
     ) -> String {
         self.start(
@@ -154,17 +160,20 @@ impl TerminalViews {
             Source::Paired(Box::new(paired.dial), paired.grant),
             session_id,
             dimensions,
+            anchor,
             publish,
             Some(paired.on_lost),
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // The open's own parts: the page, the reach, the size, the place.
     fn start(
         &self,
         page: &str,
         source: Source,
         session_id: SessionId,
         dimensions: Dimensions,
+        anchor: Option<Anchor>,
         publish: Publish,
         on_lost: Option<Box<dyn FnOnce() + Send>>,
     ) -> String {
@@ -186,7 +195,7 @@ impl TerminalViews {
                 Source::Local(locate) => view::Reach::Local(locate),
                 Source::Paired(dial, grant) => view::Reach::Paired(dial, *grant),
             };
-            let cause = view::run(reach, session_id, dimensions, receiver, &publish).await;
+            let cause = view::run(reach, session_id, dimensions, anchor, receiver, &publish).await;
             // Before the view is told over, so whoever waits for its end finds it done.
             if cause == view::Cause::Lost
                 && let Some(on_lost) = on_lost
