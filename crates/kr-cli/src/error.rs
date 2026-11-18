@@ -55,14 +55,15 @@ pub enum CliError {
         /// What a person does about it.
         action: kr_client::retry::UserAction,
     },
-    /// The host refused to show the receipt of the earlier action that a later request names, and
-    /// the command says what holds if the host holds no receipt for it.
+    /// The host refused, and the command follows the host's words with a sentence of its own.
     ///
-    /// A person is told the host's words and then that sentence. No action is chosen by the code
-    /// after them: the code says an argument cannot be used, the command did not read a cause, and
-    /// the standing action for the code ("update this app or the host") names a version mismatch
-    /// that the sentence contradicts in the commonest state. A `--json` failure carries the code and
-    /// the host's words alone, as it did before the sentence was added.
+    /// Two commands say one. The one that shows the receipt of an earlier action says what holds if
+    /// the host holds no receipt for it: the code says an argument cannot be used, the command did
+    /// not read a cause, and the standing action for the code ("update this app or the host") names
+    /// a version mismatch that the sentence contradicts in the commonest state. The one that
+    /// confirms a pairing says what the issuing owner does when the invitation ended. A person is
+    /// told the host's words and then that sentence, and no action is chosen by the code after
+    /// them. A `--json` failure carries the code and the host's words alone.
     ReadRefused {
         /// What the host said was wrong.
         error: kr_protocol::error::ProtocolError,

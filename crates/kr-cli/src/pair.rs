@@ -604,7 +604,7 @@ async fn confirmed(
         OWNER_DEVICE_POLL,
         async || match perform(&mut **client.lock().await, target.clone(), effect).await? {
             Ok(answer) => Ok(answer),
-            Err(refused) => Err(CliError::Refused(refused)),
+            Err(refused) => Err(confirmation_refused(refused)),
         },
         async || {
             crate::plugin::challenge_listed(
@@ -638,7 +638,23 @@ async fn completed_and_performed<C>(
     crate::plugin::performed_within(within, complete(client)).await?;
     crate::plugin::performed_within(within, perform(client))
         .await?
-        .map_err(CliError::Refused)
+        .map_err(confirmation_refused)
+}
+
+/// What the issuing owner is told when the host refuses a confirmation because the invitation
+/// ended: the host's own words, and then that a new invitation is issued. The owner has no device
+/// to pair again, and the table of the client's actions names none for these codes, so the next
+/// step is this command's to say. A refusal under any other code is said as it was.
+fn confirmation_refused(refused: ProtocolError) -> CliError {
+    match refused.code {
+        ErrorCode::PairingExpired
+        | ErrorCode::PairingRejected
+        | ErrorCode::PairingAttemptsExhausted => CliError::ReadRefused {
+            error: refused,
+            then: Shown::said("Issue a new invitation with `kr pair invite`."),
+        },
+        _ => CliError::Refused(refused),
+    }
 }
 
 /// What the host issued for a request to confirm.
@@ -2050,25 +2066,61 @@ mod tests {
     }
 
     /// KR-REQ-23.57: an owner whose confirmation the host refuses because the invitation expired,
-    /// or was cancelled, while the command waited is told the host's own words and nothing that
-    /// tells the owner to pair a device: the next step is a new invitation, and the words say what
-    /// ended.
+    /// was cancelled or used its attempts while the command waited is told the host's own words and
+    /// then what the owner can do: issue a new invitation. Nothing tells the owner to pair a device.
+    /// A refusal under any other code is said as it was, and `--json` carries the host's words alone.
     #[tokio::test(start_paused = true)]
-    async fn a_confirmation_refused_for_an_invitation_that_ended_while_it_waited_says_only_the_hosts_words()
+    async fn a_confirmation_refused_for_an_invitation_that_ended_says_the_hosts_words_then_how_to_issue_another()
      {
         let completed = || OwnerConfirmationCompleteResult {
             confirmation_id: kr_protocol::ids::ConfirmationId::new(Uuid::from_bytes([1; 16])),
             channel: ConfirmationChannel::LocalBootstrapTerminal,
             answered_at_ms: TimestampMs::new(1),
         };
+        let next_step = "Issue a new invitation with `kr pair invite`.";
         for ended in [
-            kr_pairing::PairingError::Expired,
-            kr_pairing::PairingError::Consumed {
-                reason: PairingConsumedReason::Cancelled,
-            },
+            ProtocolError::new(ErrorCode::PairingExpired, "the invitation expired"),
+            ProtocolError::new(
+                ErrorCode::PairingRejected,
+                "the invitation is no longer open (Cancelled)",
+            ),
+            ProtocolError::new(
+                ErrorCode::PairingAttemptsExhausted,
+                "the invitation used its failed-confirmation allowance",
+            ),
         ] {
-            let hosts_words = ended.to_string();
-            let refusal = ProtocolError::new(ended.code(), hosts_words.clone());
+            let hosts_words = ended.message.to_string();
+            let refused = completed_and_performed(
+                &mut (),
+                async |_| Ok(completed()),
+                async |_| Ok(Err(ended.clone())),
+            )
+            .await;
+            let Err(refused) = refused else {
+                panic!("the host's refusal ends the command: {ended:?}");
+            };
+            assert_eq!(refused.code(), ended.code, "{ended:?}");
+            assert_eq!(
+                refused.to_string(),
+                format!("{hosts_words}\n{next_step}"),
+                "{ended:?}"
+            );
+            assert_eq!(
+                refused.machine_message().to_string(),
+                CliError::Refused(ended.clone())
+                    .machine_message()
+                    .to_string(),
+                "{ended:?}: a script reads the host's words alone"
+            );
+        }
+        // A refusal under another code is not the invitation's end: it is said as it was, with no
+        // sentence of this command's after it, and the action of a code that has one stays.
+        for other in [
+            ErrorCode::PairingAuthFailed,
+            ErrorCode::PairingEndpointPaired,
+            ErrorCode::PermissionDenied,
+        ] {
+            let refusal = ProtocolError::new(other, "the host's words");
             let refused = completed_and_performed(
                 &mut (),
                 async |_| Ok(completed()),
@@ -2076,10 +2128,17 @@ mod tests {
             )
             .await;
             let Err(refused @ CliError::Refused(_)) = refused else {
-                panic!("the host's refusal ends the command: {refused:?}");
+                panic!("a refusal under {other:?} is said as it was: {refused:?}");
             };
-            assert_eq!(refused.code(), ended.code());
-            assert_eq!(refused.to_string(), hosts_words, "{ended:?}");
+            if other == ErrorCode::PermissionDenied {
+                assert!(
+                    refused.to_string().starts_with("the host's words\n"),
+                    "{other:?}: {refused}"
+                );
+            } else {
+                assert_eq!(refused.to_string(), "the host's words", "{other:?}");
+            }
+            assert!(!refused.to_string().contains(next_step), "{other:?}");
         }
     }
 
