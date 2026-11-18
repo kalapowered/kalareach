@@ -2298,7 +2298,11 @@ pub(crate) mod tests {
                 } else {
                     (*label).to_owned()
                 };
-                // A failed start that asked for a daemon says its kind and no process.
+                // A failed start that asked for a daemon says its kind and no process. The kind
+                // here is this table's own rule for the shape, not the product's choice of it
+                // (`StartFailed::facts`, which reads the environment's chosen start): the member
+                // case of `every_result_of_a_restart_says_what_it_started_or_asked_for` alone holds
+                // that function.
                 let asked = started.as_ref().map_or(Launched::Nothing, |started| {
                     Launched::Start(StartedFact {
                         pid: None,
