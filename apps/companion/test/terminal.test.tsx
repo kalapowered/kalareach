@@ -392,11 +392,17 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     // The connection returns in the turn that publishes the refusal, before the page has drawn it.
     const returning: HostPort = {
       ...port,
-      openTerminalView: (sessionId, grid, listener) =>
-        port.openTerminalView(sessionId, grid, (state) => {
-          listener(state)
-          if (state.state === 'ended') controls.setConnected(true)
-        })
+      openTerminalView: (sessionId, grid, listener, opening, anchor) =>
+        port.openTerminalView(
+          sessionId,
+          grid,
+          (state) => {
+            listener(state)
+            if (state.state === 'ended') controls.setConnected(true)
+          },
+          opening,
+          anchor
+        )
     }
     open(returning)
     await waitFor(() => {
@@ -412,8 +418,8 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
     let refused = false
     const failing: HostPort = {
       ...port,
-      openTerminalView: (sessionId, grid, listener) => {
-        if (refused) return port.openTerminalView(sessionId, grid, listener)
+      openTerminalView: (sessionId, grid, listener, opening, anchor) => {
+        if (refused) return port.openTerminalView(sessionId, grid, listener, opening, anchor)
         refused = true
         return Promise.reject(new Error('This session could not be reached'))
       }
@@ -525,7 +531,10 @@ describe('the raw view draws the screen native code holds for it (KR-REQ-08.02)'
         attachment: first.attachment,
         settled: 0,
         screen: terminalScreen(SESSION_MAIN, { columns: 80, rows: 24 }),
-        control: { number: 0, state: 'watching', ended: null }
+        control: { number: 0, state: 'watching', ended: null },
+        anchor: null,
+        live: null,
+        note: null
       })
     })
     await settle()
@@ -1548,8 +1557,8 @@ describe("the desktop's keys reach the program while the view controls it (KR-RE
       const answers: (() => void)[] = []
       const held: HostPort = {
         ...port,
-        openTerminalView: async (sessionId, grid, listener) => {
-          const view = await port.openTerminalView(sessionId, grid, listener)
+        openTerminalView: async (sessionId, grid, listener, opening, anchor) => {
+          const view = await port.openTerminalView(sessionId, grid, listener, opening, anchor)
           return {
             ...view,
             input: (input) => {

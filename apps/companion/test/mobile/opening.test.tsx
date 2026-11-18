@@ -937,9 +937,10 @@ describe('the terminal under an opening', () => {
 
   it('sends the program nothing once the screen may no longer control it, whatever the view shows', async () => {
     const { port, controls } = fakeHost()
+    // The session's own, as the store gives it: the same one at every render.
+    const kept = { read: () => null, keep: () => undefined }
     const view = renderHook(
-      ({ may }) =>
-        useTerminalView(port, SESSION_MAIN, () => ({ columns: 80, rows: 24 }), true, undefined, may),
+      ({ may }) => useTerminalView(port, SESSION_MAIN, () => ({ columns: 80, rows: 24 }), true, undefined, may, kept),
       { initialProps: { may: true } }
     )
     await waitFor(() => {

@@ -203,7 +203,7 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
 
   it('refuses an input a view was sent in the command layer\'s words, as a refusal that asks nothing more', async () => {
     const { port } = fakeHost()
-    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {}, undefined, null)
     const wheel = { kind: 'wheel', take: 1, column: 0, line: 0, turns: 0, shift: false, alt: false, control: false }
     const words =
       "those are not this operation's parameters: a wheel turns between 1 and 1024 times either way, not 0"
@@ -243,9 +243,15 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
   it('refuses a wheel turn or a key while the view does not control the program, and takes them while it does', async () => {
     const { port, controls } = fakeHost()
     const states: TerminalViewState[] = []
-    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, (state) => {
-      states.push(state)
-    })
+    const view: TerminalView = await port.openTerminalView(
+      SESSION_MAIN,
+      { columns: 80, rows: 8 },
+      (state) => {
+        states.push(state)
+      },
+      undefined,
+      null
+    )
     await new Promise((resolve) => {
       setTimeout(resolve, 0)
     })
@@ -279,7 +285,7 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
 
   it('refuses any input once the view has ended, as native code does, and records none of it', async () => {
     const { port, controls } = fakeHost()
-    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {}, undefined, null)
     await view.input({ kind: 'take', number: 1 })
     await new Promise((resolve) => {
       setTimeout(resolve, 0)
@@ -301,7 +307,7 @@ describe('the scripted host reads input as native code does (KR-REQ-10.01)', () 
   it("refuses a key, text or a paste before the view holds the session's screen, as native code does, and keeps control", async () => {
     const { port, controls } = fakeHost()
     controls.holdTerminalViews()
-    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {}, undefined, null)
     const held = controls.terminalViews[0]
     held?.attach()
     await view.input({ kind: 'take', number: 1 })
@@ -367,38 +373,38 @@ describe("the scripted host reads a view's opening, size and moves as native cod
       '8a7b6c50x22bb-4c3d-8e4f-000000000101',
       'zzzzzzzz-22bb-4c3d-8e4f-000000000101'
     ]) {
-      await expect(port.openTerminalView(sessionId, { columns: 80, rows: 8 }, () => {}), sessionId).rejects.toMatchObject({
+      await expect(port.openTerminalView(sessionId, { columns: 80, rows: 8 }, () => {}, undefined, null), sessionId).rejects.toMatchObject({
         code: 'INVALID_ARGUMENT',
         message: 'that is not a session identifier'
       })
     }
     for (const [grid, words] of outOfBounds) {
-      await expect(port.openTerminalView(SESSION_MAIN, grid, () => {}), JSON.stringify(grid)).rejects.toMatchObject({
+      await expect(port.openTerminalView(SESSION_MAIN, grid, () => {}, undefined, null), JSON.stringify(grid)).rejects.toMatchObject({
         code: 'INVALID_ARGUMENT',
         message: `that is not a terminal's size: ${words}`
       })
     }
     for (const [grid, key] of unreadable) {
-      await expect(port.openTerminalView(SESSION_MAIN, grid as never, () => {}), JSON.stringify(grid)).rejects.toMatch(
+      await expect(port.openTerminalView(SESSION_MAIN, grid as never, () => {}, undefined, null), JSON.stringify(grid)).rejects.toMatch(
         undecodable('terminal_view_open', key)
       )
     }
     // Every argument is decoded before the session identifier is parsed.
-    await expect(port.openTerminalView('session-1', { columns: 80.5, rows: 24 }, () => {})).rejects.toMatch(
+    await expect(port.openTerminalView('session-1', { columns: 80.5, rows: 24 }, () => {}, undefined, null)).rejects.toMatch(
       undecodable('terminal_view_open', 'columns')
     )
     // No size at all: the port cannot read one, as the desktop's cannot, and says so as a refusal.
-    await expect(port.openTerminalView(SESSION_MAIN, null as never, () => {})).rejects.toThrow(TypeError)
+    await expect(port.openTerminalView(SESSION_MAIN, null as never, () => {}, undefined, null)).rejects.toThrow(TypeError)
     expect(controls.terminalViews).toHaveLength(0)
     // The largest a terminal may be, 262,144 cells, opens, and so does an identifier in capitals.
-    await port.openTerminalView(SESSION_MAIN, { columns: 2048, rows: 128 }, () => {})
-    await port.openTerminalView(SESSION_MAIN.toUpperCase(), { columns: 80, rows: 8 }, () => {})
+    await port.openTerminalView(SESSION_MAIN, { columns: 2048, rows: 128 }, () => {}, undefined, null)
+    await port.openTerminalView(SESSION_MAIN.toUpperCase(), { columns: 80, rows: 8 }, () => {}, undefined, null)
     expect(controls.terminalViews).toHaveLength(2)
   })
 
   it('refuses a size or a move native code would not take, and takes neither', async () => {
     const { port, controls } = fakeHost()
-    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {}, undefined, null)
     for (const [grid, words] of outOfBounds) {
       await expect(view.resize(grid), JSON.stringify(grid)).rejects.toMatchObject({
         code: 'INVALID_ARGUMENT',
@@ -447,9 +453,9 @@ describe("the scripted host reads a view's opening, size and moves as native cod
 
   it('words each refusal as the command layer or native code words it', async () => {
     const { port } = fakeHost()
-    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {})
+    const view: TerminalView = await port.openTerminalView(SESSION_MAIN, { columns: 80, rows: 8 }, () => {}, undefined, null)
     const said = async (call: Promise<unknown>): Promise<unknown> => call.then(() => 'taken', (refusal: unknown) => refusal)
-    expect(await said(port.openTerminalView(1 as never, { columns: 80, rows: 8 }, () => {}))).toBe(
+    expect(await said(port.openTerminalView(1 as never, { columns: 80, rows: 8 }, () => {}, undefined, null))).toBe(
       'invalid args `sessionId` for command `terminal_view_open`: invalid type: integer `1`, expected a string'
     )
     for (const [grid, words] of [

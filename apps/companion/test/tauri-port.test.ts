@@ -60,9 +60,15 @@ describe('the desktop port and a raw terminal view', () => {
   it('opens a view with the session, the grid and a channel of its own', async () => {
     shell.answers.set('terminal_view_open', '7')
     const heard: unknown[] = []
-    await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, (state) => {
-      heard.push(state)
-    })
+    await tauriPort().openTerminalView(
+      SESSION,
+      { columns: 80, rows: 24 },
+      (state) => {
+        heard.push(state)
+      },
+      undefined,
+      null
+    )
     expect(shell.invoked).toHaveLength(1)
     const [opened] = shell.invoked
     expect(opened?.command).toBe('terminal_view_open')
@@ -70,12 +76,14 @@ describe('the desktop port and a raw terminal view', () => {
       sessionId: string
       columns: number
       rows: number
+      anchor: unknown
       onState: { onmessage: (message: unknown) => void }
     }
-    expect({ sessionId: args.sessionId, columns: args.columns, rows: args.rows }).toEqual({
+    expect({ sessionId: args.sessionId, columns: args.columns, rows: args.rows, anchor: args.anchor }).toEqual({
       sessionId: SESSION,
       columns: 80,
-      rows: 24
+      rows: 24,
+      anchor: null
     })
     // What native code publishes on the view's channel reaches the view's listener, and only it.
     const ended = { state: 'ended', reason: 'This session has closed.' }
@@ -85,7 +93,7 @@ describe('the desktop port and a raw terminal view', () => {
 
   it('sends the size, the moves and the close to their own commands, with the handle the open answered', async () => {
     shell.answers.set('terminal_view_open', '7')
-    const view = await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined)
+    const view = await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined, undefined, null)
     await view.resize({ columns: 100, rows: 30 })
     await view.move({ number: 1, across: -2, down: 3 })
     await view.move({ number: 2, live: true })
@@ -103,7 +111,7 @@ describe('the desktop port and a raw terminal view', () => {
 
   it("sends the person's input to the view's own command, in the shape native code reads", async () => {
     shell.answers.set('terminal_view_open', '7')
-    const view = await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined)
+    const view = await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined, undefined, null)
     const wheel = { kind: 'wheel', take: 1, column: 3, line: 2, turns: -1, shift: false, alt: true, control: false } as const
     const escape = {
       kind: 'key',
@@ -583,7 +591,7 @@ describe('the desktop port and a session screen’s opening', () => {
 
   it('opens a terminal view under the screen’s opening', async () => {
     shell.answers.set('terminal_view_open', '7')
-    await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined, OPENING)
+    await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined, OPENING, null)
     const [opened] = shell.invoked
     expect((opened?.args as { opening?: string }).opening).toBe(OPENING)
   })

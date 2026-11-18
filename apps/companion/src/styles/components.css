@@ -595,6 +595,17 @@ textarea::placeholder {
   line-height: 1.5;
 }
 
+/* The terminal's note on a restored place is one badge whose words may wrap, so the whole fact stays
+   reachable at a large text size and in the phone's expanded status; empty, it has no box. */
+.terminal-place-note:empty {
+  display: none;
+}
+
+.terminal-place-note .badge {
+  white-space: normal;
+  max-inline-size: 100%;
+}
+
 .badge.success {
   color: var(--success);
   background: var(--success-soft);

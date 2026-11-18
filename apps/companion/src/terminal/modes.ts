@@ -25,7 +25,7 @@ import type {
   TerminalPresentationMode
 } from '@kalareach/protocol'
 
-import type { TerminalControl, TerminalScreen, TerminalWheel } from '../host/port'
+import type { TerminalControl, TerminalNote, TerminalScreen, TerminalWheel } from '../host/port'
 
 /** Who owns the pointer. */
 export type ViewMode = 'control' | 'view'
@@ -40,6 +40,24 @@ export function modeOf(control: TerminalControl | null): ViewMode {
 
 /** What a view says while it asks the session for control. */
 export const ASKING = 'Asking the session for control…'
+
+/**
+ * What a view says of a place it restored when it is not the place the person left: the fact first,
+ * and none says where the window is, which the position words say.
+ */
+export function noteWords(note: TerminalNote): string {
+  switch (note) {
+    case 'gone':
+      return 'Your place is no longer in the history.'
+    case 'different':
+      return 'This may not be where you were.'
+    case 'unavailable':
+      return 'Your place could not be restored.'
+  }
+}
+
+/** What the desktop says while it holds no screen to move, in place of how to move around. */
+export const MOVES_LATER = "You can move the window once the session's screen is here."
 
 /**
  * Why a wheel turn in control mode does not reach the program, in words that end with the way to

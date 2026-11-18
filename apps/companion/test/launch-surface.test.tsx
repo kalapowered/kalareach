@@ -276,8 +276,8 @@ describe('the buttons that start something', () => {
     const { port, controls } = fakeHost()
     const uncertain: HostPort = {
       ...port,
-      openTerminalView: async (sessionId, grid, listener, opening) => {
-        const view = await port.openTerminalView(sessionId, grid, listener, opening)
+      openTerminalView: async (sessionId, grid, listener, opening, anchor) => {
+        const view = await port.openTerminalView(sessionId, grid, listener, opening, anchor)
         return {
           ...view,
           launch: () =>

@@ -96,10 +96,12 @@ import type {
   StandingEvent,
   SyncServiceView,
   TerminalControl,
+  TerminalAnchor,
   TerminalGrid,
   TerminalInput,
   TerminalLine,
   TerminalMove,
+  TerminalNote,
   TerminalRoom,
   TerminalScreen,
   TerminalView,
@@ -943,6 +945,8 @@ export interface FakeTerminalView {
   readonly closed: boolean
   /** The summary it attached with. */
   readonly attachment: AttachmentSummary
+  /** The place it was opened to restore, or null when it was opened with none. */
+  readonly anchor: TerminalAnchor | null
   /** Every move the page made, in the order it made them. */
   readonly moves: readonly TerminalMove[]
   /** Every input the page sent that the view took, in the order it sent them. */
@@ -969,7 +973,7 @@ export interface FakeTerminalView {
    * of its fields replaced by those `screen` gives, as settling the page's moves up to `settled`
    * (the newest move the view has applied, unless the test says otherwise).
    */
-  show(screen?: Partial<TerminalScreen>, settled?: number): void
+  show(screen?: Partial<TerminalScreen>, settled?: number, note?: TerminalNote): void
   /** Publishes that it waits for a screen, as after the host's reset. */
   wait(settled?: number): void
   /** Publishes that it ended, for `reason`. */
@@ -2358,7 +2362,7 @@ export function fakeHost(
 
     // The command the page's port sends, read as native code reads it: its arguments decoded in
     // order, then the session identifier parsed and the size checked, or nothing opens.
-    openTerminalView: (sessionId, grid, listener, opening) => {
+    openTerminalView: (sessionId, grid, listener, opening, anchor) => {
       const args = { sessionId, ...viewSizeArguments(grid) }
       const undecoded = undecodable('terminal_view_open', args, [
         ['sessionId', aString],
@@ -2403,7 +2407,8 @@ export function fakeHost(
                 })
               )
             })
-        }
+        },
+        anchor
       )
       terminalViews.push(view)
       if (!connected) {
@@ -4319,7 +4324,8 @@ function fakeTerminalView(
   } = {
     read: () => Promise.resolve({ state: 'not_served' }),
     press: () => refused('LEASE_LOST', 'This view does not control the program.')
-  }
+  },
+  anchor: TerminalAnchor | null = null
 ): HeldTerminalView {
   terminalViewCount += 1
   const grids: TerminalGrid[] = [grid]
@@ -4394,6 +4400,7 @@ function fakeTerminalView(
       return closed
     },
     attachment,
+    anchor,
     get moves() {
       return moves
     },
@@ -4425,13 +4432,16 @@ function fakeTerminalView(
     attach() {
       publish({ state: 'waiting', attachment, settled: applied, control: controlNow() })
     },
-    show(screen, settled) {
+    show(screen, settled, note) {
       publish({
         state: 'showing',
         attachment,
         screen: { ...screenAt(), ...screen },
         settled: settled ?? applied,
-        control: controlNow()
+        control: controlNow(),
+        anchor: null,
+        live: null,
+        note: note ?? null
       })
     },
     wait(settled) {
@@ -4488,7 +4498,10 @@ function fakeTerminalView(
               attachment,
               screen: screenAt(),
               settled: applied,
-              control: controlNow()
+              control: controlNow(),
+              anchor: null,
+              live: null,
+              note: null
             })
           }, 0)
         }
