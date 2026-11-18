@@ -2183,8 +2183,9 @@ async fn a_failed_read_of_the_list_at_the_redemption_locks_nothing_and_the_repea
 
 /// KR-REQ-10.08: the refusal that says the host lists a device is for that device alone. Another
 /// device, one the host does not list, that presents the direct invitation after it ended for the
-/// listed one is given the general rejection at the challenge and at a proof, like every other
-/// ending, and is not told that the host lists it. The listed device still reads its own code.
+/// listed one is given the general rejection at the challenge and at a proof, in the words that every
+/// other ending of this code is given, and is not told that the host lists it. The listed device
+/// still reads its own code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn another_device_presenting_the_invitation_that_ended_for_a_listed_device_gets_the_general_rejection()
  {
@@ -2284,7 +2285,81 @@ async fn another_device_presenting_the_invitation_that_ended_for_a_listed_device
         refusal_code(&again.expect_err("refused again")),
         "PAIRING_ENDPOINT_PAIRED"
     );
+
+    // An invitation that the owner denied is given to the same peer under the same code and in the
+    // same words, so the message of the one cannot be told from the message of the other.
+    let candidate = Device::create().await;
+    let denied = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("a second invitation");
+    within(
+        "the redemption of the second invitation",
+        BOUND,
+        calls::try_redeem(&candidate.candidate(), &denied),
+    )
+    .await
+    .outcome
+    .as_ref()
+    .expect("the host locks the candidate");
+    within(
+        "the denial",
+        BOUND,
+        calls::cancel(host.environment_id, &mut client, denied.invitation_id, true),
+    )
+    .await
+    .expect("the owner denies the candidate");
+    let of_a_denial = challenge_refusal_of(&other, &denied).await;
+    assert_eq!(
+        refusal_code(&of_a_denial),
+        "PAIRING_REJECTED",
+        "a denied invitation is a rejection"
+    );
+    let kr_transport::TransportError::Refused(of_a_denial) = &of_a_denial else {
+        panic!("the host answered with a refusal, not {of_a_denial:?}");
+    };
+    assert_eq!(
+        of_a_denial.message, told.message,
+        "the words of a denied invitation are the words of one that ended for a listed device"
+    );
     host.stop().await;
+}
+
+/// What a device that the host does not list is told when it presents the challenge of `invited`.
+async fn challenge_refusal_of(
+    device: &Device,
+    invited: &PairInviteResult,
+) -> kr_transport::TransportError {
+    let (_connection, surface) = within("an unpaired connection", BOUND, async {
+        let candidate = device.candidate();
+        let connection = calls::dial_until_connected(
+            candidate.endpoint,
+            calls::host_addr(&calls::direct_payload(invited)),
+        )
+        .await;
+        let surface =
+            kr_transport::handshake::connect_unpaired(&connection, candidate.identity).await;
+        (connection, surface)
+    })
+    .await;
+    let mut surface = surface.expect("an unpaired connection");
+    let challenged: Result<kr_protocol::preauth::PairRedeemResult, _> = within(
+        "the challenge",
+        BOUND,
+        surface.call(
+            Method::PairRedeem,
+            &kr_protocol::preauth::PairRedeemParams::Challenge {
+                invitation_id: invited.invitation_id,
+            },
+        ),
+    )
+    .await;
+    challenged.expect_err("the ended invitation is refused")
 }
 
 /// The owner's view of the invitation that the host refused a listed device on, with the member that
