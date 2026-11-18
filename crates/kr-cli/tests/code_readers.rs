@@ -14,7 +14,10 @@
 //!   function that no row names, or in a number of places that differs from the row's;
 //! - a struct or enum that derives `Deserialize` and has the code, `ProtocolError`, or any such
 //!   type that already holds one, as a direct member, is in no row;
-//! - a row names a call or a type that is gone, or a case that does not exist in the file it names.
+//! - a row names a call or a type that is gone, or a case that does not exist in the file it names
+//!   (a function declared in the code, with comments and literals blanked);
+//! - a store of the stored-formats table keeps a type that holds a code, and no stored row names
+//!   that type for that store: a second store that keeps a type with a row passes no further.
 //!
 //! What it reads: `crates/*/src` and every `src` folder under `apps`, minus tests, benches,
 //! examples, modules declared `#[cfg(test)]`, and items under `#[cfg(test)]`, with comments and
@@ -26,9 +29,21 @@
 //! fewer); a call made by a macro; a type alias; a use that renames `ErrorCode`; Rust outside the
 //! folders above. A row that says a place keeps nothing is the author's claim, which the scan does
 //! not prove.
+//!
+//! The decode-site limit: a call that decodes a text or bytes into a type that already holds a
+//! code (`serde_json::from_str::<ProtocolError>(`, a canonical CBOR decode of a listed type) is
+//! no parse site and adds no holder, so the scan does not see a new reader of a listed type or a
+//! new store that keeps one. The table check above holds the second, by the table's own lines; a
+//! new decode of a listed type is held by review and by the case of the row that names the type.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+use stored_formats::{Kept, Known, KnownIs, Store};
+
+/// The table of stored formats, which names what each store keeps.
+#[allow(dead_code, unused_imports)]
+mod stored_formats;
 
 /// The folder the scan reads, and the roster inside it. A planted run points this at a copy.
 const ROOT_VARIABLE: &str = "KR_CODE_READERS_ROOT";
@@ -612,17 +627,22 @@ fn case_exists(root: &Path, sources: &[Source], case: &str) -> Result<(), String
         return Err(format!("case `{case}` is not written crate::target::name"));
     };
     let holds = |text: &str| {
-        let bytes = text.as_bytes();
-        find_word(bytes, name, 0).is_some_and(|_| {
-            let mut from = 0;
-            while let Some(at) = find_word(bytes, name, from) {
-                if text[..at].trim_end().ends_with("fn") {
-                    return true;
-                }
-                from = at + 1;
+        if !text.contains(name) {
+            return false;
+        }
+        // Declarations are read where comments and literals are blanked, so that a function
+        // named in a comment or a string is not a case.
+        let code = blank_literals(text);
+        let mut from = 0;
+        while let Some(at) = find_word(&code, name, from) {
+            let before = code[..at].trim_ascii_end();
+            if before.ends_with(b"fn") && (before.len() == 2 || !is_word(before[before.len() - 3]))
+            {
+                return true;
             }
-            false
-        })
+            from = at + 1;
+        }
+        false
     };
     if *target == "lib" {
         let prefix = format!("crates/{package}/src/");
@@ -658,8 +678,72 @@ fn case_exists(root: &Path, sources: &[Source], case: &str) -> Result<(), String
     }
 }
 
-/// Everything that is wrong between the tree and the roster, as lines a person can act on.
-fn failures(root: &Path, roster: &str) -> Vec<String> {
+/// Whether `text` names `word` as a whole word: a store's name has `-` and `_` inside it.
+fn names_word(text: &str, word: &str) -> bool {
+    let part = |character: Option<char>| {
+        character.is_some_and(|character| {
+            character.is_alphanumeric() || character == '-' || character == '_'
+        })
+    };
+    text.match_indices(word).any(|(at, _)| {
+        !part(text[..at].chars().next_back()) && !part(text[at + word.len()..].chars().next())
+    })
+}
+
+/// Every type that a store of the table keeps and that holds a code, as the store, the file and
+/// the type's name. A source item is a file and a name; a protocol type is told by its crate and
+/// its name, as `std::any::type_name` spells them.
+fn kept_holders(
+    stores: &[Store],
+    known: &[Known],
+    held: &BTreeSet<(String, String)>,
+) -> BTreeSet<(String, String, String)> {
+    let mut found = BTreeSet::new();
+    let by_path = |found: &mut BTreeSet<(String, String, String)>, store: &str, path: &str| {
+        let Some((krate, _)) = path.split_once("::") else {
+            return;
+        };
+        let name = path.rsplit("::").next().unwrap_or(path);
+        let prefix = format!("crates/{}/src/", krate.replace('_', "-"));
+        for (file, held_name) in held {
+            if held_name == name && file.starts_with(&prefix) {
+                found.insert((store.to_owned(), file.clone(), name.to_owned()));
+            }
+        }
+    };
+    let by_source =
+        |found: &mut BTreeSet<(String, String, String)>, store: &str, file: &str, name: &str| {
+            if held.contains(&(file.to_owned(), name.to_owned())) {
+                found.insert((store.to_owned(), file.to_owned(), name.to_owned()));
+            }
+        };
+    for store in stores {
+        let name = &store.entry.store;
+        for kept in &store.kept {
+            match kept {
+                Kept::Source(file, items) => {
+                    for item in *items {
+                        by_source(&mut found, name, file, item);
+                    }
+                }
+                Kept::Protocol(_, _, path) => by_path(&mut found, name, path),
+                Kept::Words(..) => {}
+            }
+        }
+    }
+    for line in known {
+        match &line.is {
+            KnownIs::Source(file) => by_source(&mut found, line.store, file, line.name),
+            KnownIs::Protocol(_, path) => by_path(&mut found, line.store, path),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Everything that is wrong between the tree and the roster, as lines a person can act on. `stores`
+/// and `known` are the stored-formats table.
+fn failures(root: &Path, roster: &str, stores: &[Store], known: &[Known]) -> Vec<String> {
     let (rows, mut failures) = parse_roster(roster);
     let sources = product_sources(root);
 
@@ -716,6 +800,20 @@ fn failures(root: &Path, roster: &str) -> Vec<String> {
             ));
         }
     }
+    for (store, file, name) in kept_holders(stores, known, &held) {
+        let named = rows.iter().any(|row| {
+            row.kind == "type"
+                && row.class == "stored"
+                && row.file == file
+                && row.names.contains(&name)
+                && names_word(&row.text, &store)
+        });
+        if !named {
+            failures.push(format!(
+                "{file}: the store {store} keeps type {name}, which holds an error code and derives Deserialize, and no stored row names it for that store"
+            ));
+        }
+    }
     for row in rows.iter().filter(|row| row.class == "stored") {
         if let Err(missing) = case_exists(root, &sources, &row.case) {
             failures.push(format!("row `{}`: {missing}", row.text));
@@ -728,7 +826,12 @@ fn failures(root: &Path, roster: &str) -> Vec<String> {
 fn every_reader_of_a_kept_error_code_is_in_the_roster_with_a_case_that_exists() {
     let root = root();
     let roster = std::fs::read_to_string(root.join(ROSTER_PATH)).expect("the roster reads");
-    let wrong = failures(&root, &roster);
+    let wrong = failures(
+        &root,
+        &roster,
+        &stored_formats::table::table(),
+        &stored_formats::table::known(),
+    );
     assert!(
         wrong.is_empty(),
         "the roster and the product source disagree:\n{}",
@@ -771,11 +874,11 @@ site | stored | the demo store | crates/kr-demo/src/store.rs | read | 1 | from_w
 type | stored | the demo store | crates/kr-demo/src/store.rs | Kept | - | a member | unknown outcome | kr-demo::kept::the_case
 ";
 
-    fn tree(store: &str) -> tempfile::TempDir {
+    fn tree_with(store: &str, cases: &str) -> tempfile::TempDir {
         let root = tempfile::tempdir().expect("a folder");
         for (path, text) in [
             ("crates/kr-demo/src/store.rs", store),
-            ("crates/kr-demo/tests/kept.rs", CASES),
+            ("crates/kr-demo/tests/kept.rs", cases),
         ] {
             let path = root.path().join(path);
             std::fs::create_dir_all(path.parent().expect("a folder")).expect("makes the folder");
@@ -784,8 +887,35 @@ type | stored | the demo store | crates/kr-demo/src/store.rs | Kept | - | a memb
         root
     }
 
+    fn tree(store: &str) -> tempfile::TempDir {
+        tree_with(store, CASES)
+    }
+
     fn wrong(store: &str, roster: &str) -> String {
-        failures(tree(store).path(), roster).join("\n")
+        failures(tree(store).path(), roster, &[], &[]).join("\n")
+    }
+
+    /// A store of the table that keeps the types of the demo file.
+    fn keeping(store: &str, names: &'static [&'static str]) -> Store {
+        Store {
+            writers: stored_formats::Writers::Daemon,
+            entry: kr_protocol::update::ReleaseStore {
+                store: store.to_owned(),
+                scope: kr_protocol::update::StoreScope::Environment,
+                path: "demo.sqlite".to_owned(),
+                recording: kr_protocol::update::Recording::SqliteUserVersion,
+                version: 1,
+                migrates_from: 0,
+                reads_through: None,
+            },
+            owned: Vec::new(),
+            kept: vec![Kept::Source("crates/kr-demo/src/store.rs", names)],
+            levels: None,
+        }
+    }
+
+    fn wrong_for(roster: &str, stores: &[Store]) -> String {
+        failures(tree(STORE).path(), roster, stores, &[]).join("\n")
     }
 
     #[test]
@@ -894,6 +1024,81 @@ type | stored | the demo store | crates/kr-demo/src/store.rs | Kept | - | a memb
         assert!(
             said.contains("is in no source of crates/kr-demo/src"),
             "{said}"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_case_is_only_named_in_a_comment_or_a_literal_is_refused() {
+        let cases = "#[test]\nfn the_case() {}\n// fn in_a_comment() {}\n/* fn in_a_block() {} */\nconst TEXT: &str = \"fn in_a_string() {}\";\n";
+        for name in ["in_a_comment", "in_a_block", "in_a_string"] {
+            let roster = ROSTER.replace("kept::the_case", &format!("kept::{name}"));
+            let said = failures(tree_with(STORE, cases).path(), &roster, &[], &[]).join("\n");
+            assert!(
+                said.contains(&format!("has no function {name}")),
+                "a function named in {name} is a case: {said}"
+            );
+        }
+        // The same in the source of the crate itself.
+        let more = format!("{STORE}\n// fn only_in_a_comment() {{}}\n");
+        let said = wrong(
+            &more,
+            &ROSTER.replace("kr-demo::kept::the_case", "kr-demo::lib::only_in_a_comment"),
+        );
+        assert!(
+            said.contains("is in no source of crates/kr-demo/src"),
+            "{said}"
+        );
+        // A function that is declared stays a case.
+        let said = failures(tree_with(STORE, cases).path(), ROSTER, &[], &[]).join("\n");
+        assert_eq!(said, "", "a declared case is found beside the comments");
+    }
+
+    #[test]
+    fn a_store_that_keeps_a_type_that_holds_a_code_needs_a_stored_row_that_names_it() {
+        // The row names the store, so the store that the table lists passes.
+        assert_eq!(
+            wrong_for(ROSTER, &[keeping("demo", &["Kept"])]),
+            "",
+            "a store that a stored row names is refused"
+        );
+        // A second store that keeps the same type has no row of its own.
+        let said = wrong_for(
+            ROSTER,
+            &[
+                keeping("demo", &["Kept"]),
+                keeping("other-store", &["Kept"]),
+            ],
+        );
+        assert!(
+            said.contains("the store other-store keeps type Kept"),
+            "a second store that keeps a listed type passes: {said}"
+        );
+        assert!(
+            !said.contains("the store demo keeps"),
+            "the store the row names is refused: {said}"
+        );
+        // A row of another class names no store's type.
+        let wire: Vec<&str> = ROSTER
+            .lines()
+            .map(|line| {
+                if line.starts_with("type |") {
+                    "type | wire | the demo store | crates/kr-demo/src/store.rs | Kept | - | a member | unknown outcome | -"
+                } else {
+                    line
+                }
+            })
+            .collect();
+        let wire = wire.join("\n");
+        let said = wrong_for(&wire, &[keeping("demo", &["Kept"])]);
+        assert!(
+            said.contains("the store demo keeps type Kept"),
+            "a wire row stands for a type a store keeps: {said}"
+        );
+        // A type that holds no code is no holder, so a store that keeps it needs no row.
+        assert_eq!(
+            wrong_for(ROSTER, &[keeping("demo", &["Kept", "Plain"])]),
+            "",
+            "a type that holds no code needs a row"
         );
     }
 }
