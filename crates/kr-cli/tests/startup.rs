@@ -7106,3 +7106,91 @@ fn a_daemon_that_closed_the_connection_and_goes_is_waited_for_to_its_end_whichev
     assert!(attempts(&host).is_empty(), "no record stands");
     daemon.end();
 }
+
+/// The login item and the service start are two offers that share nothing but the daemon program
+/// and the environment's roots: clearing the service start leaves the login item's file and its
+/// record, and removing the login item leaves the service definition and its record, each byte for
+/// byte. The daemon the manager started keeps answering while the login item is written. It needs
+/// a real user manager, so a host with none fails it (`KR_REQUIRE_SERVICE_MANAGER=1`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_login_item_and_the_service_start_are_independent_offers_on_a_real_user_manager() {
+    let host = ServiceHost::create().expect(
+        "this case needs a user service manager: run it with KR_REQUIRE_SERVICE_MANAGER=1",
+    );
+    let run = |arguments: &[&str]| {
+        let what = format!("kr {}", arguments.join(" "));
+        let output = start(host.kr(arguments)).finish(&what);
+        assert!(
+            output.status.success(),
+            "{what} succeeds: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    host.select_service();
+    let started = start(host.new_session()).finish("kr new");
+    assert!(started.status.success(), "the manager starts the daemon");
+    assert!(host.answers(), "the daemon answers");
+    let said = run(&["host", "login-item", "install"]);
+    assert!(said.contains("login item: installed: "), "{said}");
+    assert!(host.answers(), "the daemon keeps answering across the install");
+    let directory = host.home.join(".config/autostart");
+    let item = std::fs::read_dir(&directory)
+        .expect("the autostart directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("kr-desktop-host-"))
+        })
+        .expect("the login item's file");
+    let login_record = host
+        .tree
+        .environment()
+        .state_dir()
+        .join("desktop-host-login.json");
+    let (item_bytes, record_bytes) = (
+        std::fs::read(&item).expect("the file"),
+        std::fs::read(&login_record).expect("the record"),
+    );
+    run(&["host", "startup", "--clear"]);
+    assert_eq!(std::fs::read(&item).expect("kept"), item_bytes, "--clear leaves the entry");
+    assert_eq!(std::fs::read(&login_record).expect("kept"), record_bytes, "and its record");
+    host.select_service();
+    let (unit, record) = (
+        std::fs::read(host.definition()).expect("the unit"),
+        std::fs::read(host.record()).expect("the service record"),
+    );
+    let removed = run(&["host", "login-item", "remove"]);
+    assert!(removed.contains("removed "), "{removed}");
+    assert_eq!(std::fs::read(host.definition()).expect("kept"), unit, "the unit is as it was");
+    assert_eq!(std::fs::read(host.record()).expect("kept"), record, "so is its record");
+    assert!(!item.exists(), "the login item is gone");
+}
+
+/// Installing, showing and removing the login item neither start nor end a daemon: the one daemon
+/// a command of this tree started keeps its process number and keeps the lock.
+#[cfg(target_os = "linux")]
+#[test]
+fn installing_and_removing_the_login_item_neither_start_nor_end_a_daemon() {
+    let (host, _session, _created, daemon) = a_host_with_a_session();
+    for argument in ["install", "status", "remove"] {
+        let what = format!("kr host login-item {argument}");
+        let output = start(host.kr(&["host", "login-item", argument])).finish(&what);
+        assert!(
+            output.status.success(),
+            "{what} succeeds: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("login item: "),
+            "{what} says the login item's state"
+        );
+        assert_eq!(host.one_daemon(), daemon, "{what} left the daemon's process number");
+        assert!(lock_is_held(&host), "{what} left the daemon holding the lock");
+    }
+}
