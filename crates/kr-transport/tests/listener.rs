@@ -589,6 +589,23 @@ impl HostHandler for ListedHost {
     }
 }
 
+/// The exchange deadline of the listed-endpoint case. The listener holds the admission to it as
+/// well as the exchange, so it is long enough for a loaded runner to admit the peer.
+const LISTED_EXCHANGE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long the listed-endpoint case waits for work that correct code does at speed.
+const CASE_BOUND: Duration = Duration::from_secs(60);
+
+/// How long it waits for the host to close an idle exchange: the deadline and the time to notice.
+const CLOSE_BOUND: Duration = Duration::from_secs(30);
+
+/// Waits for `future` for at most `bound`, and fails with `what` when it is not done.
+async fn within<T>(what: &str, bound: Duration, future: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(bound, future)
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not finish within {bound:?}"))
+}
+
 /// KR-REQ-23.19: a listed endpoint that offers another device identifier reaches the pairing surface
 /// by the second route, and the listener holds it there to the same deadline as any unpaired peer:
 /// a peer that completes hello and then sends nothing has its connection closed by the host, as
@@ -601,7 +618,7 @@ async fn an_idle_exchange_of_a_listed_endpoint_on_the_second_route_ends_at_the_d
     });
     let config = ListenerConfig {
         accepted_kinds: vec![StreamKind::TerminalOutput],
-        handshake_deadline: Duration::from_secs(2),
+        handshake_deadline: LISTED_EXCHANGE_DEADLINE,
         ..ListenerConfig::new(
             EndpointConfig {
                 bind_addr: Some("127.0.0.1:0".parse().expect("a loopback address")),
@@ -611,41 +628,61 @@ async fn an_idle_exchange_of_a_listed_endpoint_on_the_second_route_ends_at_the_d
             ControllerGeneration::new(1),
         )
     };
-    let listener = register(
-        config,
-        Arc::clone(&host.identity),
-        &host.keys.transport,
-        handler,
+    let listener = within(
+        "the listener registering",
+        CASE_BOUND,
+        register(
+            config,
+            Arc::clone(&host.identity),
+            &host.keys.transport,
+            handler,
+        ),
     )
     .await
     .expect("a listener");
-    let connection = client
-        .endpoint
-        .connect(listener_addr(&listener), ALPN)
+    let connection = within(
+        "the connection to the listener",
+        CASE_BOUND,
+        client.endpoint.connect(listener_addr(&listener), ALPN),
+    )
+    .await
+    .expect("a connection");
+    let (send, recv) = within("the stream opening", CASE_BOUND, connection.open_bi())
         .await
-        .expect("a connection");
-    let (send, recv) = connection.open_bi().await.expect("a stream");
+        .expect("a stream");
     let mut writer = FrameWriter::new(send, StreamKind::Control);
     let mut reader = FrameReader::new(recv, StreamKind::Control);
     let another = ClientOffer {
         device_id: DeviceId::new(Uuid::from_bytes([0xCA; 16])),
         ..offer(&client)
     };
-    writer.write_message(&another).await.expect("sent");
-    let hello = tokio::time::timeout(Duration::from_secs(20), reader.read_message())
-        .await
-        .expect("the host answered hello within 20 seconds")
-        .expect("a reply")
-        .expect("the stream did not end");
+    within(
+        "the offer being written",
+        CASE_BOUND,
+        writer.write_message(&another),
+    )
+    .await
+    .expect("sent");
+    let hello = within(
+        "the host's answer to hello",
+        CASE_BOUND,
+        reader.read_message(),
+    )
+    .await
+    .expect("a reply")
+    .expect("the stream did not end");
     assert!(
         matches!(hello, HelloReply::Selected(_)),
         "the listed endpoint reaches the pairing surface and negotiates hello: {hello:?}"
     );
 
     // Nothing more is sent: the host's own deadline ends the exchange.
-    let closed = tokio::time::timeout(Duration::from_secs(20), connection.closed())
-        .await
-        .expect("the host ended the idle exchange within 20 seconds");
+    let closed = within(
+        "the host ending the idle exchange",
+        CLOSE_BOUND,
+        connection.closed(),
+    )
+    .await;
     assert!(
         matches!(
             closed,
@@ -654,7 +691,7 @@ async fn an_idle_exchange_of_a_listed_endpoint_on_the_second_route_ends_at_the_d
         ),
         "the host closed the connection as unpaired: {closed:?}"
     );
-    listener.shutdown().await;
+    within("the listener's shutdown", CASE_BOUND, listener.shutdown()).await;
 }
 
 /// KR-REQ-23.20: the host issues and renews the connection's action window itself.

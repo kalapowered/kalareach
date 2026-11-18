@@ -238,9 +238,13 @@ async fn a_device_that_forgot_a_host_that_still_lists_it_is_told_so() {
     );
     assert_eq!(kind, FailureKind::HostStillListsDevice, "{refused:?}");
 
-    let status = calls::owner_status(&mut client, invited.invitation_id)
-        .await
-        .expect("the owner's view");
+    let status = tokio::time::timeout(
+        WATCHDOG,
+        calls::owner_status(&mut client, invited.invitation_id),
+    )
+    .await
+    .expect("the host answered the owner's status request")
+    .expect("the owner's view");
     assert_eq!(
         status.status,
         PairStatus::Consumed {

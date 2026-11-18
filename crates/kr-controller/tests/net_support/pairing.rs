@@ -216,6 +216,29 @@ pub struct Candidate<'a> {
     pub declared: CandidateIdentity,
 }
 
+/// How long the owner's local calls wait for the daemon's answer. The local client has no
+/// time-out of its own, so a case that the daemon never answers would stand.
+const CALL_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Waits for the daemon's answer to `method` for at most [`CALL_BOUND`], by a thread that does not
+/// use the runtime's timers, and fails with a message that names the method when it is late.
+async fn bounded<T>(method: Method, future: impl std::future::Future<Output = T>) -> T {
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let (expired, expiry) = tokio::sync::oneshot::channel::<()>();
+    let watcher = tokio::task::spawn_blocking(move || {
+        if finished.recv_timeout(CALL_BOUND) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+            let _ = expired.send(());
+        }
+    });
+    let output = tokio::select! {
+        output = future => output,
+        Ok(()) = expiry => panic!("the daemon did not answer {method:?} within {CALL_BOUND:?}"),
+    };
+    drop(done);
+    watcher.await.expect("the watching thread ends");
+    output
+}
+
 /// Sends one read on the owner's own socket.
 pub async fn read<P, T>(
     client: &mut LocalClient,
@@ -226,8 +249,7 @@ where
     P: serde::Serialize + ?Sized,
     T: kr_protocol::wire::WireMessage,
 {
-    let answer = client
-        .request(method, params)
+    let answer = bounded(method, client.request(method, params))
         .await
         .expect("the daemon answers")?;
     Ok(answer.to_typed().expect("the answer decodes"))
@@ -266,15 +288,17 @@ where
     P: serde::Serialize + ?Sized,
     T: kr_protocol::wire::WireMessage,
 {
-    let answer = client
-        .mutate(
+    let answer = bounded(
+        method,
+        client.mutate(
             method,
             action,
             ActionTarget::environment(environment),
             params,
-        )
-        .await
-        .expect("the daemon answers")?;
+        ),
+    )
+    .await
+    .expect("the daemon answers")?;
     Ok(answer.to_typed().expect("the answer decodes"))
 }
 
