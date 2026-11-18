@@ -149,7 +149,8 @@ async fn host_on(clocks: Clocks) -> Host {
     let temp = teardown::Tree::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let controller = start_daemon(&environment, environment_id, clocks)
+    let started = StartedEnvironment::within(temp.root());
+    let controller = start_daemon(&environment, environment_id, clocks, &started)
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     let endpoint = environment.controller_endpoint().expect("an endpoint");
@@ -415,11 +416,18 @@ async fn working_host_on_clocks(
     let supervisor = wrap(Box::new(Patient {
         inner: temp.supervisor(kr_controller::supervision::detect(&environment, &worker)),
     }));
-    let controller = start_daemon_with(&environment, environment_id, clocks, supervisor, worker)
-        .await
-        .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     // Its sessions run a login shell: they are given a home inside the tree, not the person's.
-    controller.set_host_environment(StartedEnvironment::within(temp.root()).host_variables());
+    let started = StartedEnvironment::within(temp.root());
+    let controller = start_daemon_with(
+        &environment,
+        environment_id,
+        clocks,
+        supervisor,
+        worker,
+        &started,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
@@ -490,10 +498,10 @@ async fn working_host_apart_started_by(
                     Clocks::system(),
                     supervisor,
                     worker,
+                    &started_environment,
                 )
                 .await
                 .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
-                controller.set_host_environment(started_environment.host_variables());
                 let endpoint = environment.controller_endpoint().expect("an endpoint");
                 let clients = tokio::spawn(
                     Arc::clone(&controller)
@@ -565,6 +573,7 @@ async fn start_daemon(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,
     clocks: Clocks,
+    started: &StartedEnvironment,
 ) -> kr_controller::error::Result<Arc<Controller>> {
     start_daemon_with(
         environment,
@@ -572,20 +581,25 @@ async fn start_daemon(
         clocks,
         Box::new(RefusingSupervisor),
         PathBuf::from("/nonexistent/kr-worker"),
+        started,
     )
     .await
 }
 
-/// Starts a daemon on an environment, on `clocks`, launching workers through `supervisor`.
+/// Starts a daemon on an environment, on `clocks`, launching workers through `supervisor`, and
+/// gives it the host environment of `started`, so that every session it starts has a home inside
+/// the case's own tree. The daemon reads its environment once, at the start, so the setter runs
+/// before any client endpoint exists.
 async fn start_daemon_with(
     environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,
     clocks: Clocks,
     supervisor: Box<dyn WorkerSupervisor>,
     worker_program: PathBuf,
+    started: &StartedEnvironment,
 ) -> kr_controller::error::Result<Arc<Controller>> {
     let supervisor = std::sync::Mutex::new(Some(supervisor));
-    kr_controller::testing::taken_over(|| {
+    let controller = kr_controller::testing::taken_over(|| {
         let secrets = environment.secrets_dir();
         kr_controller::testing::with_git_read_bound(
             kr_controller::testing::HUNG_GIT_READ,
@@ -618,7 +632,9 @@ async fn start_daemon_with(
             ),
         )
     })
-    .await
+    .await?;
+    controller.set_host_environment(started.host_variables());
+    Ok(controller)
 }
 
 async fn client(host: &Host) -> LocalClient {
@@ -2679,7 +2695,8 @@ async fn a_start_that_fails_at_its_configuration_gate_dispatches_nothing() {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     // A first start makes the registry and the journal; then the daemon stops.
-    let first = start_daemon(&environment, environment_id, Clocks::system())
+    let started = StartedEnvironment::within(temp.root());
+    let first = start_daemon(&environment, environment_id, Clocks::system(), &started)
         .await
         .unwrap_or_else(|error| panic!("the first start: {error}"));
     let dispatcher = Arc::downgrade(first.automation().service());
@@ -2712,7 +2729,7 @@ async fn a_start_that_fails_at_its_configuration_gate_dispatches_nothing() {
                 .expect("a runtime for the start");
             let outcome = runtime
                 .block_on(async {
-                    start_daemon(&environment, environment_id, Clocks::system())
+                    start_daemon(&environment, environment_id, Clocks::system(), &started)
                         .await
                         .map(drop)
                 })
@@ -5879,6 +5896,15 @@ fn command_node(host: &Host, node_id: &str, command: &str) -> WorkflowNode {
 /// A `create_session` node asking for an invisible session in this host's own environment, running
 /// the shell it names or, when it names none, the account's own.
 fn create_session_node(host: &Host, shell: Option<&str>) -> WorkflowNode {
+    create_session_node_with(host, shell, kr_protocol::session::LaunchProfile::default())
+}
+
+/// [`create_session_node`] asking for the launch profile `launch_profile`.
+fn create_session_node_with(
+    host: &Host,
+    shell: Option<&str>,
+    launch_profile: kr_protocol::session::LaunchProfile,
+) -> WorkflowNode {
     let params = kr_protocol::session::SessionCreateParams {
         environment_id: host.environment_id,
         presentation: kr_protocol::session::Presentation::Invisible,
@@ -5889,7 +5915,7 @@ fn create_session_node(host: &Host, shell: Option<&str>) -> WorkflowNode {
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         environment_snapshot: Vec::new(),
         palette: Nullable::null(),
-        launch_profile: kr_protocol::session::LaunchProfile::default(),
+        launch_profile,
         terminal: Nullable::null(),
     };
     WorkflowNode {
@@ -7857,11 +7883,13 @@ const STARTUP_RECORDERS: [&str; 8] = [
     ".config/fish/config.fish",
 ];
 
-/// A create-session node that names no shell gets the account's own shell, started as a login shell
-/// where the platform starts one, and that shell reads the startup files of the home the daemon gives
-/// the session. The case puts a recorder in every startup file of that home, inside its own tree,
-/// and asserts that the shell read one there and that its home is inside the tree: a shell given
-/// the person's home would read the person's files and these would stay unread.
+/// A create-session node that names no shell gets the account's own shell, and a node that asks for
+/// the login startup gets it started as a login shell on every platform, which reads the startup
+/// files of the home the daemon gives the session. The case puts a recorder in every startup file
+/// of that home, inside its own tree, and asserts that the shell read one there and that its home
+/// is inside the tree: a shell given the person's home would read the person's files and these
+/// would stay unread. It asks for the login startup because a host's default one may be the
+/// interactive startup of a plain `sh`, which reads none of these files.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_login_shell_of_a_workflows_session_reads_the_startup_files_of_the_cases_own_tree() {
@@ -7884,7 +7912,14 @@ async fn a_login_shell_of_a_workflows_session_reads_the_startup_files_of_the_cas
         workflow_id(190),
         grant_id(190),
         "a login shell",
-        create_session_node(&host, None),
+        create_session_node_with(
+            &host,
+            None,
+            kr_protocol::session::LaunchProfile {
+                startup: kr_protocol::session::ShellStartup::Login,
+                ..kr_protocol::session::LaunchProfile::default()
+            },
+        ),
     );
     install(&mut control, &host, &document).await;
     enable(&mut control, &host, &document).await;
