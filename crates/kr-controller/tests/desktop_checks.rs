@@ -63,60 +63,90 @@ async fn request_for(
         .expect("the request is built")
 }
 
-/// Asks for the checks at the daemon's own socket, as the setup assistant's command does.
+/// Runs one whole operation of a case under `PATIENCE`, so a daemon that stops answering at any
+/// step of it ends the case at that limit and not at the runner's.
+async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(PATIENCE, work).await.expect(what)
+}
+
+/// Asks for the checks at the daemon's own socket, as the setup assistant's command does: the
+/// connection, the request's building and its answer, all within `PATIENCE`.
 async fn ask(
     host: &Host,
     action: ActionId,
     file: Option<&std::path::Path>,
 ) -> Result<CapabilityChecks, kr_protocol::error::ProtocolError> {
-    let mut client = host.client().await;
-    let request = request_for(host, &mut client, action, file).await;
-    send(&mut client, &request).await
+    within(
+        "the daemon takes the request for the checks in time",
+        async {
+            let mut client = host.client().await;
+            let request = request_for(host, &mut client, action, file).await;
+            send(&mut client, &request).await
+        },
+    )
+    .await
 }
 
-/// Sends a request exactly as it was built, on any connection.
+/// Sends a request exactly as it was built, on any connection, and waits for its answer within
+/// `PATIENCE`.
 async fn send(
     client: &mut kr_ipc::client::LocalClient,
     request: &kr_protocol::envelope::MutationRequest,
 ) -> Result<CapabilityChecks, kr_protocol::error::ProtocolError> {
-    client
-        .repeat(request)
-        .await
-        .expect("the call reaches the daemon")
-        .map(|answer| typed(&answer))
-}
-
-/// What `environment.capabilities` shows at the owner's socket.
-async fn shown(host: &Host) -> EnvironmentCapabilitiesResult {
-    let mut client = host.client().await;
-    typed(
-        &client
-            .request(
-                Method::EnvironmentCapabilities,
-                &EnvironmentCapabilitiesParams {
-                    environment_id: host.environment_id,
-                },
-            )
-            .await
-            .expect("the call reaches the daemon")
-            .expect("environment.capabilities succeeds"),
+    within(
+        "the daemon answers the request for the checks in time",
+        async {
+            client
+                .repeat(request)
+                .await
+                .expect("the call reaches the daemon")
+                .map(|answer| typed(&answer))
+        },
     )
+    .await
 }
 
-/// Reads until the checks stand as `state`, or the patience runs out.
+/// What `environment.capabilities` shows at the owner's socket: the connection and the answer,
+/// within `PATIENCE`.
+async fn shown(host: &Host) -> EnvironmentCapabilitiesResult {
+    within("the daemon shows the capabilities in time", async {
+        let mut client = host.client().await;
+        typed(
+            &client
+                .request(
+                    Method::EnvironmentCapabilities,
+                    &EnvironmentCapabilitiesParams {
+                        environment_id: host.environment_id,
+                    },
+                )
+                .await
+                .expect("the call reaches the daemon")
+                .expect("environment.capabilities succeeds"),
+        )
+    })
+    .await
+}
+
+/// Reads until the checks stand as `state`, all of it within `PATIENCE`: the reads and the waits
+/// between them are one operation, and what the last read showed is told when it ends.
 async fn until(host: &Host, state: CapabilityChecksState) -> EnvironmentCapabilitiesResult {
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    loop {
-        let answer = shown(host).await;
-        if answer.checks.state == state {
-            return answer;
+    let mut last = None;
+    let reached = tokio::time::timeout(PATIENCE, async {
+        loop {
+            let answer = shown(host).await;
+            if answer.checks.state == state {
+                return answer;
+            }
+            last = Some(answer.checks);
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the checks did not come to {state:?}: {:?}",
-            answer.checks
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    })
+    .await;
+    match reached {
+        Ok(answer) => answer,
+        Err(elapsed) => panic!(
+            "the checks did not come to {state:?}; the last read showed {last:?}: {elapsed:?}"
+        ),
     }
 }
 
