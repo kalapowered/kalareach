@@ -9071,8 +9071,12 @@ async fn a_receipt_kept_under_a_code_this_build_lacks_stops_the_lookup_and_the_c
     .expect("the kept word is changed");
     assert_eq!(changed, 1);
     let before = rows(&catalogue);
+    let refused = before
+        .iter()
+        .find(|row| row.0 == "refused")
+        .expect("the refusal's row");
     assert!(
-        before[0]
+        refused
             .4
             .as_deref()
             .is_some_and(|error| error.contains(word)),

@@ -3143,6 +3143,18 @@ mod tests {
                 .map(|row| row.expect("a declaration row"))
                 .collect()
         };
+        // The mirror is the writer's own encoding: with the word the writer kept it encodes to the
+        // bytes the writer kept, so the plant changes the word and nothing else.
+        let mirrored = kr_cbor::to_canonical_vec(&Later::Refused {
+            code: ErrorCode::PermissionDenied.as_str().to_owned(),
+            message: "the declaration is not signed by the recorded key".to_owned(),
+        })
+        .expect("encodes");
+        let kept = table(&directory)
+            .into_iter()
+            .find(|row| row.0 == action(1).get().as_bytes().as_slice())
+            .expect("the refusal's row");
+        assert_eq!(kept.2, mirrored, "the mirror encodes as the writer kept it");
         let changed = directory
             .connection
             .lock()
