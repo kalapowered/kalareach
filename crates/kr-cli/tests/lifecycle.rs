@@ -42,6 +42,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
 use kr_ipc::paths::EnvironmentPaths;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
@@ -395,6 +396,7 @@ impl Host {
             make_fifo(&work.join(gate));
         }
         let daemon = Daemon::start(
+            temp.root().to_path_buf(),
             temp.environment(),
             temp.environment_id(),
             worker.to_path_buf(),
@@ -1336,7 +1338,12 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn start(paths: EnvironmentPaths, environment_id: EnvironmentId, worker: PathBuf) -> Self {
+    fn start(
+        tree: PathBuf,
+        paths: EnvironmentPaths,
+        environment_id: EnvironmentId,
+        worker: PathBuf,
+    ) -> Self {
         let (ready, started) = std::sync::mpsc::channel::<Result<(), String>>();
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::Builder::new()
@@ -1353,7 +1360,7 @@ impl Daemon {
                         return;
                     }
                 };
-                runtime.block_on(serve(paths, environment_id, worker, ready, stopped));
+                runtime.block_on(serve(tree, paths, environment_id, worker, ready, stopped));
                 // Whatever the daemon still had running is given a bounded moment, so a task that
                 // will not stop cannot keep this test from ending.
                 runtime.shutdown_timeout(DAEMON_SHUTDOWN);
@@ -1388,6 +1395,7 @@ impl Drop for Daemon {
 /// so a worker is a process of its own rather than a job left in the person's own service manager,
 /// and the file store inside the host's tree for its keys.
 async fn serve(
+    tree: PathBuf,
     paths: EnvironmentPaths,
     environment_id: EnvironmentId,
     worker: PathBuf,
@@ -1429,6 +1437,8 @@ async fn serve(
             return;
         }
     };
+    // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+    controller.set_host_environment(StartedEnvironment::within(&tree).host_variables());
     let listeners = paths
         .rendezvous_endpoint()
         .and_then(|endpoint| Listener::bind(&endpoint))

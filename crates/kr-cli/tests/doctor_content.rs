@@ -21,6 +21,7 @@ use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{DetachedSupervisor, NoTerminal};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::endpoint::Listener;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::ids::BuildId;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -189,6 +190,8 @@ impl Host {
         })
         .await
         .expect("the daemon starts");
+        // Its sessions run a login shell: they are given a home inside the tree, not the person's.
+        controller.set_host_environment(StartedEnvironment::within(temp.root()).host_variables());
         let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
             .expect("binds the rendezvous endpoint");
         let clients = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))
