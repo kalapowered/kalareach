@@ -374,7 +374,10 @@ impl Host {
             environment_snapshot: vec![EnvironmentVariable {
                 name: MARKER_NAME.to_owned(),
                 value: value.to_owned(),
-            }],
+            }]
+            .into_iter()
+            .chain(StartedEnvironment::within(self.tree.root()).snapshot_home())
+            .collect(),
             palette: Nullable::null(),
             launch_profile: kr_protocol::session::LaunchProfile::default(),
             terminal: Nullable::null(),
@@ -1505,7 +1508,10 @@ impl Waiting {
             environment_snapshot: vec![EnvironmentVariable {
                 name: MARKER_NAME.to_owned(),
                 value: value.clone(),
-            }],
+            }]
+            .into_iter()
+            .chain(StartedEnvironment::within(temp.root()).snapshot_home())
+            .collect(),
             palette: Nullable::null(),
             launch_profile: kr_protocol::session::LaunchProfile::default(),
             terminal: Nullable::null(),

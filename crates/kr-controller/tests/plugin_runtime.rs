@@ -1058,7 +1058,8 @@ impl World {
                     cwd: Nullable::some(self.tree.root().display().to_string()),
                     dimensions: Nullable::null(),
                     worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-                    environment_snapshot: Vec::new(),
+                    environment_snapshot: StartedEnvironment::within(self.tree.root())
+                        .snapshot_home(),
                     palette: Nullable::null(),
                     launch_profile: kr_protocol::session::LaunchProfile::default(),
                     terminal: Nullable::null(),

@@ -320,7 +320,10 @@ fn create_params(host: &Host) -> SessionCreateParams {
         environment_snapshot: vec![kr_protocol::session::EnvironmentVariable {
             name: "PATH".to_owned(),
             value: "/usr/bin:/bin".to_owned(),
-        }],
+        }]
+        .into_iter()
+        .chain(StartedEnvironment::within(host.temp.root()).snapshot_home())
+        .collect(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
         terminal: Nullable::null(),
     }

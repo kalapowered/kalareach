@@ -401,14 +401,15 @@ fn loopback() -> EndpointConfig {
     }
 }
 
-/// A shell that stays open, so its output is observable and it does not exit.
-fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreateParams {
+/// A shell that stays open, so its output is observable and it does not exit. It works in `root`,
+/// the host's tree, and has the home folder that tree holds.
+fn create_params(environment_id: EnvironmentId, root: &Path) -> SessionCreateParams {
     SessionCreateParams {
         environment_id,
         presentation: Presentation::Attach,
         shell: Nullable::some(kr_worker::testing::posix_shell()),
         shell_mode: ShellMode::NativeCompat,
-        cwd: Nullable::some(cwd.display().to_string()),
+        cwd: Nullable::some(root.display().to_string()),
         dimensions: Nullable::null(),
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         palette: Nullable::null(),
@@ -421,7 +422,10 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
                 name: "PS1".to_owned(),
                 value: String::new(),
             },
-        ],
+        ]
+        .into_iter()
+        .chain(StartedEnvironment::within(root).snapshot_home())
+        .collect(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
         terminal: Nullable::null(),
     }

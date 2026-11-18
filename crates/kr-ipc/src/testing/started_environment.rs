@@ -22,6 +22,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use kr_protocol::session::EnvironmentVariable;
+
 /// The search path a started program has: the system's folders and no other.
 pub const SYSTEM_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
@@ -111,6 +113,32 @@ impl StartedEnvironment {
         #[cfg(not(unix))]
         let _ = kept;
         command
+    }
+
+    /// The variables a test's own create request carries so that the session's shell has this
+    /// home.
+    ///
+    /// A visible create from a client takes the creator's snapshot of the environment and nothing
+    /// of the daemon's, and the worker adds no home to it: a login shell that is given none reads
+    /// the startup files of the account's own home, which the account database names, and neither
+    /// the test program's home nor a recorder in this one sees the read. Every maker of create
+    /// parameters in a test puts this into its snapshot.
+    ///
+    /// On Windows it is empty: a session's shell there reads the PowerShell profile, which no
+    /// variable of this kind gives a home to.
+    #[must_use]
+    pub fn snapshot_home(&self) -> Vec<EnvironmentVariable> {
+        #[cfg(unix)]
+        {
+            vec![EnvironmentVariable {
+                name: "HOME".to_owned(),
+                value: self.home.display().to_string(),
+            }]
+        }
+        #[cfg(not(unix))]
+        {
+            Vec::new()
+        }
     }
 
     /// The environment a daemon that runs inside the test's own process starts its sessions with

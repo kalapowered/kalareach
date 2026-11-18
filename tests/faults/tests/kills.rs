@@ -43,6 +43,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::{ProcessState, process_start_identity, process_state};
 use kr_ipc::paths::EnvironmentPaths;
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
@@ -548,7 +549,10 @@ impl Host {
                     environment_snapshot: vec![kr_protocol::session::EnvironmentVariable {
                         name: "PATH".to_owned(),
                         value: "/usr/bin:/bin".to_owned(),
-                    }],
+                    }]
+                    .into_iter()
+                    .chain(StartedEnvironment::within(self.tree.root()).snapshot_home())
+                    .collect(),
                     launch_profile: kr_protocol::session::LaunchProfile::default(),
                     terminal: Nullable::null(),
                 },

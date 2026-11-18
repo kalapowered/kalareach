@@ -204,7 +204,10 @@ impl Host {
             environment_snapshot: vec![EnvironmentVariable {
                 name: "PATH".to_owned(),
                 value: "/usr/bin:/bin".to_owned(),
-            }],
+            }]
+            .into_iter()
+            .chain(StartedEnvironment::within(self.temp.root()).snapshot_home())
+            .collect(),
             launch_profile: LaunchProfile::default(),
             terminal: Nullable::null(),
         };
@@ -565,7 +568,7 @@ async fn a_launch_that_named_no_process_has_its_job_removed_once_it_ends() {
         dimensions: Nullable::null(),
         worker_profile: WorkerProfile::HeadlessUser,
         palette: Nullable::null(),
-        environment_snapshot: Vec::new(),
+        environment_snapshot: StartedEnvironment::within(host.temp.root()).snapshot_home(),
         launch_profile: LaunchProfile::default(),
         terminal: Nullable::null(),
     };

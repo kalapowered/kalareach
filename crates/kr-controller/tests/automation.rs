@@ -87,6 +87,11 @@ impl Host {
         self.work.path()
     }
 
+    /// The host tree, which holds the home folder its daemon's sessions have.
+    fn tree(&self) -> &Path {
+        self._temp.root()
+    }
+
     /// Writes one live grant into this daemon's own grant store.
     ///
     /// A definition names a grant and the host reads it from here, so a test that installs one
@@ -8525,7 +8530,7 @@ async fn session_in(
                     cwd: Nullable::some(directory.display().to_string()),
                     dimensions: Nullable::null(),
                     worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-                    environment_snapshot: Vec::new(),
+                    environment_snapshot: StartedEnvironment::within(host.tree()).snapshot_home(),
                     palette: Nullable::null(),
                     launch_profile: kr_protocol::session::LaunchProfile::default(),
                     terminal: Nullable::null(),
@@ -8741,7 +8746,7 @@ async fn a_hold_turns_away_a_session_and_an_installation_over_the_wire() {
                 cwd: Nullable::some(host.work().join("source").display().to_string()),
                 dimensions: Nullable::null(),
                 worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-                environment_snapshot: Vec::new(),
+                environment_snapshot: StartedEnvironment::within(host.tree()).snapshot_home(),
                 palette: Nullable::null(),
                 launch_profile: kr_protocol::session::LaunchProfile::default(),
                 terminal: Nullable::null(),
