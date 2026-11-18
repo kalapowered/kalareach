@@ -134,24 +134,30 @@ pub(super) async fn connect(
 /// the launch alone, which answers the daemon's process and stops nothing, on the same connection.
 /// The process is none where the daemon refuses the request; an exchange that is cut, withheld or
 /// not answered is not whole.
+///
+/// What it decoded is returned apart from what it wrote to `record`: what `host.info` gave, and
+/// what the request for the launch alone came to, none where `host.info` gave no generation and
+/// the request was not made.
 pub(super) async fn exchange(
     connection: &mut LocalClient,
     id: EnvironmentId,
     progress: &Progress,
     record: &Shared,
-) {
+) -> (Gave, Option<Asked>) {
     let gave = host_stop::gave_by_the_read(connection.request(Method::HostInfo, &()).await);
     record.observe(Observation::Sight(Sight::Gave(gave)));
     if !matches!(gave, Gave::Reported(_)) {
-        return;
+        return (gave, None);
     }
-    let launch = match host_stop::ask(connection, id, false, progress, true).await {
+    let asked = host_stop::ask(connection, id, false, progress, true).await;
+    let launch = match &asked {
         Asked::Taken(result) => Launch::Stated(Some(result.pid.get())),
         // A daemon that refuses the request states no process.
         Asked::Refused(_) => Launch::Stated(None),
         Asked::Unknown(_) | Asked::NotComposed { .. } => Launch::NotWhole,
     };
     record.observe(Observation::Launch(launch));
+    (gave, Some(asked))
 }
 
 /// One read of the daemon at the environment's endpoint, as a whole bounded by `within`: the
