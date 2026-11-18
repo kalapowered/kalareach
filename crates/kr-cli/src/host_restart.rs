@@ -798,7 +798,8 @@ async fn wait_for_the_successor(
     }
     Err(StartFailed {
         error: None,
-        launched: false,
+        made: false,
+        may_still_start: false,
     })
 }
 
@@ -1163,9 +1164,11 @@ pub(crate) struct StartFailed {
     /// What the start said in its own words, where the start itself failed: none where the daemon
     /// that answered is what the record shows.
     pub(crate) error: Option<CliError>,
-    /// Whether a daemon was started, or the service manager or the task was asked to start one: the
-    /// requested daemon may still come up.
-    pub(crate) launched: bool,
+    /// Whether a start was made: a daemon was started, or the service manager or the task was
+    /// asked to start one, whether or not that daemon may still come up.
+    pub(crate) made: bool,
+    /// Whether the daemon that the start asked for may still come up.
+    pub(crate) may_still_start: bool,
 }
 
 impl StartFailed {
@@ -1198,7 +1201,7 @@ impl StartFailed {
             progress.remove_marker();
         }
         let own = self.error.as_ref().map(Said::said);
-        let message = failed_said(id, Some(came), &read, self.launched, own.as_ref());
+        let message = failed_said(id, Some(came), &read, self.may_still_start, own.as_ref());
         let facts = self.facts(environment, facts);
         let error = match self.error {
             Some(CliError::HostUnavailable(_)) => CliError::HostUnavailable(message),
@@ -1216,7 +1219,7 @@ impl StartFailed {
     /// asked for nothing says so.
     fn facts(&self, environment: &KnownEnvironment, facts: &Facts) -> Facts {
         Facts {
-            launched: Some(if self.launched {
+            launched: Some(if self.made {
                 Launched::Start(startup::chosen_start_fact(environment))
             } else {
                 Launched::Nothing
@@ -1509,7 +1512,8 @@ pub(crate) mod tests {
         );
         let nothing = StartFailed {
             error: None,
-            launched: false,
+            made: false,
+            may_still_start: false,
         };
         assert_eq!(
             nothing
@@ -1540,19 +1544,25 @@ pub(crate) mod tests {
                 kr_ipc::paths::write_owner_only_file(&document, text.as_bytes())
                     .expect("the choice is written");
             }
-            let failed = StartFailed {
-                error: None,
-                launched: true,
-            };
-            let said = failed
-                .facts(&environment, &facts)
-                .launched
-                .map(Launched::parts);
-            assert_eq!(
-                said,
-                Some(Some((expected, None))),
-                "a failed start that asked for a daemon, the environment choosing {chosen:?}"
-            );
+            // The start's kind does not depend on whether its daemon may still come up: a child
+            // that started and ended made a start as well.
+            for may_still_start in [true, false] {
+                let failed = StartFailed {
+                    error: None,
+                    made: true,
+                    may_still_start,
+                };
+                let said = failed
+                    .facts(&environment, &facts)
+                    .launched
+                    .map(Launched::parts);
+                assert_eq!(
+                    said,
+                    Some(Some((expected, None))),
+                    "a failed start that asked for a daemon (it may still come up: \
+                     {may_still_start}), the environment choosing {chosen:?}"
+                );
+            }
         }
         let progress = Progress::new(environment.environment_id);
         for (beyond, expected) in [
@@ -1613,7 +1623,8 @@ pub(crate) mod tests {
             error: Some(CliError::HostUnavailable(Shown::said(
                 "the start's own words",
             ))),
-            launched: true,
+            made: true,
+            may_still_start: true,
         }
         .reported(
             temp.paths(),
@@ -1750,7 +1761,8 @@ pub(crate) mod tests {
             let _ = progress.with_marker(|marker| marker.told());
             let _ = StartFailed {
                 error: None,
-                launched: false,
+                made: false,
+                may_still_start: false,
             }
             .reported(
                 temp.paths(),
@@ -1781,7 +1793,8 @@ pub(crate) mod tests {
         ) -> String {
             let completion = StartFailed {
                 error: None,
-                launched: false,
+                made: false,
+                may_still_start: false,
             }
             .reported(
                 temp.paths(),
