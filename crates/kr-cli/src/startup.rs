@@ -968,10 +968,11 @@ fn unanswered(message: Shown) -> CliError {
 }
 
 /// The start that this environment chooses, as `--json` names it, for a start that was asked for
-/// and did not give a daemon: the kind is the chosen one, and no process is read.
+/// and did not give a daemon: the kind is the chosen one, and no process is read. On Windows the
+/// one start made is the scheduled task, whichever start the environment chooses.
 pub(crate) fn chosen_start_fact(environment: &KnownEnvironment) -> crate::host_stop::StartedFact {
     let start = match Chosen::read(&environment.paths).controller {
-        Some(ControllerStartup::Service) if cfg!(windows) => "task",
+        _ if cfg!(windows) => "task",
         Some(ControllerStartup::Service) if cfg!(target_os = "macos") => "launchd",
         Some(ControllerStartup::Service) => "systemd",
         Some(ControllerStartup::Standalone) | None => "standalone",
