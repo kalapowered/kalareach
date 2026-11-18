@@ -33,6 +33,18 @@ pub enum RetrievalPolicy {
 }
 
 impl RetrievalPolicy {
+    /// The policy that reaches the service at `origin`: `managed_origin` is where the managed
+    /// account service is, as the host this runs for treats it, so its origin is reached through
+    /// the managed account and any other through the account the owner has at a service they run.
+    #[must_use]
+    pub fn for_origin(origin: &str, managed_origin: &str) -> Self {
+        if origin == managed_origin {
+            Self::Account
+        } else {
+            Self::SelfHosted
+        }
+    }
+
     /// Returns the stable name a report uses.
     #[must_use]
     pub const fn as_str(self) -> &'static str {

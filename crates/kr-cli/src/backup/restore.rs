@@ -835,9 +835,9 @@ async fn explain<P: Privacy>(
     began: &PrivacyReport,
 ) -> CliError {
     match error {
-        RestoreError::NotSignedIn { cause, .. } => CliError::refused_in_its_own_words(
+        RestoreError::NotSignedIn { cause, policy, .. } => CliError::refused_in_its_own_words(
             ErrorCode::PermissionDenied,
-            shown!("{}. {}", cause.why(), cause.remedy()),
+            shown!("{}. {}", cause.why(), cause.remedy(policy)),
         ),
         RestoreError::OlderThanTheCheckpoint { checkpoint, held } => CliError::Usage(shown!(
             "the service holds generation {} of this archive, which is older than generation {} \
@@ -864,8 +864,10 @@ async fn explain<P: Privacy>(
         )),
         RestoreError::OriginNotConfigured => CliError::Usage(Shown::said(
             "the recovery kit names no storage service this host is configured for. This host \
-             reads backups from the managed account service its storage.origin names, and a \
-             backup kept only at a self-hosted service cannot be restored here",
+             reads backups only from the service its storage.origin names. If the kit names a \
+             service you run, write that service's origin into storage.origin, which the daemon \
+             reads when it starts; write it only for a service you run, because this host then \
+             signs in there. Otherwise check storage.origin",
         )),
         RestoreError::BundleAbsent => CliError::Other(Shown::said(
             "the storage service holds no recovery bundle for this account at that locator. The \

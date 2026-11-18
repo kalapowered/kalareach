@@ -54,17 +54,20 @@ pub fn real_pause() -> Pause {
 pub struct DaemonSource {
     daemon: tokio::sync::Mutex<Daemon>,
     pause: Pause,
+    managed_origin: String,
 }
 
 kr_client::debug_as_name!(DaemonSource);
 
 impl DaemonSource {
     /// A source that reads through `daemon` and spends the waits it is told to with `pause`.
+    /// `managed_origin` is where the managed account service is, as that daemon treats it.
     #[must_use]
-    pub fn new(daemon: Daemon, pause: Pause) -> Self {
+    pub fn new(daemon: Daemon, pause: Pause, managed_origin: &str) -> Self {
         Self {
             daemon: tokio::sync::Mutex::new(daemon),
             pause,
+            managed_origin: managed_origin.to_owned(),
         }
     }
 
@@ -142,6 +145,7 @@ impl RestoreSource for DaemonSource {
             match self.ask(BackupReadParams::Service {}).await? {
                 BackupReadResult::Service { origin, sign_in } => Ok(SourceService {
                     origin,
+                    managed_origin: self.managed_origin.clone(),
                     sign_in: match sign_in {
                         BackupSignIn::Usable => SourceSignIn::Usable,
                         BackupSignIn::SignedOut => SourceSignIn::Unusable(SignInCause::SignedOut),
