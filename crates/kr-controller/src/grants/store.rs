@@ -5266,6 +5266,7 @@ mod a_devices_revocation {
     /// One grant of a case's forest. `number` names it and puts it in the order the store lists a
     /// device's grants (the identifier's leading bytes, which the listing sorts by); the grants
     /// are issued in the order of the forest's list, so a parent comes before its children.
+    #[derive(Clone, Copy)]
     struct Node {
         number: u32,
         parent: Option<u32>,
@@ -5459,6 +5460,101 @@ mod a_devices_revocation {
                 .expect("the subtree is revoked beforehand");
         }
         store
+    }
+
+    /// A store whose rows are written as they stand, in the order listed and in one transaction,
+    /// past what `issue` takes: a parent no row holds, a grant that is its own parent, a cycle.
+    /// The row's key is the node's number; when a payload number is given, the grant stored in the
+    /// row is the one of that number, so that the key and the grant name two things.
+    fn store_written_by_hand(rows: &[(Node, Option<u32>)]) -> GrantDirectory {
+        let store = GrantDirectory::in_memory().expect("a grant store");
+        store
+            .in_transaction(|connection| {
+                for (node, payload) in rows {
+                    let stored = record_of(&Node {
+                        number: payload.unwrap_or(node.number),
+                        ..*node
+                    });
+                    let encoded = kr_cbor::to_canonical_vec(&stored.grant)
+                        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                    write_grant(connection, &record_of(node), &encoded)?;
+                }
+                Ok(())
+            })
+            .expect("the rows are written");
+        store
+    }
+
+    /// How a case builds a store afresh, so that two stores built alike can be compared.
+    type Build = Box<dyn Fn() -> GrantDirectory>;
+
+    /// The stores an edit by hand can leave, each with whether the device's revocation is refused.
+    /// Every grant of them is the device's.
+    fn stores_edited_by_hand() -> Vec<(String, Build, bool)> {
+        let held = |number: u32, parent: Option<u32>| Node {
+            number,
+            parent,
+            holder: DEVICE,
+        };
+        let stores: Vec<(&str, Build, bool)> = vec![
+            (
+                "a held row whose key is not the identifier of its grant",
+                Box::new(move || {
+                    store_written_by_hand(&[
+                        (held(1, None), None),
+                        (held(2, Some(1)), None),
+                        (held(3, None), Some(4)),
+                    ])
+                }),
+                true,
+            ),
+            (
+                "two held rows whose grants have one identifier",
+                Box::new(move || {
+                    store_written_by_hand(&[
+                        (held(3, None), Some(4)),
+                        (held(4, None), None),
+                        (held(5, Some(4)), None),
+                    ])
+                }),
+                false,
+            ),
+            (
+                "a row that is its own parent and a cycle of two rows, each with a child",
+                Box::new(move || {
+                    store_written_by_hand(&[
+                        (held(1, None), None),
+                        (held(2, Some(1)), None),
+                        (held(3, Some(3)), None),
+                        (held(4, Some(3)), None),
+                        (held(5, Some(6)), None),
+                        (held(7, Some(5)), None),
+                        (held(6, Some(5)), None),
+                        (held(8, Some(6)), None),
+                    ])
+                }),
+                false,
+            ),
+        ];
+        stores
+            .into_iter()
+            .map(|(name, build, refused)| (name.to_owned(), build, refused))
+            .collect()
+    }
+
+    /// Every store the comparison cases run: the shapes at `size` grants, then the stores an edit
+    /// by hand leaves, each with whether the device's revocation is refused.
+    fn every_store(size: u32) -> Vec<(String, Build, bool)> {
+        let mut stores: Vec<(String, Build, bool)> = shapes(size)
+            .into_iter()
+            .map(|shape| {
+                let name = shape.name.to_owned();
+                let build: Build = Box::new(move || store_of(&shape));
+                (name, build, false)
+            })
+            .collect();
+        stores.extend(stores_edited_by_hand());
+        stores
     }
 
     /// A device's revocation decodes each grant row of the store a bounded number of times, however
@@ -5656,8 +5752,8 @@ mod a_devices_revocation {
     #[test]
     fn withdraws_what_a_walk_from_each_of_its_grants_in_turn_withdrew_whatever_the_order_and_the_shape()
      {
-        for shape in shapes(64) {
-            let store = store_of(&shape);
+        for (name, build, _) in every_store(64) {
+            let store = build();
             let held = store
                 .in_transaction(|connection| read_for_device(connection, device_of(DEVICE)))
                 .expect("the device's grants read");
@@ -5665,18 +5761,22 @@ mod a_devices_revocation {
                 let (now, before) = store
                     .in_transaction(|connection| {
                         Ok((
-                            GrantDirectory::subtrees_to_revoke(connection, &held)?,
-                            subtrees_read_one_root_at_a_time(connection, &held)?
-                                .into_iter()
-                                .filter(|(_, subtree)| !subtree.is_empty())
-                                .collect::<Vec<_>>(),
+                            GrantDirectory::subtrees_to_revoke(connection, &held)
+                                .map_err(|error| error.to_string()),
+                            subtrees_read_one_root_at_a_time(connection, &held)
+                                .map(|entries| {
+                                    entries
+                                        .into_iter()
+                                        .filter(|(_, subtree)| !subtree.is_empty())
+                                        .collect::<Vec<_>>()
+                                })
+                                .map_err(|error| error.to_string()),
                         ))
                     })
                     .expect("both readings read");
                 assert!(
                     now == before,
-                    "{}, {order}: what is read to be withdrawn",
-                    shape.name
+                    "{name}, {order}: what is read to be withdrawn"
                 );
             }
         }
@@ -5686,32 +5786,34 @@ mod a_devices_revocation {
     /// as it left them, when the grants are read once for all of the device's roots.
     #[test]
     fn returns_and_leaves_what_a_walk_from_each_of_its_grants_in_turn_returned_and_left() {
-        for shape in shapes(64) {
-            let (before, now) = (store_of(&shape), store_of(&shape));
+        // A debt has an identifier of its own each time: whether one was written is what is compared.
+        let told = |result: Result<GrantRevocation>| {
+            result
+                .map(|revocation| {
+                    (
+                        revocation.debt.is_some(),
+                        GrantRevocation {
+                            debt: None,
+                            ..revocation
+                        },
+                    )
+                })
+                .map_err(|error| error.to_string())
+        };
+        for (name, build, refused) in every_store(64) {
+            let (before, now) = (build(), build());
             let device = device_of(DEVICE);
-            let one = revoke_device_one_root_at_a_time(&before, device, 5_000)
-                .expect("revoked one root at a time");
-            let other = now
-                .revoke_device(device, 5_000, || Ok(()), None)
-                .expect("revoked");
+            let one = revoke_device_one_root_at_a_time(&before, device, 5_000);
+            let other = now.revoke_device(device, 5_000, || Ok(()), None);
             assert_eq!(
-                one.debt.is_some(),
-                other.debt.is_some(),
-                "{}: whether it wrote a debt",
-                shape.name
+                other.is_err(),
+                refused,
+                "{name}: whether the revocation is refused"
             );
-            let (one, other) = (
-                GrantRevocation { debt: None, ..one },
-                GrantRevocation {
-                    debt: None,
-                    ..other
-                },
-            );
-            assert!(one == other, "{}: what it returned", shape.name);
+            assert!(told(one) == told(other), "{name}: what it returned");
             assert!(
                 rows_of(&before) == rows_of(&now),
-                "{}: the rows it left",
-                shape.name
+                "{name}: the rows it left"
             );
         }
     }
