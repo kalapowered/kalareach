@@ -5871,3 +5871,212 @@ mod a_devices_revocation {
         }
     }
 }
+
+/// A store with a grants row under a key that is not the identifier of the grant it carries. Only
+/// an edit by hand or a damaged file leaves one: every writer files a grant under its own
+/// identifier. Such a row is a damaged row: it is refused as unreadable wherever it is read, so a
+/// revocation never walks past it and leaves it live.
+#[cfg(test)]
+mod a_grants_row_whose_key_is_not_its_own {
+    use super::*;
+    use kr_protocol::grant::{EnvironmentSelector, HistoryScope, SessionSelector};
+    use kr_protocol::ids::{AuthorityRevision, EnvironmentId};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, Uuid};
+
+    fn id_of(byte: u8) -> GrantId {
+        GrantId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    /// The grant the store holds under its own key.
+    fn real() -> GrantId {
+        id_of(0x11)
+    }
+
+    /// The key the damaged row sits under; the grant in its payload is [`real`].
+    fn alias() -> GrantId {
+        id_of(0x22)
+    }
+
+    fn holder() -> DeviceId {
+        DeviceId::new(Uuid::from_bytes([0xd1; 16]))
+    }
+
+    fn record_of(grant_id: GrantId) -> GrantRecord {
+        let session = SessionId::new(Uuid::from_bytes([0xa0; 16]));
+        GrantRecord {
+            grant: Grant {
+                grant_id,
+                parent_grant_id: Nullable::null(),
+                issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+                recipient_device_id: holder(),
+                authority_revision: AuthorityRevision::new(1),
+                environment_selector: EnvironmentSelector::These {
+                    environment_ids: [EnvironmentId::new(Uuid::from_bytes([0xe0; 16]))]
+                        .into_iter()
+                        .collect(),
+                },
+                session_selector: SessionSelector::These {
+                    session_ids: [session].into_iter().collect(),
+                },
+                actions: [ActionRight::SessionView, ActionRight::TerminalInput]
+                    .into_iter()
+                    .collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::from_iter([]),
+                    named_approvals: CanonicalSet::from_iter([]),
+                },
+                expiry: GrantExpiry::Never,
+                organisation: Nullable::null(),
+            },
+            session_id: Some(session),
+            issued_at_ms: 1_000,
+            activated_at_ms: Some(1_000),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        }
+    }
+
+    /// A store that holds the real grant under its own key and a copy of its row under another.
+    fn store_with_an_alias() -> GrantDirectory {
+        let store = GrantDirectory::in_memory().expect("a grant store");
+        store
+            .issue(&record_of(real()), || Ok(()))
+            .expect("the grant is issued");
+        store
+            .in_transaction(|connection| {
+                let copied = connection
+                    .execute(
+                        "INSERT INTO grants (grant_id, parent_grant_id, recipient_device_id,
+                                             session_id, grant, issued_at_ms, activated_at_ms)
+                         SELECT ?1, parent_grant_id, recipient_device_id, session_id, grant,
+                                issued_at_ms, activated_at_ms
+                           FROM grants WHERE grant_id = ?2",
+                        params![
+                            alias().get().as_bytes().as_slice(),
+                            real().get().as_bytes().as_slice()
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+                assert_eq!(copied, 1, "the real row is copied under the other key");
+                Ok(())
+            })
+            .expect("the alias row is written");
+        store
+    }
+
+    /// How many rows of the store are revoked.
+    fn revoked_rows(store: &GrantDirectory) -> i64 {
+        store
+            .in_transaction(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM grants WHERE revoked_at_ms IS NOT NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(ControllerError::registry)
+            })
+            .expect("the rows are counted")
+    }
+
+    /// The key the damaged row sits under, as a refusal names it, and the identifier in its payload.
+    fn texts() -> (String, String) {
+        (alias().get().to_string(), real().get().to_string())
+    }
+
+    #[test]
+    fn the_alias_is_refused_as_unreadable_wherever_it_is_read() {
+        let store = store_with_an_alias();
+        let (under, carried) = texts();
+        let refusals = [
+            (
+                "a read by the key",
+                store
+                    .record(alias())
+                    .expect_err("the row under the other key is not a grant of that key"),
+            ),
+            (
+                "a listing of every grant",
+                store.records().expect_err("a listing of every grant"),
+            ),
+            (
+                "a listing of the holder's grants",
+                store
+                    .records_for_device(holder())
+                    .expect_err("a listing of the holder's grants"),
+            ),
+        ];
+        for (read, refused) in refusals {
+            let text = refused.to_string();
+            assert!(
+                text.contains("grants") && text.contains(&under),
+                "{read} names the table and the key the row sits under: {text}"
+            );
+            assert!(
+                !text.contains(&carried),
+                "{read} does not name the identifier in the payload: {text}"
+            );
+        }
+        let real_row = store
+            .record(real())
+            .expect("the real row reads")
+            .expect("the real grant");
+        assert_eq!(real_row.grant.grant_id, real());
+    }
+
+    #[test]
+    fn a_revocation_of_the_grant_beside_the_alias_is_refused_before_any_write() {
+        let store = store_with_an_alias();
+        let refused = store
+            .revoke(real(), 2_000, || Ok(()))
+            .expect_err("a revocation does not walk past a damaged row");
+        assert!(
+            refused.to_string().contains(&texts().0),
+            "the refusal names the key the row sits under: {refused}"
+        );
+        assert_eq!(revoked_rows(&store), 0, "no row was written");
+    }
+
+    #[test]
+    fn a_revocation_of_the_device_that_holds_the_real_row_is_refused_before_any_write() {
+        let store = store_with_an_alias();
+        let refused = store
+            .revoke_device(holder(), 2_000, || Ok(()), None)
+            .expect_err("a revocation does not walk past a damaged row");
+        assert!(
+            refused.to_string().contains(&texts().0),
+            "the refusal names the key the row sits under: {refused}"
+        );
+        assert_eq!(revoked_rows(&store), 0, "no row was written");
+    }
+
+    #[test]
+    fn a_row_under_a_key_that_is_not_an_identifier_is_refused_as_unreadable() {
+        let store = GrantDirectory::in_memory().expect("a grant store");
+        store
+            .issue(&record_of(real()), || Ok(()))
+            .expect("the grant is issued");
+        store
+            .in_transaction(|connection| {
+                let changed = connection
+                    .execute(
+                        "UPDATE grants SET grant_id = x'0102' WHERE grant_id = ?1",
+                        params![real().get().as_bytes().as_slice()],
+                    )
+                    .map_err(ControllerError::registry)?;
+                assert_eq!(changed, 1, "the row is filed under a short key");
+                Ok(())
+            })
+            .expect("the key is changed");
+        let refused = store
+            .records()
+            .expect_err("a row that no identifier keys is not a grant");
+        assert!(
+            refused.to_string().contains("with a malformed key"),
+            "the refusal says the key is malformed: {refused}"
+        );
+    }
+}
