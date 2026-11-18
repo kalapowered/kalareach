@@ -12,9 +12,10 @@
 //! A case passes when the stop happens within the times section 7 gives it: the answer inside the
 //! seven seconds the daemon's close allows, the shell asked to stop at once, forced five seconds
 //! after it was asked, a drain of two seconds after that and the closure recorded after the drain.
-//! The drain is measured where the worker says it ended, so that a slow disk cannot stand in for
-//! it. The closure's record is allowed what a few synced writes cost the machine the case runs on,
-//! measured when the case judges.
+//! The drain is measured on its own, to the instant the worker took where it ended, so that a slow
+//! disk cannot stand in for a cut drain, nor hide a long one. The closure's record is allowed what
+//! a few synced writes cost the machine the case runs on, measured when the case judges, and at
+//! most [`ALLOWANCE_CAP`].
 //!
 //! The daemon's own disk is the other place a close can stand: a close of a session whose worker
 //! has closed is answered with the closure, and the daemon's write of that closure to its registry
@@ -50,6 +51,10 @@ const SLACK: Duration = Duration::from_secs(3);
 /// journal grows. A machine's disk queue makes each as slow as one synced write is, which the case
 /// measures when it judges, so the closure is allowed what this many of them cost there.
 const CLOSURE_WRITES: u32 = 4;
+/// The most that a slow disk may add to the closure's record, whatever one synced write cost when
+/// the case judged: the closure is then recorded by `GRACE + DRAIN + SLACK + ALLOWANCE_CAP` at the
+/// latest, which is inside [`WINDOW`]. The drain has bounds of its own that no disk can widen.
+const ALLOWANCE_CAP: Duration = Duration::from_secs(4);
 /// How much earlier than its time a moment may be seen: the watch looks every 20 ms, and the shell
 /// notes the request when the machine lets it run, which a loaded one can put off.
 const SEEN_EARLY: Duration = Duration::from_secs(1);
@@ -105,8 +110,8 @@ struct Rig {
     marks: tempfile::TempDir,
     root: kr_protocol::identity::ProcessStartIdentity,
     closure: std::sync::mpsc::Receiver<Instant>,
-    /// When the worker said the closure's drain period had ended, which it says before it writes
-    /// the closure's record.
+    /// The instant the worker took where the closure's drain period ended, which is before it
+    /// writes any of the closure's record.
     drain_ended: std::sync::mpsc::Receiver<Instant>,
 }
 
@@ -146,8 +151,8 @@ impl Rig {
             let waiting = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("a runtime for the watch");
-            if waiting.block_on(drained).is_ok() {
-                let _ = drain_sender.send(Instant::now());
+            if let Ok(at) = waiting.block_on(drained) {
+                let _ = drain_sender.send(at);
             }
         });
         let (sender, closure) = std::sync::mpsc::channel();
@@ -346,9 +351,9 @@ impl Seen {
     /// What of the stop did not happen within its times: the request reaching the shell, counted
     /// from the close's send, and the grace, the forced end and the drain, counted from the request
     /// reaching the shell, which is where the worker counts them. The drain itself is also measured
-    /// on its own, from the shell's end to the moment the worker says the drain ended. The
-    /// closure's record is allowed what [`CLOSURE_WRITES`] synced writes cost, `synced_write` being
-    /// what one cost just now.
+    /// on its own, from the shell's end to the instant the worker took where the drain ended, and
+    /// held to its own bounds. The closure's record is allowed what [`CLOSURE_WRITES`] synced
+    /// writes cost, `synced_write` being what one cost just now, and at most [`ALLOWANCE_CAP`].
     fn shortfalls(&self, synced_write: Duration) -> Vec<String> {
         let mut missed = Vec::new();
         match &self.first {
@@ -389,27 +394,30 @@ impl Seen {
                 said(self.asked)
             ));
         }
-        // The closure's own time cannot tell a drain that was cut from a disk that was slow after
-        // it: both put the record where a full drain would. The worker says where its drain ended,
-        // which is before any of the record's writes, so the drain is measured from the shell's end
-        // to that, and a slow disk cannot lengthen it.
+        // The closure's own time cannot tell a drain that was cut, or one that was kept long, from a
+        // disk that was slow around it: both put the record where a full drain with a slow disk
+        // would. The worker took an instant where its drain ended, which is before any of the
+        // record's writes and which no wake-up of a thread of this case delays, so the drain is
+        // measured from the shell's end to that instant, and held to bounds that no disk widens.
         let drain = self
             .ended
             .zip(self.drained)
             .map(|(ended, drained)| drained.saturating_sub(ended));
-        if !drain.is_some_and(|drain| drain >= DRAIN - SEEN_EARLY) {
+        let drain_held = (DRAIN - SEEN_EARLY, DRAIN + SLACK);
+        if !drain.is_some_and(|drain| drain_held.0 <= drain && drain <= drain_held.1) {
             missed.push(format!(
-                "the drain lasted {} from the shell's end (at {}) to its own end (at {}), not at \
-                 least {:?}",
+                "the drain lasted {} from the shell's end (at {}) to its own end (at {}), not \
+                 {:?} to {:?}",
                 said(drain),
                 said(self.ended),
                 said(self.drained),
-                DRAIN - SEEN_EARLY
+                drain_held.0,
+                drain_held.1
             ));
         }
         let closed = (
             GRACE + DRAIN - SEEN_EARLY,
-            GRACE + DRAIN + SLACK + synced_write * CLOSURE_WRITES,
+            GRACE + DRAIN + SLACK + (synced_write * CLOSURE_WRITES).min(ALLOWANCE_CAP),
         );
         if !held(self.closed, closed.0, closed.1) {
             missed.push(format!(

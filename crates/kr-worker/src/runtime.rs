@@ -546,8 +546,8 @@ struct RuntimePauses {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
-    /// Where a closure says its drain period has ended.
-    drain_ended: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Where a closure says its drain period has ended, and the instant it ended at.
+    drain_ended: Mutex<Option<tokio::sync::oneshot::Sender<Instant>>>,
     /// Where the supervision says it is reading the session's processes, and what lets it go on.
     in_observation: Mutex<
         Option<(
@@ -628,7 +628,7 @@ impl RuntimePauses {
         }
     }
 
-    /// Says that a closure's drain period has ended, where that is being watched for.
+    /// Says that a closure's drain period has ended, and when, where that is being watched for.
     fn drain_ended(&self) {
         let armed = self
             .drain_ended
@@ -636,7 +636,7 @@ impl RuntimePauses {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         if let Some(ended) = armed {
-            let _ = ended.send(());
+            let _ = ended.send(Instant::now());
         }
     }
 }
@@ -1912,10 +1912,10 @@ impl SessionRuntime {
     }
 
     /// Says when the next closure's drain period ends, before what has been read is measured, for
-    /// this host's own tests.
+    /// this host's own tests: the answer is the instant the worker took where the drain ended.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn watch_drain_end(&self) -> tokio::sync::oneshot::Receiver<()> {
+    pub fn watch_drain_end(&self) -> tokio::sync::oneshot::Receiver<Instant> {
         let (ended, watch) = tokio::sync::oneshot::channel();
         *self
             .progress

@@ -11,8 +11,10 @@
 //!
 //! A case passes when the stop happens within the times section 7 gives it: five seconds of grace
 //! and two of drain, counted from the request that reaches the shell, with an answer inside the
-//! seven seconds the daemon's close allows in all. The closure's record is allowed what a few
-//! synced writes cost the machine the case runs on, measured when the case judges.
+//! seven seconds the daemon's close allows in all. The drain is measured on its own, to the instant
+//! the worker took where it ended, so that a slow disk cannot stand in for a cut drain, nor hide a
+//! long one. The closure's record is allowed what a few synced writes cost the machine the case
+//! runs on, measured when the case judges, and at most [`ALLOWANCE_CAP`].
 
 #![cfg(unix)]
 
@@ -51,6 +53,10 @@ const SLACK: Duration = Duration::from_secs(3);
 /// journal grows. A machine's disk queue makes each as slow as one synced write is, which the case
 /// measures when it judges, so the closure is allowed what this many of them cost there.
 const CLOSURE_WRITES: u32 = 4;
+/// The most that a slow disk may add to the closure's record, whatever one synced write cost when
+/// the case judged: the closure is then recorded by `GRACE + DRAIN + SLACK + ALLOWANCE_CAP` at the
+/// latest, which is inside [`WINDOW`]. The drain has bounds of its own that no disk can widen.
+const ALLOWANCE_CAP: Duration = Duration::from_secs(4);
 /// How much earlier than its time a moment may be seen: the watch looks every 20 ms, and the shell
 /// notes the request when the machine lets it run, which a loaded one can put off.
 const SEEN_EARLY: Duration = Duration::from_secs(1);
@@ -350,9 +356,29 @@ async fn stall(host: &Host, stalled: Stalled, holder: LocalClient) -> Standing {
     }
 }
 
-/// Watches for the closure's record without taking the session's lock on the case's own thread.
-fn watch_the_closure(runtime: &Arc<SessionRuntime>) -> std::sync::mpsc::Receiver<Instant> {
-    let (sender, receiver) = std::sync::mpsc::channel();
+/// What a case watches of the closure.
+struct Closure {
+    /// The instant the worker took where the closure's drain period ended, which is before it
+    /// writes any of the closure's record.
+    drain_ended: std::sync::mpsc::Receiver<Instant>,
+    /// When the closure's record was written, as the case's thread saw it.
+    closed: std::sync::mpsc::Receiver<Instant>,
+}
+
+/// Watches for the closure's drain end and record without taking the session's lock on the case's
+/// own thread. It stands before the close is sent, which is when the drain's watch is armed.
+fn watch_the_closure(runtime: &Arc<SessionRuntime>) -> Closure {
+    let drained = runtime.watch_drain_end();
+    let (drain_sender, drain_ended) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let waiting = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a runtime for the watch");
+        if let Ok(at) = waiting.block_on(drained) {
+            let _ = drain_sender.send(at);
+        }
+    });
+    let (sender, closed) = std::sync::mpsc::channel();
     let runtime = Arc::clone(runtime);
     std::thread::spawn(move || {
         let waiting = tokio::runtime::Builder::new_current_thread()
@@ -361,7 +387,10 @@ fn watch_the_closure(runtime: &Arc<SessionRuntime>) -> std::sync::mpsc::Receiver
         waiting.block_on(runtime.wait_closed());
         let _ = sender.send(Instant::now());
     });
-    receiver
+    Closure {
+        drain_ended,
+        closed,
+    }
 }
 
 /// What a case saw, each moment counted from the first close's send.
@@ -371,6 +400,7 @@ struct Seen {
     second: Option<Answer>,
     asked: Option<Duration>,
     ended: Option<Duration>,
+    drained: Option<Duration>,
     closed: Option<Duration>,
 }
 
@@ -378,7 +408,7 @@ struct Seen {
 struct Watch<'a> {
     host: &'a Host,
     root: kr_protocol::identity::ProcessStartIdentity,
-    closure: std::sync::mpsc::Receiver<Instant>,
+    closure: Closure,
     started: Instant,
     first: Slot,
     second: Option<Slot>,
@@ -401,8 +431,13 @@ impl Watch<'_> {
         if self.seen.ended.is_none() && matches!(process_state(&self.root), ProcessState::Ended) {
             self.seen.ended = Some(now);
         }
+        if self.seen.drained.is_none()
+            && let Ok(at) = self.closure.drain_ended.try_recv()
+        {
+            self.seen.drained = Some(at.saturating_duration_since(self.started));
+        }
         if self.seen.closed.is_none()
-            && let Ok(at) = self.closure.try_recv()
+            && let Ok(at) = self.closure.closed.try_recv()
         {
             self.seen.closed = Some(at.saturating_duration_since(self.started));
         }
@@ -410,6 +445,7 @@ impl Watch<'_> {
             && self.seen.second.is_some()
             && self.seen.asked.is_some()
             && self.seen.ended.is_some()
+            && self.seen.drained.is_some()
             && self.seen.closed.is_some()
     }
 
@@ -445,19 +481,22 @@ impl Seen {
     fn line(&self) -> String {
         format!(
             "first close answered {}; second close answered {}; the shell was asked to stop {}; \
-             the shell ended {}; the closure was recorded {}",
+             the shell ended {}; the drain ended {}; the closure was recorded {}",
             answer_said(&self.first),
             answer_said(&self.second),
             said(self.asked),
             said(self.ended),
+            said(self.drained),
             said(self.closed),
         )
     }
 
     /// What of the stop did not happen within its times: the request reaching the shell, counted
     /// from the first close, and the grace, the forced end and the drain, counted from the request
-    /// reaching the shell, which is where the worker counts them. The closure's record is allowed
-    /// what [`CLOSURE_WRITES`] synced writes cost, `synced_write` being what one cost just now.
+    /// reaching the shell, which is where the worker counts them. The drain itself is also measured
+    /// on its own, from the shell's end to the instant the worker took where the drain ended, and
+    /// held to its own bounds. The closure's record is allowed what [`CLOSURE_WRITES`] synced
+    /// writes cost, `synced_write` being what one cost just now, and at most [`ALLOWANCE_CAP`].
     fn shortfalls(&self, synced_write: Duration) -> Vec<String> {
         let mut missed = Vec::new();
         match &self.first {
@@ -501,9 +540,30 @@ impl Seen {
                 said(self.asked)
             ));
         }
+        // The closure's own time cannot tell a drain that was cut, or one that was kept long, from a
+        // disk that was slow around it: both put the record where a full drain with a slow disk
+        // would. The worker took an instant where its drain ended, which is before any of the
+        // record's writes and which no wake-up of a thread of this case delays, so the drain is
+        // measured from the shell's end to that instant, and held to bounds that no disk widens.
+        let drain = self
+            .ended
+            .zip(self.drained)
+            .map(|(ended, drained)| drained.saturating_sub(ended));
+        let drain_held = (DRAIN - SEEN_EARLY, DRAIN + SLACK);
+        if !drain.is_some_and(|drain| drain_held.0 <= drain && drain <= drain_held.1) {
+            missed.push(format!(
+                "the drain lasted {} from the shell's end (at {}) to its own end (at {}), not \
+                 {:?} to {:?}",
+                said(drain),
+                said(self.ended),
+                said(self.drained),
+                drain_held.0,
+                drain_held.1
+            ));
+        }
         let closed = (
             GRACE + DRAIN - SEEN_EARLY,
-            GRACE + DRAIN + SLACK + synced_write * CLOSURE_WRITES,
+            GRACE + DRAIN + SLACK + (synced_write * CLOSURE_WRITES).min(ALLOWANCE_CAP),
         );
         if !held(self.closed, closed.0, closed.1) {
             missed.push(format!(
@@ -535,7 +595,7 @@ async fn the_stop_is_watched(
     case: &str,
     host: &Host,
     root: kr_protocol::identity::ProcessStartIdentity,
-    closure: std::sync::mpsc::Receiver<Instant>,
+    closure: Closure,
     started: Instant,
     first: Slot,
     second_client: LocalClient,
@@ -568,7 +628,7 @@ async fn watch_the_stop(
     case: &str,
     host: &Host,
     root: kr_protocol::identity::ProcessStartIdentity,
-    closure: std::sync::mpsc::Receiver<Instant>,
+    closure: Closure,
     started: Instant,
     first: Slot,
     second_client: LocalClient,
