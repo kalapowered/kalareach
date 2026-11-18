@@ -925,8 +925,8 @@ function PairedHosts({
 }): ReactNode {
   const [using, setUsing] = useState<string | null>(null)
   const [failure, setFailure] = useState<string | null>(null)
-  // The host being asked about, and the one being forgotten. Forgetting is asked twice: this
-  // computer cannot pair with the host again from here, so the first press only asks.
+  // The host being asked about, and the one being forgotten. Forgetting is asked twice: pairing
+  // again needs the old pairing ended and another owner device, so the first press only asks.
   const [asking, setAsking] = useState<string | null>(null)
   const [forgetting, setForgetting] = useState<string | null>(null)
   const [forgetFailure, setForgetFailure] = useState<string | null>(null)
