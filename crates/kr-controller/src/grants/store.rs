@@ -5516,7 +5516,8 @@ mod a_devices_revocation {
     type Build = Box<dyn Fn() -> GrantDirectory>;
 
     /// The stores an edit by hand can leave, each with whether the device's revocation is refused.
-    /// Every grant of them is the device's.
+    /// Every grant of them is the device's. A revocation is refused for each store whose row keyed
+    /// 3 carries grant 4: the device's own read refuses that row.
     fn stores_edited_by_hand() -> Vec<(String, Build, bool)> {
         let held = |number: u32, parent: Option<u32>| Node {
             number,
@@ -5545,7 +5546,7 @@ mod a_devices_revocation {
                         (held(6, None), None),
                     ])
                 }),
-                false,
+                true,
             ),
             (
                 "a row that is its own parent and a cycle of two rows, each with a child",
@@ -5570,27 +5571,30 @@ mod a_devices_revocation {
             .collect()
     }
 
-    /// A store with two faults at once: a grant of the device whose row is keyed by another
-    /// grant's identifier (the row keyed 3 carries grant 4, and no row is keyed 4), and a row of
-    /// another device that holds no grant at all. A revocation returns the first fault it meets. It
-    /// reads the row of each grant it walks before it reads the table, so which fault comes first
-    /// depends on the order the device's grants are listed in. This store is not in `every_store`:
-    /// a case that reads every row of a store cannot read this one.
+    /// A store with two faults at once, both in rows of another device, so that the device's own
+    /// read meets neither: a row keyed 3 that carries grant 4 (no row is keyed 4), and a row keyed 9
+    /// that holds no grant at all. The device holds two grants of its own. A revocation walks each
+    /// of them and reads the whole table by key to do so, so it returns the first fault in the order
+    /// of the keys. This store is not in `every_store`: its revocation is refused by the walk, and
+    /// the device's read does not refuse it.
     fn store_with_two_faults() -> GrantDirectory {
-        let held = |number: u32| Node {
+        let node = |number: u32, holder: u8| Node {
             number,
             parent: None,
-            holder: DEVICE,
+            holder,
         };
-        let store = store_written_by_hand(&[(held(1), None), (held(3), Some(4))]);
+        let store = store_written_by_hand(&[
+            (node(1, DEVICE), None),
+            (node(2, DEVICE), None),
+            (node(3, OTHER_DEVICE), Some(4)),
+        ]);
         store
             .in_transaction(|connection| {
-                let other = Node {
-                    number: 9,
-                    parent: None,
-                    holder: OTHER_DEVICE,
-                };
-                write_grant(connection, &record_of(&other), b"not a grant")
+                write_grant(
+                    connection,
+                    &record_of(&node(9, OTHER_DEVICE)),
+                    b"not a grant",
+                )
             })
             .expect("the other device's row is written");
         store
@@ -5774,9 +5778,14 @@ mod a_devices_revocation {
         ]
     }
 
-    /// The rows the store holds after a revocation that bear on it: every grant, and the moment
-    /// and text of every fence debt.
-    fn rows_of(store: &GrantDirectory) -> (Vec<GrantRecord>, Vec<(String, i64)>) {
+    /// A grant row as it is stored, read with no decode (a row this build refuses is still a row):
+    /// its key, the moment it was revoked and the grant it was revoked through.
+    type StoredGrant = (Vec<u8>, Option<i64>, Option<Vec<u8>>);
+
+    /// The rows the store holds after a revocation that bear on it, read by SQL with no decode: the
+    /// key, the moment of revocation and the revoking parent of every grant row, and the moment and
+    /// text of every fence debt.
+    fn rows_of(store: &GrantDirectory) -> (Vec<StoredGrant>, Vec<(String, i64)>) {
         store
             .in_transaction(|connection| {
                 let debts = connection
@@ -5791,59 +5800,105 @@ mod a_devices_revocation {
                     .map_err(ControllerError::registry)?
                     .collect::<rusqlite::Result<Vec<_>>>()
                     .map_err(ControllerError::registry)?;
-                Ok((read_all(connection)?, debts))
+                let grants = connection
+                    .prepare(
+                        "SELECT grant_id, revoked_at_ms, revoked_by_parent FROM grants
+                          ORDER BY grant_id",
+                    )
+                    .map_err(ControllerError::registry)?
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .map_err(ControllerError::registry)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(ControllerError::registry)?;
+                Ok((grants, debts))
             })
             .expect("the rows read")
+    }
+
+    /// What a device's grants are read to withdraw: the entries, or the refusal of the read.
+    type Readings = std::result::Result<Vec<(GrantId, Box<[GrantRecord]>)>, String>;
+
+    /// The device's grants `held`, read to be withdrawn once for all of the device's roots and one
+    /// root at a time. Reading one root at a time also made an entry with no grant in it for each
+    /// root an earlier root had taken; such an entry withdraws nothing (the case below shows the
+    /// result and the rows are the same without it), so the comparison leaves it out.
+    fn both_readings(store: &GrantDirectory, held: &[GrantRecord]) -> (Readings, Readings) {
+        store
+            .in_transaction(|connection| {
+                Ok((
+                    GrantDirectory::subtrees_to_revoke(connection, held)
+                        .map_err(|error| error.to_string()),
+                    subtrees_read_one_root_at_a_time(connection, held)
+                        .map(|entries| {
+                            entries
+                                .into_iter()
+                                .filter(|(_, subtree)| !subtree.is_empty())
+                                .collect::<Vec<_>>()
+                        })
+                        .map_err(|error| error.to_string()),
+                ))
+            })
+            .expect("both readings read")
     }
 
     /// What is read to be withdrawn is what reading one root at a time read, grant for grant and
     /// in the same order, whatever the order the device's grants are listed in, for each store
     /// built here (the eight shapes and the stores an edit by hand leaves): the first of the
-    /// device's roots, in the order listed, that reaches a grant
-    /// keeps it, and the grants of a root come breadth first. Reading one root at a time also made
-    /// an entry with no grant in it for each root an earlier root had taken; such an entry
-    /// withdraws nothing (the case below shows the result and the rows are the same without it),
-    /// and the comparison leaves it out. In a store with two faults at once the two readings return
-    /// the same fault in each order the grants are listed in.
+    /// device's roots, in the order listed, that reaches a grant keeps it, and the grants of a root
+    /// come breadth first. A store whose row keyed 3 carries grant 4 and is the device's is
+    /// refused by the device's read before any walk, and the refusal names the key 3.
     #[test]
     fn withdraws_what_a_walk_from_each_of_its_grants_in_turn_withdrew_whatever_the_order_and_the_shape()
      {
-        let two_faults: Build = Box::new(store_with_two_faults);
-        let stores = every_store(64)
-            .into_iter()
-            .map(|(name, build, _)| (name, build))
-            .chain([(
-                "a grant with no row of its own and a row of another device that holds no grant"
-                    .to_owned(),
-                two_faults,
-            )]);
-        for (name, build) in stores {
+        for (name, build, refused) in every_store(64) {
             let store = build();
-            let held = store
-                .in_transaction(|connection| read_for_device(connection, device_of(DEVICE)))
-                .expect("the device's grants read");
+            let held =
+                store.in_transaction(|connection| read_for_device(connection, device_of(DEVICE)));
+            if refused {
+                let Err(refusal) = held else {
+                    panic!(
+                        "{name}: the device's read refuses the row keyed 3 that carries grant 4"
+                    );
+                };
+                assert!(
+                    refusal.to_string().contains(&id_of(3).to_string()),
+                    "{name}: the refusal names the key of the row: {refusal}"
+                );
+                continue;
+            }
+            let held = held.expect("the device's grants read");
             for (order, held) in orders(&held) {
-                let (now, before) = store
-                    .in_transaction(|connection| {
-                        Ok((
-                            GrantDirectory::subtrees_to_revoke(connection, &held)
-                                .map_err(|error| error.to_string()),
-                            subtrees_read_one_root_at_a_time(connection, &held)
-                                .map(|entries| {
-                                    entries
-                                        .into_iter()
-                                        .filter(|(_, subtree)| !subtree.is_empty())
-                                        .collect::<Vec<_>>()
-                                })
-                                .map_err(|error| error.to_string()),
-                        ))
-                    })
-                    .expect("both readings read");
+                let (now, before) = both_readings(&store, &held);
                 assert!(
                     now == before,
                     "{name}, {order}: what is read to be withdrawn"
                 );
             }
+        }
+    }
+
+    /// In a store with two faults at once, both in rows of another device, the two readings return
+    /// the first of them in the order of the keys (the row keyed 3, before the row keyed 9), in
+    /// each order the device's grants are listed in. The device's own read meets neither fault; each
+    /// walk reads the whole table by key and stops at the first row it refuses.
+    #[test]
+    fn returns_the_first_fault_in_the_order_of_the_keys_whatever_the_order_the_grants_are_listed_in()
+     {
+        let store = store_with_two_faults();
+        let held = store
+            .in_transaction(|connection| read_for_device(connection, device_of(DEVICE)))
+            .expect("the device's grants read");
+        assert!(held.len() > 1, "the device holds more than one grant");
+        for (order, held) in orders(&held) {
+            let (now, before) = both_readings(&store, &held);
+            let Err(first) = &now else {
+                panic!("{order}: the walk reads the rows of both faults");
+            };
+            assert!(now == before, "{order}: the two readings return one fault");
+            assert!(
+                first.contains(&id_of(3).to_string()) && !first.contains(&id_of(9).to_string()),
+                "{order}: the first fault in the order of the keys: {first}"
+            );
         }
     }
 
@@ -5880,6 +5935,12 @@ mod a_devices_revocation {
                 rows_of(&before) == rows_of(&now),
                 "{name}: the rows it left"
             );
+            if refused {
+                assert!(
+                    rows_of(&now) == rows_of(&build()),
+                    "{name}: a refused revocation writes nothing"
+                );
+            }
         }
     }
 }
