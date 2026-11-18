@@ -253,10 +253,9 @@ fn create_params(
         dimensions: Nullable::null(),
         worker_profile: profile,
         palette: Nullable::null(),
-        // A session nobody is shown takes the host's environment and carries only its home, which
-        // is the host's too.
+        // A session nobody is shown takes the host's environment and carries none of its own.
         environment_snapshot: if presentation == Presentation::Invisible {
-            StartedEnvironment::within(root).snapshot_home()
+            Vec::new()
         } else {
             vec![
                 kr_protocol::session::EnvironmentVariable {

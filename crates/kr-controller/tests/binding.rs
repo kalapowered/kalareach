@@ -334,8 +334,7 @@ impl Hosted {
                     cwd: Nullable::some(self.tree.root().display().to_string()),
                     dimensions: Nullable::null(),
                     worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-                    environment_snapshot: StartedEnvironment::within(self.tree.root())
-                        .snapshot_home(),
+                    environment_snapshot: Vec::new(),
                     palette: Nullable::null(),
                     launch_profile: kr_protocol::session::LaunchProfile::default(),
                     terminal: Nullable::null(),
@@ -1041,7 +1040,6 @@ async fn a_worker_fenced_between_its_claim_and_its_specification_leaves_once_its
     let client = hosted.client().await;
     let environment_id = hosted.environment_id;
     let target = hosted.target(None);
-    let tree = hosted.tree.root().to_path_buf();
     let creating = tokio::spawn(async move {
         let mut client = client;
         client
@@ -1057,7 +1055,7 @@ async fn a_worker_fenced_between_its_claim_and_its_specification_leaves_once_its
                     cwd: Nullable::some("/".to_owned()),
                     dimensions: Nullable::null(),
                     worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-                    environment_snapshot: StartedEnvironment::within(&tree).snapshot_home(),
+                    environment_snapshot: Vec::new(),
                     palette: Nullable::null(),
                     launch_profile: kr_protocol::session::LaunchProfile::default(),
                     terminal: Nullable::null(),
