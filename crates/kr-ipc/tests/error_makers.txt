@@ -77,7 +77,7 @@ crates/kr-ipc/src/descriptor.rs | decode_under | UnexpectedMessage | 1 | own | o
 crates/kr-ipc/src/descriptor.rs | retire | Io | 1 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | Accepted::refusal | PeerAccountRejected | 1 | own | own | - | agrees
 crates/kr-ipc/src/endpoint.rs | Connection::connect | PeerAccountRejected | 1 | own | own | connect | agrees
-crates/kr-ipc/src/endpoint.rs | Connection::connect | Socket | 3 | connect | closure+own | connect | by-kind   # nothing listening is a closure; the Windows pipe that stays busy to its deadline (TimedOut) is the daemon's, and the function says own
+crates/kr-ipc/src/endpoint.rs | Connection::connect | Socket | 3 | connect | closure+own | connect | by-kind   # nothing listening, or a queued connection that the daemon's end reset, is a closure; the Windows pipe that stays busy to its deadline (TimedOut) is the daemon's, and the function says own
 crates/kr-ipc/src/endpoint.rs | Connection::peer | PeerClosed | 1 | stream | closure | connect | agrees
 crates/kr-ipc/src/endpoint.rs | Connection::peer | PeerUnknown | 2 | own | own | connect | agrees
 crates/kr-ipc/src/endpoint.rs | Connection::writability | Socket | 1 | stream | own | greeting+request | agrees

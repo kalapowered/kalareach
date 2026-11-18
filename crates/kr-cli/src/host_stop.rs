@@ -4985,6 +4985,15 @@ mod tests {
         kr_ipc::IpcError::Frame(kr_protocol::frame::FrameError::EmptyPayload)
     }
 
+    /// The reset that a connect gets when the daemon's end closes its listener with the connection
+    /// still in the queue.
+    fn a_connect_reset() -> kr_ipc::IpcError {
+        kr_ipc::IpcError::socket(
+            "connect",
+            std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        )
+    }
+
     /// A fault of this side's own socket.
     fn a_fault_of_the_socket() -> kr_ipc::IpcError {
         kr_ipc::IpcError::socket("read the control frame", std::io::Error::other("a fault"))
@@ -5021,6 +5030,73 @@ mod tests {
             assert_eq!(before_said(&before), the_end_said(id, named), "{old:?}");
             assert_eq!(supplied.start.elapsed(), Duration::ZERO, "{old:?}");
         }
+    }
+
+    /// A connect that the daemon's end resets, because the listener closed with the connection in
+    /// its queue, is the daemon's end as a closed greeting is: no fault of this side's own, and the
+    /// command sent nothing. It is looked at once, and an old process that has gone with a free lock
+    /// is the end.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_reset_before_the_greeting_is_the_daemons_end() {
+        let id = an_environment();
+        let process = asked_process();
+        let reset = a_connect_reset();
+        let supplied = Supplied::new()
+            .process(vec![at_once(ProcessState::Ended)])
+            .look(vec![at_once(Endpoint::Nobody)]);
+        let before = greeting_failed(&supplied, &reset, Some(&process), id, the_deadline()).await;
+        let said = before_said(&before);
+        assert_eq!(said, the_end_said_for(id, Some(4000), &reset));
+        assert_eq!(supplied.looks(), 1, "{said}");
+        assert_eq!(supplied.start.elapsed(), Duration::ZERO, "{said}");
+    }
+
+    /// The kernel's own order on Linux: a connection that waits in the queue of a listener that
+    /// closes without accepting it fails at the connect with a reset, and that failure is the
+    /// daemon's end, with the words of an end that this command's request did not cause.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_connect_reset_by_a_listener_that_closes_with_it_queued_is_the_daemons_end() {
+        use std::future::Future as _;
+
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let path = directory.path().join("stand-in.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&path).expect("the stand-in listener binds");
+        let endpoint = kr_ipc::paths::Endpoint::from_path(path).expect("the endpoint");
+        let reach = startup::reach(&endpoint, startup::ANSWER_BOUND, &[]);
+        let mut reach = std::pin::pin!(reach);
+        // One poll makes the connect, which the kernel queues at the listener that never accepts;
+        // the greeting cannot be answered, so the reach is pending.
+        let first =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(reach.as_mut().poll(cx))).await;
+        assert!(
+            first.is_pending(),
+            "the connection waits in the listener's queue"
+        );
+        drop(listener);
+        let startup::Reached::Refused(error) = reach.await else {
+            panic!("the reach of a listener that closed with the connection queued is refused");
+        };
+        assert!(
+            matches!(
+                &error,
+                kr_ipc::IpcError::Socket { operation: "connect", source }
+                    if source.kind() == std::io::ErrorKind::ConnectionReset
+            ),
+            "{error:?}"
+        );
+
+        let id = an_environment();
+        let process = asked_process();
+        let supplied = Supplied::new()
+            .process(vec![at_once(ProcessState::Ended)])
+            .look(vec![at_once(Endpoint::Nobody)]);
+        let before = greeting_failed(&supplied, &error, Some(&process), id, the_deadline()).await;
+        assert_eq!(
+            before_said(&before),
+            the_end_said_for(id, Some(4000), &error)
+        );
     }
 
     /// A greeting that fails on the socket and is no closure is judged as any failure before the

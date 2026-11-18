@@ -274,9 +274,10 @@ impl IpcError {
     /// control connection's connect, greeting or request can return it, and a case holds each row
     /// that a control connection can return against this function.
     ///
-    /// A `Socket` failure is a closure where nothing listens (`NotFound`, `ConnectionRefused`) and
-    /// this side's own fault otherwise, and so is a refusal of the endpoint's access list that one
-    /// carries.
+    /// A `Socket` failure is a closure where nothing listens (`NotFound`, `ConnectionRefused`) or
+    /// where the daemon's end reset a connection that was still in its listener's queue
+    /// (`ConnectionReset`), and this side's own fault otherwise, and so is a refusal of the
+    /// endpoint's access list that one carries.
     ///
     /// For every maker that a control connection can return, the answer is the maker's true
     /// source, except for two, which a caller must not read as the maker's source:
@@ -305,9 +306,13 @@ impl IpcError {
                     ErrorSource::OwnFault
                 } else if matches!(
                     source.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
                 ) {
                     // A connect that finds nothing listening: the daemon has gone, or is not there.
+                    // A connect that the daemon's end resets is the same: the listener closed with
+                    // the connection still in its queue.
                     ErrorSource::Closure
                 } else {
                     ErrorSource::OwnFault
@@ -597,6 +602,10 @@ mod tests {
             (refused(std::io::ErrorKind::NotFound), ErrorSource::Closure),
             (
                 refused(std::io::ErrorKind::ConnectionRefused),
+                ErrorSource::Closure,
+            ),
+            (
+                refused(std::io::ErrorKind::ConnectionReset),
                 ErrorSource::Closure,
             ),
             (refused(std::io::ErrorKind::TimedOut), ErrorSource::OwnFault),
