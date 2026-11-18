@@ -4282,19 +4282,31 @@ pub(crate) fn grant_rows_read() -> u64 {
 
 /// Reads one grant row. A grant this build cannot read is refused with its table and the grant its
 /// key column names, read apart from the payload, so the row can be found and removed.
+///
+/// A row whose key is not the identifier of the grant in its payload cannot be read either. Every
+/// writer files a grant under its own identifier, so such a row is a damaged file or an edit by
+/// hand, and it would otherwise stand for a grant that another row holds: a revocation finds the
+/// row to withdraw by the payload's identifier and would leave the other one live.
 fn read_row(row: &rusqlite::Row<'_>) -> Row {
     #[cfg(feature = "testing")]
     GRANT_ROWS_READ.with(|rows| rows.set(rows.get().saturating_add(1)));
     let encoded: Vec<u8> = row.get(0).map_err(ControllerError::registry)?;
-    let grant: Grant =
-        kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT).map_err(|error| {
-            let key: Option<Vec<u8>> = row.get(6).ok();
-            let named = key.as_deref().and_then(uuid_of).map(GrantId::new);
-            ControllerError::InvalidArgument(format!(
-                "the grants row of grant {} cannot be read: {error}",
-                named.map_or_else(|| "with a malformed key".to_owned(), |id| id.to_string())
-            ))
-        })?;
+    let key: Option<kr_protocol::scalars::Uuid> =
+        row.get::<_, Vec<u8>>(6).ok().as_deref().and_then(uuid_of);
+    let unreadable = |why: &dyn std::fmt::Display| {
+        ControllerError::InvalidArgument(format!(
+            "the grants row of grant {} cannot be read: {why}",
+            key.map_or_else(
+                || "with a malformed key".to_owned(),
+                |key| GrantId::new(key).to_string()
+            )
+        ))
+    };
+    let grant: Grant = kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| unreadable(&error))?;
+    if key != Some(grant.grant_id.get()) {
+        return Err(unreadable(&"its key does not name the grant it holds"));
+    }
     let session: Option<Vec<u8>> = row.get(1).map_err(ControllerError::registry)?;
     let issued: i64 = row.get(2).map_err(ControllerError::registry)?;
     let revoked: Option<i64> = row.get(3).map_err(ControllerError::registry)?;

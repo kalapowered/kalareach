@@ -1516,18 +1516,24 @@ fn a_tree_over_the_limit_redeems_no_invitation() {
         .redeem(first_preview.invitation_id, redeemer, now, || Ok(()), None)
         .expect("a tree at the limit redeems");
 
-    // A tree from before the limit: a row written past it.
+    // A tree from before the limit: a row written past it, filed under the identity its grant
+    // carries.
+    let past = Grant {
+        grant_id: GrantId::new(Uuid::from_bytes([0xee; 16])),
+        ..first.grant.clone()
+    };
     rusqlite::Connection::open(&database)
         .expect("the store opens")
         .execute(
             "INSERT INTO grants (grant_id, parent_grant_id, recipient_device_id, session_id, grant,
                                  issued_at_ms, activated_at_ms)
-             SELECT ?1, parent_grant_id, recipient_device_id, session_id, grant, issued_at_ms,
+             SELECT ?1, parent_grant_id, recipient_device_id, session_id, ?3, issued_at_ms,
                     activated_at_ms
                FROM grants WHERE grant_id = ?2",
             rusqlite::params![
-                [0xee_u8; 16].as_slice(),
-                first.grant.grant_id.get().as_bytes().as_slice()
+                past.grant_id.get().as_bytes().as_slice(),
+                first.grant.grant_id.get().as_bytes().as_slice(),
+                kr_cbor::to_canonical_vec(&past).expect("a grant encodes"),
             ],
         )
         .expect("a row from before the limit");
