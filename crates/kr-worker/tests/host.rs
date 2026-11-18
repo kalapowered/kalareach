@@ -703,7 +703,7 @@ impl Host {
         // over, not how soon the runtime drops the last reference to the one before it. Anything
         // else fails at once.
         let started = std::time::Instant::now();
-        let daemon = kr_controller::testing::taken_over(|| {
+        kr_controller::testing::taken_over(|| {
             let supervisor = self.temp.supervisor(self.with_the_marking(
                 match (self.worker_packages.clone(), self.launched.clone()) {
                     (Some(packages), _) => Box::new(WorkerWithPackageRoot {
@@ -732,8 +732,7 @@ impl Host {
                 "the daemon did not start in {:.1?}: {error}",
                 started.elapsed()
             )
-        });
-        daemon
+        })
     }
 
     async fn client(&self) -> LocalClient {

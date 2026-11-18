@@ -339,10 +339,7 @@ const NO_WORKER_CREATES: &str = "every daemon it starts names a worker program t
 const NO_WORKER_CREATES_REMOVAL: &str = "none while its daemons name a worker program that does not exist; the condition is \
      tested, and the row goes when a daemon of the source gets a real worker";
 
-/// Why a source writes no snapshot for a create it sends: the create is invisible.
-const INVISIBLE_CREATE: &str = "its place is an invisible create, which the daemon refuses when it carries a variable (a \
-     session started with the host's environment carries none); the session takes the host's \
-     environment, which the harness gives the daemon";
+/// When the rows of sources that send invisible creates go.
 const INVISIBLE_CREATE_REMOVAL: &str =
     "none while the daemon refuses a variable on an invisible create";
 
