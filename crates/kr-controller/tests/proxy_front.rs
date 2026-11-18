@@ -125,8 +125,11 @@ async fn a_refused_login_is_written_zero_times_after_the_verdict_by_irohs_relay_
     login.refuse(StopKind::Refused);
     let written = proxy.logins().len();
     let before = proxy.accepted() + probe.accepted();
-    proxy.close_tunnels_to(&authority(&relay));
+    // A redial that the proxy lets through is ended again as it opens, so that the library keeps
+    // dialling and the case sees the same event, three more connections taken, whoever takes them.
+    let target = authority(&relay);
     until("three more connections after the verdict", || {
+        proxy.close_tunnels_to(&target);
         proxy.accepted() + probe.accepted() >= before + 3
     })
     .await;
