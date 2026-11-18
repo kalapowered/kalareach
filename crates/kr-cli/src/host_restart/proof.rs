@@ -236,11 +236,7 @@ pub(super) async fn prove<O: Operations>(
     let (mut connection, started) = match operations.start(&launched, record).await {
         Ok(found) => found,
         Err(error) => {
-            return Err(StartFailed {
-                error: Some(error),
-                made: launched.was_made(),
-                may_still_start: launched.may_still_start(),
-            });
+            return Err(StartFailed::after(&launched, Some(error)));
         }
     };
     let deadline = tokio::time::Instant::now() + bound;
@@ -256,11 +252,7 @@ pub(super) async fn prove<O: Operations>(
     if whole && answers_as_another_daemon(&record.read(), stopped) {
         return Ok(started);
     }
-    Err(StartFailed {
-        error: None,
-        made: launched.was_made(),
-        may_still_start: launched.may_still_start(),
-    })
+    Err(StartFailed::after(&launched, None))
 }
 
 #[cfg(test)]
@@ -411,6 +403,18 @@ mod tests {
         }
     }
 
+    /// The standalone child that a start made, and the service manager that a start asked.
+    const CHILD: Started = Started {
+        pid: Some(77),
+        start: ControllerStartup::Standalone,
+        manager: None,
+    };
+    const SERVICE: Started = Started {
+        pid: None,
+        start: ControllerStartup::Service,
+        manager: Some(crate::service_manager::Manager::Launchd),
+    };
+
     /// The failure of a start that fails after `made` has set what the start made of its request.
     async fn the_failure_after(made: fn(&Launching)) -> StartFailed {
         let failed = prove(
@@ -425,14 +429,20 @@ mod tests {
         failed
     }
 
-    /// A start that asked and was not answered made a start whose daemon may still come up; one
-    /// that was refused before it asked made none.
+    /// The start that a failed start made is the one that the start or its request gave: a child
+    /// that was started, and the manager that was asked, each as it is. A start that asked and was
+    /// not answered made a start whose daemon may still come up; one that was refused before it
+    /// asked made none.
     #[tokio::test(start_paused = true)]
     async fn a_failed_start_that_asked_made_a_start_and_one_refused_before_it_asked_made_none() {
-        let asked = the_failure_after(Launching::start_made).await;
-        assert!(asked.made && asked.may_still_start);
+        let asked = the_failure_after(|launched| launched.start_made(CHILD)).await;
+        assert_eq!(asked.made, Some(CHILD));
+        assert!(asked.may_still_start);
+        let asked = the_failure_after(|launched| launched.start_made(SERVICE)).await;
+        assert_eq!(asked.made, Some(SERVICE));
+        assert!(asked.may_still_start);
         let refused = the_failure_after(|_| {}).await;
-        assert!(!refused.made && !refused.may_still_start);
+        assert!(refused.made.is_none() && !refused.may_still_start);
     }
 
     /// A process that was started and was seen to end made a start that no daemon may still come
@@ -442,11 +452,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_failed_start_whose_child_started_and_ended_made_a_start_with_no_daemon_to_come() {
         let failed = the_failure_after(|launched| {
-            launched.start_made();
+            launched.start_made(CHILD);
             launched.process_ended();
         })
         .await;
-        assert!(failed.made, "a start was made");
+        assert_eq!(failed.made, Some(CHILD), "a start was made");
         assert!(!failed.may_still_start, "and no daemon may still come up");
     }
 

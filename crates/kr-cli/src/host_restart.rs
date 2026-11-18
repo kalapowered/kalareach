@@ -38,7 +38,7 @@ use crate::host_stop::{
 use crate::report::Completion;
 use crate::resolve::KnownEnvironment;
 use crate::restart_launch;
-use crate::startup::{self, Started, Unstartable};
+use crate::startup::{self, Launching, Started, Unstartable};
 use record::{Last, Lock, Record};
 
 /// Where a restart is past its stop. The stop's own stages stand in the [`Progress`] that the work
@@ -798,7 +798,7 @@ async fn wait_for_the_successor(
     }
     Err(StartFailed {
         error: None,
-        made: false,
+        made: None,
         may_still_start: false,
     })
 }
@@ -1164,14 +1164,25 @@ pub(crate) struct StartFailed {
     /// What the start said in its own words, where the start itself failed: none where the daemon
     /// that answered is what the record shows.
     pub(crate) error: Option<CliError>,
-    /// Whether a start was made: a daemon was started, or the service manager or the task was
-    /// asked to start one, whether or not that daemon may still come up.
-    pub(crate) made: bool,
+    /// The start that was made, as the start or its request gave it: the daemon this command
+    /// started, or the service manager or the task that it asked to start one, whether or not that
+    /// daemon may still come up; none where no start was made.
+    pub(crate) made: Option<Started>,
     /// Whether the daemon that the start asked for may still come up.
     pub(crate) may_still_start: bool,
 }
 
 impl StartFailed {
+    /// The failure of a start that made what `launched` says it made, with the start's own words
+    /// where the start itself failed.
+    pub(super) fn after(launched: &Launching, error: Option<CliError>) -> Self {
+        Self {
+            error,
+            made: launched.made(),
+            may_still_start: launched.may_still_start(),
+        }
+    }
+
     /// Reports the failure: what the record shows after one more read of the endpoint and of the
     /// lock, and the record of the attempt as a failed start. A daemon that gives a usable greeting
     /// once the record is written makes the failure moot, and the record goes.
@@ -1202,7 +1213,7 @@ impl StartFailed {
         }
         let own = self.error.as_ref().map(Said::said);
         let message = failed_said(id, Some(came), &read, self.may_still_start, own.as_ref());
-        let facts = self.facts(environment, facts);
+        let facts = self.facts(facts);
         let error = match self.error {
             Some(CliError::HostUnavailable(_)) => CliError::HostUnavailable(message),
             Some(CliError::Unfinished { code, .. }) => CliError::Unfinished { code, message },
@@ -1214,16 +1225,17 @@ impl StartFailed {
         host_stop::failed(error, &facts, json)
     }
 
-    /// The facts of the failure's result: what this command asked for. A start that asked for a
-    /// daemon says which start it asked for, without a process, since none was read; one that
-    /// asked for nothing says so.
-    fn facts(&self, environment: &KnownEnvironment, facts: &Facts) -> Facts {
+    /// The facts of the failure's result: what this command asked for. A start that was made says
+    /// which start it made, as the start or its request gave it and not as the environment
+    /// chooses by now, without a process, since none was read; one that made none says so.
+    fn facts(&self, facts: &Facts) -> Facts {
         Facts {
-            launched: Some(if self.made {
-                Launched::Start(startup::chosen_start_fact(environment))
-            } else {
-                Launched::Nothing
-            }),
+            launched: Some(self.made.as_ref().map_or(Launched::Nothing, |started| {
+                Launched::Start(StartedFact {
+                    pid: None,
+                    ..started_fact(started)
+                })
+            })),
             ..facts.clone()
         }
     }
@@ -1502,9 +1514,11 @@ pub(crate) mod tests {
     }
 
     /// Every result of a restart carries `launched`: null where nothing was started or asked, the
-    /// start's kind where a failed start asked for one (no process was read), `unknown` for an
+    /// start's kind where a failed start made one (no process was read), `unknown` for an
     /// interrupt while the start runs, and the success's own form; a stop's result carries none.
-    /// The kind of a failed start is the platform's word for the start the environment chooses.
+    /// The kind of a failed start is the kind of the start that was made, as the start or its
+    /// request gave it: the environment's choice, changed between the request and the report,
+    /// does not change it.
     #[test]
     fn every_result_of_a_restart_says_what_it_started_or_asked_for() {
         let (_temp, environment) = an_environment();
@@ -1518,55 +1532,53 @@ pub(crate) mod tests {
         );
         let nothing = StartFailed {
             error: None,
-            made: false,
+            made: None,
             may_still_start: false,
         };
         assert_eq!(
-            nothing
-                .facts(&environment, &facts)
-                .launched
-                .map(Launched::parts),
+            nothing.facts(&facts).launched.map(Launched::parts),
             Some(None),
             "a failed start that asked for nothing"
         );
         let standalone_word = if cfg!(windows) { "task" } else { "standalone" };
-        let service_word = if cfg!(windows) {
-            "task"
-        } else if cfg!(target_os = "macos") {
-            "launchd"
-        } else {
-            "systemd"
+        let service = Started {
+            pid: None,
+            start: ControllerStartup::Service,
+            manager: Some(crate::service_manager::Manager::Systemd),
         };
         let document = crate::doctor::configuration::document_path(&environment.paths);
-        for (chosen, expected) in [
-            (None, standalone_word),
-            (Some("standalone"), standalone_word),
-            (Some("service"), service_word),
+        let choose = |chosen: &str| {
+            let text = format!(
+                r#"{{"version": 1, "revision": 1, "startup": {{"controller": "{chosen}"}}}}"#
+            );
+            kr_ipc::paths::write_owner_only_file(&document, text.as_bytes())
+                .expect("the choice is written");
+        };
+        // The environment chooses one start when the request is made and the other by the time the
+        // failure is reported: the start that was made is the one that the request gave.
+        for (started, expected, at_the_request, by_the_report) in [
+            (standalone(77), standalone_word, "standalone", "service"),
+            (service, "systemd", "service", "standalone"),
         ] {
-            if let Some(chosen) = chosen {
-                let text = format!(
-                    r#"{{"version": 1, "revision": 1, "startup": {{"controller": "{chosen}"}}}}"#
-                );
-                kr_ipc::paths::write_owner_only_file(&document, text.as_bytes())
-                    .expect("the choice is written");
-            }
+            choose(at_the_request);
+            let launching = Launching::default();
+            launching.start_made(started);
+            choose(by_the_report);
             // The start's kind does not depend on whether its daemon may still come up: a child
             // that started and ended made a start as well.
             for may_still_start in [true, false] {
                 let failed = StartFailed {
                     error: None,
-                    made: true,
+                    made: launching.made(),
                     may_still_start,
                 };
-                let said = failed
-                    .facts(&environment, &facts)
-                    .launched
-                    .map(Launched::parts);
+                let said = failed.facts(&facts).launched.map(Launched::parts);
                 assert_eq!(
                     said,
                     Some(Some((expected, None))),
-                    "a failed start that asked for a daemon (it may still come up: \
-                     {may_still_start}), the environment choosing {chosen:?}"
+                    "a failed start that made {started:?} (its daemon may still come up: \
+                     {may_still_start}), the environment choosing {at_the_request} at the request \
+                     and {by_the_report} at the report"
                 );
             }
         }
@@ -1629,7 +1641,7 @@ pub(crate) mod tests {
             error: Some(CliError::HostUnavailable(Shown::said(
                 "the start's own words",
             ))),
-            made: true,
+            made: Some(standalone(77)),
             may_still_start: true,
         }
         .reported(
@@ -1777,7 +1789,7 @@ pub(crate) mod tests {
             let _ = progress.with_marker(|marker| marker.told());
             let _ = StartFailed {
                 error: None,
-                made: false,
+                made: None,
                 may_still_start: false,
             }
             .reported(
@@ -1809,7 +1821,7 @@ pub(crate) mod tests {
         ) -> String {
             let completion = StartFailed {
                 error: None,
-                made: false,
+                made: None,
                 may_still_start: false,
             }
             .reported(
@@ -2304,10 +2316,10 @@ pub(crate) mod tests {
                 } else {
                     (*label).to_owned()
                 };
-                // A failed start that asked for a daemon says its kind and no process. The kind
-                // here is this table's own rule for the shape, not the product's choice of it
-                // (`StartFailed::facts`, which reads the environment's chosen start): the member
-                // case of `every_result_of_a_restart_says_what_it_started_or_asked_for` holds that
+                // A failed start that made a start says its kind and no process. The kind here is
+                // this table's own rule for the shape, not the product's own carrying of it
+                // (`StartFailed::facts`): the member case of
+                // `every_result_of_a_restart_says_what_it_started_or_asked_for` holds that
                 // function, and the start-up target's two Linux cases hold it end to end.
                 let asked = started.as_ref().map_or(Launched::Nothing, |started| {
                     Launched::Start(StartedFact {
