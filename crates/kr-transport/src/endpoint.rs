@@ -51,8 +51,8 @@ use iroh::endpoint::{
     RelayStatus, VarInt, presets,
 };
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
-    Watcher,
+    Endpoint, EndpointAddr, EndpointId, NetReportConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
+    TransportAddr, Watcher,
 };
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use iroh_mdns_address_lookup::MdnsAddressLookup;
@@ -64,6 +64,8 @@ use rustls_pki_types::CertificateDer;
 
 use crate::config::{EndpointConfig, PublishedAddresses};
 use crate::error::{RelayRefusal, Result, TransportError};
+use crate::front::RelayFront;
+use crate::proxy::ProxyCredential;
 use crate::streams::MAX_PENDING_HEADERS;
 
 /// How often an idle connection sends a QUIC keepalive.
@@ -167,6 +169,55 @@ pub(crate) async fn bind_sharing_map(
     accept: bool,
     name_server: Option<std::net::SocketAddr>,
 ) -> Result<(Endpoint, RelayMap)> {
+    // Only the network endpoint takes a login, and it has an owner for the front that serves it.
+    refuse_a_login(config)?;
+    bind_with_front(config, identity, accept, name_server)
+        .await
+        .map(|(endpoint, map, _)| (endpoint, map))
+}
+
+/// Refuses a configuration whose proxy holds a login, for a caller that has no owner for the front
+/// a login needs.
+fn refuse_a_login(config: &EndpointConfig) -> Result<()> {
+    if config
+        .proxy_url
+        .as_ref()
+        .is_some_and(|proxy| proxy.login().is_some())
+    {
+        return Err(TransportError::Configuration {
+            what: "proxy_url".to_owned(),
+            kind: "proxy",
+            reason: "this endpoint does not take a proxy that holds a login".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Builds the endpoint that serves the host's network, and the closer that owns its end.
+///
+/// A proxy that holds a login is reached through a loopback front that the closer holds; see
+/// [`crate::front`]. The endpoint listens for KalaReach connections, as [`bind_listener`] does.
+///
+/// # Errors
+///
+/// As [`bind_listener`], and [`TransportError::Configuration`] when the proxy holds a login and
+/// the configuration names no opener for the front.
+pub async fn bind_network(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+) -> Result<(Endpoint, EndpointCloser)> {
+    let (endpoint, _, front) = bind_with_front(config, identity, true, None).await?;
+    let closer = EndpointCloser::new(endpoint.clone(), front);
+    Ok((endpoint, closer))
+}
+
+/// Builds the endpoint, and with it the front that a proxy's login needs, which the caller owns.
+async fn bind_with_front(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+    accept: bool,
+    name_server: Option<std::net::SocketAddr>,
+) -> Result<(Endpoint, RelayMap, Option<RelayFront>)> {
     let seed = identity.export_endpoint_seed();
     let secret_key = SecretKey::from_bytes(seed.expose());
     let mode = relay_mode(config);
@@ -213,8 +264,42 @@ pub(crate) async fn bind_sharing_map(
     // when the proxy cannot be reached: the owner chose to go through it. With none named, the
     // net report's probes go direct. `proxy_from_env` is never called, because the proxy is this
     // configuration's to name.
+    //
+    // A proxy that holds a login is never given to the library. It gets the address of a front on
+    // the loopback instead, which opens each tunnel through the host's own writer, so the library
+    // never holds the login and writes it from no task of its own. The front serves no forwarded
+    // request, so the captive-portal check, which is one, is off for it.
+    let mut front = None;
     if let Some(proxy) = &config.proxy_url {
-        builder = builder.proxy_url(proxy.as_url().clone());
+        match proxy.login() {
+            None => builder = builder.proxy_url(proxy.as_url().clone()),
+            Some(login) => {
+                let opener =
+                    config
+                        .login_front
+                        .as_ref()
+                        .ok_or_else(|| TransportError::Configuration {
+                            what: "proxy_url".to_owned(),
+                            kind: "proxy",
+                            reason:
+                                "a proxy that holds a login needs the front that opens its tunnels"
+                                    .to_owned(),
+                        })?;
+                let started = RelayFront::start(
+                    std::sync::Arc::clone(&opener.0),
+                    relay_map.clone(),
+                    login.verdict(),
+                )
+                .await
+                .map_err(|error| TransportError::Bind(error.to_string()))?;
+                let mut report = NetReportConfig::default();
+                report.captive_portal_check = false;
+                builder = builder
+                    .proxy_url(started.proxy_url())
+                    .net_report_config(report);
+                front = Some(started);
+            }
+        }
     }
     builder = apply_discovery(builder, config)?;
 
@@ -238,11 +323,265 @@ pub(crate) async fn bind_sharing_map(
         // path. Every packet then goes through the selected relay, because there is nothing else.
         builder = builder.clear_ip_transports();
     }
+    // A failed bind drops the front with this call: its tasks end with it.
     let endpoint = builder
         .bind()
         .await
         .map_err(|error| TransportError::Bind(error.to_string()))?;
-    Ok((endpoint, relay_map))
+    Ok((endpoint, relay_map, front))
+}
+
+/// What a closer runs in place of its endpoint's own close, for a case that has no endpoint.
+#[cfg(any(test, feature = "testing"))]
+type CloseFn = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// What the closer owns until its owner task takes it.
+struct CloserParts {
+    endpoint: Option<Endpoint>,
+    front: Option<RelayFront>,
+    #[cfg(any(test, feature = "testing"))]
+    gate: Option<CloseFn>,
+    #[cfg(any(test, feature = "testing"))]
+    replacement: Option<CloseFn>,
+}
+
+struct CloserInner {
+    front_address: Option<std::net::SocketAddr>,
+    #[cfg(any(test, feature = "testing"))]
+    front_probe: Option<crate::front::FrontProbe>,
+    started: std::sync::atomic::AtomicBool,
+    parts: std::sync::Mutex<Option<CloserParts>>,
+    done: tokio::sync::watch::Sender<bool>,
+    #[cfg(any(test, feature = "testing"))]
+    steps: std::sync::Mutex<Vec<&'static str>>,
+}
+
+/// The one owner of the network endpoint's end, and of the front that serves its proxy.
+///
+/// Every caller of [`EndpointCloser::close`] waits for the same completion. The first caller
+/// starts one task that owns the whole end, so no caller's cancellation can interrupt it: it runs
+/// the endpoint's own close with the front still serving, so that the close frames to peers
+/// travel through the tunnels that are open and every redial in the drain is refused at the front,
+/// and then it shuts the front down, and only then does it publish that the end is complete.
+/// [`EndpointCloser::closed`] therefore reads true only when the endpoint's close has returned and
+/// the front holds no task and no open port.
+#[derive(Clone)]
+pub struct EndpointCloser(std::sync::Arc<CloserInner>);
+
+impl std::fmt::Debug for EndpointCloser {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("EndpointCloser")
+    }
+}
+
+impl EndpointCloser {
+    pub(crate) fn new(endpoint: Endpoint, front: Option<RelayFront>) -> Self {
+        Self::of(CloserParts {
+            endpoint: Some(endpoint),
+            front,
+            #[cfg(any(test, feature = "testing"))]
+            gate: None,
+            #[cfg(any(test, feature = "testing"))]
+            replacement: None,
+        })
+    }
+
+    fn of(parts: CloserParts) -> Self {
+        let (done, _) = tokio::sync::watch::channel(false);
+        Self(std::sync::Arc::new(CloserInner {
+            front_address: parts.front.as_ref().map(RelayFront::address),
+            #[cfg(any(test, feature = "testing"))]
+            front_probe: parts.front.as_ref().map(RelayFront::probe),
+            started: std::sync::atomic::AtomicBool::new(false),
+            parts: std::sync::Mutex::new(Some(parts)),
+            done,
+            #[cfg(any(test, feature = "testing"))]
+            steps: std::sync::Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// A closer with no endpoint, whose close is `close`, for a case that holds the close.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn for_test(close: CloseFn) -> Self {
+        Self::of(CloserParts {
+            endpoint: None,
+            front: None,
+            gate: None,
+            replacement: Some(close),
+        })
+    }
+
+    /// Holds this closer's real close at `gate`: the owner awaits the gate, then calls the
+    /// endpoint's own close, then shuts the front down, then publishes. For a case that has to see
+    /// the endpoint while its close is held.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn with_gate(self, gate: CloseFn) -> Self {
+        if let Some(parts) = self
+            .0
+            .parts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+        {
+            parts.gate = Some(gate);
+        }
+        self
+    }
+
+    /// The address of the front this closer owns, if it owns one.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn front_address(&self) -> Option<std::net::SocketAddr> {
+        self.0.front_address
+    }
+
+    /// The counters and the secret of the front this closer owns, if it owns one.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn front_probe(&self) -> Option<crate::front::FrontProbe> {
+        self.0.front_probe.clone()
+    }
+
+    /// The steps the owner took, in order, for a case that checks the order.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn steps(&self) -> Vec<&'static str> {
+        self.0
+            .steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Whether the end is complete: the endpoint's close has returned and the front is gone.
+    #[must_use]
+    pub fn closed(&self) -> bool {
+        *self.0.done.borrow()
+    }
+
+    /// Whether the end has started.
+    #[must_use]
+    pub fn closing(&self) -> bool {
+        self.0.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Ends the endpoint, and waits until the end is complete. Every caller waits for the same
+    /// end, and a caller that is cancelled leaves it to finish.
+    pub async fn close(&self) {
+        if self
+            .0
+            .started
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            let parts = self
+                .0
+                .parts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let inner = std::sync::Arc::clone(&self.0);
+            tokio::spawn(async move {
+                if let Some(parts) = parts {
+                    own_the_end(&inner, parts).await;
+                }
+                inner.done.send_replace(true);
+            });
+        }
+        let mut done = self.0.done.subscribe();
+        // The sender lives in the shared state this very call holds.
+        let _ = done.wait_for(|complete| *complete).await;
+    }
+}
+
+/// The owner's steps, in order: the gate of a case, the endpoint's close with the front still
+/// serving, and the front's shutdown.
+async fn own_the_end(inner: &CloserInner, parts: CloserParts) {
+    #[cfg(any(test, feature = "testing"))]
+    let note = |step: &'static str| {
+        inner
+            .steps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(step);
+    };
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = inner;
+    #[cfg(any(test, feature = "testing"))]
+    {
+        if let Some(gate) = parts.gate {
+            gate().await;
+            note("gate");
+        }
+        if let Some(replacement) = parts.replacement {
+            replacement().await;
+            note("close");
+        }
+    }
+    if let Some(endpoint) = parts.endpoint {
+        endpoint.close().await;
+        #[cfg(any(test, feature = "testing"))]
+        note("close");
+    }
+    if let Some(front) = parts.front {
+        front.shutdown().await;
+        #[cfg(any(test, feature = "testing"))]
+        note("front");
+    }
+}
+
+/// Watches a login's verdict and ends the network endpoint when it is set.
+///
+/// One task, held beside the endpoint and aborted when the guard drops; the abort does not reach
+/// the close, which has one owner of its own. A refusal reaches the verdict through the host's
+/// writer, which a front tunnel's `407` or any other client's sets, so this task reads no error of
+/// the network library.
+pub struct ProxyGuard {
+    closer: EndpointCloser,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for ProxyGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProxyGuard")
+    }
+}
+
+impl ProxyGuard {
+    /// Whether the endpoint's end is complete.
+    #[must_use]
+    pub fn proxy_closed(&self) -> bool {
+        self.closer.closed()
+    }
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Starts the guard of `login`'s verdict over `closer`. A verdict that was set before the guard
+/// started closes the endpoint at once.
+#[must_use]
+pub fn guard_proxy(closer: &EndpointCloser, login: &ProxyCredential) -> ProxyGuard {
+    let watched = closer.clone();
+    let login = login.clone();
+    let task = tokio::spawn(async move {
+        login.stopped_wait().await;
+        watched.close().await;
+    });
+    ProxyGuard {
+        closer: closer.clone(),
+        task,
+    }
 }
 
 /// Opens a connection to `peer`, and names the relay that could not be used when that is why no
@@ -1766,5 +2105,197 @@ mod tests {
         );
         assert_eq!(endpoint.id().as_bytes(), identity.public().as_bytes());
         endpoint.close().await;
+    }
+
+    /// A closer whose close waits on a gate and counts its calls.
+    fn held_closer() -> (
+        EndpointCloser,
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (held, counted) = (std::sync::Arc::clone(&gate), std::sync::Arc::clone(&calls));
+        let closer = EndpointCloser::for_test(Box::new(move || {
+            Box::pin(async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.notified().await;
+            })
+        }));
+        (closer, gate, calls)
+    }
+
+    /// KR-REQ-10.02: two callers of the close wait for the same end: the close runs once, and while
+    /// it is held neither caller has returned and `closed()` reads false.
+    #[tokio::test]
+    async fn two_callers_of_the_close_wait_for_the_same_end() {
+        let (closer, gate, calls) = held_closer();
+        let first = tokio::spawn({
+            let closer = closer.clone();
+            async move { closer.close().await }
+        });
+        let second = tokio::spawn({
+            let closer = closer.clone();
+            async move { closer.close().await }
+        });
+        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!closer.closed() && !first.is_finished() && !second.is_finished());
+        gate.notify_one();
+        first.await.expect("the first caller");
+        second.await.expect("the second caller");
+        assert!(closer.closed());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the close ran once"
+        );
+        closer.close().await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a later caller closes nothing"
+        );
+    }
+
+    /// KR-REQ-10.02: a guard that is cancelled while the drain is under way leaves the close to
+    /// finish, and the end is published only once the close returns.
+    #[tokio::test]
+    async fn a_guard_cancelled_during_the_drain_leaves_the_close_to_finish() {
+        let (closer, gate, calls) = held_closer();
+        let login = crate::proxy::ProxyCredential::new(
+            kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+            kr_crypto::secret::SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login");
+        let guard = guard_proxy(&closer, &login);
+        login.refuse(crate::proxy::StopKind::Refused);
+        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(!closer.closed(), "the guard's end does not end the drain");
+        gate.notify_one();
+        closer.close().await;
+        assert!(closer.closed());
+    }
+
+    /// KR-REQ-10.02: a guard that is built after the verdict closes the endpoint with no further
+    /// event.
+    #[tokio::test]
+    async fn a_guard_built_after_the_verdict_closes_at_once() {
+        let (closer, gate, calls) = held_closer();
+        gate.notify_one();
+        let login = crate::proxy::ProxyCredential::new(
+            kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+            kr_crypto::secret::SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login");
+        login.refuse(crate::proxy::StopKind::Unsupported);
+        let guard = guard_proxy(&closer, &login);
+        closer.close().await;
+        assert!(guard.proxy_closed());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// KR-REQ-10.02: the endpoint takes no proxy that holds a login unless a front opens its
+    /// tunnels, and the public bind functions have no owner for a front, so they take none.
+    #[tokio::test]
+    async fn an_endpoint_is_never_given_a_login_in_its_proxy_url() {
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let login = crate::proxy::ProxyCredential::new(
+            kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+            kr_crypto::secret::SecretVec::new(b"pw0rd-secret".to_vec()),
+        )
+        .expect("a login");
+        let proxy: crate::config::ProxyUrl = "https://proxy.example:3128".parse().expect("a proxy");
+        let config = EndpointConfig {
+            proxy_url: Some(proxy.with_login(login)),
+            ..EndpointConfig::default()
+        };
+        for refused in [
+            bind_listener(&config, &identity).await.err(),
+            bind_dialer(&config, &identity).await.err(),
+            bind_network(&config, &identity).await.err(),
+        ] {
+            let refused = refused.expect("the bind is refused");
+            assert!(
+                matches!(refused, TransportError::Configuration { .. }),
+                "{refused:?}"
+            );
+            assert!(!format!("{refused} {refused:?}").contains("pw0rd-secret"));
+        }
+    }
+
+    /// KR-REQ-10.02: the closer ends the front after the endpoint's own close. With the real close
+    /// held at the gate the endpoint is open and the front still serves; after the release, at the
+    /// first instant the end reads complete, the endpoint is closed and a connect to the front's
+    /// port is refused by the system, and the steps ran in order.
+    #[tokio::test]
+    async fn the_closer_ends_the_front_after_iroh_closes() {
+        struct NoTunnels;
+        impl crate::front::TunnelOpener for NoTunnels {
+            fn open<'a>(
+                &'a self,
+                _host: &'a str,
+                _port: u16,
+            ) -> futures::future::BoxFuture<
+                'a,
+                std::result::Result<crate::front::Tunnel, crate::front::TunnelRefusal>,
+            > {
+                Box::pin(async { Err(crate::front::TunnelRefusal::Failed) })
+            }
+        }
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let login = crate::proxy::ProxyCredential::new(
+            kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+            kr_crypto::secret::SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login");
+        let proxy: crate::config::ProxyUrl = "https://proxy.example:3128".parse().expect("a proxy");
+        let config = EndpointConfig {
+            relay_urls: vec!["https://relay.example./".parse().expect("a relay")],
+            proxy_url: Some(proxy.with_login(login)),
+            login_front: Some(crate::front::FrontOpener(std::sync::Arc::new(NoTunnels))),
+            ..EndpointConfig::default()
+        };
+        let (endpoint, closer) = bind_network(&config, &identity)
+            .await
+            .expect("a network endpoint");
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let closer = closer.with_gate({
+            let (gate, entered) = (
+                std::sync::Arc::clone(&gate),
+                std::sync::Arc::clone(&entered),
+            );
+            Box::new(move || {
+                Box::pin(async move {
+                    entered.notify_one();
+                    gate.notified().await;
+                })
+            })
+        });
+        let address = closer.front_address().expect("a front");
+        let closing = tokio::spawn({
+            let closer = closer.clone();
+            async move { closer.close().await }
+        });
+        entered.notified().await;
+        assert!(!closer.closed() && !endpoint.is_closed());
+        assert!(
+            tokio::net::TcpStream::connect(address).await.is_ok(),
+            "the front still serves while the close is held"
+        );
+        gate.notify_one();
+        closing.await.expect("the close");
+        assert!(closer.closed() && endpoint.is_closed());
+        assert!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            "a connect to the port is refused by the system"
+        );
+        assert_eq!(closer.steps(), ["gate", "close", "front"]);
     }
 }

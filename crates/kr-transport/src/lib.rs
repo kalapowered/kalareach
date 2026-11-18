@@ -44,6 +44,8 @@
 //! | [`reconnect`] | Backoff, and the input lane a reconnect never carries across |
 //! | [`clock`] | The suspend-aware continuous clock every deadline is measured on |
 //! | [`listener`] | One registration call for the host |
+//! | [`proxy`] | A proxy's login, the verdict on it, and the gate that keeps it on the host's own paths |
+//! | [`front`] | The loopback front that gives the network library a proxy with no login in it |
 //!
 //! # What this crate does not do
 //!
@@ -60,11 +62,13 @@ pub mod deadlines;
 pub mod dialler;
 pub mod endpoint;
 pub mod error;
+pub mod front;
 pub mod handshake;
 pub mod lease;
 pub mod listener;
 mod pkarr;
 pub mod preauth;
+pub mod proxy;
 pub mod random;
 pub mod reconnect;
 pub mod scheduler;

@@ -31,6 +31,8 @@ use kr_protocol::scalars::Nullable;
 pub use url::Url;
 
 use crate::error::{Result, TransportError};
+use crate::front::FrontOpener;
+use crate::proxy::ProxyCredential;
 
 /// How long a published discovery record stays valid, in seconds.
 ///
@@ -164,23 +166,54 @@ pub struct EndpointConfig {
     /// nothing reads it from the environment. `None` sends every one of those requests directly,
     /// whatever the environment's proxy variables name, as [`crate::endpoint`] explains.
     pub proxy_url: Option<ProxyUrl>,
+    /// How the endpoint reaches a proxy that holds a login.
+    ///
+    /// A proxy that holds a login is never given to the network library: the endpoint starts a
+    /// loopback front of its own and gives the library that, and each tunnel the front opens is
+    /// opened by this opener, which writes the login. A proxy with no login needs none, and an
+    /// endpoint whose proxy holds one and has no opener does not bind.
+    pub login_front: Option<FrontOpener>,
 }
 
 /// The HTTP proxy an endpoint reaches its relays and Pkarr servers through, named by its origin.
 ///
 /// An `http` or `https` scheme, a host and an optional port, and nothing after them. A proxy URL
-/// that names a user or a password cannot be built: a proxy that needs credentials is not
-/// supported, and a credential is never dropped to use the proxy without it, because the proxy
-/// would then turn every request away. So a value of this type carries no credential, and
-/// printing one prints none.
+/// that names a user or a password cannot be built: a login is given apart from the address
+/// ([`ProxyUrl::with_login`]), and a credential is never dropped to use the proxy without it,
+/// because the proxy would then turn every request away. So the address never carries a
+/// credential, and printing one prints none, whether it holds a login or not.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProxyUrl(Url);
+pub struct ProxyUrl {
+    url: Url,
+    login: Option<ProxyCredential>,
+}
 
 impl ProxyUrl {
-    /// Returns the proxy's URL.
+    /// Returns the proxy's URL: its origin, with no user and no password.
     #[must_use]
     pub fn as_url(&self) -> &Url {
-        &self.0
+        &self.url
+    }
+
+    /// Returns this proxy with `login` as the login it is asked for. The address itself still
+    /// prints, and compares as a plain origin does.
+    #[must_use]
+    pub fn with_login(mut self, login: ProxyCredential) -> Self {
+        self.login = Some(login);
+        self
+    }
+
+    /// Returns the login this proxy holds, if it holds one.
+    #[must_use]
+    pub fn login(&self) -> Option<&ProxyCredential> {
+        self.login.as_ref()
+    }
+
+    /// Returns this proxy with no login.
+    #[must_use]
+    pub fn without_login(mut self) -> Self {
+        self.login = None;
+        self
     }
 }
 
@@ -218,13 +251,13 @@ impl std::str::FromStr for ProxyUrl {
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
             return Err(ProxyUrlError::NotAnOrigin);
         }
-        Ok(Self(url))
+        Ok(Self { url, login: None })
     }
 }
 
 impl std::fmt::Display for ProxyUrl {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
+        self.url.fmt(formatter)
     }
 }
 
@@ -373,6 +406,7 @@ impl EndpointConfig {
             relay_only: false,
             relay_ca_roots: Vec::new(),
             proxy_url: None,
+            login_front: None,
         })
     }
 
@@ -504,6 +538,7 @@ mod tests {
             relay_only: false,
             relay_ca_roots: Vec::new(),
             proxy_url: None,
+            login_front: None,
         }
     }
 

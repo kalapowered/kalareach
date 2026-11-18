@@ -31,7 +31,9 @@ use crate::clock::{ContinuousClock, ContinuousInstant, SystemContinuousClock};
 use crate::codec::{FrameReader, FrameWriter};
 use crate::config::EndpointConfig;
 use crate::deadlines::{Deadlines, TimerDeadlines};
-use crate::endpoint::{KEEPALIVE, allow_data_streams, bind_listener, withdraw_data_streams};
+use crate::endpoint::{
+    EndpointCloser, KEEPALIVE, allow_data_streams, bind_network, withdraw_data_streams,
+};
 use crate::error::{Result, TransportError};
 use crate::handshake::{Admitted, HostEpochs, LocalIdentity, PairedDirectory};
 use crate::preauth::{PairingSurface, PreAuthLimits};
@@ -856,17 +858,23 @@ impl ConnectionTasks {
 /// that each peer is told its connection is closed instead of waiting for it to time out.
 ///
 /// The endpoint is closed after the tasks have gone because a task's own close, with the code a lost
-/// control stream gives, has then been made before the endpoint closes what is left with none.
-async fn wind_down(endpoint: Endpoint, connections: Arc<ConnectionTasks>) {
+/// control stream gives, has then been made before the endpoint closes what is left with none. The
+/// close goes through the endpoint's one closer, so it is the same close that a proxy's refusal
+/// starts, and a caller that arrives second waits for the first.
+async fn wind_down(closer: EndpointCloser, connections: Arc<ConnectionTasks>) {
     let mut ended = connections.take_ended();
     while ended.join_next().await.is_some() {}
-    endpoint.close().await;
+    closer.close().await;
 }
 
 /// A running listener.
-#[derive(Debug)]
+///
+/// Its `Debug` leaves the endpoint out: the endpoint's own `Debug` prints the proxy address the
+/// network library was given, and for a proxy that holds a login that address carries the front's
+/// secret.
 pub struct NetworkListener {
     endpoint: Endpoint,
+    closer: EndpointCloser,
     accept_loop: JoinHandle<()>,
     connections: Arc<ConnectionTasks>,
     /// The runtime the listener was registered on, which closes the endpoint for a listener that is
@@ -878,11 +886,23 @@ pub struct NetworkListener {
     windows: Arc<ActionWindowIssuer>,
 }
 
+impl std::fmt::Debug for NetworkListener {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NetworkListener")
+    }
+}
+
 impl NetworkListener {
     /// Returns the endpoint, for its identity and its addresses.
     #[must_use]
     pub const fn endpoint(&self) -> &Endpoint {
         &self.endpoint
+    }
+
+    /// Returns the closer that owns the end of the endpoint and of the front that serves its proxy.
+    #[must_use]
+    pub const fn closer(&self) -> &EndpointCloser {
+        &self.closer
     }
 
     /// Returns this host's endpoint identity.
@@ -908,9 +928,9 @@ impl NetworkListener {
     /// registered on, and is lost only if that runtime has already ended.
     pub fn end_connections(&self) {
         self.accept_loop.abort();
-        if self.connections.end() && !self.endpoint.is_closed() {
+        if self.connections.end() && !self.closer.closed() {
             let winding = self.runtime.spawn(wind_down(
-                self.endpoint.clone(),
+                self.closer.clone(),
                 Arc::clone(&self.connections),
             ));
             *self
@@ -984,7 +1004,7 @@ pub async fn register_with_clock<H: HostHandler>(
     clock: Arc<dyn ContinuousClock>,
 ) -> Result<NetworkListener> {
     config.send_limits.check()?;
-    let endpoint = bind_listener(&config.endpoint, transport_key).await?;
+    let (endpoint, closer) = bind_network(&config.endpoint, transport_key).await?;
     let windows = Arc::new(ActionWindowIssuer::new(
         Arc::clone(&clock),
         config.action_window_validity,
@@ -1018,6 +1038,7 @@ pub async fn register_with_clock<H: HostHandler>(
 
     Ok(NetworkListener {
         endpoint,
+        closer,
         accept_loop,
         connections,
         runtime: tokio::runtime::Handle::current(),
