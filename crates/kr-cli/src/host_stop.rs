@@ -447,15 +447,36 @@ pub(crate) struct StartedFact {
     pub(crate) pid: Option<u32>,
 }
 
-/// What a restart's result says in `--json` of the daemon that answers and of what this command
-/// launched: absent for a stop.
+/// What a restart's result says in `--json` of the daemon that answers: absent for a stop and for a
+/// failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Answer {
     /// The process the daemon that answers states, where it states one.
     pub(crate) serving: Option<u64>,
-    /// What this command launched, where it launched something, whether or not the daemon that
-    /// answers is the one it made.
-    pub(crate) launched: Option<StartedFact>,
+}
+
+/// What a restart's result says in `--json` of the start that this command made or asked for, in
+/// every result of the command and in none of a stop's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Launched {
+    /// This command started nothing and asked for nothing.
+    Nothing,
+    /// The start that was made or asked for.
+    Start(StartedFact),
+    /// The command cannot tell whether its request for a start left: it was interrupted while the
+    /// start ran.
+    Unknown,
+}
+
+impl Launched {
+    /// The member's two parts, none where nothing was started or asked.
+    pub(crate) const fn parts(self) -> Option<(&'static str, Option<u32>)> {
+        match self {
+            Self::Nothing => None,
+            Self::Start(fact) => Some((fact.start, fact.pid)),
+            Self::Unknown => Some(("unknown", None)),
+        }
+    }
 }
 
 /// The facts a result carries in `--json`.
@@ -466,8 +487,10 @@ pub(crate) struct Facts {
     pub(crate) unsettled: Option<u64>,
     /// What earlier attempts recorded, which this command said at its start.
     pub(crate) records: Vec<Shown>,
-    /// The daemon that answers a restart and what the restart launched: absent for a stop.
+    /// The daemon that answers a restart: absent for a stop and for a failure.
     pub(crate) answer: Option<Answer>,
+    /// What a restart started or asked for: absent for a stop.
+    pub(crate) launched: Option<Launched>,
 }
 
 impl Facts {
@@ -479,6 +502,7 @@ impl Facts {
             unsettled: None,
             records,
             answer: None,
+            launched: None,
         }
     }
 
@@ -489,13 +513,13 @@ impl Facts {
             .with("unsettled", self.unsettled);
         if let Some(answer) = self.answer {
             document.set("serving", answer.serving);
+        }
+        if let Some(launched) = self.launched {
             document.set(
                 "launched",
-                answer.launched.map(|launched| {
-                    Document::new()
-                        .with("start", launched.start)
-                        .with("pid", launched.pid)
-                }),
+                launched
+                    .parts()
+                    .map(|(start, pid)| Document::new().with("start", start).with("pid", pid)),
             );
         }
         if self.records.is_empty() {
@@ -784,7 +808,10 @@ pub(crate) async fn begin(
     progress: &Progress,
 ) -> std::result::Result<Begun, Completion> {
     let id = environment.environment_id;
-    let none = Facts::none(Vec::new());
+    let none = Facts {
+        launched: starts_nothing(which),
+        ..Facts::none(Vec::new())
+    };
     if let Err(error) = crate::bind::require_outside_to_end_a_daemon(
         &crate::build_id(),
         which.command(),
@@ -795,7 +822,10 @@ pub(crate) async fn begin(
         return Err(failed(error, &none, json));
     }
     let mut earlier = Earlier::read(&environment.paths);
-    let none = Facts::none(earlier.said(id));
+    let none = Facts {
+        launched: starts_nothing(which),
+        ..Facts::none(earlier.said(id))
+    };
     *progress
         .earlier
         .lock()
@@ -804,6 +834,15 @@ pub(crate) async fn begin(
         earlier.say(id);
     }
     Ok(Begun { none, earlier })
+}
+
+/// What a result of `which` says of a start before anything was started: a restart says that it
+/// started nothing, and a stop says nothing of a start.
+const fn starts_nothing(which: Which) -> Option<Launched> {
+    match which {
+        Which::Restart => Some(Launched::Nothing),
+        Which::Stop => None,
+    }
 }
 
 /// What the first reach of the endpoint found.
@@ -1682,6 +1721,7 @@ pub(crate) fn say_the_stop(
         unsettled,
         records: none.records.clone(),
         answer: none.answer,
+        launched: none.launched,
     };
     conclude(said.exit, message, &facts, json, earlier)
 }
@@ -2093,6 +2133,7 @@ pub(crate) fn ended_by(
                 unsettled: None,
                 records: none.records.clone(),
                 answer: none.answer,
+                launched: none.launched,
             };
             Ok(conclude(said.exit, words, &facts, json, earlier))
         }
@@ -7234,6 +7275,7 @@ pub(crate) mod tests {
                 unsettled: None,
                 records: Vec::new(),
                 answer: None,
+                launched: None,
             };
             assert!(
                 matches!(done(&said, &facts, true, &earlier), Completion::Done),
