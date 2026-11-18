@@ -332,9 +332,7 @@ fn a_failed_step_is_taken_back_or_left_named_by_what_is_on_disk() {
     std::fs::create_dir_all(tree.directory()).expect("a directory");
     std::fs::create_dir(&run.paths.staging).expect("a directory at the staging name");
     let staging = run.paths.staging.clone();
-    let error = steps::run_all(&mut run, &PUBLISH)
-        .err()
-        .expect("the staging fails");
+    let error = steps::run_all(&mut run, &PUBLISH).expect_err("the staging fails");
     let failure = steps::fail(&mut run, Operation::Publish, error);
     assert!(matches!(failure.tail, Tail::KeptNamed(ref path) if *path == staging));
     assert!(staging.is_dir(), "the directory is untouched");
@@ -349,9 +347,7 @@ fn a_failed_step_is_taken_back_or_left_named_by_what_is_on_disk() {
     std::fs::create_dir_all(tree.dir.path().join("home")).expect("a home");
     std::fs::write(tree.directory(), b"a file").expect("a file where the directory belongs");
     let mut run = tree.run(NEW, None);
-    let error = steps::run_all(&mut run, &PUBLISH)
-        .err()
-        .expect("the directory fails");
+    let error = steps::run_all(&mut run, &PUBLISH).expect_err("the directory fails");
     let failure = steps::fail(&mut run, Operation::Publish, error);
     assert!(matches!(failure.tail, Tail::TookBack));
     assert!(tree.record().is_none(), "no record");
@@ -364,9 +360,7 @@ fn a_failed_step_is_taken_back_or_left_named_by_what_is_on_disk() {
     std::fs::write(tree.directory(), b"a file").expect("a file where the directory belongs");
     let before = tree.record();
     let mut run = tree.run(OLD, before.clone());
-    let error = steps::run_all(&mut run, &PUBLISH)
-        .err()
-        .expect("the directory fails");
+    let error = steps::run_all(&mut run, &PUBLISH).expect_err("the directory fails");
     let failure = steps::fail(&mut run, Operation::Publish, error);
     assert!(matches!(failure.tail, Tail::TookBack));
     assert!(tree.record() == before, "the record is as it was");
@@ -507,9 +501,7 @@ fn a_publication_that_failed_after_the_name_existed_is_finished_not_undone() {
     std::fs::create_dir_all(tree.directory()).expect("a directory");
     let guard = kr_flush::testing::refuse_flushes_of(tree.directory());
     let mut run = tree.run(NEW, None);
-    let error = steps::run_all(&mut run, &PUBLISH)
-        .err()
-        .expect("the flush after the link fails");
+    let error = steps::run_all(&mut run, &PUBLISH).expect_err("the flush after the link fails");
     let failure = steps::fail(&mut run, Operation::Publish, error);
     assert!(matches!(failure.tail, Tail::InPlace));
     assert_eq!(
@@ -537,9 +529,7 @@ fn a_publication_that_failed_after_the_name_existed_is_finished_not_undone() {
     std::fs::create_dir_all(tree.directory()).expect("a directory");
     let guard = kr_flush::testing::refuse_flushes_of(tree.state());
     let mut run = tree.run(NEW, None);
-    let error = steps::run_all(&mut run, &PUBLISH[..1])
-        .err()
-        .expect("the record flush fails");
+    let error = steps::run_all(&mut run, &PUBLISH[..1]).expect_err("the record flush fails");
     drop(guard);
     let failure = steps::fail(&mut run, Operation::Publish, error);
     assert!(
