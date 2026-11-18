@@ -68,8 +68,8 @@ pub const SHARE_WORD: &str = "share";
 /// How long a share lasts when the person names nothing and the device's pairing allows it.
 const DEFAULT_LIFETIME_MS: u64 = 60 * 60_000;
 
-/// The shortest share the host is asked for: a pairing with less left than this ends before a share
-/// can begin.
+/// The shortest share the host is asked for: a pairing with less left than this cannot carry a
+/// share this long.
 const MIN_LIFETIME_MS: u64 = 60_000;
 
 /// What is left of a pairing's end for the host to claim the share in: the host dates a share when
@@ -205,9 +205,9 @@ fn lifetime(asked: Option<Lasts>, pairing_ends_at_ms: Option<u64>, now_ms: u64) 
     };
     if milliseconds < MIN_LIFETIME_MS {
         return Err(CliError::Usage(Shown::said(
-            "that device's pairing ends in less than a minute, so a share to it would hardly \
-             begin; once it has ended, the device has to be paired again before a session is \
-             shared with it",
+            "that device's pairing has too little time left for this share, so a share to it \
+             would hardly begin; once it has ended, the device has to be paired again before a \
+             session is shared with it",
         )));
     }
     Ok(milliseconds)
@@ -2055,19 +2055,32 @@ mod tests {
     /// may still list the device, because a pairing that is out of force need not have ended.
     #[test]
     fn a_device_is_paired_again_only_after_its_pairing_has_ended() {
-        let refused = lifetime(None, Some(NOW + 30_000), NOW).expect_err("less than a minute left");
-        let CliError::Usage(said) = refused else {
-            panic!("a usage mistake: {refused:?}");
-        };
-        let said = said.as_str();
-        assert!(said.contains("once it has ended"), "it says when: {said}");
-        let when = said.find("once it has ended").expect("found above");
-        let again = said.find("paired again").expect(said);
-        assert!(
-            when < again,
-            "the condition comes before the remedy: {said}"
-        );
-        assert!(!said.contains("pair the device again first"), "{said}");
+        // The host dates a share a moment after the person pressed enter, so the margin comes off
+        // what is left before the minimum is tested: 65 seconds left is refused too.
+        for left_ms in [30_000, 65_000] {
+            let refused = lifetime(None, Some(NOW + left_ms), NOW).expect_err("too little left");
+            let CliError::Usage(said) = refused else {
+                panic!("a usage mistake: {refused:?}");
+            };
+            let said = said.as_str();
+            assert!(
+                said.starts_with("that device's pairing has too little time left for this share"),
+                "{left_ms} ms left: {said}"
+            );
+            assert!(
+                !said.contains("less than a minute"),
+                "{left_ms} ms left: {said}"
+            );
+            assert!(said.contains("once it has ended"), "it says when: {said}");
+            let when = said.find("once it has ended").expect("found above");
+            let again = said.find("paired again").expect(said);
+            assert!(
+                when < again,
+                "the condition comes before the remedy: {said}"
+            );
+            assert!(!said.contains("pair the device again first"), "{said}");
+        }
+        lifetime(None, Some(NOW + 75_000), NOW).expect("a minute and a quarter is enough");
 
         let mut ran_out = device(3, "old phone");
         ran_out.grant_expired = true;
