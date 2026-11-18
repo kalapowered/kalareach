@@ -297,6 +297,20 @@ impl EnvironmentPaths {
         // environment whose identity shares that prefix is refused rather than allowed to open
         // another environment's registry, journals and sockets.
         self.claim_identity(&self.runtime_dir)?;
+        self.create_state_dir()
+    }
+
+    /// Creates this environment's state directory and the identity marker in it, and nothing else:
+    /// no runtime directory and none of the state directory's subdirectories.
+    ///
+    /// For a command that keeps one file of its own in the state directory and has nothing to run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the directory cannot be created, when one already exists with wider
+    /// permissions or a different owner, or when its identity belongs to another environment.
+    pub fn create_state_dir(&self) -> Result<()> {
+        create_private_tree(&self.state_root, &self.state_dir)?;
         self.claim_identity(&self.state_dir)
     }
 
@@ -4501,6 +4515,31 @@ mod tests {
             error,
             IpcError::Io { ref source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists
         ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn the_state_directory_alone_is_made_with_its_marker_and_no_runtime_directory() {
+        let root = temporary_root("state-only");
+        let paths = HostPaths::new(root.join("r"), root.join("s")).expect("roots");
+        let environment = paths.environment(EnvironmentId::new(Uuid::from_bytes([9_u8; 16])));
+        environment.create_state_dir().expect("the state directory");
+        let marker = environment.state_dir().join(ENVIRONMENT_MARKER);
+        assert_eq!(
+            std::fs::read_to_string(&marker).expect("the marker").trim(),
+            environment.environment_id().to_string()
+        );
+        let inside = std::fs::read_dir(environment.state_dir())
+            .expect("the directory")
+            .count();
+        assert_eq!(inside, 1, "only the marker is in it");
+        assert!(
+            !environment.runtime_dir().exists(),
+            "no runtime directory was made"
+        );
+        // The whole tree made afterwards is the one `create` has always made.
+        environment.create().expect("the rest");
+        assert!(environment.journals_dir().is_dir());
         std::fs::remove_dir_all(&root).ok();
     }
 
