@@ -1218,9 +1218,10 @@ impl PairingHost {
     ///
     /// This is asked before a first admission's freshness is: a caller that reconnects and repeats
     /// an action it already submitted gets that action's own result, not a refusal about a window
-    /// that has since been replaced. Only the copy of a repeated `pair.cancel` can write: it reads
-    /// the owner's view of the invitation, which anchors a grant that has run out and writes its end
-    /// before it answers.
+    /// that has since been replaced. Only the copy of a repeated `pair.cancel` can write: for an
+    /// invitation refused for a listed device, the owner's view that it reads takes that device's
+    /// grant through the lifetimes' own path, which can write the grant's deadline for this boot,
+    /// the clock's marks and the end of a grant that has run out, before it answers.
     #[must_use]
     pub fn retained(
         &self,
@@ -1674,10 +1675,11 @@ impl PairingHost {
     /// What the peer at `endpoint` is told when its request met `error`.
     ///
     /// An invitation that ended because the host lists the device it was refused for answers that
-    /// device's endpoint, and no other, under the code that says so. Any other peer is told what
-    /// every other ending tells it, under the same code and in the same words, so it is not told
-    /// that the host lists a device that it does not, and cannot tell this ending from a denial, a
-    /// withdrawal or a restart by what it is told.
+    /// device's endpoint, and no other, under the code that says so. Any other peer is told what a
+    /// denial, a withdrawal or a restart tells it, under the same code and in the same words, so it
+    /// is not told that the host lists a device that it does not, and cannot tell this ending from
+    /// those by what it is told. A failed read of the host's record of that device is reported as
+    /// that failure.
     fn refusal_to(
         &self,
         endpoint: &EndpointKey,
@@ -2009,9 +2011,10 @@ fn protocol_refusal(error: kr_pairing::PairingError) -> ProtocolError {
     if code == ErrorCode::PairingAuthFailed {
         return ProtocolError::new(code, AUTHENTICATION_FAILED);
     }
-    // An ending that reports as a rejection says so in one set of words, whichever ending it was:
-    // a peer that names the invitation could otherwise compare the messages of the endings and
-    // learn the reason, among them that the host lists a device.
+    // An invitation consumed under the rejected code is told in one set of words, whatever
+    // consumed it: a peer that names the invitation could otherwise compare the messages of the
+    // endings and learn the reason, among them that the host lists a device. A committed
+    // invitation keeps its own words.
     if code == ErrorCode::PairingRejected
         && matches!(error, kr_pairing::PairingError::Consumed { .. })
     {
@@ -2020,8 +2023,9 @@ fn protocol_refusal(error: kr_pairing::PairingError) -> ProtocolError {
     ProtocolError::new(code, error.to_string())
 }
 
-/// What a peer is told of an invitation that ended under the rejected code, whichever ending it
-/// was: the words give no reason, so no ending can be told from another by them.
+/// What a peer is told of an invitation consumed under the rejected code, whatever consumed it:
+/// the words give no reason, so a denial, a withdrawal, a restart and a listed device cannot be
+/// told apart by them.
 const NO_LONGER_OPEN: &str = "the invitation is no longer open";
 
 /// The one thing a candidate is told when its pairing could not be authenticated.
@@ -2119,7 +2123,8 @@ mod tests {
         ] {
             let told = protocol_refusal(ended_as(state));
             assert_eq!(told.code, code, "an invitation in {state:?}");
-            // Every ending that is rejected is told in the same words, so no reason shows in them.
+            // Every consumed invitation that is rejected is told in the same words, so no reason
+            // shows in them; a committed one keeps its own.
             if code == ErrorCode::PairingRejected && state != InvitationState::Committed {
                 assert_eq!(
                     told.message, NO_LONGER_OPEN,
