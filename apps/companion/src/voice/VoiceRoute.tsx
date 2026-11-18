@@ -27,11 +27,14 @@ import {
   closureWords,
   endedWords,
   unavailableWords,
+  nextLapseOf,
   owedWords,
   problemWords,
   requestedSeconds,
   runningCallFrom,
   serviceWords,
+  startNoticeOf,
+  type AftermathLine,
   type ContextRequest,
   type ProviderChoice,
   type RunningCall
@@ -42,6 +45,7 @@ import { useApp } from '../app/state'
 import {
   failureCode,
   failureMessage as portFailureMessage,
+  failureStartAgainFor,
   follow,
   watch
 } from '../host/port'
@@ -231,6 +235,9 @@ export function VoiceRoute({
    */
   const [waitingForHost, setWaitingForHost] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  // The earlier start that the notice names, when the host's refusal named one that this device
+  // keeps: "Start again" is offered beside the notice, and goes with it.
+  const [noticeStartAgain, setNoticeStartAgain] = useState<string | null>(null)
   /**
    * What this device last said while it held no call: the problems the last call met, what an earlier
    * call left the host to hold open, and, for a call that ended while no screen was looking, how.
@@ -591,10 +598,7 @@ export function VoiceRoute({
 
   // What this device owes lapses by itself, and the device stops saying it then: the screen reads
   // again at the first lapse it is waiting for, so a warning does not outlive what it warns of.
-  const nextLapse = useMemo(() => {
-    const ends = (left?.owed ?? []).map((owed) => owed.until_ms)
-    return ends.length === 0 ? null : Math.min(...ends)
-  }, [left])
+  const nextLapse = useMemo(() => nextLapseOf(left?.owed ?? []), [left])
   const [lapseTries, setLapseTries] = useState(0)
   useEffect(() => {
     if (nextLapse === null) return
@@ -623,12 +627,14 @@ export function VoiceRoute({
 
   /** What the last call left, as lines a person reads before starting another. */
   const aftermath = useMemo(() => {
-    const lines: string[] = []
-    if (endedBefore !== null) lines.push(endedBefore)
-    for (const owed of left?.owed ?? []) lines.push(owedWords(owed))
+    const lines: AftermathLine[] = []
+    if (endedBefore !== null) lines.push({ words: endedBefore, startAction: null })
+    for (const owed of left?.owed ?? []) {
+      lines.push({ words: owedWords(owed), startAction: startNoticeOf(owed) })
+    }
     const service = left?.ended ? serviceWords(left.ended) : null
-    if (service !== null) lines.push(service)
-    for (const words of problemWords(left?.problems ?? [])) lines.push(words)
+    if (service !== null) lines.push({ words: service, startAction: null })
+    for (const words of problemWords(left?.problems ?? [])) lines.push({ words, startAction: null })
     return lines
   }, [endedBefore, left])
 
@@ -729,8 +735,12 @@ export function VoiceRoute({
   )
 
   const actions = useMemo<VoiceSurfaceActions>(
-    () => ({
-      start: () => {
+    () => {
+      /**
+       * Starts a call: the one path "Start" and "Start again" both take, from its first step. A
+       * start that names an earlier one carries that action and nothing else is different.
+       */
+      const begin = (after: string | null): void => {
         // A managed call starts only under terms the person was shown: the start names the
         // version of the rate on screen, and there is no start without one.
         const terms = choice?.managed
@@ -743,6 +753,7 @@ export function VoiceRoute({
         setBusy(true)
         setWaitingForHost(true)
         setNotice(null)
+        setNoticeStartAgain(null)
         setChoiceLostAfterStart(false)
         starting.current = true
         const shown = choice
@@ -753,7 +764,8 @@ export function VoiceRoute({
               durationSeconds: seconds,
               reasoningBudgetMinor: null,
               prepared: shown.prepared,
-              expectedRateVersion: terms.rate.version
+              expectedRateVersion: terms.rate.version,
+              ...(after === null ? {} : { afterActionId: after })
             },
             {}
           )
@@ -834,6 +846,9 @@ export function VoiceRoute({
           })
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
+            // A refusal at the host's hold that names an earlier start this device keeps offers
+            // "Start again", which names it.
+            setNoticeStartAgain(failureStartAgainFor(error instanceof AskFailed ? error.payload : error))
             void ask(() => port.voiceCallState()).then(settle, () => undefined)
           })
           .finally(() => {
@@ -841,6 +856,21 @@ export function VoiceRoute({
             setBusy(false)
             setWaitingForHost(false)
             setEndingSetUp(false)
+          })
+      }
+      return {
+      start: () => {
+        begin(null)
+      },
+      startAfter: (actionId: string) => {
+        begin(actionId)
+      },
+      dismissStart: (actionId: string) => {
+        void ask(() => port.voiceDismissStart(actionId))
+          .then(() => ask(() => port.voiceCallState()))
+          .then(settle)
+          .catch((error: unknown) => {
+            setNotice(failureMessage(error))
           })
       },
 
@@ -974,7 +1004,8 @@ export function VoiceRoute({
             )
           })
       }
-    }),
+      }
+    },
     [busy, choice, endTheCall, port, prepare, sessionIds, settle]
   )
 
@@ -1015,6 +1046,7 @@ export function VoiceRoute({
         busy={busy}
         waiting={waitingForHost}
         notice={notice}
+        noticeStartAgain={noticeStartAgain}
         aftermath={aftermath}
         settingUp={setUp && !call}
         ending={endingSetUp}

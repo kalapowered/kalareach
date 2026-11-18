@@ -480,6 +480,7 @@ async fn start<R: Runtime>(
         prepared["managed"]["rate"]["version"]
             .as_str()
             .map(str::to_owned),
+        None,
     )
     .await;
     watcher.abort();
