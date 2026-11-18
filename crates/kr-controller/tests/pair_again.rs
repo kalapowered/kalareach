@@ -22,10 +22,10 @@ use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::confirmation::ConfirmationSubject;
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{DeviceId, InvitationId};
+use kr_protocol::ids::{ActionId, DeviceId, InvitationId};
 use kr_protocol::invitation::{
-    InviteGrantKind, InviteMode, InviteModeKind, PairConfirmParams, PairInviteParams,
-    PairInviteResult,
+    InviteGrantKind, InviteMode, InviteModeKind, PairConfirmParams, PairConfirmResult,
+    PairInviteParams, PairInviteResult, PairingApproval,
 };
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{DeviceName, PairStatus, PairingConsumedReason, ProposedGrant};
@@ -2240,10 +2240,18 @@ async fn another_device_presenting_the_invitation_that_ended_for_a_listed_device
         ),
     )
     .await;
+    let challenge_refusal = challenged.expect_err("the ended invitation is refused");
     assert_eq!(
-        refusal_code(&challenged.expect_err("the ended invitation is refused")),
+        refusal_code(&challenge_refusal),
         "PAIRING_REJECTED",
         "a device that is not listed is not told that the host lists it"
+    );
+    let kr_transport::TransportError::Refused(told) = &challenge_refusal else {
+        panic!("the host answered with a refusal, not {challenge_refusal:?}");
+    };
+    assert_eq!(
+        told.message, "the invitation is no longer open",
+        "the message holds no reason: a device that is not listed is not told why the invitation ended"
     );
     let proved: Result<kr_protocol::preauth::PairRedeemResult, _> = within(
         "the other device's proof",
@@ -2251,10 +2259,18 @@ async fn another_device_presenting_the_invitation_that_ended_for_a_listed_device
         surface.call(Method::PairRedeem, &listed.request),
     )
     .await;
+    let proof_refusal = proved.expect_err("the ended invitation is refused");
     assert_eq!(
-        refusal_code(&proved.expect_err("the ended invitation is refused")),
+        refusal_code(&proof_refusal),
         "PAIRING_REJECTED",
         "the same at a proof"
+    );
+    let kr_transport::TransportError::Refused(told) = &proof_refusal else {
+        panic!("the host answered with a refusal, not {proof_refusal:?}");
+    };
+    assert_eq!(
+        told.message, "the invitation is no longer open",
+        "the same message at a proof"
     );
 
     // The listed device reads its own code, as before.
@@ -2453,6 +2469,64 @@ async fn the_owners_view_gives_no_record_after_the_record_it_named_ran_out() {
             .await
             .is_none(),
         "the record ran out: the view names no pairing"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the view names a record only while the host lists it, and the host records the end
+/// of a grant that ran out before it answers. The clocks pass the grant of the record the view
+/// named, with no connection of the device and no device list, so nothing but the view's own read
+/// can write the end: the view then gives no record, and the end is on record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_owners_view_gives_no_record_after_the_grant_it_named_ran_out_and_nothing_wrote_its_end()
+ {
+    let (moved, clocks) = Moved::new();
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start_on_clocks(&owner, clocks).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("an invitation");
+    let refused = within(
+        "the redemption",
+        BOUND,
+        calls::try_redeem(&phone.candidate(), &invited),
+    )
+    .await;
+    assert_eq!(
+        refusal_code(refused.outcome.as_ref().expect_err("refused")),
+        "PAIRING_ENDPOINT_PAIRED"
+    );
+    assert!(
+        existing_after_the_refusal(&mut client, &invited)
+            .await
+            .is_some(),
+        "the grant stands: the view names the record"
+    );
+
+    moved.past_the_grant();
+    let path = host.registry_database();
+    assert!(
+        !expired(&path, first.device_id),
+        "no end of the grant is on record before the view is read"
+    );
+    assert!(
+        existing_after_the_refusal(&mut client, &invited)
+            .await
+            .is_none(),
+        "the grant ran out: the view names no pairing"
+    );
+    assert!(
+        expired(&path, first.device_id),
+        "the view's read recorded the end of the grant"
     );
     host.stop().await;
 }
@@ -2942,6 +3016,336 @@ async fn a_grant_that_ran_out_unread_is_recorded_at_the_binding_and_the_device_p
             .map(|record| record.device_id),
         Some(second.device_id),
         "the endpoint identity reads the record that stands"
+    );
+    host.stop().await;
+}
+
+/// Makes the host list the endpoint identity of `phone`, as it is when a device is listed between
+/// its redemption and the owner's approval: the record the host holds for `holder` takes the
+/// identity, the way a record of another pairing would.
+fn list_the_endpoint_of(host: &Host, phone: &Device, holder: DeviceId) {
+    let changed = registry(host)
+        .execute(
+            "UPDATE network_devices SET endpoint_id = ?1 WHERE device_id = ?2",
+            rusqlite::params![
+                endpoint_of(phone).as_bytes().as_slice(),
+                holder.get().as_bytes().as_slice()
+            ],
+        )
+        .expect("the host lists the endpoint identity");
+    assert_eq!(changed, 1, "one record took the identity");
+}
+
+/// The approval of the candidate bound to `invitation_id`, as the owner's view shows it.
+async fn approval_of(client: &mut LocalClient, invitation_id: InvitationId) -> PairingApproval {
+    owner_view(client, invitation_id)
+        .await
+        .expect("the owner's view")
+        .owner
+        .0
+        .and_then(|view| view.approval.0)
+        .expect("a bound candidate the owner can approve")
+}
+
+/// The owner's answer to the confirmation of the candidate bound to `invitation_id`, given and not
+/// yet spent.
+async fn answer_the_confirmation(
+    host: &Host,
+    client: &mut LocalClient,
+    owner: &DeviceKeys,
+    invitation_id: InvitationId,
+) {
+    within(
+        "the owner's answer to the confirmation",
+        BOUND,
+        calls::confirm_subject(
+            host.environment_id,
+            client,
+            ConfirmationSubject::ConfirmDevice { invitation_id },
+            &Signer::OwnerDevice(owner),
+        ),
+    )
+    .await
+    .expect("the owner's answer is given");
+}
+
+/// One `pair.confirm` of `invitation_id` under `action`.
+async fn confirm_under(
+    host: &Host,
+    client: &mut LocalClient,
+    invitation_id: InvitationId,
+    approval: PairingApproval,
+    action: ActionId,
+) -> Result<PairConfirmResult, kr_protocol::error::ProtocolError> {
+    within(
+        "pair.confirm",
+        BOUND,
+        calls::mutate_as(
+            host.environment_id,
+            client,
+            action,
+            Method::PairConfirm,
+            &PairConfirmParams {
+                invitation_id,
+                approval,
+            },
+        ),
+    )
+    .await
+}
+
+/// How many answers of the owner's are given and not yet spent.
+async fn unspent_answers(client: &mut LocalClient) -> usize {
+    within(
+        "the owner's pending confirmations",
+        BOUND,
+        calls::pending(client),
+    )
+    .await
+    .expect("the pending confirmations")
+    .pending
+    .iter()
+    .filter(|pending| pending.answered)
+    .count()
+}
+
+/// KR-REQ-10.08: the owner's repeat of `pair.confirm` after the commit refused a device that became
+/// listed is told what became of the invitation, and the answer does not depend on whether the host
+/// issued another invitation since: the invitation sits in the host's open slot, ended, and is
+/// answered as one that has left it. The same action and a new one get it, and no answer of the
+/// owner's is spent by the repeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_the_owners_confirmation_after_the_commit_refused_a_listed_device_is_told_the_ending_in_direct_mode()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let other = Device::create().await;
+    let holder = pair_with(&host, &other, &owner, rights()).await;
+    let phone = Device::create().await;
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("an invitation");
+    let redeemed = within(
+        "the redemption",
+        BOUND,
+        calls::try_redeem(&phone.candidate(), &invited),
+    )
+    .await;
+    redeemed
+        .outcome
+        .as_ref()
+        .expect("the host locks a device it does not list");
+    let approval = approval_of(&mut client, invited.invitation_id).await;
+    list_the_endpoint_of(&host, &phone, holder.device_id);
+
+    answer_the_confirmation(&host, &mut client, &owner, invited.invitation_id).await;
+    let first = ActionId::new(kr_ipc::new_uuid());
+    let refused = confirm_under(&host, &mut client, invited.invitation_id, approval, first)
+        .await
+        .expect_err("the commit is refused for the device the host lists");
+    assert_eq!(refused.code.as_str(), "PAIRING_ENDPOINT_PAIRED");
+
+    let same = confirm_under(&host, &mut client, invited.invitation_id, approval, first)
+        .await
+        .expect_err("the invitation ended");
+    assert_eq!(
+        same.code.as_str(),
+        "PAIRING_REJECTED",
+        "the same action is told that the invitation is no longer open"
+    );
+    assert!(
+        same.message.contains("no longer open"),
+        "the same action is told how it ended: {}",
+        same.message
+    );
+    let new = ActionId::new(kr_ipc::new_uuid());
+    let another = confirm_under(&host, &mut client, invited.invitation_id, approval, new)
+        .await
+        .expect_err("the invitation ended");
+    assert_eq!(
+        another.code.as_str(),
+        "PAIRING_REJECTED",
+        "a new action is told the same"
+    );
+    assert!(
+        another.message.contains("no longer open"),
+        "a new action is told how it ended: {}",
+        another.message
+    );
+
+    answer_the_confirmation(&host, &mut client, &owner, invited.invitation_id).await;
+    assert_eq!(
+        unspent_answers(&mut client).await,
+        1,
+        "the owner's answer stands before the repeat"
+    );
+    let again = confirm_under(
+        &host,
+        &mut client,
+        invited.invitation_id,
+        approval,
+        ActionId::new(kr_ipc::new_uuid()),
+    )
+    .await
+    .expect_err("the invitation ended");
+    assert_eq!(again.code.as_str(), "PAIRING_REJECTED");
+    assert_eq!(
+        unspent_answers(&mut client).await,
+        1,
+        "the repeat spent no answer of the owner's"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: the same in code mode, where the repeat met a wrong phase before: the invitation
+/// ended at the commit, and the same action and a new one are told that. No candidate is bound
+/// there any more, so the owner can be given no answer for the repeat to spend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_the_owners_confirmation_after_the_commit_refused_a_listed_device_is_told_the_ending_in_code_mode()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let other = Device::create().await;
+    let holder = pair_with(&host, &other, &owner, rights()).await;
+    let phone = Device::create().await;
+    let mut client = host.client().await;
+    let (invited, mut candidate) =
+        code_candidate(&host, phone.candidate(), &mut client, &owner).await;
+    let finished = within("the finish", BOUND, candidate.try_finish()).await;
+    finished
+        .outcome
+        .as_ref()
+        .expect("the host binds a device it does not list");
+    let approval = approval_of(&mut client, invited.invitation_id).await;
+    list_the_endpoint_of(&host, &phone, holder.device_id);
+
+    answer_the_confirmation(&host, &mut client, &owner, invited.invitation_id).await;
+    let first = ActionId::new(kr_ipc::new_uuid());
+    let refused = confirm_under(&host, &mut client, invited.invitation_id, approval, first)
+        .await
+        .expect_err("the commit is refused for the device the host lists");
+    assert_eq!(refused.code.as_str(), "PAIRING_ENDPOINT_PAIRED");
+
+    let same = confirm_under(&host, &mut client, invited.invitation_id, approval, first)
+        .await
+        .expect_err("the invitation ended");
+    assert_eq!(
+        same.code.as_str(),
+        "PAIRING_REJECTED",
+        "the same action is told that the invitation is no longer open"
+    );
+    assert!(
+        same.message.contains("no longer open"),
+        "the same action is told how it ended: {}",
+        same.message
+    );
+    let another = confirm_under(
+        &host,
+        &mut client,
+        invited.invitation_id,
+        approval,
+        ActionId::new(kr_ipc::new_uuid()),
+    )
+    .await
+    .expect_err("the invitation ended");
+    assert_eq!(
+        another.code.as_str(),
+        "PAIRING_REJECTED",
+        "a new action is told the same"
+    );
+    assert!(
+        another.message.contains("no longer open"),
+        "a new action is told how it ended: {}",
+        another.message
+    );
+
+    host.stop().await;
+}
+
+/// KR-REQ-10.08: another ending that sits in the open slot is answered the same way: an owner that
+/// denied the candidate and repeats `pair.confirm` is told that the invitation was denied, with the
+/// same action and with a new one, and not that a confirmation is needed or that the phase is wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repeat_of_the_owners_confirmation_after_the_owner_denied_the_candidate_is_told_it_was_denied()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &rights(),
+        &Signer::OwnerDevice(&owner),
+    )
+    .await
+    .expect("an invitation");
+    let redeemed = within(
+        "the redemption",
+        BOUND,
+        calls::try_redeem(&phone.candidate(), &invited),
+    )
+    .await;
+    redeemed
+        .outcome
+        .as_ref()
+        .expect("the host locks the candidate");
+    let approval = approval_of(&mut client, invited.invitation_id).await;
+    let denied = within(
+        "the denial",
+        BOUND,
+        calls::cancel(
+            host.environment_id,
+            &mut client,
+            invited.invitation_id,
+            true,
+        ),
+    )
+    .await
+    .expect("the owner denies the candidate");
+    assert_eq!(
+        denied.status,
+        PairStatus::Consumed {
+            reason: PairingConsumedReason::Denied
+        }
+    );
+
+    let first = ActionId::new(kr_ipc::new_uuid());
+    let same = confirm_under(&host, &mut client, invited.invitation_id, approval, first)
+        .await
+        .expect_err("the invitation was denied");
+    assert_eq!(
+        same.code.as_str(),
+        "PAIRING_REJECTED",
+        "the owner is told that the invitation is no longer open"
+    );
+    assert!(
+        same.message.contains("Denied"),
+        "the owner is told that it was denied: {}",
+        same.message
+    );
+    let another = confirm_under(
+        &host,
+        &mut client,
+        invited.invitation_id,
+        approval,
+        ActionId::new(kr_ipc::new_uuid()),
+    )
+    .await
+    .expect_err("the invitation was denied");
+    assert_eq!(another.code.as_str(), "PAIRING_REJECTED");
+    assert!(
+        another.message.contains("Denied"),
+        "a new action is told the same: {}",
+        another.message
     );
     host.stop().await;
 }
