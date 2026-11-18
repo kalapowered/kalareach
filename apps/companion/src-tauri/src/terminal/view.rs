@@ -1917,8 +1917,9 @@ impl View {
                 self.lane = None;
                 // Whatever ended it, a view that holds the lease ends control: no key can be
                 // written under it any more, the keys of a new stream need a new epoch, and the
-                // lease's epoch is given back, except where the connection is gone: no release can
-                // reach the host then, and the host gives the lease back itself.
+                // lease's epoch is given back, except where the lane ended with its connection and
+                // the connection is gone: no release can reach the host then, and the host gives
+                // the lease back itself.
                 let changed = match owes_at_the_lane_end(&cause, self.link.session()) {
                     Owes::Nothing => self.lease.connection_ended(),
                     Owes::Release => self.lease.stream_ended(),
