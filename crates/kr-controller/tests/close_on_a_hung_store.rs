@@ -10,8 +10,10 @@
 //! case's own.
 //!
 //! A case passes when the stop happens within the times section 7 gives it: the answer inside the
-//! seven seconds the daemon's close allows, the shell asked to stop at once, forced after five
-//! seconds and the closure recorded two seconds after that.
+//! seven seconds the daemon's close allows, the shell asked to stop at once, forced five seconds
+//! after it was asked and the closure recorded two seconds after that. The closure's record is
+//! allowed what a few synced writes cost the machine the case runs on, measured when the case
+//! judges.
 //!
 //! The daemon's own disk is the other place a close can stand: a close of a session whose worker
 //! has closed is answered with the closure, and the daemon's write of that closure to its registry
@@ -42,6 +44,31 @@ const ANSWER_BOUND: Duration = Duration::from_secs(7);
 const GRACE: Duration = Duration::from_secs(5);
 const DRAIN: Duration = Duration::from_secs(2);
 const SLACK: Duration = Duration::from_secs(3);
+/// The synced writes between the end of the drain and the closure's record: the history's index of
+/// output times, the session's queued notices and the closure itself, and one spare for the log the
+/// journal grows. A machine's disk queue makes each as slow as one synced write is, which the case
+/// measures when it judges, so the closure is allowed what this many of them cost there.
+const CLOSURE_WRITES: u32 = 4;
+/// How much earlier than its time a moment may be seen: the watch looks every 20 ms, and the shell
+/// notes the request when the machine lets it run, which a loaded one can put off.
+const SEEN_EARLY: Duration = Duration::from_secs(1);
+
+/// How long one synced write takes on this machine now: the slowest of five files of 4 KiB written
+/// and synced in `directory`, which is on the disk the worker's journal is on.
+fn synced_write_time(directory: &std::path::Path) -> Duration {
+    use std::io::Write;
+    (0..5)
+        .map(|probe| {
+            let started = Instant::now();
+            let mut file = std::fs::File::create(directory.join(format!("synced-write-{probe}")))
+                .expect("a file to sync");
+            file.write_all(&[0; 4096]).expect("writes the file");
+            file.sync_all().expect("syncs the file");
+            started.elapsed()
+        })
+        .max()
+        .expect("five probes")
+}
 /// How long a case watches a stall that stands before it lets it go. A paired device's call has
 /// thirty seconds of its own, so its case watches longer.
 const WINDOW: Duration = Duration::from_secs(17);
@@ -299,7 +326,11 @@ impl Seen {
         )
     }
 
-    fn shortfalls(&self) -> Vec<String> {
+    /// What of the stop did not happen within its times: the request reaching the shell, counted
+    /// from the close's send, and the grace, the forced end and the drain, counted from the request
+    /// reaching the shell, which is where the worker counts them. The closure's record is allowed
+    /// what [`CLOSURE_WRITES`] synced writes cost, `synced_write` being what one cost just now.
+    fn shortfalls(&self, synced_write: Duration) -> Vec<String> {
         let mut missed = Vec::new();
         match &self.first {
             Some((after, Ok(_))) if *after <= ANSWER_BOUND => {}
@@ -318,11 +349,39 @@ impl Seen {
         if !within(self.asked, SLACK) {
             missed.push(format!("the shell was asked to stop {}", said(self.asked)));
         }
-        if !within(self.ended, GRACE + SLACK) {
-            missed.push(format!("the shell ended {}", said(self.ended)));
+        // The shell notes no request but the signal and stays, so the worker forces it when the
+        // grace is over, and records the closure when the drain after that is: not before them,
+        // and not later than the machine's own work adds.
+        let after_asked = |moment: Option<Duration>| {
+            moment
+                .zip(self.asked)
+                .map(|(at, asked)| at.saturating_sub(asked))
+        };
+        let held = |moment: Option<Duration>, from: Duration, to: Duration| {
+            after_asked(moment).is_some_and(|after| from <= after && after <= to)
+        };
+        let ended = (GRACE - SEEN_EARLY, GRACE + SLACK);
+        if !held(self.ended, ended.0, ended.1) {
+            missed.push(format!(
+                "the shell ended {}, not {:?} to {:?} after it was asked (asked {})",
+                said(self.ended),
+                ended.0,
+                ended.1,
+                said(self.asked)
+            ));
         }
-        if !within(self.closed, GRACE + DRAIN + SLACK) {
-            missed.push(format!("the closure was recorded {}", said(self.closed)));
+        let closed = (
+            GRACE + DRAIN - SEEN_EARLY,
+            GRACE + DRAIN + SLACK + synced_write * CLOSURE_WRITES,
+        );
+        if !held(self.closed, closed.0, closed.1) {
+            missed.push(format!(
+                "the closure was recorded {}, not {:?} to {:?} after the shell was asked (asked {})",
+                said(self.closed),
+                closed.0,
+                closed.1,
+                said(self.asked)
+            ));
         }
         missed
     }
@@ -339,6 +398,25 @@ async fn the_stop_is_watched(
     window: Duration,
     release: Option<std::sync::mpsc::Sender<()>>,
 ) {
+    let shortfalls = watch_the_stop(case, rig, started, first, window, release).await;
+    assert!(
+        shortfalls.is_empty(),
+        "{case}: the authorised stop did not happen within its times while the storage call stood \
+         still: {shortfalls:?}"
+    );
+}
+
+/// Watches a close that has been sent, says what the daemon says of the session meanwhile, lets
+/// the stall go after `window`, watches for what the let-go brings, and returns what of the stop
+/// did not happen within its times.
+async fn watch_the_stop(
+    case: &str,
+    rig: &Rig,
+    started: Instant,
+    first: &Slot,
+    window: Duration,
+    release: Option<std::sync::mpsc::Sender<()>>,
+) -> Vec<String> {
     let mut seen = Seen::default();
     let mut looked_at_the_daemon = false;
     let mut daemon_while_it_stood = String::new();
@@ -377,7 +455,9 @@ async fn the_stop_is_watched(
     }
     step(&mut seen);
     let standing_line = seen.line();
-    let shortfalls = seen.shortfalls();
+    // What a synced write costs now: the closure's record is allowed several of them.
+    let synced_write = synced_write_time(rig.marks.path());
+    let shortfalls = seen.shortfalls(synced_write);
     let let_go_at = started.elapsed();
     let mut daemon_after = String::new();
     if let Some(release) = release {
@@ -398,15 +478,12 @@ async fn the_stop_is_watched(
          RESULT {case}: at the end (to {AFTER_LET_GO:?} after the let-go): {}; the daemon said \
          of the session: {daemon_after}\n\
          RESULT {case}: the shell's record of what it was asked: {:?}\n\
-         RESULT {case}: shortfalls inside its times: {shortfalls:?}",
+         RESULT {case}: shortfalls inside its times (a synced write cost {synced_write:.2?}): \
+         {shortfalls:?}",
         seen.line(),
         std::fs::read_to_string(rig.marks.path().join("asked")).unwrap_or_default(),
     );
-    assert!(
-        shortfalls.is_empty(),
-        "{case}: the authorised stop did not happen within its times while the storage call stood \
-         still: {shortfalls:?}"
-    );
+    shortfalls
 }
 
 /// Control: nothing stands still, and a close at the daemon stops the session within its times.
@@ -415,7 +492,12 @@ async fn a_close_at_the_daemon_with_nothing_standing_still_stops_within_its_time
     let rig = Rig::start().await;
     let started = Instant::now();
     let first = close_at_the_daemon(&rig).await;
-    the_stop_is_watched("control", &rig, started, &first, WINDOW, None).await;
+    let shortfalls = watch_the_stop("control", &rig, started, &first, WINDOW, None).await;
+    assert!(
+        shortfalls.is_empty(),
+        "control: the authorised stop did not happen within its times while nothing stood still: \
+         {shortfalls:?}"
+    );
 }
 
 /// `kr close` while the worker's dispatch marker stands still: the daemon's seven seconds, what
