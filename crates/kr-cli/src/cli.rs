@@ -1411,33 +1411,30 @@ pub enum HostCommand {
     /// sessions take their search path, home, user name, language, time zone, temporary folder
     /// and locale from it; a service manager gives its own.
     ///
-    /// Exit 0: a control daemon answers after the old one ended or where none ran (the result says
-    /// whether this command started it, whether another daemon serves the environment, or that this
-    /// command cannot tell), or a holder that did not answer gave way to a daemon, with nothing
-    /// stopped or started. Exit 3: the host is not set up for the restart, the daemon's launch
-    /// differs from this command's start, the daemon could not be reached, or the request could not
-    /// be made (nothing was stopped in each of these); or the start could not be set up (after the
-    /// stop, or where no daemon ran, or where a holder gave way). Exit 8:
-    /// the refusal inside a session, or the daemon's refusal of the host read or of the stop
-    /// request, in the daemon's own words. Exit 1: every other failure, among them a daemon or a
-    /// holder that does not answer, a daemon of another build, a start that failed after the stop,
-    /// a daemon that answers and cannot be shown to serve, and an interrupt; the message says what
-    /// was stopped and what was started. With `--json`, a result where a control daemon answers
-    /// carries `stop`, `pid`, `unsettled`, `started`, `serving` and `launched`; a failure carries
-    /// `ok` false, `code`, `message` and `exit_code` beside `stop`, `pid`, `unsettled` and a null
-    /// `started`, and no `serving` or `launched`, and the refusal inside a session carries no
-    /// `started` either.
+    /// Exit 0: a control daemon answers after the old one ended (of another generation where the
+    /// stopped generation was read) or where none ran, or a holder that did not answer gave way
+    /// to a daemon, with nothing stopped or started; the result says what this command started or
+    /// asked for, or that it started none, and not whether the daemon that answers is its start.
+    /// Exit 3: the host is not set up for the restart, the daemon's launch differs from this
+    /// command's start, the daemon could not be reached, or the request could not be made (nothing
+    /// was stopped in each of these); or the start could not be set up (after the stop, or where
+    /// no daemon ran, or where a holder gave way). Exit 8: the refusal inside a session, or the
+    /// daemon's refusal of the host read or of the stop request, in the daemon's own words. Exit 1:
+    /// every other failure, among them a daemon or a holder that does not answer or gives no whole
+    /// answer, a daemon of another build, a start that failed after the stop, a daemon of the
+    /// stopped generation that still answers, and an interrupt; the message says what was stopped
+    /// and what was started. With `--json`, a result where a control daemon answers carries
+    /// `stop`, `pid`, `unsettled`, `serving` (the process that the daemon's answer states, or
+    /// null) and `launched` (what this command started or asked for, or null); a failure carries
+    /// `ok` false, `code`, `message` and `exit_code` beside `stop`, `pid` and `unsettled`, and
+    /// neither `serving` nor `launched`.
     ///
-    /// The command proves that the daemon which answers is the one it started by the process that
-    /// daemon states and, where it read the generation of the daemon that it stopped, a newer
-    /// generation. A daemon that does not state its process cannot be told from the one that was
-    /// started: the command fails and says so. Where the start names no process (the scheduled
-    /// task, a service manager that does not say), the command says what it read and what it
-    /// asked, and does not call the daemon its own start. Where the
-    /// exchange with the daemon does not complete, the command starts nothing more, waits up to
-    /// 30 seconds for a whole one, and says what it could not read. On macOS, a `launchctl
-    /// kickstart` that does not answer in time is reported with the line that the requested
-    /// daemon may still start; a `launchctl bootstrap` that does not answer in time is reported
+    /// The command reads what answers and says what it read and what it did; it gives no verdict
+    /// of whose start the daemon that answers is. Where the exchange with the daemon does not
+    /// complete, the command starts nothing more, waits up to 30 seconds for a whole one, and says
+    /// what it could not read. On macOS, a `launchctl kickstart` that does not answer in time is
+    /// reported with the line that the requested daemon may still start; a `launchctl bootstrap`
+    /// that does not answer in time is reported
     /// as a failed start without that line.
     Restart,
     /// Show which network and services this host selects, join the service that publishes a
