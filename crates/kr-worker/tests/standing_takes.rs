@@ -904,11 +904,13 @@ fn a_raw_take_that_is_gone_from_the_boundary_is_reported() {
 const BOUNDARY_TEXT: &str = include_str!("../src/service/boundary.rs");
 
 /// Where the drop of the guard (`impl Drop for DispatchGuard`) clears the holder and lets the
-/// mutex go: how many such blocks the text has, and the offset of each statement in the first.
+/// mutex go: how many such blocks the text has, the offset of each statement in the first, and how
+/// many times the first names the guard (`self.guard`).
 struct DropOrder {
     blocks: usize,
     clear: Option<usize>,
     unlock: Option<usize>,
+    guard_names: usize,
 }
 
 fn drop_order(source: &str) -> DropOrder {
@@ -923,6 +925,7 @@ fn drop_order(source: &str) -> DropOrder {
         blocks: code.matches(head).count(),
         clear: body.find("holder.store(0"),
         unlock: body.find("drop(self.guard.take())"),
+        guard_names: body.matches("self.guard").count(),
     }
 }
 
@@ -944,6 +947,11 @@ fn the_drop_of_the_guard_clears_the_holder_before_it_lets_the_mutex_go() {
     assert!(
         order.unlock.is_some(),
         "the drop of the guard has no unlock of the mutex (`drop(self.guard.take())`)"
+    );
+    assert_eq!(
+        order.guard_names, 1,
+        "the drop of the guard names the guard (`self.guard`) once, in the unlock: a second statement \
+         that lets the mutex go first leaves the unlock with nothing to do"
     );
     assert!(
         order.clear < order.unlock,
