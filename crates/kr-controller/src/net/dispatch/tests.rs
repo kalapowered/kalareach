@@ -3279,7 +3279,8 @@ pub(super) fn an_empty_draft(
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "look at this".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )
@@ -3319,7 +3320,8 @@ fn a_draft_written_for(
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::some(application_instance_id),
                 text: "look at this".to_owned(),
-            }, Some(kr_protocol::ids::AgentBindingRevision::new(1)),
+            },
+            Some(kr_protocol::ids::AgentBindingRevision::new(1)),
             None,
             None,
         )
@@ -3341,6 +3343,45 @@ fn made_for_application(
         prompt.target.application_instance_id = Nullable::some(application_instance_id);
     }
     prompt
+}
+
+/// `prompt`, made under `revision` of its application's binding instead of the revision it was
+/// built for.
+fn made_at_binding(
+    mut prompt: MutationRequest,
+    revision: kr_protocol::ids::AgentBindingRevision,
+) -> MutationRequest {
+    let mut params: kr_protocol::agent::AgentPromptParams =
+        prompt.params.to_typed().expect("a prompt's parameters");
+    params.target.binding_revision = revision;
+    prompt.params = ParamsValue::from_typed(&params).expect("encodes");
+    if prompt.target.agent_binding_revision.is_present() {
+        prompt.target.agent_binding_revision = Nullable::some(revision);
+    }
+    prompt
+}
+
+/// `request`, rebuilt as the `draft.create` that writes a draft for `application` in `session_id`
+/// under `revision` of its binding, with the target and the parameters that name them.
+fn a_create_naming(
+    mut request: MutationRequest,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    session_id: SessionId,
+    application: kr_protocol::ids::ApplicationInstanceId,
+    revision: kr_protocol::ids::AgentBindingRevision,
+) -> MutationRequest {
+    request.method = Method::DraftCreate.into();
+    request.params = ParamsValue::from_typed(&kr_protocol::transfer::DraftCreateParams {
+        environment_id,
+        device_id: Nullable::null(),
+        session_id: Nullable::some(session_id),
+        application_instance_id: Nullable::some(application),
+        text: "look at this".to_owned(),
+    })
+    .expect("encodes");
+    request.target.application_instance_id = Nullable::some(application);
+    request.target.agent_binding_revision = Nullable::some(revision);
+    request
 }
 
 /// A prompt a device makes to the scripted session, naming `draft_id`.
@@ -3781,6 +3822,186 @@ async fn kr_req_12_06_a_draft_written_for_another_application_is_a_conflict_on_e
     assert!(!is_submitted(controller, &local, draft_id));
     let answer = controller
         .perform(&local, admission.connection_id, None, prompt(written_for))
+        .await;
+    assert!(answered_ok(&answer), "{answer:?}");
+    assert!(is_submitted(controller, &local, draft_id));
+    assert_eq!(prompts_the_worker_was_asked_to_take(&script).len(), 2);
+    world.serving.abort();
+}
+
+/// KR-REQ-12.06: a draft written under one binding revision of an application is not sent by a
+/// prompt that names another, higher or lower, whether the prompt comes from a paired device or from
+/// a caller at this machine. Each draft is written by its own route's `draft.create`, which states
+/// the revision it was written under, and each prompt is refused as a conflict before the draft is
+/// recorded as sent and before the worker is asked; the prompt for the revision the draft was
+/// written under goes through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_06_a_draft_written_under_another_binding_revision_is_a_conflict_on_either_prompt_route()
+ {
+    use kr_protocol::envelope::{ControlFrame, Outcome, Response};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::transfer::DraftCreateResult;
+
+    use crate::service::a_close_a_worker_never_answers as fake;
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    let script = Scripted::new();
+    script.accepts_prompts(true);
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let application = ApplicationInstanceId::new(kr_ipc::new_uuid());
+    let written_under = AgentBindingRevision::new(2);
+    let answered_ok = |frame: &ControlFrame| {
+        matches!(
+            frame,
+            ControlFrame::Response(Response {
+                outcome: Outcome::Ok(_),
+                ..
+            })
+        )
+    };
+
+    // A paired device.
+    let device = paired(controller, 62, |grant| {
+        grant.actions = ActionRight::ALL.iter().copied().collect();
+    });
+    let connection = super::RemoteConnection::for_test(controller, device);
+    let actor = connection.device.principal();
+    let handle = a_published_attachment(controller, world.environment_id, &actor, "paired.bin");
+    let create = a_create_naming(
+        device_mutation(
+            &world,
+            &connection,
+            Method::DraftCreate,
+            1,
+            ParamsValue::empty(),
+        ),
+        world.environment_id,
+        world.session_id,
+        application,
+        written_under,
+    );
+    let created = connection
+        .answer_now(ControlFrame::Mutation(Box::new(create)))
+        .await
+        .expect("the create is answered");
+    assert!(answered_ok(created.frame()), "{:?}", created.frame());
+    let draft: kr_protocol::transfer::DraftRecord =
+        super::a_draft_a_device_writes::result_of::<DraftCreateResult>(created.frame()).draft;
+    let draft_id = bound_to_a_draft(controller, &actor, &draft, &handle).draft_id;
+    for (request_id, revision) in [(2, 3), (3, 1)] {
+        let answer = connection
+            .answer_now(ControlFrame::Mutation(Box::new(made_at_binding(
+                made_for_application(
+                    a_prompt_naming(
+                        &world,
+                        &connection,
+                        Method::AgentPromptQueue,
+                        request_id,
+                        draft_id,
+                    ),
+                    application,
+                ),
+                AgentBindingRevision::new(revision),
+            ))))
+            .await
+            .expect("the prompt is answered");
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(refused),
+            ..
+        }) = answer.frame()
+        else {
+            panic!(
+                "a conflict was expected for revision {revision}: {:?}",
+                answer.frame()
+            );
+        };
+        assert_eq!(refused.code, ErrorCode::DraftConflict, "{refused:?}");
+    }
+    assert!(
+        prompts_the_worker_was_asked_to_take(&script).is_empty(),
+        "nothing was sent"
+    );
+    assert!(
+        !is_submitted(controller, &actor, draft_id),
+        "and the draft was not recorded as sent"
+    );
+    let answer = connection
+        .answer_now(ControlFrame::Mutation(Box::new(made_at_binding(
+            made_for_application(
+                a_prompt_naming(&world, &connection, Method::AgentPromptQueue, 4, draft_id),
+                application,
+            ),
+            written_under,
+        ))))
+        .await
+        .expect("the prompt is answered");
+    assert!(answered_ok(answer.frame()), "{:?}", answer.frame());
+    assert!(is_submitted(controller, &actor, draft_id));
+    assert_eq!(prompts_the_worker_was_asked_to_take(&script).len(), 1);
+
+    // A caller at this machine.
+    let admission = fake::admission(controller, world.accepted).await;
+    let local = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+    let handle = a_published_attachment(controller, world.environment_id, &local, "local.bin");
+    let create = a_create_naming(
+        a_local_prompt(
+            &world,
+            &admission,
+            ActionId::new(kr_ipc::new_uuid()),
+            Nullable::null(),
+            Nullable::some(kr_protocol::agent::PromptText::new("write it").expect("text")),
+        ),
+        world.environment_id,
+        world.session_id,
+        application,
+        written_under,
+    );
+    let created = controller
+        .perform(&local, admission.connection_id, None, create)
+        .await;
+    assert!(answered_ok(&created), "{created:?}");
+    let draft: kr_protocol::transfer::DraftRecord =
+        super::a_draft_a_device_writes::result_of::<DraftCreateResult>(&created).draft;
+    let draft_id = bound_to_a_draft(controller, &local, &draft, &handle).draft_id;
+    let prompt = |revision: u64| {
+        made_at_binding(
+            made_for_application(
+                a_local_prompt(
+                    &world,
+                    &admission,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    Nullable::some(draft_id),
+                    Nullable::null(),
+                ),
+                application,
+            ),
+            AgentBindingRevision::new(revision),
+        )
+    };
+    for revision in [3, 1] {
+        let answer = controller
+            .perform(&local, admission.connection_id, None, prompt(revision))
+            .await;
+        let ControlFrame::Response(Response {
+            outcome: Outcome::Error(refused),
+            ..
+        }) = &answer
+        else {
+            panic!("a conflict was expected for revision {revision}: {answer:?}");
+        };
+        assert_eq!(refused.code, ErrorCode::DraftConflict, "{refused:?}");
+    }
+    assert_eq!(
+        prompts_the_worker_was_asked_to_take(&script).len(),
+        1,
+        "nothing more was sent"
+    );
+    assert!(!is_submitted(controller, &local, draft_id));
+    let answer = controller
+        .perform(&local, admission.connection_id, None, prompt(2))
         .await;
     assert!(answered_ok(&answer), "{answer:?}");
     assert!(is_submitted(controller, &local, draft_id));
@@ -4628,6 +4849,7 @@ async fn record_directly(
                 application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(
                     kr_ipc::new_uuid(),
                 ),
+                binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
             },
             session_id,
             crate::transfer::TransferAdmission::new(

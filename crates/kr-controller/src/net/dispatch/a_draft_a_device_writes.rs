@@ -1098,6 +1098,7 @@ async fn a_device_holds_at_most_the_bound_of_open_drafts_and_the_owner_is_held_t
             last.draft.draft_id,
             world.session_id,
             kr_protocol::ids::ApplicationInstanceId::new(kr_ipc::new_uuid()),
+            kr_protocol::ids::AgentBindingRevision::new(1),
             &kr_transfer::service::Admission::none(),
         )
         .expect("the prompt sends the draft");

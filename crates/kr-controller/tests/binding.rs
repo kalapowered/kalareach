@@ -566,7 +566,8 @@ impl Hosted {
                     session_id: Nullable::some(session_id),
                     application_instance_id: Nullable::null(),
                     text: "have a look at this".to_owned(),
-                }, None,
+                },
+                None,
                 None,
                 None,
             )

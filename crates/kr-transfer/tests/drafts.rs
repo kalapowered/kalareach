@@ -45,7 +45,8 @@ fn draft(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
                     Uuid::from_bytes([10; 16]),
                 )),
                 text: "have a look at this".to_owned(),
-            }, Some(crate::support::a_binding()),
+            },
+            Some(crate::support::a_binding()),
             None,
             None,
         )
@@ -181,6 +182,7 @@ fn transfer_insertion_and_submission_are_three_separate_actions() {
                 created.draft_id,
                 created.session_id.0.expect("a session"),
                 crate::support::an_application(),
+                crate::support::a_binding(),
                 &Admission::none()
             )
             .expect("records the submission"),
@@ -605,7 +607,8 @@ fn a_binding_needs_one_principal_and_one_session() {
                 session_id: Nullable::some(other_session),
                 application_instance_id: Nullable::null(),
                 text: "not this session".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )
@@ -640,7 +643,8 @@ fn a_binding_needs_one_principal_and_one_session() {
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
                 text: "someone else's draft".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )
@@ -677,7 +681,8 @@ fn a_binding_needs_one_principal_and_one_session() {
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
                 text: "this session".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )
@@ -861,7 +866,8 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
                     session_id: Nullable::some(session),
                     application_instance_id: Nullable::null(),
                     text: "for the session".to_owned(),
-                }, None,
+                },
+                None,
                 None,
                 None,
             )
@@ -879,7 +885,8 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
                     session_id: Nullable::null(),
                     application_instance_id: Nullable::null(),
                     text: "no session yet".to_owned(),
-                }, None,
+                },
+                None,
                 None,
                 None,
             )
@@ -982,6 +989,7 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
             other.draft_id,
             session,
             crate::support::an_application(),
+            crate::support::a_binding(),
             &Admission::none(),
         )
         .expect_err("a prompt for an ended session");
@@ -1083,7 +1091,8 @@ fn ending_a_session_fails_an_insertion_whose_upload_it_owns_though_the_draft_nam
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "names no session".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )
@@ -1196,7 +1205,8 @@ fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_read
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
                 text: "for a session that is gone".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )
@@ -1338,7 +1348,8 @@ fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_ses
                     session_id: session,
                     application_instance_id: Nullable::null(),
                     text: "a draft".to_owned(),
-                }, None,
+                },
+                None,
                 None,
                 None,
             )
@@ -1356,6 +1367,7 @@ fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_ses
             sent.draft_id,
             sent_session,
             crate::support::an_application(),
+            crate::support::a_binding(),
             &Admission::none(),
         )
         .expect("sends the draft to the session");
@@ -1555,7 +1567,9 @@ fn a_draft_for_another_application_is_a_conflict_and_a_wrong_session_keeps_its_o
                     application_instance_id,
                     text: "have a look at this".to_owned(),
                 },
-                application_instance_id.0.map(|_| crate::support::a_binding()),
+                application_instance_id
+                    .0
+                    .map(|_| crate::support::a_binding()),
                 None,
                 None,
             )
@@ -1572,6 +1586,7 @@ fn a_draft_for_another_application_is_a_conflict_and_a_wrong_session_keeps_its_o
             draft.draft_id,
             session,
             application,
+            crate::support::a_binding(),
             &Admission::none(),
         )
     };
@@ -1591,6 +1606,187 @@ fn a_draft_for_another_application_is_a_conflict_and_a_wrong_session_keeps_its_o
     record(&open, session, elsewhere).expect("a draft that names no application goes to any");
 }
 
+/// KR-REQ-12.06: a draft that names an application is sent only under the binding revision it was
+/// written under. A prompt that names a higher or a lower one is refused as a conflict that records
+/// nothing, and one that names the same revision records the draft. A draft that names an
+/// application and holds no revision is refused whichever revision the prompt names, and a draft
+/// that names no application is held to none.
+#[test]
+fn kr_req_12_06_a_draft_keeps_the_binding_revision_it_was_written_under() {
+    use kr_protocol::ids::AgentBindingRevision;
+
+    let harness = Harness::create();
+    let create = |application: Nullable<ApplicationInstanceId>,
+                  revision: Option<AgentBindingRevision>| {
+        harness
+            .service
+            .draft_create(
+                &harness.actor,
+                &DraftCreateParams {
+                    environment_id: harness.environment_id(),
+                    device_id: Nullable::null(),
+                    session_id: Nullable::null(),
+                    application_instance_id: application,
+                    text: "have a look at this".to_owned(),
+                },
+                revision,
+                None,
+                None,
+            )
+            .expect("creates the draft")
+            .draft
+    };
+    let session = SessionId::new(Uuid::from_bytes([9; 16]));
+    let other_session = SessionId::new(Uuid::from_bytes([11; 16]));
+    let record = |draft: &kr_protocol::transfer::DraftRecord, session, revision: u64| {
+        harness.service.record_prompt(
+            &harness.actor,
+            draft.draft_id,
+            session,
+            support::an_application(),
+            AgentBindingRevision::new(revision),
+            &Admission::none(),
+        )
+    };
+
+    let written = create(
+        Nullable::some(support::an_application()),
+        Some(AgentBindingRevision::new(2)),
+    );
+    let ahead = record(&written, session, 3).expect_err("a prompt for a later revision");
+    assert_eq!(ahead.code(), ErrorCode::DraftConflict);
+    assert!(
+        ahead
+            .to_string()
+            .contains("written under binding revision 2"),
+        "{ahead}"
+    );
+    let behind = record(&written, session, 1).expect_err("a prompt for an earlier revision");
+    assert_eq!(behind.code(), ErrorCode::DraftConflict);
+    // Neither refusal recorded the draft as sent to the session, so another session still takes it
+    // under the revision it was written under.
+    let recorded = record(&written, other_session, 2);
+    assert!(
+        recorded.is_ok(),
+        "the revision it was written under records it: {recorded:?}"
+    );
+
+    let unbound = create(Nullable::some(support::an_application()), None);
+    let refused = record(&unbound, session, 1).expect_err("no revision was kept");
+    assert_eq!(refused.code(), ErrorCode::DraftConflict);
+    assert!(
+        refused
+            .to_string()
+            .contains("before this host kept the binding revision"),
+        "{refused}"
+    );
+
+    let open = create(Nullable::null(), None);
+    let sent = record(&open, session, 5);
+    assert!(
+        sent.is_ok(),
+        "a draft that names no application is held to no revision: {sent:?}"
+    );
+}
+
+/// KR-REQ-12.06: no draft that names an application is made while the journal holds sessions of an
+/// earlier build, because a build that ignores the revision could send it under another. A repeat of
+/// a create that was performed is answered from its record, a draft that names no application is
+/// made, and a draft that names one is made once the sessions have ended.
+#[test]
+fn kr_req_12_06_no_draft_that_names_an_application_is_made_while_the_journal_is_owed_its_sessions()
+{
+    use kr_protocol::ids::AgentBindingRevision;
+
+    let harness = Harness::create();
+    let journal = kr_transfer::staging::StagingArea::store_path(&harness.host.environment());
+    let set_version = |version: i64| {
+        rusqlite::Connection::open(&journal)
+            .expect("opens")
+            .execute("UPDATE schema_version SET version = ?1", [version])
+            .expect("a version");
+    };
+    let params = |application: Nullable<ApplicationInstanceId>| DraftCreateParams {
+        environment_id: harness.environment_id(),
+        device_id: Nullable::null(),
+        session_id: Nullable::null(),
+        application_instance_id: application,
+        text: "have a look at this".to_owned(),
+    };
+    let named = || Nullable::some(support::an_application());
+    let revision = Some(AgentBindingRevision::new(1));
+    let action = |id: u8| Action {
+        actor_id: harness.actor.clone(),
+        action_id: Uuid::from_bytes([id; 16]),
+        method: "draft.create".to_owned(),
+        payload_digest: support::digest(b"create"),
+        admission: Admission::none(),
+    };
+
+    let first = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &params(named()),
+            revision,
+            Some(&action(1)),
+            None,
+        )
+        .expect("made in a journal this build made");
+
+    // The journal is now one that still holds sessions of an earlier build.
+    set_version(2);
+    let repeat = harness.service.draft_create(
+        &harness.actor,
+        &params(named()),
+        revision,
+        Some(&action(1)),
+        None,
+    );
+    assert!(
+        repeat
+            .as_ref()
+            .is_ok_and(|repeat| repeat.draft.draft_id == first.draft.draft_id),
+        "a repeat is answered from its record: {repeat:?}"
+    );
+    let refused = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &params(named()),
+            revision,
+            Some(&action(2)),
+            None,
+        )
+        .expect_err("a new create that names an application is refused");
+    assert!(
+        matches!(refused, kr_transfer::TransferError::StoreUnavailable { .. }),
+        "{refused:?}"
+    );
+    let unnamed = harness.service.draft_create(
+        &harness.actor,
+        &params(Nullable::null()),
+        None,
+        Some(&action(3)),
+        None,
+    );
+    assert!(
+        unnamed.is_ok(),
+        "a draft that names no application is made: {unnamed:?}"
+    );
+
+    // The sessions have ended: the journal is at the current version, and the create goes through.
+    set_version(kr_transfer::store::SCHEMA_VERSION);
+    let made = harness.service.draft_create(
+        &harness.actor,
+        &params(named()),
+        revision,
+        Some(&action(2)),
+        None,
+    );
+    assert!(made.is_ok(), "made once the sessions have ended: {made:?}");
+}
+
 /// A draft for no session, made for `actor` with at most `limit` open drafts.
 fn a_sessionless_draft(
     harness: &Harness,
@@ -1607,7 +1803,8 @@ fn a_sessionless_draft(
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "an open draft".to_owned(),
-            }, None,
+            },
+            None,
             None,
             limit,
         )
@@ -1678,6 +1875,7 @@ fn a_draft_a_prompt_has_sent_stops_counting_against_the_bound() {
                 first.draft_id,
                 session,
                 crate::support::an_application(),
+                crate::support::a_binding(),
                 &Admission::none(),
             )
             .expect("the prompt sends the draft"),
@@ -1705,7 +1903,8 @@ fn a_draft_whose_session_has_ended_stops_counting_against_the_bound() {
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
                 text: "for a session".to_owned(),
-            }, None,
+            },
+            None,
             None,
             limit,
         )
@@ -1771,6 +1970,7 @@ fn a_repeat_of_the_create_that_took_the_last_place_is_answered_from_its_record()
             made.draft.draft_id,
             SessionId::new(Uuid::from_bytes([7; 16])),
             crate::support::an_application(),
+            crate::support::a_binding(),
             &Admission::none(),
         )
         .expect("the prompt sends the draft");
@@ -1994,6 +2194,7 @@ fn a_draft_in_use_is_refused_and_nothing_is_deleted() {
                         created.draft_id,
                         session,
                         support::an_application(),
+                        crate::support::a_binding(),
                         &Admission::none(),
                     )
                     .expect("the prompt sends the draft");
@@ -2330,7 +2531,8 @@ fn a_draft_a_session_of_an_earlier_build_may_have_been_sent_is_kept() {
                 session_id: Nullable::some(other_session),
                 application_instance_id: Nullable::null(),
                 text: "for another session".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )

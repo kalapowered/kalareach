@@ -2090,6 +2090,18 @@ impl TransferService {
             return Ok(answered);
         }
         ask_admission(action)?;
+        // A draft that names an application keeps the binding revision it was written under, and
+        // a build before this one ignores the revision and would send the draft under another. A
+        // journal that still holds sessions of an earlier build may be read by such a build until
+        // they have ended, so no draft of this kind is made in it until then, as no attachment is
+        // offered from it ([`Self::insertion_begin`]). A repeat of a create already performed was answered
+        // above.
+        if row.application_instance_id.is_some() && store.noting()? != Noting::Done {
+            return Err(TransferError::store(
+                "the journal still holds sessions of an earlier build, so no draft that names an \
+                 application can be made until they have ended",
+            ));
+        }
         let outcome = commit_admitted(action, || {
             store.insert_draft(&row, retained.as_ref(), open_limit)
         })?;
@@ -2835,7 +2847,8 @@ impl TransferService {
     /// Returns [`TransferError::UnknownDraft`] when the draft is not this actor's,
     /// [`TransferError::NotAdmitted`] when the admission the prompt arrived under no longer stands
     /// where the record is made, [`TransferError::DraftConflict`] when the draft was written for
-    /// another application than `application_instance_id`, the one the prompt is for, and what
+    /// another application than `application_instance_id`, the one the prompt is for, or under
+    /// another binding revision of it than `binding_revision`, the one the prompt names, and what
     /// [`Store::record_prompt`] returns otherwise.
     pub fn record_prompt(
         &self,
@@ -2843,6 +2856,7 @@ impl TransferService {
         draft_id: DraftId,
         session_id: SessionId,
         application_instance_id: ApplicationInstanceId,
+        binding_revision: AgentBindingRevision,
         admission: &Admission,
     ) -> Result<usize> {
         let now = self.clock.now_ms();
@@ -2853,7 +2867,15 @@ impl TransferService {
         // both wait, so a deadline that passed or a registration that was withdrawn while the
         // prompt was queued is refused here and records nothing.
         admission.ask()?;
-        admission.commit(|| store.record_prompt(draft_id, session_id, application_instance_id, now))
+        admission.commit(|| {
+            store.record_prompt(
+                draft_id,
+                session_id,
+                application_instance_id,
+                binding_revision,
+                now,
+            )
+        })
     }
 
     /// Returns where the journal stands with the sessions whose agents may be sent a prompt that

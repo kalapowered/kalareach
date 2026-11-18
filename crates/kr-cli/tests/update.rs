@@ -5511,6 +5511,109 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
     );
 }
 
+/// KR-REQ-12.06: a rollback is refused, naming the transfer journal, when this build brought it
+/// forward from the version the release before wrote, the version that keeps the binding revision a
+/// draft was written under: a release that reads versions 1 to 5 would send a draft under another
+/// revision. Nothing is switched, and the journal and the draft in it are left as they were.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rollback_is_refused_naming_a_transfer_journal_that_keeps_the_revision_of_its_drafts() {
+    let mut host = Host::bare();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+        "transfers",
+        1,
+        5,
+    ));
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    host.install(&one);
+    let controller = host.store.stable(Program::Controller);
+    host.start_daemon(&controller).await;
+    let idle = Idle::new(&host.store);
+
+    // A journal as the release before wrote it: at version 5, with a draft that names an
+    // application and no column for the revision it was written under.
+    let journal = kr_transfer::staging::StagingArea::store_path(&idle.temp.environment());
+    std::fs::create_dir_all(journal.parent().expect("a directory")).expect("transfers/");
+    rusqlite::Connection::open(&journal)
+        .expect("opens")
+        .execute_batch(&format!(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (5);
+             CREATE TABLE ended_sessions (session_id BLOB PRIMARY KEY, ended_at_ms INTEGER NOT NULL);
+             CREATE TABLE drafts (
+                 draft_id BLOB PRIMARY KEY, environment_id BLOB NOT NULL, actor_id TEXT NOT NULL,
+                 device_id BLOB, session_id BLOB, application_instance_id BLOB,
+                 revision INTEGER NOT NULL, state TEXT NOT NULL, text TEXT NOT NULL,
+                 created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL);
+             INSERT INTO drafts (draft_id, environment_id, actor_id, application_instance_id,
+                                 revision, state, text, created_at_ms, updated_at_ms)
+             VALUES (X'{}', X'{}', 'local:501', X'{}', 1, 'open', 'an old draft', 1, 1);",
+            "0B".repeat(16),
+            "0E".repeat(16),
+            "0A".repeat(16),
+        ))
+        .expect("writes the journal of the release before");
+    drop(
+        kr_transfer::store::Store::open(&journal, idle.temp.environment_id())
+            .expect("this build brings the journal forward"),
+    );
+    let read = |query: &str| -> String {
+        rusqlite::Connection::open(&journal)
+            .expect("opens")
+            .query_row(query, [], |row| row.get::<_, String>(0))
+            .expect("reads")
+    };
+    let version = || read("SELECT CAST(version AS TEXT) FROM schema_version");
+    let draft = || read("SELECT text FROM drafts");
+    assert_eq!(version(), kr_transfer::store::SCHEMA_VERSION.to_string());
+
+    let archive = host.scratch("archives").join("two.tar.gz");
+    two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert!(
+        output.status.success(),
+        "kr host update: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "kr host rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let message = said["message"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        message.contains(&format!(
+            "transfers of environment {}",
+            idle.environment_id()
+        )) && message.contains(&format!(
+            "schema version {}",
+            kr_transfer::store::SCHEMA_VERSION
+        )) && message.contains("versions 1 to 5"),
+        "{said}"
+    );
+    assert_eq!(
+        host.store.current().expect("reads"),
+        Some(two.name().clone()),
+        "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", two.name()),
+        "the daemon the rollback stopped serves again, from the release still current"
+    );
+    assert_eq!(version(), kr_transfer::store::SCHEMA_VERSION.to_string());
+    assert_eq!(draft(), "an old draft", "the draft was left as it was");
+}
+
 /// KR-REQ-26.10: a rollback is refused, naming the document, when the configuration document is at a
 /// version the older release does not read: the document this build writes is at version 3, and a release
 /// that reads versions 1 to 2 cannot take it. Nothing is switched, and the document is left as it was; a
