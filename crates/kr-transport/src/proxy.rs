@@ -15,11 +15,16 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use kr_crypto::secret::SecretVec;
-use reqwest::header::HeaderValue;
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue,
+    LOCATION, PROXY_AUTHORIZATION, REFERER, TRANSFER_ENCODING, WWW_AUTHENTICATE,
+};
+use reqwest::{Method, StatusCode};
 use tokio::sync::{Notify, watch};
 use url::Url;
 
@@ -589,6 +594,11 @@ where
 /// connector layer reads the proxy's answer. No login is in any URL, so the library's `Debug` of
 /// the proxy prints none.
 ///
+/// A client whose proxy holds a login follows no redirect by itself: the library reports a refused
+/// hop of its own redirect loop with the first request's URL, so that client's sends go through
+/// [`follow`], which keeps the URL of each hop. A client whose proxy holds no login keeps the
+/// library's policy.
+///
 /// # Errors
 ///
 /// Returns the library's error when the proxy's address is not one it takes.
@@ -600,9 +610,14 @@ pub fn proxied(
     if let Some(login) = proxy.login() {
         selected = selected.custom_http_auth(login.authorization());
     }
-    Ok(builder
+    let builder = builder
         .proxy(selected)
-        .connector_layer(ProxyLoginLayer::new(proxy.login().cloned())))
+        .connector_layer(ProxyLoginLayer::new(proxy.login().cloned()));
+    Ok(if proxy.login().is_some() {
+        builder.redirect(reqwest::redirect::Policy::none())
+    } else {
+        builder
+    })
 }
 
 /// Notes a failed send through `proxy` to `url`: a `CONNECT` that failed with the library's words
@@ -617,6 +632,216 @@ pub fn note_failure(proxy: &ProxyUrl, url: &Url, error: &(dyn Error + 'static)) 
         && let Some(target) = Target::of(url)
     {
         login.suspicion().suspect(target);
+    }
+}
+
+/// How [`follow`] follows the redirects of one request.
+#[derive(Clone, Copy, Debug)]
+pub struct Following {
+    /// How many redirects are followed: the next one is refused.
+    pub limit: usize,
+    /// The one deadline of every hop and of the final body together.
+    pub deadline: Duration,
+}
+
+/// Why [`follow`] gave no response.
+#[derive(Debug)]
+pub enum FollowFailure {
+    /// The hop's request did not complete.
+    Send(reqwest::Error),
+    /// The gate refused the hop's address, or the proxy's login is stopped.
+    Login(ProxyLoginFailure),
+    /// A redirect came after the limit was reached.
+    TooManyRedirects,
+    /// A redirect named a scheme other than `http` and `https`.
+    BadScheme,
+}
+
+impl fmt::Display for FollowFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Send(error) => error.fmt(formatter),
+            Self::Login(failure) => failure.fmt(formatter),
+            Self::TooManyRedirects => formatter.write_str("too many redirects"),
+            Self::BadScheme => formatter.write_str("a redirect names an address that is not http"),
+        }
+    }
+}
+
+/// A [`follow`] that ended in an error, with the address of the hop that failed: the first
+/// request's, or a redirect's.
+#[derive(Debug)]
+pub struct FollowError {
+    /// The address of the hop that failed.
+    pub url: Url,
+    /// What failed.
+    pub failure: FollowFailure,
+}
+
+impl fmt::Display for FollowError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.failure.fmt(formatter)
+    }
+}
+
+impl Error for FollowError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match &self.failure {
+            FollowFailure::Send(error) => Some(error),
+            FollowFailure::Login(failure) => Some(failure),
+            FollowFailure::TooManyRedirects | FollowFailure::BadScheme => None,
+        }
+    }
+}
+
+/// What a followed request carries as its body.
+enum Carried {
+    Nothing,
+    Bytes(Vec<u8>),
+    /// A body that is read once and cannot be sent again.
+    Stream,
+}
+
+fn drop_payload_headers(headers: &mut HeaderMap) {
+    for name in [
+        CONTENT_TYPE,
+        CONTENT_LENGTH,
+        CONTENT_ENCODING,
+        TRANSFER_ENCODING,
+    ] {
+        headers.remove(name);
+    }
+}
+
+fn same_place(left: &Url, right: &Url) -> bool {
+    left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left.scheme() == right.scheme()
+}
+
+/// The `Referer` the library gives a followed request: the previous address without its user
+/// information and fragment, and none for a step from `https` to `http`.
+fn referer_of(next: &Url, previous: &Url) -> Option<HeaderValue> {
+    if next.scheme() == "http" && previous.scheme() == "https" {
+        return None;
+    }
+    let mut referer = previous.clone();
+    let _ = referer.set_username("");
+    let _ = referer.set_password(None);
+    referer.set_fragment(None);
+    referer.as_str().parse().ok()
+}
+
+/// Sends `request` through `client`, whose redirect policy is `none`, and follows its redirects
+/// itself, so that each hop is gated and a failure names the hop that failed.
+///
+/// The rules are the library's own: `301` and `302` turn a `POST` into a `GET` with no body, `303`
+/// turns every method but `HEAD` into a `GET` with no body, `307` and `308` keep the method and the
+/// body, and a redirect that needs a body that cannot be sent again, or whose `Location` cannot be
+/// read, is the answer. A header that holds a login or a cookie goes no further than the host that
+/// received it, and a followed request carries a `Referer`. `following.limit` redirects are followed
+/// and the next is [`FollowFailure::TooManyRedirects`].
+///
+/// One deadline, `following.deadline`, bounds every hop and the body of the last response: each hop
+/// is given the time that is left.
+///
+/// `gate` runs before every send, the first included.
+///
+/// # Errors
+///
+/// Returns the failed hop's address and the reason.
+pub async fn follow(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    following: Following,
+    gate: impl Fn(&Url) -> Result<(), ProxyLoginKind>,
+) -> Result<reqwest::Response, FollowError> {
+    let deadline = tokio::time::Instant::now() + following.deadline;
+    let mut method = request.method().clone();
+    let mut headers = request.headers().clone();
+    let version = request.version();
+    let mut carried = match request.body() {
+        None => Carried::Nothing,
+        Some(body) => body
+            .as_bytes()
+            .map_or(Carried::Stream, |bytes| Carried::Bytes(bytes.to_vec())),
+    };
+    let mut previous: Vec<Url> = Vec::new();
+    let mut request = request;
+    loop {
+        let url = request.url().clone();
+        if let Err(kind) = gate(&url) {
+            return Err(FollowError {
+                url,
+                failure: FollowFailure::Login(ProxyLoginFailure::new(kind)),
+            });
+        }
+        // A deadline that has passed is a timeout the library raises before it writes anything.
+        *request.timeout_mut() =
+            Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let response = client.execute(request).await.map_err(|error| FollowError {
+            url: url.clone(),
+            failure: FollowFailure::Send(error),
+        })?;
+        match response.status() {
+            StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND => {
+                if method == Method::POST {
+                    method = Method::GET;
+                    carried = Carried::Nothing;
+                    drop_payload_headers(&mut headers);
+                }
+            }
+            StatusCode::SEE_OTHER => {
+                if method != Method::HEAD {
+                    method = Method::GET;
+                }
+                carried = Carried::Nothing;
+                drop_payload_headers(&mut headers);
+            }
+            StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT => {}
+            _ => return Ok(response),
+        }
+        if matches!(carried, Carried::Stream) {
+            return Ok(response);
+        }
+        let Some(next) = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|location| location.to_str().ok())
+            .and_then(|location| url.join(location).ok())
+        else {
+            return Ok(response);
+        };
+        previous.push(url.clone());
+        if previous.len() > following.limit {
+            return Err(FollowError {
+                url,
+                failure: FollowFailure::TooManyRedirects,
+            });
+        }
+        if next.scheme() != "http" && next.scheme() != "https" {
+            return Err(FollowError {
+                url: next,
+                failure: FollowFailure::BadScheme,
+            });
+        }
+        if !same_place(&next, &url) {
+            for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION, WWW_AUTHENTICATE] {
+                headers.remove(name);
+            }
+            headers.remove("cookie2");
+        }
+        let mut hop_headers = headers.clone();
+        if let Some(referer) = referer_of(&next, &url) {
+            hop_headers.insert(REFERER, referer);
+        }
+        let mut following_request = reqwest::Request::new(method.clone(), next);
+        *following_request.version_mut() = version;
+        *following_request.headers_mut() = hop_headers;
+        if let Carried::Bytes(bytes) = &carried {
+            *following_request.body_mut() = Some(reqwest::Body::from(bytes.clone()));
+        }
+        request = following_request;
     }
 }
 
