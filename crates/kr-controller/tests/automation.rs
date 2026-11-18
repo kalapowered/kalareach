@@ -7420,6 +7420,24 @@ async fn tests_run_settled(
     (run, receipt, version_as_read(control, version).await)
 }
 
+/// What the daemon recorded of a suite's run, for the message of an assertion about the run or its
+/// node. A node's summary says "unknown" and not why; the reason is in the result's attestation and
+/// in the evidence line, so a run that paused because the host could not establish what was tested
+/// (a file-event watcher that did not report the host's own change, for one) says so in the failure.
+fn the_suite_said(read: &kr_protocol::changeset::ChangesetReadResult) -> String {
+    let results: Vec<String> = read
+        .results
+        .iter()
+        .map(|result| format!("{:?}: {}", result.tested_source, result.attestation))
+        .collect();
+    let evidence: Vec<&str> = read
+        .evidence
+        .iter()
+        .map(|evidence| evidence.detail.as_str())
+        .collect();
+    format!("what the daemon recorded of the suite: results {results:?}, evidence {evidence:?}")
+}
+
 /// A version as `changeset.read` answers for it: its results and the evidence against it.
 async fn version_as_read(
     control: &mut LocalClient,
@@ -7465,8 +7483,18 @@ async fn a_suite_that_passes_against_a_version_is_recorded_as_the_host_observed_
     .expect("an edit in the main workspace");
 
     let (run, receipt, read) = tests_run(&mut control, &host, 61, "passes", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Completed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Success,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     assert_eq!(
         receipt.output.0,
         Some(kr_protocol::automation::NodeOutput::RunTests {
@@ -7563,8 +7591,18 @@ async fn a_suite_that_fails_is_recorded_with_the_status_the_host_observed() {
     let version = captured(&mut control, &host, workspace, 63).await;
 
     let (run, receipt, read) = tests_run(&mut control, &host, 64, "fails", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Failed, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Failed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Failed,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     assert_eq!(read.results.len(), 1, "{read:?}");
     assert_eq!(read.results[0].receipt.exit_status.0, Some(U64::new(3)));
     assert!(
@@ -7579,8 +7617,18 @@ async fn a_suite_that_fails_is_recorded_with_the_status_the_host_observed() {
     // A suite a signal ended is a failed node, whatever the copy holds, and the result says that
     // something stopped it and that it had no status.
     let (run, receipt, read) = tests_run(&mut control, &host, 69, "killed", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Failed, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Failed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Failed,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     let killed = read
         .results
         .iter()
@@ -7597,8 +7645,18 @@ async fn a_suite_that_fails_is_recorded_with_the_status_the_host_observed() {
 
     let sessions_before = all_sessions(&mut control).await.len();
     let (run, receipt, read) = tests_run(&mut control, &host, 65, "no-such-suite", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Failed, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Failed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Failed,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     assert_eq!(read.results.len(), 2, "no further result: {read:?}");
     assert_eq!(
         all_sessions(&mut control).await.len(),
@@ -7675,7 +7733,12 @@ async fn a_suite_that_outlives_its_wait_is_stopped_and_records_no_result() {
             .expect("the run is answered"),
     );
     let (_, receipt, read) = tests_run_settled(&mut control, &host, &document, run, version).await;
-    assert_eq!(receipt.status, NodeStatus::Cancelled, "{receipt:?}");
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Cancelled,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     // The suite had started: its session was closed because its node was asked to stop.
     let sessions = all_sessions(&mut control).await;
     assert_eq!(sessions.len(), 1, "{sessions:?}");
@@ -7728,8 +7791,18 @@ async fn a_suite_that_writes_only_its_declared_output_still_attests_the_version(
     let version = captured(&mut control, &host, workspace, 66).await;
 
     let (run, receipt, read) = tests_run(&mut control, &host, 67, "builds", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Completed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Success,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     assert_eq!(
         read.results[0].tested_source,
         TestedSource::UnmodifiedVersion
@@ -7744,7 +7817,12 @@ async fn a_suite_that_writes_only_its_declared_output_still_attests_the_version(
     );
 
     let (_, receipt, read) = tests_run(&mut control, &host, 68, "strays", version).await;
-    assert_eq!(receipt.status, NodeStatus::Unknown, "{receipt:?}");
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Unknown,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     let result = read
         .results
         .iter()
@@ -7784,8 +7862,18 @@ async fn a_suite_that_changes_a_tested_path_and_restores_it_attests_nothing() {
     let version = captured(&mut control, &host, workspace, 80).await;
 
     let (run, receipt, read) = tests_run(&mut control, &host, 81, "reads", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Completed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Success,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     let result = read
         .results
         .iter()
@@ -7797,7 +7885,12 @@ async fn a_suite_that_changes_a_tested_path_and_restores_it_attests_nothing() {
     // A suite that writes only where it declares output is attested, and one that makes a file
     // beside that output and removes it again, at the copy's root where the output is, is not.
     let (_, receipt, read) = tests_run(&mut control, &host, 84, "builds", version).await;
-    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Success,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     let result = read
         .results
         .iter()
@@ -9272,11 +9365,17 @@ async fn a_suite_that_declares_a_junit_report_leaves_it_parsed_beside_its_result
     let version = captured(&mut control, &host, workspace, 150).await;
 
     let (run, receipt, read) = tests_run(&mut control, &host, 151, "reports", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Failed, "{run:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Failed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
     assert_eq!(
         receipt.status,
         NodeStatus::Failed,
-        "the exit status decides: {receipt:?}"
+        "the exit status decides: {receipt:?}: {}",
+        the_suite_said(&read)
     );
     let first = read.results[0].materialisation_id;
     let answered = test_reports_of(&mut control, version, None).await;
@@ -9314,8 +9413,18 @@ async fn a_suite_that_declares_a_junit_report_leaves_it_parsed_beside_its_result
     // The report says the suite failed a case while the suite said it passed, and the node is
     // what the suite said.
     let (run, receipt, read) = tests_run(&mut control, &host, 152, "disagrees", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Completed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Success,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     let second = read
         .results
         .iter()
@@ -9339,7 +9448,12 @@ async fn a_suite_that_declares_a_junit_report_leaves_it_parsed_beside_its_result
 
     // A declared file in no documented format is not a report.
     let (_, receipt, read) = tests_run(&mut control, &host, 153, "notes", version).await;
-    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Success,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     let third = read
         .results
         .iter()
@@ -9559,8 +9673,18 @@ async fn a_daemon_starts_without_a_store_of_reports_it_cannot_use(
     let workspace = adopted_workspace(&mut control, host.environment_id, host.work()).await;
     let version = captured(&mut control, &host, workspace, number).await;
     let (run, receipt, read) = tests_run(&mut control, &host, number + 1, "reports", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Completed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Success,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     assert_eq!(
         read.results[0].tested_source,
         TestedSource::UnmodifiedVersion
@@ -9698,8 +9822,18 @@ async fn a_report_that_cannot_be_kept_changes_nothing_else() {
     .expect("the table goes");
 
     let (run, receipt, read) = tests_run(&mut control, &host, 163, "reports", version).await;
-    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
-    assert_eq!(receipt.status, NodeStatus::Success, "{receipt:?}");
+    assert_eq!(
+        run.status,
+        WorkflowRunStatus::Completed,
+        "{run:?}: {}",
+        the_suite_said(&read)
+    );
+    assert_eq!(
+        receipt.status,
+        NodeStatus::Success,
+        "{receipt:?}: {}",
+        the_suite_said(&read)
+    );
     assert_eq!(
         read.results[0].tested_source,
         TestedSource::UnmodifiedVersion
