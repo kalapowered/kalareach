@@ -15,6 +15,9 @@ gave=nothing_listens asked=another -> nobody
 gave=link_failed asked=none -> unclear
 gave=link_failed asked=same -> unclear
 gave=link_failed asked=another -> unclear
+gave=greeting_then_link_failed asked=none -> unclear
+gave=greeting_then_link_failed asked=same -> unclear
+gave=greeting_then_link_failed asked=another -> unclear
 gave=greeting_replied asked=none -> unproved
 gave=greeting_replied asked=same -> unproved
 gave=greeting_replied asked=another -> unproved
