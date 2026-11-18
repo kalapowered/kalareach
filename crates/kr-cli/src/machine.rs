@@ -839,19 +839,103 @@ fn load(paths: &HostPaths) -> Result<Option<Plan>> {
         max_collection_len: bytes.len(),
         ..kr_cbor::Limits::DEFAULT
     };
-    let unreadable = || {
-        CliError::Other(Shown::said(
-            "the merge plan this client keeps cannot be read; it is in this user's state \
-             directory as machine-merge-plan, and the owner selects the environments again \
-             once it is moved aside",
-        ))
+    let plan: Plan = match kr_cbor::from_canonical_slice(&bytes, &limits) {
+        Ok(plan) => plan,
+        // A refusal that a later release kept under a code this build lacks: the plan is that
+        // release's, and it stays where it is for the release that can read it.
+        Err(_) if holds_a_code_this_build_lacks(&bytes, &limits) => {
+            return Err(CliError::Other(Shown::said(
+                "the merge plan this client keeps holds a refusal that a later release wrote, \
+                 and this release cannot read it; it is in this user's state directory as \
+                 machine-merge-plan and stays as it is, so run `kr host update` to a release \
+                 that can read it and then run this command again",
+            )));
+        }
+        Err(_) => {
+            return Err(CliError::Other(Shown::said(
+                "the merge plan this client keeps cannot be read; it is in this user's state \
+                 directory as machine-merge-plan, and the owner selects the environments again \
+                 once it is moved aside",
+            )));
+        }
     };
-    let plan: Plan = kr_cbor::from_canonical_slice(&bytes, &limits).map_err(|_| unreadable())?;
     // A later release's format is not read as this one.
     if plan.version > PLAN_FORMAT {
-        return Err(unreadable());
+        return Err(CliError::Other(Shown::said(
+            "the merge plan this client keeps was written by a later release in a format this \
+             release cannot read; it is in this user's state directory as machine-merge-plan \
+             and stays as it is, so run `kr host update` to a release that can read it and then \
+             run this command again",
+        )));
     }
     Ok(Some(plan))
+}
+
+/// Whether the plan in `bytes` fails to decode only because a refused step holds a code that this
+/// build lacks: the same bytes decode once each such code is read as the unknown outcome.
+///
+/// A step's state is kept as `{"Refused": [code, why]}` in a step of the plan's `steps`.
+fn holds_a_code_this_build_lacks(bytes: &[u8], limits: &kr_cbor::Limits) -> bool {
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+    use std::cell::Cell;
+
+    /// `map` with its member `name` replaced by `change` of it.
+    fn changed(
+        map: &CanonicalMap,
+        name: &str,
+        change: &dyn Fn(&CanonicalValue) -> CanonicalValue,
+    ) -> Option<CanonicalMap> {
+        let members = map.entries().iter().map(|(key, member)| {
+            let member = if key == name {
+                change(member)
+            } else {
+                member.clone()
+            };
+            (key.clone(), member)
+        });
+        CanonicalMap::from_entries(members.collect::<Vec<_>>()).ok()
+    }
+
+    let found = Cell::new(false);
+    let code_known = |refused: &CanonicalValue| -> CanonicalValue {
+        let CanonicalValue::Array(items) = refused else {
+            return refused.clone();
+        };
+        let mut items = items.clone();
+        if let Some(CanonicalValue::Text(word)) = items.first()
+            && ErrorCode::from_wire(word).is_none()
+        {
+            found.set(true);
+            items[0] = CanonicalValue::Text(ErrorCode::OutcomeUnknown.as_str().to_owned());
+        }
+        CanonicalValue::Array(items)
+    };
+    let state_known = |state: &CanonicalValue| -> CanonicalValue {
+        let CanonicalValue::Map(variant) = state else {
+            return state.clone();
+        };
+        changed(variant, "Refused", &code_known).map_or_else(|| state.clone(), CanonicalValue::Map)
+    };
+    let step_known = |step: &CanonicalValue| -> CanonicalValue {
+        let CanonicalValue::Map(members) = step else {
+            return step.clone();
+        };
+        changed(members, "state", &state_known).map_or_else(|| step.clone(), CanonicalValue::Map)
+    };
+    let steps_known = |steps: &CanonicalValue| -> CanonicalValue {
+        let CanonicalValue::Array(items) = steps else {
+            return steps.clone();
+        };
+        CanonicalValue::Array(items.iter().map(&step_known).collect())
+    };
+
+    let Ok(CanonicalValue::Map(plan)) = kr_cbor::decode(bytes, limits) else {
+        return false;
+    };
+    let Some(known) = changed(&plan, "steps", &steps_known) else {
+        return false;
+    };
+    found.get() && kr_cbor::from_canonical_value::<Plan>(&CanonicalValue::Map(known)).is_ok()
 }
 
 /// The plan as it is kept: in this build's format, whatever format it was read in.
@@ -2024,7 +2108,6 @@ mod tests {
         )
         .expect("keeps the plan");
         let planted = std::fs::read(plan_path(paths)).expect("reads");
-        let listed = entries_beside(paths);
 
         let sentence = "the merge plan this client keeps was written by a later release in a \
                         format this release cannot read; it is in this user's state directory \
@@ -2034,6 +2117,11 @@ mod tests {
             assert_eq!(said, sentence, "{command}");
         }
         assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+        // The commands take the plan's lock, a file of its own; a second round makes no other.
+        let listed = entries_beside(paths);
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}, again");
+        }
         assert_eq!(entries_beside(paths), listed, "no file was made or removed");
     }
 
