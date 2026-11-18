@@ -907,11 +907,6 @@ fn succeeded_said(
     started: Option<&Started>,
     creates: Shown,
 ) -> Shown {
-    let generation = match came.old() {
-        Old::Generation(_) => " of another generation",
-        Old::None | Old::Unread => "",
-    };
-    let serving = record.whole.and_then(|whole| whole.process);
     let after = if came.ended() {
         Shown::said(
             "No session was stopped. Paired devices' connections to the old daemon closed; \
@@ -923,11 +918,7 @@ fn succeeded_said(
     let said = sentences([
         came.opening(id),
         successor_said(id, came),
-        shown!(
-            "A control daemon{}{} answers now.",
-            generation,
-            process_said(serving)
-        ),
+        another_answers_said(came.old(), record),
         launched_said(started),
         after,
     ]);
@@ -1000,7 +991,7 @@ fn failed_said(
     if let Some(own) = own {
         parts.push(shown!("This command's start failed: {}.", *own));
     }
-    parts.push(present_said(record));
+    parts.push(present_said(record, came.map_or(Old::None, Came::old)));
     parts.push(earlier_said(record));
     parts.push(wait_said(record, own.is_none()));
     parts.push(lock_said(id, record));
@@ -1014,8 +1005,28 @@ fn failed_said(
     sentences(parts)
 }
 
-/// What the last read of the endpoint gave.
-fn present_said(record: &Record) -> Shown {
+/// That a daemon of another generation than the stopped one answers (of another generation where
+/// the stopped generation was read), and its process where the launch-only answer stated it.
+fn another_answers_said(old: Old, record: &Record) -> Shown {
+    let generation = match old {
+        Old::Generation(_) => " of another generation",
+        Old::None | Old::Unread => "",
+    };
+    let serving = record.whole.and_then(|whole| whole.process);
+    shown!(
+        "A control daemon{}{} answers now.",
+        generation,
+        process_said(serving)
+    )
+}
+
+/// What the last read of the endpoint gave. A whole answer is said as a success says it where the
+/// generation test says that it is another daemon's, and as the stopped generation's where it is not.
+fn present_said(record: &Record, old: Old) -> Shown {
+    if matches!(record.last, Some(Last::Whole(_))) && proof::answers_as_another_daemon(record, old)
+    {
+        return another_answers_said(old, record);
+    }
     Shown::said(match record.last {
         None => "",
         Some(Last::Whole(_)) => {
@@ -1176,7 +1187,10 @@ impl StartFailed {
         facts: &Facts,
     ) -> Completion {
         let id = environment.environment_id;
-        let _ = progress.with_marker(|marker| marker.start_failed());
+        // A command that waited for a successor started nothing: its record keeps the stop's phase.
+        if came.successor().is_none() {
+            let _ = progress.with_marker(|marker| marker.start_failed());
+        }
         proof::read(environment, progress, record, startup::ANSWER_BOUND).await;
         let locks = Real::of(host, &environment.paths, None);
         let _ = holder::read_the_lock(&locks, startup::ANSWER_BOUND, record).await;
@@ -1458,6 +1472,146 @@ pub(crate) mod tests {
             manager: Some(crate::service_manager::Manager::Systemd),
         });
         assert_eq!((managed.start, managed.pid), ("systemd", None));
+    }
+
+    /// What a failed start says where a stand-in daemon of `generation` gives the final read of the
+    /// reporting a whole exchange with the process 7, through the real reporting of the command.
+    async fn said_by_a_failed_start_that_a_daemon_answers_late(
+        came: Came,
+        generation: u64,
+    ) -> String {
+        use kr_client::shown::Said as _;
+
+        let (temp, environment) = an_environment();
+        let id = environment.environment_id;
+        let endpoint = environment
+            .paths
+            .controller_endpoint()
+            .expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let daemon = tokio::spawn(host_stop::tests::answer_a_whole_exchange(
+            listener,
+            id,
+            generation_of(generation),
+            7,
+        ));
+        let completion = StartFailed {
+            error: Some(CliError::HostUnavailable(Shown::said(
+                "the start's own words",
+            ))),
+            launched: true,
+        }
+        .reported(
+            temp.paths(),
+            &environment,
+            &came,
+            &record::Shared::new(),
+            false,
+            &Progress::new(id),
+            &Facts::none(Vec::new()),
+        )
+        .await;
+        let Completion::Reported(error) = completion else {
+            panic!("a failed start is reported");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), daemon)
+            .await
+            .expect("the stand-in daemon ends where the command lets go of its connection")
+            .expect("the stand-in daemon ran");
+        error.said().to_string()
+    }
+
+    fn generation_of(number: u64) -> ControllerGeneration {
+        ControllerGeneration::new(number)
+    }
+
+    /// A failed start whose final read finds a daemon of a newer generation than the stopped one
+    /// says what a success says of it, and never that it is the generation that was asked to stop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_start_that_a_new_generation_answers_late_does_not_call_it_the_stopped_one() {
+        let said = said_by_a_failed_start_that_a_daemon_answers_late(
+            taken(Old::Generation(generation(1))),
+            2,
+        )
+        .await;
+        assert!(
+            said.contains(
+                "This command's start failed: the start's own words. A control daemon of another generation (process 7) answers now."
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("asked to stop"), "{said}");
+    }
+
+    /// A failed start where no daemon ran, whose final read finds a daemon, says what a success
+    /// says of it, and never that it is the generation that was asked to stop: none was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_start_where_none_ran_does_not_call_a_late_answer_the_stopped_one() {
+        let said = said_by_a_failed_start_that_a_daemon_answers_late(Came::NoneRan, 2).await;
+        assert!(
+            said.contains(
+                "This command's start failed: the start's own words. A control daemon (process 7) answers now."
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("asked to stop"), "{said}");
+        assert!(!said.contains("another generation"), "{said}");
+    }
+
+    /// A failed start whose final read finds the stopped generation says so.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_start_whose_final_read_finds_the_stopped_generation_says_so() {
+        let said = said_by_a_failed_start_that_a_daemon_answers_late(
+            taken(Old::Generation(generation(1))),
+            1,
+        )
+        .await;
+        assert!(
+            said.contains(
+                "This command's start failed: the start's own words. A control daemon of the generation that was asked to stop answers now."
+            ),
+            "{said}"
+        );
+    }
+
+    /// The record of an attempt says that this command's start failed only where this command
+    /// entered its start path: a wait for a successor leaves the stop's phase, and a start that
+    /// fails writes `start_failed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_wait_for_a_successor_keeps_the_stops_phase_in_the_record() {
+        use kr_controller::attempt::{self, Phase};
+
+        let old = Old::Generation(generation(1));
+        let successor = Came::Stopped(Stopped {
+            successor: Some(Some(3)),
+            ..match taken(old) {
+                Came::Stopped(stopped) => stopped,
+                Came::NoneRan | Came::HolderLetGo { .. } => unreachable!("a stop"),
+            }
+        });
+        for (came, expected) in [(successor, Phase::Told), (taken(old), Phase::StartFailed)] {
+            let (temp, environment) = an_environment();
+            let progress = Progress::new(environment.environment_id);
+            begin_the_record(&environment, None, &progress).expect("writes the record");
+            let _ = progress.with_marker(|marker| marker.told());
+            let _ = StartFailed {
+                error: None,
+                launched: false,
+            }
+            .reported(
+                temp.paths(),
+                &environment,
+                &came,
+                &record::Shared::new(),
+                false,
+                &progress,
+                &Facts::none(Vec::new()),
+            )
+            .await;
+            let found = attempt::recorded(&environment.paths);
+            assert_eq!(found.len(), 1, "one record stands");
+            assert_eq!(found[0].attempt.phase, expected);
+        }
     }
 
     /// KR-REQ-07.12: a failed start says the lock that it read after its last read of the
@@ -1894,6 +2048,12 @@ pub(crate) mod tests {
             ("stopped, successor", Some(successor), None, None),
             ("none ran", Some(Came::NoneRan), words, Some(standalone(77))),
             (
+                "none ran, no start words",
+                Some(Came::NoneRan),
+                None,
+                Some(standalone(77)),
+            ),
+            (
                 "holder let go, a read gave",
                 Some(Came::HolderLetGo { read: true }),
                 None,
@@ -1910,54 +2070,77 @@ pub(crate) mod tests {
 
     /// The whole text and the `--json` members that the product's makers write for a record, in a
     /// shape. The environment is written as `E`.
-    fn words_of(shape: &Shape, record: &Record, id: EnvironmentId) -> (String, String) {
-        let (_, came, own, started) = shape;
+    ///
+    /// The failure's maker writes a row for every record of every shape, and the success's maker
+    /// one only where the shape has no start words of its own and the generation test holds: the
+    /// two decisions that the command's reporting makes. A failure whose final read finds a daemon
+    /// of another generation is a row of its own, labelled with that.
+    fn words_of(
+        shape: &Shape,
+        record: &Record,
+        id: EnvironmentId,
+    ) -> Vec<(String, String, String)> {
+        let (label, came, own, started) = shape;
         let own = own.map(Shown::said);
-        let (text, answer) = match came {
+        let none = Answer {
+            serving: None,
+            launched: None,
+        };
+        let mut made = Vec::new();
+        match came {
             None => {
                 if let (Some(Last::Whole(_)), Some(whole)) = (record.last, record.whole) {
-                    (
+                    made.push((
+                        (*label).to_owned(),
                         holder_answers_said(id, whole.process),
                         Answer {
                             serving: whole.process,
                             launched: None,
                         },
-                    )
+                    ));
                 } else {
-                    (
+                    made.push((
+                        (*label).to_owned(),
                         failed_said(id, None, record, false, None),
-                        Answer {
-                            serving: None,
-                            launched: None,
-                        },
-                    )
+                        none,
+                    ));
                 }
             }
             Some(came) => {
-                if proof::answers_as_another_daemon(record, came.old()) {
-                    (
+                let succeeds =
+                    own.is_none() && proof::answers_as_another_daemon(record, came.old());
+                if succeeds {
+                    made.push((
+                        (*label).to_owned(),
                         succeeded_said(id, came, record, started.as_ref(), Shown::said("")),
                         answer_of(record, started.as_ref()),
-                    )
-                } else {
-                    (
-                        failed_said(id, Some(came), record, started.is_some(), own.as_ref()),
-                        Answer {
-                            serving: None,
-                            launched: None,
-                        },
-                    )
+                    ));
                 }
+                let late = if succeeds {
+                    format!("{label}, late answer after a failed start")
+                } else {
+                    (*label).to_owned()
+                };
+                made.push((
+                    late,
+                    failed_said(id, Some(came), record, started.is_some(), own.as_ref()),
+                    none,
+                ));
             }
-        };
-        let launched = answer
-            .launched
-            .map(|launched| serde_json::json!({"start": launched.start, "pid": launched.pid}));
-        let json = serde_json::json!({"serving": answer.serving, "launched": launched});
-        (
-            text.to_string().replace(&id.to_string(), "E"),
-            json.to_string(),
-        )
+        }
+        made.into_iter()
+            .map(|(label, text, answer)| {
+                let launched = answer.launched.map(
+                    |launched| serde_json::json!({"start": launched.start, "pid": launched.pid}),
+                );
+                let json = serde_json::json!({"serving": answer.serving, "launched": launched});
+                (
+                    label,
+                    text.to_string().replace(&id.to_string(), "E"),
+                    json.to_string(),
+                )
+            })
+            .collect()
     }
 
     /// Phrases that claim whose start the daemon that answers is, or that its identity is proved: no
@@ -1985,10 +2168,19 @@ pub(crate) mod tests {
         let held = matches!(record.lock.map(|read| read.lock), Some(Lock::Held));
         let greeted_or_replied = record.greeted || record.replied;
         let reads = matches!(last, Some(Last::Whole(_) | Last::Greeting(_) | Last::Reply));
-        let phrases: [(&str, bool); 12] = [
+        // The stopped generation's phrase is for a whole answer of that generation or an older one.
+        let stopped = matches!(
+            (last, came.map(Came::old)),
+            (Some(Last::Whole(whole)), Some(Old::Generation(old))) if whole <= old
+        );
+        let phrases: [(&str, bool); 13] = [
             (
                 " answers now.",
                 matches!(last, Some(Last::Whole(_))) && record.whole.is_some(),
+            ),
+            (
+                "of the generation that was asked to stop answers now.",
+                stopped,
             ),
             (
                 "No control daemon answers now: nothing listens.",
@@ -2046,12 +2238,14 @@ pub(crate) mod tests {
 
         let id = EnvironmentId::new(kr_ipc::new_uuid());
         let records = super::record::tests::every_record_that_up_to_three_reads_reach();
-        let mut rows: BTreeMap<(&str, String, String), usize> = BTreeMap::new();
+        let mut rows: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+        let mut texts = Vec::new();
         for shape in &shapes() {
             for record in &records {
-                let (text, json) = words_of(shape, record, id);
-                the_phrases_of_a_text_match_its_record(&text, shape.1.as_ref(), record);
-                *rows.entry((shape.0, text, json)).or_default() += 1;
+                for (label, text, json) in words_of(shape, record, id) {
+                    texts.push((shape.1.clone(), *record, text.clone()));
+                    *rows.entry((label, text, json)).or_default() += 1;
+                }
             }
         }
         let mut table = String::new();
@@ -2070,5 +2264,9 @@ pub(crate) mod tests {
             table == include_str!("../tests/host_restart_words.txt"),
             "the words changed: rerun with KR_WRITE_WORDS_TABLE=1 and read the file's diff"
         );
+        // The second check follows the frozen file's, so that a changed word fails on the file.
+        for (came, record, text) in &texts {
+            the_phrases_of_a_text_match_its_record(text, came.as_ref(), record);
+        }
     }
 }

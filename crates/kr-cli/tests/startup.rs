@@ -9093,6 +9093,13 @@ fn a_successor_that_never_answers_after_an_unknown_stop_keeps_the_stops_words() 
         "{message}\n{saw}"
     );
     assert!(silent.host.running().is_empty(), "nothing was started");
+    // This command started nothing: its record keeps the stop's phase (the request was written and
+    // its answer was never known) and never says that a start failed.
+    let phases: Vec<_> = attempts(&silent.host)
+        .iter()
+        .map(|record| record.attempt.phase)
+        .collect();
+    assert_eq!(phases, [kr_controller::attempt::Phase::Asking], "{saw}");
 }
 
 /// KR-REQ-07.12 (a holder that answers and ends before the read of who serves): the daemon that

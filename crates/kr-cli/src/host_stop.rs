@@ -3098,7 +3098,7 @@ impl Operations for Real<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A refusal that is `PERMISSION_DENIED` is told from a request the daemon does not list by the
@@ -6472,6 +6472,40 @@ mod tests {
 
     // The look's exchange at its producers: a stand-in daemon on a real link does each thing that
     // the exchange can meet, and the look's value and label are read from the real client.
+
+    /// A stand-in daemon of `generation` that gives one connection a whole exchange: it greets the
+    /// next connection on `listener`, answers `host.info`, and answers the request for the launch
+    /// alone with `process`. It ends where the command lets go of the connection.
+    pub(crate) async fn answer_a_whole_exchange(
+        listener: kr_ipc::endpoint::Listener,
+        id: EnvironmentId,
+        generation: ControllerGeneration,
+        process: u64,
+    ) {
+        use kr_protocol::envelope::ParamsValue;
+        use kr_protocol::scalars::{Nullable, U64};
+
+        let (mut reader, mut writer) = greet(&listener, id).await;
+        while let Ok(frame) = reader.read_message::<ControlFrame>().await {
+            let (request_id, value) = match frame {
+                ControlFrame::Request(request) => (
+                    request.request_id,
+                    ParamsValue::from_typed(&host_info_of(generation)).expect("a host.info result"),
+                ),
+                ControlFrame::Mutation(request) => (
+                    request.request_id,
+                    ParamsValue::from_typed(&HostStopResult {
+                        pid: U64::new(process),
+                        unsettled: U64::new(0),
+                        launch: Nullable::null(),
+                    })
+                    .expect("a stop result"),
+                ),
+                _ => continue,
+            };
+            write_outcome(&mut writer, request_id, Outcome::Ok(value)).await;
+        }
+    }
 
     /// A `host.info` result as a daemon of `generation` answers it.
     fn host_info_of(generation: ControllerGeneration) -> HostInfoResult {
