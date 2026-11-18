@@ -10,7 +10,7 @@
 //! The vector is pinned here and in `infra/relay/vectors/admission.json` in the website repository,
 //! where the service rebuilds the same bytes from the JSON it receives.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1020,6 +1020,9 @@ struct Scripted {
     asked: AtomicUsize,
     answered: AtomicUsize,
     gate: Option<Arc<tokio::sync::Notify>>,
+    /// The request, counted from 1 in the order they are made, whose task ends by unwinding when
+    /// the gate lets it through, with no answer.
+    unwinds_at: Option<usize>,
 }
 
 impl Scripted {
@@ -1029,6 +1032,7 @@ impl Scripted {
             asked: AtomicUsize::new(0),
             answered: AtomicUsize::new(0),
             gate: None,
+            unwinds_at: None,
         })
     }
 
@@ -1042,6 +1046,16 @@ impl Scripted {
     fn gated_script(
         answers: Vec<Result<AdmissionAnswer>>,
     ) -> (Arc<Self>, Arc<tokio::sync::Notify>) {
+        Self::gated_script_unwinding_at(answers, None)
+    }
+
+    /// As [`Scripted::gated_script`], and the task of the `unwinds_at`th request that is made ends
+    /// when the gate lets that request through, by `resume_unwind`: no panic line is printed, and
+    /// the script is not read for it. The request counts as answered then, though no answer is kept.
+    fn gated_script_unwinding_at(
+        answers: Vec<Result<AdmissionAnswer>>,
+        unwinds_at: Option<usize>,
+    ) -> (Arc<Self>, Arc<tokio::sync::Notify>) {
         let gate = Arc::new(tokio::sync::Notify::new());
         (
             Arc::new(Self {
@@ -1049,6 +1063,7 @@ impl Scripted {
                 asked: AtomicUsize::new(0),
                 answered: AtomicUsize::new(0),
                 gate: Some(Arc::clone(&gate)),
+                unwinds_at,
             }),
             gate,
         )
@@ -1086,10 +1101,14 @@ impl Scripted {
 
 impl PairingAdmissionService for Scripted {
     fn admit<'a>(&'a self, _request: &'a AdmissionRequest) -> ServiceFuture<'a, AdmissionAnswer> {
-        self.asked.fetch_add(1, Ordering::SeqCst);
+        let nth = self.asked.fetch_add(1, Ordering::SeqCst) + 1;
         Box::pin(async move {
             if let Some(gate) = &self.gate {
                 gate.notified().await;
+            }
+            if self.unwinds_at == Some(nth) {
+                self.answered.fetch_add(1, Ordering::SeqCst);
+                std::panic::resume_unwind(Box::new("the request's task ends"));
             }
             let mut answers = self.answers.lock().expect("the script");
             self.answered.fetch_add(1, Ordering::SeqCst);
@@ -2370,8 +2389,17 @@ impl Hosts {
 
     /// A service that holds each request until the test lets one through.
     fn holding(script: Vec<Result<AdmissionAnswer>>) -> Self {
+        Self::holding_and_unwinding_at(script, None)
+    }
+
+    /// As [`Hosts::holding`], and the task of the `unwinds_at`th request that is made ends when the
+    /// test lets that request through, with no answer.
+    fn holding_and_unwinding_at(
+        script: Vec<Result<AdmissionAnswer>>,
+        unwinds_at: Option<usize>,
+    ) -> Self {
         let clock = AdmissionClock::default();
-        let (service, gate) = Scripted::gated_script(script);
+        let (service, gate) = Scripted::gated_script_unwinding_at(script, unwinds_at);
         let admissions =
             scripted_admissions(Arc::clone(&service), &clock).waiting(Duration::from_millis(20));
         Self {
@@ -2571,8 +2599,9 @@ async fn kr_req_17_48_a_first_answer_that_arrives_during_a_stop_is_kept_to_its_e
 /// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: an answer that needs no explanation of a failed dial
 /// replaces a kept answer at once, during a stop as at any time, and the stop is unchanged. As the
 /// order of the case with a request on its way, but A's held request is answered at 40 s that the
-/// pair needs no admission, and in a second order that an admission is installed: no refusal is
-/// held from 41 s, and no request is made until the stop ends at 630 s.
+/// pair needs no admission, in a second order that an admission is installed, and in a third that
+/// the host is not managed: no refusal is held from 41 s, and no request is made until the stop ends
+/// at 630 s. That answer is held to 640 s, so the first dial after the stop asks then.
 #[tokio::test]
 async fn kr_req_17_48_a_newer_answer_that_is_no_refusal_replaces_a_kept_word_at_once_during_a_stop()
 {
@@ -2582,7 +2611,11 @@ async fn kr_req_17_48_a_newer_answer_that_is_no_refusal_replaces_a_kept_word_at_
             byte_ceiling: 1_000_000,
         })
     };
-    for newer in [Ok(AdmissionAnswer::NotNeeded), admitted()] {
+    for (newer, asks_again_at) in [
+        (Ok(AdmissionAnswer::NotNeeded), 630),
+        (admitted(), 630),
+        (Ok(AdmissionAnswer::NotManaged), 640),
+    ] {
         let mut hosts = Hosts::holding(vec![unable(None), stops_requests(), newer]);
         hosts.go_to(0);
         hosts.dial_and_answer(HOST_A).await;
@@ -2604,6 +2637,15 @@ async fn kr_req_17_48_a_newer_answer_that_is_no_refusal_replaces_a_kept_word_at_
         assert!(hosts.refusal(HOST_A).is_none(), "the newer answer at 101 s");
         hosts.go_to(630);
         hosts.dial(HOST_A).await;
+        if asks_again_at > 630 {
+            assert_eq!(
+                hosts.asks(),
+                3,
+                "the newer answer is held to {asks_again_at} s"
+            );
+            hosts.go_to(asks_again_at);
+            hosts.dial(HOST_A).await;
+        }
         assert_eq!(hosts.asks(), 4, "the first dial after the stop asks again");
     }
 }
@@ -2802,4 +2844,116 @@ async fn kr_req_17_48_a_failure_that_begins_no_stop_keeps_the_answer_no_longer_t
     assert_eq!(hosts.told(HOST_A), out_of_reach(), "the answer has stopped");
     hosts.dial(HOST_A).await;
     assert_eq!(hosts.asks(), 3, "no stop held the dial back");
+}
+
+const MANAGED_SECOND: &str = "https://relay-2.reach.kala.to";
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a dial that is held between two relays reads the time
+/// again for the second, so it does not keep, as it makes a request, an answer that stopped while it
+/// was held. The second relay's answer comes at 0 s and is kept to 60 s. A dial over both relays at
+/// 25 s makes its request for the first relay and is held; the clock moves to 61 s, and the dial goes
+/// on to the second relay, whose request drops the answer that has stopped: a lost dial to that relay
+/// is told the host could not be reached, though the request is on its way.
+#[tokio::test]
+async fn kr_req_17_48_a_dial_held_between_two_relays_does_not_keep_an_answer_that_stopped_meanwhile()
+ {
+    let clock = AdmissionClock::default();
+    let (service, gate) = Scripted::gated_script(vec![unable(None), no_answer()]);
+    let (reached, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let (held, holds) = (key(0x33), Arc::new(AtomicBool::new(true)));
+    let admissions = scripted_admissions(Arc::clone(&service), &clock)
+        .waiting(Duration::from_millis(20))
+        .after_the_locked_step({
+            let (reached, release) = (Arc::clone(&reached), Arc::clone(&release));
+            move |candidate| {
+                let (reached, release, holds) = (
+                    Arc::clone(&reached),
+                    Arc::clone(&release),
+                    Arc::clone(&holds),
+                );
+                Box::pin(async move {
+                    // Once: the hook runs after the second relay's step as well.
+                    if candidate == held && holds.swap(false, Ordering::SeqCst) {
+                        reached.notify_one();
+                        release.notified().await;
+                    }
+                })
+            }
+        });
+    let host = key(0x11);
+    let (second, both) = (
+        network(&[MANAGED_SECOND]),
+        network(&[MANAGED, MANAGED_SECOND]),
+    );
+
+    gate.notify_one();
+    admissions.before_dial(&second, &host, key(0x22)).await;
+    service.answered_to(1).await;
+    clock.advance(Duration::from_secs(25));
+    assert_eq!(
+        reported_as(admissions.refusal(&second, &host)),
+        no_capacity(0),
+        "the second relay's answer stands at 25 s"
+    );
+
+    let held_dial = tokio::spawn({
+        let (admissions, both) = (admissions.clone(), both.clone());
+        async move { admissions.before_dial(&both, &host, held).await }
+    });
+    tokio::time::timeout(Duration::from_secs(30), reached.notified())
+        .await
+        .expect("the dial reaches the hook after the first relay's step");
+    service.asked_to(2).await;
+    clock.advance(Duration::from_secs(36));
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), held_dial)
+        .await
+        .expect("the held dial returns")
+        .expect("the held dial's task");
+    service.asked_to(3).await;
+    assert_eq!(
+        service.asks(),
+        3,
+        "the second relay's request at 61 s is the third"
+    );
+    assert_eq!(
+        reported_as(admissions.refusal(&second, &host)),
+        out_of_reach(),
+        "at 61 s the answer has stopped"
+    );
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a request whose task ends with no answer, as a panic
+/// ends it, does not take away the answer that a stop kept for it. A's answer comes at 0 s and is
+/// kept to 60 s; A's second request is made at 55 s and held; B's request at 65 s is refused, so no
+/// request is made until 665 s, and the stop keeps A's answer because a request for it is alive; A's
+/// request ends its task at 70 s. At 91 s, when the answer's own keep time and its time to ask again
+/// have passed, a lost dial is still told the lack of capacity, to the stop's end.
+#[tokio::test]
+async fn kr_req_17_48_a_request_whose_task_ends_with_no_answer_leaves_the_answer_that_a_stop_kept()
+{
+    let mut hosts = Hosts::holding_and_unwinding_at(vec![unable(None), stops_requests()], Some(2));
+    hosts.go_to(0);
+    hosts.dial_and_answer(HOST_A).await;
+    hosts.go_to(55);
+    hosts.dial(HOST_A).await;
+    hosts.service.asked_to(2).await;
+    hosts.go_to(65);
+    hosts.dial(HOST_B).await;
+    hosts.service.asked_to(3).await;
+    hosts.lets_the_newest_through().await;
+    hosts.go_to(70);
+    hosts.lets_the_oldest_through().await;
+
+    for (second, wait) in [(91, 574), (664, 1)] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 3, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_A), no_capacity(wait), "at {second} s");
+    }
+    hosts.go_to(665);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the stop has ended");
 }
