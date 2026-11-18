@@ -46,7 +46,11 @@
 //! is loaded under a label that names the test's own environment. On Linux it is a user manager of
 //! the test's own, run in a delegated scope with the test's home as its home, so it reads the
 //! definition from there; ending the scope ends everything it started. A host with no user manager
-//! says why these did not run, unless `KR_REQUIRE_SERVICE_MANAGER` is set.
+//! says why these did not run, unless `KR_REQUIRE_SERVICE_MANAGER` is set. On macOS the manager is
+//! the account's own launchd, which these cases load jobs into and remove them from, and which any
+//! daemon in a graphical login session submits its sessions' workers to; so every case that starts
+//! a daemon runs there only in a run that sets `KR_ALLOW_ACCOUNT_LAUNCHD=1`, as a hosted runner's
+//! does. A person's own Mac says why they did not run and calls no `launchctl`.
 
 #![cfg(unix)]
 
@@ -450,7 +454,24 @@ impl Standalone {
         (identities, unreadable)
     }
 
-    fn create() -> Self {
+    /// A tree for daemons started without a service manager of the test's own, or none where this
+    /// run did not ask for the account's own launchd. On macOS a daemon in a graphical login
+    /// session submits the worker of each session it makes to that launchd as a job, so these
+    /// cases run there only where a run sets `KR_ALLOW_ACCOUNT_LAUNCHD`.
+    fn create() -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let asked = std::env::var_os(ALLOW_ACCOUNT_LAUNCHD);
+            if let Err(why) = account_launchd(asked.as_deref()) {
+                eprintln!("the daemon start is not tested here: {why}");
+                return None;
+            }
+        }
+        Some(Self::make())
+    }
+
+    /// A tree that no daemon is started in, or that the caller has made sure may have one.
+    fn make() -> Self {
         let tree = teardown::Tree::create();
         let home = tree.root().join("home");
         std::fs::create_dir_all(&home).expect("a home of this test's own");
@@ -1277,7 +1298,9 @@ fn allowed(call: &Recorded, daemons: &[u32], allowance: Allowance<'_>) -> Result
 /// the command.
 #[test]
 fn three_first_invocations_at_once_converge_on_one_daemon() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     host.ask_the_scripts(BARRIER, "3");
 
@@ -1350,7 +1373,9 @@ fn three_first_invocations_at_once_converge_on_one_daemon() {
 /// environment.
 #[test]
 fn a_daemon_that_does_not_come_up_in_time_is_named_and_no_second_one_is_left() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     let environment = host.tree.environment();
     let held = kr_controller::singleton::SingletonLock::acquire(
@@ -1406,7 +1431,9 @@ fn a_daemon_that_does_not_come_up_in_time_is_named_and_no_second_one_is_left() {
 /// there.
 #[test]
 fn a_daemon_slow_to_come_up_is_named_left_to_come_up_and_then_used() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     host.ask_the_scripts(DELAY, "40");
 
@@ -1453,7 +1480,9 @@ fn a_daemon_slow_to_come_up_is_named_left_to_come_up_and_then_used() {
 /// per-user service definition would go.
 #[test]
 fn selecting_and_using_the_standalone_start_installs_nothing_and_seeks_no_privilege() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let calls = host.tree.root().join("tool-calls");
     let tools = host.tree.root().join("tools");
     recording_tools(&tools, &calls, &[]);
@@ -1846,7 +1875,9 @@ fn the_allow_list_refuses_every_mutating_or_privileged_call() {
 /// Clearing it is an edit too, and the report goes back to the product default.
 #[test]
 fn the_start_is_selected_with_no_daemon_and_the_doctor_names_its_source() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
 
     let shown = start(host.kr(&["--json", "host", "startup"])).finish("kr host startup");
     let unchosen = document(&shown, "kr host startup");
@@ -1931,7 +1962,9 @@ fn the_start_is_selected_with_no_daemon_and_the_doctor_names_its_source() {
 /// then starts the daemon and creates its session.
 #[test]
 fn the_start_is_chosen_and_used_where_no_daemon_has_ever_run() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     std::fs::remove_dir_all(host.tree.paths().runtime_root()).expect("no runtime tree");
     std::fs::remove_dir_all(host.tree.paths().state_root().join("environments"))
         .expect("no environment directories");
@@ -2016,7 +2049,9 @@ async fn terminal_attachment(
 /// `kr doctor` reports the mode in force with the rung it came from.
 #[test]
 fn a_session_made_with_no_shell_mode_takes_the_hosts_default_in_the_order_section_26_gives() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
 
     // Nothing chosen: the product default, a managed shell, which `/bin/sh` cannot be.
@@ -2077,7 +2112,9 @@ fn a_session_made_with_no_shell_mode_takes_the_hosts_default_in_the_order_sectio
 /// document, and what is in force is the host's answer with the rung it came from.
 #[test]
 fn kr_host_shell_mode_chooses_and_clears_the_default_for_new_sessions() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     // The command asks the running daemon what is in force, so one is started the way a person's
     // first `kr new` starts it.
@@ -2138,7 +2175,9 @@ fn kr_host_shell_mode_chooses_and_clears_the_default_for_new_sessions() {
 #[test]
 fn kr_req_26_42_an_ordinary_user_with_no_account_and_no_managed_service_runs_a_host_and_its_sessions()
  {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     assert!(
         !host.document().exists(),
         "a first run: the host has no configuration"
@@ -2211,7 +2250,9 @@ fn kr_req_26_42_an_ordinary_user_with_no_account_and_no_managed_service_runs_a_h
 /// the name of the setting, and write nothing.
 #[test]
 fn kr_host_push_gateways_lists_and_clears_the_gateways_a_credential_may_name() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
@@ -2328,7 +2369,9 @@ fn kr_host_push_gateways_with_nothing_to_change_fails_when_the_host_did_not_put_
  {
     let gateway = a_gateway_that_is_unavailable();
     let gateway = gateway.as_str();
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     // The first revision of a document that chooses the standalone start and lists the gateway.
     kr_ipc::paths::write_owner_only_file(
         &host.document(),
@@ -2427,14 +2470,18 @@ fn kr_host_push_gateways_with_nothing_to_change_fails_on_a_host_started_over_an_
     };
 
     // The control: a daemon started by hand over a document the host can use shows its list.
-    let usable = Standalone::create();
+    let Some(usable) = Standalone::create() else {
+        return;
+    };
     usable.select_standalone();
     usable.start_a_daemon_by_hand();
     let (ok, shown) = show(&usable);
     assert!(ok, "{shown}");
     assert_eq!(shown["push_gateways"], serde_json::json!([]), "{shown}");
 
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     kr_ipc::paths::write_owner_only_file(&host.document(), br#"{"version": 99}"#)
         .expect("writes a configuration document this build cannot use");
     host.start_a_daemon_by_hand();
@@ -2479,7 +2526,9 @@ fn kr_host_push_gateways_says_a_restart_is_needed_on_a_host_started_over_a_docum
     };
 
     // The control: a daemon started by hand over a document the host can use needs no restart.
-    let usable = Standalone::create();
+    let Some(usable) = Standalone::create() else {
+        return;
+    };
     usable.select_standalone();
     usable.start_a_daemon_by_hand();
     let (ok, shown, said) = show(&usable);
@@ -2526,7 +2575,9 @@ fn kr_host_push_gateways_says_a_restart_is_needed_on_a_host_started_over_a_docum
         "a proxy the host did not start with needs one: {said}"
     );
 
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     kr_ipc::paths::write_owner_only_file(&host.document(), br#"{"version": 99}"#)
         .expect("writes a configuration document this build cannot use");
     host.start_a_daemon_by_hand();
@@ -2564,7 +2615,9 @@ fn kr_host_push_gateways_says_a_restart_is_needed_on_a_host_started_over_a_docum
 fn kr_host_push_gateways_says_a_restart_is_needed_when_the_document_put_right_is_not_all_in_force()
 {
     let gateway = a_gateway_that_is_unavailable();
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     kr_ipc::paths::write_owner_only_file(&host.document(), br#"{"version": 99}"#)
         .expect("writes a configuration document this build cannot use");
     host.hold_a_credential_issued_by(&gateway);
@@ -2641,7 +2694,9 @@ fn kr_host_push_gateways_says_a_restart_is_needed_when_the_document_put_right_is
 /// read does not depend on when it is read.
 #[test]
 fn status_reports_each_terminal_attachments_presentation_and_its_reason() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
@@ -2848,7 +2903,9 @@ async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: 
 /// of the output is in it.
 #[test]
 fn doctor_reports_the_faults_a_running_sessions_terminal_met() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     let shell = host.tree.root().join("faulty-shell.sh");
     kr_ipc::testing::place_script(
@@ -2917,7 +2974,9 @@ fn doctor_reports_the_faults_a_running_sessions_terminal_met() {
 /// the bound.
 #[test]
 fn status_reports_the_session_when_its_worker_withholds_the_attachments() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -2957,7 +3016,9 @@ fn status_reports_the_session_when_its_worker_withholds_the_attachments() {
 /// up at its bound as it would with no daemon.
 #[test]
 fn a_supervisor_still_waiting_when_its_test_ends_starts_nothing() {
-    let mut host = Standalone::create();
+    let Some(mut host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     host.ask_the_scripts(DELAY, "40");
     let running = start(host.new_session());
@@ -3022,7 +3083,9 @@ fn a_process_that_ended_before_it_was_recorded_is_recorded_as_ended() {
 /// A record cut off part way is reported, and every record that can be read is still waited for.
 #[test]
 fn a_partial_record_is_reported_and_the_others_are_still_waited_for() {
-    let mut host = Standalone::create();
+    let Some(mut host) = Standalone::create() else {
+        return;
+    };
     let ended = serde_json::to_string(&kr_ipc::identity::ended_process_identity(4242))
         .expect("encodes an identity");
     let starts = host.tree.root().join(STARTS);
@@ -3042,7 +3105,8 @@ fn a_partial_record_is_reported_and_the_others_are_still_waited_for() {
 fn a_failing_test_with_a_partial_record_keeps_its_tree_and_does_not_end_the_suite() {
     let root = std::sync::Mutex::new(None);
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let host = Standalone::create();
+        // No daemon is started here, so this one needs no launchd.
+        let host = Standalone::make();
         *root.lock().expect("the root") = Some(host.tree.root().to_path_buf());
         std::fs::write(host.tree.root().join(LAUNCHED), "4243\t{\"pid\":\"42\n")
             .expect("writes a partial record");
@@ -3180,11 +3244,30 @@ fn bus_address(path: &Path) -> String {
     address
 }
 
+/// Set to `1` by a run that has the service-start cases load jobs into the account's own launchd
+/// on macOS: a hosted runner's account is for the run alone, and a person's own is not.
+const ALLOW_ACCOUNT_LAUNCHD: &str = "KR_ALLOW_ACCOUNT_LAUNCHD";
+
+/// Whether a run asked, by the value of [`ALLOW_ACCOUNT_LAUNCHD`], for the account's own launchd,
+/// and where it did not, why the cases that need it do not run. Only `1` asks.
+fn account_launchd(asked: Option<&std::ffi::OsStr>) -> Result<(), String> {
+    if asked == Some(std::ffi::OsStr::new("1")) {
+        Ok(())
+    } else {
+        Err(format!(
+            "this run did not ask for the account's own launchd, which the daemons these cases start \
+             load jobs into and remove them from; set {ALLOW_ACCOUNT_LAUNCHD}=1 where that account \
+             is a test account or a hosted runner's"
+        ))
+    }
+}
+
 /// A host tree of a test's own where the service start is chosen: a home of the test's own that
 /// the definition is written in, and the user service manager that starts the daemon.
 ///
 /// On macOS that manager is launchd, and the definition is loaded into this user's own domain under
-/// a label that names the tree's own environment, so no other test has it. On Linux it is a
+/// a label that names the tree's own environment, so no other test has it. A run loads into the
+/// account's own launchd only where it sets [`ALLOW_ACCOUNT_LAUNCHD`]. On Linux the manager is a
 /// [`UserManager`] of the test's own.
 ///
 /// However a test ends, the daemon the manager started is ended through the manager first. On
@@ -3209,26 +3292,21 @@ impl Drop for ServiceHost {
 
 impl ServiceHost {
     /// A tree with a user service manager, or none where this host has no manager to test with,
-    /// having said why; a host that sets `KR_REQUIRE_SERVICE_MANAGER` fails instead.
+    /// having said why; a host that sets `KR_REQUIRE_SERVICE_MANAGER` fails instead. On macOS the
+    /// manager is the account's own launchd, which a run uses only where it sets
+    /// `KR_ALLOW_ACCOUNT_LAUNCHD`.
     fn create() -> Option<Self> {
-        let tree = teardown::Tree::create();
-        let home = tree.root().join("home");
-        std::fs::create_dir_all(&home).expect("a home of this test's own");
         #[cfg(target_os = "macos")]
         {
-            let domain = format!("user/{}", kr_ipc::paths::current_uid());
-            let mut print = Command::new("/bin/launchctl");
-            print.args(["print", &domain]);
-            match bounded(print, STREAMS_DEADLINE) {
-                Ok(printed) if printed.status.success() => Some(Self { tree, home }),
-                answered => Self::not_here(&format!(
-                    "launchd has no {domain} domain for this user to load a definition into: \
-                     {answered:?}"
-                )),
+            let asked = std::env::var_os(ALLOW_ACCOUNT_LAUNCHD);
+            match Self::in_launchd(asked.as_deref(), Path::new("/bin/launchctl")) {
+                Ok(host) => Some(host),
+                Err(why) => Self::not_here(&why),
             }
         }
         #[cfg(target_os = "linux")]
         {
+            let (tree, home) = Self::tree_and_home();
             match UserManager::start(&home, tree.holder()) {
                 Ok(manager) => Some(Self {
                     manager,
@@ -3240,8 +3318,35 @@ impl ServiceHost {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            drop((tree, home));
+            drop(Self::tree_and_home());
             Self::not_here("this platform has no service start")
+        }
+    }
+
+    /// The tree of a test's own, with the home of its own that a definition is written in.
+    fn tree_and_home() -> (teardown::Tree, PathBuf) {
+        let tree = teardown::Tree::create();
+        let home = tree.root().join("home");
+        std::fs::create_dir_all(&home).expect("a home of this test's own");
+        (tree, home)
+    }
+
+    /// A tree on the account's own launchd, which `launchctl` reaches, or why there is none. Where
+    /// the run did not ask for that launchd, nothing is made and `launchctl` is not run, not even
+    /// to read.
+    #[cfg(target_os = "macos")]
+    fn in_launchd(asked: Option<&std::ffi::OsStr>, launchctl: &Path) -> Result<Self, String> {
+        account_launchd(asked)?;
+        let (tree, home) = Self::tree_and_home();
+        let domain = format!("user/{}", kr_ipc::paths::current_uid());
+        let mut print = Command::new(launchctl);
+        print.args(["print", &domain]);
+        match bounded(print, STREAMS_DEADLINE) {
+            Ok(printed) if printed.status.success() => Ok(Self { tree, home }),
+            answered => Err(format!(
+                "launchd has no {domain} domain for this user to load a definition into: \
+                 {answered:?}"
+            )),
         }
     }
 
@@ -3550,6 +3655,60 @@ impl ServiceHost {
             Ok(())
         }
     }
+}
+
+/// Only a run that sets `KR_ALLOW_ACCOUNT_LAUNCHD` to `1` asks for the account's own launchd: the
+/// variable absent, empty, or set to anything else does not.
+#[test]
+fn only_a_run_that_sets_the_account_launchd_variable_to_one_asks_for_the_accounts_launchd() {
+    use std::ffi::OsStr;
+
+    assert!(account_launchd(Some(OsStr::new("1"))).is_ok());
+    for refused in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("true"),
+        Some("11"),
+        Some(" 1"),
+    ] {
+        let why = account_launchd(refused.map(OsStr::new)).expect_err("does not ask");
+        assert!(why.contains(ALLOW_ACCOUNT_LAUNCHD), "{why}");
+    }
+}
+
+/// A Mac run that did not ask for the account's own launchd gets no host from the service-start
+/// cases and runs no `launchctl`, not to load a job and not to read one. A program in the place of
+/// `launchctl` records each call it is given, and it is shown to record before it is trusted to
+/// show there was none.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_run_that_did_not_ask_for_the_accounts_launchd_gets_no_host_and_runs_no_launchctl() {
+    use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let tree = teardown::Tree::create();
+    let calls = tree.root().join("launchctl-calls");
+    let stand_in = tree.root().join("launchctl");
+    std::fs::write(
+        &stand_in,
+        format!("#!/bin/sh\necho \"$@\" >> '{}'\n", calls.display()),
+    )
+    .expect("a stand-in for launchctl");
+    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
+        .expect("the stand-in can run");
+    let control = bounded(Command::new(&stand_in), STREAMS_DEADLINE).expect("the stand-in runs");
+    assert!(control.status.success(), "{control:?}");
+    assert!(calls.exists(), "the stand-in does not record a call");
+    std::fs::remove_file(&calls).expect("clears the record");
+
+    for asked in [None, Some(OsStr::new("")), Some(OsStr::new("0"))] {
+        assert!(
+            ServiceHost::in_launchd(asked, &stand_in).is_err(),
+            "a run that asked {asked:?} got a host"
+        );
+    }
+    assert!(!calls.exists(), "launchctl was run");
 }
 
 /// KR-REQ-07.12: with the service start chosen, three first invocations at once converge on the
@@ -5461,8 +5620,10 @@ impl Typing {
 }
 
 /// A host with a daemon and one live session, the daemon's process and the session.
-fn a_host_with_a_session() -> (Standalone, SessionId, Value, u32) {
-    let host = Standalone::create();
+fn a_host_with_a_session() -> Option<(Standalone, SessionId, Value, u32)> {
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.select_standalone();
     let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
@@ -5473,7 +5634,7 @@ fn a_host_with_a_session() -> (Standalone, SessionId, Value, u32) {
         .parse()
         .expect("parses");
     let daemon = host.one_daemon();
-    (host, session_id, created, daemon)
+    Some((host, session_id, created, daemon))
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -5512,7 +5673,9 @@ fn attempts(host: &Standalone) -> Vec<kr_controller::attempt::Recorded> {
 /// own record of the attempt is gone once it has seen the end.
 #[test]
 fn kr_host_stop_ends_the_daemon_and_no_session_goes_with_it() {
-    let (host, session_id, _created, daemon) = a_host_with_a_session();
+    let Some((host, session_id, _created, daemon)) = a_host_with_a_session() else {
+        return;
+    };
     let runtime = runtime();
     let mut before = runtime.block_on(async {
         let mut terminal = Typing::attach(&host, session_id, true).await;
@@ -5582,7 +5745,9 @@ fn signal(name: &str, pid: u32) {
 /// refused. The control: a worker that cannot say lets the command go on, and the daemon stops.
 #[test]
 fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_say() {
-    let (host, session_id, _created, daemon) = a_host_with_a_session();
+    let Some((host, session_id, _created, daemon)) = a_host_with_a_session() else {
+        return;
+    };
     for variable in ["KR_SESSION", "KR_ATTACHMENT"] {
         let mut command = host.kr(&["--json", "host", "stop"]);
         command.env(variable, "x");
@@ -5640,7 +5805,9 @@ fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_sa
 /// the daemon did not show whether it took the stop and that it has ended.
 #[test]
 fn two_kr_host_stops_at_once_each_say_what_is_true_and_one_daemon_ends() {
-    let (host, _session_id, _created, _daemon) = a_host_with_a_session();
+    let Some((host, _session_id, _created, _daemon)) = a_host_with_a_session() else {
+        return;
+    };
     let first = start(host.kr(&["host", "stop"]));
     let second = start(host.kr(&["host", "stop"]));
     let results = [
@@ -5690,7 +5857,9 @@ fn two_kr_host_stops_at_once_each_say_what_is_true_and_one_daemon_ends() {
 /// runs this installation's daemon.
 #[test]
 fn kr_host_stop_says_when_no_daemon_runs_and_names_a_holder_that_does_not_answer() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let output = start(host.kr(&["host", "stop"])).finish("kr host stop");
     assert!(output.status.success());
     let said = String::from_utf8_lossy(&output.stdout);
@@ -6145,7 +6314,9 @@ const NOBODY: u32 = 4_194_000;
 /// the case below, which an interrupt ends.
 #[test]
 fn a_hangup_after_the_request_has_left_does_not_end_kr_host_stop() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -6171,7 +6342,9 @@ fn a_hangup_after_the_request_has_left_does_not_end_kr_host_stop() {
 /// ended with its own result.
 #[test]
 fn an_interrupt_after_the_request_has_left_says_what_may_be_so_and_the_record_stands() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -6227,7 +6400,9 @@ fn an_interrupt_after_the_request_has_left_says_what_may_be_so_and_the_record_st
 /// stopped, and the command leaves no record: the daemon had received only the command's look.
 #[test]
 fn an_interrupt_before_the_request_says_that_nothing_was_asked_and_leaves_no_record() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     leave_a_record(&host);
     let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldTheLook, true);
     let running = start(host.kr(&["host", "stop"]));
@@ -6286,7 +6461,9 @@ fn start_a_copy_that_holds_still(working: &Path, copy: &Path) -> Child {
 /// and the lock file names a live process named kr-controller that is not the old one.
 #[test]
 fn a_successor_that_holds_the_environment_after_the_stop_reads_as_the_daemons_end() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let lock = host.tree.environment().singleton_lock();
     let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
         .expect("takes the lock");
@@ -6330,7 +6507,9 @@ fn a_successor_that_holds_the_environment_after_the_stop_reads_as_the_daemons_en
 /// asked ended when its listener closed, and the one that answers after it is another.
 #[test]
 fn a_daemon_of_another_generation_that_answers_after_the_stop_is_a_successor() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let lock = host.tree.environment().singleton_lock();
     let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
         .expect("takes the lock");
@@ -6363,7 +6542,9 @@ fn a_daemon_of_another_generation_that_answers_after_the_stop_is_a_successor() {
 /// after it, and leaves the record where it was.
 #[test]
 fn a_reader_of_no_daemon_gives_the_record_of_a_killed_stop_and_removes_nothing() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -6401,7 +6582,9 @@ fn a_reader_of_no_daemon_gives_the_record_of_a_killed_stop_and_removes_nothing()
 /// process it did not learn.
 #[test]
 fn a_stop_with_no_answer_is_an_unknown_outcome_and_the_command_looks_at_the_lock() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::Cut, true);
     let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
     let stopped = document(&output, "kr host stop");
@@ -6436,7 +6619,9 @@ fn a_refused_read_of_the_daemon_exits_8_and_one_that_does_not_decode_exits_1_wit
         ),
         (OnStop::UndecodableRead, 1),
     ] {
-        let host = Standalone::create();
+        let Some(host) = Standalone::create() else {
+            return;
+        };
         let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", on_stop, true);
         let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
         let said = document(&output, "kr host stop");
@@ -6459,7 +6644,9 @@ fn a_refused_read_of_the_daemon_exits_8_and_one_that_does_not_decode_exits_1_wit
 /// the refusal at the hello.
 #[test]
 fn a_daemon_that_answers_the_hello_with_another_major_is_refused_with_exit_3_and_no_stop_asked() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::AnotherMajor, true);
     let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
     let said = document(&output, "kr host stop");
@@ -6479,7 +6666,9 @@ fn a_daemon_that_answers_the_hello_with_another_major_is_refused_with_exit_3_and
 /// would be `refused`.
 #[test]
 fn a_stop_answered_with_an_unknown_outcome_error_is_waited_for_and_not_refused() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -6501,7 +6690,9 @@ fn a_stop_answered_with_an_unknown_outcome_error_is_waited_for_and_not_refused()
 /// daemon not seen to end after 30 seconds is `maybe_asked`.
 #[test]
 fn the_record_of_a_stop_whose_outcome_is_unknown_is_not_told() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -6530,7 +6721,9 @@ fn the_record_of_a_stop_whose_outcome_is_unknown_is_not_told() {
 /// was told.
 #[test]
 fn the_record_of_a_stop_that_the_daemon_took_and_has_not_ended_is_told() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -6558,7 +6751,9 @@ fn the_record_of_a_stop_that_the_daemon_took_and_has_not_ended_is_told() {
 /// the command shows as the refusal with exit 8, with nothing else asked.
 #[test]
 fn a_daemon_that_lists_no_stop_is_left_as_it_is_and_a_refusal_of_its_own_is_shown() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/0.1.0+aaaaaaaaaaaa",
@@ -6615,7 +6810,9 @@ fn a_daemon_that_lists_no_stop_is_left_as_it_is_and_a_refusal_of_its_own_is_show
 /// still stops the daemon and removes its own record, because what it says is not what it does.
 #[test]
 fn kr_host_stop_goes_on_when_nobody_reads_what_it_says() {
-    let (host, _session_id, _created, _daemon) = a_host_with_a_session();
+    let Some((host, _session_id, _created, _daemon)) = a_host_with_a_session() else {
+        return;
+    };
     let mut child = spawning(|| {
         host.kr(&["host", "stop"])
             .stdout(Stdio::piped())
@@ -6697,7 +6894,9 @@ fn stop_that_nobody_reads(host: &Standalone, arguments: &[&str], stream: &str) -
 /// `not_asked` is for what never left.
 #[test]
 fn a_request_the_daemon_refused_is_refused_in_json_and_not_asked() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     for (probe_answered, code) in [(true, 1), (false, 8)] {
         let mut daemon = TestDaemon::serve(
             &host,
@@ -6723,7 +6922,9 @@ fn a_request_the_daemon_refused_is_refused_in_json_and_not_asked() {
 /// be ending and to run the command again to see, gives `told`, and the command's record stands.
 #[test]
 fn an_interrupt_after_the_daemon_was_told_says_what_may_be_so_and_the_record_stands() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -6764,7 +6965,9 @@ fn an_interrupt_after_the_daemon_was_told_says_what_may_be_so_and_the_record_sta
 /// nothing was stopped, gives `refused`, and leaves no record.
 #[test]
 fn an_interrupt_after_the_daemon_refused_says_that_nothing_was_stopped_and_leaves_no_record() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/0.1.0+aaaaaaaaaaaa",
@@ -6797,7 +7000,9 @@ fn an_interrupt_after_the_daemon_refused_says_that_nothing_was_stopped_and_leave
 /// The result removes nothing: the command's own record and an earlier attempt's both stand.
 #[test]
 fn a_daemon_that_took_the_stop_and_has_not_ended_is_named_and_no_record_is_removed() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     leave_a_record(&host);
     let lock = host.tree.environment().singleton_lock();
     let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
@@ -6847,7 +7052,9 @@ fn a_daemon_that_took_the_stop_and_has_not_ended_is_named_and_no_record_is_remov
 /// and the one that is read says them and then removes them.
 #[test]
 fn the_records_of_earlier_attempts_are_removed_only_after_they_were_put_out() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     leave_a_record(&host);
     assert!(stop_that_nobody_reads(
         &host,
@@ -6882,7 +7089,9 @@ fn the_records_of_earlier_attempts_are_removed_only_after_they_were_put_out() {
 /// nothing; it does not wait for ever.
 #[test]
 fn a_daemon_that_does_not_answer_host_info_is_a_holder_that_is_silent_and_no_stop_is_asked() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(&host, "kr-controller/9.9.9", OnStop::HoldTheLook, true);
     let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
     let said = document(&output, "kr host stop");
@@ -6910,7 +7119,9 @@ fn a_daemon_that_does_not_answer_host_info_is_a_holder_that_is_silent_and_no_sto
 /// whether it ended could not be read, and never that the daemon was told.
 #[test]
 fn an_unknown_answer_followed_by_a_failed_lock_check_does_not_say_the_daemon_was_told() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let lock = host.tree.environment().singleton_lock();
     let _ = std::fs::remove_file(&lock);
     std::fs::create_dir_all(&lock).expect("a directory where the lock file is");
@@ -6945,7 +7156,9 @@ fn an_unknown_answer_followed_by_a_failed_lock_check_does_not_say_the_daemon_was
 /// and one that waited would have looked again and again.
 #[test]
 fn a_request_that_could_not_be_made_is_not_asked_and_nothing_is_waited_for() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -6991,7 +7204,9 @@ fn a_request_that_could_not_be_made_is_not_asked_and_nothing_is_waited_for() {
 /// no record.
 #[test]
 fn a_request_that_could_not_be_made_because_the_daemon_ended_is_the_daemons_end() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -7018,7 +7233,9 @@ fn a_request_that_could_not_be_made_because_the_daemon_ended_is_the_daemons_end(
 /// made, and that this command sent nothing.
 #[test]
 fn the_end_of_a_daemon_that_closed_before_the_request_says_that_nothing_was_sent() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",
@@ -7059,7 +7276,9 @@ fn the_end_of_a_daemon_that_closed_before_the_request_says_that_nothing_was_sent
 /// of the stop's decision hold.
 #[test]
 fn a_daemon_that_closed_the_connection_and_goes_is_waited_for_to_its_end_whichever_path_is_taken() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut daemon = TestDaemon::serve(
         &host,
         "kr-controller/9.9.9",

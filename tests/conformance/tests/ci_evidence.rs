@@ -1202,6 +1202,37 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
     );
 }
 
+/// The tests that start a daemon through the user's service manager load jobs into the account's
+/// own launchd on macOS, and stand down, and pass, in a run that does not set
+/// `KR_ALLOW_ACCOUNT_LAUNCHD`, as a person's own Mac does. The macOS runs that report on the
+/// workspace's tests set it, so that those tests run on the runner whose account is for the run
+/// alone and are not reported as passed without having run.
+#[test]
+fn the_macos_runs_of_the_workspace_tests_ask_for_the_accounts_launchd() {
+    let variable = "KR_ALLOW_ACCOUNT_LAUNCHD: \"1\"";
+    let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let tests = steps_running(&job(&landing, "macos"), "cargo test --locked --workspace");
+    assert!(
+        tests
+            .iter()
+            .all(|step| step.lines().any(|line| line.trim() == variable)),
+        "a step of the landing workflow's macos job that runs the workspace's tests does not ask \
+         for the account's own launchd"
+    );
+    let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
+        .expect("the conformance workflow");
+    // Among the job's own keys, in its environment ahead of its steps, so that every step that runs
+    // tests has it.
+    assert!(
+        header(&job(&report, "macos"))
+            .lines()
+            .any(|line| line.trim() == variable),
+        "the macOS job of the conformance workflow does not ask for the account's own launchd in \
+         its own environment"
+    );
+}
+
 /// The reference host's job builds the release profile in hours when its cargo cache is gone, and a
 /// run that ends without saving the cache starts cold again. So the save runs after a good build
 /// whatever a later step does (a failure, a limit, a cancelled run) and after no build that did not
