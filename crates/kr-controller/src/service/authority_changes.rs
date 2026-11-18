@@ -4438,14 +4438,22 @@ mod tests {
             .expect("a read")
     }
 
-    /// Runs one push registration of the host's device to the point after the gateway has taken
-    /// it, where it waits for the registry, which this holds; does `ends` to the device's record
-    /// there; then lets the registry go and returns what the registration ended as. The connection
-    /// it came on stays admitted.
+    /// Runs one push registration of the host's device with an admission that lasts `lifetime` on
+    /// the continuous clock, and holds the registry from before it starts. The gateway has taken
+    /// the registration when `ends` runs: the registration is then between the gateway's answer
+    /// and the registry's lock, or waiting for the lock, and it cannot pass the lock before the
+    /// registry is let go, so what `ends` does to the device's record comes before every guard of
+    /// the write. Then the registry is let go and what the registration ended as is returned. The
+    /// connection it came on stays admitted, unless `ends` withdraws it or `lifetime` lapses.
+    ///
+    /// Each wait is bounded and says which it was; a registration that does not end is aborted and
+    /// joined before the case fails.
     async fn push_registered_while(
         host: &Host,
+        lifetime: Duration,
         ends: impl FnOnce(&Host),
     ) -> crate::error::Result<ParamsValue> {
+        const BOUND: Duration = Duration::from_secs(30);
         let (answered, gateway_answered) = std::sync::mpsc::channel();
         let gateway = Arc::new(Gateway {
             answered: std::sync::Mutex::new(answered),
@@ -4455,23 +4463,36 @@ mod tests {
                 .attach_delivery_transport(Arc::new(ThroughGateway(gateway))),
             "no transport was attached before this one"
         );
-        let admission = host.admission(Duration::from_secs(600));
+        let admission = host.admission(lifetime);
         let mutation = push_registration(host, 0x72);
         let actor = kr_transport::listener::device_principal(&host.device_id);
-        let registry = host.controller.registry.lock().await;
+        let registry = tokio::time::timeout(BOUND, host.controller.registry.lock())
+            .await
+            .expect("the case takes the registry within its bound");
         let controller = Arc::clone(&host.controller);
-        let effect = tokio::spawn(async move {
+        let mut effect = tokio::spawn(async move {
             controller
                 .device_push_register(&actor, &mutation, admission)
                 .await
         });
-        tokio::task::spawn_blocking(move || gateway_answered.recv_timeout(Duration::from_secs(30)))
+        let asked = tokio::task::spawn_blocking(move || gateway_answered.recv_timeout(BOUND))
             .await
-            .expect("the wait ends")
-            .expect("the gateway was asked to begin the renewal");
+            .expect("the wait ends");
+        if asked.is_err() {
+            effect.abort();
+            let _ = effect.await;
+            panic!("the gateway was not asked to begin the renewal within {BOUND:?}");
+        }
         ends(host);
         drop(registry);
-        effect.await.expect("the registration ends")
+        match tokio::time::timeout(BOUND, &mut effect).await {
+            Ok(ended) => ended.expect("the registration task ends without a panic"),
+            Err(_) => {
+                effect.abort();
+                let _ = effect.await;
+                panic!("the registration did not end within {BOUND:?} of the registry's release");
+            }
+        }
     }
 
     /// KR-REQ-10.08: a push registration is decided on the device's record as the registry shows
@@ -4483,7 +4504,7 @@ mod tests {
      {
         for revoked in [false, true] {
             let host = Host::start(GrantExpiry::Never, false).await;
-            let outcome = push_registered_while(&host, |host| {
+            let outcome = push_registered_while(&host, Duration::from_secs(600), |host| {
                 if revoked {
                     assert!(
                         host.controller
@@ -4531,7 +4552,7 @@ mod tests {
      {
         let host = Host::start(GrantExpiry::Never, false).await;
         let new_id = DeviceId::new(uuid(11));
-        let outcome = push_registered_while(&host, |host| {
+        let outcome = push_registered_while(&host, Duration::from_secs(600), |host| {
             let mut replacement = host
                 .controller
                 .devices()
@@ -4593,7 +4614,7 @@ mod tests {
             false,
         )
         .await;
-        let outcome = push_registered_while(&host, |host| {
+        let outcome = push_registered_while(&host, Duration::from_secs(600), |host| {
             host.wall.store(now + 3_600_001, Ordering::SeqCst);
         })
         .await;
@@ -4610,6 +4631,44 @@ mod tests {
             destination.is_none(),
             "no destination stands under the device: {destination:?}"
         );
+    }
+
+    /// KR-REQ-10.08: a push registration is checked against the admission it carries where the
+    /// destination is written, after it has waited for the registry. With the record standing and
+    /// its grant without an end, the admission's deadline passes on the continuous clock while the
+    /// registration waits, and the registration is refused with no destination; the control, with
+    /// the deadline still ahead, registers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_push_registration_whose_admission_lapses_while_it_waits_for_the_registry_writes_no_destination()
+     {
+        for lapses in [false, true] {
+            let host = Host::start(GrantExpiry::Never, false).await;
+            let outcome = push_registered_while(&host, Duration::from_secs(10), |host| {
+                if lapses {
+                    host.continuous.advance(Duration::from_secs(11));
+                }
+            })
+            .await;
+            let destination = destination_of(&host, host.device_id);
+            if lapses {
+                let error =
+                    outcome.expect_err("an admission that has lapsed registers no destination");
+                assert!(
+                    matches!(&error, crate::error::ControllerError::WindowExpired { .. }),
+                    "the admission's own check refuses it: {error}"
+                );
+                assert!(
+                    destination.is_none(),
+                    "no destination stands under the device: {destination:?}"
+                );
+            } else {
+                outcome.expect("the control registers");
+                assert!(
+                    destination.is_some(),
+                    "the control's destination stands under the device"
+                );
+            }
+        }
     }
 
     /// KR-REQ-09.13: the daemon's entry for a worker replaces the one an answer was given with only
