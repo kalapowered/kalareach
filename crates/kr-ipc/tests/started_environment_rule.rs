@@ -19,8 +19,10 @@
 //!    an assignment to it, and the same name written into a JSON text) names the helper's
 //!    `snapshot_home()` inside the expression it writes, or its file has a row in `SNAPSHOTS` that
 //!    counts the places it excuses.
-//! 3. Every start of a daemon in the test's own process (`Controller::start` and
-//!    `Controller::start_on_clocks`) gives the daemon its host environment in the same function
+//! 3. Every start of a daemon in the test's own process (`Controller::start`,
+//!    `Controller::start_on_clocks`, `Controller::start_on_timer`,
+//!    `Controller::start_on_clocks_and_timer` and `Controller::start_on_clocks_and_timers`)
+//!    gives the daemon its host environment in the same function
 //!    (`set_host_environment`), or names a worker program that does not exist, or its file has a
 //!    row in `DAEMON_STARTS` that counts the starts it excuses.
 //! 4. Each row that says a source keeps the real environment on purpose (`INHERITS`) names text
@@ -78,7 +80,13 @@ const SNAPSHOT_HOME: &str = "snapshot_home(";
 const SETTER: &str = "set_host_environment(";
 
 /// The starts of a daemon in the test's own process.
-const DAEMON_STARTS_AT: [&str; 2] = ["Controller::start(", "Controller::start_on_clocks("];
+const DAEMON_STARTS_AT: [&str; 5] = [
+    "Controller::start(",
+    "Controller::start_on_clocks(",
+    "Controller::start_on_timer(",
+    "Controller::start_on_clocks_and_timer(",
+    "Controller::start_on_clocks_and_timers(",
+];
 
 /// The text of a worker program's path that shows the path does not exist, so no worker and no
 /// shell can start.
@@ -548,8 +556,8 @@ const DAEMON_STARTS: &[Counted] = &[
     },
     Counted {
         file: "crates/kr-controller/tests/net_support/mod.rs",
-        places: 1,
-        reason: "the setup of every host it makes names a worker program that does not exist",
+        places: 3,
+        reason: "its three starts (on the clocks, on the clocks and a timer, on the clocks and three timers) share the setup of every host it makes, which names a worker program that does not exist",
         removal: "none while the setup names none; the condition is tested",
         holds: |text| text.contains("\"/nonexistent/kr-worker\""),
     },
@@ -1228,6 +1236,35 @@ fn the_daemon_reading_finds_a_start_with_no_environment_and_a_worker_that_may_ex
         "root.join(\"no-such-worker\")",
     ] {
         assert!(unexcused_starts(&setup(worker)).is_empty(), "{worker}");
+    }
+    // Each of the five spellings of a start is read: with a worker that may exist and no setter it
+    // is unexcused; with the setter, or with a worker that does not exist, it is excused.
+    for call in [
+        "Controller::start(",
+        "Controller::start_on_clocks(",
+        "Controller::start_on_timer(",
+        "Controller::start_on_clocks_and_timer(",
+        "Controller::start_on_clocks_and_timers(",
+    ] {
+        let start = |worker: &str, setter: &str| {
+            format!(
+                "async fn a() {{\n let c = {call}ControllerSetup {{ worker_program: {worker}, \
+                 build_id: b }}, t).await;\n{setter}}}\n"
+            )
+        };
+        assert_eq!(
+            unexcused_starts(&start("worker.clone()", "")),
+            vec![2],
+            "{call}"
+        );
+        assert!(
+            unexcused_starts(&start("worker.clone()", " c.set_host_environment(v);\n")).is_empty(),
+            "{call}"
+        );
+        assert!(
+            unexcused_starts(&start("PathBuf::from(\"/nonexistent/kr-worker\")", "")).is_empty(),
+            "{call}"
+        );
     }
     let given = "async fn a() {\n let c = Controller::start_on_clocks(setup).await;\n \
                  c.set_host_environment(v);\n}\n";
