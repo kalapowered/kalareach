@@ -23,11 +23,16 @@
 //! records its holder for this: one number, zero when nobody holds it, that the guard sets when the
 //! mutex gives it, also inside a poison error, and clears before the mutex is let go. The record is
 //! no lock, and nothing waits on it. Where the first guard is on the stack that the panic unwinds,
-//! the mutex is poisoned and every later take of it panics. The trying take, which cannot wait,
-//! does not compare: the holder gets "busy" as any other thread does. A take by another thread
-//! that the holder waits for is not refused. The tests of the roster in
-//! `tests/standing_takes.txt` show each new mention of a function that takes the boundary, by
-//! function, to a person; they prove nothing about the property.
+//! the mutex is poisoned: a later take gives a poison error, which the waiting sites turn into a
+//! panic, and the announcement reads as a held boundary. The trying take, which cannot wait, does
+//! not compare: the holder gets "busy", as any other thread does. A take by another thread that
+//! the holder waits for is not refused, and a guard handed to another thread that then waits for
+//! the boundary is not seen (the guard is not sendable, so only a borrow can be).
+//!
+//! The roster in `tests/standing_takes.txt` shows each new mention of a function that takes the
+//! boundary, by function, to a person. It proves nothing about the property, and it does not see a
+//! call that a macro writes, an async taker that a sync body runs to its end, or a take on a thread
+//! that the holder waits for.
 
 use std::cell::Cell;
 use std::sync::Mutex;
@@ -72,8 +77,9 @@ fn this_thread() -> u64 {
 pub(super) struct DispatchBoundary {
     lock: Mutex<()>,
     released: tokio::sync::Notify,
-    /// The number of the thread that holds the boundary, or zero. Only the holder writes it, and
-    /// the mutex orders the holders, so relaxed loads and stores are enough.
+    /// The number of the thread that holds the boundary, or zero. Only the holder writes it, and a
+    /// thread compares it with a number that only that thread's own earlier store can equal, so
+    /// relaxed loads and stores are enough; the mutex orders the holders.
     holder: AtomicU64,
 }
 
