@@ -107,6 +107,9 @@ pub const WRITTEN: Written = Written {
 /// The largest record, or definition, this build reads: far more than it ever writes.
 const READ_LIMIT: u64 = 64 * 1024;
 
+/// What the service start's lock protects, as the sentence that names its holder ends.
+const SERVICE_LOCK_HOLDS: &str = "sets up, removes or starts this environment's daemon";
+
 /// How long a command waits for another to finish with the service start before it says who holds
 /// it: long enough for every command the other puts to the manager to have answered.
 const LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -384,19 +387,22 @@ pub fn lock(environment: &EnvironmentPaths) -> Result<Lock> {
 impl Lock {
     /// Takes the environment's lock, waiting [`LOCK_WAIT`] for another command to finish with it.
     fn take(environment: &EnvironmentPaths) -> std::result::Result<Self, Shown> {
-        Self::take_within(environment, LOCK_WAIT)
+        Self::take_within(environment, LOCK_FILE, SERVICE_LOCK_HOLDS, LOCK_WAIT)
     }
 
-    /// Takes the environment's lock, waiting at most `wait`.
+    /// Takes the lock on the file `file` in the environment's state directory, waiting at most
+    /// `wait`. `holds` finishes the sentence that says what the holder is doing: "while it ...".
     ///
     /// The lock is the operating system's, on an open file, so a command that ends however it ends
     /// lets go of it. The file stays where it is.
-    fn take_within(
+    pub(crate) fn take_within(
         environment: &EnvironmentPaths,
+        file: &'static str,
+        holds: &'static str,
         wait: Duration,
     ) -> std::result::Result<Self, Shown> {
-        let path = environment.state_dir().join(LOCK_FILE);
-        let said = Shown::within(environment.state_dir(), LOCK_FILE);
+        let path = environment.state_dir().join(file);
+        let said = Shown::within(environment.state_dir(), file);
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(unix)]
@@ -416,10 +422,10 @@ impl Lock {
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     return Err(shown!(
-                        "another kr command has held {} for {} seconds while it sets up, removes \
-                         or starts this environment's daemon",
+                        "another kr command has held {} for {} seconds while it {}",
                         said,
-                        wait.as_secs()
+                        wait.as_secs(),
+                        holds
                     ));
                 }
                 Err(std::fs::TryLockError::Error(error)) => {
@@ -2657,12 +2663,19 @@ mod tests {
     fn one_command_at_a_time_holds_the_service_start() {
         let host = kr_ipc::testing::TempHost::create();
         let environment = host.environment();
-        let held = Lock::take_within(&environment, Duration::ZERO).expect("the first takes it");
-        let refused = Lock::take_within(&environment, Duration::from_millis(100))
+        let held = Lock::take_within(&environment, LOCK_FILE, SERVICE_LOCK_HOLDS, Duration::ZERO)
+            .expect("the first takes it");
+        let refused = Lock::take_within(
+            &environment,
+            LOCK_FILE,
+            SERVICE_LOCK_HOLDS,
+            Duration::from_millis(100),
+        )
             .expect_err("the second waits and gives up");
         assert!(refused.as_str().contains(LOCK_FILE), "{refused}");
         drop(held);
-        Lock::take_within(&environment, Duration::ZERO).expect("free once the first lets go");
+        Lock::take_within(&environment, LOCK_FILE, SERVICE_LOCK_HOLDS, Duration::ZERO)
+            .expect("free once the first lets go");
     }
 
     /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
