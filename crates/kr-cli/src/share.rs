@@ -265,8 +265,9 @@ fn pick_device<'a>(
     if device.all_sessions {
         return Err(CliError::Usage(shown!(
             "that device's pairing already opens every session, so a share to it adds nothing the \
-             connection can use; pair it as a guest (`kr pair invite --guest{}`) to share one \
-             session",
+             connection can use; to share one session, pair it again as a guest \
+             (`kr pair invite --guest{}`) after its pairing has ended (the host refuses a new \
+             pairing while this one stands)",
             environment.clone()
         )));
     }
@@ -2105,6 +2106,29 @@ mod tests {
             said.contains("(the host refuses a new pairing while it stands)"),
             "{said}"
         );
+    }
+
+    /// The host refuses a new pairing of a device it still lists, so the share command offers a
+    /// guest pairing to a device whose pairing opens every session only once that pairing has
+    /// ended.
+    #[test]
+    fn a_device_whose_pairing_opens_every_session_is_paired_as_a_guest_only_after_it_has_ended() {
+        let mut every_session = device(3, "old phone");
+        every_session.all_sessions = true;
+        let refused = pick_device(&[every_session], "old phone", &Shown::said(""))
+            .expect_err("a pairing that opens every session takes no share");
+        let CliError::Usage(said) = refused else {
+            panic!("a usage mistake: {refused:?}");
+        };
+        let said = said.as_str();
+        assert!(
+            said.contains(
+                "to share one session, pair it again as a guest (`kr pair invite --guest`) after \
+                 its pairing has ended (the host refuses a new pairing while this one stands)"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("pair it as a guest"), "{said}");
     }
 
     /// A share is asked for what is left of the end the person was shown, so the time spent at the
