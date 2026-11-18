@@ -2937,6 +2937,105 @@ mod tests {
         assert_eq!(code, ErrorCode::InvalidArgument);
     }
 
+    #[test]
+    fn an_action_kept_under_a_refusal_code_this_build_lacks_is_unknown_and_is_never_carried_out_again()
+     {
+        // A store keeps an error code as its wire word, and a build can meet a word that a later
+        // build added. The reading is the same for every kept refusal: the outcome is unknown,
+        // the stored detail is still shown, the row stays, and no second copy of the action
+        // takes the claim.
+        let mut store = store();
+        let actor = ActorId::new("an actor").expect("an actor identifier");
+        let action = kr_ipc::new_uuid();
+        let digest = crate::objects::digest_of(b"the request");
+        let authority = Authority::new(true);
+        assert!(
+            store
+                .claim_action(
+                    &actor,
+                    action,
+                    "changeset.capture",
+                    digest,
+                    Some(&authority)
+                )
+                .expect("the claim is taken")
+        );
+        store
+            .settle_action(
+                &actor,
+                action,
+                "changeset.capture",
+                digest,
+                &RetainedOutcome::Error {
+                    code: ErrorCode::InvalidArgument,
+                    detail: "it was refused".to_owned(),
+                },
+            )
+            .expect("the claim settles with a refusal");
+
+        let kept = |store: &Store| -> (i64, Option<Vec<u8>>, Option<String>, Option<String>) {
+            store
+                .connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM actions), result, error_code, error_detail
+                       FROM actions WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor.as_str(), action.as_bytes().to_vec()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("the one action row")
+        };
+        assert_eq!(
+            kept(&store).2.as_deref(),
+            Some(ErrorCode::InvalidArgument.as_str()),
+            "the writer kept the refusal as its wire word"
+        );
+
+        // A later build added a code, and the refusal of this record was kept under it.
+        let word = "A_CODE_A_LATER_BUILD_ADDS";
+        assert!(
+            ErrorCode::from_wire(word).is_none(),
+            "this build lacks the word"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE actions SET error_code = ?3 WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor.as_str(), action.as_bytes().to_vec(), word],
+            )
+            .expect("the kept word is changed");
+        let before = kept(&store);
+
+        // 1. The reader's answer: the outcome is unknown, with the stored detail. The record is
+        // neither absent nor a success, and it is not a refusal under another definite code.
+        let Some(RetainedOutcome::Error { code, detail }) = store
+            .retained_action(&actor, action, "changeset.capture", digest)
+            .expect("the record reads")
+        else {
+            panic!("a record kept under a word this build lacks is answered, and as an error");
+        };
+        assert_eq!(code, ErrorCode::OutcomeUnknown);
+        assert_eq!(detail, "it was refused");
+
+        // 2. The record stays: the same row, byte for byte.
+        assert_eq!(kept(&store), before);
+
+        // 3. No effect runs again: a repeat under the same identifier does not win the claim, and
+        // it makes no row.
+        assert!(
+            !store
+                .claim_action(
+                    &actor,
+                    action,
+                    "changeset.capture",
+                    digest,
+                    Some(&authority)
+                )
+                .expect("the repeat asks"),
+            "a repeat of an action kept under an unknown word does not take a new claim"
+        );
+        assert_eq!(kept(&store), before);
+    }
+
     fn digest_of_other() -> Digest256 {
         crate::objects::digest_of(b"another request")
     }
