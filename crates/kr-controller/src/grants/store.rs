@@ -4285,8 +4285,8 @@ pub(crate) fn grant_rows_read() -> u64 {
 ///
 /// A row whose key is not the identifier of the grant in its payload cannot be read either. Every
 /// writer files a grant under its own identifier, so such a row is a damaged file or an edit by
-/// hand, and it would otherwise stand for a grant that another row holds: a revocation finds the
-/// row to withdraw by the payload's identifier and would leave the other one live.
+/// hand, and it would otherwise be read as a grant of the identifier its payload carries: a
+/// revocation finds the row to withdraw by that identifier, so it would leave this row live.
 fn read_row(row: &rusqlite::Row<'_>) -> Row {
     #[cfg(feature = "testing")]
     GRANT_ROWS_READ.with(|rows| rows.set(rows.get().saturating_add(1)));
