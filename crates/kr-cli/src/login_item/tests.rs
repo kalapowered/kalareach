@@ -787,7 +787,9 @@ fn a_record_whose_paths_are_not_this_logins_own_is_refused_whole() {
         json(&|v| {
             v["path"] = file
                 .with_file_name("other.desktop")
-                .to_string_lossy().into_owned().into()
+                .to_string_lossy()
+                .into_owned()
+                .into()
         }),
         json(&|v| v["path"] = "relative".into()),
         pending(
