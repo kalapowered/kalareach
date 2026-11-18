@@ -814,9 +814,14 @@ impl PairingHost {
         if let Some(confirmed) = self.confirmed(caller, action) {
             return noted_as_a_copy(confirmed, copied);
         }
+        // An invitation that ended while it sat in the open slot is answered as one that has left
+        // it: from its stored row, with the issuer's check, before a candidate is looked for and
+        // before the owner's answer is spent. Which answer a repeat gets then does not depend on
+        // whether the host issued another invitation since.
         let Some(offered) = open
             .as_mut()
             .filter(|offered| offered.invitation_id() == params.invitation_id)
+            .filter(|offered| !matches!(offered.state(), InvitationState::Consumed { .. }))
         else {
             let answer = self.committed_answer(caller, params.invitation_id)?;
             self.rows.record_action(&recorded)?;
