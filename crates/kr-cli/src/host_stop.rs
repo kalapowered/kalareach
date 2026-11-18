@@ -1894,7 +1894,11 @@ async fn ended_before_the_request(
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let first = match first_look(closed) {
         FirstLook::NotMade => Endpoint::Unclear,
-        FirstLook::Made => operations.look(startup::ANSWER_BOUND.min(left())).await,
+        FirstLook::Made => {
+            operations
+                .look(startup::ANSWER_BOUND.min(left()), &mut |_| {})
+                .await
+        }
     };
     match first_look_answers(first) {
         Some(answered) => Decided::Answers(answered),
@@ -2726,7 +2730,7 @@ pub(crate) async fn wait_for_the_end(
             Holder::NotRead
         };
         let look = if look_wanted(&lock, process, holder) {
-            Some(operations.look(left()).await)
+            Some(operations.look(left(), &mut |_| {}).await)
         } else {
             None
         };
@@ -2846,7 +2850,7 @@ fn by_generation(asked: Option<ControllerGeneration>, reported: ControllerGenera
 /// What the exchange of a look gave: one value for each way it can end, from the address of the
 /// endpoint to the answer of `host.info`. [`label_of`] takes each to what answers at the endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Gave {
+pub(crate) enum Gave {
     /// The address of the endpoint could not be made, so nothing was tried.
     NoAddress,
     /// Nothing came within the bound: the connection and the greeting did not finish, or `host.info`
@@ -2899,8 +2903,20 @@ fn label_of(asked: Option<ControllerGeneration>, gave: Gave) -> Endpoint {
     }
 }
 
+/// What a look at the endpoint saw as it went, told to whoever asked for the look, so that a
+/// time-out or a failure that comes later cannot discard what was seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sight {
+    /// The look began: until it shows more, nothing came.
+    Began,
+    /// The greeting was acknowledged: a usable greeting.
+    Greeted,
+    /// The exchange ended and gave this.
+    Gave(Gave),
+}
+
 /// What the failure of the connection or of the greeting gave.
-fn gave_by_the_greeting(error: &kr_ipc::IpcError) -> Gave {
+pub(crate) fn gave_by_the_greeting(error: &kr_ipc::IpcError) -> Gave {
     if startup::nothing_listening(error) {
         return Gave::NothingListens;
     }
@@ -2911,7 +2927,7 @@ fn gave_by_the_greeting(error: &kr_ipc::IpcError) -> Gave {
 }
 
 /// What the read of `host.info` gave.
-fn gave_by_the_read(
+pub(crate) fn gave_by_the_read(
     read: kr_ipc::Result<std::result::Result<kr_protocol::envelope::ParamsValue, ProtocolError>>,
 ) -> Gave {
     match read {
@@ -2930,34 +2946,49 @@ fn gave_by_the_read(
 /// What a daemon that answered the greeting gives: a daemon that states another major is another
 /// daemon, whatever it would say to a read, and one that states this command's major is asked
 /// `host.info`. A look offers no other major, so the first never answers a look over a real link.
-async fn gave_after_the_greeting(listed: Listed) -> Gave {
+async fn gave_after_the_greeting(listed: Listed, seen: &mut dyn FnMut(Sight)) -> Gave {
     match listed {
         Listed::Other(_) => Gave::GreetingOfAnotherMajor,
-        Listed::Ours(mut client) => gave_by_the_read(client.request(Method::HostInfo, &()).await),
+        Listed::Ours(mut client) => {
+            seen(Sight::Greeted);
+            gave_by_the_read(client.request(Method::HostInfo, &()).await)
+        }
     }
 }
 
 /// The connection, the greeting and the read of `host.info`, as the exchange of a look.
-async fn the_exchange(endpoint: &kr_ipc::paths::Endpoint, within: Duration) -> Gave {
+async fn the_exchange(
+    endpoint: &kr_ipc::paths::Endpoint,
+    within: Duration,
+    seen: &mut dyn FnMut(Sight),
+) -> Gave {
     match startup::reach(endpoint, within, &[]).await {
         Reached::Silent => Gave::NothingInTime,
         Reached::Refused(error) => gave_by_the_greeting(&error),
-        Reached::Answered(listed) => gave_after_the_greeting(*listed).await,
+        Reached::Answered(listed) => gave_after_the_greeting(*listed, seen).await,
     }
 }
 
 /// What the exchange of a look at the environment's endpoint gave, bounded as a whole by `within`
-/// and by one second: the address, then the connection, the hello and `host.info` together.
-async fn the_look_gave(environment: &EnvironmentPaths, within: Duration) -> Gave {
-    match environment.controller_endpoint().ok() {
+/// and by one second: the address, then the connection, the hello and `host.info` together. What
+/// it saw is told to `seen` as it goes, the greeting before the read that follows it.
+async fn the_look_gave(
+    environment: &EnvironmentPaths,
+    within: Duration,
+    seen: &mut dyn FnMut(Sight),
+) -> Gave {
+    seen(Sight::Began);
+    let gave = match environment.controller_endpoint().ok() {
         Some(endpoint) => {
             let within = within.min(LOOK_EVERY * 20);
-            tokio::time::timeout(within, the_exchange(&endpoint, within))
+            tokio::time::timeout(within, the_exchange(&endpoint, within, &mut *seen))
                 .await
                 .unwrap_or(Gave::NothingInTime)
         }
         None => Gave::NoAddress,
-    }
+    };
+    seen(Sight::Gave(gave));
+    gave
 }
 
 /// Looks at the environment's endpoint and says what answers there: what the exchange gave,
@@ -2966,8 +2997,9 @@ async fn endpoint_look(
     environment: &EnvironmentPaths,
     generation: Option<ControllerGeneration>,
     within: Duration,
+    seen: &mut dyn FnMut(Sight),
 ) -> Endpoint {
-    label_of(generation, the_look_gave(environment, within).await)
+    label_of(generation, the_look_gave(environment, within, seen).await)
 }
 
 /// What a failed look at the lock says, in this command's words. The store's start lock, which
@@ -3027,8 +3059,9 @@ pub(crate) trait Operations {
     async fn held(&self, within: Duration) -> std::result::Result<bool, Shown>;
     /// What the system says of the process of the daemon that was asked.
     fn process_state(&self, old: &ProcessStartIdentity) -> ProcessState;
-    /// What answers at the environment's endpoint, bounded by `within`.
-    async fn look(&self, within: Duration) -> Endpoint;
+    /// What answers at the environment's endpoint, bounded by `within`; what the look saw is told to
+    /// `seen` as it goes.
+    async fn look(&self, within: Duration, seen: &mut dyn FnMut(Sight)) -> Endpoint;
     /// The process the lock file names as a control daemon, where it names one.
     fn named_daemon(&self) -> Option<u64>;
     /// Waits `time` between two rounds of looks.
@@ -3068,8 +3101,8 @@ impl Operations for Real<'_> {
         identity::process_state(old)
     }
 
-    async fn look(&self, within: Duration) -> Endpoint {
-        endpoint_look(self.environment, self.generation, within).await
+    async fn look(&self, within: Duration, seen: &mut dyn FnMut(Sight)) -> Endpoint {
+        endpoint_look(self.environment, self.generation, within, seen).await
     }
 
     fn named_daemon(&self) -> Option<u64> {
@@ -4454,7 +4487,7 @@ mod tests {
             self.process.next().gives
         }
 
-        async fn look(&self, within: Duration) -> Endpoint {
+        async fn look(&self, within: Duration, _seen: &mut dyn FnMut(Sight)) -> Endpoint {
             self.record(Call::Look(within));
             let step = self.look.next();
             tokio::time::advance(step.takes.unwrap_or(within)).await;
@@ -6609,7 +6642,7 @@ mod tests {
     /// What the exchange of a look at `peer` gave, from the real client on a real link.
     async fn the_exchange_with(peer: Peer) -> Gave {
         let (_temp, environment, within, daemon) = a_stand_in_for(peer);
-        let gave = the_look_gave(&environment, within).await;
+        let gave = the_look_gave(&environment, within, &mut |_| {}).await;
         if let Some(daemon) = daemon {
             daemon.abort();
         }
@@ -6623,7 +6656,7 @@ mod tests {
     async fn a_look_takes_no_longer_than_one_second_however_much_of_the_deadline_is_left() {
         let (_temp, environment, _within, daemon) = a_stand_in_for(Peer::SaysNothingToTheHello);
         let started = tokio::time::Instant::now();
-        let gave = the_look_gave(&environment, seconds(30)).await;
+        let gave = the_look_gave(&environment, seconds(30), &mut |_| {}).await;
         let taken = tokio::time::Instant::now() - started;
         if let Some(daemon) = daemon {
             daemon.abort();
@@ -6635,7 +6668,7 @@ mod tests {
     /// What a look at `peer` says answers at the endpoint, where the generation asked is `asked`.
     async fn look_at(peer: Peer, asked: Option<ControllerGeneration>) -> Endpoint {
         let (_temp, environment, within, daemon) = a_stand_in_for(peer);
-        let look = endpoint_look(&environment, asked, within).await;
+        let look = endpoint_look(&environment, asked, within, &mut |_| {}).await;
         if let Some(daemon) = daemon {
             daemon.abort();
         }
@@ -6868,7 +6901,7 @@ mod tests {
         let Reached::Answered(listed) = startup::reach(&endpoint, within, &[other]).await else {
             panic!("the daemon answers the greeting and the look offers its major");
         };
-        let gave = gave_after_the_greeting(*listed).await;
+        let gave = gave_after_the_greeting(*listed, &mut |_| {}).await;
         assert_eq!(gave.label(), "greeting_of_another_major");
         assert!(matches!(label_of(None, gave), Endpoint::Another));
         if let Some(daemon) = daemon {
@@ -6890,10 +6923,10 @@ mod tests {
             environment.controller_endpoint().is_err(),
             "the address is too long for a socket"
         );
-        let gave = the_look_gave(&environment, LOOK_BOUND_FOR_AN_ANSWER).await;
+        let gave = the_look_gave(&environment, LOOK_BOUND_FOR_AN_ANSWER, &mut |_| {}).await;
         assert_eq!(gave.label(), "no_address");
         assert!(matches!(
-            endpoint_look(&environment, None, LOOK_BOUND_FOR_AN_ANSWER).await,
+            endpoint_look(&environment, None, LOOK_BOUND_FOR_AN_ANSWER, &mut |_| {}).await,
             Endpoint::Unclear
         ));
     }

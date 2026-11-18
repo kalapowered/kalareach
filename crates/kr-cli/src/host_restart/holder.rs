@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use super::record::{Lock, LockRead, Observation, Shared};
 use crate::host_stop::{Endpoint, LOOK_EVERY, Operations};
 
 /// What the wait for a holder came to.
@@ -22,17 +23,32 @@ pub(super) enum Holder {
 
 /// Waits up to `bound` for the holder to answer or to let go.
 ///
-/// Each round asks whether the environment is held, then what answers at its endpoint; a daemon of
-/// any generation that answers ends the wait, and so does a free environment where nothing
-/// listens. A holder that is not looked at, a listener that does not answer and a lock that is
-/// held are waited through, and the bound is counted from the first call on the runtime's clock.
-pub(super) async fn wait(operations: &impl Operations, bound: Duration) -> Holder {
+/// Each round asks what answers at the endpoint, then whether the environment is held, so that the
+/// lock is read after the look that it belongs to; a daemon of any generation that answers ends the
+/// wait, and so does a free environment where nothing listens. A holder that is not looked at, a
+/// listener that does not answer and a lock that is held are waited through, and the bound is
+/// counted from the first call on the runtime's clock. Every look and every lock read is written
+/// to `record` as it is seen.
+pub(super) async fn wait(operations: &impl Operations, bound: Duration, record: &Shared) -> Holder {
     let deadline = tokio::time::Instant::now() + bound;
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let mut replied = false;
     loop {
+        let endpoint = operations
+            .look(left(), &mut |sight| {
+                record.observe(Observation::Sight(sight))
+            })
+            .await;
         let held = operations.held(left()).await;
-        match operations.look(left()).await {
+        record.observe(Observation::Lock(LockRead {
+            lock: match held {
+                Ok(true) => Lock::Held,
+                Ok(false) => Lock::Free,
+                Err(_) => Lock::NotReadable,
+            },
+            named: operations.named_daemon(),
+        }));
+        match endpoint {
             Endpoint::Same(_) | Endpoint::Another => return Holder::Answers,
             Endpoint::Nobody if matches!(held, Ok(false)) => return Holder::Gone,
             Endpoint::Unproved(_) => replied = true,
@@ -53,6 +69,8 @@ mod tests {
     use kr_protocol::identity::ProcessStartIdentity;
 
     use super::*;
+    use crate::host_restart::record::{Last, Record};
+    use crate::host_stop::{Gave, Sight};
 
     /// One answer of an operation, and the time it takes on the clock; none takes the whole bound
     /// the operation was given.
@@ -106,6 +124,7 @@ mod tests {
         calls: Mutex<Vec<(Duration, Call)>>,
         held: Script<std::result::Result<bool, Shown>>,
         look: Script<Endpoint>,
+        named: Option<u64>,
     }
 
     impl Supplied {
@@ -118,7 +137,14 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 held: Script::of(held),
                 look: Script::of(look),
+                named: None,
             }
+        }
+
+        /// The process that the lock file names, as the cases have it.
+        fn naming(mut self, named: u64) -> Self {
+            self.named = Some(named);
+            self
         }
 
         fn record(&self, call: Call) {
@@ -152,15 +178,27 @@ mod tests {
             unreachable!("the wait for a holder asks of no process")
         }
 
-        async fn look(&self, within: Duration) -> Endpoint {
+        async fn look(&self, within: Duration, seen: &mut dyn FnMut(Sight)) -> Endpoint {
             self.record(Call::Look(within));
             let step = self.look.next();
+            seen(Sight::Began);
+            if matches!(step.gives, Endpoint::Same(_) | Endpoint::Another) {
+                seen(Sight::Greeted);
+            }
             tokio::time::advance(step.takes.unwrap_or(within)).await;
+            seen(Sight::Gave(match step.gives {
+                Endpoint::Nobody => Gave::NothingListens,
+                Endpoint::Same(_) | Endpoint::Another => {
+                    Gave::Reported(kr_protocol::ids::ControllerGeneration::new(1))
+                }
+                Endpoint::Unproved(answered) => Gave::GreetingReplied(answered),
+                Endpoint::Unclear => Gave::NothingInTime,
+            }));
             step.gives
         }
 
         fn named_daemon(&self) -> Option<u64> {
-            unreachable!("the wait for a holder asks of no lock file")
+            self.named
         }
 
         async fn pause(&self, time: Duration) {
@@ -183,7 +221,10 @@ mod tests {
                 at_once(Endpoint::Another),
             ],
         );
-        assert_eq!(wait(&supplied, BOUND).await, Holder::Answers);
+        assert_eq!(
+            wait(&supplied, BOUND, &Shared::new()).await,
+            Holder::Answers
+        );
         assert_eq!(supplied.looks(), 3);
         assert_eq!(
             supplied.start.elapsed(),
@@ -203,7 +244,11 @@ mod tests {
     async fn an_answer_of_either_generation_is_an_answer() {
         for answer in [Endpoint::Same(an_answer()), Endpoint::Another] {
             let supplied = Supplied::new(vec![at_once(Ok(true))], vec![at_once(answer)]);
-            assert_eq!(wait(&supplied, BOUND).await, Holder::Answers, "{answer:?}");
+            assert_eq!(
+                wait(&supplied, BOUND, &Shared::new()).await,
+                Holder::Answers,
+                "{answer:?}"
+            );
             assert_eq!(supplied.start.elapsed(), Duration::ZERO, "{answer:?}");
         }
     }
@@ -215,7 +260,10 @@ mod tests {
             vec![at_once(Err(Shown::said("the lock could not be looked at")))],
             vec![at_once(Endpoint::Same(an_answer()))],
         );
-        assert_eq!(wait(&supplied, BOUND).await, Holder::Answers);
+        assert_eq!(
+            wait(&supplied, BOUND, &Shared::new()).await,
+            Holder::Answers
+        );
     }
 
     /// Where the environment is free and nothing listens at the first look, no daemon runs: one
@@ -223,13 +271,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_free_environment_where_nothing_listens_is_no_daemon_at_once() {
         let supplied = Supplied::new(vec![at_once(Ok(false))], vec![at_once(Endpoint::Nobody)]);
-        assert_eq!(wait(&supplied, BOUND).await, Holder::Gone);
+        assert_eq!(wait(&supplied, BOUND, &Shared::new()).await, Holder::Gone);
         assert_eq!(supplied.start.elapsed(), Duration::ZERO);
         assert_eq!(
             supplied.calls(),
             vec![
-                (Duration::ZERO, Call::Held(BOUND)),
                 (Duration::ZERO, Call::Look(BOUND)),
+                (Duration::ZERO, Call::Held(BOUND)),
             ]
         );
     }
@@ -242,7 +290,7 @@ mod tests {
             vec![at_once(Ok(true)), at_once(Ok(true)), at_once(Ok(false))],
             vec![at_once(Endpoint::Nobody)],
         );
-        assert_eq!(wait(&supplied, BOUND).await, Holder::Gone);
+        assert_eq!(wait(&supplied, BOUND, &Shared::new()).await, Holder::Gone);
         assert_eq!(supplied.looks(), 3);
         assert_eq!(supplied.start.elapsed(), LOOK_EVERY * 2);
     }
@@ -253,7 +301,7 @@ mod tests {
     async fn a_holder_that_never_answers_ends_the_wait_at_the_bound() {
         let supplied = Supplied::new(vec![at_once(Ok(true))], vec![at_once(Endpoint::Unclear)]);
         assert_eq!(
-            wait(&supplied, BOUND).await,
+            wait(&supplied, BOUND, &Shared::new()).await,
             Holder::Silent { replied: false }
         );
         assert_eq!(supplied.start.elapsed(), BOUND);
@@ -283,9 +331,77 @@ mod tests {
             ],
         );
         assert_eq!(
-            wait(&supplied, BOUND).await,
+            wait(&supplied, BOUND, &Shared::new()).await,
             Holder::Silent { replied: true }
         );
+    }
+
+    /// Every look and the lock read after it are written to the record: the lock read belongs to
+    /// the last look, with the process that the lock file named at that read, and a daemon that
+    /// answered keeps its generation.
+    #[tokio::test(start_paused = true)]
+    async fn the_record_holds_the_last_look_and_the_lock_read_after_it() {
+        let supplied = Supplied::new(
+            vec![at_once(Ok(true))],
+            vec![at_once(Endpoint::Unclear), at_once(Endpoint::Another)],
+        )
+        .naming(9);
+        let record = Shared::new();
+        assert_eq!(wait(&supplied, BOUND, &record).await, Holder::Answers);
+        let written = record.read();
+        assert!(written.greeted);
+        assert!(!written.replied);
+        assert_eq!(
+            written.last,
+            Some(Last::Greeting(Some(
+                kr_protocol::ids::ControllerGeneration::new(1)
+            )))
+        );
+        assert_eq!(
+            written.lock,
+            Some(LockRead {
+                lock: Lock::Held,
+                named: Some(9)
+            })
+        );
+    }
+
+    /// A lock that cannot be read is written as that, and a reply that cannot be used as a reply,
+    /// not as a daemon that did not answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_that_cannot_be_read_and_a_reply_are_written_as_they_are() {
+        let supplied = Supplied::new(
+            vec![at_once(Err(Shown::said("the lock could not be looked at")))],
+            vec![at_once(Endpoint::Unproved(an_answer()))],
+        );
+        let record = Shared::new();
+        assert_eq!(
+            wait(&supplied, BOUND, &record).await,
+            Holder::Silent { replied: true }
+        );
+        let written = record.read();
+        assert!(written.replied && !written.greeted);
+        assert_eq!(written.last, Some(Last::Reply));
+        assert_eq!(
+            written.lock,
+            Some(LockRead {
+                lock: Lock::NotReadable,
+                named: None
+            })
+        );
+    }
+
+    /// A look that is cut off after the greeting by the bound keeps the greeting: the record says
+    /// that a daemon greeted and that no whole exchange followed.
+    #[tokio::test(start_paused = true)]
+    async fn a_look_cut_off_after_the_greeting_keeps_the_greeting_in_the_record() {
+        let record = Shared::new();
+        for sight in [Sight::Began, Sight::Greeted] {
+            record.observe(Observation::Sight(sight));
+        }
+        let written: Record = record.read();
+        assert!(written.greeted);
+        assert_eq!(written.last, Some(Last::Greeting(None)));
     }
 
     /// A look that takes the whole of what is left, as a listener that does not answer does, ends
@@ -300,7 +416,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            wait(&supplied, BOUND).await,
+            wait(&supplied, BOUND, &Shared::new()).await,
             Holder::Silent { replied: false }
         );
         assert_eq!(supplied.start.elapsed(), BOUND);
