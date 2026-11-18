@@ -1707,18 +1707,22 @@ async fn every_close_returns_only_once_the_view_has_ended() {
             let expired = Arc::clone(&expired);
             Arc::new(move |_state| {
                 published.fetch_add(1, Ordering::SeqCst);
-                let (open, opened) = &*gate;
-                let mut open = open.lock().expect("the gate");
-                while !*open {
-                    let (next, waited) = opened.wait_timeout(open, WATCHDOG).expect("the gate");
-                    open = next;
-                    if waited.timed_out() {
-                        // A case that failed before it opened the gate: the view goes on, so that
-                        // the case ends with its own message and the program ends with it.
-                        expired.store(true, Ordering::SeqCst);
-                        *open = true;
+                // The wait holds the view's task of the one runtime that every view runs on, and the
+                // runtime is told that this worker waits, so that the other views' tasks go on.
+                tokio::task::block_in_place(|| {
+                    let (open, opened) = &*gate;
+                    let mut open = open.lock().expect("the gate");
+                    while !*open {
+                        let (next, waited) = opened.wait_timeout(open, WATCHDOG).expect("the gate");
+                        open = next;
+                        if waited.timed_out() {
+                            // A case that failed before it opened the gate: the view goes on, so
+                            // that the case ends with its own message and the program ends with it.
+                            expired.store(true, Ordering::SeqCst);
+                            *open = true;
+                        }
                     }
-                }
+                });
             })
         };
         let view = views.open("main", worker.session_id, Dimensions::new(10, 2), publish);
