@@ -1495,6 +1495,7 @@ pub(crate) mod tests {
     /// Every result of a restart carries `launched`: null where nothing was started or asked, the
     /// start's kind where a failed start asked for one (no process was read), `unknown` for an
     /// interrupt while the start runs, and the success's own form; a stop's result carries none.
+    /// The kind of a failed start is the platform's word for the start the environment chooses.
     #[test]
     fn every_result_of_a_restart_says_what_it_started_or_asked_for() {
         let (_temp, environment) = an_environment();
@@ -1506,16 +1507,52 @@ pub(crate) mod tests {
             Facts::none(Vec::new()).launched.is_none(),
             "a stop has no member"
         );
-        for (asked, expected) in [(false, None), (true, Some(("standalone", None)))] {
+        let nothing = StartFailed {
+            error: None,
+            launched: false,
+        };
+        assert_eq!(
+            nothing
+                .facts(&environment, &facts)
+                .launched
+                .map(Launched::parts),
+            Some(None),
+            "a failed start that asked for nothing"
+        );
+        let standalone_word = if cfg!(windows) { "task" } else { "standalone" };
+        let service_word = if cfg!(windows) {
+            "task"
+        } else if cfg!(target_os = "macos") {
+            "launchd"
+        } else {
+            "systemd"
+        };
+        let document = crate::doctor::configuration::document_path(&environment.paths);
+        for (chosen, expected) in [
+            (None, standalone_word),
+            (Some("standalone"), standalone_word),
+            (Some("service"), service_word),
+        ] {
+            if let Some(chosen) = chosen {
+                let text = format!(
+                    r#"{{"version": 1, "revision": 1, "startup": {{"controller": "{chosen}"}}}}"#
+                );
+                kr_ipc::paths::write_owner_only_file(&document, text.as_bytes())
+                    .expect("the choice is written");
+            }
             let failed = StartFailed {
                 error: None,
-                launched: asked,
+                launched: true,
             };
             let said = failed
                 .facts(&environment, &facts)
                 .launched
                 .map(Launched::parts);
-            assert_eq!(said, Some(expected), "a failed start, asked: {asked}");
+            assert_eq!(
+                said,
+                Some(Some((expected, None))),
+                "a failed start that asked for a daemon, the environment choosing {chosen:?}"
+            );
         }
         let progress = Progress::new(environment.environment_id);
         for (beyond, expected) in [
@@ -2255,16 +2292,31 @@ pub(crate) mod tests {
         }
         made.into_iter()
             .map(|(label, text, answer, launched)| {
-                let launched = launched
-                    .parts()
-                    .map(|(start, pid)| serde_json::json!({"start": start, "pid": pid}));
+                // The frozen file holds the Unix word of a start with no manager: the task's word
+                // for it is put back to it.
+                let launched = launched.parts().map(|(start, pid)| {
+                    let start = if cfg!(windows) && start == "task" {
+                        "standalone"
+                    } else {
+                        start
+                    };
+                    serde_json::json!({"start": start, "pid": pid})
+                });
                 let json = serde_json::json!({"serving": answer.serving, "launched": launched});
-                // The frozen file holds the Unix words of the standalone start; the platform's own
-                // words for it are put back to them where they differ.
-                let text = text.to_string().replace(
-                    &launched_said(Some(&standalone(77))).to_string(),
-                    "This command started a control daemon (process 77) under the standalone start.",
-                );
+                // The frozen file holds the Unix words: the platform's own words for the standalone
+                // start, for the command that ends a process and for the advice where no process is
+                // named are put back to them where they differ.
+                let text = text
+                    .to_string()
+                    .replace(
+                        &launched_said(Some(&standalone(77))).to_string(),
+                        "This command started a control daemon (process 77) under the standalone start.",
+                    )
+                    .replace(crate::update::handover::STOP_COMMAND, "kill -KILL")
+                    .replace(
+                        &host_stop::how_to_end_the_process(None).to_string(),
+                        "If it stays like this, end the process that holds the lock file.",
+                    );
                 (
                     label,
                     text.replace(&id.to_string(), "E"),
