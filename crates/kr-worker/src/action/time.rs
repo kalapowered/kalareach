@@ -5577,4 +5577,81 @@ mod tests {
             "the clock went back ten minutes from a reading taken after the owner's act"
         );
     }
+
+    /// A platform adapter that, at its first reading, lets a second pass on the host, puts the wall
+    /// clock right and has the daemon state its record again at that reading: a restatement
+    /// published after the look's own reading of the clocks and before its following.
+    #[derive(Debug)]
+    struct Restating {
+        held: Arc<Holdup>,
+        floor: Arc<kr_ipc::floor::SharedFloor>,
+        level: u64,
+        began: u64,
+        armed: std::sync::atomic::AtomicBool,
+        inner: RecordedTimeAdapter,
+    }
+
+    impl crate::action::adapter::TimeAdapter for Restating {
+        fn read(&self) -> kr_protocol::action::TimeAdapterReading {
+            if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.held.pass(Duration::from_secs(1));
+                self.held
+                    .wall
+                    .set(right_time(&self.held, self.level, self.began));
+                assert!(self.floor.restate(
+                    self.held.wall.now_ms().get(),
+                    self.held.continuous.boot_elapsed_ms()
+                ));
+            }
+            <RecordedTimeAdapter as crate::action::adapter::TimeAdapter>::read(&self.inner)
+        }
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a restatement answers to the worker's mark whatever its age, even
+    /// when no reading taken after the restatement's reading is behind another. A worker that began
+    /// with nothing recorded and trusts its clock looks while the wall clock reads ten minutes
+    /// ahead of the right time, which raises its mark; the daemon, which did not see that, states its
+    /// record at the right time after the look's reading and before its following; the following
+    /// reads the right time. The look's reading is stamped before the restatement's, so the readings
+    /// refuse nothing, and the clock is ten minutes behind the mark: the restatement is not taken.
+    #[test]
+    fn a_restatement_published_after_a_peak_the_look_read_is_not_taken() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let level = held.wall.now_ms().get();
+        let began = held.continuous.boot_elapsed_ms();
+        let restating = Arc::new(Restating {
+            held: Arc::clone(&held),
+            floor: Arc::clone(&floor),
+            level,
+            began,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            inner: RecordedTimeAdapter::new(qualified()),
+        });
+        let contract = TimeContract::new(
+            boot(1),
+            AUTHORITY,
+            TimeSources {
+                continuous: Arc::new(Slipping {
+                    held: Arc::clone(&held),
+                }),
+                active: Arc::new(held.active.clone()),
+                wall: Arc::clone(&held) as Arc<dyn WallClock>,
+                adapter: Arc::clone(&restating) as Arc<dyn crate::action::adapter::TimeAdapter>,
+                floor: Some(Arc::clone(&floor)),
+            },
+        );
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+        restating
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        held.pass(Duration::from_secs(60));
+        held.wall.set(right_time(&held, level, began) + 600_000);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock is ten minutes behind the worker's mark: the restatement is not taken"
+        );
+    }
 }
