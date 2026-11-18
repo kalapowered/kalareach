@@ -16,6 +16,7 @@
 
 mod holder;
 mod proof;
+mod record;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -241,12 +242,14 @@ async fn wait_for_the_holder(
     // No daemon was asked here, so no generation is the one that answers: any answer counts.
     let operations = Real::of(host, &environment.paths, Some(ControllerGeneration::new(0)));
     let deadline = tokio::time::Instant::now() + startup::START_BOUND;
+    // What every read of this wait gave, written as each is seen.
+    let record = record::Shared::new();
     // What the read of who serves gave after the wait saw a daemon answer, where it was no daemon:
     // the command goes on waiting within its bound and says it if the bound ends so.
     let mut since: Option<Shown> = None;
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match holder::wait(&operations, left).await {
+        match holder::wait(&operations, left, &record).await {
             holder::Holder::Answers => {
                 match who_serves(environment, startup::ANSWER_BOUND, progress).await {
                     Serves::Daemon(serving) => {
