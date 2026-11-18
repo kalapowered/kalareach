@@ -1495,29 +1495,42 @@ impl GrantDirectory {
     /// them, that grant and the grants below it that no earlier one has taken, breadth first, as
     /// [`Self::subtree_to_revoke`] reads them one grant at a time.
     ///
-    /// The grants are read once, however many the device holds and in whatever order `held` lists
-    /// them. A walk does not go below a grant an earlier walk took, because everything below that
-    /// grant was taken with it. A grant reached from two of the device's roots is kept once, under
-    /// the first root that reaches it, which is the root its record would have named anyway: the
-    /// write takes each row only while it is still live, so a second root never revoked it twice.
-    /// A device with no grant left to withdraw reads none.
+    /// Each of them is found by its identifier, one row read for each, as the revocation of that
+    /// grant alone finds it, so a held record that names a grant no row holds refuses the whole
+    /// revocation as it refuses that one. The grants below them are read once, however many the
+    /// device holds and in whatever order `held` lists them, and only when a held grant is to be
+    /// walked: a device with nothing left to withdraw reads none. A walk does not go below a grant
+    /// an earlier walk took, because everything below that grant was taken with it. A grant reached
+    /// from two of the device's roots is kept once, under the first root that reaches it, which is
+    /// the root its record would have named anyway: the write takes each row only while it is
+    /// still live, so a second root never revoked it twice.
     fn subtrees_to_revoke(
         connection: &Connection,
         held: &[GrantRecord],
     ) -> Result<Vec<(GrantId, Box<[GrantRecord]>)>> {
-        if held.iter().all(|record| record.revoked_at_ms.is_some()) {
-            return Ok(Vec::new());
-        }
-        let children = children_by_parent(connection)?;
+        let mut children_of: Option<BTreeMap<GrantId, Vec<GrantRecord>>> = None;
         let mut claimed: BTreeSet<GrantId> = BTreeSet::new();
         let mut subtrees = Vec::new();
-        for root in held {
-            let grant_id = root.grant.grant_id;
-            if root.revoked_at_ms.is_some() || !claimed.insert(grant_id) {
+        for listed in held {
+            if listed.revoked_at_ms.is_some() {
                 continue;
             }
+            let grant_id = listed.grant.grant_id;
+            let Some(root) = read_one(connection, grant_id)? else {
+                return Err(ControllerError::InvalidArgument(
+                    "this host holds no such grant".to_owned(),
+                ));
+            };
+            if !claimed.insert(root.grant.grant_id) {
+                continue;
+            }
+            let children = if let Some(children) = &children_of {
+                children
+            } else {
+                children_of.insert(children_by_parent(connection)?)
+            };
             let mut found = Vec::new();
-            let mut queue = VecDeque::from([root.clone()]);
+            let mut queue = VecDeque::from([root]);
             while let Some(record) = queue.pop_front() {
                 if let Some(next) = children.get(&record.grant.grant_id) {
                     for child in next {
