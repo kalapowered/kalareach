@@ -336,7 +336,7 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
         "share", "invite", &display, "--to", &device_id, "--yes", "--for", "15m",
     ]);
     assert!(relay.lost(), "the host's answer was lost on the way back");
-    relay.remove();
+    relay.remove(&host);
     // The document holds what the host answered, which only the repeat on a connection of its own
     // gives back: a command that took the share's presence in the list for its answer has neither.
     assert!(plain["grant_id"].as_str().is_some(), "{plain}");
@@ -711,7 +711,7 @@ fn an_invitation_whose_every_answer_is_lost_is_found_by_reading_the_host() {
         "15m",
     ]);
     assert!(relay.lost(), "the host's answers were lost on the way back");
-    relay.remove();
+    relay.remove(&host);
     assert!(issued["grant_id"].as_str().is_some(), "{issued}");
     assert!(
         issued["actions"].is_null() && issued["ends_at_ms"].is_null(),
@@ -860,7 +860,7 @@ fn hand_over(leg: &str, lose: Option<Method>, stopped: bool) {
     let done = ceremony::finished(transferring, "kr share transfer");
     if let Some(relay) = relay {
         assert!(relay.lost(), "the host's answer was lost on the way back");
-        relay.remove();
+        relay.remove(&host);
     }
     assert!(
         done.exit == 0 || done.exit == 1,

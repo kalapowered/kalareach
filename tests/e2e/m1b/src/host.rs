@@ -519,8 +519,10 @@ impl<'r> Host<'r> {
     }
 
     /// Records the control socket the daemon bound, by its device and inode, found by a walk from
-    /// the run's pinned directory that follows no link, or why it could not be.
-    fn note_control_socket(&self) {
+    /// the run's pinned directory that follows no link, or why it could not be. A test that puts
+    /// its own socket at the daemon's name, or puts the daemon's back, records the one that stands
+    /// there by this.
+    pub(crate) fn note_control_socket(&self) {
         let found = self.control_socket_place().and_then(|place| {
             socket_below(self.run.root(), self.run.pin(), &place)
                 .map_err(|why| format!("the control socket cannot be recorded: {why}"))?
