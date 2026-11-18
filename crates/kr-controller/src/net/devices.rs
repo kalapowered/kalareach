@@ -2191,12 +2191,61 @@ fn read_declaration(
         return Ok(None);
     };
     let payload_digest = Digest256::from_bytes(key(&digest)?);
-    let outcome = kr_cbor::from_canonical_slice(&outcome, &kr_cbor::Limits::DEFAULT)
-        .map_err(ControllerError::registry)?;
+    let outcome = declaration_kept_as(&outcome)?;
     Ok(Some(RecordedDeclaration {
         payload_digest,
         outcome,
     }))
+}
+
+/// Reads a kept declaration.
+///
+/// A refusal kept under a code that this build lacks reads as a refusal with the unknown outcome,
+/// under the message it was kept with: what the device was told is not known here, and the record
+/// is not changed. The bytes are decoded strictly first, and only bytes that fail for that word
+/// alone read this way, so anything else that this build cannot decode is still unavailable.
+fn declaration_kept_as(bytes: &[u8]) -> Result<KeyDeclaration> {
+    let limits = kr_cbor::Limits::DEFAULT;
+    match kr_cbor::from_canonical_slice(bytes, &limits) {
+        Ok(declaration) => Ok(declaration),
+        Err(failure) => {
+            read_as_unknown(bytes, &limits).ok_or_else(|| ControllerError::registry(failure))
+        }
+    }
+}
+
+/// The declaration in `bytes` with its unknown code read as the unknown outcome, when that code is
+/// the only thing this build cannot decode in it.
+fn read_as_unknown(bytes: &[u8], limits: &kr_cbor::Limits) -> Option<KeyDeclaration> {
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+
+    let CanonicalValue::Map(declaration) = kr_cbor::decode(bytes, limits).ok()? else {
+        return None;
+    };
+    let [(variant, CanonicalValue::Map(refusal))] = declaration.entries() else {
+        return None;
+    };
+    if variant != "refused" {
+        return None;
+    }
+    let mut changed = false;
+    let members = refusal.entries().iter().map(|(name, member)| match member {
+        CanonicalValue::Text(word) if name == "code" && ErrorCode::from_wire(word).is_none() => {
+            changed = true;
+            (
+                name.clone(),
+                CanonicalValue::Text(ErrorCode::OutcomeUnknown.as_str().to_owned()),
+            )
+        }
+        other => (name.clone(), other.clone()),
+    });
+    let refusal = CanonicalMap::from_entries(members.collect::<Vec<_>>()).ok()?;
+    if !changed {
+        return None;
+    }
+    let declaration =
+        CanonicalMap::from_entries([(variant.clone(), CanonicalValue::Map(refusal))]).ok()?;
+    kr_cbor::from_canonical_value(&CanonicalValue::Map(declaration)).ok()
 }
 
 /// Returns the grant identity a row records, for a caller that wants it without the grant.
