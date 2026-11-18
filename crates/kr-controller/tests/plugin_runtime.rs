@@ -32,7 +32,7 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::ProcessState;
 use kr_ipc::paths::EnvironmentPaths;
-use kr_ipc::testing::started_environment::StartedEnvironment;
+use kr_ipc::testing::started_environment::{StartedEnvironment, USER_MANAGER_VARIABLES};
 use kr_ipc::verify::ControllerIdentity;
 use kr_plugin_catalogue::transport::RepositoryTransport;
 use kr_plugin_catalogue::{
@@ -910,8 +910,10 @@ impl World {
                 std::env::current_exe().expect("this test's own binary"),
             );
             // The daemon's sessions run a login shell: they are given a home inside the tree, not
-            // the person's.
-            StartedEnvironment::within(self.tree.root()).apply(&mut command);
+            // the person's. The daemon itself keeps the variables of the user's service manager,
+            // which it chooses its supervisor by.
+            StartedEnvironment::within(self.tree.root())
+                .apply_keeping(&mut command, &USER_MANAGER_VARIABLES);
             command
                 .args([
                     "--exact",

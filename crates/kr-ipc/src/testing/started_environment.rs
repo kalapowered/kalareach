@@ -33,6 +33,12 @@ const HOME_NAME: &str = "home";
 /// The name of the folder inside the root that a started program works in.
 const WORKING_NAME: &str = "work";
 
+/// The two variables through which a program reaches the user's own service manager on Linux, for
+/// the daemon that must choose that manager (`systemctl --user` needs one of them): a daemon a test
+/// starts keeps them through [`StartedEnvironment::apply_keeping`], and a session's snapshot never
+/// does.
+pub const USER_MANAGER_VARIABLES: [&str; 2] = ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"];
+
 /// The variable that names where a started program makes its temporary files. It is passed on
 /// because the case's own root was made under it, so a program that makes a socket or a file there
 /// makes it beside the root rather than in another place on the machine.
@@ -77,12 +83,6 @@ impl StartedEnvironment {
     #[must_use]
     pub fn home(&self) -> &Path {
         &self.home
-    }
-
-    /// The folder a started program works in.
-    #[must_use]
-    pub fn working_directory(&self) -> &Path {
-        &self.working_directory
     }
 
     /// Gives `command` this environment and working folder, and returns it for the caller to add
@@ -144,6 +144,12 @@ impl StartedEnvironment {
     /// The environment a daemon that runs inside the test's own process starts its sessions with
     /// when the session's creator brought none, for the test to give it through
     /// `Controller::set_host_environment`.
+    ///
+    /// The daemon reads the environment of its process once, at its start, and the test gives it
+    /// this after the start returns. A run that the daemon resumes from its journal at its start,
+    /// and a trigger that is due, can create a session before the test's next line runs, and that
+    /// session has the test program's own environment, so a case that restarts a daemon over such a
+    /// run is not covered by this.
     ///
     /// On Windows it is the test program's own environment, as the daemon would have read it.
     #[must_use]

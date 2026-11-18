@@ -999,7 +999,10 @@ fn workspace_root() -> PathBuf {
 }
 
 /// A session's shell starts under the home of the host's own tree: the startup files it reads are
-/// the ones a case puts there, and the person's profile is never read or run.
+/// the ones a case puts there, and the person's profile is never read or run. The home reaches the
+/// shell through the creator's snapshot, which `create_params` gives it: a create from a client
+/// takes that snapshot and nothing of the daemon's environment, and a shell with no home reads the
+/// account's own. The case fails when the snapshot's home is not the host tree's.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sessions_shell_has_a_home_inside_the_hosts_own_tree() {

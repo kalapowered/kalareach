@@ -7781,9 +7781,12 @@ async fn a_suite_that_writes_only_its_declared_output_still_attests_the_version(
     host.clients.abort();
 }
 
-/// A suite's session starts its shell as a login shell, which reads the startup files of the home
-/// it is given. The home is one the case made inside its own tree, so the person's profile is
-/// neither read nor run, and the search path names no folder of the person's home.
+/// A suite's command runs in a shell that the worker starts with `-c`: not as a login shell and not
+/// as an interactive one, so it reads no startup file. What it shows is that the environment the
+/// daemon gives a session reaches the command: its home is one the case made inside its own tree,
+/// and its search path names no folder of the person's home. The login shell that reads startup
+/// files is the one of a session made by a create-session node, which
+/// `a_login_shell_of_a_workflows_session_reads_the_startup_files_of_the_cases_own_tree` observes.
 ///
 /// The suite writes what its shell has beside the case's tree, because a declared output of a
 /// suite is kept as a digest and a length and cannot be read back.
@@ -7835,6 +7838,89 @@ async fn a_suites_shell_has_a_home_inside_the_cases_own_tree() {
                     .is_none_or(|home| !Path::new(folder).starts_with(home)),
             "the shell's search path holds {folder}, which the person's profile may have put \
              there: {search_path}"
+        );
+    }
+    host.clients.abort();
+}
+
+/// The startup files of the shells an account may have, each of which appends the name it was
+/// read as and the home it was read under to the case's record. `.bashrc` is here because a native
+/// shell on Linux is interactive and not a login shell, and an interactive bash reads that file.
+const STARTUP_RECORDERS: [&str; 8] = [
+    ".zshenv",
+    ".zprofile",
+    ".zshrc",
+    ".zlogin",
+    ".profile",
+    ".bash_profile",
+    ".bashrc",
+    ".config/fish/config.fish",
+];
+
+/// A create-session node that names no shell gets the account's own shell, started as a login shell
+/// where the platform starts one, and that shell reads the startup files of the home the daemon gives
+/// the session. The case puts a recorder in every startup file of that home, inside its own tree,
+/// and asserts that the shell read one there and that its home is inside the tree: a shell given
+/// the person's home would read the person's files and these would stay unread.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_login_shell_of_a_workflows_session_reads_the_startup_files_of_the_cases_own_tree() {
+    let host = working_host().await;
+    let root = host.tree().to_path_buf();
+    let home = StartedEnvironment::within(&root).home().to_path_buf();
+    let record = home.join("startup-read.log");
+    for name in STARTUP_RECORDERS {
+        let file = home.join(name);
+        std::fs::create_dir_all(file.parent().expect("a folder")).expect("a folder in the tree");
+        std::fs::write(
+            &file,
+            format!("echo \"{name} $HOME\" >> '{}'\n", record.display()),
+        )
+        .expect("a recorder in the tree");
+    }
+    let mut control = client(&host).await;
+    host.issue(grant_id(190), &[ActionRight::SessionCreate]);
+    let document = definition(
+        workflow_id(190),
+        grant_id(190),
+        "a login shell",
+        create_session_node(&host, None),
+    );
+    install(&mut control, &host, &document).await;
+    enable(&mut control, &host, &document).await;
+    let run: WorkflowRunResult = typed(
+        &start(&mut control, &host, &document, "evt-190")
+            .await
+            .expect("the run is admitted"),
+    );
+    assert_eq!(run.status, WorkflowRunStatus::Completed, "{run:?}");
+
+    // The shell reads its startup files a moment after the session exists: wait for the first
+    // record, which is a condition and not a delay.
+    let waited = std::time::Instant::now();
+    let read = loop {
+        match std::fs::read_to_string(&record) {
+            Ok(text) if text.contains('\n') => break text,
+            _ if waited.elapsed() > std::time::Duration::from_secs(60) => {
+                panic!(
+                    "the session's shell read no startup file of {} in 60 s: it was given \
+                     another home, or the account's shell reads none of {STARTUP_RECORDERS:?}",
+                    home.display()
+                )
+            }
+            _ => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    };
+    for line in read.lines() {
+        let (name, seen_home) = line.split_once(' ').expect("a recorded line");
+        assert!(
+            STARTUP_RECORDERS.contains(&name),
+            "a startup file this case did not write was read: {line}"
+        );
+        assert!(
+            Path::new(seen_home).starts_with(&root),
+            "the shell's home {seen_home} is not inside the case's tree {}",
+            root.display()
         );
     }
     host.clients.abort();

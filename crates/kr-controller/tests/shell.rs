@@ -861,6 +861,11 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
 // --------------------------------------------------------------------------------------------
 
 /// A daemon that starts real workers, on a tree of its own, and the environment it runs in.
+///
+/// The environment is the case's own, on purpose: the cases are about which variables reach a
+/// session's shell, and one gives the daemon the account's home by leaving its own out. The
+/// sessions run a placed script that reports its environment and then a shell that is not a login
+/// shell, so no startup file is read whichever home a case gives.
 #[cfg(unix)]
 struct Daemon {
     controller: Option<Arc<Controller>>,

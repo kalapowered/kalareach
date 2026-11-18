@@ -25,7 +25,7 @@ use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::{Connection, Listener};
-use kr_ipc::testing::started_environment::StartedEnvironment;
+use kr_ipc::testing::started_environment::{StartedEnvironment, USER_MANAGER_VARIABLES};
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::error::ErrorCode;
@@ -292,8 +292,10 @@ impl Host {
             .expect("opens the daemon's log");
         let mut command = std::process::Command::new(&self.program);
         // The daemon's sessions run a login shell: they are given a home inside the tree, not the
-        // person's.
-        StartedEnvironment::within(self.tree.root()).apply(&mut command);
+        // person's. The daemon itself keeps the variables of the user's service manager, which it
+        // chooses its supervisor by.
+        StartedEnvironment::within(self.tree.root())
+            .apply_keeping(&mut command, &USER_MANAGER_VARIABLES);
         let child = command
             .arg("--runtime-dir")
             .arg(environment.runtime_root())

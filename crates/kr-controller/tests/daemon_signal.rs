@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use kr_controller::singleton::SingletonLock;
 use kr_ipc::client::LocalClient;
-use kr_ipc::testing::started_environment::StartedEnvironment;
+use kr_ipc::testing::started_environment::{StartedEnvironment, USER_MANAGER_VARIABLES};
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::ids::{ActionId, BuildId};
 use kr_protocol::local::LocalClientKind;
@@ -127,8 +127,9 @@ fn spawn_daemon(
         .expect("opens the daemon's log");
     let mut command = std::process::Command::new(program);
     // The daemon's sessions run a login shell: they are given a home inside the tree, not the
-    // person's.
-    StartedEnvironment::within(host.root()).apply(&mut command);
+    // person's. The daemon itself keeps the variables of the user's service manager, which it
+    // chooses its supervisor by.
+    StartedEnvironment::within(host.root()).apply_keeping(&mut command, &USER_MANAGER_VARIABLES);
     command
         .arg("--runtime-dir")
         .arg(environment.runtime_root())
