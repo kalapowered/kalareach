@@ -298,6 +298,10 @@ mod tests {
     struct Supplied {
         script: Mutex<VecDeque<Daemon>>,
         started: Option<Started>,
+        /// Where the clock stood when the operations were made, and, for each connect, the time
+        /// from then at which the read that it began was to end.
+        origin: tokio::time::Instant,
+        ends: Mutex<Vec<Duration>>,
     }
 
     impl Supplied {
@@ -309,7 +313,15 @@ mod tests {
                     start: ControllerStartup::Standalone,
                     manager: None,
                 }),
+                origin: tokio::time::Instant::now(),
+                ends: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The time, from the start of the case, at which each read that the operations began was
+        /// to end.
+        fn the_ends_of_the_reads(&self) -> Vec<Duration> {
+            self.ends.lock().expect("the ends").clone()
         }
 
         fn next(&self) -> Daemon {
@@ -355,6 +367,10 @@ mod tests {
         }
 
         async fn connect(&self, within: Duration, record: &Shared) -> Option<Daemon> {
+            self.ends
+                .lock()
+                .expect("the ends")
+                .push(self.origin.elapsed() + within);
             record.observe(Observation::Sight(Sight::Began));
             let daemon = self.next();
             if let Daemon::Silent(takes) = daemon {
@@ -448,37 +464,73 @@ mod tests {
     }
 
     /// One deadline for the wait: where each read of the wait would use its full bound the wait
-    /// still ends at its own bound, and what a read saw before the time-out is in the record.
+    /// still ends at its own bound, no read is given time past it, and what a read saw before the
+    /// time-out is in the record.
     #[tokio::test(start_paused = true)]
     async fn a_wait_does_not_pass_its_bound_where_each_read_uses_its_full_time() {
+        let bound = Duration::from_secs(30);
         let record = Shared::new();
         let began = tokio::time::Instant::now();
         let operations = Supplied::of(vec![Daemon::Hangs]);
-        let deadline = began + Duration::from_secs(30);
-        assert!(!until_whole(&operations, &record, deadline).await);
-        assert!(
-            tokio::time::Instant::now() <= deadline,
-            "the wait ended after {:?}",
-            began.elapsed()
+        assert!(!until_whole(&operations, &record, began + bound).await);
+        let ends = operations.the_ends_of_the_reads();
+        assert_eq!(
+            ends.iter().copied().max().map(|latest| latest <= bound),
+            Some(true),
+            "no read of a wait that ends at {bound:?} ends after it: {ends:?}"
         );
+        let took = began.elapsed();
+        assert!(took <= bound, "the wait ended after {took:?}");
         let read = record.read();
         assert!(
             read.greeted,
             "the greeting that came before the time-out stays"
         );
         assert!(matches!(read.last, Some(Last::Greeting(None))));
-        // A start whose exchange hangs ends within the start's bound as well.
+        // A start whose exchange hangs ends within the start's bound as well, and no read of its
+        // wait is given time past it.
         let record = Shared::new();
         let began = tokio::time::Instant::now();
+        let operations = Supplied::of(vec![Daemon::Hangs]);
+        let failed = prove(&operations, Old::None, bound, &record).await;
+        assert!(failed.is_err());
+        let ends = operations.the_ends_of_the_reads();
+        assert_eq!(
+            ends.iter().copied().max().map(|latest| latest <= bound),
+            Some(true),
+            "no read of a start's wait that ends at {bound:?} ends after it: {ends:?}"
+        );
+        let took = began.elapsed();
+        assert!(took <= bound, "the start's wait ended after {took:?}");
+        assert!(record.read().greeted);
+    }
+
+    /// A read of a wait is given its own bound, or the time that is left of the wait where that is
+    /// less.
+    #[tokio::test(start_paused = true)]
+    async fn a_read_is_given_its_own_bound_or_the_time_that_is_left_of_the_wait() {
+        let now = tokio::time::Instant::now();
+        let near = within(now + Duration::from_secs(3));
+        let far = within(now + Duration::from_secs(30));
+        assert_eq!(near, Duration::from_secs(3));
+        assert_eq!(far, startup::ANSWER_BOUND);
+    }
+
+    /// A start whose connection gave a usable greeting and whose exchange then hangs has that
+    /// greeting in the record, and the later reads that get nothing in time do not discard it.
+    #[tokio::test(start_paused = true)]
+    async fn a_start_whose_exchange_hangs_keeps_the_greeting_that_the_start_gave() {
+        let record = Shared::new();
         let failed = prove(
-            &Supplied::of(vec![Daemon::Hangs]),
+            &Supplied::of(vec![Daemon::Hangs, Daemon::Silent(Duration::ZERO)]),
             Old::None,
             Duration::from_secs(30),
             &record,
         )
         .await;
         assert!(failed.is_err());
-        assert!(began.elapsed() <= Duration::from_secs(30));
-        assert!(record.read().greeted);
+        let read = record.read();
+        assert!(read.greeted, "the greeting of the start's connection stays");
+        assert_eq!(read.last, Some(Last::NothingInTime));
     }
 }

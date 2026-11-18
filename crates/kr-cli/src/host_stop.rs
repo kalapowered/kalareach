@@ -6783,6 +6783,30 @@ pub(crate) mod tests {
         gave
     }
 
+    /// A look tells the greeting before the read that follows it, so that a read that is never
+    /// answered still shows it, and tells none where the hello was refused.
+    #[tokio::test]
+    async fn a_look_tells_the_greeting_before_the_read_that_follows_it() {
+        for (peer, greeted) in [
+            (Peer::Reports(ControllerGeneration::new(1)), true),
+            (Peer::RefusesTheRead, true),
+            (Peer::SaysNothingToTheRead, true),
+            (Peer::RefusesTheHello, false),
+        ] {
+            let (_temp, environment, within, daemon) = a_stand_in_for(peer);
+            let mut seen = Vec::new();
+            the_look_gave(&environment, within, &mut |sight| seen.push(sight)).await;
+            if let Some(daemon) = daemon {
+                daemon.abort();
+            }
+            assert_eq!(
+                seen.contains(&Sight::Greeted),
+                greeted,
+                "a look at {peer:?} told {seen:?}"
+            );
+        }
+    }
+
     /// A look takes no longer than one second, however much of the deadline is left: a daemon
     /// that says nothing to the hello is waited for until that second has gone, not until the
     /// deadline, and the look then shows nothing in time.
@@ -8714,6 +8738,34 @@ pub(crate) mod tests {
                 split_of(category).label()
             ));
         }
+    }
+
+    /// The wait for a stop's end is by the start identity of the process that the lock file named
+    /// only where a reply on the connection that carried the request named that same process: a
+    /// holder that no reply confirms is waited for by none, a statement that names it gives its
+    /// identity, and a statement that names another process gives none. The process that `--json`
+    /// shows is the holder's where no answer named one.
+    #[test]
+    fn a_holder_is_waited_for_by_its_identity_only_where_a_reply_on_the_connection_named_it() {
+        let holder = asked_process();
+        let waited = process_waited_for(Some(&holder), None, None);
+        assert_eq!(
+            (waited.old, waited.pid),
+            (None, Some(4000)),
+            "a holder that no reply confirms"
+        );
+        let waited = process_waited_for(Some(&holder), Some(4000), None);
+        assert_eq!(
+            (waited.old, waited.pid),
+            (Some(&holder), Some(4000)),
+            "a statement that names the holder"
+        );
+        let waited = process_waited_for(Some(&holder), Some(4001), None);
+        assert_eq!(
+            (waited.old, waited.pid),
+            (None, Some(4000)),
+            "a statement that names another process"
+        );
     }
 
     /// The table that the code makes is the table that the repository holds: a change of a walked

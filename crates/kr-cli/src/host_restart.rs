@@ -793,8 +793,6 @@ async fn wait_for_the_successor(
         progress,
     };
     let whole = proof::until_whole(&operations, record, deadline).await;
-    let locks = Real::of(host, &environment.paths, None);
-    let _ = holder::read_the_lock(&locks, proof::within(deadline), record).await;
     if whole && proof::answers_as_another_daemon(&record.read(), stopped) {
         return Ok(None);
     }
@@ -1653,6 +1651,46 @@ pub(crate) mod tests {
         );
     }
 
+    /// A read of a daemon that answers on a real link is in the record as it goes: the greeting
+    /// where the connection is made, before any read follows it, and then the whole exchange with
+    /// the generation that `host.info` gave and the process that the launch-only answer stated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_of_a_daemon_that_answers_is_in_the_record_by_its_greeting_and_its_exchange() {
+        let (_temp, environment) = an_environment();
+        let id = environment.environment_id;
+        let endpoint = environment
+            .paths
+            .controller_endpoint()
+            .expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let daemon = tokio::spawn(host_stop::tests::answer_a_whole_exchange(
+            listener,
+            id,
+            generation_of(2),
+            7,
+        ));
+        let record = record::Shared::new();
+        let connection = proof::connect(&environment.paths, startup::ANSWER_BOUND, &record).await;
+        let greeted = record.read();
+        assert!(
+            greeted.greeted,
+            "the greeting is in the record where the connection was made"
+        );
+        assert_eq!(greeted.last, Some(Last::Greeting(None)));
+        let Some(mut connection) = connection else {
+            panic!("a usable greeting gives the connection");
+        };
+        proof::exchange(&mut connection, id, &Progress::new(id), &record).await;
+        let read = record.read();
+        assert_eq!(read.last, Some(Last::Whole(generation_of(2))));
+        assert_eq!(read.whole.and_then(|whole| whole.process), Some(7));
+        drop(connection);
+        tokio::time::timeout(std::time::Duration::from_secs(10), daemon)
+            .await
+            .expect("the stand-in daemon ends where the command lets go of its connection")
+            .expect("the stand-in daemon ran");
+    }
+
     /// The record of an attempt says that this command's start failed only where this command
     /// entered its start path: a wait for a successor leaves the stop's phase, and a start that
     /// fails writes `start_failed`.
@@ -1729,13 +1767,12 @@ pub(crate) mod tests {
         let lock = environment.paths.singleton_lock();
         let held = kr_controller::singleton::SingletonLock::hold(&lock, id).expect("holds");
         let said = said_by_a_failed_start(&temp, &environment).await;
-        let nothing = said
-            .find("No control daemon answers now: nothing listens.")
-            .expect("what the last read of the endpoint gave");
-        let hold = said
-            .find(&format!("The lock of environment {id} is held."))
-            .expect("the lock that was read after it");
-        assert!(nothing < hold, "{said}");
+        let nothing = said.find("No control daemon answers now: nothing listens.");
+        let hold = said.find(&format!("The lock of environment {id} is held."));
+        assert!(
+            matches!((nothing, hold), (Some(nothing), Some(hold)) if nothing < hold),
+            "the last read of the endpoint, then the lock that was read after it: {said}"
+        );
         drop(held);
         let said = said_by_a_failed_start(&temp, &environment).await;
         assert!(
