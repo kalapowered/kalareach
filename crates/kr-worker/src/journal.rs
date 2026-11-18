@@ -1793,15 +1793,29 @@ impl Journal {
     }
 }
 
+/// Whether a write of a receipt's state writes its error too.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ErrorColumns {
+    /// The error the receipt holds is written: the writer's own outcome.
+    Write,
+    /// The error stays as it is stored. A receipt read from a row kept under a code this build lacks
+    /// holds the unknown outcome in its place, and a write that brings no error of its own must not
+    /// put that in the row.
+    Keep,
+}
+
 fn write_state(
     health: &crate::persistence::fault::JournalHealth,
     transaction: &rusqlite::Transaction<'_>,
     receipt: &Receipt,
+    error: ErrorColumns,
 ) -> Result<()> {
     transaction
         .execute(
-            "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
-                 error_message = ?7, updated_at_ms = ?8
+            "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5,
+                 error_code = CASE WHEN ?9 THEN ?6 ELSE error_code END,
+                 error_message = CASE WHEN ?9 THEN ?7 ELSE error_message END,
+                 updated_at_ms = ?8
              WHERE actor_id = ?1 AND action_id = ?2",
             params![
                 receipt.actor_id.as_str(),
@@ -1815,6 +1829,7 @@ fn write_state(
                     .map(|error| error.code.as_str().to_owned()),
                 receipt.error.as_ref().map(|error| error.message.clone()),
                 i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
+                error == ErrorColumns::Write,
             ],
         )
         .map_err(|error| faulted(health, error))?;
@@ -2090,7 +2105,7 @@ impl Journal {
             .connection
             .transaction()
             .map_err(|error| faulted(&self.health, error))?;
-        write_state(&self.health, &transaction, &receipt)?;
+        write_state(&self.health, &transaction, &receipt, ErrorColumns::Write)?;
         // A rejection is a settlement: what the caller sent is committed with the receipt only
         // where privacy mode does not withhold it. Read once the write lock is held.
         if withholds_content(&self.health, &transaction, state)? {
@@ -3057,7 +3072,8 @@ impl Journal {
     /// or an outcome nobody can establish, and the outcome has been established. `result` is the
     /// mutation's result an applied receipt keeps, and `refusal` the failure a refused one does;
     /// both are written with the state in the one transaction, and neither is used when the
-    /// observation settles nothing.
+    /// observation settles nothing. A refused receipt that the observation settles without a
+    /// `refusal` keeps the error it is stored with, whatever code that holds.
     ///
     /// # Errors
     ///
@@ -3118,9 +3134,11 @@ impl Journal {
             // The observation's insert holds the write lock, so the privacy record read here is
             // the one this settlement commits against.
             let withheld = withholds_content(&self.health, &transaction, state)?;
+            let mut error = ErrorColumns::Keep;
             match state {
                 ReceiptState::Applied => {
                     receipt.error = Nullable::null();
+                    error = ErrorColumns::Write;
                     if let Some(result) = result
                         && !withheld
                     {
@@ -3141,10 +3159,11 @@ impl Journal {
                 }
                 ReceiptState::Refused if refusal.is_some() => {
                     receipt.error = Nullable(refusal);
+                    error = ErrorColumns::Write;
                 }
                 _ => {}
             }
-            write_state(&self.health, &transaction, &receipt)?;
+            write_state(&self.health, &transaction, &receipt, error)?;
             if withheld {
                 withhold_content(&self.health, &transaction, &receipt)?;
             }
