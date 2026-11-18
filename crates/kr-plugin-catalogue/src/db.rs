@@ -1813,7 +1813,7 @@ impl ReceiptRow {
             state,
             revision: unsigned(self.revision)?,
             result: self.result,
-            error: self.error.as_deref().map(from_json).transpose()?,
+            error: self.error.as_deref().map(stored_error).transpose()?,
             updated_at_ms: unsigned(self.updated_at_ms)?,
         })
     }
@@ -1895,6 +1895,37 @@ fn json<T: serde::Serialize + ?Sized>(value: &T) -> CatalogueResult<String> {
 
 fn from_json<T: serde::de::DeserializeOwned>(text: &str) -> CatalogueResult<T> {
     serde_json::from_str(text).map_err(unreadable)
+}
+
+/// Reads the error a receipt keeps.
+///
+/// A receipt kept under a code that this build lacks reads as the unknown outcome under the message
+/// it was kept with: what the action came to is not known here, and the record is not changed. The
+/// text is read strictly first, and only a text that fails for that word alone reads this way, so
+/// anything else that this build cannot read is still a record it cannot read.
+fn stored_error(text: &str) -> CatalogueResult<ProtocolError> {
+    match serde_json::from_str(text) {
+        Ok(error) => Ok(error),
+        Err(source) => read_as_unknown(text).ok_or_else(|| unreadable(source)),
+    }
+}
+
+/// The error in `text` with its unknown code read as the unknown outcome, when that code is the
+/// only thing this build cannot read in it.
+fn read_as_unknown(text: &str) -> Option<ProtocolError> {
+    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let code = value.get_mut("code")?;
+    if kr_protocol::error::ErrorCode::from_wire(code.as_str()?).is_some() {
+        return None;
+    }
+    *code = serde_json::Value::String(
+        kr_protocol::error::ErrorCode::OutcomeUnknown
+            .as_str()
+            .to_owned(),
+    );
+    let mut error: ProtocolError = serde_json::from_value(value).ok()?;
+    error.retry = kr_protocol::error::ErrorCode::OutcomeUnknown.retry_category();
+    Some(error)
 }
 
 fn number(value: u64) -> CatalogueResult<i64> {
