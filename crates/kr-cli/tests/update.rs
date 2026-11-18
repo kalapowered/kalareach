@@ -8067,6 +8067,9 @@ async fn a_daemon_with_a_path_variable_that_is_not_text_is_not_prepared() {
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
     let not_text = std::ffi::OsStr::from_bytes(b"/home/\xff");
+    // The daemon drops a `HOME` that is not text, so the session this case creates takes the
+    // account's own home. Its shell is `/bin/sh` with the interactive startup, which reads a startup
+    // file only through `ENV`, and the harness passes none: no profile is read.
     host.start_daemon_with(&controller, &[("HOME", not_text)], &[])
         .await;
     let endpoint = host

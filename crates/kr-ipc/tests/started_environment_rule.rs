@@ -45,6 +45,10 @@
 //!   later. The row's reason says what the file does today.
 //! - A snapshot written by a name other than the field's (a shorthand `environment_snapshot,`), or
 //!   built in a source under `src` that holds test modules, is not seen.
+//! - Reading 2 reads one expression as one text: a conditional that names `snapshot_home(` on one
+//!   branch passes for both. A branch that writes a snapshot without the home (an invisible create,
+//!   whose session takes the daemon's host environment) is not seen, so its daemon's setter is the
+//!   author's to keep.
 //! - The environment a daemon in the test's own process reads at its start. A run the daemon
 //!   resumes from its journal, as well as a trigger that is due, can create a session before the
 //!   next line of the harness runs; that session has the test program's environment.
@@ -404,7 +408,7 @@ const SNAPSHOTS: &[Counted] = &[
     Counted {
         file: "crates/kr-controller/tests/automation.rs",
         places: 3,
-        reason: "every place is an invisible create (a create-session node, which the product also refuses when it carries a variable, and two creates from the client), so each session takes the host's environment of its file's daemon: the daemons that start workers are started by `working_host_on_clocks` and `working_host_apart_started_by`, and both call `set_host_environment` with the helper's variables, the home of the case's own tree; the daemons that do not call it have a worker program that does not exist",
+        reason: "every place is an invisible create (a create-session node, which the product also refuses when it carries a variable, and two creates from the client), so each session takes the host's environment of its file's daemon: every daemon of the file is started by `start_daemon_with`, which calls `set_host_environment` with the helper's variables, the home of the case's own tree",
         removal: INVISIBLE_CREATE_REMOVAL,
         holds: |text| text.contains("fn create_session_node(") && text.contains("fn session_in("),
     },
@@ -506,7 +510,7 @@ const SNAPSHOTS: &[Counted] = &[
     Counted {
         file: "crates/kr-controller/tests/binding.rs",
         places: 2,
-        reason: "its places are invisible creates, which the daemon refuses when they carry a variable (a session started with the host's environment carries none), so each session takes the host's environment of its file's daemon: `Hosted::start` calls `set_host_environment` after the daemon starts, so the home is inside the case's own tree",
+        reason: "its places are invisible creates, which the daemon refuses when they carry a variable (a session started with the host's environment carries none), so each session takes the host's environment of its file's daemon: `Hosted::run`, which `Hosted::start` and the restart both call, starts the daemon and calls `set_host_environment`, so the home is inside the case's own tree",
         removal: INVISIBLE_CREATE_REMOVAL,
         holds: |text| text.contains("Presentation::Invisible"),
     },
@@ -535,18 +539,6 @@ const CHILD_DAEMON_REMOVAL: &str =
 /// The sources that start a daemon in the test's own process without giving it a host environment
 /// in the same function, with the number of starts each excuses.
 const DAEMON_STARTS: &[Counted] = &[
-    Counted {
-        file: "crates/kr-controller/tests/automation.rs",
-        places: 1,
-        reason: "the one function that starts the file's daemons takes the worker program as an \
-                 argument: the two callers that give it a real worker set the host environment \
-                 before any client endpoint exists, and the others pass a path that does not exist",
-        removal: "the row goes when the function takes the environment as an argument",
-        holds: |text| {
-            text.matches("set_host_environment(").count() == 2
-                && text.contains("PathBuf::from(\"/nonexistent/kr-worker\")")
-        },
-    },
     Counted {
         file: "crates/kr-controller/tests/configuration_reader.rs",
         places: 1,
