@@ -9947,6 +9947,50 @@ async fn a_host_whose_storage_is_one_its_owner_runs_is_set_up_there_and_backs_up
     );
 }
 
+/// A host whose storage service is one its owner runs, and which is signed in at it to no account,
+/// is told so in the doctor's words for that service, which name it because the managed account can
+/// be signed in while the storage account is not, and which sign-in mends it: the storage account's.
+/// No request carrying an account leaves the host. A host whose storage is managed keeps the words
+/// of the managed account, which `a_token_that_is_not_usable_never_leaves_the_host` reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_signed_in_to_no_account_at_the_storage_service_its_owner_runs_is_told_which_sign_in_mends_it()
+ {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(
+        Arrangement {
+            token: Token::None,
+            ..Arrangement::OWNER_RUN
+        },
+        Arc::clone(&timer),
+    )
+    .await;
+    rig.admit(1, &[(1, plaintext(2048))]);
+    let web = Arc::clone(rig.served.web());
+    let (waited, _release) = tokio::select! {
+        waited = within("the token is looked at again", timer.next_wait()) => waited,
+        () = web.requests_reach(STATUS, 1) => panic!("the host asked the service"),
+    };
+    assert_eq!(waited, TOKEN_CHECK);
+    assert!(
+        web.arrived().iter().all(|request| request.token.is_none()),
+        "a token left the host"
+    );
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+    assert!(
+        detail.contains(
+            "this host is signed in to no account at the storage service its storage.origin \
+             names; "
+        ),
+        "{detail}"
+    );
+    let remedy = rig.storage_remedy().await;
+    assert!(
+        remedy.contains("Sign this host in with `kr account sign-in --storage`."),
+        "{remedy}"
+    );
+}
+
 /// A doctor read of the daemon at `endpoint`.
 async fn doctor_at(endpoint: &kr_ipc::paths::Endpoint) -> HostDoctorResult {
     let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())

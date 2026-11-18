@@ -3076,6 +3076,63 @@ async fn a_kit_that_names_only_another_service_than_the_configured_one_is_refuse
     assert!(names(&fixture.into).is_empty());
 }
 
+/// KR-REQ-20.19: a kit that does not name the service an export file was made at does not open that
+/// export, and the refusal says so in the words for a file: the host's `storage.origin` cannot mend
+/// it, because a restore from a file compares the kit with the file's own service, so those words
+/// are not the ones a restore through the daemon gets. The host here is configured for the
+/// service the file was made at, and no request reaches any service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kit_that_does_not_name_the_service_an_export_file_was_made_at_does_not_open_it_and_asks_nothing()
+ {
+    let world = World::new();
+    let rig = Rig::start_owner_run(SignIn::Usable).await;
+    let sealed = seal(&world, 1, &borrowed(&members()));
+    let file = rig.work.join("backup.krexport");
+    std::fs::write(
+        &file,
+        export_of(&world, rig.origin(), &sealed)
+            .to_canonical_bytes()
+            .expect("canonical bytes"),
+    )
+    .expect("the export file");
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&["https://backups.other.example"])).expect("the kit file");
+    let into = folder(&rig, "restored");
+    let refused = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into.display().to_string(),
+                "--kit-file",
+                &kit.display().to_string(),
+                "--from-export",
+                &file.display().to_string(),
+                "--preview",
+            ],
+            None,
+        )
+        .await;
+    assert!(!refused.status.success());
+    let said = text(&refused.stderr);
+    assert!(
+        said.contains(
+            "the recovery kit does not name the service the export file was made at, so this kit \
+             does not open that export; restore it with the kit it was made with"
+        ),
+        "{said}"
+    );
+    assert!(
+        !said.contains("storage.origin"),
+        "a change to the host's configuration cannot mend this: {said}"
+    );
+    for path in [SYNC, MANIFEST, OBJECT_READ] {
+        assert_eq!(rig.served.web().requests_to(path), 0, "{path} was asked");
+    }
+    assert!(names(&into).is_empty());
+}
+
 /// KR-REQ-20.19 and KR-ACC-033: a host configured for a service its owner runs, and signed in there
 /// for storage, restores a backup from a kit that names that service and nothing else, through the
 /// real daemon and the stand-in and with the stand-in given no standing as the managed service. The
@@ -3311,8 +3368,8 @@ async fn a_host_signed_in_to_no_account_at_the_service_its_owner_runs_is_told_to
         let said = text(&refused.stderr);
         assert!(
             said.contains(
-                "no account is signed in on this host. Sign this host in with `kr account \
-                 sign-in --storage`."
+                "this host is signed in to no account at the storage service its storage.origin \
+                 names. Sign this host in with `kr account sign-in --storage`."
             ),
             "{said}"
         );
@@ -3320,8 +3377,10 @@ async fn a_host_signed_in_to_no_account_at_the_service_its_owner_runs_is_told_to
     assert_eq!(rig.served.web().requests_to(SYNC), 0);
 }
 
-/// A host that is signed in to no account says so and what to do, and sends no bundle read, because
-/// the service answers a read with no token as a bundle that is not there.
+/// A host that is signed in to no account says so, and sends no bundle read, because the service
+/// answers a read with no token as a bundle that is not there. The binary picks the remedy from the
+/// managed origin it is built with, and this rig's stand-in is not that origin, so the remedy is
+/// not asserted here; the library's table holds both policies' remedies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_is_signed_in_to_no_account_says_so_and_sends_no_read() {
     let world = World::new();
@@ -3345,8 +3404,7 @@ async fn a_host_that_is_signed_in_to_no_account_says_so_and_sends_no_read() {
         .await;
     assert_eq!(refused.status.code(), Some(8), "{}", text(&refused.stderr));
     let said = text(&refused.stderr);
-    assert!(said.contains("no account is signed in"), "{said}");
-    assert!(said.contains("kr account sign-in"), "{said}");
+    assert!(said.contains("signed in to no account"), "{said}");
     assert_eq!(rig.served.web().requests_to(SYNC), 0);
 }
 
