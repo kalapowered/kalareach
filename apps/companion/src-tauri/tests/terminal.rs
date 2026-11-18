@@ -7938,9 +7938,16 @@ async fn a_view_whose_connection_went_with_output_unread_serves_it_and_gives_not
         gone.is_ok_and(|host| host.is_ok()),
         "the worker did not write its output and go within the bound while the page held the view"
     );
+    let output = kr_protocol::ids::StreamId::new(scripted_worker::OUTPUT_STREAM)
+        .expect("a literal stream name");
     assert!(
         page.state_within(3, shown).await.is_some(),
-        "the view did not reach its first state of the output within the bound"
+        "the view did not reach its first state of the output within the bound: the page was sent {} states, {shown} of them before it held the view, and the session's reader had read the output stream through {:?}",
+        page.states(3).len(),
+        views
+            .read_through(&view, &output)
+            .await
+            .map(|read| read.get())
     );
     // The key goes to the view's queue while the view is held at its first screen, and the one
     // state that the page lets pass is the turn after which the view takes the key: the page lets
