@@ -46,7 +46,15 @@ async fn a_pairing_that_ran_out_since_the_check_is_refused_where_the_share_is_wr
         .expect_err("a pairing that ran out since is refused where the share is written");
     assert_eq!(refused.code(), ErrorCode::PermissionDenied);
     assert!(
-        refused.to_string().contains("pairing has run out"),
+        refused.to_string().contains(
+            "pairing cannot be used now; it can be paired again after the pairing has ended"
+        ),
+        "{refused}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .contains("(the host refuses a new pairing while it stands)"),
         "{refused}"
     );
 

@@ -47,12 +47,15 @@ describe('a device whose pairing ends within a minute', () => {
     expect(ending?.match(/Pair it again(?! after the pairing has ended)/)).toBeNull()
   })
 
-  it('says to pair it again with no condition only for a pairing that has already ended', () => {
-    const ended = whyNot(
+  it('says a pairing that is out of force cannot be used now, and is paired again only after it has ended', () => {
+    const outOfForce = whyNot(
       device({ grant_expired: true, grant_expires_at_ms: String(NOW - 1_000) }),
       NOW
     )
-    expect(ended).toBe('Its pairing has ended. Pair it again to share a session with it.')
+    expect(outOfForce).toBe(
+      'Its pairing cannot be used now. Pair it again after the pairing has ended; the host refuses a new pairing while it stands.'
+    )
+    expect(outOfForce?.match(/Pair it again(?! after the pairing has ended)/)).toBeNull()
   })
 })
 

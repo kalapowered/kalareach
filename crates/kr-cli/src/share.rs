@@ -272,7 +272,8 @@ fn pick_device<'a>(
     }
     if device.grant_expired {
         return Err(CliError::Usage(Shown::said(
-            "that device's pairing has run out; pair it again before sharing a session with it",
+            "that device's pairing cannot be used now; pair it again after the pairing has ended \
+             (the host refuses a new pairing while it stands)",
         )));
     }
     Ok(device)
@@ -2050,8 +2051,8 @@ mod tests {
 
     /// The host refuses a new pairing of a device it still lists, so a share refused because the
     /// pairing ends in under a minute says to pair the device again only once the pairing has
-    /// ended, and a share refused because the pairing has run out, which has ended, says it
-    /// without a condition.
+    /// ended, and a share refused because the pairing cannot be used now says the same: the host
+    /// may still list the device, because a pairing that is out of force need not have ended.
     #[test]
     fn a_device_is_paired_again_only_after_its_pairing_has_ended() {
         let refused = lifetime(None, Some(NOW + 30_000), NOW).expect_err("less than a minute left");
@@ -2075,11 +2076,21 @@ mod tests {
         let CliError::Usage(said) = refused else {
             panic!("a usage mistake: {refused:?}");
         };
+        let said = said.as_str();
+        assert!(!said.contains("has run out"), "{said}");
+        let when = said
+            .find("after the pairing has ended")
+            .unwrap_or_else(|| panic!("it says when: {said}"));
+        let again = said
+            .find("pair it again")
+            .unwrap_or_else(|| panic!("it says to pair the device again: {said}"));
         assert!(
-            said.as_str()
-                .contains("pairing has run out; pair it again before"),
-            "{}",
-            said.as_str()
+            said.starts_with("that device's pairing cannot be used now; ") && again < when,
+            "{said}"
+        );
+        assert!(
+            said.contains("(the host refuses a new pairing while it stands)"),
+            "{said}"
         );
     }
 

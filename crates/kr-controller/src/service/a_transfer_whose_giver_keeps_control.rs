@@ -12,8 +12,12 @@ use super::a_transfer_left_unanswered::{daemon, owner_share};
 use super::a_voice_grant_on_the_floor::paired;
 use crate::sharing::ShareRequest;
 
-/// A paired device whose four keys this host holds, which a transfer can hand control to.
-fn paired_with_all_keys(controller: &crate::service::Controller) -> DeviceId {
+/// A paired device whose four keys this host holds, which a transfer can hand control to, with a
+/// pairing that ends as `expiry` says.
+fn paired_with_all_keys(
+    controller: &crate::service::Controller,
+    expiry: kr_protocol::grant::GrantExpiry,
+) -> DeviceId {
     let keys = kr_crypto::keys::DeviceKeys::generate()
         .expect("keys")
         .public_keys();
@@ -44,7 +48,7 @@ fn paired_with_all_keys(controller: &crate::service::Controller) -> DeviceId {
                 named_questions: kr_protocol::scalars::CanonicalSet::new(),
                 named_approvals: kr_protocol::scalars::CanonicalSet::new(),
             },
-            expiry: kr_protocol::grant::GrantExpiry::Never,
+            expiry,
             organisation: Nullable::null(),
         },
         paired_at_ms: kr_protocol::scalars::TimestampMs::new(1),
@@ -64,7 +68,7 @@ async fn a_transfer_from_a_device_that_holds_the_grant_above_is_not_described() 
     let actor_id = ActorId::new("local:test").expect("a principal");
     let session_id = SessionId::new(Uuid::from_bytes([0xa0; 16]));
     let giver = paired(&controller, 1, None).device_id;
-    let taker = paired_with_all_keys(&controller);
+    let taker = paired_with_all_keys(&controller, kr_protocol::grant::GrantExpiry::Never);
     let share = owner_share(&controller, session_id, giver);
     let now_ms = kr_ipc::now_ms().get();
 
@@ -133,6 +137,50 @@ async fn a_transfer_from_a_device_that_holds_the_grant_above_is_not_described() 
     assert_eq!(plan.parent_grant_id, Nullable::null());
 }
 
+/// KR-REQ-18.03: a transfer to a device whose pairing is out of force is refused with the words that
+/// say the pairing cannot be used now: a pairing that is out of force need not have ended, so the
+/// refusal claims no end. The control: a device whose pairing is in force is described.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transfer_to_a_device_whose_pairing_cannot_be_used_now_is_refused_so() {
+    let (_temp, controller) = daemon().await;
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let session_id = SessionId::new(Uuid::from_bytes([0xa0; 16]));
+    let giver = paired(&controller, 1, None).device_id;
+    let share = owner_share(&controller, session_id, giver);
+    let describe = |to_device_id: DeviceId| {
+        controller.transfer_plan(
+            &actor_id,
+            &GrantTransferParams {
+                session_id,
+                from_grant_id: share.grant_id,
+                to_device_id,
+            },
+            ActionId::new(Uuid::from_bytes([9; 16])),
+        )
+    };
+
+    let lasting = paired_with_all_keys(&controller, kr_protocol::grant::GrantExpiry::Never);
+    describe(lasting).expect("a pairing in force takes the transfer described");
+    let out_of_force = paired_with_all_keys(
+        &controller,
+        kr_protocol::grant::GrantExpiry::At {
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(2),
+        },
+    );
+    let refused = describe(out_of_force).expect_err("a pairing out of force takes no transfer");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+    let said = refused.to_string();
+    assert!(
+        said.contains("the receiving device's pairing cannot be used now"),
+        "{said}"
+    );
+    assert!(!said.contains("has run out"), "{said}");
+}
+
 /// KR-REQ-18.03: however long the chain between the grant the giving device holds and the one it
 /// gives up, the grant above is found. A chain of three hundred grants held by other devices sits
 /// between them, longer than any search a host could cap.
@@ -142,7 +190,7 @@ async fn the_grant_above_is_found_however_long_the_chain_below_it() {
     let actor_id = ActorId::new("local:test").expect("a principal");
     let session_id = SessionId::new(Uuid::from_bytes([0xa0; 16]));
     let giver = paired(&controller, 1, None).device_id;
-    let taker = paired_with_all_keys(&controller);
+    let taker = paired_with_all_keys(&controller, kr_protocol::grant::GrantExpiry::Never);
     let share = owner_share(&controller, session_id, giver);
     let now_ms = kr_ipc::now_ms().get();
 
@@ -209,7 +257,7 @@ async fn a_chain_with_a_missing_link_is_not_one_without_a_grant_above() {
     let actor_id = ActorId::new("local:test").expect("a principal");
     let session_id = SessionId::new(Uuid::from_bytes([0xa0; 16]));
     let giver = paired(&controller, 1, None).device_id;
-    let taker = paired_with_all_keys(&controller);
+    let taker = paired_with_all_keys(&controller, kr_protocol::grant::GrantExpiry::Never);
     let share = owner_share(&controller, session_id, giver);
     let now_ms = kr_ipc::now_ms().get();
 

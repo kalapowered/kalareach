@@ -1019,7 +1019,9 @@ async fn kr_req_25_10_a_pairing_that_runs_out_while_the_share_waits_takes_no_sha
         .expect_err("a pairing that ran out while the request waited takes no share");
     assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
     assert!(
-        refused.message.contains("pairing has run out"),
+        refused.message.contains(
+            "pairing cannot be used now; it can be paired again after the pairing has ended"
+        ),
         "{refused:?}"
     );
     let listed: GrantListResult = net_support::pairing::read(

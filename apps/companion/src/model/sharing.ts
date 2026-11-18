@@ -102,7 +102,9 @@ export function whyNot(device: DeviceSummary, nowMs: number): string | null {
   if (device.revoked) return null
   if (device.manages_host) return 'An owner device already has every session of this host.'
   if (device.all_sessions) return 'Its pairing already opens every session of this host.'
-  if (device.grant_expired) return 'Its pairing has ended. Pair it again to share a session with it.'
+  if (device.grant_expired) {
+    return 'Its pairing cannot be used now. Pair it again after the pairing has ended; the host refuses a new pairing while it stands.'
+  }
   const end = pairingEnd(device)
   if (end !== null && end - nowMs < SHORTEST_LEFT_MS) {
     return 'Its pairing ends within a minute. Pair it again after the pairing has ended; the host refuses a new pairing while it stands.'

@@ -985,8 +985,8 @@ impl Controller {
         let facts = self.pairing_facts(&record)?;
         if !facts.in_force {
             return Err(recipient(
-                "that device's pairing has run out; it has to be paired again before a session \
-                 is shared with it",
+                "that device's pairing cannot be used now; it can be paired again after the \
+                 pairing has ended (the host refuses a new pairing while it stands)",
             ));
         }
         let proposed = crate::sharing::roles::compile(
@@ -1040,8 +1040,8 @@ impl Controller {
         }
         Err(recipient_refusal(
             matches!(caller, AuthorityCaller::Device(_)),
-            "that device's pairing has run out; it has to be paired again before a session is \
-             shared with it",
+            "that device's pairing cannot be used now; it can be paired again after the pairing \
+             has ended (the host refuses a new pairing while it stands)",
         ))
     }
 
@@ -2032,7 +2032,7 @@ impl Controller {
         // a grant past its own end: refused here, before an owner is asked to confirm what the
         // write would refuse.
         if !self.pairing_facts(&to)?.in_force {
-            return Err(denied("the receiving device's pairing has run out"));
+            return Err(denied("the receiving device's pairing cannot be used now"));
         }
         if let (
             GrantExpiry::At {
@@ -2363,8 +2363,8 @@ impl Controller {
                 Ok(())
             } else {
                 Err(ControllerError::PermissionDenied {
-                    detail: "this device's grant has run out, so it can register no destination; \
-                             pairing a new device gives notifications one that stands"
+                    detail: "this device's grant cannot be used now, so it can register no \
+                             destination; pairing a new device gives notifications one that stands"
                         .to_owned(),
                 })
             }
@@ -4145,7 +4145,9 @@ mod tests {
     /// KR-REQ-25.10: the host refuses a new pairing of a device it still lists, so a share that
     /// would end after its recipient's pairing is refused with the time the pairing has left and
     /// says to pair the device again only once the pairing has ended, with the reason. The
-    /// control: a share inside the pairing is accepted.
+    /// control: a share inside the pairing is accepted. A pairing that is out of force need not
+    /// have ended, so the refusal of a share to it says the pairing cannot be used now and offers
+    /// a second pairing only after the pairing has ended.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_share_past_the_pairings_end_is_told_when_the_device_can_be_paired_again() {
         use kr_protocol::sharing::{AuthorityNotice, RoleSelection, SessionRole};
@@ -4199,6 +4201,26 @@ mod tests {
         host.controller
             .check_recipient_pairing(AuthorityCaller::Owner, &share(10 * 60_000))
             .expect("a share inside the pairing is accepted");
+
+        host.wall
+            .store(now + 30 * 60_000 + 1, std::sync::atomic::Ordering::SeqCst);
+        let refused = host
+            .controller
+            .check_recipient_pairing(AuthorityCaller::Owner, &share(10 * 60_000))
+            .expect_err("a pairing that is out of force takes no share");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        let said = refused.to_string();
+        assert!(!said.contains("has run out"), "{said}");
+        assert!(
+            said.contains(
+                "pairing cannot be used now; it can be paired again after the pairing has ended"
+            ),
+            "{said}"
+        );
+        assert!(
+            said.contains("(the host refuses a new pairing while it stands)"),
+            "{said}"
+        );
     }
 
     /// A registration the journal has taken is finished in the directory whatever has happened to
