@@ -322,7 +322,7 @@ mod tests {
         );
     }
 
-    /// A holder whose look finds a reply that proves nothing is not one that never answers: the wait
+    /// A holder whose look finds a reply that this command cannot use is not one that never answers: the wait
     /// ends at the bound as for a holder that is silent, and says that a reply came.
     #[tokio::test(start_paused = true)]
     async fn a_holder_whose_look_finds_a_reply_ends_the_wait_as_one_that_replied() {
