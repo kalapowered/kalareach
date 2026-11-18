@@ -1806,8 +1806,6 @@ async fn a_fresh_host_at_the_service_its_owner_runs_restores_from_the_kit_a_set_
     .await;
     let mut window = Window::run(&rig, &["backup", "setup"]);
     let kit = window.bring_up_the_kit();
-    window.confirm(&kit);
-    window.wait_for("kr ended 0");
     assert_eq!(
         parse_kit(&kit.text)
             .expect("the kit shown is a recovery kit")
@@ -1815,6 +1813,8 @@ async fn a_fresh_host_at_the_service_its_owner_runs_restores_from_the_kit_a_set_
         [rig.origin().to_owned()],
         "the kit names the service the owner runs and not the managed one"
     );
+    window.confirm(&kit);
+    window.wait_for("kr ended 0");
 
     let BackupSetupState::Committed { archive_id, .. } = rig.status().await.setup else {
         panic!("the host is set up");
