@@ -212,7 +212,7 @@ mod writer {
         expected: Option<String>,
     }
 
-    fn derive(environment: &EnvironmentPaths, kind: Kind, strict: bool) -> Result<Derived> {
+    fn derived_for(environment: &EnvironmentPaths, kind: Kind, strict: bool) -> Result<Derived> {
         let label = label(environment);
         let file = directory(kind)?.join(format!("{label}.{}", kind.extension()));
         let program = if strict {
@@ -581,7 +581,7 @@ mod writer {
             return Ok(());
         };
         let environment = paths.environment(id);
-        let derived = derive(&environment, kind, false)?;
+        let derived = derived_for(&environment, kind, false)?;
         let said = record_said(&environment);
         let record = record::read(environment.state_dir(), kind, &derived.label, &said)
             .map_err(CliError::Usage)?;
@@ -606,7 +606,7 @@ mod writer {
         render::render(kind, &probe).map_err(|refused| cannot_hold(&refused.path, refused.kind))?;
         let id = paths.open_environment_id().map_err(CliError::Ipc)?;
         let environment = paths.environment(id);
-        let derived = derive(&environment, kind, true)?;
+        let derived = derived_for(&environment, kind, true)?;
         let expected = derived.expected.clone().unwrap_or_default();
         let writers = crate::barrier::hold_in(&environment)?;
         let permit = crate::barrier::permit(&writers, &WRITTEN)?;
@@ -783,7 +783,7 @@ mod writer {
             return Ok(());
         };
         let environment = paths.environment(id);
-        let derived = derive(&environment, kind, false)?;
+        let derived = derived_for(&environment, kind, false)?;
         let said = record_said(&environment);
         let read = || {
             if environment.state_dir().is_dir() {
