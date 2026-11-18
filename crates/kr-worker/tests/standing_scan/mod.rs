@@ -629,8 +629,18 @@ pub fn listed(names: &[&str], name: &str) -> bool {
     })
 }
 
-/// Whether the call that stands at `at` follows a `.` or a `::`.
+/// Whether the call that stands at `at` follows a `.` or a `::`. A raw identifier (`r#lock`) is
+/// the name itself, so the reading starts at its `r#`.
 fn reached(text: &[char], at: usize) -> bool {
+    let at = if at >= 2
+        && text[at - 1] == '#'
+        && text[at - 2] == 'r'
+        && (at == 2 || !is_ident(text[at - 3]))
+    {
+        at - 2
+    } else {
+        at
+    };
     let before: Vec<&char> = text[..at]
         .iter()
         .rev()
