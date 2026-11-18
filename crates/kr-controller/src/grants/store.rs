@@ -1496,7 +1496,7 @@ impl GrantDirectory {
     /// [`Self::subtree_to_revoke`] reads them one grant at a time.
     ///
     /// Each of them is found by its identifier, one row read for each, as the revocation of that
-    /// grant alone finds it, so a held record that names a grant no row holds refuses the whole
+    /// grant alone finds it, so a held record whose grant no row is keyed by refuses the whole
     /// revocation as it refuses that one. The grants below them are read once, however many the
     /// device holds and in whatever order `held` lists them, and only when a held grant is to be
     /// walked: a device with nothing left to withdraw reads none. A walk does not go below a grant

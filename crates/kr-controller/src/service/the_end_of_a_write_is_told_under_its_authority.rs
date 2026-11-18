@@ -555,9 +555,9 @@ async fn a_refusal_membership_present_raises_is_not_shown_under_a_fence_or_a_wit
 /// barrier withdraws the whole host. With `another_withdrawal_follows` another device's withdrawal
 /// completes once the route has answered and before the answer is told.
 ///
-/// Writing a tree of this size takes about half a minute in a debug build, and revoking the device
-/// that holds it about as long again on a quiet machine and several minutes under load, so each leg
-/// is a case of its own.
+/// Writing a tree of this size and revoking the device that holds it take about twenty seconds
+/// together in a debug build on a quiet machine, and up to about five minutes on four loaded
+/// processors, so each leg is a case of its own.
 async fn told_a_device_revocation_at_the_most_a_notice_names(
     another_withdrawal_follows: bool,
 ) -> ControlFrame {
