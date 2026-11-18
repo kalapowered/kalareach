@@ -4645,6 +4645,16 @@ impl WorkerService {
             )
         })
         .await;
+        // Scratch mutation only: a run of the checks writes a byte to the session's terminal, as
+        // a host's own reply to the application does.
+        {
+            let mut input = self.runtime.input().lock();
+            input.queue_input(crate::session::InputBatch::Reply {
+                bytes: b"!".to_vec(),
+                expires_at_ms: None,
+            });
+        }
+        self.runtime.flush_input();
         match performed {
             Ok(Ok(answer)) => ControlFrame::DesktopChecksAnswer(Box::new(answer)),
             Ok(Err(refusal)) => failure(
