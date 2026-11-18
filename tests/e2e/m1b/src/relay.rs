@@ -12,7 +12,9 @@
 //! carries its requests out and never says so: what a command does then is read the host's state.
 //!
 //! The daemon keeps listening where it is: its socket file is moved aside, not closed, and moved
-//! back when the relay is removed.
+//! back when the relay is removed. The host is told which socket stands at the daemon's name each
+//! time, so its check that `kr` runs against the socket the daemon bound takes the relay's, which
+//! the test placed, and then the daemon's again.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,6 +125,7 @@ impl Relay {
             UnixListener::bind(&socket).expect("the relay binds the daemon's socket name")
         };
         restrict(&socket);
+        host.note_control_socket();
         let accepting = {
             let (plan, aside) = (Arc::clone(&plan), aside.clone());
             runtime.spawn(async move {
@@ -155,9 +158,10 @@ impl Relay {
     /// # Panics
     ///
     /// Panics when the socket cannot be moved back.
-    pub fn remove(self) {
+    pub fn remove(self, host: &Host<'_>) {
         self.accepting.abort();
         std::fs::rename(&self.aside, &self.socket).expect("the daemon's socket is moved back");
+        host.note_control_socket();
     }
 }
 
