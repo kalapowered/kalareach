@@ -570,17 +570,32 @@ impl InvitationRows {
     }
 
     /// Returns the pairing this host holds for `device_id`, from its own record of the device: the
-    /// name and the date it recorded, whatever any later candidate presented, and only while that
-    /// record is in force. A record that was removed or whose grant ended is no longer a pairing
-    /// the host holds, so it gives none.
+    /// name and the date it recorded, whatever any later candidate presented, and only while the
+    /// host lists that record. A record that was removed or that carries an end is no longer a
+    /// pairing the host holds, so it gives none.
+    ///
+    /// A grant that ran out and is owed its end gets the end written first, as
+    /// [`Self::listed_device`] does it, so the view agrees with the binding on which record is
+    /// listed. The record is then read again and the end marks decide: a record whose grant this
+    /// host cannot decide, because its clock is not trusted, carries no end and is named.
     ///
     /// # Errors
     ///
-    /// Returns an error when the record cannot be read.
+    /// Returns an error when the record cannot be read or an end found cannot be recorded.
     pub fn existing_pairing(
         &self,
         device_id: DeviceId,
     ) -> kr_pairing::Result<Option<ExistingPairing>> {
+        let record = self
+            .directory
+            .record_for_device(device_id)
+            .map_err(store_error)?;
+        if let Some(record) = record.filter(DeviceRecord::is_paired) {
+            self.lifetimes
+                .paired_standing(&record)
+                .map_err(store_error)?;
+            self.lifetimes.settle();
+        }
         Ok(self
             .directory
             .record_for_device(device_id)
