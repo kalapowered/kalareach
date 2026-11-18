@@ -285,23 +285,37 @@ fn guard_finding(file: &str, function: &str, name: &str) -> String {
     )
 }
 
+/// What is wrong with the findings of a plant against the beginnings it has to bring: the count
+/// differs, or a beginning does not stand in exactly one finding. Empty where the findings are
+/// exactly these. A plant case asserts that this is empty in its own body.
+fn finding_faults(found: &[String], expected: &[String]) -> Vec<String> {
+    let mut faults = Vec::new();
+    if found.len() != expected.len() {
+        faults.push(format!(
+            "{} findings against {}",
+            found.len(),
+            expected.len()
+        ));
+    }
+    for beginning in expected {
+        let count = found
+            .iter()
+            .filter(|line| line.starts_with(beginning.as_str()))
+            .count();
+        if count != 1 {
+            faults.push(format!("{beginning} stands in {count} findings"));
+        }
+    }
+    faults
+}
+
 /// The findings of a plant are exactly these, each one the beginning of one finding.
 fn findings_are(found: &[String], expected: &[String]) {
     assert_eq!(
-        found.len(),
-        expected.len(),
-        "{found:?} against {expected:?}"
+        finding_faults(found, expected),
+        Vec::<String>::new(),
+        "{found:?}"
     );
-    for beginning in expected {
-        assert_eq!(
-            found
-                .iter()
-                .filter(|line| line.starts_with(beginning.as_str()))
-                .count(),
-            1,
-            "{beginning} is not one finding of {found:?}"
-        );
-    }
 }
 
 /// The one finding of a plant that is read as a changed number of mentions.
@@ -453,13 +467,17 @@ fn a_plain_call_of_each_sync_wrapper_of_a_taker_under_the_held_boundary_is_repor
             REVALIDATE,
             &format!("{REVALIDATE}        {call}\n"),
         );
-        findings_are(
-            &found,
-            &[
-                mention_finding("service.rs", "revalidate_time", name, 1, 0),
-                sync_finding("service.rs", "revalidate_time", name),
-                guard_finding("service.rs", "revalidate_time", name),
-            ],
+        assert_eq!(
+            finding_faults(
+                &found,
+                &[
+                    mention_finding("service.rs", "revalidate_time", name, 1, 0),
+                    sync_finding("service.rs", "revalidate_time", name),
+                    guard_finding("service.rs", "revalidate_time", name),
+                ]
+            ),
+            Vec::<String>::new(),
+            "{name}: {found:?}"
         );
     }
 }
@@ -471,12 +489,16 @@ fn a_new_sync_wrapper_of_a_blocking_taker_is_reported() {
         "    fn maintain_pass(&self) -> MaintenancePass {",
         "    fn maintain_twice(&self) {\n        let _ = self.maintain_once();\n    }\n\n    fn maintain_pass(&self) -> MaintenancePass {",
     );
-    findings_are(
-        &found,
-        &[
-            mention_finding("service.rs", "maintain_twice", "maintain_once", 1, 0),
-            sync_finding("service.rs", "maintain_twice", "maintain_once"),
-        ],
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[
+                mention_finding("service.rs", "maintain_twice", "maintain_once", 1, 0),
+                sync_finding("service.rs", "maintain_twice", "maintain_once"),
+            ]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
     );
 }
 
@@ -487,13 +509,17 @@ fn a_taker_mentioned_in_a_function_that_takes_a_guard_is_reported() {
         "    fn fence_what_is_owed(&self, barrier: &DispatchGuard<'_>) {\n",
         "    fn fence_what_is_owed(&self, barrier: &DispatchGuard<'_>) {\n        let _again = self.try_boundary();\n",
     );
-    findings_are(
-        &found,
-        &[
-            mention_finding("service.rs", "fence_what_is_owed", "try_boundary", 1, 0),
-            sync_finding("service.rs", "fence_what_is_owed", "try_boundary"),
-            guard_finding("service.rs", "fence_what_is_owed", "try_boundary"),
-        ],
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[
+                mention_finding("service.rs", "fence_what_is_owed", "try_boundary", 1, 0),
+                sync_finding("service.rs", "fence_what_is_owed", "try_boundary"),
+                guard_finding("service.rs", "fence_what_is_owed", "try_boundary"),
+            ]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
     );
 }
 
@@ -513,14 +539,18 @@ fn the_take_of_the_storage_recovery_moved_to_the_time_revalidation_is_reported()
             ),
         ],
     );
-    findings_are(
-        &found,
-        &[
-            mention_finding("service.rs", "recover_storage_now", "take_boundary", 0, 1),
-            mention_finding("service.rs", "revalidate_time", "take_boundary", 1, 0),
-            sync_finding("service.rs", "revalidate_time", "take_boundary"),
-            guard_finding("service.rs", "revalidate_time", "take_boundary"),
-        ],
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[
+                mention_finding("service.rs", "recover_storage_now", "take_boundary", 0, 1),
+                mention_finding("service.rs", "revalidate_time", "take_boundary", 1, 0),
+                sync_finding("service.rs", "revalidate_time", "take_boundary"),
+                guard_finding("service.rs", "revalidate_time", "take_boundary"),
+            ]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
     );
 }
 
@@ -580,7 +610,20 @@ fn a_take_that_a_macro_hides_in_a_test_module_it_strips_is_reported() {
         RECEIPTED_CALL,
         "            macro_rules! again {\n                (#[$a:meta] mod ignored { $($body:tt)* }) => { $($body)* };\n            }\n            again! {\n                #[cfg(test)] mod ignored {\n                    let _again = self.take_boundary();\n                }\n            }\n            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
     );
-    only_mentions(&found, "service.rs", "receipt_once", "take_boundary", 1, 0);
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[mention_finding(
+                "service.rs",
+                "receipt_once",
+                "take_boundary",
+                1,
+                0
+            )]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -590,12 +633,16 @@ fn a_take_in_a_test_helper_of_the_crate_is_reported() {
         "impl WorkerService {\n    /// Starts a pass of the standing function in `mode`",
         "#[cfg(test)]\nmod rogue {\n    fn again(service: &super::WorkerService) {\n        let _again = service.take_boundary();\n    }\n}\n\nimpl WorkerService {\n    /// Starts a pass of the standing function in `mode`",
     );
-    findings_are(
-        &found,
-        &[
-            mention_finding("service/standing.rs", "again", "take_boundary", 1, 0),
-            sync_finding("service/standing.rs", "again", "take_boundary"),
-        ],
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[
+                mention_finding("service/standing.rs", "again", "take_boundary", 1, 0),
+                sync_finding("service/standing.rs", "again", "take_boundary"),
+            ]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
     );
 }
 
@@ -613,9 +660,13 @@ fn a_new_method_over_the_boundarys_take_by_the_service_is_reported() {
         "impl WorkerService {\n    /// Takes the service's dispatch boundary, waiting for whoever holds it.",
         "impl WorkerService {\n    pub(super) fn hold_for_a_moment(&self) -> std::sync::LockResult<DispatchGuard<'_>> {\n        self.dispatch.lock()\n    }\n\n    /// Takes the service's dispatch boundary, waiting for whoever holds it.",
     );
-    findings_are(
-        &found,
-        &[rawtake_finding("hold_for_a_moment", "lock", 1, 0)],
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[rawtake_finding("hold_for_a_moment", "lock", 1, 0)]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
     );
 }
 
@@ -626,7 +677,11 @@ fn a_new_method_over_the_boundarys_own_mutex_is_reported() {
         "    /// Completes when the boundary is next let go.",
         "    fn another_take(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {\n        self.lock.lock()\n    }\n\n    /// Completes when the boundary is next let go.",
     );
-    findings_are(&found, &[rawtake_finding("another_take", "lock", 1, 0)]);
+    assert_eq!(
+        finding_faults(&found, &[rawtake_finding("another_take", "lock", 1, 0)]),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -636,9 +691,13 @@ fn a_try_planted_in_the_service_take_of_the_boundary_is_reported() {
         "    pub(super) fn take_boundary(&self) -> std::sync::LockResult<DispatchGuard<'_>> {\n        self.dispatch.lock()",
         "    pub(super) fn take_boundary(&self) -> std::sync::LockResult<DispatchGuard<'_>> {\n        drop(self.dispatch.try_lock());\n        self.dispatch.lock()",
     );
-    findings_are(
-        &found,
-        &[rawtake_finding("take_boundary", "try_lock", 1, 0)],
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[rawtake_finding("take_boundary", "try_lock", 1, 0)]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
     );
 }
 
@@ -649,9 +708,13 @@ fn a_raw_take_that_is_gone_from_the_boundary_is_reported() {
         "        self.dispatch.try_lock()\n",
         "        self.dispatch.try_lock_stand_in()\n",
     );
-    findings_are(
-        &found,
-        &[rawtake_finding("try_take_boundary", "try_lock", 0, 1)],
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[rawtake_finding("try_take_boundary", "try_lock", 0, 1)]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
     );
 }
 
@@ -667,7 +730,11 @@ fn an_include_planted_in_the_crate_is_reported() {
         REVALIDATE,
         &format!("{REVALIDATE}        include!(\"second_take.inc\");\n"),
     );
-    findings_are(&found, &[reference_finding("service.rs", "include", 1, 0)]);
+    assert_eq!(
+        finding_faults(&found, &[reference_finding("service.rs", "include", 1, 0)]),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -677,7 +744,11 @@ fn a_path_attribute_planted_in_the_crate_is_reported() {
         "    /// Takes the dispatch boundary when nobody holds it, and never waits.\n    fn try_boundary(",
         "    #[path = \"second_take.rs\"]\n    mod second_take;\n\n    /// Takes the dispatch boundary when nobody holds it, and never waits.\n    fn try_boundary(",
     );
-    findings_are(&found, &[reference_finding("service.rs", "path", 1, 0)]);
+    assert_eq!(
+        finding_faults(&found, &[reference_finding("service.rs", "path", 1, 0)]),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -687,15 +758,23 @@ fn a_block_on_planted_in_the_crate_is_reported() {
         REVALIDATE,
         &format!("{REVALIDATE}        futures_util::future::block_on(self.again());\n"),
     );
-    findings_are(&found, &[reference_finding("service.rs", "block_on", 1, 0)]);
+    assert_eq!(
+        finding_faults(&found, &[reference_finding("service.rs", "block_on", 1, 0)]),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
     let found = planted(
         "crates/kr-worker/src/bin/kr-worker.rs",
         "    match runtime.block_on(run(arguments)) {",
         "    runtime.block_on(run(arguments));\n    match runtime.block_on(run(arguments)) {",
     );
-    findings_are(
-        &found,
-        &[reference_finding("bin/kr-worker.rs", "block_on", 2, 1)],
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[reference_finding("bin/kr-worker.rs", "block_on", 2, 1)]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
     );
 }
 
@@ -706,10 +785,10 @@ fn a_session_held_where_the_first_admission_is_called_is_reported() {
         RECEIPTED_CALL,
         "            let _session = self.runtime.session();\n            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
     );
-    only_finding(
-        &found,
-        "service.rs receipt_once calls receipted holding {\"SES\"} and its held row says {}",
-    );
+    let names =
+        "service.rs receipt_once calls receipted holding {\"SES\"} and its held row says {}";
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains(names), "{found:?}");
 }
 
 #[test]
@@ -722,10 +801,9 @@ fn a_session_taken_before_the_call_of_the_prepared_path_is_reported() {
         "            let ReadyPreparation {\n",
         "            let _session = self.runtime.session();\n            let ReadyPreparation {\n",
     );
-    only_finding(
-        &found,
-        "service.rs prepared_once calls continue_prepared holding {\"SES\"} and its held row says {}",
-    );
+    let names = "service.rs prepared_once calls continue_prepared holding {\"SES\"} and its held row says {}";
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains(names), "{found:?}");
 }
 
 #[test]
