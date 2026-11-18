@@ -1,0 +1,1057 @@
+//! `kr host login-item status`, `install` and `remove`, run as the commands a person types.
+//!
+//! Every run gets a home, the installation's two roots, a temporary directory and a layout of its
+//! own on the internal disk: a copy of `kr` beside a stand-in `kr-controller` that only appends a
+//! line to a file, so nothing here starts a daemon. The environment is cleared and holds exactly
+//! `HOME`, a `PATH` of the system's directories (a stand-in folder first on Linux), both roots,
+//! `TMPDIR` and, on Linux, `XDG_CONFIG_HOME` inside the home. No case touches a real home, a
+//! launch agent, a login item or a service manager.
+
+use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+mod support;
+
+const MARKER: &str = "login item: ";
+const STUB_LINE: &str = "started\n";
+
+struct Setup {
+    _root: tempfile::TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+    runtime: PathBuf,
+    bin: PathBuf,
+    stub_log: PathBuf,
+}
+
+impl Setup {
+    fn new() -> Self {
+        let root = tempfile::tempdir().expect("a directory on the internal disk");
+        let base = std::fs::canonicalize(root.path()).expect("the directory resolves");
+        let home = base.join("home");
+        let bin = base.join("bin");
+        for directory in [&home, &bin, &base.join("tmp")] {
+            std::fs::create_dir_all(directory).expect("a directory");
+        }
+        let layout = Self {
+            _root: root,
+            root: base.clone(),
+            home,
+            state: base.join("s"),
+            runtime: base.join("r"),
+            stub_log: base.join("stub-ran"),
+            bin,
+        };
+        layout.layout(&layout.bin);
+        layout
+    }
+
+    /// A `kr` copy and a stand-in `kr-controller` beside it in `directory`.
+    fn layout(&self, directory: &Path) {
+        std::fs::create_dir_all(directory).expect("a directory");
+        let target = directory.join("kr");
+        std::fs::copy(support::kr(), &target).expect("a copy of kr");
+        std::fs::write(
+            directory.join("kr-controller"),
+            format!("#!/bin/sh\necho started >> '{}'\n", self.stub_log.display()),
+        )
+        .expect("the stand-in");
+        std::fs::set_permissions(
+            directory.join("kr-controller"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("a mode");
+    }
+
+    fn command_in(&self, kr: &Path, home: &Path, arguments: &[&str]) -> Command {
+        let mut command = Command::new(kr);
+        command
+            .args(arguments)
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("KR_STATE_DIR", &self.state)
+            .env("KR_RUNTIME_DIR", &self.runtime)
+            .env("TMPDIR", self.root.join("tmp"))
+            .current_dir(&self.root)
+            .stdin(std::process::Stdio::null());
+        #[cfg(target_os = "linux")]
+        command.env("XDG_CONFIG_HOME", home.join(".config"));
+        command
+    }
+
+    fn run_with(&self, kr: &Path, home: &Path, arguments: &[&str]) -> std::process::Output {
+        self.command_in(kr, home, arguments)
+            .output()
+            .expect("kr runs")
+    }
+
+    fn run(&self, arguments: &[&str]) -> std::process::Output {
+        self.run_with(&self.bin.join("kr"), &self.home, arguments)
+    }
+
+    /// Runs `kr host login-item <argument>` and requires success; returns what it printed.
+    fn ok(&self, argument: &str) -> String {
+        let output = self.run(&["host", "login-item", argument]);
+        assert!(
+            output.status.success(),
+            "kr host login-item {argument} succeeds: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Runs `kr host login-item <argument>`, requires failure, and returns what it said.
+    fn refused(&self, argument: &str) -> String {
+        let output = self.run(&["host", "login-item", argument]);
+        assert!(
+            !output.status.success(),
+            "kr host login-item {argument} is refused"
+        );
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    fn directory(&self, home: &Path) -> PathBuf {
+        if cfg!(target_os = "macos") {
+            home.join("Library/LaunchAgents")
+        } else {
+            home.join(".config/autostart")
+        }
+    }
+
+    /// The login item's file in `home`, when there is one.
+    fn item_in(&self, home: &Path) -> Option<PathBuf> {
+        std::fs::read_dir(self.directory(home))
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("kr-desktop-host-"))
+            })
+    }
+
+    fn item(&self) -> PathBuf {
+        self.item_in(&self.home)
+            .expect("the login item's file is there")
+    }
+
+    fn state_dir(&self) -> Option<PathBuf> {
+        let environments = std::fs::read_dir(self.state.join("environments")).ok()?;
+        environments.flatten().map(|entry| entry.path()).next()
+    }
+
+    fn record_path(&self) -> Option<PathBuf> {
+        self.state_dir()
+            .map(|directory| directory.join("desktop-host-login.json"))
+    }
+
+    fn record(&self) -> serde_json::Value {
+        let path = self.record_path().expect("a state directory");
+        serde_json::from_slice(&std::fs::read(path).expect("a record")).expect("a record in JSON")
+    }
+
+    fn record_bytes(&self) -> Option<Vec<u8>> {
+        self.record_path().and_then(|path| std::fs::read(path).ok())
+    }
+
+    fn stub_ran(&self) -> bool {
+        self.stub_log.exists()
+    }
+
+    /// Every file under the home, the roots and the layout's temporary directory, by path.
+    fn snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut found = BTreeMap::new();
+        for root in [&self.home, &self.state, &self.runtime] {
+            collect(root, &mut found);
+        }
+        found
+    }
+}
+
+fn collect(directory: &Path, found: &mut BTreeMap<PathBuf, Vec<u8>>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path).expect("metadata");
+        if metadata.is_dir() {
+            found.insert(path.clone(), b"<directory>".to_vec());
+            collect(&path, found);
+        } else if metadata.file_type().is_symlink() {
+            found.insert(path, b"<link>".to_vec());
+        } else {
+            found.insert(path, std::fs::read(entry.path()).unwrap_or_default());
+        }
+    }
+}
+
+fn last_line(text: &str) -> &str {
+    text.lines().last().unwrap_or_default()
+}
+
+fn status_word(setup: &Setup) -> String {
+    let output = setup.run(&["--json", "host", "login-item", "status"]);
+    assert!(output.status.success(), "status succeeds");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    value["state"].as_str().expect("a state").to_owned()
+}
+
+#[cfg(target_os = "macos")]
+fn read_vector(file: &Path) -> Vec<String> {
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(file)
+        .output()
+        .expect("plutil reads a file of the test's own tree");
+    assert!(output.status.success(), "plutil reads the file");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    value["ProgramArguments"]
+        .as_array()
+        .expect("ProgramArguments")
+        .iter()
+        .map(|item| item.as_str().expect("a string").to_owned())
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn read_vector(file: &Path) -> Vec<String> {
+    let script = "import json, sys\nimport gi\ngi.require_version('GLib', '2.0')\nfrom gi.repository import GLib\nfor line in open(sys.argv[1], encoding='utf-8').read().split('\\n'):\n    if line.startswith('Exec='):\n        print(json.dumps(GLib.shell_parse_argv(line[5:])[1], ensure_ascii=False))\n";
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .arg(file)
+        .output()
+        .expect("python3 with GLib is installed: this case reads the entry with GLib's own parser");
+    assert!(
+        output.status.success(),
+        "GLib's parser reads the Exec line: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("a JSON vector")
+}
+
+#[test]
+fn the_login_item_is_written_for_this_platform_and_recorded_exactly() {
+    let setup = Setup::new();
+    let text = setup.ok("install");
+    assert!(
+        last_line(&text).starts_with("login item: installed: "),
+        "{text}"
+    );
+    let item = setup.item();
+    let name = item
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("a name")
+        .to_owned();
+    let extension = if cfg!(target_os = "macos") {
+        ".plist"
+    } else {
+        ".desktop"
+    };
+    assert!(
+        name.starts_with("kr-desktop-host-") && name.ends_with(extension),
+        "{name}"
+    );
+    assert!(
+        !name.starts_with("kr-controller-"),
+        "not the service start's label"
+    );
+    let mode = std::fs::metadata(&item)
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the file is owner-only");
+    let contents = std::fs::read_to_string(&item).expect("text");
+    let record = setup.record();
+    assert_eq!(record["version"], 1);
+    assert_eq!(record["label"], name.trim_end_matches(extension));
+    assert_eq!(record["path"], item.to_string_lossy().as_ref());
+    assert_eq!(record["contents"], contents.as_str());
+    assert!(record["pending"].is_null(), "nothing is under way");
+    assert!(record.get("made").is_none(), "no directory is recorded");
+    assert_eq!(
+        record["kind"],
+        if cfg!(target_os = "macos") {
+            "launch_agent"
+        } else {
+            "autostart_entry"
+        }
+    );
+    #[cfg(target_os = "macos")]
+    for key in [
+        "RunAtLoad",
+        "LimitLoadToSessionType",
+        "Aqua",
+        "KeepAlive",
+        "Umask",
+    ] {
+        assert!(contents.contains(key), "the property list holds {key}");
+    }
+    #[cfg(target_os = "linux")]
+    for line in ["Type=Application", "Terminal=false", "TryExec="] {
+        assert!(contents.contains(line), "the entry holds {line}");
+    }
+    let directory = setup.state_dir().expect("the state directory");
+    let mut inside: Vec<String> = std::fs::read_dir(&directory)
+        .expect("the state directory")
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    inside.sort();
+    assert!(
+        inside.contains(&"desktop-host-login.lock".to_owned()),
+        "{inside:?}"
+    );
+    assert!(
+        !inside.contains(&"controller-service.lock".to_owned()),
+        "{inside:?}"
+    );
+    assert_eq!(
+        inside.len(),
+        3,
+        "the marker, the record and the lock only: {inside:?}"
+    );
+    assert!(!setup.runtime.exists(), "no runtime directory was made");
+    assert!(!setup.stub_ran(), "nothing was started");
+}
+
+#[test]
+fn the_command_the_login_item_stores_is_the_one_kr_gives_the_daemon_and_nothing_runs_it() {
+    let setup = Setup::new();
+    assert!(setup.ok("install").contains(MARKER));
+    let vector = read_vector(&setup.item());
+    let controller = std::fs::canonicalize(setup.bin.join("kr-controller")).expect("resolves");
+    assert_eq!(
+        vector,
+        vec![
+            controller.to_string_lossy().into_owned(),
+            "--runtime-dir".to_owned(),
+            setup.runtime.to_string_lossy().into_owned(),
+            "--state-dir".to_owned(),
+            setup.state.to_string_lossy().into_owned(),
+        ]
+    );
+    assert!(!setup.stub_ran(), "the stand-in stays untouched");
+}
+
+#[test]
+fn a_second_install_changes_nothing() {
+    let setup = Setup::new();
+    setup.ok("install");
+    let before = setup.snapshot();
+    let text = setup.ok("install");
+    assert!(text.contains("already installed"), "{text}");
+    assert!(
+        before == setup.snapshot(),
+        "every byte of the tree is equal"
+    );
+}
+
+#[test]
+fn removing_takes_out_the_file_and_the_record_and_no_directory_and_nothing_else() {
+    let setup = Setup::new();
+    let directory = setup.directory(&setup.home);
+    std::fs::create_dir_all(&directory).expect("the person's own directory");
+    let theirs = [
+        ("foo.desktop", "[Desktop Entry]\nName=Foo\n"),
+        ("kr-desktop-host-other.plist", "other\n"),
+        ("another-program.plist", "<plist/>\n"),
+    ];
+    for (name, contents) in theirs {
+        std::fs::write(directory.join(name), contents).expect("a seeded file");
+    }
+    let seeded = setup.snapshot();
+    setup.ok("install");
+    let text = setup.ok("remove");
+    assert!(text.contains("removed "), "{text}");
+    assert!(
+        text.contains("does not end a daemon that is running"),
+        "{text}"
+    );
+    assert!(
+        setup
+            .item_in(&setup.home)
+            .is_none_or(|p| p.ends_with("kr-desktop-host-other.plist"))
+    );
+    assert!(setup.record_bytes().is_none(), "the record is gone");
+    let after = setup.snapshot();
+    for (name, contents) in theirs {
+        assert_eq!(
+            after.get(&directory.join(name)).map(Vec::as_slice),
+            Some(contents.as_bytes()),
+            "{name} is as seeded"
+        );
+    }
+    assert!(directory.is_dir(), "no directory is removed");
+    let extra: Vec<_> = after
+        .keys()
+        .filter(|path| !seeded.contains_key(*path))
+        .collect();
+    assert!(
+        extra.iter().all(|path| path.starts_with(&setup.state)),
+        "only kr's own state is left: {extra:?}"
+    );
+}
+
+#[test]
+fn a_login_item_changed_since_kr_wrote_it_is_named_and_left() {
+    for change in ["append", "replace", "directory", "link"] {
+        let setup = Setup::new();
+        setup.ok("install");
+        let item = setup.item();
+        match change {
+            "append" => {
+                let mut text = std::fs::read(&item).expect("bytes");
+                text.extend_from_slice(b"X-Mine=1\n");
+                std::fs::write(&item, text).expect("a change");
+            }
+            "replace" => std::fs::write(&item, b"mine\n").expect("a change"),
+            "directory" => {
+                std::fs::remove_file(&item).expect("goes");
+                std::fs::create_dir(&item).expect("a directory");
+            }
+            _ => {
+                std::fs::remove_file(&item).expect("goes");
+                std::os::unix::fs::symlink(&setup.home, &item).expect("a link");
+            }
+        }
+        let refusal = setup.refused("install");
+        assert!(
+            refusal.contains("was changed after kr wrote it, so kr does not replace it"),
+            "{change}: {refusal}"
+        );
+        let before = std::fs::symlink_metadata(&item).is_ok();
+        let text = setup.ok("remove");
+        assert!(
+            before && std::fs::symlink_metadata(&item).is_ok(),
+            "{change}: left"
+        );
+        assert!(
+            text.contains(&format!(
+                "left {}: it was changed after kr wrote it",
+                item.display()
+            )),
+            "{change}: {text}"
+        );
+        assert!(
+            last_line(&text).starts_with(MARKER),
+            "{change}: ends with the status line"
+        );
+        assert!(
+            setup.record_bytes().is_none(),
+            "{change}: the record is dropped"
+        );
+        assert!(setup.item_in(&setup.home).is_some_and(|p| p == item));
+        let leftovers = std::fs::read_dir(setup.directory(&setup.home))
+            .expect("dir")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .count();
+        assert_eq!(leftovers, 0, "{change}: no aside is left");
+    }
+}
+
+#[test]
+fn a_file_kr_did_not_write_at_the_login_items_place_is_refused_and_left() {
+    let setup = Setup::new();
+    setup.ok("install");
+    let other_home = setup.root.join("home2");
+    std::fs::create_dir_all(setup.directory(&other_home)).expect("a directory");
+    let item = setup.item();
+    let name = item.file_name().expect("a name").to_owned();
+    let place = setup.directory(&other_home).join(name);
+    std::fs::write(&place, b"somebody's own file\n").expect("a foreign file");
+    // The record of the first home is dropped, so the second has none and a file at its place.
+    setup.ok("remove");
+    let output = |argument: &str| {
+        setup.run_with(
+            &setup.bin.join("kr"),
+            &other_home,
+            &["host", "login-item", argument],
+        )
+    };
+    let before = setup.snapshot();
+    let install = output("install");
+    assert!(!install.status.success(), "install is refused");
+    let said = String::from_utf8_lossy(&install.stderr).into_owned();
+    assert!(said.contains("is not what this installation of kr writes, and kr has no record of writing it, so kr does not replace it"), "{said}");
+    assert!(setup.snapshot() == before, "nothing was written");
+    let remove = output("remove");
+    let text = String::from_utf8_lossy(&remove.stdout).into_owned();
+    assert!(remove.status.success(), "remove succeeds");
+    assert!(
+        text.contains("nothing of the login item's to remove"),
+        "{text}"
+    );
+    assert!(
+        last_line(&text).contains("login item: ")
+            && last_line(&text).contains("kr leaves it as it is"),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read(&place).expect("left"),
+        b"somebody's own file\n"
+    );
+}
+
+#[test]
+fn a_login_item_that_has_gone_is_said_to_be_gone_and_its_record_dropped() {
+    let setup = Setup::new();
+    setup.ok("install");
+    std::fs::remove_file(setup.item()).expect("the file goes");
+    assert_eq!(status_word(&setup), "gone");
+    let text = setup.ok("remove");
+    assert!(setup.record_bytes().is_none(), "{text}");
+    setup.ok("install");
+    assert!(
+        setup.item_in(&setup.home).is_some(),
+        "install writes the file again"
+    );
+    std::fs::remove_file(setup.item()).expect("goes again");
+    let text = setup.ok("install");
+    assert!(
+        last_line(&text).starts_with("login item: installed: "),
+        "{text}"
+    );
+    assert!(setup.item_in(&setup.home).is_some());
+}
+
+#[test]
+fn no_program_is_started_by_any_login_item_command() {
+    let setup = Setup::new();
+    for argument in ["install", "status", "remove"] {
+        setup.ok(argument);
+        assert!(
+            !setup.stub_ran(),
+            "{argument} started the stand-in controller"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn no_manager_is_asked_by_any_login_item_command() {
+    let setup = Setup::new();
+    let stand_ins = setup.root.join("stand-ins");
+    std::fs::create_dir(&stand_ins).expect("a directory");
+    let calls = setup.root.join("manager-calls");
+    for program in ["systemctl", "loginctl", "gsettings", "dbus-send"] {
+        let path = stand_ins.join(program);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho {program} >> '{}'\n", calls.display()),
+        )
+        .expect("a stand-in");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("a mode");
+    }
+    for argument in ["install", "status", "remove"] {
+        let mut command = setup.command_in(
+            &setup.bin.join("kr"),
+            &setup.home,
+            &["host", "login-item", argument],
+        );
+        command.env("PATH", format!("{}:/usr/bin:/bin", stand_ins.display()));
+        let output = command.output().expect("kr runs");
+        assert!(output.status.success(), "{argument} succeeds");
+    }
+    assert!(!calls.exists(), "no manager was asked");
+}
+
+#[test]
+fn the_login_item_and_the_other_offers_are_separate_and_neither_touches_the_others_files() {
+    let setup = Setup::new();
+    setup.ok("install");
+    let directory = setup.state_dir().expect("a state directory");
+    for name in [
+        "controller-service.json",
+        "shell-entries.json",
+        "terminal-profiles.json",
+    ] {
+        assert!(
+            !directory.join(name).exists() && !setup.state.join(name).exists(),
+            "{name}"
+        );
+    }
+    // A seeded service record and definition are as seeded across all three commands.
+    let seeded = [
+        (
+            directory.join("controller-service.json"),
+            b"{\"seeded\":true}\n".to_vec(),
+        ),
+        (
+            setup
+                .directory(&setup.home)
+                .join("kr-controller-seeded.plist"),
+            b"seeded\n".to_vec(),
+        ),
+    ];
+    for (path, contents) in &seeded {
+        std::fs::write(path, contents).expect("a seeded file");
+    }
+    for argument in ["install", "status", "remove"] {
+        setup.ok(argument);
+        for (path, contents) in &seeded {
+            assert_eq!(&std::fs::read(path).expect("kept"), contents, "{argument}");
+        }
+    }
+    // In a tree of its own with no service record, `kr host startup --set standalone` and
+    // `kr shell install` write no login item and no record.
+    let second = Setup::new();
+    let output = second.run(&["host", "startup", "--set", "standalone"]);
+    let _ = output;
+    assert!(second.item_in(&second.home).is_none());
+    assert!(second.record_bytes().is_none());
+}
+
+#[test]
+fn status_says_each_state_in_words_and_in_json() {
+    let setup = Setup::new();
+    let json = |setup: &Setup| -> serde_json::Value {
+        let output = setup.run(&["--json", "host", "login-item", "status"]);
+        assert_eq!(output.status.code(), Some(0));
+        serde_json::from_slice(&output.stdout).expect("JSON")
+    };
+    let words = |setup: &Setup| {
+        let output = setup.run(&["host", "login-item", "status"]);
+        assert_eq!(output.status.code(), Some(0));
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    // none, with no identity yet and with one
+    let fresh = words(&setup);
+    assert!(
+        fresh.contains("this environment has no identity yet"),
+        "{fresh}"
+    );
+    assert!(json(&setup)["file"].is_null());
+    assert!(setup.state_dir().is_none(), "status wrote nothing");
+    setup.ok("install");
+    // installed
+    let installed = words(&setup);
+    assert!(
+        installed.starts_with("login item: installed: ")
+            && installed.contains("is there as kr wrote it"),
+        "{installed}"
+    );
+    let document = json(&setup);
+    assert_eq!(document["state"], "installed");
+    assert_eq!(document["recorded"], true);
+    assert!(document["pending"].is_null());
+    // changed
+    let item = setup.item();
+    let original = std::fs::read(&item).expect("bytes");
+    std::fs::write(&item, b"edited\n").expect("a change");
+    assert!(
+        words(&setup).contains(
+            "was changed after kr wrote it, so it is no longer kr's to replace or remove"
+        )
+    );
+    assert_eq!(json(&setup)["state"], "changed");
+    // gone
+    std::fs::remove_file(&item).expect("goes");
+    assert!(
+        words(&setup)
+            .contains(", and the file is gone; kr host login-item remove drops the record")
+    );
+    assert_eq!(json(&setup)["state"], "gone");
+    // unrecorded: exactly kr's bytes and no record
+    std::fs::write(&item, &original).expect("restored");
+    std::fs::set_permissions(&item, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+    let record = setup.record_path().expect("a path");
+    let kept = std::fs::read(&record).expect("a record");
+    std::fs::remove_file(&record).expect("the record goes");
+    assert!(words(&setup).contains(
+        "is exactly what this installation of kr writes, and kr has no record of writing it"
+    ));
+    assert_eq!(json(&setup)["state"], "unrecorded");
+    // foreign: other bytes and no record
+    std::fs::write(&item, b"foreign\n").expect("a change");
+    assert!(words(&setup).contains("kr leaves it as it is and does not write over it"));
+    assert_eq!(json(&setup)["state"], "foreign");
+    // outdated: a second layout writes other bytes
+    std::fs::write(&item, &original).expect("restored");
+    std::fs::write(&record, &kept).expect("the record is back");
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+    let layout = setup.root.join("bin2");
+    setup.layout(&layout);
+    let other = setup.run_with(
+        &layout.join("kr"),
+        &setup.home,
+        &["--json", "host", "login-item", "status"],
+    );
+    let other: serde_json::Value = serde_json::from_slice(&other.stdout).expect("JSON");
+    assert_eq!(other["state"], "outdated");
+    // elsewhere: another home
+    let second = setup.root.join("home2");
+    std::fs::create_dir_all(&second).expect("a home");
+    let elsewhere = setup.run_with(
+        &setup.bin.join("kr"),
+        &second,
+        &["host", "login-item", "status"],
+    );
+    let text = String::from_utf8_lossy(&elsewhere.stdout).into_owned();
+    assert!(
+        text.contains("login item: the file the record ") && text.contains(" names is not "),
+        "{text}"
+    );
+    // an unusable record gives its sentence and a non-zero exit
+    std::fs::write(&record, b"not json").expect("a bad record");
+    let bad = setup.run(&["host", "login-item", "status"]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("cannot be used"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_path_a_property_list_must_escape_reads_back_whole() {
+    for name in ["a&b", "a<b>", "a'b", "a\"b"] {
+        let setup = Setup::new();
+        let layout = setup.root.join(name).join("bin");
+        setup.layout(&layout);
+        let output = setup.run_with(
+            &layout.join("kr"),
+            &setup.home,
+            &["host", "login-item", "install"],
+        );
+        assert!(
+            output.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let controller = std::fs::canonicalize(layout.join("kr-controller")).expect("resolves");
+        assert_eq!(
+            read_vector(&setup.item())[0],
+            controller.to_string_lossy(),
+            "{name}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_path_a_desktop_entry_cannot_hold_exactly_is_refused_and_every_other_path_reads_back_whole() {
+    let accepted = [
+        "a b", "a'b", "a#b", "a;b", "a(b", "a&b", "a<b>", "a~b", "a*b", "a?b", "a|b", ".dot", "zoë",
+    ];
+    for name in accepted {
+        let setup = Setup::new();
+        let layout = setup.root.join(name).join("bin");
+        setup.layout(&layout);
+        let output = setup.run_with(
+            &layout.join("kr"),
+            &setup.home,
+            &["host", "login-item", "install"],
+        );
+        assert!(
+            output.status.success(),
+            "the daemon path {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let controller = std::fs::canonicalize(layout.join("kr-controller")).expect("resolves");
+        assert_eq!(
+            read_vector(&setup.item())[0],
+            controller.to_string_lossy(),
+            "the daemon path {name}"
+        );
+        for input in ["runtime", "state"] {
+            let setup = Setup::new();
+            let root = setup.root.join(name).join(input);
+            let mut command = setup.command_in(
+                &setup.bin.join("kr"),
+                &setup.home,
+                &["host", "login-item", "install"],
+            );
+            command.env(
+                if input == "runtime" {
+                    "KR_RUNTIME_DIR"
+                } else {
+                    "KR_STATE_DIR"
+                },
+                &root,
+            );
+            assert!(
+                command.output().expect("kr runs").status.success(),
+                "the {input} root {name}"
+            );
+            let vector = read_vector(&setup.item_in(&setup.home).expect("written"));
+            assert!(
+                vector.contains(&root.to_string_lossy().into_owned()),
+                "the {input} root {name}"
+            );
+        }
+    }
+    for bad in ["a\"b", "a`b", "a$b", "a\\b", "a%b", "a\tb", " a", "a "] {
+        let setup = Setup::new();
+        let layout = setup.root.join(bad).join("bin");
+        setup.layout(&layout);
+        let before = setup.snapshot();
+        let output = setup.run_with(
+            &layout.join("kr"),
+            &setup.home,
+            &["host", "login-item", "install"],
+        );
+        assert!(
+            !output.status.success(),
+            "the daemon path {bad:?} is refused"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("cannot be written into a desktop entry exactly")
+        );
+        assert!(setup.snapshot() == before, "{bad:?}: nothing was written");
+    }
+    let setup = Setup::new();
+    let layout = setup.root.join("a=b").join("bin");
+    setup.layout(&layout);
+    let output = setup.run_with(
+        &layout.join("kr"),
+        &setup.home,
+        &["host", "login-item", "install"],
+    );
+    assert!(!output.status.success(), "= in the daemon path is refused");
+}
+
+#[test]
+fn an_install_and_a_removal_at_once_leave_no_file_the_record_does_not_name() {
+    let setup = Setup::new();
+    setup.ok("install");
+    setup.ok("remove");
+    for _ in 0..4 {
+        let install = setup
+            .command_in(
+                &setup.bin.join("kr"),
+                &setup.home,
+                &["host", "login-item", "install"],
+            )
+            .spawn()
+            .expect("starts");
+        let remove = setup
+            .command_in(
+                &setup.bin.join("kr"),
+                &setup.home,
+                &["host", "login-item", "remove"],
+            )
+            .spawn()
+            .expect("starts");
+        for mut child in [install, remove] {
+            let _ = child.wait();
+        }
+        let file = setup.item_in(&setup.home);
+        let record = setup.record_bytes();
+        match (&file, &record) {
+            (Some(file), Some(record)) => {
+                let record: serde_json::Value = serde_json::from_slice(record).expect("JSON");
+                assert_eq!(
+                    record["contents"],
+                    std::fs::read_to_string(file).expect("text").as_str()
+                );
+                assert!(record["pending"].is_null());
+            }
+            (None, None) => {}
+            other => panic!(
+                "the file and the record are both there or both gone: {:?}",
+                (other.0.is_some(), other.1.is_some())
+            ),
+        }
+        let leftovers = std::fs::read_dir(setup.directory(&setup.home)).map_or(0, |entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+                .count()
+        });
+        assert_eq!(leftovers, 0, "no aside and no staging file");
+    }
+}
+
+#[test]
+fn a_record_this_build_does_not_read_is_refused_and_left() {
+    let setup = Setup::new();
+    setup.ok("install");
+    let item = setup.item();
+    let good = setup.record();
+    let mutate = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut value = good.clone();
+        change(&mut value);
+        value.to_string().into_bytes()
+    };
+    let outside = setup.root.join("outside");
+    std::fs::write(&outside, b"not kr's\n").expect("an outside file");
+    let records = [
+        mutate(&|v| v["version"] = 2.into()),
+        mutate(&|v| v["extra"] = 1.into()),
+        b"not json".to_vec(),
+        mutate(&|v| v["pending"] = serde_json::json!({"operation": "remove", "aside": outside})),
+        mutate(&|v| {
+            v["pending"] =
+                serde_json::json!({"operation": "publish", "staging": "/x/.y.kr-staging"})
+        }),
+    ];
+    let path = setup.record_path().expect("a path");
+    for record in records {
+        std::fs::write(&path, &record).expect("a record");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        let file = std::fs::read(&item).expect("the file");
+        for argument in ["install", "status", "remove"] {
+            let said = setup.refused(argument);
+            assert!(said.contains("cannot be used"), "{argument}: {said}");
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("kept"),
+            record,
+            "the record is as it was"
+        );
+        assert_eq!(
+            std::fs::read(&item).expect("kept"),
+            file,
+            "the file is as it was"
+        );
+        assert_eq!(std::fs::read(&outside).expect("kept"), b"not kr's\n");
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn a_login_item_is_refused_on_a_system_with_no_writer() {
+    let root = tempfile::tempdir().expect("a directory");
+    for argument in ["status", "install", "remove"] {
+        let output = Command::new(support::kr())
+            .args(["host", "login-item", argument])
+            .env_clear()
+            .env(
+                "SystemRoot",
+                std::env::var_os("SystemRoot").unwrap_or_default(),
+            )
+            .env("LOCALAPPDATA", root.path().join("local"))
+            .env("USERPROFILE", root.path().join("home"))
+            .env("KR_STATE_DIR", "")
+            .output()
+            .expect("kr runs");
+        assert!(!output.status.success());
+        let said = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            said.contains(
+                "the login item is written on macOS and Linux; this system has no writer for it"
+            ),
+            "{said}"
+        );
+    }
+    assert!(
+        !root.path().join("local").exists(),
+        "nothing was made under LOCALAPPDATA"
+    );
+}
+
+#[test]
+fn a_failed_install_takes_its_record_back_and_leaves_no_file() {
+    let setup = Setup::new();
+    let directory = setup.directory(&setup.home);
+    std::fs::create_dir_all(directory.parent().expect("a parent")).expect("a parent");
+    std::fs::write(&directory, b"a file where the directory belongs\n").expect("a file");
+    let said = setup.refused("install");
+    assert!(
+        said.contains("kr stopped while it was making the directory for the file"),
+        "{said}"
+    );
+    assert!(
+        said.contains("kr took back its record and wrote no file"),
+        "{said}"
+    );
+    assert!(setup.record_bytes().is_none(), "no record");
+    assert_eq!(
+        std::fs::read(&directory).expect("left"),
+        b"a file where the directory belongs\n"
+    );
+}
+
+#[test]
+fn a_login_item_written_from_another_home_is_not_overwritten_and_removal_goes_through_the_record() {
+    let setup = Setup::new();
+    setup.ok("install");
+    let first = setup.item();
+    let recorded = setup.record_bytes().expect("a record");
+    let second = setup.root.join("home2");
+    std::fs::create_dir_all(&second).expect("a home");
+    let run = |argument: &str| {
+        setup.run_with(
+            &setup.bin.join("kr"),
+            &second,
+            &["host", "login-item", argument],
+        )
+    };
+    let install = run("install");
+    assert!(!install.status.success());
+    let said = String::from_utf8_lossy(&install.stderr).into_owned();
+    assert!(
+        said.contains("kr wrote this environment's login item at the file the record "),
+        "{said}"
+    );
+    assert_eq!(setup.record_bytes(), Some(recorded));
+    let status = run("status");
+    assert!(String::from_utf8_lossy(&status.stdout).contains(" names is not "));
+    let remove = run("remove");
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let text = String::from_utf8_lossy(&remove.stdout).into_owned();
+    assert!(text.contains("removed the file the record "), "{text}");
+    assert!(!first.exists(), "the first home's file is taken out");
+    assert!(setup.record_bytes().is_none());
+    assert!(
+        setup.item_in(&second).is_none(),
+        "the second home is untouched"
+    );
+}
+
+#[test]
+fn a_missing_or_non_executable_controller_is_refused_at_install_and_removal_works_without_it() {
+    let layouts = ["none", "directory", "mode"];
+    for layout in layouts {
+        let setup = Setup::new();
+        let directory = setup.root.join("layout").join(layout);
+        setup.layout(&directory);
+        let controller = directory.join("kr-controller");
+        std::fs::remove_file(&controller).expect("goes");
+        match layout {
+            "directory" => std::fs::create_dir(&controller).expect("a directory"),
+            "mode" => {
+                std::fs::write(&controller, b"#!/bin/sh\n").expect("a file");
+                std::fs::set_permissions(&controller, std::fs::Permissions::from_mode(0o644))
+                    .expect("a mode");
+            }
+            _ => {}
+        }
+        let output = setup.run_with(
+            &directory.join("kr"),
+            &setup.home,
+            &["host", "login-item", "install"],
+        );
+        assert!(!output.status.success(), "{layout}");
+        let said = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            said.contains("the control daemon is not at ") || said.contains("is not executable"),
+            "{layout}: {said}"
+        );
+        assert!(
+            !setup.state.exists() && !setup.home.join(".config").exists(),
+            "{layout}: nothing was written"
+        );
+    }
+    let setup = Setup::new();
+    setup.ok("install");
+    std::fs::remove_file(setup.bin.join("kr-controller")).expect("the controller goes");
+    assert!(setup.ok("status").contains(MARKER));
+    setup.ok("remove");
+    assert!(setup.record_bytes().is_none());
+}
