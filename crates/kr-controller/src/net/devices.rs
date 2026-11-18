@@ -3087,6 +3087,99 @@ mod tests {
     }
 
     #[test]
+    fn a_declaration_kept_as_a_refusal_under_a_code_this_build_lacks_is_unavailable_and_declares_nothing_again()
+     {
+        // A kept refusal under a word that a later build added cannot be decoded here. It is told
+        // as unavailable, which is a try-again class for a kept refusal; the record stays, and the
+        // repeat that would have declared keys declares none.
+        let directory = DeviceDirectory::in_memory().expect("a directory");
+        let earlier = an_earlier_device(&directory, 12);
+        let keys = declared(&earlier, 0x82);
+        let refused = declare(
+            &directory,
+            &earlier,
+            1,
+            Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "the declaration is not signed by the recorded key",
+            )),
+        )
+        .expect("decided");
+        assert!(matches!(refused.outcome, KeyDeclaration::Refused { .. }));
+        assert!(keys_of(&directory, &earlier).is_none());
+
+        // A later build added a code, and the refusal of this record was kept under it. The same
+        // record is written with the unknown word as its code.
+        let word = "A_CODE_A_LATER_BUILD_ADDS";
+        assert!(
+            ErrorCode::from_wire(word).is_none(),
+            "this build lacks the word"
+        );
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Later {
+            Refused { code: String, message: String },
+        }
+        let planted = kr_cbor::to_canonical_vec(&Later::Refused {
+            code: word.to_owned(),
+            message: "the declaration is not signed by the recorded key".to_owned(),
+        })
+        .expect("encodes");
+        let table = |directory: &DeviceDirectory| -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+            let connection = directory
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut statement = connection
+                .prepare(
+                    "SELECT action_id, payload_digest, outcome FROM network_key_declarations
+                      ORDER BY action_id",
+                )
+                .expect("selects the declarations");
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("reads the declarations")
+                .map(|row| row.expect("a declaration row"))
+                .collect()
+        };
+        let changed = directory
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute(
+                "UPDATE network_key_declarations SET outcome = ?1 WHERE action_id = ?2",
+                params![planted, action(1).get().as_bytes().as_slice()],
+            )
+            .expect("the kept word is changed");
+        assert_eq!(changed, 1);
+        let before = table(&directory);
+
+        // 1. The reader's answer: the registry is unavailable, on the lookup and on the repeat.
+        let lookup = directory
+            .recorded_declaration(&earlier.principal(), action(1))
+            .expect_err("the record cannot be decoded");
+        assert!(
+            matches!(lookup, ControllerError::RegistryUnavailable { .. }),
+            "{lookup:?}"
+        );
+        assert_eq!(lookup.code(), ErrorCode::StorageUnavailable);
+        let repeat = declare(&directory, &earlier, 1, Ok(keys))
+            .expect_err("the repeat reads the record first and stops");
+        assert!(
+            matches!(repeat, ControllerError::RegistryUnavailable { .. }),
+            "{repeat:?}"
+        );
+
+        // 2. The record stays, and 3. nothing was declared again: no key is on record for the
+        // device and no row was added or changed.
+        assert_eq!(table(&directory), before);
+        assert!(
+            keys_of(&directory, &earlier).is_none(),
+            "the repeat declared no key"
+        );
+    }
+
+    #[test]
     fn the_admission_is_asked_with_the_directory_and_the_database_write_lock_held() {
         let dir = tempfile::tempdir().expect("a directory");
         let path = dir.path().join("registry.sqlite");

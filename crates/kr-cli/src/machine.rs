@@ -1847,6 +1847,124 @@ mod tests {
         );
     }
 
+    /// A plan whose refused step holds a code that a later build added is read as a plan this build
+    /// cannot read: one sentence, from every command that reads the plan, with the file left exactly
+    /// as it is and no step sent.
+    #[tokio::test]
+    async fn a_plan_whose_step_holds_a_refusal_code_this_build_lacks_is_unreadable_and_stays_whole()
+    {
+        use crate::error::Said as _;
+
+        fn replace(value: CanonicalValue, from: &str, to: &str) -> CanonicalValue {
+            match value {
+                CanonicalValue::Text(text) if text == from => CanonicalValue::Text(to.to_owned()),
+                CanonicalValue::Array(items) => CanonicalValue::Array(
+                    items
+                        .into_iter()
+                        .map(|item| replace(item, from, to))
+                        .collect(),
+                ),
+                CanonicalValue::Map(map) => CanonicalValue::Map(
+                    CanonicalMap::from_entries(
+                        map.entries()
+                            .iter()
+                            .map(|(name, item)| (name.clone(), replace(item.clone(), from, to))),
+                    )
+                    .expect("a map"),
+                ),
+                other => other,
+            }
+        }
+        fn error_of<T>(result: Result<T>) -> CliError {
+            match result {
+                Ok(_) => panic!("a plan this build cannot read is not read"),
+                Err(error) => error,
+            }
+        }
+
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.paths();
+        let into = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16]));
+        let from = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+        let mut refused = step();
+        refused.state = StepState::Refused(ErrorCode::PermissionDenied, Why::Environment);
+        let plan = Plan {
+            version: PLAN_FORMAT,
+            into,
+            from,
+            steps: vec![step(), refused],
+            undo: Vec::new(),
+            undoing: false,
+        };
+        save(paths, &plan).expect("saves");
+        assert!(
+            load(paths).expect("reads").is_some(),
+            "a plan whose step holds a code this build knows is read"
+        );
+
+        // A later build added a code, and the refusal of this step was kept under it.
+        let word = "A_CODE_A_LATER_BUILD_ADDS";
+        assert!(
+            ErrorCode::from_wire(word).is_none(),
+            "this build lacks the word"
+        );
+        let CanonicalValue::Map(record) = kr_cbor::decode(
+            &std::fs::read(plan_path(paths)).expect("reads"),
+            &kr_cbor::Limits::DEFAULT,
+        )
+        .expect("the plan decodes") else {
+            panic!("a plan is a map");
+        };
+        let planted = kr_cbor::encode(&replace(
+            CanonicalValue::Map(record),
+            ErrorCode::PermissionDenied.as_str(),
+            word,
+        ));
+        std::fs::write(plan_path(paths), &planted).expect("the kept word is changed");
+
+        // 1. The reader's answer: the whole plan is refused with one sentence, whichever command
+        // reads it. Show, finish, undo and a new merge all stop there.
+        let sentence = "the merge plan this client keeps cannot be read; it is in this user's \
+                        state directory as machine-merge-plan, and the owner selects the \
+                        environments again once it is moved aside";
+        let commands = async {
+            vec![
+                error_of(load(paths)),
+                error_of(plan_shown(paths, false)),
+                error_of(finish(paths, false, None).await),
+                error_of(undo(paths, false).await),
+                error_of(plan_made(paths, &["bravo".to_owned()], into, from, false).await),
+            ]
+        };
+        for error in commands.await {
+            assert_eq!(error.said().as_str(), sentence);
+        }
+
+        // 2. The record stays: the same bytes, and nothing was written beside it or in its place.
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+        let entries = || {
+            let mut names: Vec<_> = std::fs::read_dir(plan_path(paths).parent().expect("a folder"))
+                .expect("lists the folder")
+                .map(|entry| entry.expect("an entry").file_name())
+                .collect();
+            names.sort();
+            names
+        };
+        let listed = entries();
+
+        // 3. Nothing runs again: a second round of every command reads the same record, sends no
+        // step (no host is reachable here, so a send would be another error) and writes nothing.
+        for error in [
+            error_of(plan_made(paths, &["bravo".to_owned()], into, from, false).await),
+            error_of(undo(paths, false).await),
+            error_of(finish(paths, false, None).await),
+        ] {
+            assert_eq!(error.said().as_str(), sentence);
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+        assert_eq!(entries(), listed, "no file was made or removed");
+    }
+
     /// KR-REQ-26.10: a plan is written only at the format the release `current` names lists for it.
     /// Where it lists the plan at another, neither the first write of a plan nor a later save writes
     /// anything; where it lists the same, or does not list it, both write.
