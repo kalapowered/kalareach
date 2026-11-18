@@ -6749,6 +6749,24 @@ async fn a_request_the_host_has_not_answered_stays_asking_whatever_the_provider_
     scene.stand_in.control().announce("d-1", 6_600);
     until_announced(&scene, "d-0", 200).await;
     until_announced(&scene, "d-1", 6_600).await;
+    // What the call tells the model as its control attaches, that the host can be asked and the
+    // host's context, is written on tasks of its own, and the service reads it in its own time. A
+    // service that is held before it has read it holds it and everything written behind it on the
+    // same connection, so it is held once it has read both.
+    scene
+        .stand_in
+        .control()
+        .until(
+            "what the call tells the model as its control attaches, read",
+            |report| {
+                report
+                    .sent
+                    .iter()
+                    .any(|sent| sent.command == "instructions")
+                    && !thinking(report).is_empty()
+            },
+        )
+        .await;
     // The service reads what the model is told of the first sentence and answers none of it while it
     // is held: its acknowledgement comes once the request for the second waits at the writer. The
     // owner sets the row before it tells the model of it, so the row is read once the service has
