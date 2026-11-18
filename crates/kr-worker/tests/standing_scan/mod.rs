@@ -119,9 +119,13 @@
 //!   taker or in an `async` function (a sync function that calls a taker takes the boundary too),
 //!   and not in a function that takes a `DispatchGuard` parameter (such a function runs under the
 //!   boundary).
-//! * `rawtake <file> <function> <name> <count>`: how many times `function` calls `lock` or
-//!   `try_lock` in the product text of `file`, for each file that has a row (`service/boundary.rs`,
-//!   whose mutex is private to it): a take that does not go through a taker is a row too.
+//! * `rawtake <file> <function> <name> <count>`: how many times `function` names `lock` or
+//!   `try_lock` after a `.` or a `::` (a call, a field, a function value) in the product text of
+//!   the module of `file` (`service/boundary.rs`, whose mutex is private to it): `file` itself and
+//!   the files under the folder that is named like it without `.rs`, its child modules, which reach
+//!   the private mutex too, whether they have a row or none. Every function with such a name is a
+//!   `taker` as well, bar the two methods named `lock` and `try_lock` in `file`; a take that does
+//!   not go through a taker is a row too.
 //! * `reference <word> <file> <count>`: how many times `include` (followed by `!`), a path
 //!   attribute (`path` after `[`, `(` or `,`, followed by `=`) or `block_on` stands in the code of
 //!   `file`; a file with no row has none. These bring in source that this reading does not see, or
@@ -634,6 +638,18 @@ fn reached(text: &[char], at: usize) -> bool {
 
 /// Every call of a name in `callees` in `source`, with the function it stands in.
 pub fn sites(file: &str, source: &str, callees: &[&str]) -> Vec<Site> {
+    reached_sites(file, source, callees, true)
+}
+
+/// Every place where a name in `names` follows a `.` or a `::` in `source`, whether a parenthesis
+/// follows it or not (a field, a function value), with the function it stands in.
+fn named_sites(file: &str, source: &str, names: &[&str]) -> Vec<Site> {
+    reached_sites(file, source, names, false)
+}
+
+/// The names in `callees` that follow a `.` or a `::`, each with the function it stands in: only
+/// where a parenthesis follows the name when `called` is set.
+fn reached_sites(file: &str, source: &str, callees: &[&str], called: bool) -> Vec<Site> {
     let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
     let inside = function_at(&text);
     let mut found = Vec::new();
@@ -647,7 +663,7 @@ pub fn sites(file: &str, source: &str, callees: &[&str]) -> Vec<Site> {
             .find(|c| !c.is_whitespace())
             .is_some_and(|c| *c == '(');
         let reached = reached(&text, at);
-        if opens && reached {
+        if (opens || !called) && reached {
             found.push(Site {
                 file: file.to_owned(),
                 function: inside[at].clone().unwrap_or_else(|| "(top)".to_owned()),
@@ -1659,20 +1675,50 @@ fn referenced(files: &[(String, String)], kept: &[Vec<char>], roster: &Roster) -
     problems
 }
 
-/// The takes of the boundary's own mutex (`lock` and `try_lock`) in the product text of every file
-/// that has a `rawtake` row, by function: the only takes that do not go through a taker.
+/// The names of the boundary's own mutex's two takes. In the file of a `rawtake` row, the functions
+/// of these names are the boundary's methods: the only functions that take the mutex and are no
+/// taker.
+const MUTEX_TAKES: [&str; 2] = ["lock", "try_lock"];
+
+/// Whether `file` is `root` or the file of a child module of `root` (a file under the folder that
+/// is named like `root` without its extension).
+fn in_module(root: &str, file: &str) -> bool {
+    let folder = format!("{}/", root.strip_suffix(".rs").unwrap_or(root));
+    file == root || file.starts_with(&folder)
+}
+
+/// The names of the boundary's own mutex's takes (`lock` and `try_lock`) in the product text of
+/// every file of the boundary's module, by function: the files that have a `rawtake` row and the
+/// files of their child modules, rows or none, since a child module reaches the private mutex. A
+/// name counts where it follows a `.` or a `::` with a parenthesis after it or without (a field, a
+/// function value). Every function with such a name is a taker, bar the two methods.
 fn raw_takes(files: &[(String, String)], roster: &Roster) -> Vec<String> {
     let mut problems = Vec::new();
     let rowed: BTreeSet<&String> = roster.rawtakes.keys().map(|(file, _, _)| file).collect();
     let mut found: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     for (file, source) in files {
-        if !rowed.contains(file) {
+        if !rowed.iter().any(|root| in_module(root, file)) {
             continue;
         }
-        for site in sites(file, source, &["lock", "try_lock"]) {
+        for site in named_sites(file, source, &MUTEX_TAKES) {
             *found
                 .entry((site.file, site.function, site.callee))
                 .or_default() += 1;
+        }
+    }
+    let functions: BTreeSet<(&String, &String)> = found
+        .keys()
+        .map(|(file, function, _)| (file, function))
+        .collect();
+    for (file, function) in functions {
+        let method = rowed.contains(file) && MUTEX_TAKES.contains(&function.as_str());
+        if !method && !roster.takers.contains(function) {
+            problems.push(format!(
+                "{file} {function} takes the boundary's own mutex and has no `taker` row: a function \
+                 that takes the dispatch boundary is a taker, so that each place that mentions it is \
+                 read. Add `taker {function}`, its `mention` rows and an entry in the lock audit's \
+                 table of takers (only the boundary's two methods take the mutex and are no taker)"
+            ));
         }
     }
     let mut keys: BTreeSet<(String, String, String)> = found.keys().cloned().collect();
@@ -1683,10 +1729,11 @@ fn raw_takes(files: &[(String, String)], roster: &Roster) -> Vec<String> {
         let listed = roster.rawtakes.get(key).copied().unwrap_or(0);
         if count != listed {
             problems.push(format!(
-                "{file} {function} calls {name} {count} time(s) and its rawtake row says {listed}: a \
-                 take of the boundary's own mutex stands where it did not, or does not where it did. \
-                 Read the new text (every take has to set the record of its holder, which the \
-                 guard's constructor does), then set `rawtake {file} {function} {name} {count}`"
+                "{file} {function} names {name} {count} time(s) and its rawtake row says {listed}: a \
+                 take of the boundary's own mutex, or a name that stands for one (a field, a function \
+                 value), stands where it did not, or does not where it did. Read the new text (every \
+                 take has to set the record of its holder, which the guard's constructor does), then \
+                 set `rawtake {file} {function} {name} {count}`"
             ));
         }
     }
