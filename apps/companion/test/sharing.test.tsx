@@ -111,7 +111,9 @@ describe('who an invitation can go to', () => {
     const reasons = screen.getByTestId('not-offered')
     expect(reasons.textContent).toMatch(/An owner device already has every session/)
     expect(reasons.textContent).toMatch(/pairing already opens every session/)
-    expect(reasons.textContent).toMatch(/pairing has ended. Pair it again/)
+    expect(reasons.textContent).toMatch(
+      /pairing cannot be used now. Pair it again after the pairing has ended; the host refuses a new pairing while it stands/
+    )
   })
 
   it('lists the owner device as having access whatever is done to a share', async () => {
