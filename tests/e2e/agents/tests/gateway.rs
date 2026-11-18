@@ -2667,6 +2667,10 @@ fn run_case(
 /// connection both writers use, and that the terminal closes its prompt on it: a paired device
 /// answers the approval of a command the terminal holds, the host's resource resolves, the
 /// terminal's prompt goes while the turn still runs, and the command runs once.
+///
+/// KR-REQ-11.33, the rich approval half: the host interprets the approval the terminal holds, the
+/// device's rich answer is encoded and dispatched through the gateway, and the server receives one
+/// answer. Not claimed: a native answer that arrives while the rich one is being encoded.
 #[test]
 fn gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt() {
     const TEST: &str = "gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt";
@@ -3038,6 +3042,11 @@ fn gateway_a_title_asked_for_again_at_the_next_prompt_leaves_the_binding_alone()
 /// through a turn and through a slash command that selects nothing, takes a new one when the
 /// terminal forks and when it starts a new conversation, and names the saved one when a launch
 /// resumes it.
+///
+/// KR-REQ-12.06, the binding's revision and thread: the revision moves with each thread the
+/// terminal selects and stays through a turn and through a command that selects nothing, and the
+/// thread the binding names is the one the terminal's frames select. Not claimed: a stale
+/// submission, or the suspension of rich mutations.
 #[test]
 fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes_or_forks_one() {
     const TEST: &str = "gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes_or_forks_one";
