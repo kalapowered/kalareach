@@ -3186,6 +3186,7 @@ pub fn connection_state(state: State<'_, AppState>) -> crate::connection::Connec
 /// opening and ends when it does. When the view's connection ends and the opening's link does not,
 /// the host is asked again what the opening allows, and the page is told.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // The page's arguments: its names are the command's contract.
 pub async fn terminal_view_open<R: tauri::Runtime>(
     webview: tauri::Webview<R>,
     state: State<'_, AppState>,
@@ -3193,10 +3194,14 @@ pub async fn terminal_view_open<R: tauri::Runtime>(
     columns: u64,
     rows: u64,
     opening: Option<String>,
+    anchor: Option<Value>,
     on_state: tauri::ipc::Channel<crate::terminal::TerminalViewState>,
 ) -> Result<String> {
     use tauri::{Emitter as _, Manager as _};
 
+    // Read here, so that a place that is not one answers as an invalid parameter does: a typed
+    // argument would fail before this body runs, with an error that has no code.
+    let anchor: Option<crate::terminal::Anchor> = decode(anchor.unwrap_or(Value::Null))?;
     let views = webview.state::<crate::terminal::TerminalViews>();
     let session_id: kr_protocol::ids::SessionId = session_id
         .parse()
@@ -3207,7 +3212,7 @@ pub async fn terminal_view_open<R: tauri::Runtime>(
             // A page that has gone takes nothing; its load ends the view.
             let _ = on_state.send(state);
         });
-        return Ok(views.open(webview.label(), session_id, dimensions, publish));
+        return Ok(views.open(webview.label(), session_id, dimensions, anchor, publish));
     };
     let Some(opening) = opening else {
         return Err(CommandError::invalid(
@@ -3257,6 +3262,7 @@ pub async fn terminal_view_open<R: tauri::Runtime>(
         },
         session_id,
         dimensions,
+        anchor,
         publish,
     );
     // The view belongs to the opening: leaving or replacing it, or the share ending, closes the

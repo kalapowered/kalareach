@@ -13,6 +13,8 @@ use kr_protocol::scalars::U64;
 use kr_protocol::session::Dimensions;
 use serde::Serialize;
 
+use super::anchor::{Anchor, Note};
+
 /// DEC private mode 5, reverse video: the whole screen drawn with foreground and background
 /// swapped.
 const REVERSE_VIDEO: u64 = 5;
@@ -20,6 +22,7 @@ const REVERSE_VIDEO: u64 = 5;
 /// What one raw terminal view is, as its page is told.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // Each state is built once, sent at once and never stored in bulk.
 pub enum TerminalViewState {
     /// Attached, with no complete screen to draw: before the first, or between the host's reset or
     /// resynchronisation and the next.
@@ -41,6 +44,14 @@ pub enum TerminalViewState {
         settled: u64,
         /// Whether the view controls the program.
         control: TerminalControl,
+        /// Where the window is, for the page to keep and give back when it opens a view of this
+        /// session again: none at the live screen's first line and first column.
+        anchor: Option<Anchor>,
+        /// Where the window would be after a return to the live screen.
+        live: Option<Anchor>,
+        /// What native code says of the place a restored window landed at, when it is not the place
+        /// the person left.
+        note: Option<Note>,
     },
     /// The view has ended, and why, in the host's words or the link's.
     Ended {
@@ -67,12 +78,18 @@ impl TerminalViewState {
                 attachment,
                 screen,
                 settled,
+                anchor,
+                live,
+                note,
                 ..
             } => Self::Showing {
                 attachment,
                 screen,
                 settled,
                 control,
+                anchor,
+                live,
+                note,
             },
             ended @ Self::Ended { .. } => ended,
         }
@@ -433,20 +450,28 @@ fn cursor(screen: &Screen, top: u64, rows: u32, left: u64, columns: u32) -> Opti
 }
 
 /// The state a view is in while it holds `screen`, or waits for one, with the newest of the page's
-/// moves it may take as settled and whether it controls the program.
+/// moves it may take as settled, whether it controls the program and what it says of a restored
+/// place.
 pub(crate) fn state_of(
     attachment: &AttachmentSummary,
     screen: Option<&Screen>,
     settled: u64,
     control: TerminalControl,
+    note: Option<Note>,
 ) -> TerminalViewState {
     match screen {
-        Some(screen) => TerminalViewState::Showing {
-            attachment: attachment.clone(),
-            screen: of(screen),
-            settled,
-            control,
-        },
+        Some(screen) => {
+            let anchor = Anchor::of(screen);
+            TerminalViewState::Showing {
+                attachment: attachment.clone(),
+                screen: of(screen),
+                settled,
+                control,
+                live: anchor.as_ref().and_then(Anchor::live_of),
+                anchor,
+                note,
+            }
+        }
         None => TerminalViewState::Waiting {
             attachment: attachment.clone(),
             settled,

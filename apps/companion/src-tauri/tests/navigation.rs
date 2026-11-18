@@ -548,12 +548,14 @@ mod macos {
             "view-one",
             first.session_id,
             kr_protocol::session::Dimensions::new(10, 2),
+            None,
             publish(1),
         );
         views.open(
             "view-two",
             second.session_id,
             kr_protocol::session::Dimensions::new(10, 2),
+            None,
             publish(2),
         );
         let (mut one_link, mut two_link) = runtime.block_on(async {

@@ -49,6 +49,7 @@ use crate::connection::{Asked, Unopened};
 use crate::error::CommandError;
 use crate::launch::{LaunchSurfaceAnswer, Press};
 
+use super::anchor::{Anchor, Note};
 use super::input::{Input, Lease, Owed, PROFILE, Refused, wheel_reports};
 use super::keys::{self, KeyAction, Keyboard, Pressed, TypedKey};
 use super::screen::{TerminalViewState, state_of};
@@ -173,12 +174,14 @@ pub(super) async fn run(
     reach: Reach<'_>,
     session_id: SessionId,
     dimensions: Dimensions,
+    anchor: Option<Anchor>,
     mut commands: UnboundedReceiver<Command>,
     publish: &Publish,
 ) -> Cause {
     // The window's reports, which take the page's sizes and moves while the view is opening too, and
-    // control of the program, which a take made while it opens asks for once it is attached.
-    let mut window = WindowReports::new(dimensions);
+    // control of the program, which a take made while it opens asks for once it is attached. A view
+    // opened with a place holds its first screen from the page until that place is settled.
+    let mut window = WindowReports::new(dimensions, anchor);
     let mut lease = Lease::default();
     let opened = {
         let opening = open(&reach, session_id, dimensions);
@@ -194,6 +197,7 @@ pub(super) async fn run(
                         let _ = answer.send(match input {
                             Input::Take { number } => {
                                 lease.request(number, true);
+                                window.drop_queued_restore();
                                 Ok(())
                             }
                             Input::Release { number } => {
@@ -267,6 +271,7 @@ pub(super) async fn run(
         recoveries: 0,
         showing: false,
         held: false,
+        note: None,
         drawn: None,
         told: 0,
         last: None,
@@ -729,6 +734,10 @@ struct View {
     showing: bool,
     /// Whether the screen the view holds waits for its report's answer before the page is told.
     held: bool,
+    /// What the view says of the place its restore landed at, and the number of the last move taken
+    /// when it did: a move above that number ends it, and the moves made while the restore was
+    /// unsettled never do.
+    note: Option<(Note, u64)>,
     /// The revision of the window the screen the page draws was drawn for.
     drawn: Option<u64>,
     /// The newest of its moves the page was last told is settled.
@@ -776,6 +785,9 @@ impl View {
                 }
                 Next::Command(Some(Command::Move(asked))) => {
                     self.window.take(asked);
+                    if self.note.is_some_and(|(_, taken)| asked.number() > taken) {
+                        self.note = None;
+                    }
                     None
                 }
                 Next::Command(Some(Command::Input(input, taken))) => self.input(input, taken).await,
@@ -836,6 +848,7 @@ impl View {
             Applied::Reset(_) => {
                 self.held = false;
                 self.waiting();
+                self.weighed();
                 None
             }
             // Nothing is drawn from a snapshot until its last page.
@@ -906,18 +919,20 @@ impl View {
                             window_revision: result.window_revision.get(),
                         }
                     }
+                    // An accepted answer that cannot be read does not say what became of a restore.
+                    Err(_) if self.window.restore_in_flight() => Answer::Unknown,
                     Err(_) => Answer::Refused,
                 },
-                Outcome::Error(refusal) if HostWord::of(refusal.code).is_definite() => {
-                    Answer::Refused
-                }
-                Outcome::Error(_) => Answer::NotSettled,
+                Outcome::Error(refusal) => match HostWord::of(refusal.code) {
+                    HostWord::Definite => Answer::Refused,
+                    HostWord::Transient => Answer::NotSettled,
+                    HostWord::Unknown => Answer::Unknown,
+                },
             };
             self.window.answered(answer);
-            if self.held {
-                self.held = false;
-                self.show();
-            } else {
+            let released = self.weigh();
+            let was_held = std::mem::take(&mut self.held);
+            if !((was_held || released) && self.show_released()) {
                 self.tell();
             }
             return None;
@@ -946,6 +961,7 @@ impl View {
         self.held = false;
         self.window.recovering();
         self.waiting();
+        self.weighed();
         let mut streams = CanonicalSet::new();
         streams.insert(EventStream::Output);
         let params = EventsSubscribeParams {
@@ -1019,6 +1035,8 @@ impl View {
             }
             self.lease.sent(owed, request_id);
         }
+        // A restore that was settled while the next report was chosen has no event of its own.
+        self.weighed();
         self.tell();
         None
     }
@@ -1032,6 +1050,7 @@ impl View {
                 if self.lease.request(number, true) {
                     self.control_changed();
                 }
+                self.window.drop_queued_restore();
                 let _ = taken.send(Ok(()));
                 None
             }
@@ -1216,11 +1235,46 @@ impl View {
     /// in control: the screen and the end go in one state, or the end alone while the screen waits.
     fn screen_changed(&mut self) {
         let ended = !self.keyboard_supplied() && self.lease.unsupported();
-        if !self.held {
+        self.weigh();
+        if !self.holding() {
             self.show();
         } else if ended {
             self.control_changed();
         }
+    }
+
+    /// Whether the screen the view holds is kept from the page: it waits for its report's answer,
+    /// or the place the view was opened with is not settled.
+    fn holding(&self) -> bool {
+        self.held || self.window.holds_restore()
+    }
+
+    /// Reads how the restore ended, if it has: the note it leaves goes with the screen, which the
+    /// caller then tells. Says whether it ended.
+    fn weigh(&mut self) -> bool {
+        self.window.resolve(self.projection.screen());
+        let Some(resolution) = self.window.take_resolution() else {
+            return false;
+        };
+        self.note = resolution.note.map(|note| (note, self.window.taken()));
+        true
+    }
+
+    /// Weighs the restore, and tells the page of the screen its end released.
+    fn weighed(&mut self) {
+        if self.weigh() {
+            let _ = self.show_released();
+        }
+    }
+
+    /// Tells the page of the screen the view holds, when nothing keeps it back and there is one.
+    /// Says whether it did.
+    fn show_released(&mut self) -> bool {
+        let shown = !self.holding() && self.projection.screen().is_some();
+        if shown {
+            self.show();
+        }
+        shown
     }
 
     /// Ends control at once when the screen the view holds says the program reads keys in a form
@@ -1286,7 +1340,7 @@ impl View {
     /// is not the page's yet, so the change goes with the state the page was last sent, its screen
     /// and settlement as they were.
     fn control_changed(&mut self) {
-        if self.held {
+        if self.holding() {
             if let Some(last) = self.last.take() {
                 let state = last.with_control(self.lease.control());
                 self.last = Some(state.clone());
@@ -1478,7 +1532,13 @@ impl View {
             self.drawn = Some(screen.window_revision);
         }
         self.told = self.window.told(self.drawn);
-        let state = state_of(&self.attachment, screen, self.told, self.lease.control());
+        let state = state_of(
+            &self.attachment,
+            screen,
+            self.told,
+            self.lease.control(),
+            self.note.map(|(note, _)| note),
+        );
         self.last = Some(state.clone());
         (self.publish)(state);
     }
