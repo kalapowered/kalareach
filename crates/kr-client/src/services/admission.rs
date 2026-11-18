@@ -365,17 +365,34 @@ impl PairingAdmissionService for ManagedPairingAdmission {
 /// The clock the cache reads: the system's, moved forward by whatever a test adds.
 ///
 /// Nothing in the product moves it. It exists so a test decides when a time in the cache passes
-/// without waiting for it.
+/// without waiting for it. A standing clock does not run: it reads what a test has added and nothing
+/// else.
 #[derive(Clone, Debug, Default)]
 pub struct AdmissionClock {
     forward_ms: Arc<AtomicU64>,
+    #[cfg(feature = "testing")]
+    stands_at: Option<Instant>,
 }
 
 impl AdmissionClock {
+    /// A clock that does not run.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn standing() -> Self {
+        Self {
+            forward_ms: Arc::default(),
+            stands_at: Some(Instant::now()),
+        }
+    }
+
     /// The present moment.
     #[must_use]
     pub fn now(&self) -> Instant {
-        Instant::now() + Duration::from_millis(self.forward_ms.load(Ordering::SeqCst))
+        #[cfg(feature = "testing")]
+        let start = self.stands_at.unwrap_or_else(Instant::now);
+        #[cfg(not(feature = "testing"))]
+        let start = Instant::now();
+        start + Duration::from_millis(self.forward_ms.load(Ordering::SeqCst))
     }
 
     /// Moves this clock, and every clone of it, forward.

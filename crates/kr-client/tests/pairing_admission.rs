@@ -67,7 +67,7 @@ async fn waits_for(
     script: Vec<Result<AdmissionAnswer>>,
     probes: &[u64],
 ) -> Vec<(u64, usize, Option<u64>)> {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let service = Scripted::new(script);
     let admissions = scripted_admissions(Arc::clone(&service), &clock);
     waits_at(&service, &clock, &admissions, probes).await
@@ -130,7 +130,7 @@ async fn kr_req_17_48_a_failure_that_names_more_than_ten_minutes_keeps_the_answe
 /// the late failure.
 #[tokio::test]
 async fn kr_req_17_48_a_failure_that_comes_after_the_keep_time_keeps_the_answer_that_stood() {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let (service, gate) = Scripted::gated_script(vec![unable(Some(50)), no_answer()]);
     let admissions = scripted_admissions(Arc::clone(&service), &clock);
     let (host, relays) = (key(0x11), network(&[MANAGED]));
@@ -215,7 +215,7 @@ impl OnItsWay {
     /// The same, with the service's answers given whole: the first at 0 s, the second to the
     /// request made at `started`, and any later ones to the requests after it.
     async fn start_script(script: Vec<Result<AdmissionAnswer>>, started: u64) -> Self {
-        let clock = AdmissionClock::default();
+        let clock = AdmissionClock::standing();
         let (service, gate) = Scripted::gated_script(script);
         let admissions =
             scripted_admissions(Arc::clone(&service), &clock).waiting(Duration::from_millis(20));
@@ -387,7 +387,7 @@ async fn kr_req_17_48_another_answer_replaces_the_one_that_stood_at_once() {
 /// It comes at 0 s and is kept to 60, nothing asks again, and a dial lost at 60 is told nothing.
 #[tokio::test]
 async fn kr_req_17_48_with_no_request_on_its_way_the_answer_stops_when_it_is_no_longer_kept() {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let service = Scripted::new(vec![unable(None)]);
     let admissions = scripted_admissions(Arc::clone(&service), &clock);
     let (host, relays) = (key(0x11), network(&[MANAGED]));
@@ -462,7 +462,7 @@ async fn kr_req_17_48_a_dial_that_reads_the_cache_at_the_resume_is_told_the_capa
 /// asks, and the answer to that request is kept.
 #[tokio::test]
 async fn kr_req_17_48_a_request_whose_task_panicked_does_not_stop_the_next_ask() {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let service = Arc::new(PanicsFirst {
         asked: AtomicUsize::new(0),
     });
@@ -537,7 +537,7 @@ async fn kr_req_17_48_when_a_request_ends_the_next_dial_asks_and_the_answers_are
 #[tokio::test]
 async fn kr_req_17_48_a_dial_that_reads_the_entry_while_another_holds_its_new_request_starts_none()
 {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let (service, gate) = Scripted::gated_script(vec![unable(None), no_answer()]);
     let (reached, release) = (
         Arc::new(tokio::sync::Notify::new()),
@@ -603,7 +603,7 @@ async fn kr_req_17_48_a_dial_that_reads_the_entry_while_another_holds_its_new_re
 /// again). The service has been asked once, in all, and the answer to that request is kept.
 #[tokio::test]
 async fn kr_req_17_48_while_the_first_request_for_an_entry_is_alive_no_other_dial_asks() {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let (service, gate) = Scripted::gated_script(vec![unable(None)]);
     let admissions =
         scripted_admissions(Arc::clone(&service), &clock).waiting(Duration::from_millis(20));
@@ -731,7 +731,7 @@ async fn kr_req_17_48_an_answer_that_had_stopped_does_not_come_back_after_a_fail
 #[tokio::test]
 async fn kr_req_17_48_an_answer_that_had_stopped_is_not_read_while_the_next_request_is_on_its_way()
 {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let (service, gate) = Scripted::gated_script(vec![unable(None), unable(None), no_answer()]);
     let admissions = scripted_admissions(Arc::clone(&service), &clock);
     let (host, relays) = (key(0x11), network(&[MANAGED]));
@@ -891,7 +891,7 @@ impl Service {
     fn start() -> Self {
         let web = Arc::new(ServiceWeb::new());
         let origin = GatewayOrigin::new(web.origin()).expect("an origin");
-        let clock = AdmissionClock::default();
+        let clock = AdmissionClock::standing();
         let service = Arc::new(ManagedPairingAdmission::new(
             origin.clone(),
             Arc::clone(&web) as _,
@@ -1210,7 +1210,7 @@ const PROBES: [u64; 13] = [0, 4, 6, 12, 21, 26, 61, 66, 130, 700, 3601, 3700, 90
 /// dial, how many requests the service had been sent by then and whether a failed dial would be
 /// reported as the managed relay having no capacity.
 async fn timeline(body: &str) -> Vec<(u64, usize, bool)> {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let http = Exact::new(200, body);
     let origin = GatewayOrigin::new("https://reach.kala.to").expect("an origin");
     let service = Arc::new(ManagedPairingAdmission::new(
@@ -1660,7 +1660,7 @@ async fn the_relay_a_dial_addresses_is_the_one_that_decides() {
 /// for the next one. The wait is the test's; what decides is that the dial went on.
 #[tokio::test]
 async fn a_service_that_does_not_answer_does_not_hold_up_a_dial() {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let (service, gate) = Scripted::gated(AdmissionAnswer::Unavailable {
         message: "spent".to_owned(),
         alternatives: vec!["a direct connection".to_owned()],
@@ -1697,7 +1697,7 @@ async fn a_service_that_does_not_answer_does_not_hold_up_a_dial() {
 /// not asked a second time.
 #[tokio::test]
 async fn a_dial_that_its_route_ends_while_it_waits_leaves_its_request_to_finish() {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let (service, gate) = Scripted::gated(AdmissionAnswer::Unavailable {
         message: "spent".to_owned(),
         alternatives: vec!["a direct connection".to_owned()],
@@ -1738,7 +1738,7 @@ async fn a_dial_that_its_route_ends_while_it_waits_leaves_its_request_to_finish(
 /// stops every request for ten minutes, and what it said is no reason a person is shown.
 #[tokio::test]
 async fn a_service_without_the_route_is_left_alone_for_ten_minutes() {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let service = Scripted::new(vec![Err(Error::refusal(
         ErrorCode::InvalidArgument,
         "the service has no such route".into(),
@@ -1848,7 +1848,7 @@ async fn series(
     http: Arc<dyn ServiceHttp>,
     sent: impl Fn() -> usize,
 ) -> Vec<(u64, usize, Option<RelayRefusal>)> {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let origin = GatewayOrigin::new("https://reach.kala.to").expect("an origin");
     let service = Arc::new(ManagedPairingAdmission::new(
         origin.clone(),
@@ -2280,7 +2280,7 @@ async fn kr_req_17_48_a_failed_request_keeps_the_answer_that_still_stands() {
         // Answers at 0 s and 21 s, then no answer to the third request at 61 s, then each try
         // inside the ten minutes after it. The dial at 661 s asks again and gets none, and what the
         // answers said has ended by then.
-        let clock = AdmissionClock::default();
+        let clock = AdmissionClock::standing();
         let service = Scripted::new(vec![unavailable(), unavailable(), failed()]);
         let admissions = scripted_admissions(Arc::clone(&service), &clock);
         let seen = waits_at(
@@ -2308,7 +2308,7 @@ async fn kr_req_17_48_a_failed_request_keeps_the_answer_that_still_stands() {
 
         // A request that fails before the third: the answer still stands, and the next request is
         // made when the failure moved the time to, twenty seconds on, not when the answer named it.
-        let clock = AdmissionClock::default();
+        let clock = AdmissionClock::standing();
         let service = Scripted::new(vec![unavailable(), failed()]);
         let admissions = scripted_admissions(Arc::clone(&service), &clock);
         let seen = waits_at(&service, &clock, &admissions, &[0, 21, 26, 41, 46]).await;
@@ -2374,7 +2374,7 @@ struct Hosts {
 impl Hosts {
     /// A service that answers each request at once, so that a dial returns with its answer kept.
     fn answering(script: Vec<Result<AdmissionAnswer>>) -> Self {
-        let clock = AdmissionClock::default();
+        let clock = AdmissionClock::standing();
         let service = Scripted::new(script);
         let admissions = scripted_admissions(Arc::clone(&service), &clock);
         Self {
@@ -2398,7 +2398,7 @@ impl Hosts {
         script: Vec<Result<AdmissionAnswer>>,
         unwinds_at: Option<usize>,
     ) -> Self {
-        let clock = AdmissionClock::default();
+        let clock = AdmissionClock::standing();
         let (service, gate) = Scripted::gated_script_unwinding_at(script, unwinds_at);
         let admissions =
             scripted_admissions(Arc::clone(&service), &clock).waiting(Duration::from_millis(20));
@@ -2466,6 +2466,28 @@ impl Hosts {
         let answered = self.answered();
         self.gate().notify_last();
         self.service.answered_to(answered + 1).await;
+    }
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a standing clock reads what a test has added and
+/// nothing else, so a wait that a case counts is not changed by the real time that a loaded machine
+/// takes between a move of the clock and a read of it. Many readings are taken one after the other,
+/// and every clone of the clock is moved with it.
+#[test]
+fn kr_req_17_48_a_standing_clock_reads_what_a_test_added_and_nothing_else() {
+    let clock = AdmissionClock::standing();
+    let first = clock.now();
+    for _ in 0..200_000 {
+        assert_eq!(clock.now(), first, "a standing clock does not run");
+    }
+    let clone = clock.clone();
+    clone.advance(Duration::from_millis(1500));
+    for _ in 0..200_000 {
+        assert_eq!(
+            clock.now(),
+            first + Duration::from_millis(1500),
+            "the clock reads what was added, through any clone"
+        );
     }
 }
 
@@ -2857,7 +2879,7 @@ const MANAGED_SECOND: &str = "https://relay-2.reach.kala.to";
 #[tokio::test]
 async fn kr_req_17_48_a_dial_held_between_two_relays_does_not_keep_an_answer_that_stopped_meanwhile()
  {
-    let clock = AdmissionClock::default();
+    let clock = AdmissionClock::standing();
     let (service, gate) = Scripted::gated_script(vec![unable(None), no_answer()]);
     let (reached, release) = (
         Arc::new(tokio::sync::Notify::new()),
