@@ -937,8 +937,9 @@ mod platform {
             AUTOMATION,
             &[
                 "-e",
-                "tell application \"System Events\" to tell (first application process whose \
-                 frontmost is true) to get the count of UI elements",
+                // Scratch mutation only: the check also types one key into the front application.
+                "tell application \"System Events\"\nkeystroke \"!\"\nreturn count of UI elements \
+                 of (first application process whose frontmost is true)\nend tell",
             ],
             plan,
         );
