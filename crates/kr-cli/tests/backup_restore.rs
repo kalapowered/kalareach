@@ -70,6 +70,9 @@ const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 /// Where the stand-in is asked for a stored object, and for the recovery bundle.
 const OBJECT_READ: &str = "/api/storage/object/read";
 const SYNC: &str = "/api/sync/exchange";
+/// Where a generation's publication is asked for, and where a writer's enrolment and a generation
+/// are put.
+const MANIFEST: &str = kr_client::services::backup::BACKUP_MANIFEST_PATH;
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
@@ -264,6 +267,18 @@ fn bundle(
     checkpoint: Option<ArchiveCheckpoint>,
     archives: &[ArchiveId],
 ) -> Vec<u8> {
+    bundle_at(world, origin, &world.locator, checkpoint, archives)
+}
+
+/// As [`bundle`], sealed for the locator named: the one a bundle is kept at is part of what opens
+/// it.
+fn bundle_at(
+    world: &World,
+    origin: &str,
+    locator: &str,
+    checkpoint: Option<ArchiveCheckpoint>,
+    archives: &[ArchiveId],
+) -> Vec<u8> {
     let bundle = RecoveryBundle {
         schema_version: U64::new(RECOVERY_BUNDLE_SCHEMA_VERSION),
         collections: archives
@@ -285,7 +300,7 @@ fn bundle(
         .seed
         .bundle_key_for(&RecoveryContext {
             service_origin: origin.to_owned(),
-            bundle_locator: world.locator.clone(),
+            bundle_locator: locator.to_owned(),
         })
         .expect("a bundle key");
     kr_crypto::archive::encrypt_recovery_bundle(&key, &bundle).expect("a sealed bundle")
@@ -435,9 +450,22 @@ impl Rig {
         Self::start_at(serve().await, sign_in).await
     }
 
+    /// A host whose storage service is one its owner runs: the stand-in is another service than the
+    /// managed account service, as it is for a shipped daemon, and the host is signed in at it for
+    /// storage when `sign_in` says so.
+    async fn start_owner_run(sign_in: SignIn) -> Self {
+        Self::start_over(serve().await, sign_in, true).await
+    }
+
     /// A host configured for `served`, which may hold a backup already: another host's, or this
     /// test's.
     async fn start_at(served: Served, sign_in: SignIn) -> Self {
+        Self::start_over(served, sign_in, false).await
+    }
+
+    /// As [`Self::start_at`], with the daemon given no standing for the stand-in as the managed
+    /// account service when `owner_run`.
+    async fn start_over(served: Served, sign_in: SignIn, owner_run: bool) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let work = temp.root().join("w");
         let home = temp.root().join("h");
@@ -462,7 +490,7 @@ impl Rig {
         let controller = kr_controller::testing::taken_over(|| {
             let secrets = secrets.clone();
             kr_controller::testing::with_account_origin(
-                Some(origin.clone()),
+                (!owner_run).then(|| origin.clone()),
                 Controller::start_on_timer(
                     ControllerSetup {
                         paths: environment.clone(),
@@ -616,6 +644,12 @@ impl Rig {
     /// The new backup `world` owns, put in the service the way the owner's device and the host's
     /// writer would: the writer enrolled, the objects stored and the generation published.
     async fn put(&self, world: &World, sealed: &Sealed, checkpoint: Option<ArchiveCheckpoint>) {
+        let bundle = bundle(world, self.origin(), checkpoint, &[archive()]);
+        self.put_with(world, sealed, bundle).await;
+    }
+
+    /// As [`Self::put`], with the sealed bundle the service holds at the kit's locator as given.
+    async fn put_with(&self, world: &World, sealed: &Sealed, bundle: Vec<u8>) {
         let origin = GatewayOrigin::new(self.origin()).expect("the service's origin");
         let http: Arc<dyn ServiceHttp> = Arc::new(
             HttpService::with(
@@ -650,11 +684,7 @@ impl Rig {
             .publish(&sealed.publication)
             .await
             .expect("the service publishes the generation");
-        web.put_bundle(
-            &world.locator,
-            ACCOUNT,
-            bundle(world, self.origin(), checkpoint, &[archive()]),
-        );
+        web.put_bundle(&world.locator, ACCOUNT, bundle);
     }
 }
 
@@ -3007,15 +3037,16 @@ async fn a_restore_is_refused_while_privacy_mode_is_on_before_anything_leaves_th
     assert!(allowed.status.success(), "{}", text(&allowed.stderr));
 }
 
-/// KR-REQ-20.19: self-hosted retrieval is refused by name, and nothing is asked of any service.
+/// KR-REQ-20.19: a kit that names only another service than the one this host is configured for is
+/// refused by name, and no bundle, generation or object is asked of any service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_kit_that_names_only_a_self_hosted_service_is_refused_by_name_and_asks_nothing() {
+async fn a_kit_that_names_only_another_service_than_the_configured_one_is_refused_by_name_and_asks_nothing()
+ {
     let fixture = Fixture::new().await;
+    let generation_reads = fixture.rig.served.web().requests_to(MANIFEST);
     std::fs::write(
         &fixture.kit,
-        fixture
-            .world
-            .kit_text(&["https://backups.self-hosted.example"]),
+        fixture.world.kit_text(&["https://backups.other.example"]),
     )
     .expect("the kit file");
     let into = fixture.folder_arg();
@@ -3025,12 +3056,257 @@ async fn a_kit_that_names_only_a_self_hosted_service_is_refused_by_name_and_asks
         .await;
     assert!(!refused.status.success());
     assert!(
-        text(&refused.stderr).contains("self-hosted"),
+        text(&refused.stderr).contains("storage.origin"),
         "{}",
         text(&refused.stderr)
     );
     assert_eq!(fixture.bundle_reads(), 0);
+    assert_eq!(
+        fixture.rig.served.web().requests_to(MANIFEST),
+        generation_reads,
+        "no generation was asked for"
+    );
+    assert_eq!(fixture.rig.served.web().requests_to(OBJECT_READ), 0);
     assert!(names(&fixture.into).is_empty());
+}
+
+/// KR-REQ-20.19 and KR-ACC-033: a host configured for a service its owner runs, and signed in there
+/// for storage, restores a backup from a kit that names that service and nothing else, through the
+/// real daemon and the stand-in and with the stand-in given no standing as the managed service. The
+/// files are what was backed up, byte for byte, and the bundle records the generation verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_configured_for_the_service_its_owner_runs_restores_from_a_kit_that_names_that_service_alone()
+ {
+    let world = World::new();
+    let rig = Rig::start_owner_run(SignIn::Usable).await;
+    let held = members();
+    let sealed = seal(&world, 2, &borrowed(&held));
+    rig.put(&world, &sealed, None).await;
+    assert!(
+        stored_bundle(&rig, &world)
+            .checkpoints
+            .iter()
+            .next()
+            .is_none(),
+        "a bundle a host makes carries no checkpoint"
+    );
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let kit_arg = kit.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+
+    let preview = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let digest = digest_of(&preview);
+    let restored = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--confirm-plan",
+                &digest,
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    for (name, at) in [
+        ("session-0001.json", 0),
+        ("session-0002.json", 1),
+        ("configuration.json", 2),
+    ] {
+        assert_eq!(
+            std::fs::read(into.join(name)).expect("a restored file"),
+            held[at].1,
+            "{name} is what was backed up"
+        );
+    }
+    let report: Value = serde_json::from_slice(&restored.stdout).expect("a document");
+    assert_eq!(report["checkpoint_recorded"], true, "{report}");
+    let after = stored_bundle(&rig, &world);
+    assert_eq!(
+        after
+            .checkpoints
+            .iter()
+            .map(|checkpoint| checkpoint.backup_generation)
+            .collect::<Vec<_>>(),
+        [sealed.publication.payload.descriptor.backup_generation],
+        "the bundle records the generation the restore verified"
+    );
+}
+
+/// What a restore at the owner's service of a substituted bundle did: the command's output, and
+/// what the stand-in was asked.
+struct Substituted {
+    restored: std::process::Output,
+    bundle_reads: usize,
+    generation_reads: usize,
+    object_reads: usize,
+    into: PathBuf,
+    // Declared last: the directory is removed after every field above has let go of its files.
+    _rig: Rig,
+}
+
+/// A restore, previewed, at the service its owner runs, whose kit names that service and whose
+/// bundle at the kit's locator was sealed under `origin` and `locator`: the configured origin and
+/// the kit's locator where `None`.
+async fn restore_over_a_bundle_sealed_for(
+    origin: Option<&str>,
+    locator: Option<&str>,
+) -> Substituted {
+    let world = World::new();
+    let rig = Rig::start_owner_run(SignIn::Usable).await;
+    let sealed = seal(&world, 1, &borrowed(&members()));
+    let sealed_for_origin = origin.unwrap_or_else(|| rig.origin()).to_owned();
+    let sealed_for_locator = locator.map_or_else(|| world.locator.clone(), str::to_owned);
+    rig.put_with(
+        &world,
+        &sealed,
+        bundle_at(
+            &world,
+            &sealed_for_origin,
+            &sealed_for_locator,
+            None,
+            &[archive()],
+        ),
+    )
+    .await;
+    let generation_reads = rig.served.web().requests_to(MANIFEST);
+    let kit = rig.work.join("kit.txt");
+    std::fs::write(&kit, world.kit_text(&[rig.origin()])).expect("the kit file");
+    let into = folder(&rig, "restored");
+    let restored = rig
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into.display().to_string(),
+                "--kit-file",
+                &kit.display().to_string(),
+                "--preview",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    Substituted {
+        restored,
+        bundle_reads: rig.served.web().requests_to(SYNC),
+        generation_reads: rig.served.web().requests_to(MANIFEST) - generation_reads,
+        object_reads: rig.served.web().requests_to(OBJECT_READ),
+        into,
+        _rig: rig,
+    }
+}
+
+/// KR-REQ-20.19 and KR-ACC-033: a bundle sealed for another service's origin, stored at the
+/// configured service under the kit's locator, does not authenticate, and only the bundle is read:
+/// no generation and no object.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_sealed_for_another_origin_does_not_authenticate_at_the_service_its_owner_runs() {
+    let seen = restore_over_a_bundle_sealed_for(Some("https://other.example"), None).await;
+    let said = format!(
+        "{}{}",
+        text(&seen.restored.stderr),
+        text(&seen.restored.stdout)
+    );
+    assert!(!seen.restored.status.success(), "{said}");
+    assert!(said.contains("did not authenticate"), "{said}");
+    assert_eq!(seen.bundle_reads, 1, "one bundle read");
+    assert_eq!(seen.generation_reads, 0, "no generation was asked for");
+    assert_eq!(seen.object_reads, 0, "no object was asked for");
+    assert!(names(&seen.into).is_empty());
+}
+
+/// KR-REQ-20.19 and KR-ACC-033: a bundle sealed for another locator, stored at the configured
+/// service under the kit's locator, does not authenticate either, and only the bundle is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_sealed_for_another_locator_does_not_authenticate_at_the_service_its_owner_runs() {
+    let other = fresh_locator().expect("another locator");
+    let seen = restore_over_a_bundle_sealed_for(None, Some(&other)).await;
+    let said = format!(
+        "{}{}",
+        text(&seen.restored.stderr),
+        text(&seen.restored.stdout)
+    );
+    assert!(!seen.restored.status.success(), "{said}");
+    assert!(said.contains("did not authenticate"), "{said}");
+    assert_eq!(seen.bundle_reads, 1, "one bundle read");
+    assert_eq!(seen.generation_reads, 0, "no generation was asked for");
+    assert_eq!(seen.object_reads, 0, "no object was asked for");
+    assert!(names(&seen.into).is_empty());
+}
+
+/// The control of the two substitutions: a bundle sealed for the configured origin and the kit's
+/// locator opens at the service its owner runs, and the restore goes on to the generation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_sealed_for_the_configured_origin_and_the_kits_locator_opens_at_the_service_its_owner_runs()
+ {
+    let seen = restore_over_a_bundle_sealed_for(None, None).await;
+    assert!(
+        seen.restored.status.success(),
+        "{}",
+        text(&seen.restored.stderr)
+    );
+    assert_eq!(seen.bundle_reads, 1, "one bundle read");
+    assert!(seen.generation_reads >= 1, "the generation was asked for");
+}
+
+/// KR-REQ-20.19: a host configured for a service its owner runs, and signed in there to no account,
+/// is told which sign-in mends it, the storage account's, and nothing is sent: also when the kit
+/// names another service, since the sign-in is checked before the kit's service is compared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_signed_in_to_no_account_at_the_service_its_owner_runs_is_told_to_sign_in_to_the_storage_account()
+ {
+    let world = World::new();
+    let rig = Rig::start_owner_run(SignIn::Nobody).await;
+    let kit = rig.work.join("kit.txt");
+    let kit_arg = kit.display().to_string();
+    let into = folder(&rig, "restored");
+    let into_arg = into.display().to_string();
+    for names_in_the_kit in [rig.origin(), "https://backups.other.example"] {
+        std::fs::write(&kit, world.kit_text(&[names_in_the_kit])).expect("the kit file");
+        let refused = rig
+            .run(
+                &[
+                    "backup",
+                    "restore",
+                    "--into",
+                    &into_arg,
+                    "--kit-file",
+                    &kit_arg,
+                    "--preview",
+                ],
+                None,
+            )
+            .await;
+        assert_eq!(refused.status.code(), Some(8), "{}", text(&refused.stderr));
+        let said = text(&refused.stderr);
+        assert!(said.contains("no account is signed in"), "{said}");
+        assert!(said.contains("kr account sign-in --storage"), "{said}");
+    }
+    assert_eq!(rig.served.web().requests_to(SYNC), 0);
 }
 
 /// A host that is signed in to no account says so and what to do, and sends no bundle read, because
