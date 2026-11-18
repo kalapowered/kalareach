@@ -1134,7 +1134,8 @@ impl Acting {
                     session_id: Nullable::some(self.hosted.session_id),
                     application_instance_id: Nullable::some(application_instance_id),
                     text: "have a look at this".to_owned(),
-                }, Some(kr_protocol::ids::AgentBindingRevision::new(1)),
+                },
+                Some(kr_protocol::ids::AgentBindingRevision::new(1)),
                 None,
                 None,
             )

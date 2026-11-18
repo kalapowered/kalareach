@@ -931,7 +931,8 @@ async fn a_copy_of_a_performed_discard_is_withheld_while_a_fence_is_owed() {
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "to be ended".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )

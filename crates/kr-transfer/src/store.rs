@@ -1600,14 +1600,18 @@ impl Store {
     /// that holds an attachment belonging to another session are each refused, and the refusal
     /// writes nothing. So is a draft written for another application than the one the prompt is
     /// for: its text and attachments were composed for that conversation, and sending them to this
-    /// one is not what the person prepared. A draft that names no application is sent to any.
+    /// one is not what the person prepared. So is one written under another binding revision of
+    /// that application than the prompt names, higher or lower: the revision advances when the
+    /// application's conversation changes, and a draft prepared for the earlier one is not sent into
+    /// the one that is open now. A draft that names an application and holds no revision is refused
+    /// the same way. A draft that names no application is sent to any.
     ///
     /// Returns how many attachments the draft holds.
     ///
     /// # Errors
     ///
-    /// Returns [`TransferError::DraftConflict`] for a draft written for another application and for
-    /// one whose attachment is being offered to the agent,
+    /// Returns [`TransferError::DraftConflict`] for a draft written for another application or under
+    /// another binding revision of it, and for one whose attachment is being offered to the agent,
     /// [`TransferError::InvalidArgument`] for each other refusal above,
     /// [`TransferError::SessionEnded`] when the session has ended, and
     /// [`TransferError::StoreUnavailable`] when the write fails.
@@ -1616,6 +1620,7 @@ impl Store {
         draft_id: DraftId,
         session_id: SessionId,
         application_instance_id: ApplicationInstanceId,
+        binding_revision: AgentBindingRevision,
         at_ms: TimestampMs,
     ) -> Result<usize> {
         let draft = self
@@ -1699,6 +1704,29 @@ impl Store {
                 detail: "this draft was written for another application, so it is not sent to \
                          this one"
                     .to_owned(),
+            });
+        }
+        // One comparison, equality and not "at most": the revision advances when the selected
+        // owner or thread changes, so a draft written under an earlier one is stale, and a prompt
+        // prepared behind the draft is refused as well. A draft that names an application and holds
+        // no revision fails it too, so no row of an earlier shape is waved through. The words differ
+        // for such a row only; remove them with `UNBOUND_VERSION` once no supported upgrade can start
+        // from a journal at that version. The revision, like the application, is fixed when the
+        // draft is made.
+        if draft.application_instance_id.is_some()
+            && draft.agent_binding_revision != Some(binding_revision)
+        {
+            return Err(TransferError::DraftConflict {
+                detail: match draft.agent_binding_revision {
+                    Some(written_under) => format!(
+                        "this draft was written under binding revision {written_under} of this \
+                         application and the prompt names {binding_revision}, so it is not sent"
+                    ),
+                    None => "this draft was written before this host kept the binding revision it \
+                             was written under, so it is not sent; write it again for the \
+                             conversation that is open now"
+                        .to_owned(),
+                },
             });
         }
         transaction
@@ -4110,7 +4138,7 @@ mod tests {
 
     #[test]
     fn a_version_four_journal_gains_the_columns_that_record_a_claim_and_moves_to_the_current_version()
-    {
+     {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("transfers.sqlite");
         write_a_journal_at(
@@ -4184,7 +4212,13 @@ mod tests {
         );
         assert!(!drafts_have_the_column(&path));
 
-        let store = Store::open(&path, environment()).expect("migrates and opens");
+        let opened = Store::open(&path, environment());
+        assert!(
+            opened.is_ok(),
+            "the step from version 5 opens: {:?}",
+            opened.err()
+        );
+        let store = opened.expect("opens");
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
         assert!(drafts_have_the_column(&path));
         assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
@@ -4204,7 +4238,65 @@ mod tests {
     }
 
     #[test]
-    fn a_version_two_journal_gains_the_column_that_holds_a_binding_revision_and_keeps_its_version() {
+    fn a_draft_an_earlier_build_wrote_is_refused_for_every_prompt_when_it_names_an_application() {
+        // A draft that names an application was written with no revision, so no prompt can show
+        // that it is the conversation the draft was written for. One that names none is not held.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at(
+            &path,
+            UNBOUND_VERSION,
+            &format!(
+                "CREATE TABLE ended_sessions (session_id BLOB PRIMARY KEY, ended_at_ms INTEGER NOT NULL);
+                 {DRAFTS_BEFORE_REVISIONS}
+                 {}
+                 INSERT INTO drafts (draft_id, environment_id, actor_id, revision, state, text,
+                                     created_at_ms, updated_at_ms)
+                 VALUES (X'{}', X'{}', '{}', 1, 'open', 'no application', 1, 1);",
+                an_old_draft_that_names_an_application(),
+                "0C".repeat(16),
+                "0E".repeat(16),
+                actor().as_str(),
+            ),
+        );
+        let mut store = Store::open(&path, environment()).expect("migrates and opens");
+        let session = SessionId::new(Uuid::from_bytes([7; 16]));
+        let application = ApplicationInstanceId::new(Uuid::from_bytes([0x0A; 16]));
+        let prompt = |store: &mut Store, draft: u8, revision: u64| {
+            store.record_prompt(
+                DraftId::new(Uuid::from_bytes([draft; 16])),
+                session,
+                application,
+                AgentBindingRevision::new(revision),
+                TimestampMs::new(2000),
+            )
+        };
+
+        for revision in [0, 1, 2] {
+            let refused = prompt(&mut store, 0x0B, revision)
+                .expect_err("a draft with no revision is refused under every one");
+            assert!(
+                matches!(&refused, TransferError::DraftConflict { detail }
+                    if detail.contains("before this host kept the binding revision")),
+                "{refused:?}"
+            );
+        }
+        let sent: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM draft_prompts", [], |row| row.get(0))
+            .expect("counts the sent drafts");
+        assert_eq!(sent, 0, "a refused prompt records nothing");
+
+        let sent = prompt(&mut store, 0x0C, 7);
+        assert!(
+            sent.is_ok(),
+            "a draft that names no application is held to no revision: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn a_version_two_journal_gains_the_column_that_holds_a_binding_revision_and_keeps_its_version()
+    {
         // A journal of an earlier build's sessions stays at its version until they are settled, and
         // it has the column all the same, so that settling still finds a journal this build reads.
         let directory = tempfile::tempdir().expect("a temporary directory");

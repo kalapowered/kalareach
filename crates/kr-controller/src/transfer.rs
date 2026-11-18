@@ -1047,7 +1047,8 @@ impl TransferModule {
     ///
     /// Returns the refusal the service decided, other than for a draft it does not hold: among
     /// them a draft that is for another session, or holds an attachment that belongs to one, a
-    /// draft written for another application than the prompt's (`DRAFT_CONFLICT`), a session that
+    /// draft written for another application, or under another binding revision of it, than the
+    /// prompt's (`DRAFT_CONFLICT`), a session that
     /// has ended (`SESSION_CLOSED`), and an admission that no longer stands.
     pub(crate) async fn record_submission(
         &self,
@@ -1069,6 +1070,7 @@ impl TransferModule {
                 prompted.draft_id,
                 session_id,
                 prompted.application_instance_id,
+                prompted.binding_revision,
                 &admission,
             ) {
                 Err(kr_transfer::TransferError::UnknownDraft { .. }) => Ok(0),
@@ -2180,6 +2182,9 @@ pub(crate) struct PromptedDraft {
     /// The application instance the prompt is for, which the draft must not be written against
     /// another of.
     pub(crate) application_instance_id: kr_protocol::ids::ApplicationInstanceId,
+    /// The binding revision of that application the prompt names, which the draft must have been
+    /// written under.
+    pub(crate) binding_revision: kr_protocol::ids::AgentBindingRevision,
 }
 
 /// The draft a prompt names, when the mutation is a prompt that names a draft.
@@ -2200,6 +2205,7 @@ pub(crate) fn prompted_draft(mutation: &MutationRequest) -> Option<PromptedDraft
     Some(PromptedDraft {
         draft_id: params.draft_id.0?,
         application_instance_id: params.target.subject.application_instance_id,
+        binding_revision: params.target.binding_revision,
     })
 }
 

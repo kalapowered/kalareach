@@ -83,10 +83,16 @@ An attachment uploaded without a session takes that session. A prompt that names
 session, or a draft that holds an attachment belonging to another session, is refused before
 anything is sent. So is a prompt for one application when the draft was written for another: it is
 refused as `DRAFT_CONFLICT`, the draft is left as it was and nothing is recorded. A draft that names
-no application can be sent to any. The prompt's own binding revision is the worker's to check; the
-host's draft records no binding revision, so a draft prepared at an earlier revision of the same
-application is not told apart from one prepared at the current revision. A prompt the worker takes
-and then refuses was still sent to its session, so the
+no application can be sent to any. A draft that names an application keeps the binding revision
+that its `draft.create` was made under, and it is sent only under that revision. A prompt that names
+another revision, higher or lower, is refused as `DRAFT_CONFLICT`; the draft is left as it was and
+nothing is recorded. The revision advances when the application's upstream owner or selected thread
+changes, so a draft written for an earlier conversation is not sent into the one that is open now,
+and the person writes a new draft for it. A draft keeps its revision for as long as it exists:
+`draft.update` and `agent.draft.add_attachment` do not move it. A draft that names an application
+and was written before the host kept the revision is refused the same way. The worker still checks
+the prompt's own binding revision against the binding in force. A prompt the worker takes and then
+refuses was still sent to its session, so the
 attachments stay with it. A prompt made under an identifier already used for another prompt is
 refused before the draft is recorded. The host tells the service which sessions its retention still
 covers; the service never guesses.
@@ -289,11 +295,15 @@ of a draft by `draft.discard`, which the action's own record traces.
 | `actions` | retained mutation outcomes, keyed by actor and action identifier |
 | `events`, `cursors` | the outbox and its consumers' positions |
 
-The journal is at schema version 5. The step from version 4 adds the two columns that record who
-claimed a binding and the read grant of that claim. An older build that doesn't know about the
-`inserting` and `unknown` states will refuse to accept a version-5 journal. A journal that still
-holds sessions of an earlier build keeps its older version until they are settled. It has the
-columns all the same, and no claim is made in it.
+The journal is at schema version 6. The step from version 5 adds the column that holds the binding
+revision a draft that names an application was written under; a draft that an earlier build wrote
+has none. The step from version 4 adds the two columns that record who claimed a binding and the
+read grant of that claim, and that column. An older build that doesn't know about the `inserting`
+and `unknown` states, or doesn't read the revision, will refuse to accept a version-6 journal. A
+journal that still holds sessions of an earlier build keeps its older version until they are
+settled. It has the columns all the same, and no claim is made in it. No draft that names an
+application is made in it either, because a build that ignored the revision could send that draft
+under another one: the create is refused until those sessions have ended.
 
 The order the rows are written in is what makes a resume possible.
 
@@ -910,7 +920,7 @@ untouched. Nothing invents a placeholder image to stand in for it.
 | `SOURCE_CHANGED` | a declaration changed, a source moved under a snapshot, or a snapshot is gone |
 | `QUOTA_EXCEEDED` | a per-file or per-environment byte limit |
 | `RESOURCE_UNAVAILABLE` | the device's concurrency ceiling, or a transfer in a state that admits no more |
-| `DRAFT_CONFLICT` | the draft is not as the call needs it: its revision is not the one the caller expected, an attachment of it is being offered to the agent or was accepted, a claim or a report does not match the binding it names, or a prompt names a draft written for another application |
+| `DRAFT_CONFLICT` | the draft is not as the call needs it: its revision is not the one the caller expected, an attachment of it is being offered to the agent or was accepted, a claim or a report does not match the binding it names, or a prompt names a draft written for another application or under another binding revision of the application it is for |
 | `PERMISSION_DENIED` | a name that leaves an authorised directory, or a revoked scope or grant |
 | `ENVIRONMENT_UNAVAILABLE` | the request names an environment this service does not own |
 | `ID_CONFLICT` | one action identifier used for two different payloads |

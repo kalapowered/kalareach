@@ -54,7 +54,8 @@ fn draft_for(harness: &Harness, session: Option<SessionId>) -> DraftRecord {
                     Uuid::from_bytes([10; 16]),
                 )),
                 text: "a private draft, never shown to a worker".to_owned(),
-            }, Some(crate::support::a_binding()),
+            },
+            Some(crate::support::a_binding()),
             None,
             None,
         )
@@ -209,6 +210,7 @@ fn a_worker_reads_the_facts_of_a_draft_and_never_its_text_or_the_names_of_its_fi
             created.draft_id,
             session(),
             crate::support::an_application(),
+            crate::support::a_binding(),
             &Admission::none(),
         )
         .expect("sends the draft by a prompt");
@@ -761,6 +763,7 @@ fn a_draft_with_an_offer_in_flight_is_neither_sent_nor_rebound() {
             created.draft_id,
             session(),
             crate::support::an_application(),
+            crate::support::a_binding(),
             &Admission::none(),
         )
         .expect_err("a draft with an offer in flight");
@@ -795,6 +798,7 @@ fn a_draft_with_an_offer_in_flight_is_neither_sent_nor_rebound() {
             created.draft_id,
             session(),
             crate::support::an_application(),
+            crate::support::a_binding(),
             &Admission::none(),
         )
         .expect("the draft is sent once the offer is reported");
@@ -1130,6 +1134,7 @@ fn a_claim_is_refused_for_a_draft_that_is_not_the_workers_and_for_a_file_that_is
             sent.draft_id,
             session(),
             crate::support::an_application(),
+            crate::support::a_binding(),
             &Admission::none(),
         )
         .expect("a prompt sends the draft to the session");
@@ -1304,6 +1309,7 @@ fn a_draft_only_sent_to_a_session_that_ends_has_its_offer_failed_and_stays_open(
             sent.draft_id,
             session(),
             crate::support::an_application(),
+            crate::support::a_binding(),
             &Admission::none(),
         )
         .expect("a prompt sends the draft to the session");
@@ -1353,7 +1359,8 @@ fn a_draft_is_not_made_for_a_session_that_has_ended() {
                 session_id: Nullable::some(session()),
                 application_instance_id: Nullable::null(),
                 text: "for a session that is gone".to_owned(),
-            }, None,
+            },
+            None,
             None,
             None,
         )
