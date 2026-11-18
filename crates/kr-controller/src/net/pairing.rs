@@ -1687,7 +1687,9 @@ impl PairingHost {
                 Ok(true) => {
                     protocol_refusal(kr_pairing::PairingError::EndpointPaired { device_id })
                 }
-                Ok(false) => protocol_refusal(error),
+                // The general rejection, in the general words: neither its code nor its message
+                // says that the invitation ended because the host lists a device.
+                Ok(false) => ProtocolError::new(ErrorCode::PairingRejected, NO_LONGER_OPEN),
                 Err(unreadable) => protocol_refusal(unreadable),
             };
         }
@@ -2001,6 +2003,10 @@ fn protocol_refusal(error: kr_pairing::PairingError) -> ProtocolError {
     }
     ProtocolError::new(code, error.to_string())
 }
+
+/// The one thing a peer that did not use an invitation is told of an invitation that ended because
+/// the host lists the device that did.
+const NO_LONGER_OPEN: &str = "the invitation is no longer open";
 
 /// The one thing a candidate is told when its pairing could not be authenticated.
 pub const AUTHENTICATION_FAILED: &str = "the pairing could not be authenticated";
