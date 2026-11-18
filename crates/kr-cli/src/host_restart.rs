@@ -531,9 +531,11 @@ async fn restart_the_daemon(
         }
     };
     // How it was started, before anything is stopped. The request for it stops nothing. A daemon of
-    // another build that lists no such request refuses it, and says so as `kr host stop` does.
-    let launch = match host_stop::ask(&mut client, id, json, progress, true).await {
-        Asked::Taken(result) => result.launch.0,
+    // another build that lists no such request refuses it, and says so as `kr host stop` does. Its
+    // answer states the process of the daemon that is on this connection, which the stop then waits
+    // for by its identity where the lock file named the same process.
+    let (launch, stated) = match host_stop::ask(&mut client, id, json, progress, true).await {
+        Asked::Taken(result) => (result.launch.0, Some(result.pid.get())),
         Asked::Refused(error) => {
             let refusal = Facts {
                 knows: Knows::Refused,
@@ -551,9 +553,9 @@ async fn restart_the_daemon(
             .await;
         }
         // A daemon that cannot say how it was started, or whose answer was cut or withheld, gives
-        // no launch to compare: the restart goes on, since a start that fails after the stop says
-        // so and the keys stay on disk.
-        Asked::Unknown(_) | Asked::NotComposed { .. } => None,
+        // no launch to compare and states no process: the restart goes on, since a start that
+        // fails after the stop says so and the keys stay on disk.
+        Asked::Unknown(_) | Asked::NotComposed { .. } => (None, None),
     };
     if let Some(launch) = &launch {
         let differences = restart_launch::compare_here(launch, start, &environment.paths);
@@ -573,6 +575,7 @@ async fn restart_the_daemon(
         client,
         &info,
         holder,
+        stated,
         json,
         progress,
         &begun.none,

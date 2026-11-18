@@ -896,9 +896,15 @@ accepted=no decided=answers -> before=answers
 named=none answer=none -> waits_for=- json_pid=-
 named=none answer=4000 -> waits_for=- json_pid=4000
 named=none answer=4001 -> waits_for=- json_pid=4001
-named=4000 answer=none -> waits_for=4000 json_pid=4000
+named=4000 answer=none -> waits_for=- json_pid=4000
 named=4000 answer=4000 -> waits_for=4000 json_pid=4000
 named=4000 answer=4001 -> waits_for=- json_pid=4001
+
+## the same where the answer named none and an earlier reply on the connection that carries the request (the restart's request for the launch alone) named a process
+named=none stated=4000 -> waits_for=- json_pid=-
+named=none stated=4001 -> waits_for=- json_pid=-
+named=4000 stated=4000 -> waits_for=4000 json_pid=4000
+named=4000 stated=4001 -> waits_for=- json_pid=4000
 
 ## the stop: where a refusal goes, by the retry category of its code (every code's category)
 category=configuration_change -> refused: nothing was taken, no wait

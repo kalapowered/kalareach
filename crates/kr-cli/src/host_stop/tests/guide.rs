@@ -472,7 +472,7 @@ fn claims() -> Vec<Claim> {
             ],
         },
         Claim {
-            text: r#""Ended" means, where the command read the process that held the environment before it asked and the daemon's answer, if it arrived, named the same process, that this process has gone and that the lock is free or another control daemon holds it."#,
+            text: r#""Ended" means, where the command read the process that held the environment before it asked and a reply on the connection that carried the request named the same process (the daemon's answer to the stop, or, for `kr host restart`, its earlier answer to the request for how the daemon was started), that this process has gone and that the lock is free or another control daemon holds it."#,
             place: (22, 0),
             speaks_of: "the after rows of a process that was read as running or as ended and that end with exit 0",
             about: |r| {
@@ -493,13 +493,12 @@ fn claims() -> Vec<Claim> {
             ],
         },
         Claim {
-            text: r#"Where it did not (always on Windows; where the lock file cannot be read; where it names no process whose start the command can read; or where the daemon's answer names another process than the lock file does),"#,
+            text: r#"Where no such reply did (always on Windows; where the lock file cannot be read; where it names no process whose start the command can read; where the stop's answer is an unknown outcome and names no process, since the lock file was read before the connection was made and may name a daemon that another has replaced; or where a reply names another process than the lock file does),"#,
             place: (23, 1),
-            speaks_of: "the walk of the process that a stop is waited for by: no process where the lock file names none or the answer names another",
+            speaks_of: "the walk of the process that a stop is waited for by: no process where the lock file names none or the answer is not the lock file's process",
             about: |r| r.kind == Kind::Waited,
             breaks: |r| {
-                (r.is("named", "none")
-                    || (r.field("answer") != "none" && r.field("answer") != r.field("named")))
+                (r.is("named", "none") || r.field("answer") != r.field("named"))
                     && r.field("waits_for") != "-"
             },
             doctored: &[
@@ -510,6 +509,10 @@ fn claims() -> Vec<Claim> {
                 (
                     "named=4000 answer=4001 -> waits_for=-",
                     "named=4000 answer=4001 -> waits_for=4000",
+                ),
+                (
+                    "named=4000 answer=none -> waits_for=-",
+                    "named=4000 answer=none -> waits_for=4000",
                 ),
             ],
         },
@@ -571,8 +574,8 @@ fn claims() -> Vec<Claim> {
                     "named=4000 answer=4001 -> waits_for=- json_pid=4000",
                 ),
                 (
-                    "named=4000 answer=none -> waits_for=4000 json_pid=4000",
-                    "named=4000 answer=none -> waits_for=4000 json_pid=-",
+                    "named=4000 answer=none -> waits_for=- json_pid=4000",
+                    "named=4000 answer=none -> waits_for=- json_pid=-",
                 ),
             ],
         },
