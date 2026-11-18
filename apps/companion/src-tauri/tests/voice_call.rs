@@ -6609,6 +6609,35 @@ fn told_at_the_service_of(
     }
 }
 
+/// Whether the voice service has read a request about the delegation `id`, taken up or held: a
+/// service that holds the requests it reads takes up none, so what it was told is seen here and not
+/// in what it was sent.
+fn read_at_the_service_of(id: &str) -> impl Fn(&voice_support::control_route::Report) -> bool {
+    let id = id.to_owned();
+    move |report| {
+        report
+            .arrived
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .any(|frame| frame["delegationId"] == id)
+    }
+}
+
+/// A first sentence that comes to nothing, as `chatter` has it, waited for on the voice service: the
+/// model is told it was refused after the row says so. The case reads the row once this returns.
+async fn chatter_told_to_the_model(scene: &Scene) {
+    speak(scene, 0, "hello there");
+    ask(scene, "d-0", 200).await;
+    scene
+        .stand_in
+        .control()
+        .until(
+            "what the model was told of d-0",
+            told_at_the_service_of("d-0", 1),
+        )
+        .await;
+}
+
 /// KR-REQ-15.17: a request whose answer was lost is unknown, the model is told so, and the provider's
 /// acknowledgement of that commentary leaves it unknown: it was neither done nor said to be. The
 /// host's answer to the question about it, from its own record, is what makes it done, and the
@@ -6624,7 +6653,10 @@ async fn a_lost_answer_leaves_the_request_unknown_until_the_hosts_own_answer_wha
     };
     let mut scene = delegating_with(timings, 1).await;
     calling(&scene).await;
-    chatter(&scene).await;
+    chatter_told_to_the_model(&scene).await;
+    let spent = row_of(&scene.state(), "d-0").expect("the row");
+    assert_eq!(spent["state"], "refused", "{spent}");
+    assert_eq!(spent["cause"], "first_fragment", "{spent}");
     let end = speak(&scene, 6_000, "what is the status");
     // The answer to the first request is lost, and the question that follows is held.
     scene
@@ -6633,6 +6665,13 @@ async fn a_lost_answer_leaves_the_request_unknown_until_the_hosts_own_answer_wha
     scene.link.hold_request_after(1, HostMethod::VoiceDelegate);
     ask(&scene, "d-1", end - 200).await;
     scene.link.until_request_held().await;
+    // The question is released only to a host that has finished the request: a host that has not
+    // answers a repeat of an attempt still in flight with no result, and the question tries three
+    // times and gives up.
+    scene
+        .link
+        .until_the_host_answers(1, HostMethod::VoiceDelegate)
+        .await;
     scene
         .stand_in
         .control()
@@ -6691,7 +6730,17 @@ async fn a_lost_answer_leaves_the_request_unknown_until_the_hosts_own_answer_wha
 /// done.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_request_the_host_has_not_answered_stays_asking_whatever_the_provider_acknowledges() {
-    let mut scene = delegating().await;
+    // The request waits at the writer from the moment its proof is asked for until the case lets it
+    // go. The case lets that take 15 s at most. The proof and the host are given three times that,
+    // which is less than the 60 s that the request lives, so a request that is let go is one that
+    // the proof, the host and the request itself all still allow.
+    const HELD_AT_MOST: Duration = Duration::from_secs(15);
+    let timings = Timings {
+        proof_age: HELD_AT_MOST * 3,
+        host_within: HELD_AT_MOST * 3,
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
     calling(&scene).await;
     // Both delegations are announced before the service is held: a service that holds the requests it
     // reads writes nothing else meanwhile.
@@ -6701,30 +6750,47 @@ async fn a_request_the_host_has_not_answered_stays_asking_whatever_the_provider_
     until_announced(&scene, "d-0", 200).await;
     until_announced(&scene, "d-1", 6_600).await;
     // The service reads what the model is told of the first sentence and answers none of it while it
-    // is held: its acknowledgement comes once the request for the second waits at the writer.
+    // is held: its acknowledgement comes once the request for the second waits at the writer. The
+    // owner sets the row before it tells the model of it, so the row is read once the service has
+    // read that.
     scene.stand_in.control().hold_requests(true);
     scene.platform.tell_provider(&delegation_event("d-0", 200));
-    let spent = row_reaching(&scene, "d-0", "refused").await;
-    assert_eq!(spent["cause"], "first_fragment");
-    let end = speak(&scene, 6_000, "what is the status");
-    assert_eq!(end - 200, 6_600);
-    scene.link.hold_next_request(HostMethod::VoiceDelegate);
-    scene
-        .platform
-        .tell_provider(&delegation_event("d-1", end - 200));
-    scene.link.until_request_held().await;
-    scene.stand_in.control().hold_requests(false);
     scene
         .stand_in
         .control()
         .until(
-            "what the model was told of d-0",
-            told_at_the_service_of("d-0", 1),
+            "what the model is told of d-0, read",
+            read_at_the_service_of("d-0"),
         )
         .await;
-    // The announcement is read after the acknowledgement of what the model was told.
-    scene.stand_in.control().announce("d-9", 9_000);
-    until_announced(&scene, "d-9", 9_000).await;
+    let spent = row_of(&scene.state(), "d-0").expect("the row");
+    assert_eq!(spent["state"], "refused", "{spent}");
+    assert_eq!(spent["cause"], "first_fragment", "{spent}");
+    let end = speak(&scene, 6_000, "what is the status");
+    assert_eq!(end - 200, 6_600);
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    // The waits of the held request end by this bound if what they wait for never comes: that is a
+    // wait that ran out, and no assertion of the case is inside it.
+    tokio::time::timeout(HELD_AT_MOST, async {
+        scene
+            .platform
+            .tell_provider(&delegation_event("d-1", end - 200));
+        scene.link.until_request_held().await;
+        scene.stand_in.control().hold_requests(false);
+        scene
+            .stand_in
+            .control()
+            .until(
+                "what the model was told of d-0",
+                told_at_the_service_of("d-0", 1),
+            )
+            .await;
+        // The announcement is read after the acknowledgement of what the model was told.
+        scene.stand_in.control().announce("d-9", 9_000);
+        until_announced(&scene, "d-9", 9_000).await;
+    })
+    .await
+    .expect("the request is held and what the model was told is read");
 
     let state = scene.state();
     let row = row_of(&state, "d-1").expect("the row");
@@ -6771,7 +6837,10 @@ async fn a_request_the_host_took_and_did_not_perform_stays_admitted_whatever_the
  {
     let mut scene = delegating().await;
     calling(&scene).await;
-    chatter(&scene).await;
+    chatter_told_to_the_model(&scene).await;
+    let spent = row_of(&scene.state(), "d-0").expect("the row");
+    assert_eq!(spent["state"], "refused", "{spent}");
+    assert_eq!(spent["cause"], "first_fragment", "{spent}");
     scene.link.answer_the_next_delegation_as_admitted();
     let end = speak(&scene, 6_000, "what is the status");
     ask(&scene, "d-1", end - 200).await;
