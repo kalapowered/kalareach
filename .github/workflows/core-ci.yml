@@ -2984,6 +2984,10 @@ jobs:
           # The terminfo checks that run tmux and tic stand down with a printed reason where the
           # host has none. Here a missing tmux or tic fails them.
           KR_REQUIRE_MULTIPLEXERS: "1"
+          # The service-start checks load jobs into the account's own launchd, and stand down with
+          # a printed reason in a run that does not ask for it, as a person's own Mac does. This
+          # runner's account is for the run alone, so here they run.
+          KR_ALLOW_ACCOUNT_LAUNCHD: "1"
         run: >-
           cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor

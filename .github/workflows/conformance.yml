@@ -250,6 +250,10 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       KR_REQUIRE_PLUGIN_FIXTURES: "1"
+      # The service-start checks load jobs into the account's own launchd, and stand down with a
+      # printed reason in a run that does not ask for it. This runner's account is for the run
+      # alone, so here they run.
+      KR_ALLOW_ACCOUNT_LAUNCHD: "1"
       KR_TEST_ARTIFACTS_DIR: /tmp/kr-conformance-evidence
     steps:
       - name: Check out
