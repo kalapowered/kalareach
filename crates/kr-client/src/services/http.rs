@@ -93,7 +93,7 @@ use url::{Host, Url};
 
 use super::ServiceFuture;
 use super::account::AccountHttp;
-use super::relay::{ServiceHttp, ServiceHttpAnswer};
+use super::relay::{ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 use crate::shown::Shown;
 
@@ -465,10 +465,16 @@ impl HttpService {
         method: reqwest::Method,
         target: Url,
         body: Option<(&str, &[u8])>,
-        headers: &[(&str, &str)],
+        headers: &[ServiceHeader<'_>],
     ) -> Result<ServiceHttpAnswer> {
         let limit = self.limits.of(target.path());
         let named = crate::shown!("{}{}", self.origin.clone(), Shown::route(target.path()));
+        // A header value can be a token, so neither the name's value nor the value itself reaches
+        // the error.
+        let headers = final_headers(headers).map_err(|fault| match fault {
+            HeaderFault::Name => refused("a request header name is not one this client can send"),
+            HeaderFault::Value => refused("a request header value is not one this client can send"),
+        })?;
 
         // One connection, and a second only when the connector itself failed in a way a new
         // connection can end differently ([`connection_may_be_replaced`]): that is before any byte
@@ -483,17 +489,8 @@ impl HttpService {
                     .header(reqwest::header::CONTENT_TYPE, content_type)
                     .body(bytes.to_vec());
             }
-            for (name, value) in headers {
-                // A header value can be a token, so neither the name's value nor the value itself
-                // reaches this error.
-                let name =
-                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-                        refused("a request header name is not one this client can send")
-                    })?;
-                let value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
-                    refused("a request header value is not one this client can send")
-                })?;
-                request = request.header(name, value);
+            for (name, value) in &headers {
+                request = request.header(name.clone(), value.clone());
             }
             if replaced {
                 request = request.timeout(self.deadlines.total.saturating_sub(started.elapsed()));
@@ -536,12 +533,46 @@ impl HttpService {
     }
 }
 
+/// Why a header could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderFault {
+    /// The name is not a header name.
+    Name,
+    /// The value is not a header value.
+    Value,
+}
+
+/// The final header values of a request, in the order given: what a transport puts on the wire.
+///
+/// An HTTP request and a WebSocket upgrade build their headers here, so a header that carries a
+/// credential is marked sensitive in one place.
+pub(crate) fn final_headers(
+    headers: &[ServiceHeader<'_>],
+) -> std::result::Result<
+    Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>,
+    HeaderFault,
+> {
+    headers
+        .iter()
+        .map(|header| {
+            let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|_| HeaderFault::Name)?;
+            let mut value = reqwest::header::HeaderValue::from_str(header.value)
+                .map_err(|_| HeaderFault::Value)?;
+            // The mark goes on the final value, after the conversion, so a client library that
+            // formats its own request leaves a credential out.
+            value.set_sensitive(header.sensitive);
+            Ok((name, value))
+        })
+        .collect()
+}
+
 impl ServiceHttp for HttpService {
     fn post_json<'a>(
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             // The three deadlines are the transport's own and they are enforced where the bytes
@@ -567,7 +598,7 @@ impl ServiceHttp for HttpService {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let target = self.target(url)?;
@@ -585,7 +616,7 @@ impl ServiceHttp for HttpService {
     fn get_json<'a>(
         &'a self,
         url: &'a str,
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let target = self.target(url)?;
@@ -616,7 +647,7 @@ impl AccountHttp for HttpService {
     fn get<'a>(
         &'a self,
         url: &'a str,
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let target = self.target(url)?;
@@ -995,6 +1026,37 @@ impl HttpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K20: the final header values of an HTTP request and of a WebSocket upgrade, which both come
+    /// from one builder, are marked sensitive where the caller said they carry a credential and
+    /// nowhere else, and no debug form of the headers or the values prints the credential.
+    #[test]
+    fn the_final_http_and_websocket_header_values_are_marked_sensitive() {
+        let headers = [
+            ServiceHeader::secret("authorization", "Bearer kr-test-sentinel-0123456789"),
+            ServiceHeader::plain("x-trace", "visible-value"),
+        ];
+        let built = final_headers(&headers).expect("the headers build");
+        assert_eq!(built.len(), 2);
+        assert!(
+            built[0].1.is_sensitive(),
+            "the final authorization value is marked sensitive"
+        );
+        assert!(
+            !built[1].1.is_sensitive(),
+            "a header that carries no credential is not marked"
+        );
+        let shown = format!("{headers:?} {built:?}");
+        assert!(
+            !shown.contains("kr-test-sentinel"),
+            "a debug form prints the credential: {shown}"
+        );
+        assert!(shown.contains("visible-value"));
+        assert_eq!(
+            final_headers(&[ServiceHeader::plain("bad name", "v")]).expect_err("a bad name"),
+            HeaderFault::Name
+        );
+    }
     use std::io;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::{Arc, Mutex};
@@ -1906,7 +1968,7 @@ mod tests {
             .post_json(
                 &gateway.url("/api/relay/lease"),
                 b"{\"body\":1}",
-                &[("authorization", "Bearer opensesame")],
+                &[ServiceHeader::secret("authorization", "Bearer opensesame")],
             )
             .await
             .expect("an answer");
@@ -1961,7 +2023,7 @@ mod tests {
         transport
             .get(
                 &gateway.url("/auth/oauth2/userinfo"),
-                &[("authorization", "Bearer opensesame")],
+                &[ServiceHeader::secret("authorization", "Bearer opensesame")],
             )
             .await
             .expect("an answer");
@@ -2013,8 +2075,8 @@ mod tests {
                 &gateway.url("/api/storage/upload/part"),
                 &content,
                 &[
-                    ("kr-service-request", "eyJib2R5Ijp7fX0"),
-                    ("authorization", "Bearer opensesame"),
+                    ServiceHeader::plain("kr-service-request", "eyJib2R5Ijp7fX0"),
+                    ServiceHeader::secret("authorization", "Bearer opensesame"),
                 ],
             )
             .await
@@ -3086,7 +3148,10 @@ mod tests {
             .post_json(
                 &gateway.url("/api/sync/exchange"),
                 b"{\"signature\":\"a-signature-nobody-should-see\"}",
-                &[("authorization", "Bearer a-token-nobody-should-see")],
+                &[ServiceHeader::secret(
+                    "authorization",
+                    "Bearer a-token-nobody-should-see",
+                )],
             )
             .await
             .expect_err("a connection that ended");

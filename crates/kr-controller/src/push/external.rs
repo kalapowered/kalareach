@@ -48,6 +48,7 @@
 
 use std::sync::Arc;
 
+use kr_client::services::ServiceHeader;
 use kr_delivery::destination::{DestinationKind, ExternalDestination, Idempotency};
 use kr_delivery::external::{ExternalMessage, ExternalOutcome, ExternalSender};
 use kr_protocol::delivery::DestinationSecret;
@@ -115,9 +116,9 @@ impl ExternalSender for WebhookSender {
             }
             _ => None,
         };
-        let headers: Vec<(&str, &str)> = header
+        let headers: Vec<ServiceHeader<'_>> = header
             .as_ref()
-            .map(|(name, value)| vec![(name.as_str(), value.as_str())])
+            .map(|(name, value)| vec![ServiceHeader::plain(name.as_str(), value.as_str())])
             .unwrap_or_default();
         let answer = self.runtime.block_on(async {
             transport

@@ -776,7 +776,7 @@ impl kr_client::services::ServiceHttp for Redirected {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         let redirected = url.replacen(&self.service, &self.stand_in, 1);
         Box::pin(async move { self.transport.post_json(&redirected, body, headers).await })

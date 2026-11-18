@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use kr_client::services::ServiceHttpAnswer;
+use kr_client::services::{ServiceHeader, ServiceHttpAnswer};
 use kr_protocol::ids::NotificationId;
 use kr_protocol::push::PushDeliveryCredential;
 
@@ -108,7 +108,11 @@ impl PreparedForget {
         let header = format!("Bearer {}", bearer(self.credential.secret.expose()));
         let answered = self.runtime.block_on(async {
             self.transport
-                .post_json(&url, &body, &[("authorization", header.as_str())])
+                .post_json(
+                    &url,
+                    &body,
+                    &[ServiceHeader::secret("authorization", header.as_str())],
+                )
                 .await
         });
         match answered {

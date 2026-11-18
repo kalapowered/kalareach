@@ -717,6 +717,7 @@ impl FeedAnnouncement {
 mod tests {
     use super::*;
     use crate::services::ServiceFuture;
+    use crate::services::ServiceHeader;
     use crate::services::relay::ServiceHttpAnswer;
     use crate::services::rendering::{NEVER_RENDERED, renders_only};
     use kr_crypto::keys::AuthorisationKeyPair;
@@ -775,7 +776,7 @@ mod tests {
             &'a self,
             url: &'a str,
             body: &'a [u8],
-            headers: &'a [(&'a str, &'a str)],
+            headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             assert!(
                 headers.is_empty(),

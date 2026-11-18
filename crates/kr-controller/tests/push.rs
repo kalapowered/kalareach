@@ -302,7 +302,7 @@ impl kr_client::services::ServiceHttp for RecordingHttp {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         self.asked
             .lock()
@@ -312,7 +312,7 @@ impl kr_client::services::ServiceHttp for RecordingHttp {
                 body: body.to_vec(),
                 headers: headers
                     .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .map(|header| (header.name.to_owned(), header.value.to_owned()))
                     .collect(),
             });
         let answer = {
@@ -4158,7 +4158,7 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         self.asked
             .lock()
@@ -4168,7 +4168,7 @@ impl kr_client::services::ServiceHttp for DeliveringGateway {
                 body: body.to_vec(),
                 headers: headers
                     .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .map(|header| (header.name.to_owned(), header.value.to_owned()))
                     .collect(),
             });
         if url.ends_with("/api/push/deliver")
@@ -9350,7 +9350,7 @@ impl kr_client::services::ServiceHttp for Reached {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         (self.on_request)();
         self.web.post_json(url, body, headers)
@@ -10482,7 +10482,7 @@ impl<F: FnMut()> Drop for OnDrop<F> {
 #[test]
 fn an_exchange_under_a_bearer_never_leaves_for_a_gateway_taken_out_of_the_list_but_a_revocation_does()
  {
-    use kr_client::services::ServiceHttp;
+    use kr_client::services::{ServiceHeader, ServiceHttp};
     use kr_controller::push::credentials::CredentialRenewal;
     use kr_controller::push::gateways::{AllowedGateways, GatedTransports};
     use kr_controller::push::sender::{GatewaySenders, HostSigner, SenderRevocation};

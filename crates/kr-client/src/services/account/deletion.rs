@@ -69,7 +69,7 @@ use serde::{Deserialize, Serialize};
 use super::{AccountMark, SignedInAccount, storage};
 use crate::error::{ClientError, Result};
 use crate::services::signed::{Repeat, data_or_refusal};
-use crate::services::{ServiceHttp, ServiceHttpAnswer};
+use crate::services::{ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use crate::shown::Shown;
 
 /// What a deletion asks of the token: the scope every sign-in has.
@@ -851,9 +851,9 @@ impl ManagedAccountDeletion {
     async fn send(&self, route: Route, authorisation: Option<&str>, body: Option<&[u8]>) -> Sent {
         let url = self.url(route);
         let headers_with;
-        let headers: &[(&str, &str)] = match authorisation {
+        let headers: &[ServiceHeader<'_>] = match authorisation {
             Some(value) => {
-                headers_with = [("authorization", value)];
+                headers_with = [ServiceHeader::secret("authorization", value)];
                 &headers_with
             }
             None => &[],

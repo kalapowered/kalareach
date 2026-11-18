@@ -116,6 +116,57 @@ pub const RELAY_LEASE_PATH: &str = "/api/relay/lease";
 /// The path a revocation request is addressed to.
 pub const RELAY_LEASE_REVOKE_PATH: &str = "/api/relay/lease/revoke";
 
+/// One request header, and whether its value is a credential.
+///
+/// A credential travels in a header value, so the flag says which values a transport marks sensitive
+/// on the final request: a marked value never appears in a debug form, and a client library that logs
+/// its own requests leaves it out.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ServiceHeader<'a> {
+    /// The header's name, lower-cased.
+    pub name: &'a str,
+    /// The header's value.
+    pub value: &'a str,
+    /// Whether the value is a credential.
+    pub sensitive: bool,
+}
+
+impl<'a> ServiceHeader<'a> {
+    /// A header whose value is not a credential.
+    #[must_use]
+    pub const fn plain(name: &'a str, value: &'a str) -> Self {
+        Self {
+            name,
+            value,
+            sensitive: false,
+        }
+    }
+
+    /// A header whose value is a credential.
+    #[must_use]
+    pub const fn secret(name: &'a str, value: &'a str) -> Self {
+        Self {
+            name,
+            value,
+            sensitive: true,
+        }
+    }
+}
+
+impl std::fmt::Debug for ServiceHeader<'_> {
+    /// Names the header and says whether it is sensitive; a sensitive value is never printed.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = formatter.debug_struct("ServiceHeader");
+        shown.field("name", &self.name);
+        if self.sensitive {
+            shown.field("value", &"redacted");
+        } else {
+            shown.field("value", &self.value);
+        }
+        shown.field("sensitive", &self.sensitive).finish()
+    }
+}
+
 /// One HTTP exchange, as the embedder performs it.
 ///
 /// What an implementation owes this client, because the answers above are read on these terms:
@@ -148,7 +199,7 @@ pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer>;
 
     /// Posts content that is not a JSON document, and returns what came back.
@@ -164,7 +215,7 @@ pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
         &'a self,
         _url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async {
             Err(ClientError::refusal(
@@ -185,7 +236,7 @@ pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
     fn get_json<'a>(
         &'a self,
         _url: &'a str,
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async {
             Err(ClientError::refusal(
@@ -887,9 +938,9 @@ impl ManagedRelayLeaseService {
             })?;
         let url = format!("{}{path}", self.origin.as_str());
         let authorisation = bearer.map(|token| format!("Bearer {}", token.expose()));
-        let headers: Vec<(&str, &str)> = authorisation
+        let headers: Vec<ServiceHeader<'_>> = authorisation
             .as_deref()
-            .map(|value| ("authorization", value))
+            .map(|value| ServiceHeader::secret("authorization", value))
             .into_iter()
             .collect();
         self.http.post_json(&url, &request, &headers).await

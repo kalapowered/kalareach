@@ -226,7 +226,7 @@ impl kr_client::services::ServiceHttp for EchoingGateway {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         let (route, status) = if url.ends_with("/api/push/deliver") {
             let request: PushDeliveryRequest =

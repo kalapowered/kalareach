@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 
 use super::ServiceFuture;
 use super::account::AccountTokenSource;
-pub use super::{ServiceHttp, ServiceHttpAnswer};
+pub use super::{ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
 use crate::shown::{ServiceMessage, Shown};
@@ -1214,7 +1214,14 @@ impl ManagedVoiceBroker {
         let authorisation = self.authorisation().await?;
         let url = format!("{}{path}", self.origin);
         self.http
-            .post_json(&url, &body, &[("authorization", authorisation.as_str())])
+            .post_json(
+                &url,
+                &body,
+                &[ServiceHeader::secret(
+                    "authorization",
+                    authorisation.as_str(),
+                )],
+            )
             .await
     }
 
@@ -1229,8 +1236,13 @@ impl ManagedVoiceBroker {
         let url = format!("{}{path}", self.origin);
         tokio::time::timeout(
             within,
-            self.http
-                .get_json(&url, &[("authorization", authorisation.as_str())]),
+            self.http.get_json(
+                &url,
+                &[ServiceHeader::secret(
+                    "authorization",
+                    authorisation.as_str(),
+                )],
+            ),
         )
         .await
         .map_err(|_| {
@@ -2220,15 +2232,15 @@ mod tests {
             &'a self,
             url: &'a str,
             body: &'a [u8],
-            headers: &'a [(&'a str, &'a str)],
+            headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.sent.lock().expect("what was sent").push(Sent {
                 url: url.to_owned(),
                 body: serde_json::from_slice(body).expect("a JSON body"),
                 authorisation: headers
                     .iter()
-                    .find(|(name, _)| *name == "authorization")
-                    .map(|(_, value)| (*value).to_owned()),
+                    .find(|header| header.name == "authorization")
+                    .map(|header| header.value.to_owned()),
             });
             let answer = self
                 .answers
@@ -2242,15 +2254,15 @@ mod tests {
         fn get_json<'a>(
             &'a self,
             url: &'a str,
-            headers: &'a [(&'a str, &'a str)],
+            headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.sent.lock().expect("what was sent").push(Sent {
                 url: url.to_owned(),
                 body: serde_json::Value::Null,
                 authorisation: headers
                     .iter()
-                    .find(|(name, _)| *name == "authorization")
-                    .map(|(_, value)| (*value).to_owned()),
+                    .find(|header| header.name == "authorization")
+                    .map(|header| header.value.to_owned()),
             });
             let answer = self.answers.lock().expect("the script").pop_front();
             Box::pin(async move {
@@ -2624,7 +2636,7 @@ mod tests {
                 &'a self,
                 _url: &'a str,
                 _body: &'a [u8],
-                _headers: &'a [(&'a str, &'a str)],
+                _headers: &'a [ServiceHeader<'a>],
             ) -> ServiceFuture<'a, ServiceHttpAnswer> {
                 Box::pin(async { panic!("no request is made") })
             }

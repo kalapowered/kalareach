@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::ClientError;
 use kr_client::services::account::{AccountToken, AccountTokenSource};
-use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
+use kr_client::services::relay::{ServiceHeader, ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use kr_client::services::{ServiceFuture, SyncRecoveryId};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -383,7 +383,7 @@ impl ServiceHttp for Watched {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -612,7 +612,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             _body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             let body = serde_json::to_vec(&self.0).expect("an answer");
             Box::pin(std::future::ready(Ok(ServiceHttpAnswer {

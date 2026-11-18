@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kr_client::error::ClientError;
-use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer, ServiceSigner};
+use kr_client::services::{
+    ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
+};
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::scalars::{AuthorisationKey, Signature64};
@@ -102,7 +104,7 @@ impl ServiceHttp for Recording {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let answer = self.inner.post_json(url, body, headers).await?;
@@ -115,7 +117,7 @@ impl ServiceHttp for Recording {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let answer = self.inner.post_bytes(url, body, headers).await?;
@@ -176,7 +178,7 @@ impl ServiceHttp for Replaying {
         &'a self,
         url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move { Ok(self.answer(url)) })
     }
@@ -185,7 +187,7 @@ impl ServiceHttp for Replaying {
         &'a self,
         url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move { Ok(self.answer(url)) })
     }

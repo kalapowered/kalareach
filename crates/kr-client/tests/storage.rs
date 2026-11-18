@@ -17,7 +17,8 @@ use kr_client::services::storage::{
     UploadPart, UploadProgress, upload_parts,
 };
 use kr_client::services::{
-    BackupManifestService, Dispatched, NullService, ServiceFuture, ServiceSigner, StorageService,
+    BackupManifestService, Dispatched, NullService, ServiceFuture, ServiceHeader, ServiceSigner,
+    StorageService,
 };
 use kr_crypto::backup::{
     ArchivePlan, ArchiveRecipients, CollectionKind, KeyRotation, ObjectSource, SealedArchive,
@@ -579,7 +580,7 @@ impl kr_client::services::ServiceHttp for BusyWeb {
         &'a self,
         _url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         Box::pin(async {
             Ok(kr_service_stand_in::refusal(
@@ -594,7 +595,7 @@ impl kr_client::services::ServiceHttp for BusyWeb {
         &'a self,
         _url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         Box::pin(async {
             Ok(kr_client::services::ServiceHttpAnswer {
@@ -805,7 +806,7 @@ impl kr_client::services::ServiceHttp for Answering {
         &'a self,
         _url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         let answer = self.0.clone();
         Box::pin(async move { Ok(answer) })

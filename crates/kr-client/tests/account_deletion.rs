@@ -19,7 +19,7 @@ use kr_client::services::account::{
     AccountUsage, AuthorisationGrant, Client, Exchanged, IssuedGrant, RefreshToken, Refreshed,
     SignedInAccount, StoredGrant,
 };
-use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use kr_crypto::secret::SecretVec;
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
 use kr_crypto::{CryptoError, Result as CryptoResult};
@@ -124,7 +124,7 @@ impl Wire {
         &self,
         method: &'static str,
         url: &str,
-        headers: &[(&str, &str)],
+        headers: &[ServiceHeader<'_>],
         body: &[u8],
     ) -> std::result::Result<ServiceHttpAnswer, ClientError> {
         if let Some(peek) = self.peek.lock().expect("peek").as_ref() {
@@ -135,7 +135,7 @@ impl Wire {
             url: url.to_owned(),
             headers: headers
                 .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .map(|header| (header.name.to_owned(), header.value.to_owned()))
                 .collect(),
             body: body.to_vec(),
         });
@@ -154,7 +154,7 @@ impl ServiceHttp for Wire {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let answer = self.answer("POST", url, headers, body);
         let gate = self.take_gate(url);
@@ -170,7 +170,7 @@ impl ServiceHttp for Wire {
     fn get_json<'a>(
         &'a self,
         url: &'a str,
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let answer = self.answer("GET", url, headers, b"");
         let gate = self.take_gate(url);

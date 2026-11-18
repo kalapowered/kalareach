@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use kr_controller::service::Controller;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::open_store_in;
@@ -457,12 +457,12 @@ impl Gateway {
 
     /// A status question about a notification: the bearer is authenticated first, and the
     /// gateway holds nothing under an identifier it was never given.
-    fn status(&self, headers: &[(&str, &str)]) -> ServiceHttpAnswer {
+    fn status(&self, headers: &[ServiceHeader<'_>]) -> ServiceHttpAnswer {
         let state = self.state();
         let presented = headers
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            .map(|(_, value)| *value);
+            .find(|header| header.name.eq_ignore_ascii_case("authorization"))
+            .map(|header| header.value);
         let known = state.authorisations.values().any(|held| {
             let expected = {
                 use base64::Engine as _;
@@ -491,7 +491,7 @@ impl Gateway {
         }
     }
 
-    fn deliver(&self, body: &[u8], headers: &[(&str, &str)]) -> ServiceHttpAnswer {
+    fn deliver(&self, body: &[u8], headers: &[ServiceHeader<'_>]) -> ServiceHttpAnswer {
         let Ok(request) = serde_json::from_slice::<PushDeliveryRequest>(body) else {
             return Self::refusal(400, "INVALID_REQUEST");
         };
@@ -509,8 +509,8 @@ impl Gateway {
         };
         let presented = headers
             .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            .map(|(_, value)| *value);
+            .find(|header| header.name.eq_ignore_ascii_case("authorization"))
+            .map(|header| header.value);
         if presented != Some(expected.as_str()) {
             state.bearers_refused += 1;
             return Self::refusal(401, "UNAUTHENTICATED");
@@ -712,7 +712,7 @@ impl Gateway {
         &self,
         url: &str,
         body: &[u8],
-        headers: &[(&str, &str)],
+        headers: &[ServiceHeader<'_>],
     ) -> Result<ServiceHttpAnswer, kr_client::ClientError> {
         let replied = self
             .replies
@@ -729,7 +729,7 @@ impl Gateway {
                 body: serde_json::from_slice(body).unwrap_or(serde_json::Value::Null),
                 headers: headers
                     .iter()
-                    .map(|(name, value)| (name.to_ascii_lowercase(), (*value).to_owned()))
+                    .map(|header| (header.name.to_ascii_lowercase(), header.value.to_owned()))
                     .collect(),
             });
         }
@@ -762,7 +762,7 @@ impl ServiceHttp for Gateway {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         if url.contains("/api/mailbox/") {
             return self.mailbox.post_json(url, body, headers);

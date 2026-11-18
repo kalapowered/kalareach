@@ -15,7 +15,7 @@ use std::sync::Arc;
 use kr_client::services::ServiceFuture;
 use kr_client::services::account::{AccountToken, AccountTokenSource};
 use kr_client::services::voice::{
-    ManagedVoiceBroker, ManagedVoiceService, ServiceHttp, ServiceHttpAnswer,
+    ManagedVoiceBroker, ManagedVoiceService, ServiceHeader, ServiceHttp, ServiceHttpAnswer,
 };
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -3099,7 +3099,7 @@ impl ServiceHttp for ScriptedService {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let path = url
             .strip_prefix("https://reach.example")

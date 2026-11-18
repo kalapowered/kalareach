@@ -2677,7 +2677,7 @@ impl ServiceHttp for Contract {
         &'a self,
         _url: &'a str,
         body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let request: serde_json::Value = serde_json::from_slice(body).expect("a signed request");
         let signature: ServiceRequestSignature =

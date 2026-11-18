@@ -33,6 +33,7 @@ use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_websockets::{ClientBuilder, Limits, WebSocketStream};
 
+use crate::services::http::{HeaderFault, final_headers};
 use crate::shown::{Said, Shown};
 use crate::tunnel::{self, Carrier};
 
@@ -143,7 +144,7 @@ pub(crate) struct Upgrade<'a> {
     /// The path of the socket, beginning with `/`.
     pub path: &'a str,
     /// Headers to send with the upgrade, as name and value.
-    pub headers: &'a [(&'a str, &'a str)],
+    pub headers: &'a [crate::services::ServiceHeader<'a>],
     /// The largest frame the socket reads.
     pub max_payload: usize,
     /// The proxy to tunnel through, or nothing to connect directly.
@@ -297,15 +298,12 @@ async fn open_now(tls: &Arc<ClientConfig>, upgrade: &Upgrade<'_>) -> Result<Sock
     let mut builder = ClientBuilder::new()
         .uri(&address)
         .map_err(|_| Failure::Configuration(NOT_AN_ADDRESS))?;
-    for (name, value) in upgrade.headers {
+    for (name, value) in final_headers(upgrade.headers).map_err(|fault| match fault {
+        HeaderFault::Name => Failure::Configuration(NO_TOKEN_HEADER),
+        HeaderFault::Value => Failure::Configuration(NO_TOKEN),
+    })? {
         builder = builder
-            .add_header(
-                name.parse()
-                    .map_err(|_| Failure::Configuration(NO_TOKEN_HEADER))?,
-                value
-                    .parse()
-                    .map_err(|_| Failure::Configuration(NO_TOKEN))?,
-            )
+            .add_header(name, value)
             .map_err(|_| Failure::Configuration(NO_TOKEN_HEADER))?;
     }
     let retry_after = Arc::new(OnceLock::new());

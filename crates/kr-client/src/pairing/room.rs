@@ -42,6 +42,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_websockets::{Message, WebSocketStream};
 
+use crate::services::ServiceHeader;
 use crate::shown::{Said, Shown};
 use crate::tunnel;
 use crate::wss::{self, Failure, Upgrade};
@@ -284,7 +285,7 @@ impl RoomConnector {
         let path = format!("/api/pair/room/{}/{}", locator.as_str(), role.path());
         let headers = token
             .as_deref()
-            .map(|token| [(CONTROL_TOKEN_HEADER, token)]);
+            .map(|token| [ServiceHeader::secret(CONTROL_TOKEN_HEADER, token)]);
         let opened = wss::open(
             &self.tls,
             &Upgrade {

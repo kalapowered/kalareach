@@ -956,7 +956,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+    use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer};
     use kr_delivery::destination::DestinationRecord;
     use kr_delivery::producer::RecipientScope;
     use kr_delivery::push::{DeliveryStatus, PushSender};
@@ -1031,7 +1031,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             _body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             *self.put.lock().expect("not poisoned") += 1;
             Box::pin(async {

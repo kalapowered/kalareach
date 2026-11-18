@@ -17,7 +17,9 @@ use kr_client::services::account::{
     ACCOUNT_ORIGIN, AccountMark, AccountService, AccountToken, Client, IssuedGrant,
     PendingAuthorisation, Redirect, RefreshToken, SignedInAccount,
 };
-use kr_client::services::{NullService, ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::{
+    NullService, ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer,
+};
 use kr_crypto::store::MemoryStore;
 use kr_protocol::service::GatewayOrigin;
 
@@ -55,7 +57,7 @@ impl ServiceHttp for Closing {
         &'a self,
         url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         if url.ends_with("/status") {
             if self.unreachable.load(std::sync::atomic::Ordering::SeqCst) {
@@ -77,7 +79,7 @@ impl ServiceHttp for Closing {
     fn get_json<'a>(
         &'a self,
         _url: &'a str,
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         answered(r#"{"ok":false,"error":{"code":"NOT_FOUND","message":"no"}}"#)
     }

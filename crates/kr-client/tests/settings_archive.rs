@@ -22,9 +22,9 @@ use kr_client::services::storage::{
     STORAGE_UPLOAD_CREATE_PATH, STORAGE_UPLOAD_PART_PATH,
 };
 use kr_client::services::{
-    BackupManifestService, ServiceFuture, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
-    StorageService, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition, SyncRequestFence,
-    SyncRequestStatus, SyncRevision,
+    BackupManifestService, ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer,
+    ServiceSigner, StorageService, SyncBackupService, SyncExchanged, SyncFetched, SyncPosition,
+    SyncRequestFence, SyncRequestStatus, SyncRevision,
 };
 use kr_client::sync::{
     PrivacyRecord, SettingValue, SyncBody, SyncError, SyncObject, SyncSettings, SyncStore,
@@ -1225,7 +1225,7 @@ impl ServiceHttp for Meddling {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let answer = self.web.post_json(url, body, headers).await;
@@ -1238,7 +1238,7 @@ impl ServiceHttp for Meddling {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let answer = self.web.post_bytes(url, body, headers).await;

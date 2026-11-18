@@ -22,12 +22,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_client::services::ServiceHttp;
 use kr_client::services::account::deletion::{
     CodeRefusal, DeletionFault, DeletionOutcome, DeletionPreview, DeletionProgress, DeletionRead,
     DeviceSteps, ManagedAccountDeletion, OwnedOrganisation, StepFuture,
 };
 use kr_client::services::account::{AccountMark, SignedInAccount};
+use kr_client::services::{ServiceHeader, ServiceHttp};
 use kr_protocol::service::GatewayOrigin;
 use serde::Serialize;
 
@@ -379,7 +379,7 @@ impl ServiceHttp for Silent {
         &'a self,
         _url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         Box::pin(async {
             Err(kr_client::error::ClientError::refusal(

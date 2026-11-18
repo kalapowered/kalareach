@@ -479,15 +479,15 @@ impl ServiceHttp for Web {
         &'a self,
         _url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let request: serde_json::Value = serde_json::from_slice(body).expect("a signed request");
         let signature: ServiceRequestSignature =
             serde_json::from_value(request["signature"].clone()).expect("a credential");
         let authorization = headers
             .iter()
-            .find(|(name, _)| *name == "authorization")
-            .map(|(_, value)| *value);
+            .find(|header| header.name == "authorization")
+            .map(|header| header.value);
         let is_exchange = request["body"].get("exchange").is_some();
         let answer = self.take(
             &request["body"],

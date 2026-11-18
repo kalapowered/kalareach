@@ -85,7 +85,8 @@ use crate::services::storage::{
 };
 use crate::services::{
     ArchiveAnswer, BackupManifestService, Dispatched, NewUpload, Published, ServiceFuture,
-    ServiceHttp, ServiceHttpAnswer, ServiceSigner, StorageService, UploadProgress, upload_parts,
+    ServiceHeader, ServiceHttp, ServiceHttpAnswer, ServiceSigner, StorageService, UploadProgress,
+    upload_parts,
 };
 use crate::shown::{IoFault, Shown};
 use crate::sync::{SyncError, SyncStore};
@@ -632,7 +633,7 @@ impl ServiceHttp for PrivacyGate {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         match self.admit(url) {
             Ok(()) => self.http.post_json(url, body, headers),
@@ -644,7 +645,7 @@ impl ServiceHttp for PrivacyGate {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         match self.admit(url) {
             Ok(()) => self.http.post_bytes(url, body, headers),

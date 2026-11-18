@@ -10,8 +10,8 @@ use std::sync::Mutex;
 
 use kr_client::error::ClientError;
 use kr_client::services::{
-    AccountHttp, HttpDeadlines, HttpService, ResponseLimits, ServiceFuture, ServiceHttp,
-    ServiceHttpAnswer,
+    AccountHttp, HttpDeadlines, HttpService, ResponseLimits, ServiceFuture, ServiceHeader,
+    ServiceHttp, ServiceHttpAnswer,
 };
 use kr_client::shown::Shown;
 use kr_protocol::error::ErrorCode;
@@ -92,7 +92,7 @@ impl ServiceHttp for ManagedTransport {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             match self.transport() {
@@ -105,7 +105,7 @@ impl ServiceHttp for ManagedTransport {
     fn get_json<'a>(
         &'a self,
         url: &'a str,
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             match self.transport() {
@@ -133,7 +133,7 @@ impl AccountHttp for ManagedTransport {
     fn get<'a>(
         &'a self,
         url: &'a str,
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             match self.transport() {
@@ -174,7 +174,7 @@ impl AccountHttp for ClosedTransport {
     fn get<'a>(
         &'a self,
         _url: &'a str,
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move { Err(Self::refuse()) })
     }

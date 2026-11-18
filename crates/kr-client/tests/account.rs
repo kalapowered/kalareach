@@ -21,7 +21,7 @@ use kr_client::services::account::{
     Redirect, RefreshToken, Refreshed, SignedInAccount, StoredGrant, TOKEN_PATH, USAGE_PATH,
     USAGE_SCOPE, UsageLine, UsageResource, code_challenge, issuer_of,
 };
-use kr_client::services::{ServiceFuture, ServiceHttpAnswer};
+use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttpAnswer};
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use url::Url;
@@ -473,7 +473,7 @@ impl AccountHttp for Scripted {
     fn get<'a>(
         &'a self,
         url: &'a str,
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         self.seen
             .lock()

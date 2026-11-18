@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use kr_client::services::ServiceHttpAnswer;
+use kr_client::services::{ServiceHeader, ServiceHttpAnswer};
 use kr_delivery::external::ExternalMessage;
 use kr_delivery::push::{PushSender, SendOutcome};
 use kr_protocol::ids::NotificationId;
@@ -83,7 +83,11 @@ impl GatewayClient {
         let header = format!("Bearer {}", bearer(credential.secret.expose()));
         let answer = self.runtime.block_on(async {
             transport
-                .post_json(&url, &body, &[("authorization", header.as_str())])
+                .post_json(
+                    &url,
+                    &body,
+                    &[ServiceHeader::secret("authorization", header.as_str())],
+                )
                 .await
         });
         match answer {

@@ -1614,7 +1614,7 @@ impl kr_client::services::ServiceHttp for TakingGateway {
         &'a self,
         _url: &'a str,
         body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         let request: PushDeliveryRequest = serde_json::from_slice(body).expect("a request");
         self.bodies
@@ -3096,7 +3096,7 @@ impl kr_client::services::ServiceHttp for HeldMailbox {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         self.gate.pass();
         self.web.post_json(url, body, headers)

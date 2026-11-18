@@ -82,7 +82,7 @@ use url::Url;
 pub mod deletion;
 
 use super::json::Unreadable;
-use super::{ServiceFuture, ServiceHttpAnswer};
+use super::{ServiceFuture, ServiceHeader, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 use crate::shown::Shown;
 
@@ -1131,7 +1131,7 @@ pub trait AccountHttp: Send + Sync + fmt::Debug {
     fn get<'a>(
         &'a self,
         url: &'a str,
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer>;
 }
 
@@ -1538,7 +1538,10 @@ impl AccountService for ManagedAccountService {
                 .http
                 .get(
                     &self.url(USERINFO_PATH),
-                    &[("authorization", authorisation.as_str())],
+                    &[ServiceHeader::secret(
+                        "authorization",
+                        authorisation.as_str(),
+                    )],
                 )
                 .await?;
             if answer.status != 200 {
@@ -1569,7 +1572,10 @@ impl AccountService for ManagedAccountService {
                 .http
                 .get(
                     &self.url(USAGE_PATH),
-                    &[("authorization", authorisation.as_str())],
+                    &[ServiceHeader::secret(
+                        "authorization",
+                        authorisation.as_str(),
+                    )],
                 )
                 .await?;
             if answer.status != 200 {
@@ -3361,7 +3367,7 @@ mod tests {
         fn get<'a>(
             &'a self,
             _url: &'a str,
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             Box::pin(async move { panic!("nothing here reads with a token") })
         }
@@ -3694,7 +3700,7 @@ mod tests {
         fn get<'a>(
             &'a self,
             _url: &'a str,
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.answer()
         }

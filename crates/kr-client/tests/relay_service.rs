@@ -21,7 +21,7 @@ use kr_client::services::relay::{
 };
 use kr_client::services::{
     AccountToken, LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseAnswer,
-    RelayLeaseService, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
+    RelayLeaseService, ServiceHeader, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
 };
 use kr_client::{ClientError, Result};
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -102,7 +102,7 @@ impl ServiceHttp for Recorder {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, ServiceHttpAnswer> {
         // A signed relay request carries its credential in the body, so it sends no headers of
         // its own unless an account owns what it asks for. Recorded rather than ignored, so a test
@@ -112,7 +112,7 @@ impl ServiceHttp for Recorder {
             body.to_vec(),
             headers
                 .iter()
-                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .map(|header| (header.name.to_owned(), header.value.to_owned()))
                 .collect(),
         ));
         let answer = self.answer.lock().expect("the answer").clone();

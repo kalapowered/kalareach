@@ -34,7 +34,7 @@ use companion_tauri::push::{
 };
 use futures_util::FutureExt as _;
 use kr_client::pairing::paired::PairedHost;
-use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::relay::{ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use kr_client::services::{ManagedService, PushService, ServiceFuture, push};
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore, load_notification_preview_key};
@@ -519,7 +519,7 @@ impl ServiceHttp for Gateway {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         self.urls.lock().expect("the urls").push(url.to_owned());
         let sent: Value = serde_json::from_slice(body).expect("a request");

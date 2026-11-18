@@ -19,7 +19,7 @@ use kr_client::services::account::{
     AuthorisationGrant, Client, Exchanged, IssuedGrant, PendingAuthorisation, Redirect,
     RefreshToken, Refreshed, SignedInAccount, StoredGrant,
 };
-use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use kr_crypto::secret::SecretVec;
 use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
 use kr_crypto::{CryptoError, Result as CryptoResult};
@@ -88,7 +88,7 @@ impl ServiceHttp for Wire {
         &'a self,
         _url: &'a str,
         body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let answer = self.answer(body);
         Box::pin(async move { answer })
@@ -97,7 +97,7 @@ impl ServiceHttp for Wire {
     fn get_json<'a>(
         &'a self,
         _url: &'a str,
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let answer = self.answer(b"");
         Box::pin(async move { answer })

@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use base64::Engine as _;
-use kr_client::services::relay::{ServiceHttp, ServiceSigner};
+use kr_client::services::relay::{ServiceHeader, ServiceHttp, ServiceSigner};
 use kr_controller::push::client::GatewayClient;
 use kr_controller::push::status::{GatewayStatus, StatusAllowance};
 use kr_controller::push::transport::DeliveryTransports;
@@ -75,7 +75,7 @@ impl Gateway {
         }
     }
 
-    async fn post(&self, route: &str, body: &[u8], headers: &[(&str, &str)]) -> Answer {
+    async fn post(&self, route: &str, body: &[u8], headers: &[ServiceHeader<'_>]) -> Answer {
         let url = format!("{}{route}", self.origin.as_str());
         let answer = self
             .transport
@@ -265,8 +265,12 @@ impl Gateway {
                     base64::engine::general_purpose::URL_SAFE_NO_PAD
                         .encode(credential.secret.expose())
                 );
-                self.post(FORGET_ROUTE, &body, &[("authorization", bearer.as_str())])
-                    .await
+                self.post(
+                    FORGET_ROUTE,
+                    &body,
+                    &[ServiceHeader::secret("authorization", bearer.as_str())],
+                )
+                .await
             }
             None => self.post(FORGET_ROUTE, &body, &[]).await,
         }

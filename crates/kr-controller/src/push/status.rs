@@ -43,7 +43,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use kr_client::services::ServiceHttpAnswer;
+use kr_client::services::{ServiceHeader, ServiceHttpAnswer};
 use kr_delivery::push::{DeliveryStatus, StatusAnswer};
 use kr_protocol::ids::NotificationId;
 use kr_protocol::push::{PushDeliveryAck, PushDeliveryCredential};
@@ -214,7 +214,11 @@ impl GatewayStatus {
         self.runtime
             .block_on(async {
                 transport
-                    .post_json(&url, body, &[("authorization", header.as_str())])
+                    .post_json(
+                        &url,
+                        body,
+                        &[ServiceHeader::secret("authorization", header.as_str())],
+                    )
                     .await
             })
             .map_err(|error| error.to_string())

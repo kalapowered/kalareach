@@ -23,7 +23,7 @@ use kr_protocol::scalars::{AuthorisationKey, to_base64url};
 use serde::Deserialize;
 
 use super::account::{AccountMark, LEASE_SCOPE, SignedInAccount};
-use super::relay::ServiceHttp;
+use super::relay::{ServiceHeader, ServiceHttp};
 use super::signed::{Repeat, data_or_refusal, unreadable_answer};
 use super::{ServiceFuture, unconfigured};
 use crate::error::{ClientError, Result};
@@ -280,7 +280,14 @@ impl MembershipLeaseService for ManagedMembershipLeaseService {
             let authorisation = self.authorisation(token == Token::Renewed).await?;
             let answer = self
                 .http
-                .post_json(&path, &body, &[("authorization", authorisation.as_str())])
+                .post_json(
+                    &path,
+                    &body,
+                    &[ServiceHeader::secret(
+                        "authorization",
+                        authorisation.as_str(),
+                    )],
+                )
                 .await?;
             let answered: LeaseAnswer =
                 serde_json::from_value(data_or_refusal(&answer, Repeat::Safe)?)
@@ -302,7 +309,13 @@ impl MembershipLeaseService for ManagedMembershipLeaseService {
             let authorisation = self.authorisation(token == Token::Renewed).await?;
             let answer = self
                 .http
-                .get_json(&path, &[("authorization", authorisation.as_str())])
+                .get_json(
+                    &path,
+                    &[ServiceHeader::secret(
+                        "authorization",
+                        authorisation.as_str(),
+                    )],
+                )
                 .await?;
             serde_json::from_value(data_or_refusal(&answer, Repeat::Safe)?)
                 .map_err(|error| unreadable_answer("a policy authority", &error))

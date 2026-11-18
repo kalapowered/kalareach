@@ -78,6 +78,7 @@ use tokio_websockets::Message;
 
 use super::account::AccountTokenSource;
 use super::json;
+use super::relay::ServiceHeader;
 use super::voice::{
     VOICE_CLIENT_ABSENT_SECONDS, VOICE_CONTEXT_BURST, VOICE_CONTEXT_BYTES,
     VOICE_CONTEXT_PER_MINUTE, VOICE_CONTROL_FRAME_BYTES, VOICE_HEARTBEAT_SECONDS, VOICE_SCOPE,
@@ -1687,7 +1688,10 @@ async fn attach(
         &Upgrade {
             origin: &target.origin,
             path: &target.path,
-            headers: &[("authorization", authorisation.as_str())],
+            headers: &[ServiceHeader::secret(
+                "authorization",
+                authorisation.as_str(),
+            )],
             max_payload: VOICE_EVENT_FRAME_BYTES,
             proxy: None,
             loopback_plain: true,

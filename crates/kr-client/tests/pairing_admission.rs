@@ -20,8 +20,8 @@ use kr_client::services::admission::RelayAdmissionIssueBody;
 use kr_client::services::{
     AdmissionAnswer, AdmissionClock, AdmissionRequest, Alternatives, LeaseRequest,
     ManagedPairingAdmission, ManagedRelayLeaseService, PairingAdmissionService, PairingAdmissions,
-    RelayDirection, RelayLeaseService, RelayRefusal, ServiceFuture, ServiceHttp, ServiceHttpAnswer,
-    ServiceSigner,
+    RelayDirection, RelayLeaseService, RelayRefusal, ServiceFuture, ServiceHeader, ServiceHttp,
+    ServiceHttpAnswer, ServiceSigner,
 };
 use kr_client::{ClientError as Error, Result};
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -1151,7 +1151,7 @@ impl ServiceHttp for Exact {
         &'a self,
         _url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         Box::pin(async move {
@@ -1799,7 +1799,7 @@ impl ServiceHttp for Unreached {
         &'a self,
         _url: &'a str,
         _body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         self.requests.fetch_add(1, Ordering::SeqCst);
         Box::pin(async {

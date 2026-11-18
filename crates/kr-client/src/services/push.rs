@@ -373,6 +373,7 @@ mod tests {
     use kr_protocol::scalars::Digest256;
 
     use super::*;
+    use crate::services::ServiceHeader;
     use crate::services::relay::ServiceHttpAnswer;
 
     const VECTORS: &str = include_str!("../../../../fixtures/push/push.json");
@@ -544,7 +545,7 @@ mod tests {
             &'a self,
             url: &'a str,
             body: &'a [u8],
-            headers: &'a [(&'a str, &'a str)],
+            headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             assert!(headers.is_empty(), "a signed push request sends no headers");
             self.asked

@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::retry::{RequestClass, Step, UserAction};
-use crate::services::ServiceHttpAnswer;
 use crate::services::rendering::{NEVER_RENDERED, renders_only};
+use crate::services::{ServiceHeader, ServiceHttpAnswer};
 use kr_crypto::secret::Secret;
 use kr_protocol::mailbox::{SEAL_OVERHEAD_BYTES, mailbox_size_bucket};
 use kr_protocol::scalars::{AuthorisationKey, Bytes, Nonce192, Signature64, TimestampMs};
@@ -106,12 +106,12 @@ impl ServiceHttp for Recorder {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
-        let presented: Vec<(&str, &str)> = self
+        let presented: Vec<ServiceHeader<'_>> = self
             .authorization
             .iter()
-            .map(|value| ("authorization", value.as_str()))
+            .map(|value| ServiceHeader::secret("authorization", value.as_str()))
             .collect();
         assert!(
             headers == presented.as_slice(),

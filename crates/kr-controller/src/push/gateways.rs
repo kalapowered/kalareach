@@ -160,7 +160,7 @@ impl kr_client::services::ServiceHttp for GatedHttp {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         Box::pin(async move {
             self.allowed_now()?;
@@ -172,7 +172,7 @@ impl kr_client::services::ServiceHttp for GatedHttp {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         Box::pin(async move {
             self.allowed_now()?;
@@ -183,7 +183,7 @@ impl kr_client::services::ServiceHttp for GatedHttp {
     fn get_json<'a>(
         &'a self,
         url: &'a str,
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [kr_client::services::ServiceHeader<'a>],
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
         Box::pin(async move {
             self.allowed_now()?;
@@ -196,7 +196,7 @@ impl kr_client::services::ServiceHttp for GatedHttp {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+    use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 
     use super::*;
 
@@ -223,7 +223,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             _body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.carry()
         }
@@ -232,7 +232,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             _body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.carry()
         }
@@ -240,7 +240,7 @@ mod tests {
         fn get_json<'a>(
             &'a self,
             _url: &'a str,
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.carry()
         }

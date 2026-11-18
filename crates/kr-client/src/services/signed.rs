@@ -85,7 +85,7 @@ use serde::{Deserialize, Serialize};
 use super::account::AccountTokenSource;
 use super::alternatives::Alternatives;
 use super::json::Unreadable;
-use super::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
+use super::relay::{ServiceHeader, ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
 use crate::shown::{ServiceMessage, Shown};
@@ -523,17 +523,18 @@ impl SignedService {
         carriage: Carriage<'_>,
         authorisation: Option<&str>,
     ) -> std::result::Result<ServiceHttpAnswer, Unanswered> {
-        let token = authorisation.map(|value| ("authorization", value));
+        let token = authorisation.map(|value| ServiceHeader::secret("authorization", value));
         match carriage {
             Carriage::Body => {
-                let headers: Vec<(&str, &str)> = token.into_iter().collect();
+                let headers: Vec<ServiceHeader<'_>> = token.into_iter().collect();
                 self.http.post_json(url, request, &headers).await
             }
             Carriage::Header { header, content } => {
                 let carried = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request);
-                let headers: Vec<(&str, &str)> = std::iter::once((header, carried.as_str()))
-                    .chain(token)
-                    .collect();
+                let headers: Vec<ServiceHeader<'_>> =
+                    std::iter::once(ServiceHeader::plain(header, carried.as_str()))
+                        .chain(token)
+                        .collect();
                 self.http.post_bytes(url, content, &headers).await
             }
         }
@@ -1580,14 +1581,14 @@ mod tests {
         fn take(
             &self,
             body: &[u8],
-            headers: &[(&str, &str)],
+            headers: &[ServiceHeader<'_>],
             content: bool,
         ) -> ServiceFuture<'static, ServiceHttpAnswer> {
             self.sent.lock().expect("the requests").push(Sent {
                 body: body.to_vec(),
                 headers: headers
                     .iter()
-                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .map(|header| (header.name.to_owned(), header.value.to_owned()))
                     .collect(),
                 content,
             });
@@ -1604,7 +1605,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             body: &'a [u8],
-            headers: &'a [(&'a str, &'a str)],
+            headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.take(body, headers, false)
         }
@@ -1613,7 +1614,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             body: &'a [u8],
-            headers: &'a [(&'a str, &'a str)],
+            headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.take(body, headers, true)
         }
@@ -2082,7 +2083,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.take(body)
         }
@@ -2091,7 +2092,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.take(body)
         }

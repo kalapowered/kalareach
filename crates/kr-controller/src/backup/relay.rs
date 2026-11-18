@@ -615,7 +615,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use kr_client::services::{ServiceHttp, ServiceHttpAnswer};
+    use kr_client::services::{ServiceHeader, ServiceHttp, ServiceHttpAnswer};
     use kr_protocol::ids::{ArchiveId, BackupObjectId};
     use kr_protocol::scalars::Uuid;
     use tokio::sync::Notify;
@@ -632,7 +632,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             _body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.0.fetch_add(1, Ordering::SeqCst);
             Box::pin(async {
@@ -647,7 +647,7 @@ mod tests {
             &'a self,
             url: &'a str,
             body: &'a [u8],
-            headers: &'a [(&'a str, &'a str)],
+            headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.post_json(url, body, headers)
         }

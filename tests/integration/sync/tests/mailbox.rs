@@ -24,7 +24,7 @@ use kr_client::services::mailbox::{
     MailboxDeliveryState,
 };
 use kr_client::services::relay::ServiceSigner;
-use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use kr_crypto::envelope::{PairedSenders, ReplayLedger, open_delivered_envelope, seal_envelope};
 use kr_crypto::keys::StoredEnvelopeKeyPair;
 use kr_crypto::sealed::answer_mailbox_claim;
@@ -261,7 +261,7 @@ impl ServiceHttp for LateMailbox {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             if !url.ends_with(MAILBOX_DELIVER_PATH) {
@@ -303,7 +303,7 @@ impl ServiceHttp for LateMailbox {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         self.through.post_bytes(url, body, headers)
     }

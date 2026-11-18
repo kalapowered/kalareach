@@ -58,7 +58,7 @@ use kr_client::ClientError;
 use kr_client::drafts::{
     DraftSealer, DraftStore, DraftSync, DraftTarget, Published as DraftPublished,
 };
-use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer, ServiceSigner};
+use kr_client::services::relay::{ServiceHeader, ServiceHttp, ServiceHttpAnswer, ServiceSigner};
 use kr_client::services::signed::SignedService;
 use kr_client::services::sync::{MAX_SYNC_REQUEST_BYTES, ManagedSyncService, SYNC_EXCHANGE_PATH};
 use kr_client::services::{
@@ -165,7 +165,7 @@ impl ServiceHttp for Recording {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             // Before the request leaves, so a request whose answer never arrives is written down
@@ -1409,7 +1409,7 @@ impl ServiceHttp for Declining {
         &'a self,
         _url: &'a str,
         body: &'a [u8],
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             let request: serde_json::Value = serde_json::from_slice(body).unwrap_or_default();

@@ -525,7 +525,7 @@ fn refused(what: impl Into<String>) -> kr_client::ClientError {
 mod tests {
     use std::sync::Mutex;
 
-    use kr_client::services::{ServiceFuture, ServiceHttp};
+    use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttp};
     use kr_protocol::ids::{InstallationId, PushSenderRecordId, PushSenderRevision};
     use kr_protocol::push::{PushRatePolicy, PushSenderBinding};
     use kr_protocol::scalars::{EndpointKey, SecretBytes32, Uuid};
@@ -554,7 +554,7 @@ mod tests {
             &'a self,
             url: &'a str,
             body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             self.asked.lock().expect("not poisoned").push(Asked {
                 url: url.to_owned(),

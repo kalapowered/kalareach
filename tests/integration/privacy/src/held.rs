@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_client::services::ServiceFuture;
-use kr_client::services::relay::{ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::relay::{ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use kr_protocol::scalars::Uuid;
 use tokio::sync::oneshot;
 
@@ -159,7 +159,7 @@ impl ServiceHttp for Held {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
             // Before the request leaves, so one whose answer never comes back is written down, and
@@ -249,7 +249,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             _body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> ServiceFuture<'a, ServiceHttpAnswer> {
             Box::pin(async {
                 Ok(ServiceHttpAnswer {

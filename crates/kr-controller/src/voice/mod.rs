@@ -495,6 +495,7 @@ fn frame(request_id: kr_protocol::ids::RequestId, outcome: Result<ParamsValue>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_client::services::ServiceHeader;
     use kr_protocol::hostinfo::configuration::{self, ConfigurationDocument};
     use kr_protocol::scalars::Nullable;
 
@@ -507,7 +508,7 @@ mod tests {
             &'a self,
             _url: &'a str,
             _body: &'a [u8],
-            _headers: &'a [(&'a str, &'a str)],
+            _headers: &'a [ServiceHeader<'a>],
         ) -> kr_client::services::ServiceFuture<'a, kr_voice::broker::ServiceHttpAnswer> {
             Box::pin(std::future::pending())
         }

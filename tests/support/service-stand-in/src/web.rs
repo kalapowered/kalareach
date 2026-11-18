@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use kr_client::error::ClientError;
-use kr_client::services::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use kr_client::services::{ServiceFuture, ServiceHeader, ServiceHttp, ServiceHttpAnswer};
 use kr_protocol::archive::{
     BACKUP_PUBLICATION_DOMAIN, BACKUP_WRITER_DOMAIN, BackupGenerationPublication,
     BackupWriterRecord, BackupWriterRecordPayload, MAX_ARCHIVE_DESCRIPTOR_LEN,
@@ -1492,12 +1492,13 @@ fn proves(method: &str, signer: ServiceRequestSigner) -> bool {
 }
 
 /// The bearer token a request carries, when it carries one.
-fn bearer(headers: &[(&str, &str)]) -> Option<String> {
+fn bearer(headers: &[ServiceHeader<'_>]) -> Option<String> {
     headers
         .iter()
-        .find(|(name, _)| *name == "authorization")
-        .map(|(_, value)| {
-            value
+        .find(|header| header.name == "authorization")
+        .map(|header| {
+            header
+                .value
                 .strip_prefix("Bearer ")
                 .expect("a bearer token")
                 .to_owned()
@@ -1509,7 +1510,7 @@ impl ServiceHttp for ServiceWeb {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let document = serde_json::from_slice(body).expect("a signed request");
         let handled = self.handle(
@@ -1525,7 +1526,7 @@ impl ServiceHttp for ServiceWeb {
     fn get_json<'a>(
         &'a self,
         url: &'a str,
-        _headers: &'a [(&'a str, &'a str)],
+        _headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         // The only reads the service has are the release matrix and the service description,
         // which are public: no body, no credential and no account.
@@ -1543,13 +1544,13 @@ impl ServiceHttp for ServiceWeb {
         &'a self,
         url: &'a str,
         body: &'a [u8],
-        headers: &'a [(&'a str, &'a str)],
+        headers: &'a [ServiceHeader<'a>],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         let carried = headers
             .iter()
-            .find(|(name, _)| *name == "kr-service-request")
+            .find(|header| header.name == "kr-service-request")
             .expect("a part carries its signed request in a header")
-            .1;
+            .value;
         let document = document_of(carried);
         let handled = self.handle(
             self.path_of(url),
