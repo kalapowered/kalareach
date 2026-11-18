@@ -1271,27 +1271,7 @@ impl GrantDirectory {
             // thing between this call and the first withdrawal rather than the first of several
             // reads. Revoking a grant changes no parent link, so a subtree read now is the same
             // subtree the writes act on.
-            //
-            // A grant reached from two of this device's roots is kept once, under the first root
-            // that reaches it, which is the root its record would have named anyway: the write
-            // below takes each row only while it is still live, so a second root never revoked it
-            // twice. Keeping every copy would hold a whole chain of grants once per grant.
-            let mut claimed: BTreeSet<GrantId> = BTreeSet::new();
-            let mut subtrees = Vec::new();
-            for record in held {
-                if record.revoked_at_ms.is_some() {
-                    continue;
-                }
-                let grant_id = record.grant.grant_id;
-                // Collected into a boxed slice: filtering a vector in place keeps the capacity it
-                // was read with, and a chain of grants read once per grant would hold that
-                // capacity once per grant even with nothing left in it.
-                let subtree: Box<[GrantRecord]> = Self::subtree_to_revoke(connection, grant_id)?
-                    .into_iter()
-                    .filter(|record| claimed.insert(record.grant.grant_id))
-                    .collect();
-                subtrees.push((grant_id, subtree));
-            }
+            let subtrees = Self::subtrees_to_revoke(connection, &held)?;
             still_admitted()?;
             // One change, one debt, however many subtrees it withdraws.
             let covers = format!("the revocation of device {device_id}'s grants");
@@ -1508,6 +1488,51 @@ impl GrantDirectory {
             ));
         }
         Ok(subtree)
+    }
+
+    /// What a device's revocation withdraws, read for all of the device's grants at once: for each
+    /// of `held` that is not revoked and that no earlier one reaches, in the order `held` lists
+    /// them, that grant and the grants below it that no earlier one has taken, breadth first, as
+    /// [`Self::subtree_to_revoke`] reads them one grant at a time.
+    ///
+    /// The grants are read once, however many the device holds and in whatever order `held` lists
+    /// them. A walk does not go below a grant an earlier walk took, because everything below that
+    /// grant was taken with it. A grant reached from two of the device's roots is kept once, under
+    /// the first root that reaches it, which is the root its record would have named anyway: the
+    /// write takes each row only while it is still live, so a second root never revoked it twice.
+    /// A device with no grant left to withdraw reads none.
+    fn subtrees_to_revoke(
+        connection: &Connection,
+        held: &[GrantRecord],
+    ) -> Result<Vec<(GrantId, Box<[GrantRecord]>)>> {
+        if held.iter().all(|record| record.revoked_at_ms.is_some()) {
+            return Ok(Vec::new());
+        }
+        let children = children_by_parent(connection)?;
+        let mut claimed: BTreeSet<GrantId> = BTreeSet::new();
+        let mut subtrees = Vec::new();
+        for root in held {
+            let grant_id = root.grant.grant_id;
+            if root.revoked_at_ms.is_some() || !claimed.insert(grant_id) {
+                continue;
+            }
+            let mut found = Vec::new();
+            let mut queue = VecDeque::from([root.clone()]);
+            while let Some(record) = queue.pop_front() {
+                if let Some(next) = children.get(&record.grant.grant_id) {
+                    for child in next {
+                        if claimed.insert(child.grant.grant_id) {
+                            queue.push_back(child.clone());
+                        }
+                    }
+                }
+                found.push(record);
+            }
+            // A boxed slice: the vector is cut to its length, so what is held for the writes holds
+            // no spare capacity.
+            subtrees.push((grant_id, found.into_boxed_slice()));
+        }
+        Ok(subtrees)
     }
 
     /// Withdraws a subtree [`Self::subtree_to_revoke`] read, inside the caller's transaction.
@@ -4188,6 +4213,18 @@ fn read_for_device(connection: &Connection, device_id: DeviceId) -> Result<Vec<G
     rows.into_iter().collect()
 }
 
+/// Every grant, listed under the grant it is delegated from, each list in the order of the grants'
+/// identifiers, on a connection the caller is already holding. One read of the whole store.
+fn children_by_parent(connection: &Connection) -> Result<BTreeMap<GrantId, Vec<GrantRecord>>> {
+    let mut children: BTreeMap<GrantId, Vec<GrantRecord>> = BTreeMap::new();
+    for record in read_all(connection)? {
+        if let Some(parent) = record.grant.parent_grant_id.as_ref().copied() {
+            children.entry(parent).or_default().push(record);
+        }
+    }
+    Ok(children)
+}
+
 /// The grant and every grant delegated from it, breadth first, inside one transaction.
 ///
 /// The visited set is not defensive clutter. This store is a file, and a row that named itself as
@@ -4197,12 +4234,7 @@ fn subtree_within(connection: &Connection, grant_id: GrantId) -> Result<Vec<Gran
     let Some(root) = read_one(connection, grant_id)? else {
         return Ok(Vec::new());
     };
-    let mut children: BTreeMap<GrantId, Vec<GrantRecord>> = BTreeMap::new();
-    for record in read_all(connection)? {
-        if let Some(parent) = record.grant.parent_grant_id.as_ref().copied() {
-            children.entry(parent).or_default().push(record);
-        }
-    }
+    let children = children_by_parent(connection)?;
     let mut seen: BTreeSet<GrantId> = BTreeSet::new();
     let mut queue: VecDeque<GrantRecord> = VecDeque::new();
     let mut found = Vec::new();
@@ -5481,5 +5513,206 @@ mod a_devices_revocation {
             }
         }
         assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// What a device's revocation reads to withdraw, as it was read before the grants were read
+    /// once for all of the device's roots: each grant the device holds that is not revoked is read
+    /// with everything below it, the whole store each time, and what an earlier read took is
+    /// dropped afterwards. The cases below compare [`GrantDirectory::subtrees_to_revoke`] with it.
+    fn subtrees_read_one_root_at_a_time(
+        connection: &Connection,
+        held: &[GrantRecord],
+    ) -> Result<Vec<(GrantId, Box<[GrantRecord]>)>> {
+        let mut claimed: BTreeSet<GrantId> = BTreeSet::new();
+        let mut subtrees = Vec::new();
+        for record in held {
+            if record.revoked_at_ms.is_some() {
+                continue;
+            }
+            let grant_id = record.grant.grant_id;
+            let subtree: Box<[GrantRecord]> =
+                GrantDirectory::subtree_to_revoke(connection, grant_id)?
+                    .into_iter()
+                    .filter(|record| claimed.insert(record.grant.grant_id))
+                    .collect();
+            subtrees.push((grant_id, subtree));
+        }
+        Ok(subtrees)
+    }
+
+    /// `revoke_device` as it was written before the grants were read once for all of the device's
+    /// roots, with [`subtrees_read_one_root_at_a_time`] in the place of the new reading and no
+    /// claim: what a claim keeps is what this returns as `revoked`, and that code is not changed.
+    fn revoke_device_one_root_at_a_time(
+        store: &GrantDirectory,
+        device_id: DeviceId,
+        now_ms: u64,
+    ) -> Result<GrantRevocation> {
+        store.in_transaction(|connection| {
+            let held = read_for_device(connection, device_id)?;
+            let mut merged = GrantRevocation {
+                grant_id: held
+                    .first()
+                    .map_or_else(|| GrantId::new(Uuid::NIL), |record| record.grant.grant_id),
+                revoked: Vec::new(),
+                reached: Vec::new(),
+                reached_holding_leases: BTreeSet::new(),
+                devices: BTreeSet::new(),
+                sessions: BTreeSet::new(),
+                covers_every_session: false,
+                debt: None,
+            };
+            merged.devices.insert(device_id);
+            let subtrees = subtrees_read_one_root_at_a_time(connection, &held)?;
+            let covers = format!("the revocation of device {device_id}'s grants");
+            let now_ms = next_moment(connection, now_ms)?;
+            let mut debt = None;
+            let closes = store.held_closes();
+            for (grant_id, subtree) in &subtrees {
+                let one = GrantDirectory::revoke_subtree(
+                    connection, *grant_id, subtree, now_ms, &mut debt, &covers, &closes,
+                )?;
+                merged.revoked.extend(one.revoked);
+                merged.reached.extend(one.reached);
+                merged
+                    .reached_holding_leases
+                    .extend(one.reached_holding_leases);
+                merged.devices.extend(one.devices);
+                merged.sessions.extend(one.sessions);
+                merged.covers_every_session |= one.covers_every_session;
+            }
+            merged.debt = debt;
+            Ok(merged)
+        })
+    }
+
+    /// The orders a device's grants can be listed in: the store's own, the reverse of it, the
+    /// second half before the first, every other grant before the rest, and a fixed shuffle.
+    fn orders(held: &[GrantRecord]) -> Vec<(&'static str, Vec<GrantRecord>)> {
+        let half = held.len() / 2;
+        let mut shuffled: Vec<(u64, GrantRecord)> = held
+            .iter()
+            .enumerate()
+            .map(|(place, record)| {
+                let place = u64::try_from(place).expect("a count");
+                (
+                    place.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 7,
+                    record.clone(),
+                )
+            })
+            .collect();
+        shuffled.sort_by_key(|(key, _)| *key);
+        vec![
+            ("as the store lists them", held.to_vec()),
+            ("reversed", held.iter().rev().cloned().collect()),
+            (
+                "the second half first",
+                held[half..].iter().chain(&held[..half]).cloned().collect(),
+            ),
+            (
+                "every other grant first",
+                held.iter()
+                    .step_by(2)
+                    .chain(held.iter().skip(1).step_by(2))
+                    .cloned()
+                    .collect(),
+            ),
+            (
+                "shuffled",
+                shuffled.into_iter().map(|(_, record)| record).collect(),
+            ),
+        ]
+    }
+
+    /// The rows the store holds after a revocation that bear on it: every grant, and the moment
+    /// and text of every fence debt.
+    fn rows_of(store: &GrantDirectory) -> (Vec<GrantRecord>, Vec<(String, i64)>) {
+        store
+            .in_transaction(|connection| {
+                let debts = connection
+                    .prepare(
+                        "SELECT covers, recorded_at_ms FROM fence_debt
+                          ORDER BY recorded_at_ms, covers",
+                    )
+                    .map_err(ControllerError::registry)?
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })
+                    .map_err(ControllerError::registry)?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(ControllerError::registry)?;
+                Ok((read_all(connection)?, debts))
+            })
+            .expect("the rows read")
+    }
+
+    /// What is read to be withdrawn is what reading one root at a time read, grant for grant and
+    /// in the same order, whatever the order the device's grants are listed in and whatever the
+    /// shape they have: the first of the device's roots, in the order listed, that reaches a grant
+    /// keeps it, and the grants of a root come breadth first. Reading one root at a time also made
+    /// an entry with no grant in it for each root an earlier root had taken; such an entry
+    /// withdraws nothing (the case below shows the result and the rows are the same without it),
+    /// and the comparison leaves it out.
+    #[test]
+    fn withdraws_what_a_walk_from_each_of_its_grants_in_turn_withdrew_whatever_the_order_and_the_shape()
+     {
+        for shape in shapes(64) {
+            let store = store_of(&shape);
+            let held = store
+                .in_transaction(|connection| read_for_device(connection, device_of(DEVICE)))
+                .expect("the device's grants read");
+            for (order, held) in orders(&held) {
+                let (now, before) = store
+                    .in_transaction(|connection| {
+                        Ok((
+                            GrantDirectory::subtrees_to_revoke(connection, &held)?,
+                            subtrees_read_one_root_at_a_time(connection, &held)?
+                                .into_iter()
+                                .filter(|(_, subtree)| !subtree.is_empty())
+                                .collect::<Vec<_>>(),
+                        ))
+                    })
+                    .expect("both readings read");
+                assert!(
+                    now == before,
+                    "{}, {order}: what is read to be withdrawn",
+                    shape.name
+                );
+            }
+        }
+    }
+
+    /// A device's revocation returns what it returned, and leaves the grants and the fence debts
+    /// as it left them, when the grants are read once for all of the device's roots.
+    #[test]
+    fn returns_and_leaves_what_a_walk_from_each_of_its_grants_in_turn_returned_and_left() {
+        for shape in shapes(64) {
+            let (before, now) = (store_of(&shape), store_of(&shape));
+            let device = device_of(DEVICE);
+            let one = revoke_device_one_root_at_a_time(&before, device, 5_000)
+                .expect("revoked one root at a time");
+            let other = now
+                .revoke_device(device, 5_000, || Ok(()), None)
+                .expect("revoked");
+            assert_eq!(
+                one.debt.is_some(),
+                other.debt.is_some(),
+                "{}: whether it wrote a debt",
+                shape.name
+            );
+            let (one, other) = (
+                GrantRevocation { debt: None, ..one },
+                GrantRevocation {
+                    debt: None,
+                    ..other
+                },
+            );
+            assert!(one == other, "{}: what it returned", shape.name);
+            assert!(
+                rows_of(&before) == rows_of(&now),
+                "{}: the rows it left",
+                shape.name
+            );
+        }
     }
 }
