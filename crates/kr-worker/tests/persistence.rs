@@ -1884,13 +1884,13 @@ fn a_receipt_kept_under_a_code_this_build_lacks_is_unavailable_to_the_running_lo
             failure.to_string().contains("error code"),
             "the answer names what it could not read: {failure}"
         );
+        assert_eq!(
+            rows(),
+            before,
+            "attempt {attempt}: the receipt stays as it was after the lookup, and no claim or effect was recorded"
+        );
     }
     drop(journal);
-    assert_eq!(
-        rows(),
-        before,
-        "the receipt stays as it was after each lookup, and no claim or effect was recorded"
-    );
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
