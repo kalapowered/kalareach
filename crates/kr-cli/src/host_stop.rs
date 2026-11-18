@@ -466,8 +466,6 @@ pub(crate) struct Facts {
     pub(crate) unsettled: Option<u64>,
     /// What earlier attempts recorded, which this command said at its start.
     pub(crate) records: Vec<Shown>,
-    /// What a restart started: absent for a stop, and null where the restart started no daemon.
-    pub(crate) started: Option<Option<StartedFact>>,
     /// The daemon that answers a restart and what the restart launched: absent for a stop.
     pub(crate) answer: Option<Answer>,
 }
@@ -480,16 +478,7 @@ impl Facts {
             pid: None,
             unsettled: None,
             records,
-            started: None,
             answer: None,
-        }
-    }
-
-    /// These facts for a restart, which started no daemon so far.
-    pub(crate) fn of_a_restart(self) -> Self {
-        Self {
-            started: Some(None),
-            ..self
         }
     }
 
@@ -498,16 +487,6 @@ impl Facts {
             .with("stop", self.knows.word())
             .with("pid", self.pid)
             .with("unsettled", self.unsettled);
-        if let Some(started) = self.started {
-            document.set(
-                "started",
-                started.map(|started| {
-                    Document::new()
-                        .with("start", started.start)
-                        .with("pid", started.pid)
-                }),
-            );
-        }
         if let Some(answer) = self.answer {
             document.set("serving", answer.serving);
             document.set(
@@ -1170,7 +1149,13 @@ pub(crate) fn say_at_the_start(
 /// What a person does if the process that holds the environment stays: the process the lock file
 /// names where it is a process named kr-controller, and otherwise the way to find it.
 pub(crate) fn how_to_end_the_holder(environment: &EnvironmentPaths) -> Shown {
-    match named_daemon(environment) {
+    how_to_end_the_process(named_daemon(environment))
+}
+
+/// What a person does if the process that holds the environment stays, where the process that the
+/// lock file names is `named`.
+pub(crate) fn how_to_end_the_process(named: Option<u64>) -> Shown {
+    match named {
         Some(pid) => shown!(
             "If it stays like this, process {} is the daemon and {} {} ends it.",
             pid,
@@ -1696,7 +1681,6 @@ pub(crate) fn say_the_stop(
         pid,
         unsettled,
         records: none.records.clone(),
-        started: none.started,
         answer: none.answer,
     };
     conclude(said.exit, message, &facts, json, earlier)
@@ -2108,7 +2092,6 @@ pub(crate) fn ended_by(
                 pid,
                 unsettled: None,
                 records: none.records.clone(),
-                started: none.started,
                 answer: none.answer,
             };
             Ok(conclude(said.exit, words, &facts, json, earlier))
@@ -7140,7 +7123,6 @@ mod tests {
                 pid: Some(4000),
                 unsettled: None,
                 records: Vec::new(),
-                started: None,
                 answer: None,
             };
             assert!(

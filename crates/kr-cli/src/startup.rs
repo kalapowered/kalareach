@@ -32,6 +32,7 @@
 //! second one from serving beside it.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -45,6 +46,7 @@ use kr_protocol::local::LocalClientKind;
 
 use crate::cli::StartupArguments;
 use crate::error::{CliError, Result};
+use crate::host_stop::{Gave, Sight, gave_by_the_greeting};
 use crate::resolve::{self, KnownEnvironment};
 use crate::service_manager;
 
@@ -506,37 +508,6 @@ pub struct Started {
     pub start: ControllerStartup,
     /// The service manager asked, under the service start.
     pub manager: Option<service_manager::Manager>,
-    /// Whether this command can name the launched process, so that an answer which states `pid`
-    /// is from that process and not from another that took the number. The standalone start holds
-    /// the child it launched: it had not ended and had not been collected when the answer came, so
-    /// no other process can hold its number. A service manager's start holds nothing: the start
-    /// identity of the number the manager named was read right after the manager named it and
-    /// again when the answer came, and the two readings are equal. Where neither holds, and for
-    /// the scheduled task, which names no number, the answer is not shown to be the launched
-    /// process.
-    pub held: bool,
-}
-
-/// Whether two readings of the start identity of the number that a service manager named show one
-/// process that held the number from the first reading to the second: the manager named a number,
-/// both readings were made, and they are equal. The instant between the manager's naming the
-/// number and the first reading is not covered: nothing the command can read closes it, since the
-/// manager's statement carries no start identity.
-#[cfg(unix)]
-#[must_use]
-pub(crate) fn one_process_held_the_number(
-    named: Option<u32>,
-    first: Option<&kr_protocol::identity::ProcessStartIdentity>,
-    second: Option<&kr_protocol::identity::ProcessStartIdentity>,
-) -> bool {
-    named.is_some() && first.is_some() && first == second
-}
-
-/// The start identity of the process that holds `pid` now: none where the process is gone or the
-/// system does not answer.
-#[cfg(unix)]
-fn start_identity_of(pid: u32) -> Option<kr_protocol::identity::ProcessStartIdentity> {
-    kr_ipc::identity::process_start_identity(pid).ok()
 }
 
 impl Started {
@@ -969,41 +940,6 @@ pub(crate) async fn reach(
     }
 }
 
-/// What one read of the daemon at an endpoint gave, in the three outcomes that a result keeps
-/// apart: a usable greeting, a reply that this command cannot use, and no reply.
-pub(crate) enum Read {
-    /// A daemon gave a usable greeting, and this is the connection to it.
-    Greeting(Box<Listed>),
-    /// A daemon replied, and this command cannot use the reply: a refusal of the greeting, a
-    /// version that does not fit, a message of another kind. The words are what the reply was.
-    Reply(Shown),
-    /// No daemon replied: nothing listens, the connection failed or was cut, or nothing answered
-    /// within the bound. The words are the failure.
-    NoReply(Shown),
-}
-
-/// Makes one attempt to reach the daemon at `endpoint`, bounded by `bound`, and says which of the
-/// three outcomes it gave. A failure is a reply only where a daemon wrote it
-/// ([`kr_ipc::error::ErrorSource::Reply`]); a closure and this side's own fault are no reply.
-pub(crate) async fn read(
-    endpoint: &kr_ipc::paths::Endpoint,
-    bound: Duration,
-    majors: &[u16],
-) -> Read {
-    match reach(endpoint, bound, majors).await {
-        Reached::Answered(listed) => Read::Greeting(listed),
-        Reached::Silent => Read::NoReply(Shown::said(
-            "the endpoint accepted the connection and did not answer",
-        )),
-        Reached::Refused(error) => match error.comes_from() {
-            kr_ipc::error::ErrorSource::Reply => Read::Reply(Shown::ipc(&error)),
-            kr_ipc::error::ErrorSource::Closure | kr_ipc::error::ErrorSource::OwnFault => {
-                Read::NoReply(Shown::ipc(&error))
-            }
-        },
-    }
-}
-
 /// The failure a daemon that does not answer in time ends `kr new` with.
 fn unanswered(message: Shown) -> CliError {
     CliError::Unfinished {
@@ -1025,8 +961,29 @@ pub(crate) fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
     )
 }
 
+tokio::task_local! {
+    /// Where the reads that a start makes tell what they saw, set by [`telling_sights`].
+    static SIGHTS: Arc<dyn Fn(Sight) + Send + Sync>;
+}
+
+/// Runs `start` with each of its attempts to reach the daemon told to `seen` as the attempt is made
+/// and ends: that it began, and what it gave where no daemon answered. The attempt that finds a
+/// daemon is told by the caller, which holds the connection.
+pub(crate) async fn telling_sights<T>(
+    seen: Arc<dyn Fn(Sight) + Send + Sync>,
+    start: impl Future<Output = T>,
+) -> T {
+    SIGHTS.scope(seen, start).await
+}
+
+/// Tells the reads of the running start, if it is told, what one of them saw.
+fn saw(sight: Sight) {
+    let _ = SIGHTS.try_with(|seen| seen(sight));
+}
+
 /// Tries the daemon at `endpoint` until one answers or `deadline` passes, each attempt bounded by
-/// what is left of the deadline, and runs `between` after every attempt that failed.
+/// what is left of the deadline, and runs `between` after every attempt that failed. Each attempt
+/// is told to the running start's reader, if there is one ([`telling_sights`]).
 ///
 /// Returns the connection, or what the last attempt found.
 pub(crate) async fn answered_by(
@@ -1037,12 +994,17 @@ pub(crate) async fn answered_by(
 ) -> std::result::Result<Listed, Shown> {
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        saw(Sight::Began);
         let last = match reach(endpoint, left, majors).await {
             Reached::Answered(client) => return Ok(*client),
             Reached::Silent => {
+                saw(Sight::Gave(Gave::NothingInTime));
                 Shown::said("the endpoint accepted the connection and did not answer")
             }
-            Reached::Refused(error) => Shown::ipc(&error),
+            Reached::Refused(error) => {
+                saw(Sight::Gave(gave_by_the_greeting(&error)));
+                Shown::ipc(&error)
+            }
         };
         between();
         if tokio::time::Instant::now() >= deadline {
@@ -1196,7 +1158,6 @@ async fn standalone(
         pid: Some(child.id()),
         start: ControllerStartup::Standalone,
         manager: None,
-        held: false,
     };
     let deadline = tokio::time::Instant::now() + bounds.start;
     // The daemon this command started, or the one another command started first: either way the
@@ -1208,13 +1169,7 @@ async fn standalone(
     })
     .await
     {
-        Ok(client) => {
-            // The child that this command holds had not ended when the answer came, and was never
-            // collected (a collected child gives its status again): its number names it alone, for
-            // as long as this command runs.
-            let held = matches!(child.try_wait(), Ok(None));
-            return Ok((ours(client)?, Some(Started { held, ..started })));
-        }
+        Ok(client) => return Ok((ours(client)?, Some(started))),
         Err(last) => last,
     };
     let ended = child.try_wait().ok().flatten();
@@ -1395,22 +1350,14 @@ async fn managed(
         .map_err(blocked)?
         .map_err(|refusal| refused(asked_and_unanswered(refusal, launched)))?;
     launched.store(true, Ordering::SeqCst);
-    // The command holds no process that the manager started. The identity of the number that the
-    // manager names is read right away and again when the answer comes.
-    let first = asked.pid.and_then(start_identity_of);
     let started = Started {
         pid: asked.pid,
         start: ControllerStartup::Service,
         manager: Some(asked.manager),
-        held: false,
     };
     let deadline = tokio::time::Instant::now() + bounds.start;
     let last = match answered_by(endpoint, deadline, majors, || {}).await {
-        Ok(client) => {
-            let second = asked.pid.and_then(start_identity_of);
-            let held = one_process_held_the_number(asked.pid, first.as_ref(), second.as_ref());
-            return Ok((client, Some(Started { held, ..started })));
-        }
+        Ok(client) => return Ok((client, Some(started))),
         Err(last) => last,
     };
     let said = log.said("its log holds nothing since it started");
@@ -1553,7 +1500,6 @@ async fn wait_for_the_task_start(
         pid: None,
         start: ControllerStartup::Standalone,
         manager: None,
-        held: false,
     };
     let last = match answered_by(endpoint, deadline, majors, || {}).await {
         Ok(client) => {
@@ -2731,7 +2677,6 @@ mod tests {
             pid: Some(4242),
             start: ControllerStartup::Standalone,
             manager: None,
-            held: true,
         };
         assert_eq!(
             standalone.describe(environment).as_str(),
@@ -2744,7 +2689,6 @@ mod tests {
             pid: None,
             start: ControllerStartup::Service,
             manager: Some(service_manager::Manager::Systemd),
-            held: false,
         };
         assert_eq!(
             service.describe(environment).as_str(),
@@ -3424,7 +3368,6 @@ mod tests {
             pid: None,
             start: ControllerStartup::Standalone,
             manager: None,
-            held: false,
         };
         let launched = AtomicBool::new(true);
         let withdrawn = Ok(kr_ipc::starter::Withdrawal::Withdrawn);
@@ -3466,38 +3409,6 @@ mod tests {
                 && !unconfirmed.contains("was run"),
             "{unconfirmed}"
         );
-    }
-
-    /// A service manager's start is proved by reading the start identity of the number it names
-    /// twice: two readings of one live process are one process; a number whose identity changed
-    /// between them, a manager that named none and a reading that failed are not.
-    #[cfg(unix)]
-    #[test]
-    fn two_readings_of_a_named_number_are_one_process_only_where_they_are_equal() {
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("30")
-            .spawn()
-            .expect("a child that holds still");
-        let pid = child.id();
-        let first = start_identity_of(pid);
-        let second = start_identity_of(pid);
-        let changed = first.as_ref().map(|identity| {
-            kr_protocol::identity::ProcessStartIdentity::new(
-                identity.pid.get(),
-                identity.source,
-                identity.start_value.get() + 1,
-            )
-        });
-        let held = one_process_held_the_number(Some(pid), first.as_ref(), second.as_ref());
-        let moved = one_process_held_the_number(Some(pid), first.as_ref(), changed.as_ref());
-        let none_named = one_process_held_the_number(None, first.as_ref(), second.as_ref());
-        let unread = one_process_held_the_number(Some(pid), None, second.as_ref());
-        let _ = child.kill();
-        let _ = child.wait();
-        assert!(first.is_some() && held, "two readings of one live process");
-        assert!(!moved, "an identity that changed between the readings");
-        assert!(!none_named, "a manager that named no number");
-        assert!(!unread, "a first reading that failed");
     }
 
     /// KR-REQ-07.12 (the task's start, whole): a daemon answers while the request this command left

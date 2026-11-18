@@ -16,9 +16,26 @@ pub(super) enum Holder {
     /// Nothing holds the environment and nothing listens: no daemon runs.
     Gone,
     /// The holder still did not answer and still held the environment when the bound ended.
-    /// `replied` is whether any look of the wait found a reply that proves nothing and cannot be
-    /// used: the holder did not then "not answer".
-    Silent { replied: bool },
+    Silent,
+}
+
+/// Reads the lock now and writes it to `record`: the read belongs to the read of the endpoint that
+/// came before it, so it is made after that read and before the next.
+pub(super) async fn read_the_lock(
+    operations: &impl Operations,
+    within: Duration,
+    record: &Shared,
+) -> std::result::Result<bool, kr_client::shown::Shown> {
+    let held = operations.held(within).await;
+    record.observe(Observation::Lock(LockRead {
+        lock: match held {
+            Ok(true) => Lock::Held,
+            Ok(false) => Lock::Free,
+            Err(_) => Lock::NotReadable,
+        },
+        named: operations.named_daemon(),
+    }));
+    held
 }
 
 /// Waits up to `bound` for the holder to answer or to let go.
@@ -32,30 +49,20 @@ pub(super) enum Holder {
 pub(super) async fn wait(operations: &impl Operations, bound: Duration, record: &Shared) -> Holder {
     let deadline = tokio::time::Instant::now() + bound;
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let mut replied = false;
     loop {
         let endpoint = operations
             .look(left(), &mut |sight| {
                 record.observe(Observation::Sight(sight))
             })
             .await;
-        let held = operations.held(left()).await;
-        record.observe(Observation::Lock(LockRead {
-            lock: match held {
-                Ok(true) => Lock::Held,
-                Ok(false) => Lock::Free,
-                Err(_) => Lock::NotReadable,
-            },
-            named: operations.named_daemon(),
-        }));
+        let held = read_the_lock(operations, left(), record).await;
         match endpoint {
             Endpoint::Same(_) | Endpoint::Another => return Holder::Answers,
             Endpoint::Nobody if matches!(held, Ok(false)) => return Holder::Gone,
-            Endpoint::Unproved(_) => replied = true,
-            Endpoint::Nobody | Endpoint::Unclear => {}
+            Endpoint::Nobody | Endpoint::Unproved(_) | Endpoint::Unclear => {}
         }
         if left().is_zero() {
-            return Holder::Silent { replied };
+            return Holder::Silent;
         }
         operations.pause(LOOK_EVERY.min(left())).await;
     }
@@ -300,10 +307,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_holder_that_never_answers_ends_the_wait_at_the_bound() {
         let supplied = Supplied::new(vec![at_once(Ok(true))], vec![at_once(Endpoint::Unclear)]);
-        assert_eq!(
-            wait(&supplied, BOUND, &Shared::new()).await,
-            Holder::Silent { replied: false }
-        );
+        assert_eq!(wait(&supplied, BOUND, &Shared::new()).await, Holder::Silent);
         assert_eq!(supplied.start.elapsed(), BOUND);
         let calls = supplied.calls();
         assert!(
@@ -330,10 +334,7 @@ mod tests {
                 at_once(Endpoint::Unclear),
             ],
         );
-        assert_eq!(
-            wait(&supplied, BOUND, &Shared::new()).await,
-            Holder::Silent { replied: true }
-        );
+        assert_eq!(wait(&supplied, BOUND, &Shared::new()).await, Holder::Silent);
     }
 
     /// Every look and the lock read after it are written to the record: the lock read belongs to
@@ -375,10 +376,7 @@ mod tests {
             vec![at_once(Endpoint::Unproved(an_answer()))],
         );
         let record = Shared::new();
-        assert_eq!(
-            wait(&supplied, BOUND, &record).await,
-            Holder::Silent { replied: true }
-        );
+        assert_eq!(wait(&supplied, BOUND, &record).await, Holder::Silent);
         let written = record.read();
         assert!(written.replied && !written.greeted);
         assert_eq!(written.last, Some(Last::Reply));
@@ -415,10 +413,7 @@ mod tests {
                 takes: None,
             }],
         );
-        assert_eq!(
-            wait(&supplied, BOUND, &Shared::new()).await,
-            Holder::Silent { replied: false }
-        );
+        assert_eq!(wait(&supplied, BOUND, &Shared::new()).await, Holder::Silent);
         assert_eq!(supplied.start.elapsed(), BOUND);
     }
 }
