@@ -288,3 +288,88 @@ fn kr_req_07_64_a_program_that_cannot_start_records_no_mode_and_says_so() {
     );
     assert!(!probed.late, "it never ran, so it was not late");
 }
+
+/// A digest of the names and bytes under `root`, to tell a tree that a probe ran in from one it
+/// changed.
+fn tree_state(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(directory: &Path, found: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let mut paths: Vec<_> = std::fs::read_dir(directory)
+            .expect("lists the directory")
+            .map(|entry| entry.expect("an entry").path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                found.push((path.clone(), Vec::new()));
+                walk(&path, found);
+            } else {
+                let bytes = std::fs::read(&path).expect("reads the file");
+                found.push((path, bytes));
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(root, &mut found);
+    found
+}
+
+/// KR-REQ-11.16: a probe is bounded, and it leaves the tree it ran in as it found it.
+///
+/// The upstream is a stand-in that answers slowly: it would name a mode, but only after a delay far
+/// longer than the probe is given. The probe is held to its deadline: it returns late with no mode,
+/// though the answer the upstream would have given names one, and it waited the whole of the bound
+/// before it gave up. The same stand-in answering at once is read, so what ended the slow one is
+/// the bound and not a refusal of that upstream. The probe runs in a private tree the person
+/// owns, and the tree is as it was after each run.
+#[test]
+fn kr_req_11_16_a_probe_is_held_to_its_deadline_and_leaves_the_tree_it_ran_in_as_it_was() {
+    let tree = kr_ipc::testing::PrivateTempDir::create();
+    let root = tree.path();
+    std::fs::create_dir_all(root.join("projects").join("notes")).expect("makes the directories");
+    std::fs::write(root.join("projects").join("notes").join("a.txt"), b"a file").expect("a file");
+    std::fs::write(root.join("top.txt"), b"another file").expect("another file");
+    let before = tree_state(root);
+
+    let slow = Standin::running(
+        r#"sleep 30; printf '{"mode":"elevated"}'"#,
+        r#"Start-Sleep 30; [Console]::Out.Write('{"mode":"elevated"}')"#,
+    );
+    let deadline = Duration::from_secs(2);
+    let started = std::time::Instant::now();
+    let probed = probe::run_within(
+        &slow.program,
+        &slow.probe(&[]),
+        &[],
+        root,
+        deadline,
+        probe::MAX_OUTPUT_BYTES,
+    );
+    let waited = started.elapsed();
+    assert_eq!(
+        probed.mode, None,
+        "the answer that comes after the bound is not taken: {probed:?}"
+    );
+    assert!(probed.late, "{probed:?}");
+    assert!(
+        waited >= deadline,
+        "the probe waited the whole of its bound, and was not refused early: {waited:?}"
+    );
+    assert_eq!(
+        tree_state(root),
+        before,
+        "the tree is as it was after a late probe"
+    );
+
+    let prompt = Standin::running(
+        r#"printf '{"mode":"elevated"}'"#,
+        r#"[Console]::Out.Write('{"mode":"elevated"}')"#,
+    );
+    let answered = prompt.run(root);
+    assert_eq!(answered.mode.as_deref(), Some("elevated"), "{answered:?}");
+    assert!(!answered.late, "{answered:?}");
+    assert_eq!(
+        tree_state(root),
+        before,
+        "the tree is as it was after an answered probe"
+    );
+}
