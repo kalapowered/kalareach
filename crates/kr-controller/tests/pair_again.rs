@@ -2531,6 +2531,87 @@ async fn the_owners_view_gives_no_record_after_the_grant_it_named_ran_out_and_no
     host.stop().await;
 }
 
+/// KR-REQ-10.08: the owner's view of an invitation that committed carries the candidate the host
+/// recorded with the commitment, and where a commitment holds no display bundle for the device the
+/// view carries none and the status is still the commitment's. No writer of this tree stores such a
+/// commitment, so the record is written directly: the stored commitment's bundle member is made null.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_view_of_a_commitment_that_holds_no_display_bundle_carries_no_candidate() {
+    use kr_cbor::{CanonicalMap, CanonicalValue, Limits};
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let phone = Device::create().await;
+    let first = pair_with(&host, &phone, &owner, rights()).await;
+    let invitation_id = first
+        .committed_invitation_id
+        .expect("the pairing names its invitation");
+    let mut client = host.client().await;
+    let status = owner_view(&mut client, invitation_id)
+        .await
+        .expect("the owner's view");
+    assert!(
+        matches!(status.status, PairStatus::Committed { device_id, .. } if device_id == first.device_id),
+        "the invitation committed this device: {:?}",
+        status.status
+    );
+    assert!(
+        status.owner.0.expect("an owner view").candidate.0.is_some(),
+        "the view carries the candidate that the commitment recorded"
+    );
+
+    let key = invitation_id.get().as_bytes().to_vec();
+    let connection = registry(&host);
+    let blob: Vec<u8> = connection
+        .query_row(
+            "SELECT commitment FROM pairing_commitments WHERE invitation_id = ?1",
+            [key.as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the stored commitment");
+    let CanonicalValue::Map(map) = kr_cbor::decode(&blob, &Limits::DEFAULT).expect("a commitment")
+    else {
+        panic!("a stored commitment is a map");
+    };
+    let entries = map
+        .entries()
+        .iter()
+        .map(|(name, value)| {
+            let value = if name == "client_bundle" {
+                CanonicalValue::Null
+            } else {
+                value.clone()
+            };
+            (name.clone(), value)
+        })
+        .collect::<Vec<_>>();
+    let rewritten = kr_cbor::encode(&CanonicalValue::Map(
+        CanonicalMap::from_entries(entries).expect("the same members"),
+    ));
+    assert_ne!(rewritten, blob, "the bundle member held a bundle");
+    let changed = connection
+        .execute(
+            "UPDATE pairing_commitments SET commitment = ?1 WHERE invitation_id = ?2",
+            rusqlite::params![rewritten, key.as_slice()],
+        )
+        .expect("the commitment is rewritten");
+    assert_eq!(changed, 1, "one commitment rewritten");
+
+    let status = owner_view(&mut client, invitation_id)
+        .await
+        .expect("the owner's view");
+    assert!(
+        matches!(status.status, PairStatus::Committed { device_id, .. } if device_id == first.device_id),
+        "the status is still the commitment's: {:?}",
+        status.status
+    );
+    assert!(
+        status.owner.0.expect("an owner view").candidate.0.is_none(),
+        "the view carries no candidate where the commitment holds no display bundle"
+    );
+    host.stop().await;
+}
+
 /// KR-REQ-10.08: the view of an invitation that did not end because the device is listed carries no
 /// `existing` member, so a reader of the earlier shape reads it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
