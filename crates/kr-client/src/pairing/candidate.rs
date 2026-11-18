@@ -3180,10 +3180,10 @@ mod tests {
     }
 
     /// KR-REQ-10.08: a device whose host answers every question in a way it cannot read, as a host
-    /// that gave a refusal code or a status reason this device does not know would, waits for the
-    /// owner and ends with `approval_unknown` when the attempt's own time has passed, on a clock the
-    /// test moves. It asks again after each unreadable answer, within the host's budget for the
-    /// connection, and never ends before the deadline.
+    /// that gave a refusal code or a status reason this device does not know would, takes the answer
+    /// for a lost connection. It tries to reach the host again until the attempt's own time has
+    /// passed, on a clock the test moves, and ends with `approval_unknown`: it never ends before
+    /// the deadline and asks nothing after it.
     #[tokio::test(start_paused = true)]
     async fn answers_it_cannot_read_end_at_the_attempts_deadline_as_approval_unknown() {
         let run = waited(
@@ -3203,9 +3203,9 @@ mod tests {
             "the device does not know what became of its pairing"
         );
         assert!(
-            run.asked.len() > 1,
-            "the device asked more than once before it gave up: {:?}",
-            run.asked
+            run.dials > 1,
+            "the device tried to reach the host again until its time ran out: {} dials",
+            run.dials
         );
         assert!(
             run.asked
