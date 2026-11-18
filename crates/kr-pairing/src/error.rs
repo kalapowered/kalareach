@@ -184,8 +184,8 @@ pub enum PairingError {
     /// The device that used the invitation is still listed as paired by this host, so the host
     /// does not pair it again. The invitation ends for that reason.
     #[error(
-        "This host still lists this device as paired. Remove the device from this host first, \
-         then pair it again."
+        "This host still lists the device that used this invitation as paired. Remove that \
+         device from this host first, then pair it again with a new invitation."
     )]
     EndpointPaired {
         /// The device record the host lists for the endpoint.
@@ -344,6 +344,20 @@ mod tests {
         assert_eq!(rendered, "the pairing could not be authenticated");
         assert!(!rendered.contains("code"));
         assert!(!rendered.contains("origin"));
+    }
+
+    /// KR-REQ-10.08: the refusal of a device that the host lists reaches the owner who issued the
+    /// invitation, not the device: it says that the host lists the device that used the invitation
+    /// and tells the owner to remove that device from the host first.
+    #[test]
+    fn the_refusal_of_a_listed_device_tells_the_owner_which_device_to_remove() {
+        let device_id =
+            kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        assert_eq!(
+            PairingError::EndpointPaired { device_id }.to_string(),
+            "This host still lists the device that used this invitation as paired. Remove that \
+             device from this host first, then pair it again with a new invitation."
+        );
     }
 
     /// KR-REQ-10.08: only the refusal of a device the host still lists reports the code that says
