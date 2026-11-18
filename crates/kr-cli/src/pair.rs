@@ -2001,14 +2001,19 @@ mod tests {
             device_id,
             grant_id,
         };
-        let recorded = |device: &DeviceId, grant: &GrantId| {
+        // The bytes that the command printed before its decision returned them: the object's members
+        // and the line, spelled out.
+        let recorded = || {
             serde_json::json!({
                 "ok": true,
-                "invitation_id": invitation_id.to_string(),
-                "device_id": serde_json::to_value(device).expect("an identifier"),
-                "grant_id": serde_json::to_value(grant).expect("an identifier"),
+                "invitation_id": "09090909-0909-0909-0909-090909090909",
+                "device_id": "05050505-0505-0505-0505-050505050505",
+                "grant_id": "06060606-0606-0606-0606-060606060606",
             })
         };
+        let said = "Invitation 09090909-0909-0909-0909-090909090909 is approved already: paired as \
+                    device 05050505-0505-0505-0505-050505050505, with grant \
+                    06060606-0606-0606-0606-060606060606.";
 
         let bare = status_without_a_device(committed.clone(), false);
         let Found::Paired { document, line } = found_in(invitation_id, &bare) else {
@@ -2016,16 +2021,10 @@ mod tests {
         };
         assert_eq!(
             document.json(),
-            recorded(&device_id, &grant_id),
+            recorded(),
             "the view carries no candidate: the object names no device name and no platform"
         );
-        assert_eq!(
-            line.text(),
-            format!(
-                "Invitation {invitation_id} is approved already: paired as device {device_id}, \
-                 with grant {grant_id}."
-            )
-        );
+        assert_eq!(line.text(), said);
 
         let mut named = bare;
         let view = named.owner.0.as_mut().expect("a view");
@@ -2040,7 +2039,7 @@ mod tests {
         let Found::Paired { document, line } = found_in(invitation_id, &named) else {
             panic!("an approved invitation is found paired");
         };
-        let mut expected = recorded(&device_id, &grant_id);
+        let mut expected = recorded();
         expected["device_name"] = candidate.device_name.as_str().into();
         expected["platform"] = crate::shown::platform(candidate.platform)
             .into_string()
@@ -2050,14 +2049,7 @@ mod tests {
             expected,
             "the view's candidate names the device and its platform"
         );
-        assert_eq!(
-            line.text(),
-            format!(
-                "Invitation {invitation_id} is approved already: paired as device {device_id}, \
-                 with grant {grant_id}."
-            ),
-            "the line is the same with a candidate"
-        );
+        assert_eq!(line.text(), said, "the line is the same with a candidate");
     }
 
     /// KR-REQ-10.08: the issuing view of an invitation that ended because the device is already
