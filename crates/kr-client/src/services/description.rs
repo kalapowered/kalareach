@@ -56,12 +56,14 @@ use kr_protocol::hostinfo::configuration::{ServiceSelection, near_miss};
 use kr_protocol::scalars::Signature64;
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
+use kr_transport::proxy::ProxyLoginKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::ServiceHttp;
 use super::http::{HttpDeadlines, HttpService};
 use super::matrix::Pins;
+use crate::error::ClientError;
 
 /// Where a service publishes its description.
 pub const PATH: &str = "/.well-known/kalareach-service.json";
@@ -233,6 +235,9 @@ pub enum Unread {
     /// The service is addressed over plain `http` and the document names a proxy, which would
     /// carry the exchange in clear text to its own loopback.
     ClearTextViaProxy,
+    /// The proxy asks for a login this host does not hold, refused the one it holds, or asks for a
+    /// sign-in method this host does not send.
+    ProxyLogin(ProxyLoginKind),
 }
 
 impl Unread {
@@ -253,6 +258,7 @@ impl Unread {
                 "the service is addressed over plain http, which a proxy would carry in clear \
                  text; a proxy is used with an https service only"
             }
+            Self::ProxyLogin(kind) => kind.clause(),
         }
     }
 }
@@ -299,7 +305,10 @@ pub async fn fetch(http: &dyn ServiceHttp, origin: &GatewayOrigin) -> Result<Vec
     let answer = http
         .get_json(&url, &[])
         .await
-        .map_err(|_| Unread::Unreachable)?;
+        .map_err(|error| match error {
+            ClientError::ProxyLogin(kind) => Unread::ProxyLogin(kind),
+            _ => Unread::Unreachable,
+        })?;
     match answer.status {
         200 => Ok(answer.body),
         404 | 501 => Err(Unread::NotPublished),

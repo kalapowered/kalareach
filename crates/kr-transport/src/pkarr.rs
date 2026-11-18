@@ -433,7 +433,6 @@ impl Drop for StopOnDrop {
 // The stand-in proxy and the certificates of the suites that run it from `tests/`.
 #[cfg(test)]
 #[path = "../../kr-client/tests/support/connect_proxy.rs"]
-#[allow(dead_code)]
 mod connect_proxy;
 #[cfg(test)]
 #[path = "../tests/support/tls.rs"]

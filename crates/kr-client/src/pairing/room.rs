@@ -201,6 +201,7 @@ fn room_reason(reason: &str) -> Shown {
         .iter()
         .chain(std::iter::once(&NO_VERIFIER))
         .chain(tunnel::REASONS.iter())
+        .chain(tunnel::LOGIN_REASONS.iter())
         .find(|known| **known == reason)
         .map_or_else(
             || Shown::said("[a reason this client does not give]"),
@@ -545,6 +546,7 @@ mod tests {
     #[tokio::test]
     async fn a_proxy_that_does_not_open_the_tunnel_is_said_in_this_clients_words() {
         use crate::shown::marker::{MARKER, NEUTRAL, assert_unmarked, failure_renderings};
+        use kr_transport::proxy::ProxyLoginKind;
         use tokio::net::TcpListener;
 
         /// A proxy that reads one tunnel request, writes `answer` and closes.
@@ -583,7 +585,7 @@ mod tests {
             (
                 format!("HTTP/1.1 407 {MARKER}\r\nProxy-Authenticate: {MARKER}\r\n\r\n")
                     .into_bytes(),
-                "the proxy refused the tunnel with status 407",
+                ProxyLoginKind::Unsupported.clause(),
             ),
             (
                 format!("{MARKER}\r\n\r\n").into_bytes(),

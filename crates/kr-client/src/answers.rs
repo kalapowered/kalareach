@@ -564,7 +564,8 @@ impl AnswerFailure {
             | ClientError::TooManyOutstandingMutations { .. }
             | ClientError::TooManyUnresolvedActions { .. }
             | ClientError::WrongEffect { .. }
-            | ClientError::UnsupportedVersion { .. } => true,
+            | ClientError::UnsupportedVersion { .. }
+            | ClientError::ProxyLogin(_) => true,
             _ => false,
         }
     }

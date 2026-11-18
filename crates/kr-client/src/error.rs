@@ -3,6 +3,8 @@
 use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
 use kr_protocol::method::{Method, MethodVersion};
 
+use kr_transport::proxy::ProxyLoginKind;
+
 use crate::retry::{Decision, Failure, RequestClass, UserAction};
 use crate::services::alternatives::Alternatives;
 use crate::shown::{Said, Shown};
@@ -23,6 +25,10 @@ pub enum ClientError {
     Ipc(kr_ipc::IpcError),
     /// The host answered with an error.
     Host(ProtocolError),
+    /// The request was not sent, or the connection was not made, because of the login the proxy
+    /// asks for. After a refusal of the host's login the request is not sent again until the host
+    /// restarts, except for [`ProxyLoginKind::Needed`], which keeps the retry the request had.
+    ProxyLogin(ProxyLoginKind),
     /// A managed service refused the request.
     ///
     /// The refusal is the protocol error a caller branches on, and the delay beside it is what the
@@ -165,6 +171,7 @@ impl ClientError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Host(error) | Self::Refused { error, .. } => error.code,
+            Self::ProxyLogin(_) => ErrorCode::UpstreamUnavailable,
             Self::Transport(error) => error.to_protocol_error().code,
             Self::Ipc(error) => error.to_protocol_error().code,
             Self::Cbor(_)
@@ -250,6 +257,12 @@ impl ClientError {
             class,
         );
         decision.action = self.user_action();
+        if let Self::ProxyLogin(kind) = self
+            && kind.stops_until_restart()
+        {
+            // The code alone would say `Transient`: the proxy will turn the same request away.
+            decision.recovery = crate::retry::Recovery::Stop;
+        }
         decision
     }
 
@@ -306,6 +319,11 @@ impl Said for ClientError {
         match self {
             Self::Transport(error) => Shown::transport(error),
             Self::Ipc(error) => Shown::ipc(error),
+            Self::ProxyLogin(kind) => crate::shown!(
+                "{}: {}",
+                ErrorCode::UpstreamUnavailable,
+                Shown::said(kind.clause())
+            ),
             Self::Host(error) => crate::shown!("{}: {}", error.code, Shown::protocol(error)),
             Self::Refused {
                 error,

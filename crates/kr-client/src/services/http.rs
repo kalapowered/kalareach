@@ -86,6 +86,7 @@ use std::time::Duration;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
+use kr_transport::proxy;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::CertificateDer;
@@ -290,6 +291,8 @@ pub struct HttpService {
     deadlines: HttpDeadlines,
     limits: ResponseLimits,
     progress: Option<Arc<dyn ExchangeProgress>>,
+    /// The proxy every request goes through, which holds the login's verdict.
+    proxy: Option<ProxyUrl>,
 }
 
 impl fmt::Debug for HttpService {
@@ -391,6 +394,7 @@ impl HttpService {
             deadlines,
             limits,
             progress: None,
+            proxy: proxy.cloned(),
         })
     }
 
@@ -477,6 +481,9 @@ impl HttpService {
         let started = tokio::time::Instant::now();
         let mut replaced = false;
         let mut response = loop {
+            // A proxy that holds a login is sent no request to a plain `http` address, and none
+            // once the proxy has refused the login, the second pass of this loop included.
+            proxy::admit(self.proxy.as_ref(), &target).map_err(ClientError::ProxyLogin)?;
             let mut request = self.client.request(method.clone(), target.clone());
             if let Some((content_type, bytes)) = body {
                 request = request
@@ -502,8 +509,16 @@ impl HttpService {
             self.entered(ExchangePhase::Connect);
             match request.send().await {
                 Ok(response) => break response,
+                Err(error) if proxy::proxy_login_kind(&error).is_some() => {
+                    return Err(failure(&named, phase_of(&error), &error));
+                }
                 Err(error) if !replaced && connection_may_be_replaced(&error) => replaced = true,
-                Err(error) => return Err(failure(&named, phase_of(&error), &error)),
+                Err(error) => {
+                    if let Some(proxy) = &self.proxy {
+                        proxy::note_failure(proxy, &target, &error);
+                    }
+                    return Err(failure(&named, phase_of(&error), &error));
+                }
             }
         };
         let status = response.status().as_u16();
@@ -706,10 +721,8 @@ fn builder_trusting(
     tls.alpn_protocols = vec![b"http/1.1".to_vec()];
     let builder = reqwest::Client::builder().tls_backend_preconfigured(tls);
     Ok(match proxy {
-        Some(proxy) => builder.proxy(
-            reqwest::Proxy::all(proxy.as_url().clone())
-                .map_err(|_| refused("this client cannot use the proxy it was given"))?,
-        ),
+        Some(proxy) => proxy::proxied(builder, proxy)
+            .map_err(|_| refused("this client cannot use the proxy it was given"))?,
         None => builder.no_proxy(),
     })
 }
@@ -955,6 +968,11 @@ fn connection_may_be_replaced(error: &reqwest::Error) -> bool {
 /// carried out. Everything else may have been: a deadline, a connection that ended and an answer
 /// that could not be read all leave a request that the service may have acted on.
 fn failure(named: &Shown, phase: ExchangePhase, error: &reqwest::Error) -> ClientError {
+    // A refusal of the login is found by its type on the error's chain, never by the words. It
+    // happened before any byte of the request was written.
+    if let Some(kind) = proxy::proxy_login_kind(error) {
+        return ClientError::ProxyLogin(kind);
+    }
     let cause = if error.is_timeout() {
         "this client's deadline ran out"
     } else if error.is_decode() {
