@@ -6656,9 +6656,11 @@ async fn a_lone_escape_sent_after_a_mutation_on_its_own_connection_reaches_the_a
 /// KR-PERF-002: a lone Escape that follows a read on the same connection reaches the application
 /// while that read waits for a session another connection's mutation is holding.
 ///
-/// A read takes the session, and a mutation on another connection holds it across its commits. The
+/// The read is the screen preview, which takes the session and waits for it for as long as it is
+/// held (a read of the session itself is answered from the published summary after a short bound,
+/// and would not wait). A mutation on another connection holds the session across its commits. The
 /// connection used to read nothing more until its read was answered, so the Escape behind it waited
-/// as long.
+/// as long. The Escape takes the input domain, which the hold leaves free.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lone_escape_sent_after_a_read_waiting_for_the_session_reaches_the_application_while_it_is_held()
  {
@@ -6669,11 +6671,17 @@ async fn a_lone_escape_sent_after_a_read_waiting_for_the_session_reaches_the_app
         .writer()
         .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
             request_id: read,
-            method: Method::SessionRead.into(),
+            method: Method::SessionScreenPreview.into(),
             method_version: MethodVersion::V1,
             params: kr_protocol::envelope::ParamsValue::from_typed(
-                &kr_protocol::session::SessionReadParams {
+                &kr_protocol::sharing::SessionScreenPreviewParams {
                     session_id: rig.wired.session_id,
+                    history: kr_protocol::grant::HistoryScope {
+                        lower_bound_ms: Nullable::null(),
+                        include_live_screen: true,
+                        named_questions: CanonicalSet::new(),
+                        named_approvals: CanonicalSet::new(),
+                    },
                 },
             )
             .expect("encodes"),
