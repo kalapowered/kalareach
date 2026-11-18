@@ -4,8 +4,10 @@
 //! The scan reads the product's own strings, the `///` lines that become a command's help, and the
 //! guides. It does not judge whether a remedy works; a remedy's accuracy is read in review.
 //!
-//! Its limits: it stops at a source file's test module, so a text after that module is not read;
-//! it skips the `tests` folders and every comment that is not help; and it reads every guide under
+//! Its limits: it stops at a source file's test module, whether the module is private (`mod `) or
+//! crate-visible and named `tests` (`pub(crate) mod tests`), so a text after that module is not
+//! read, and a crate-visible module of any other name does not end the scan; it skips the `tests`
+//! folders and every comment that is not help; and it reads every guide under
 //! `docs` except the conformance document, which lists the words of a source check and gives no
 //! person an instruction. It also misses a command's word that follows a string continuation (a
 //! `kr host` at the end of one line of a string and its word at the start of the next), and a plain
@@ -54,14 +56,24 @@ fn makes_help(source: &str) -> bool {
     })
 }
 
+/// Where a source file's test module begins: a private module, or a crate-visible one named
+/// `tests` that other files' cases reach. A crate-visible module of another name holds product
+/// text and is no marker.
+const TEST_MODULE_MARKERS: [&str; 2] = [
+    "\n#[cfg(test)]\nmod ",
+    "\n#[cfg(test)]\npub(crate) mod tests",
+];
+
 /// What a source file tells a person: its strings, and its `///` lines where they become help.
 /// The file's test module is left out, since a test runs processes of its own (`kill -0` asks
 /// whether one lives) and tells nobody anything; so is every other comment line.
 fn product_part(source: &str) -> String {
-    let product = source
-        .split("\n#[cfg(test)]\nmod ")
-        .next()
-        .unwrap_or(source);
+    let end = TEST_MODULE_MARKERS
+        .iter()
+        .filter_map(|marker| source.find(marker))
+        .min()
+        .unwrap_or(source.len());
+    let product = &source[..end];
     let help = makes_help(product);
     product
         .lines()
@@ -74,8 +86,8 @@ fn product_part(source: &str) -> String {
 }
 
 /// The texts under scan: the crates' sources outside their `tests` folders, and the guides under
-/// `docs`. Limits: the scan stops at a source file's test module, so a text after that module is
-/// not read. It reads every guide except the conformance document, which lists the words of a
+/// `docs`. Limits: the scan stops at a source file's test module (either marker above), so a text
+/// after that module is not read. It reads every guide except the conformance document, which lists the words of a
 /// source check and gives no person an instruction.
 fn texts() -> Vec<(PathBuf, String)> {
     let mut sources = Vec::new();
@@ -178,4 +190,39 @@ fn every_kill_a_text_gives_is_the_forced_one() {
         "texts give a kill that is not the forced one:\n{}",
         plain.join("\n")
     );
+}
+
+/// A source whose test module is private: its product text is read, and nothing from `mod ` on.
+#[test]
+fn a_private_test_module_ends_the_product_part() {
+    let source = "const A: &str = \"kr host stop\";\n#[cfg(test)]\nmod tests {\n    const B: &str = \"taskkill\";\n}\n";
+    let part = product_part(source);
+    assert!(part.contains("kr host stop"), "{part}");
+    assert!(!part.contains("taskkill"), "{part}");
+}
+
+/// A source whose test module is crate-visible and named `tests`: the same cut.
+#[test]
+fn a_crate_visible_test_module_ends_the_product_part() {
+    let source = "const A: &str = \"kr host stop\";\n#[cfg(test)]\npub(crate) mod tests {\n    const B: &str = \"taskkill\";\n}\n";
+    let part = product_part(source);
+    assert!(part.contains("kr host stop"), "{part}");
+    assert!(!part.contains("taskkill"), "{part}");
+}
+
+/// The cut is at the earlier marker, whichever form comes first, and a crate-visible module of
+/// another name is product text that the scan keeps.
+#[test]
+fn the_product_part_ends_at_the_earlier_marker_only() {
+    let private_first = "const A: &str = \"first\";\n#[cfg(test)]\nmod tests {\n}\n#[cfg(test)]\npub(crate) mod tests {\n    const B: &str = \"second\";\n}\n";
+    let part = product_part(private_first);
+    assert!(part.contains("first") && !part.contains("second"), "{part}");
+
+    let visible_first = "const A: &str = \"first\";\n#[cfg(test)]\npub(crate) mod tests {\n}\n#[cfg(test)]\nmod more {\n    const B: &str = \"second\";\n}\n";
+    let part = product_part(visible_first);
+    assert!(part.contains("first") && !part.contains("second"), "{part}");
+
+    let other_name = "const A: &str = \"first\";\n#[cfg(test)]\npub(crate) mod fixtures {\n}\nconst B: &str = \"second\";\n";
+    let part = product_part(other_name);
+    assert!(part.contains("first") && part.contains("second"), "{part}");
 }

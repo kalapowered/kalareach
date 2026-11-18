@@ -5128,6 +5128,8 @@ pub(crate) mod tests {
             "{error:?}"
         );
 
+        // The stand-in advances a paused clock; the connect above ran on real time.
+        tokio::time::pause();
         let id = an_environment();
         let process = asked_process();
         let supplied = Supplied::new()
