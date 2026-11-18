@@ -468,6 +468,10 @@ async fn a_create_asked_again_whose_worker_ended_before_it_was_described_is_answ
     assert!(replayed.deduplicated, "the answer says it is a repeat");
 }
 
+/// How long a hold's set-up waits for the holder to take its locks. A holder that does not get them
+/// in this time ends the case with its own message, and is let go with the case.
+const HOLD_SET_UP_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Holds the session of a worker's service until the hold is let go. The locks are taken on a
 /// thread of its own, which keeps them for as long as the hold lives, and the hold is in place when
 /// this returns.
@@ -506,7 +510,16 @@ impl HeldSession {
             drop(domain);
             drop(session);
         });
-        is_held.recv().expect("the session is held");
+        let locks = if with_the_domain {
+            "session and its input domain"
+        } else {
+            "session"
+        };
+        if let Err(error) = is_held.recv_timeout(HOLD_SET_UP_BOUND) {
+            panic!(
+                "the holder did not take the worker's {locks} within {HOLD_SET_UP_BOUND:?}: {error}"
+            );
+        }
         Self {
             release: Some(release),
             holder: Some(holder),
@@ -633,11 +646,7 @@ async fn a_create_and_its_replay_whose_worker_holds_its_session_are_answered_fro
     let controller = &world.controller;
     let held = HeldSession::of(world.service());
     assert!(
-        world
-            .service()
-            .runtime()
-            .session_within(std::time::Duration::from_millis(50))
-            .is_none(),
+        world.service().runtime().try_session().is_none(),
         "the worker's session is held"
     );
     let endpoint = world.worker.endpoint.as_text();
