@@ -24,8 +24,8 @@ use kr_flush::NameKind;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    ActionId, ActorId, ApplicationInstanceId, DraftId, DraftRevision, EnvironmentId, GrantId,
-    SessionId, TransferId,
+    ActionId, ActorId, AgentBindingRevision, ApplicationInstanceId, DraftId, DraftRevision,
+    EnvironmentId, GrantId, SessionId, TransferId,
 };
 use kr_protocol::insertion::{
     BindingFacts, DraftFacts, InsertionBegin, InsertionClaim, InsertionReport,
@@ -2035,6 +2035,10 @@ impl TransferService {
     /// drafts it holds. A repeat of a create this service already performed is answered from its
     /// record, before the count.
     ///
+    /// `binding_revision` is the binding revision of the application the draft names that the
+    /// request was made under, and is absent when the draft names none. It is kept with the draft,
+    /// which is sent only under that revision.
+    ///
     /// # Errors
     ///
     /// Returns [`TransferError::WrongEnvironment`] for another environment,
@@ -2045,6 +2049,7 @@ impl TransferService {
         &self,
         actor: &ActorId,
         params: &DraftCreateParams,
+        binding_revision: Option<AgentBindingRevision>,
         action: Option<&Action>,
         open_limit: Option<u64>,
     ) -> Result<DraftCreateResult> {
@@ -2058,6 +2063,7 @@ impl TransferService {
             device_id: params.device_id.0,
             session_id: params.session_id.0,
             application_instance_id: params.application_instance_id.0,
+            agent_binding_revision: binding_revision,
             revision: DraftRevision::new(1),
             state: DraftState::Open,
             text: params.text.clone(),

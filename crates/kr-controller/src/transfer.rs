@@ -1398,6 +1398,9 @@ impl TransferModule {
         let second_tries = Arc::clone(&self.second_tries);
         // The session the door settled for this write: the one the request's target names.
         let target_session = mutation.target.session_id.0;
+        // The binding revision the request was made under, which a draft that names an
+        // application keeps: the envelope states it exactly when it names the application.
+        let target_binding_revision = mutation.target.agent_binding_revision.0;
         let answer = blocking(move || {
             // The transfer's gate is held by this call until it ends, and not by the stream's task,
             // which is aborted when its connection ends while this call goes on.
@@ -1515,8 +1518,15 @@ impl TransferModule {
                     Method::DraftCreate => {
                         let params: kr_protocol::transfer::DraftCreateParams = typed(&params)?;
                         let draft_limit = device.map(|bounds| bounds.open_drafts);
-                        let create =
-                            || service.draft_create(&actor, &params, Some(&performed), draft_limit);
+                        let create = || {
+                            service.draft_create(
+                                &actor,
+                                &params,
+                                target_binding_revision,
+                                Some(&performed),
+                                draft_limit,
+                            )
+                        };
                         let made = tried_again_at_the_bound(
                             create(),
                             draft_limit,

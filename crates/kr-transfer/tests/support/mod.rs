@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use kr_ipc::testing::TempHost;
 use kr_protocol::ids::{
-    ActionId, ActorId, ApplicationInstanceId, DraftId, EnvironmentId, SessionId, TransferId,
+    ActionId, ActorId, AgentBindingRevision, ApplicationInstanceId, DraftId, EnvironmentId,
+    SessionId, TransferId,
 };
 use kr_protocol::insertion::{InsertionBegin, InsertionClaim, InsertionReport, ReportedOutcome};
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, U64, Uuid};
@@ -321,6 +322,12 @@ pub fn digest(bytes: &[u8]) -> Digest256 {
 /// The application the drafts of these suites that name one are written for.
 pub fn an_application() -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([10; 16]))
+}
+
+/// The binding revision of the application that the drafts of these suites that name one are
+/// written under.
+pub fn a_binding() -> AgentBindingRevision {
+    AgentBindingRevision::new(1)
 }
 
 /// Returns one chunk's descriptor and payload under the protocol's chunk size.

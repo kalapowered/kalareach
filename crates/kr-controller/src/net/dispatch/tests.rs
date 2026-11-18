@@ -3279,7 +3279,7 @@ pub(super) fn an_empty_draft(
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "look at this".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -3319,7 +3319,7 @@ fn a_draft_written_for(
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::some(application_instance_id),
                 text: "look at this".to_owned(),
-            },
+            }, Some(kr_protocol::ids::AgentBindingRevision::new(1)),
             None,
             None,
         )

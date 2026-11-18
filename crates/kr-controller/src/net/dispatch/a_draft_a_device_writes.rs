@@ -120,6 +120,7 @@ fn a_draft_of(
         .draft_create(
             actor,
             &create_params_for(world, session, application, "an open draft"),
+            application.map(|_| AgentBindingRevision::new(1)),
             None,
             None,
         )
@@ -160,6 +161,7 @@ pub(super) fn a_draft_for(
         .draft_create(
             actor,
             &create_params(world, session, None, "an open draft"),
+            None,
             None,
             None,
         )

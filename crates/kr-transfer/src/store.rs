@@ -22,8 +22,8 @@
 
 use kr_protocol::ids::TransferId;
 use kr_protocol::ids::{
-    ActorId, ApplicationInstanceId, DeviceId, DraftId, DraftRevision, EnvironmentId, GrantId,
-    SessionId,
+    ActorId, AgentBindingRevision, ApplicationInstanceId, DeviceId, DraftId, DraftRevision,
+    EnvironmentId, GrantId, SessionId,
 };
 use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
 use kr_protocol::transfer::{
@@ -36,13 +36,25 @@ use crate::error::{Result, TransferError};
 use crate::filesystem::{FilesystemId, RecordedIdentity, Settled};
 
 /// The schema version this build reads, and the one a journal holds nothing of the sessions of
-/// earlier builds at ([`Noting`]). A journal at it has the table of ended sessions and the columns
-/// that say which offer a binding was claimed for.
-pub const SCHEMA_VERSION: i64 = 5;
+/// earlier builds at ([`Noting`]). A journal at it has the table of ended sessions, the columns
+/// that say which offer a binding was claimed for, and the column that holds the binding revision a
+/// draft that names an application was written under.
+pub const SCHEMA_VERSION: i64 = 6;
+
+/// The version before the column that holds a draft's binding revision: a journal at it has the
+/// columns that record who claimed a binding and no revision for any draft. The step to
+/// [`SCHEMA_VERSION`] adds the column and moves the version; a build that does not read the column
+/// then refuses the journal, because it would send a draft under a revision it was not written
+/// under.
+///
+/// Remove this, with the step from it, once no supported upgrade can start from a journal at this
+/// version.
+const UNBOUND_VERSION: i64 = 5;
 
 /// The version before the columns that record who claimed a binding: a journal at it has the table
-/// of ended sessions and holds no claim. The step to [`SCHEMA_VERSION`] adds the columns and moves
-/// the version; a build that cannot read a claim then refuses the journal.
+/// of ended sessions and holds no claim. The step to [`SCHEMA_VERSION`] adds the columns, and the
+/// column that holds a draft's binding revision, and moves the version; a build that cannot read a
+/// claim then refuses the journal.
 ///
 /// Remove this, with the step from it, once no supported upgrade can start from a journal at this
 /// version.
@@ -291,6 +303,10 @@ pub struct DraftRow {
     pub session_id: Option<SessionId>,
     /// The application it targets.
     pub application_instance_id: Option<ApplicationInstanceId>,
+    /// The binding revision of that application the draft was written under. A draft that names
+    /// an application is sent only under this revision. It is absent for a draft that names no
+    /// application, and for one that a journal at an earlier version held.
+    pub agent_binding_revision: Option<AgentBindingRevision>,
     /// Its revision.
     pub revision: DraftRevision,
     /// Its state.
@@ -622,7 +638,8 @@ impl Store {
                      state                   TEXT NOT NULL,
                      text                    TEXT NOT NULL,
                      created_at_ms           INTEGER NOT NULL,
-                     updated_at_ms           INTEGER NOT NULL
+                     updated_at_ms           INTEGER NOT NULL,
+                     agent_binding_revision  INTEGER
                  );
                  CREATE TABLE IF NOT EXISTS draft_attachments (
                      draft_id          BLOB NOT NULL
@@ -721,6 +738,11 @@ impl Store {
         // supported upgrade can start from a store written before a binding could be claimed.
         self.add_column_if_absent("draft_attachments", "claimed_by", "TEXT")?;
         self.add_column_if_absent("draft_attachments", "claim_grant", "BLOB")?;
+        // The binding revision a draft that names an application was written under. Added empty at
+        // every version below the current one, for the same reason as the columns above. A draft
+        // that names an application and holds no revision is never sent. Remove this once no
+        // supported upgrade can start from a store written before the revision was kept.
+        self.add_column_if_absent("drafts", "agent_binding_revision", "INTEGER")?;
         match version {
             // A journal this build makes has no earlier build's session to note, and comes to the
             // current version with its table in one step.
@@ -731,7 +753,7 @@ impl Store {
             Some(SETTLED_VERSION) => self.add_ended_sessions(Some(SETTLED_VERSION))?,
             // The table is there and the columns have just been added: the version is all that
             // is left to move.
-            Some(UNCLAIMED_VERSION) => {
+            Some(UNCLAIMED_VERSION | UNBOUND_VERSION) => {
                 self.connection
                     .execute(
                         "UPDATE schema_version SET version = ?1",
@@ -2447,8 +2469,8 @@ impl Store {
                 "INSERT INTO drafts
                      (draft_id, environment_id, actor_id, device_id, session_id,
                       application_instance_id, revision, state, text, created_at_ms,
-                      updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                      updated_at_ms, agent_binding_revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     uuid_sql(row.draft_id.get()),
                     uuid_sql(row.environment_id.get()),
@@ -2462,6 +2484,7 @@ impl Store {
                     row.text,
                     as_i64(row.created_at_ms.get()),
                     as_i64(row.updated_at_ms.get()),
+                    row.agent_binding_revision.map(|value| as_i64(value.get())),
                 ],
             )
             .map_err(TransferError::store)?;
@@ -2488,7 +2511,7 @@ impl Store {
             .query_row(
                 "SELECT draft_id, environment_id, actor_id, device_id, session_id,
                         application_instance_id, revision, state, text, created_at_ms,
-                        updated_at_ms
+                        updated_at_ms, agent_binding_revision
                  FROM drafts WHERE draft_id = ?1",
                 params![uuid_sql(draft_id.get())],
                 |row| {
@@ -2505,6 +2528,9 @@ impl Store {
                         text: row.get(8)?,
                         created_at_ms: timestamp(row.get(9)?),
                         updated_at_ms: timestamp(row.get(10)?),
+                        agent_binding_revision: row
+                            .get::<_, Option<i64>>(11)?
+                            .map(|value| AgentBindingRevision::new(from_i64(value))),
                     })
                 },
             )
@@ -4039,7 +4065,7 @@ mod tests {
         let path = directory.path().join("transfers.sqlite");
 
         let mut store = Store::open(&path, environment()).expect("creates and opens");
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
         assert!(has_the_table_of_ended_sessions(&path));
         assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
@@ -4083,7 +4109,8 @@ mod tests {
     }
 
     #[test]
-    fn a_version_four_journal_gains_the_columns_that_record_a_claim_and_moves_to_version_five() {
+    fn a_version_four_journal_gains_the_columns_that_record_a_claim_and_moves_to_the_current_version()
+    {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("transfers.sqlite");
         write_a_journal_at(
@@ -4101,6 +4128,100 @@ mod tests {
         assert_eq!(recorded_version(&path), SCHEMA_VERSION);
         assert!(has_the_column(&path, "claimed_by"));
         assert!(has_the_column(&path, "claim_grant"));
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
+    }
+
+    /// The table of drafts as a build before a draft kept its binding revision made it.
+    const DRAFTS_BEFORE_REVISIONS: &str = "CREATE TABLE drafts (
+        draft_id BLOB PRIMARY KEY, environment_id BLOB NOT NULL, actor_id TEXT NOT NULL,
+        device_id BLOB, session_id BLOB, application_instance_id BLOB, revision INTEGER NOT NULL,
+        state TEXT NOT NULL, text TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL);";
+
+    /// One draft that names an application, written as a build before the revision was kept wrote
+    /// it. Its identifier is sixteen bytes of `0x0B`, and the application is sixteen of `0x0A`.
+    fn an_old_draft_that_names_an_application() -> String {
+        format!(
+            "INSERT INTO drafts (draft_id, environment_id, actor_id, application_instance_id,
+                                revision, state, text, created_at_ms, updated_at_ms)
+             VALUES (X'{id}', X'{environment}', '{actor}', X'{application}', 1, 'open',
+                     'an old draft', 1, 1);",
+            id = "0B".repeat(16),
+            environment = "0E".repeat(16),
+            actor = actor().as_str(),
+            application = "0A".repeat(16),
+        )
+    }
+
+    fn drafts_have_the_column(path: &std::path::Path) -> bool {
+        rusqlite::Connection::open(path)
+            .expect("opens")
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('drafts')
+                  WHERE name = 'agent_binding_revision'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("reads the schema")
+            == 1
+    }
+
+    #[test]
+    fn a_version_five_journal_gains_the_column_that_holds_a_binding_revision_and_keeps_its_draft() {
+        // The tables as the release before wrote them: the table of ended sessions, the table of
+        // drafts without the column, and a draft that names an application.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at(
+            &path,
+            UNBOUND_VERSION,
+            &format!(
+                "CREATE TABLE ended_sessions (session_id BLOB PRIMARY KEY, ended_at_ms INTEGER NOT NULL);
+                 {DRAFTS_BEFORE_REVISIONS}
+                 {}",
+                an_old_draft_that_names_an_application()
+            ),
+        );
+        assert!(!drafts_have_the_column(&path));
+
+        let store = Store::open(&path, environment()).expect("migrates and opens");
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+        assert!(drafts_have_the_column(&path));
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
+        let kept = store
+            .draft(DraftId::new(Uuid::from_bytes([0x0B; 16])))
+            .expect("reads the draft")
+            .expect("the draft was kept");
+        assert_eq!(kept.text, "an old draft");
+        assert_eq!(
+            kept.application_instance_id,
+            Some(ApplicationInstanceId::new(Uuid::from_bytes([0x0A; 16])))
+        );
+        assert_eq!(
+            kept.agent_binding_revision, None,
+            "the revision the draft was written under was not kept, and is not made up"
+        );
+    }
+
+    #[test]
+    fn a_version_two_journal_gains_the_column_that_holds_a_binding_revision_and_keeps_its_version() {
+        // A journal of an earlier build's sessions stays at its version until they are settled, and
+        // it has the column all the same, so that settling still finds a journal this build reads.
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = directory.path().join("transfers.sqlite");
+        write_a_journal_at(&path, UNSETTLED_VERSION, DRAFTS_BEFORE_REVISIONS);
+        assert!(!drafts_have_the_column(&path));
+
+        let mut store = Store::open(&path, environment()).expect("migrates and opens");
+        assert_eq!(recorded_version(&path), UNSETTLED_VERSION);
+        assert!(drafts_have_the_column(&path));
+        assert_eq!(store.noting().expect("reads the noting"), Noting::Owed);
+
+        store
+            .settle_unseen_prompt_sessions(TimestampMs::new(2000))
+            .expect("settles");
+        assert_eq!(recorded_version(&path), SCHEMA_VERSION);
+        assert!(drafts_have_the_column(&path));
         assert_eq!(store.noting().expect("reads the noting"), Noting::Done);
     }
 
@@ -4437,6 +4558,7 @@ mod tests {
                     device_id: None,
                     session_id: None,
                     application_instance_id: None,
+                    agent_binding_revision: None,
                     revision: DraftRevision::new(1),
                     state: DraftState::Open,
                     text: "first".to_owned(),
