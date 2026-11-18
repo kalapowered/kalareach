@@ -2858,6 +2858,10 @@ enum Gave {
     /// short, a frame that cannot be read, or this side's own fault (a check of the peer's
     /// credentials, a fault of this side's socket, a request that this side cannot encode).
     LinkFailed,
+    /// The greeting was acknowledged, and then the link failed in the read of `host.info`: a peer
+    /// that closed, a stream cut short, a frame that cannot be read, or this side's own fault. A
+    /// usable greeting was given, and no reply of the daemon's came with the failure.
+    GreetingThenLinkFailed,
     /// The daemon replied to the greeting with something that cannot be used: a refusal of the hello,
     /// a version that does not fit, or a message that is not the acknowledgement.
     GreetingReplied(Answered),
@@ -2891,6 +2895,7 @@ fn label_of(asked: Option<ControllerGeneration>, gave: Gave) -> Endpoint {
         Gave::NoAddress => Endpoint::Unclear,
         Gave::NothingInTime => Endpoint::Unclear,
         Gave::LinkFailed => Endpoint::Unclear,
+        Gave::GreetingThenLinkFailed => Endpoint::Unclear,
     }
 }
 
@@ -2917,7 +2922,7 @@ fn gave_by_the_read(
         Ok(Err(refusal)) => Gave::ReadRefused(Answered::of_refusal(&refusal)),
         Err(error) => match Answered::of_reply(&error) {
             Some(answered) => Gave::ReadReplied(answered),
-            None => Gave::LinkFailed,
+            None => Gave::GreetingThenLinkFailed,
         },
     }
 }
@@ -3253,11 +3258,6 @@ mod tests {
         );
     }
 
-    /// The words of a daemon that was told and has not ended, and of an environment that is held after
-    /// the daemon's process has gone, name no process they cannot show and promise no wait.
-    #[test]
-    fn the_words_of_a_daemon_that_has_not_ended_name_no_process_and_promise_no_wait() {
-        let temp = kr_ipc::testing::TempHost::create();
     /// The words of a daemon that has not ended where the answer to the stop named none name a
     /// process only as the lock file names it when the words are made, after the last look at the
     /// endpoint, and only where that process runs the daemon: the read starts nothing and stops
@@ -3312,6 +3312,11 @@ mod tests {
         assert!(!said.contains(&own.to_string()), "{said}");
     }
 
+    /// The words of a daemon that was told and has not ended, and of an environment that is held after
+    /// the daemon's process has gone, name no process they cannot show and promise no wait.
+    #[test]
+    fn the_words_of_a_daemon_that_has_not_ended_name_no_process_and_promise_no_wait() {
+        let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let id = environment.environment_id();
         let what = Shown::said("was told to stop and has not ended");
@@ -3562,12 +3567,12 @@ mod tests {
             client,
             &info,
             lock_holder(&environment.paths),
+            None,
             true,
             &progress,
             &none,
         )
         .await;
-            None,
         let (at_the_request, at_the_next_request, at_the_close) = match daemon {
             Some(daemon) => daemon.await.expect("the daemon saw the command's request"),
             None => (Vec::new(), None, Vec::new()),
@@ -6677,19 +6682,19 @@ mod tests {
             (
                 Peer::ClosesAfterTheHello(Closure::Clean),
                 Some(1),
-                "link_failed",
+                "greeting_then_link_failed",
                 "unclear",
             ),
             (
                 Peer::ClosesAfterTheHello(Closure::BadFrame),
                 Some(1),
-                "link_failed",
+                "greeting_then_link_failed",
                 "unclear",
             ),
             (
                 Peer::ClosesAfterTheHello(Closure::HalfFrame),
                 Some(1),
-                "link_failed",
+                "greeting_then_link_failed",
                 "unclear",
             ),
             (
@@ -6822,10 +6827,16 @@ mod tests {
             );
         }
         for failure in failures {
-            assert_eq!(gave_by_the_read(Err(failure)).label(), "link_failed");
+            assert_eq!(
+                gave_by_the_read(Err(failure)).label(),
+                "greeting_then_link_failed"
+            );
         }
         for fault in own_faults() {
-            assert_eq!(gave_by_the_read(Err(fault)).label(), "link_failed");
+            assert_eq!(
+                gave_by_the_read(Err(fault)).label(),
+                "greeting_then_link_failed"
+            );
         }
         for reply in replies {
             assert_eq!(gave_by_the_read(Err(reply)).label(), "read_replied");
@@ -7595,7 +7606,8 @@ mod tests {
                 Self::NoAddress => Some(Self::NothingInTime),
                 Self::NothingInTime => Some(Self::NothingListens),
                 Self::NothingListens => Some(Self::LinkFailed),
-                Self::LinkFailed => Some(Self::GreetingReplied(a_reply())),
+                Self::LinkFailed => Some(Self::GreetingThenLinkFailed),
+                Self::GreetingThenLinkFailed => Some(Self::GreetingReplied(a_reply())),
                 Self::GreetingReplied(_) => Some(Self::GreetingOfAnotherMajor),
                 Self::GreetingOfAnotherMajor => Some(Self::Reported(ControllerGeneration::new(1))),
                 Self::Reported(_) => Some(Self::ReadRefused(a_reply())),
@@ -7613,6 +7625,7 @@ mod tests {
                 Self::NothingInTime => "nothing_in_time",
                 Self::NothingListens => "nothing_listens",
                 Self::LinkFailed => "link_failed",
+                Self::GreetingThenLinkFailed => "greeting_then_link_failed",
                 Self::GreetingReplied(_) => "greeting_replied",
                 Self::GreetingOfAnotherMajor => "greeting_of_another_major",
                 Self::Reported(_) => "reported",
@@ -7768,7 +7781,10 @@ mod tests {
             let said = format!("gave={} asked={}", row.gave.label(), row.asked.label());
             let nothing_came = matches!(
                 row.gave,
-                Gave::NoAddress | Gave::NothingInTime | Gave::LinkFailed
+                Gave::NoAddress
+                    | Gave::NothingInTime
+                    | Gave::LinkFailed
+                    | Gave::GreetingThenLinkFailed
             );
             let replied = matches!(
                 row.gave,
@@ -8508,6 +8524,19 @@ mod tests {
                 ));
             }
         }
+        out.push_str("\n## the same where the answer named none and an earlier reply on the connection that carries the request (the restart's request for the launch alone) named a process\n");
+        for named in [None, Some(4000_u64)] {
+            for stated in [4000_u64, 4001] {
+                let holder = named.map(|_| asked_process());
+                let waited = process_waited_for(holder.as_ref(), Some(stated), None);
+                out.push_str(&format!(
+                    "named={} stated={} -> {}\n",
+                    named.map_or_else(|| "none".to_owned(), |pid| pid.to_string()),
+                    stated,
+                    waited.label()
+                ));
+            }
+        }
         out.push_str(
             "\n## the stop: where a refusal goes, by the retry category of its code (every code's category)\n",
         );
@@ -8524,19 +8553,6 @@ mod tests {
     /// decision, of a sentence's kind, of an exit or of a `stop` member shows as a change of the
     /// file. The sentences' words are not in it, and a decision that no walk prints is held by a
     /// named case.
-        out.push_str("\n## the same where the answer named none and an earlier reply on the connection that carries the request (the restart's request for the launch alone) named a process\n");
-        for named in [None, Some(4000_u64)] {
-            for stated in [4000_u64, 4001] {
-                let holder = named.map(|_| asked_process());
-                let waited = process_waited_for(holder.as_ref(), Some(stated), None);
-                out.push_str(&format!(
-                    "named={} stated={} -> {}\n",
-                    named.map_or_else(|| "none".to_owned(), |pid| pid.to_string()),
-                    stated,
-                    waited.label()
-                ));
-            }
-        }
     #[test]
     fn the_table_of_the_end_is_the_file() {
         is_the_file(
@@ -8634,6 +8650,7 @@ mod tests {
             Gave::NothingInTime,
             Gave::NothingListens,
             Gave::LinkFailed,
+            Gave::GreetingThenLinkFailed,
             Gave::GreetingReplied,
             Gave::GreetingOfAnotherMajor,
             Gave::Reported,
