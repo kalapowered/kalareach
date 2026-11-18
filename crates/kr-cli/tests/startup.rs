@@ -9002,13 +9002,14 @@ fn a_successor_that_never_answers_after_a_request_that_could_not_be_made_keeps_t
     assert!(silent.host.running().is_empty(), "nothing was started");
 }
 
-/// KR-REQ-07.12 (a holder that owes a fence): the daemon that holds the environment after the first
-/// one ended gives a usable greeting and answers each request to stop, the one that asks how it was
-/// started too, with an unknown outcome. No exchange is whole, so the command waits out its bound
-/// and says what the reads gave and that it asked for nothing, and no more.
+/// KR-REQ-07.12 (a successor wait after a request that was not made): the daemon that holds the
+/// environment after the first one ended gives a usable greeting and answers each request to stop,
+/// the one that asks how it was started too, with an unknown outcome. No exchange is whole, so the
+/// command waits out its bound and says what the reads gave and that it asked for nothing, and no
+/// more.
 #[test]
-fn a_holder_that_greets_and_answers_each_stop_with_an_unknown_outcome_is_said_by_what_the_reads_gave()
- {
+fn a_successor_after_an_unmade_request_that_greets_and_owes_a_fence_is_said_by_what_the_reads_gave()
+{
     let replaced = a_restart_that_waits_for_a_replaced_successor(
         true,
         OnStop::EndAtTheGreeting,
