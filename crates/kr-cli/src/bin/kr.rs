@@ -181,6 +181,15 @@ async fn run(cli: Cli) -> Result<Completion> {
             _ => match kr_cli::update::admit::admit(&tree, installer).await? {},
         }
     }
+    // A system with no writer for the login item refuses before any path or variable is read.
+    if matches!(
+        &cli.command,
+        Command::Host(kr_cli::cli::HostArguments {
+            command: HostCommand::LoginItem(_)
+        })
+    ) {
+        kr_cli::login_item::refuse_without_a_writer()?;
+    }
     let paths = HostPaths::discover()?;
     match cli.command {
         Command::New(arguments) => {
@@ -1394,6 +1403,10 @@ async fn run(cli: Cli) -> Result<Completion> {
             }
             HostCommand::TerminalProfile(arguments) => {
                 kr_cli::terminal_profile::run(&paths, &arguments, cli.json)
+            }
+            HostCommand::LoginItem(arguments) => {
+                kr_cli::login_item::run(&paths, &arguments.command, cli.json)?;
+                Ok(Completion::Done)
             }
             HostCommand::ImportJournals => kr_cli::import::run(&paths, cli.json),
             HostCommand::Install(install) => {
