@@ -316,15 +316,15 @@ pub const fn entry(code: ErrorCode) -> Entry {
     // succeed may still leave the person with nothing to do, and a condition the library waits out
     // may still be worth naming.
     let (step, action) = match code {
-        // Authentication, pairing and schema failures: a configuration or software change.
+        // Authentication and schema failures: a configuration or software change.
         ErrorCode::InvalidArgument => (Step::Stop, UserAction::Update),
         ErrorCode::UnsupportedSchema | ErrorCode::UnsupportedCapability => {
             (Step::Stop, UserAction::Update)
         }
         ErrorCode::PermissionDenied => (Step::Stop, UserAction::FixConfiguration),
-        // A pairing's refusal is read by the device that was refused and by the owner whose
-        // invitation or confirmation it was, and no one remedy is true for both: the host's own
-        // words say what ended, and the person reads the next step from them.
+        // A pairing's refusal names no action here. The device that was refused says its next step
+        // in its own words, and the owner who reads this table is the command line's, whose command
+        // says a next step of its own where it has one.
         ErrorCode::PairingExpired
         | ErrorCode::PairingRejected
         | ErrorCode::PairingAuthFailed
@@ -522,7 +522,7 @@ mod tests {
             let decision = decision(Failure::new(*code), RequestClass::IdempotentRead);
             assert_eq!(decision.code, *code);
             assert_eq!(decision.category, code.retry_category());
-            // An action is a key a client can translate, and every key is one of the eight.
+            // An action is a key a client can translate, and every key is one the vocabulary lists.
             assert!(
                 UserAction::ALL.contains(&decision.action),
                 "{} has an action outside the vocabulary",
@@ -614,9 +614,9 @@ mod tests {
         assert_eq!(decision.action, UserAction::Resync);
     }
 
-    /// KR-REQ-23.57: a pairing's refusal is read by the device that was refused and by the owner
-    /// whose invitation or confirmation it was, so under each code that the host gives it names no
-    /// action: the host's own words are all that a person is told.
+    /// KR-REQ-23.57: a pairing's refusal names no action under any code that the host gives it. The
+    /// device that was refused says its next step in its own words, and the owner who reads this
+    /// table is the command line's, whose command says a next step of its own where it has one.
     #[test]
     fn a_pairings_refusal_stops_and_names_no_action_for_the_device_or_the_owner() {
         for code in [

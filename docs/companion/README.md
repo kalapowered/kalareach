@@ -48,12 +48,13 @@ The command line and the application keep the answers they could not deliver in 
 
 A failure the page shows says the host's own words and, where its code maps to something the person
 can do, that action after them: sign in, update, wait, refresh, check whether it went through, or
-change a setting. A refusal of a pairing names no action, because the person who reads it may be
-the owner whose invitation ended and not the device that was refused. A pairing that the host
-refuses because it still lists the device offers no retry either. Pairing the device again requires
-another owner device that can confirm the new pairing. The person asks the host's owner to remove
-the device first, forgets the host on the device if the device still lists it, and pairs with a new
-invitation.
+change a setting. The client library names no action for a host's refusal under `PAIRING_EXPIRED`,
+`PAIRING_REJECTED`, `PAIRING_AUTH_FAILED` or `PAIRING_ATTEMPTS_EXHAUSTED`, because the command
+line's owner reads the same codes. The pairing screens say their own words and next step for each
+way an attempt ends. A pairing that the host refuses because it still lists the device offers no
+retry either. Pairing the device again requires another owner device that can confirm the new
+pairing. The person asks the host's owner to remove the device first, forgets the host on the
+device if the device still lists it, and pairs with a new invitation.
 The client library says a host's refusal as its code,
 a colon and the host's words, and the page leaves the code out. A failure whose code asks nothing of
 the person says the host's words alone. Native code names the action by its key, and the page's

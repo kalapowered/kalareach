@@ -2049,10 +2049,10 @@ mod tests {
         }
     }
 
-    /// The host refuses a new pairing of a device it still lists, so a share refused because the
-    /// pairing ends in under a minute says to pair the device again only once the pairing has
-    /// ended, and a share refused because the pairing cannot be used now says the same: the host
-    /// may still list the device, because a pairing that is out of force need not have ended.
+    /// The host refuses a new pairing of a device it still lists, so a share refused because too
+    /// little of the pairing is left (65 seconds are too little, 75 are enough) says to pair the
+    /// device again only once the pairing has ended. So does one refused because the pairing
+    /// cannot be used now: the host may still list a device whose pairing is out of force.
     #[test]
     fn a_device_is_paired_again_only_after_its_pairing_has_ended() {
         // The host dates a share a moment after the person pressed enter, so the margin comes off

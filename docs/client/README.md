@@ -102,15 +102,18 @@ precedes a subscription, and everything a real host spends answering.
 | `RESYNC_REQUIRED` | Take a new snapshot and resume from its cursor | Refresh |
 | `RATE_LIMITED`, `SERVICE_CAPACITY`, `QUOTA_EXCEEDED` | Wait the delay the host asked for, or the bounded backoff | Wait |
 | Transient conditions | An eligible request is sent again | Wait |
-| Authentication and schema failures | Stop | Sign in, update, or change a setting |
+| Authentication and schema failures, other than a pairing's | Stop | Sign in, update, or change a setting |
 | Everything else | Stop | The host's own message |
 
-A refusal of a pairing, such as an invitation that ended, is in the last row: the host's own
-message, with no action added, because the person who reads it may be the owner whose invitation
-ended and not the device that was refused. A pairing that the host refuses because it still lists
-the device offers no retry either. Pairing the device again requires another owner device that can
-confirm the new pairing. The person asks the host's owner to remove the device first, forgets the
-host on the device if the device still lists it, and pairs with a new invitation.
+A refusal under `PAIRING_EXPIRED`, `PAIRING_REJECTED`, `PAIRING_AUTH_FAILED` or
+`PAIRING_ATTEMPTS_EXHAUSTED` is in the last row: the host's own message, with no action added,
+because the person who reads it may be the owner whose invitation ended and not the device that
+was refused. Any other refusal during a pairing keeps the action of its code: a confirmation from
+an owner who did not issue the invitation is refused under `PERMISSION_DENIED`, which names a
+change of setting. A pairing that the host refuses because it still lists the device offers no
+retry either. Pairing the device again requires another owner device that can confirm the new
+pairing. The person asks the host's owner to remove the device first, forgets the host on the
+device if the device still lists it, and pairs with a new invitation.
 
 `OUTCOME_UNKNOWN` never yields a retry, whatever class asks for one. Section 9 forbids dispatching
 the identifier again, and inventing a new one would submit the same intent twice.

@@ -920,7 +920,7 @@ impl Controller {
 
     /// How one device's pairing stands, as this host decides it.
     ///
-    /// Whether a pairing has run out is decided as admission decides it, on both clocks: the
+    /// Whether a pairing is in force is decided as admission decides it, on both clocks: the
     /// settled UTC expiry and the deadline anchored on the continuous clock. It is not read from
     /// the device record, which changes only when the host first finds the end.
     ///
@@ -957,9 +957,9 @@ impl Controller {
     /// pair with, one that was revoked, one whose pairing cannot be used now, or one that would
     /// outlast its pairing, is a share that ends early or never works. It is refused here, with the
     /// reason, and never clamped to the pairing's end: an invitation silently shortened is one
-    /// whose issuer believes something untrue about it. A paired device that delegates is told in one sentence
-    /// that does not say anything about another device's pairing, because `device.list` needs
-    /// `host.manage` and this would be a way round it.
+    /// whose issuer believes something untrue about it. A paired device that delegates is told in
+    /// one sentence that does not say anything about another device's pairing, because
+    /// `device.list` needs `host.manage` and this would be a way round it.
     ///
     /// # Errors
     ///
