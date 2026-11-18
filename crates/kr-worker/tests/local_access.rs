@@ -798,9 +798,6 @@ async fn input_waiting_for_the_session_when_the_host_restricts_its_owner_is_not_
 
     let attachment = world.attach(&mut window).await;
     let epoch = world.acquire(&mut window, attachment).await;
-    // The shell sets the terminal raw before it prints its marker: input typed before that is
-    // taken by the line discipline of a terminal that is not raw yet.
-    produced(&world.runtime, b"kr-ready.").await;
     world
         .type_as(&mut window, attachment, epoch, 0, b"kr-early")
         .await
@@ -2154,6 +2151,29 @@ async fn hold_the_boundary(
     received_by(deadline, held_end).await.map(|()| let_go)
 }
 
+/// Keeps the service's own maintenance out until the returned end is sent to or dropped, once a
+/// pass that is under way has ended. Returns that end once no pass can run.
+///
+/// The service runs a pass when it starts and then once a minute. A pass takes the dispatch
+/// boundary and then the session, and it runs a withdrawal that a statement owes: a case that
+/// expects a withdrawal still owed, or the boundary to be free for its own steps, keeps passes out
+/// until it has read what it expects. The guard is held on a thread of its own, so that nothing
+/// holds it across an await on the runtime.
+async fn keep_maintenance_out(
+    world: &Arc<World>,
+    deadline: std::time::Instant,
+) -> Option<std::sync::mpsc::Sender<()>> {
+    let (held, held_end) = std::sync::mpsc::channel();
+    let (let_go, keep) = std::sync::mpsc::channel::<()>();
+    let keeper = Arc::clone(world);
+    std::thread::spawn(move || {
+        let _maintenance = keeper.service.hold_maintenance();
+        let _ = held.send(());
+        let _ = keep.recv();
+    });
+    received_by(deadline, held_end).await.map(|()| let_go)
+}
+
 /// What the maintenance pass did to a withdrawal that a statement owes.
 struct Maintenance {
     answered_while_held: bool,
@@ -2174,6 +2194,12 @@ async fn the_maintenance_pass_and_a_withdrawal_that_a_statement_owes()
     let _attachment = world.attach(&mut window).await;
     let (at_the_hold, go_statement) = world.service.stall_a_statement_after_its_hold();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    // The service's own passes are kept out from before the boundary is held until the case has
+    // read what the window holds: a pass that fell into that span, or waited for the held boundary,
+    // would run the withdrawal first.
+    let Some(let_passes_go) = keep_maintenance_out(&world, deadline).await else {
+        return Err("the service's own maintenance was never kept out");
+    };
     let Some(let_go) = hold_the_boundary(&world, deadline).await else {
         return Err("the boundary was never held");
     };
@@ -2200,7 +2226,9 @@ async fn the_maintenance_pass_and_a_withdrawal_that_a_statement_owes()
         .await
         .expect("the session is read");
 
-    // The pass runs the withdrawal that the statement owes, with the statement still stopped.
+    // The passes are let go, and the case runs one of its own: it runs the withdrawal that the
+    // statement owes, with the statement still stopped.
+    let _ = let_passes_go.send(());
     let service = Arc::clone(&world.service);
     tokio::task::spawn_blocking(move || service.maintain_now())
         .await
@@ -2266,6 +2294,11 @@ async fn the_end_of_a_connection_that_owes_a_detach() -> Result<EndOwes, &'stati
     tell(&mut daemon, open(1)).await;
     let _attachment = world.attach(&mut window).await;
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    // A pass of the service's own maintenance that took the boundary and waited for the held
+    // session would keep the statement from its wait for the detach.
+    let Some(let_passes_go) = keep_maintenance_out(&world, deadline).await else {
+        return Err("the service's own maintenance was never kept out");
+    };
 
     // The session is held on a thread of its own, so that no detach can be made.
     let (session_held, session_held_end) = std::sync::mpsc::channel();
@@ -2313,6 +2346,7 @@ async fn the_end_of_a_connection_that_owes_a_detach() -> Result<EndOwes, &'stati
         .await
         .expect("the session is read");
     let settled_by_the_service = world.service.owed_done_for_tests().1;
+    let _ = let_passes_go.send(());
     world.close();
     Ok(EndOwes {
         answered_with_a_detach_pending,
@@ -2563,6 +2597,12 @@ async fn a_statement_marks_what_a_later_statement_owes() -> Result<(bool, Held),
     let (at_the_hold, go_first) = world.service.stall_a_statement_after_its_hold();
     let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    // The first statement owes a withdrawal while the boundary is free, and a pass of the service's
+    // own maintenance would run it before the attach is checked, which the connection's latch
+    // would then refuse.
+    let Some(let_passes_go) = keep_maintenance_out(&world, deadline).await else {
+        return Err("the service's own maintenance was never kept out");
+    };
 
     // The first statement takes the lease that the host gave, which is still live, and stops at the
     // end of its wait, before it runs the withdrawal it owes.
@@ -2616,6 +2656,7 @@ async fn a_statement_marks_what_a_later_statement_owes() -> Result<(bool, Held),
     }
     let at_the_answer = recorded(&answered).map_err(|_| "the second statement failed")?;
     drop(received_by(deadline, attach_ended).await);
+    let _ = let_passes_go.send(());
     world.close();
     Ok((answered_while_held, at_the_answer))
 }
@@ -2788,6 +2829,12 @@ async fn a_push_meets_the_withdrawal_of_its_connection() -> Result<Held, &'stati
     let (checked, go_attach) = world.service.stall_a_mutation_after_its_dispatch_check();
     let (at_the_end, go_end) = world.service.stall_a_connection_at_its_end();
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    // The statement owes a withdrawal while the boundary is free, and a pass of the service's own
+    // maintenance would run it before the attach is checked, which the connection's latch would
+    // then refuse.
+    let Some(let_passes_go) = keep_maintenance_out(&world, deadline).await else {
+        return Err("the service's own maintenance was never kept out");
+    };
 
     let (_acknowledged, daemon_end) =
         start_the_statement(daemon, world.machine.lease(2, FAR_MS, FAR_MS));
@@ -2827,6 +2874,7 @@ async fn a_push_meets_the_withdrawal_of_its_connection() -> Result<Held, &'stati
     }
     let at_the_answer = recorded(&answered).map_err(|_| "the further statement failed")?;
     drop(received_by(deadline, attach_ended).await);
+    let _ = let_passes_go.send(());
     world.close();
     Ok(at_the_answer)
 }
@@ -2925,7 +2973,9 @@ async fn a_sweep_waits_for_a_lock_on_a_runtime_with_one_thread() -> Result<OnOne
     let answered_while_held = is_set(&acknowledged);
 
     // The second window asks for a read: the gate already refuses it, and the worker's one thread is
-    // there to say so.
+    // there to say so. The bound is short on purpose: a worker whose one thread waits for the
+    // fence's lock never answers while that lock is held, and the case ends by its own assertion
+    // on the read and not by the file's long deadline.
     let bound = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let asking = Arc::clone(&world);
     let read = ends_by(bound, async move { asking.read(&mut second).await }).await;
@@ -3269,6 +3319,11 @@ async fn a_statement_meets_a_detach_that_a_connections_end_owed()
     let mut second_window = world.window().await;
     let second = world.attach(&mut second_window).await;
     let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    // A pass of the service's own maintenance that took the boundary and waited for the held
+    // session would keep the statement from its wait for the owed detach.
+    let Some(let_passes_go) = keep_maintenance_out(&world, deadline).await else {
+        return Err("the service's own maintenance was never kept out");
+    };
 
     let (session_held, session_held_end) = std::sync::mpsc::channel();
     let (release_session, go) = std::sync::mpsc::channel::<()>();
@@ -3323,6 +3378,7 @@ async fn a_statement_meets_a_detach_that_a_connections_end_owed()
     if !holds_by(deadline, move || nothing.holds_nothing()).await {
         return Err("the second end never detached its attachment");
     }
+    let _ = let_passes_go.send(());
     world.close();
     Ok(OwedAndLater {
         answered_before_the_session_was_let_go,
