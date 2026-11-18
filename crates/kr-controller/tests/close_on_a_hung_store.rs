@@ -11,9 +11,10 @@
 //!
 //! A case passes when the stop happens within the times section 7 gives it: the answer inside the
 //! seven seconds the daemon's close allows, the shell asked to stop at once, forced five seconds
-//! after it was asked and the closure recorded two seconds after that. The closure's record is
-//! allowed what a few synced writes cost the machine the case runs on, measured when the case
-//! judges.
+//! after it was asked, a drain of two seconds after that and the closure recorded after the drain.
+//! The drain is measured where the worker says it ended, so that a slow disk cannot stand in for
+//! it. The closure's record is allowed what a few synced writes cost the machine the case runs on,
+//! measured when the case judges.
 //!
 //! The daemon's own disk is the other place a close can stand: a close of a session whose worker
 //! has closed is answered with the closure, and the daemon's write of that closure to its registry
@@ -104,6 +105,9 @@ struct Rig {
     marks: tempfile::TempDir,
     root: kr_protocol::identity::ProcessStartIdentity,
     closure: std::sync::mpsc::Receiver<Instant>,
+    /// When the worker said the closure's drain period had ended, which it says before it writes
+    /// the closure's record.
+    drain_ended: std::sync::mpsc::Receiver<Instant>,
 }
 
 impl Drop for Rig {
@@ -136,6 +140,16 @@ impl Rig {
         }
         let runtime = Arc::clone(adopted.workers[0].runtime());
         let root = runtime.session().root_identity().expect("a root shell");
+        let drained = runtime.watch_drain_end();
+        let (drain_sender, drain_ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let waiting = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime for the watch");
+            if waiting.block_on(drained).is_ok() {
+                let _ = drain_sender.send(Instant::now());
+            }
+        });
         let (sender, closure) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let waiting = tokio::runtime::Builder::new_current_thread()
@@ -149,6 +163,7 @@ impl Rig {
             marks,
             root,
             closure,
+            drain_ended,
         }
     }
 
@@ -311,25 +326,29 @@ struct Seen {
     first: Option<Answer>,
     asked: Option<Duration>,
     ended: Option<Duration>,
+    drained: Option<Duration>,
     closed: Option<Duration>,
 }
 
 impl Seen {
     fn line(&self) -> String {
         format!(
-            "close answered {}; the shell was asked to stop {}; the shell ended {}; the closure \
-             was recorded {}",
+            "close answered {}; the shell was asked to stop {}; the shell ended {}; the drain \
+             ended {}; the closure was recorded {}",
             answer_said(&self.first),
             said(self.asked),
             said(self.ended),
+            said(self.drained),
             said(self.closed),
         )
     }
 
     /// What of the stop did not happen within its times: the request reaching the shell, counted
     /// from the close's send, and the grace, the forced end and the drain, counted from the request
-    /// reaching the shell, which is where the worker counts them. The closure's record is allowed
-    /// what [`CLOSURE_WRITES`] synced writes cost, `synced_write` being what one cost just now.
+    /// reaching the shell, which is where the worker counts them. The drain itself is also measured
+    /// on its own, from the shell's end to the moment the worker says the drain ended. The
+    /// closure's record is allowed what [`CLOSURE_WRITES`] synced writes cost, `synced_write` being
+    /// what one cost just now.
     fn shortfalls(&self, synced_write: Duration) -> Vec<String> {
         let mut missed = Vec::new();
         match &self.first {
@@ -368,6 +387,24 @@ impl Seen {
                 ended.0,
                 ended.1,
                 said(self.asked)
+            ));
+        }
+        // The closure's own time cannot tell a drain that was cut from a disk that was slow after
+        // it: both put the record where a full drain would. The worker says where its drain ended,
+        // which is before any of the record's writes, so the drain is measured from the shell's end
+        // to that, and a slow disk cannot lengthen it.
+        let drain = self
+            .ended
+            .zip(self.drained)
+            .map(|(ended, drained)| drained.saturating_sub(ended));
+        if !drain.is_some_and(|drain| drain >= DRAIN - SEEN_EARLY) {
+            missed.push(format!(
+                "the drain lasted {} from the shell's end (at {}) to its own end (at {}), not at \
+                 least {:?}",
+                said(drain),
+                said(self.ended),
+                said(self.drained),
+                DRAIN - SEEN_EARLY
             ));
         }
         let closed = (
@@ -431,6 +468,11 @@ async fn watch_the_stop(
         if seen.ended.is_none() && matches!(process_state(&rig.root), ProcessState::Ended) {
             seen.ended = Some(now);
         }
+        if seen.drained.is_none()
+            && let Ok(at) = rig.drain_ended.try_recv()
+        {
+            seen.drained = Some(at.saturating_duration_since(started));
+        }
         if seen.closed.is_none()
             && let Ok(at) = rig.closure.try_recv()
         {
@@ -439,6 +481,7 @@ async fn watch_the_stop(
         seen.first.is_some()
             && seen.asked.is_some()
             && seen.ended.is_some()
+            && seen.drained.is_some()
             && seen.closed.is_some()
     };
     while started.elapsed() < window {
