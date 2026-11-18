@@ -30,10 +30,14 @@
 //! thread that then waits for the boundary is not seen (the guard is not sendable, so only a
 //! borrow can be).
 //!
-//! The roster in `tests/standing_takes.txt` shows each new mention of a function that takes the
-//! boundary, by function, to a person. It proves nothing about the property, and it does not see a
-//! call that a macro writes, an async taker that a sync body runs to its end, or a take on a thread
-//! that the holder waits for.
+//! The roster in `tests/standing_takes.txt` shows a person each new mention of a function that
+//! takes the boundary, by function, where its scanner reads the take: a taker's name written in
+//! the code, or `lock` or `try_lock` after a `.` or a `::` (a raw identifier such as `r#lock` reads
+//! as its name). It proves nothing about the property. It does not see a call that a macro writes,
+//! a test module that a macro hands on as product code, a take of the mutex whose name is not
+//! written after a `.` or a `::` (a struct pattern that binds the mutex's field and hands the mutex
+//! out), an async taker that a sync body runs to its end, or a take on a thread that the holder
+//! waits for.
 
 use std::cell::Cell;
 use std::sync::Mutex;
