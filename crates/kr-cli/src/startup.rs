@@ -566,13 +566,60 @@ pub async fn open_or_start(
     paths: &HostPaths,
     environment: &KnownEnvironment,
 ) -> Result<(LocalClient, Option<Started>)> {
-    open_or_start_within(paths, environment, BOUNDS, &AtomicBool::new(false), &unseen).await
+    open_or_start_within(paths, environment, BOUNDS, &Launching::default(), &unseen).await
+}
+
+/// What a start made of its request, for a command that must tell a start that was never made from
+/// one that was made and not answered.
+#[derive(Default)]
+pub(crate) struct Launching {
+    /// A daemon was started, or the service manager or the scheduled task was asked to start one,
+    /// and the request was not withdrawn before anything took it.
+    made: AtomicBool,
+    /// The daemon that was asked for may still come up.
+    pending: AtomicBool,
+}
+
+impl Launching {
+    /// A daemon was started, or the manager or the task was asked to start one: the start was
+    /// made, and the daemon it asked for may still come up.
+    pub(crate) fn start_made(&self) {
+        self.made.store(true, Ordering::SeqCst);
+        self.pending.store(true, Ordering::SeqCst);
+    }
+
+    /// The process that was started was seen to end: the start was made, and no daemon it asked for
+    /// may still come up.
+    #[cfg(unix)]
+    pub(crate) fn process_ended(&self) {
+        self.pending.store(false, Ordering::SeqCst);
+    }
+
+    /// The request was withdrawn before any starter took it: no start was made, and no daemon may
+    /// still come up for it.
+    #[cfg(windows)]
+    fn request_withdrawn(&self) {
+        self.made.store(false, Ordering::SeqCst);
+        self.pending.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether a start was made: a daemon was started, or the manager or the task was asked to
+    /// start one.
+    pub(crate) fn was_made(&self) -> bool {
+        self.made.load(Ordering::SeqCst)
+    }
+
+    /// Whether the daemon that was asked for may still come up.
+    pub(crate) fn may_still_start(&self) -> bool {
+        self.pending.load(Ordering::SeqCst)
+    }
 }
 
 /// [`open_or_start`] for a command that must tell a start that was never made from one that was
-/// made and not answered: `launched` is set when a daemon has been started, or the service manager
-/// or the scheduled task has been asked to start one, and stays unset where the start failed before.
-/// Each attempt of the start to reach the daemon is told to `seen` as it is made and ends.
+/// made and not answered: `launched` says whether a daemon has been started, or the service manager
+/// or the scheduled task has been asked to start one, and whether the daemon may still come up; it
+/// says neither where the start failed before. Each attempt of the start to reach the daemon is told
+/// to `seen` as it is made and ends.
 ///
 /// # Errors
 ///
@@ -580,7 +627,7 @@ pub async fn open_or_start(
 pub(crate) async fn open_or_start_telling(
     paths: &HostPaths,
     environment: &KnownEnvironment,
-    launched: &AtomicBool,
+    launched: &Launching,
     seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
     open_or_start_within(paths, environment, BOUNDS, launched, seen).await
@@ -590,7 +637,7 @@ async fn open_or_start_within(
     paths: &HostPaths,
     environment: &KnownEnvironment,
     bounds: Bounds,
-    launched: &AtomicBool,
+    launched: &Launching,
     seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
     let endpoint = environment.paths.controller_endpoint()?;
@@ -618,7 +665,7 @@ async fn start_vacant(
     endpoint: &kr_ipc::paths::Endpoint,
     error: &kr_ipc::IpcError,
     bounds: Bounds,
-    launched: &AtomicBool,
+    launched: &Launching,
     seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
     // The daemon beside this command serves the environment its roots name as this installation's
@@ -880,7 +927,7 @@ pub async fn start_by_service(
         &endpoint,
         BOUNDS,
         majors,
-        (&AtomicBool::new(false), &unseen),
+        (&Launching::default(), &unseen),
     )
     .await?;
     Ok(started)
@@ -913,7 +960,7 @@ pub async fn start_by_service(
         &error,
         BOUNDS,
         majors,
-        (&AtomicBool::new(false), &unseen),
+        (&Launching::default(), &unseen),
     )
     .await?;
     Ok(started)
@@ -1147,7 +1194,7 @@ async fn standalone(
     environment: &EnvironmentPaths,
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
-    launched: &AtomicBool,
+    launched: &Launching,
     seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
     // Held until the daemon answers or the start fails; the daemon takes its own hold on starting.
@@ -1174,7 +1221,7 @@ async fn standalone(
                 Shown::io(&error)
             ))
         })?;
-    launched.store(true, Ordering::SeqCst);
+    launched.start_made();
     let started = Started {
         pid: Some(child.id()),
         start: ControllerStartup::Standalone,
@@ -1196,7 +1243,7 @@ async fn standalone(
     let ended = child.try_wait().ok().flatten();
     if ended.is_some() {
         // A process that was seen to end starts nothing, so no requested daemon may still come up.
-        launched.store(false, Ordering::SeqCst);
+        launched.process_ended();
     }
     let state = ended.map_or_else(
         || Shown::said("it is still running"),
@@ -1290,10 +1337,10 @@ fn last_line_said(line: &str) -> Shown {
 #[cfg(unix)]
 fn asked_and_unanswered(
     refusal: service_manager::Refusal,
-    launched: &AtomicBool,
+    launched: &Launching,
 ) -> service_manager::Refusal {
     if refusal.may_still_start() {
-        launched.store(true, Ordering::SeqCst);
+        launched.start_made();
     }
     refusal
 }
@@ -1333,7 +1380,7 @@ async fn managed(
     error: &kr_ipc::IpcError,
     bounds: Bounds,
     majors: &[u16],
-    (launched, seen): (&AtomicBool, Seen<'_>),
+    (launched, seen): (&Launching, Seen<'_>),
 ) -> Result<(Listed, Option<Started>)> {
     let refused = |refusal| match refusal {
         service_manager::Refusal::NotSetUp(why) => resolve::not_running(environment, error, why),
@@ -1370,7 +1417,7 @@ async fn managed(
         .await
         .map_err(blocked)?
         .map_err(|refusal| refused(asked_and_unanswered(refusal, launched)))?;
-    launched.store(true, Ordering::SeqCst);
+    launched.start_made();
     let started = Started {
         pid: asked.pid,
         start: ControllerStartup::Service,
@@ -1407,7 +1454,7 @@ async fn managed(
     error: &kr_ipc::IpcError,
     _bounds: Bounds,
     _majors: &[u16],
-    _told: (&AtomicBool, Seen<'_>),
+    _told: (&Launching, Seen<'_>),
 ) -> Result<(Listed, Option<Started>)> {
     Err(resolve::not_running(
         environment,
@@ -1459,7 +1506,7 @@ async fn standalone(
     environment: &EnvironmentPaths,
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
-    launched: &AtomicBool,
+    launched: &Launching,
     seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
     let (client, started) =
@@ -1475,7 +1522,7 @@ async fn start_by_task(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
     majors: &[u16],
-    (launched, seen): (&AtomicBool, Seen<'_>),
+    (launched, seen): (&Launching, Seen<'_>),
 ) -> Result<(Listed, Option<Started>)> {
     let deadline = tokio::time::Instant::now() + bounds.start;
     let program = standalone_program()?;
@@ -1494,7 +1541,7 @@ async fn start_by_task(
                     Shown::task(&error)
                 ))
             })??;
-    launched.store(true, Ordering::SeqCst);
+    launched.start_made();
     wait_for_the_task_start(
         environment,
         endpoint,
@@ -1516,7 +1563,7 @@ async fn wait_for_the_task_start(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
     (deadline, majors): (tokio::time::Instant, &[u16]),
-    (launched, seen): (&AtomicBool, Seen<'_>),
+    (launched, seen): (&Launching, Seen<'_>),
     (asked, log): (&windows::Asked, &Log),
 ) -> Result<(Listed, Option<Started>)> {
     let started = Started {
@@ -1555,11 +1602,11 @@ async fn wait_for_the_task_start(
 pub(crate) fn launched_after_the_answer(
     withdrawn: std::result::Result<kr_ipc::starter::Withdrawal, kr_ipc::IpcError>,
     started: Started,
-    launched: &AtomicBool,
+    launched: &Launching,
 ) -> Option<Started> {
     match withdrawn {
         Ok(kr_ipc::starter::Withdrawal::Withdrawn) => {
-            launched.store(false, Ordering::SeqCst);
+            launched.request_withdrawn();
             None
         }
         Ok(kr_ipc::starter::Withdrawal::Taken) | Err(_) => Some(started),
@@ -2533,7 +2580,7 @@ mod windows {
         bound: Duration,
         last: &Shown,
         log: &super::Log,
-        launched: &std::sync::atomic::AtomicBool,
+        launched: &super::Launching,
     ) -> CliError {
         let environment_id = environment.environment_id();
         let name = task::name(environment_id);
@@ -2542,7 +2589,7 @@ mod windows {
             // The request is withdrawn and no starter took it: no daemon was started for it, so
             // none may still start.
             Ok(Withdrawal::Withdrawn) => {
-                launched.store(false, std::sync::atomic::Ordering::SeqCst);
+                launched.request_withdrawn();
                 not_taken(environment, bound, asked)
             }
             Ok(Withdrawal::Taken) => super::unanswered(shown!(
@@ -2798,22 +2845,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_a_manager_that_was_asked_and_did_not_answer_leaves_a_daemon_that_may_still_start() {
-        let not_asked = AtomicBool::new(false);
+        let not_asked = Launching::default();
         for refusal in [
             service_manager::Refusal::Failed(Shown::said("the manager could not be asked")),
             service_manager::Refusal::NotSetUp(Shown::said("the definition is not as written")),
         ] {
             let kept = asked_and_unanswered(refusal, &not_asked);
             assert!(!kept.may_still_start());
-            assert!(!not_asked.load(Ordering::SeqCst), "{kept:?}");
+            assert!(
+                !not_asked.was_made() && !not_asked.may_still_start(),
+                "{kept:?}"
+            );
         }
-        let unanswered = AtomicBool::new(false);
+        let unanswered = Launching::default();
         let kept = asked_and_unanswered(
             service_manager::Refusal::NoAnswer(Shown::said("the manager did not answer")),
             &unanswered,
         );
         assert!(matches!(kept, service_manager::Refusal::NoAnswer(_)));
-        assert!(unanswered.load(Ordering::SeqCst));
+        assert!(unanswered.was_made() && unanswered.may_still_start());
     }
 
     /// Something that accepts connections on an environment's endpoint and never says hello.
@@ -2939,7 +2989,7 @@ mod tests {
                 answer: Duration::from_millis(300),
                 start: Duration::from_secs(1),
             },
-            &AtomicBool::new(false),
+            &Launching::default(),
             &unseen,
         )
         .await
@@ -3425,19 +3475,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_withdrawn_task_request_is_no_launch_where_a_daemon_answers() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let started = Started {
             pid: None,
             start: ControllerStartup::Standalone,
             manager: None,
         };
-        let launched = AtomicBool::new(true);
+        let launched = Launching::default();
+        launched.start_made();
         let withdrawn = Ok(kr_ipc::starter::Withdrawal::Withdrawn);
         assert!(launched_after_the_answer(withdrawn, started, &launched).is_none());
         assert!(
-            !launched.load(Ordering::SeqCst),
-            "no requested daemon may still start"
+            !launched.was_made() && !launched.may_still_start(),
+            "no start was made, and no requested daemon may still start"
         );
         for taken in [
             Ok(kr_ipc::starter::Withdrawal::Taken),
@@ -3447,9 +3496,10 @@ mod tests {
                 std::io::Error::from(std::io::ErrorKind::PermissionDenied),
             )),
         ] {
-            let launched = AtomicBool::new(true);
+            let launched = Launching::default();
+            launched.start_made();
             assert!(launched_after_the_answer(taken, started, &launched).is_some());
-            assert!(launched.load(Ordering::SeqCst));
+            assert!(launched.was_made() && launched.may_still_start());
         }
     }
 
@@ -3481,8 +3531,6 @@ mod tests {
     #[tokio::test]
     async fn the_task_start_launches_nothing_where_a_daemon_answers_and_no_starter_took_the_request()
      {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
         let host = kr_ipc::testing::TempHost::create();
         let paths = host.environment();
         let id = paths.environment_id();
@@ -3507,7 +3555,8 @@ mod tests {
             run: windows::Run::Confirmed,
         };
         let log = Log::open(&paths.state_dir().join(LOG_FILE)).expect("the log");
-        let launched = AtomicBool::new(true);
+        let launched = Launching::default();
+        launched.start_made();
         let (_client, started) = wait_for_the_task_start(
             &paths,
             &endpoint,
@@ -3520,8 +3569,8 @@ mod tests {
         .expect("a daemon answered");
         assert!(started.is_none(), "an untaken request is no launch");
         assert!(
-            !launched.load(Ordering::SeqCst),
-            "no requested daemon may still start"
+            !launched.was_made() && !launched.may_still_start(),
+            "no start was made, and no requested daemon may still start"
         );
         let _connection = daemon.await.expect("the daemon answered once");
     }
