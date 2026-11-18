@@ -1241,6 +1241,95 @@ fn a_challenge_that_lapses_after_its_proof_is_verified_leaves_the_action_answere
 }
 
 #[test]
+fn an_answer_kept_under_a_refusal_code_this_build_lacks_is_told_as_unknown_and_nothing_runs_again()
+{
+    // The journal keeps a refusal's code as its wire word, and a later build can add a word that
+    // this build lacks. A repeat is told that the outcome is unknown, with the detail that was
+    // kept. The row stays, and the action is not carried out a second time.
+    type ActionRow = (
+        Vec<u8>,
+        String,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows = |fixture: &Fixture| -> Vec<ActionRow> {
+        let journal = journal(fixture);
+        let mut statement = journal
+            .prepare(
+                "SELECT action_id, method, result, error_code, error_detail
+                   FROM actions ORDER BY action_id",
+            )
+            .expect("the actions are selected");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("the actions are read")
+            .map(|row| row.expect("an action row"))
+            .collect()
+    };
+    let fixture = Fixture::create();
+    let owner = TestOwner::default();
+    let root = fixture.work().join("unknown-word");
+    std::fs::create_dir(&root).expect("a directory");
+    let params = authorise_params(
+        fixture.environment_id(),
+        &root,
+        LocationPurpose::Destination,
+        None,
+    );
+    let request = challenge_for(fixture.service(), &owner, &params, 14);
+    owner.lapse_after_verifying();
+    let refusal = confirm(fixture.service(), &owner, &params, &request, 14)
+        .expect_err("the challenge lapsed before it could be spent");
+    assert_eq!(refusal.code(), ErrorCode::OwnerConfirmationRequired);
+
+    // A later build added a code, and the refusal of this record was kept under it.
+    let word = "A_CODE_A_LATER_BUILD_ADDS";
+    assert!(
+        ErrorCode::from_wire(word).is_none(),
+        "this build lacks the word"
+    );
+    let changed = journal(&fixture)
+        .execute(
+            "UPDATE actions SET error_code = ?1 WHERE error_code = ?2",
+            rusqlite::params![word, ErrorCode::OwnerConfirmationRequired.as_str()],
+        )
+        .expect("the kept word is changed");
+    assert_eq!(changed, 1, "the one refusal this action kept");
+    let before = rows(&fixture);
+
+    // 1. The reader's answer: the outcome is unknown, under the detail that was kept.
+    let repeated = confirm(fixture.service(), &owner, &params, &request, 14)
+        .expect_err("the repeat is told what is kept, as unknown");
+    assert_eq!(repeated.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(repeated.to_string(), refusal.to_string());
+
+    // 2. The record stays, and 3. nothing ran again: no row was added or changed, and the
+    // authorisation did not happen.
+    assert_eq!(rows(&fixture), before);
+    assert!(
+        fixture
+            .service()
+            .project_location_list(&ProjectLocationListParams {
+                environment_id: fixture.environment_id(),
+                grant_id: Nullable(None),
+            })
+            .expect("the list reads")
+            .locations
+            .is_empty(),
+        "nothing was authorised"
+    );
+}
+
+#[test]
 fn withdrawal_takes_a_location_out_of_every_later_admission_and_is_final() {
     let fixture = Fixture::create();
     let owner = TestOwner::default();

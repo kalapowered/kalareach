@@ -4086,6 +4086,97 @@ mod tests {
     }
 
     #[test]
+    fn an_action_kept_under_a_refusal_code_this_build_lacks_is_unknown_and_is_never_recorded_again()
+    {
+        // A store keeps an error code as its wire word, and a later build can add a word that
+        // this build lacks. The reading is the same on every path: the outcome is unknown, the
+        // stored detail is shown, the row stays, and a repeat records nothing under the identifier.
+        let store = Store::in_memory(environment()).expect("a store opens");
+        let action = action(90, "project.init");
+        let refusal = RetainedOutcome::Error {
+            code: ErrorCode::InvalidArgument,
+            detail: "it was refused".to_owned(),
+        };
+        let record = |store: &Store, outcome: &RetainedOutcome| {
+            store.record_action(
+                &action.actor_id,
+                action.action_id,
+                &action.method,
+                action.payload_digest,
+                outcome,
+                TimestampMs::new(5),
+            )
+        };
+        assert_eq!(
+            record(&store, &refusal).expect("the refusal is kept"),
+            None,
+            "the first writer keeps it"
+        );
+        let kept = |store: &Store| {
+            store
+                .retained_action(&action.actor_id, action.action_id)
+                .expect("the row reads")
+                .expect("the row is there")
+        };
+        assert_eq!(
+            kept(&store).error_code.as_deref(),
+            Some(ErrorCode::InvalidArgument.as_str()),
+            "the writer kept the refusal as its wire word"
+        );
+
+        // A later build added a code, and the refusal of this record was kept under it.
+        let word = "A_CODE_A_LATER_BUILD_ADDS";
+        assert!(
+            ErrorCode::from_wire(word).is_none(),
+            "this build lacks the word"
+        );
+        store
+            .connection
+            .execute(
+                "UPDATE actions SET error_code = ?1 WHERE action_id = ?2",
+                params![word, action.action_id.as_bytes().to_vec()],
+            )
+            .expect("the kept word is changed");
+        let before = kept(&store);
+
+        // 1. The reader's answer: the outcome is unknown, with the stored detail. It is not a
+        // success, and it is not a refusal under another definite code.
+        assert_eq!(
+            outcome_of(&before),
+            RetainedOutcome::Error {
+                code: ErrorCode::OutcomeUnknown,
+                detail: "it was refused".to_owned(),
+            }
+        );
+        // The writer's own repeat reads the same record and answers the same.
+        assert_eq!(
+            record(&store, &refusal).expect("the repeat reads the record"),
+            Some(RetainedOutcome::Error {
+                code: ErrorCode::OutcomeUnknown,
+                detail: "it was refused".to_owned(),
+            })
+        );
+
+        // 2. The record stays: the same row, and 3. a repeat, even one that carries a success,
+        // records nothing over it.
+        assert_eq!(kept(&store), before);
+        assert_eq!(
+            record(&store, &RetainedOutcome::Ok(vec![1, 2, 3])).expect("the repeat reads"),
+            Some(RetainedOutcome::Error {
+                code: ErrorCode::OutcomeUnknown,
+                detail: "it was refused".to_owned(),
+            }),
+            "a second effect's success does not replace the kept refusal"
+        );
+        assert_eq!(kept(&store), before);
+        let rows: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM actions", [], |row| row.get(0))
+            .expect("the rows count");
+        assert_eq!(rows, 1, "no second row was made for the identifier");
+    }
+
+    #[test]
     fn an_operation_row_survives_a_round_trip_with_every_field_it_carries() {
         let mut store = Store::in_memory(environment()).expect("a store opens");
         let row = operation(1, 2);
