@@ -1393,7 +1393,8 @@ fn marker_told(request: &Request) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waited<'a> {
     /// The process that the wait is for by its start identity: the one that the lock file named
-    /// before the request, where the answer named the same process or none.
+    /// before the request, where a reply on the connection that carried the request named the
+    /// same process.
     old: Option<&'a ProcessStartIdentity>,
     /// The process that `--json` shows: the one that the answer named, and otherwise the one that
     /// the lock file named.
@@ -1401,12 +1402,20 @@ struct Waited<'a> {
 }
 
 /// Which process a stop is waited for by, from the one that the lock file named before the request
-/// (`holder`) and the one that the daemon's answer named (`answered`). A lock file that names a
-/// process other than the answer's says nothing about the daemon that answered, so the wait is not
-/// for that process by its identity.
-fn process_waited_for(holder: Option<&ProcessStartIdentity>, answered: Option<u64>) -> Waited<'_> {
+/// (`holder`), the one that an earlier reply on the connection that carries the request named
+/// (`stated`: the restart's request for the launch alone) and the one that the answer to the
+/// request named (`answered`). The lock file was read before the connection was made, so it may
+/// name a daemon that another has replaced since: the wait is for that process by its identity only
+/// where a reply on the carrying connection named it. A reply that names none (an unknown outcome)
+/// gives no identity, and the wait then ends as it does where no process is known.
+fn process_waited_for(
+    holder: Option<&ProcessStartIdentity>,
+    stated: Option<u64>,
+    answered: Option<u64>,
+) -> Waited<'_> {
+    let named = answered.or(stated);
     Waited {
-        old: holder.filter(|holder| answered.is_none_or(|answered| answered == holder.pid.get())),
+        old: holder.filter(|holder| named == Some(holder.pid.get())),
         pid: answered.or_else(|| holder.map(|holder| holder.pid.get())),
     }
 }
@@ -1440,7 +1449,8 @@ pub(crate) struct Settled {
     /// stop, where it answered.
     pub(crate) unsettled: Option<u64>,
     /// The process that the wait was for by its start identity, owned: the one that the lock file
-    /// named before the request, where the answer named the same process or none.
+    /// named before the request, where a reply on the connection that carried the request named the
+    /// same process.
     pub(crate) old: Option<ProcessStartIdentity>,
 }
 
@@ -1472,6 +1482,7 @@ async fn stop_the_daemon(
             client,
             &info,
             holder,
+            None,
             json,
             progress,
             &none,
@@ -1535,9 +1546,11 @@ pub(crate) async fn read_the_daemon(
 }
 
 /// Records the attempt, asks the daemon to stop and waits for it to end. What ends the command
-/// before the wait is a [`Cut`].
+/// before the wait is a [`Cut`]. `stated` is the process that a reply on this connection named
+/// before the request, where the command asked for one (the restart's request for the launch
+/// alone).
 // The command, the paths, the environment, the connection, what the daemon said of itself, the
-// output form, the progress and the result so far.
+// holder, the process a reply stated, the output form, the progress and the result so far.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn ask_and_wait(
     which: Which,
@@ -1546,6 +1559,7 @@ pub(crate) async fn ask_and_wait(
     mut client: LocalClient,
     info: &HostInfoResult,
     holder: Option<ProcessStartIdentity>,
+    stated: Option<u64>,
     json: bool,
     progress: &Progress,
     none: &Facts,
@@ -1627,11 +1641,13 @@ pub(crate) async fn ask_and_wait(
     }
     drop(client);
 
-    // The process that is waited for by its start identity is the one that answered: a lock file
-    // that names another says nothing about this daemon. Where there is none, the wait is for the
-    // lock and the endpoint, and no text names the asked process by its identity; a text names
-    // only a process that the lock file names, where that is a live process named kr-controller.
-    let Waited { old, pid } = process_waited_for(holder.as_ref(), pid);
+    // The process that is waited for by its start identity is the one that a reply on this
+    // connection named: a lock file that names another, or that no reply confirms, says nothing
+    // about this daemon, which may have replaced the one that it names. Where there is none, the
+    // wait is for the lock and the endpoint, and no text names the asked process by its identity; a
+    // text names only a process that the lock file names, where that is a live process named
+    // kr-controller.
+    let Waited { old, pid } = process_waited_for(holder.as_ref(), stated, pid);
     let operations = Real::of(host, &environment.paths, Some(info.generation));
     let ended = wait_for_the_end(&operations, old, END_BOUND).await;
     Ok(Settled {
@@ -2677,8 +2693,9 @@ fn bound_shows(round: &Round, at_bound: bool, why: Why) -> Option<End> {
 /// lock file names a live process named kr-controller that is not the old one, or a daemon of
 /// another generation answers. Anything else that holds the lock for a moment, another command's
 /// look among it, is waited through. Where no identity is known (always on Windows; where the
-/// lock file cannot be read or names no process whose start can be read; or where the answer named
-/// another process than the lock file did), the daemon has ended when the lock is free and nothing
+/// lock file cannot be read or names no process whose start can be read; or where no reply on the
+/// connection that carried the request named the process that the lock file named: the answer was
+/// an unknown outcome, or named another process), the daemon has ended when the lock is free and nothing
 /// answers at its endpoint, or when a daemon of another generation answers, which is a successor
 /// (the process that the lock file names, where it names one, is that successor's, and with the
 /// lock held it is never taken for one on its own); the command cannot wait for the asked process
@@ -3241,6 +3258,60 @@ mod tests {
     #[test]
     fn the_words_of_a_daemon_that_has_not_ended_name_no_process_and_promise_no_wait() {
         let temp = kr_ipc::testing::TempHost::create();
+    /// The words of a daemon that has not ended where the answer to the stop named none name a
+    /// process only as the lock file names it when the words are made, after the last look at the
+    /// endpoint, and only where that process runs the daemon: the read starts nothing and stops
+    /// nothing. A lock file that names a process that has gone gives the form with no number.
+    #[cfg(unix)]
+    #[test]
+    fn the_words_of_a_daemon_that_has_not_ended_name_no_number_for_a_lock_file_that_names_a_dead_process()
+     {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let lock = environment.singleton_lock();
+        std::fs::create_dir_all(lock.parent().expect("a state directory")).expect("a directory");
+        let mut ended = std::process::Command::new("true")
+            .spawn()
+            .expect("starts a process");
+        ended.wait().expect("collects it");
+        std::fs::write(&lock, format!("{}\n", ended.id())).expect("names a process that has gone");
+        let what = Shown::said("did not show whether it took the stop (x), and it has not ended");
+        let said = not_ended(Which::Stop, &environment, id, &what, None).to_string();
+        assert!(
+            said.contains(
+                "If it stays, end the process that holds the lock file; the next daemon recovers as it does after a crash."
+            ),
+            "{said}"
+        );
+        assert!(!said.contains(&ended.id().to_string()), "{said}");
+    }
+
+    /// The same for a lock file that names a live process that is no control daemon: it is not
+    /// named, however it came to be in the lock file.
+    #[cfg(unix)]
+    #[test]
+    fn the_words_of_a_daemon_that_has_not_ended_name_no_number_for_a_lock_file_that_names_no_control_daemon()
+     {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let lock = environment.singleton_lock();
+        std::fs::create_dir_all(lock.parent().expect("a state directory")).expect("a directory");
+        // This test program is a live process, and its program is not a control daemon's.
+        let own = std::process::id();
+        std::fs::write(&lock, format!("{own}\n")).expect("names a live process");
+        let what = Shown::said("did not show whether it took the stop (x), and it has not ended");
+        let said = not_ended(Which::Stop, &environment, id, &what, None).to_string();
+        assert!(
+            said.contains(
+                "If it stays, end the process that holds the lock file; the next daemon recovers as it does after a crash."
+            ),
+            "{said}"
+        );
+        assert!(!said.contains(&own.to_string()), "{said}");
+    }
+
         let environment = temp.environment();
         let id = environment.environment_id();
         let what = Shown::said("was told to stop and has not ended");
@@ -3496,6 +3567,7 @@ mod tests {
             &none,
         )
         .await;
+            None,
         let (at_the_request, at_the_next_request, at_the_close) = match daemon {
             Some(daemon) => daemon.await.expect("the daemon saw the command's request"),
             None => (Vec::new(), None, Vec::new()),
@@ -8427,7 +8499,7 @@ mod tests {
         for named in [None, Some(4000_u64)] {
             for answered in [None, Some(4000_u64), Some(4001)] {
                 let holder = named.map(|_| asked_process());
-                let waited = process_waited_for(holder.as_ref(), answered);
+                let waited = process_waited_for(holder.as_ref(), None, answered);
                 out.push_str(&format!(
                     "named={} answer={} -> {}\n",
                     named.map_or_else(|| "none".to_owned(), |pid| pid.to_string()),
@@ -8452,6 +8524,19 @@ mod tests {
     /// decision, of a sentence's kind, of an exit or of a `stop` member shows as a change of the
     /// file. The sentences' words are not in it, and a decision that no walk prints is held by a
     /// named case.
+        out.push_str("\n## the same where the answer named none and an earlier reply on the connection that carries the request (the restart's request for the launch alone) named a process\n");
+        for named in [None, Some(4000_u64)] {
+            for stated in [4000_u64, 4001] {
+                let holder = named.map(|_| asked_process());
+                let waited = process_waited_for(holder.as_ref(), Some(stated), None);
+                out.push_str(&format!(
+                    "named={} stated={} -> {}\n",
+                    named.map_or_else(|| "none".to_owned(), |pid| pid.to_string()),
+                    stated,
+                    waited.label()
+                ));
+            }
+        }
     #[test]
     fn the_table_of_the_end_is_the_file() {
         is_the_file(
