@@ -1382,6 +1382,8 @@ pub enum HostCommand {
     /// Show, add or take out the optional profile that makes each new window or tab of one
     /// terminal application a session of its own.
     TerminalProfile(TerminalProfileArguments),
+    /// Install, show or remove the login item that starts the control daemon when you log in.
+    LoginItem(LoginItemArguments),
     /// Show or choose how `kr new` starts this environment's control daemon when none is running.
     Startup(StartupArguments),
     /// Ask this installation's control daemon to stop, wait until it has ended, and say what that
@@ -1729,6 +1731,38 @@ pub struct TerminalProfileRemove {
     /// Show what would be taken out and take out nothing.
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// `kr host login-item`.
+///
+/// Install, show or remove the login item that starts the control daemon when you log in on macOS
+/// or Linux. It is a launch agent file on macOS and an autostart entry on Linux, offered apart from
+/// the headless host `kr host startup` chooses, the shell startup entry and the terminal profile.
+/// Nothing starts now, and a daemon that is running is never ended.
+///
+/// A daemon that already runs holds the environment's lock, so the login item's daemon exits and
+/// that login has no desktop host until the other daemon ends and you log in again. macOS 13 and
+/// later may list the item under Login Items, where you can switch it off; kr cannot read that
+/// switch. On Linux the daemon's output goes where your session sends an autostart program's, not
+/// to controller.log, and a desktop setting that edits the file makes kr read it as changed. kr
+/// writes the file where HOME (and XDG_CONFIG_HOME on Linux) point in the shell that runs it, and
+/// the item keeps that shell's runtime and state directories.
+#[derive(Args)]
+pub struct LoginItemArguments {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: LoginItemCommand,
+}
+
+/// One `kr host login-item` step.
+#[derive(Subcommand)]
+pub enum LoginItemCommand {
+    /// Show whether the login item is installed, without writing anything.
+    Status,
+    /// Write the login item, and record it.
+    Install,
+    /// Take out the login item kr wrote, and only that file.
+    Remove,
 }
 
 /// `kr host power`.

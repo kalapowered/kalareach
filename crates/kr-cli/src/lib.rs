@@ -72,6 +72,7 @@ pub mod helper;
 pub mod hold;
 pub mod host_stop;
 pub mod import;
+pub mod login_item;
 pub mod machine;
 pub mod mouse;
 pub mod network;
