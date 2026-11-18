@@ -2114,6 +2114,12 @@ mod tests {
                 },
                 ErrorCode::PairingRejected,
             ),
+            (
+                InvitationState::Consumed {
+                    reason: PairingConsumedReason::EndpointPaired,
+                },
+                ErrorCode::PairingRejected,
+            ),
             (InvitationState::Committed, ErrorCode::PairingRejected),
             (InvitationState::Open, ErrorCode::PairingRejected),
             (
@@ -2132,6 +2138,12 @@ mod tests {
                 );
             }
         }
+        // The one set of words is for a consumed invitation: a rejection of another kind under
+        // the same code keeps its own.
+        assert_ne!(
+            protocol_refusal(kr_pairing::PairingError::CandidateLocked).message,
+            NO_LONGER_OPEN
+        );
     }
 
     /// KR-REQ-10.05: a write that failed is reported as a failure even when the admission lapses
