@@ -46,6 +46,7 @@ use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
+use kr_ipc::testing::started_environment::StartedEnvironment;
 use kr_ipc::verify::ControllerIdentity;
 use kr_perf::{process, record};
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -313,7 +314,10 @@ impl Run {
                         environment_snapshot: vec![kr_protocol::session::EnvironmentVariable {
                             name: "PATH".to_owned(),
                             value: "/usr/bin:/bin".to_owned(),
-                        }],
+                        }]
+                        .into_iter()
+                        .chain(StartedEnvironment::within(host.temp.root()).snapshot_home())
+                        .collect(),
                         launch_profile: kr_protocol::session::LaunchProfile::default(),
                         terminal: Nullable::null(),
                     },

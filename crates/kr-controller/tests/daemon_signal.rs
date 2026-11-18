@@ -288,7 +288,10 @@ impl Host {
                     name: "PS1".to_owned(),
                     value: String::new(),
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(StartedEnvironment::within(self.tree.root()).snapshot_home())
+            .collect(),
             palette: Nullable::null(),
             launch_profile: kr_protocol::session::LaunchProfile::default(),
             terminal: Nullable::null(),

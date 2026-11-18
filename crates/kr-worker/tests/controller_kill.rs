@@ -581,7 +581,10 @@ async fn a_daemon_killed_during_output_leaves_local_work_running_and_a_reconnect
                         name: "PS1".to_owned(),
                         value: String::new(),
                     },
-                ],
+                ]
+                .into_iter()
+                .chain(StartedEnvironment::within(host.root()).snapshot_home())
+                .collect(),
                 launch_profile: kr_protocol::session::LaunchProfile::default(),
                 terminal: Nullable::null(),
             },

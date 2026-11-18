@@ -237,9 +237,10 @@ fn build() -> BuildId {
 }
 
 /// A create request for one session, in one execution context.
+/// The session works in `root`, the host's tree, and has the home folder that tree holds.
 fn create_params(
     environment_id: EnvironmentId,
-    cwd: &Path,
+    root: &Path,
     presentation: Presentation,
     profile: WorkerProfile,
 ) -> SessionCreateParams {
@@ -248,13 +249,14 @@ fn create_params(
         presentation,
         shell: Nullable::some(kr_worker::testing::posix_shell()),
         shell_mode: ShellMode::NativeCompat,
-        cwd: Nullable::some(cwd.display().to_string()),
+        cwd: Nullable::some(root.display().to_string()),
         dimensions: Nullable::null(),
         worker_profile: profile,
         palette: Nullable::null(),
-        // A session nobody is shown takes the host's environment and carries none of its own.
+        // A session nobody is shown takes the host's environment and carries only its home, which
+        // is the host's too.
         environment_snapshot: if presentation == Presentation::Invisible {
-            Vec::new()
+            StartedEnvironment::within(root).snapshot_home()
         } else {
             vec![
                 kr_protocol::session::EnvironmentVariable {
@@ -276,6 +278,9 @@ fn create_params(
                     value: "wayland-99".to_owned(),
                 },
             ]
+            .into_iter()
+            .chain(StartedEnvironment::within(root).snapshot_home())
+            .collect()
         },
         launch_profile: kr_protocol::session::LaunchProfile::default(),
         terminal: Nullable::null(),

@@ -719,6 +719,7 @@ impl Host {
                 },
             ));
             start_daemon(
+                self.temp.root(),
                 &environment,
                 supervisor,
                 self.worker.clone(),
@@ -732,10 +733,6 @@ impl Host {
                 started.elapsed()
             )
         });
-        // Its sessions run a login shell: they are given a home inside the tree, not the person's.
-        daemon
-            .controller
-            .set_host_environment(StartedEnvironment::within(self.temp.root()).host_variables());
         daemon
     }
 
@@ -752,7 +749,14 @@ impl Host {
 
 /// Starts a control daemon for `environment`, starting its workers through `supervisor`, and
 /// serves its rendezvous and client endpoints.
+///
+/// The daemon's sessions run a login shell, so before any endpoint exists it is given the
+/// environment of `tree`, the host's own tree, as the one a session started with the host's
+/// environment has: a home inside the tree, not the person's. A create of this suite carries its
+/// creator's snapshot (see `create_params`), so no session of the suite takes the host's
+/// environment today; the setting keeps a later invisible or app create from the person's home.
 async fn start_daemon(
+    tree: &Path,
     environment: &kr_ipc::paths::EnvironmentPaths,
     supervisor: Box<dyn WorkerSupervisor>,
     worker: PathBuf,
@@ -780,6 +784,7 @@ async fn start_daemon(
         terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await?;
+    controller.set_host_environment(StartedEnvironment::within(tree).host_variables());
     let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
         .expect("binds the rendezvous");
     let clients = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))
@@ -838,13 +843,15 @@ fn build() -> BuildId {
 }
 
 /// A shell that prints a marker and then waits, so its output is observable and it does not exit.
-fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreateParams {
+/// It works in `root`, the host's tree, and has the home folder that tree holds: every create of
+/// this suite is made here, and a session's login shell with no home reads the account's own.
+fn create_params(environment_id: EnvironmentId, root: &Path) -> SessionCreateParams {
     SessionCreateParams {
         environment_id,
         presentation: Presentation::Attach,
         shell: Nullable::some(kr_worker::testing::posix_shell()),
         shell_mode: ShellMode::NativeCompat,
-        cwd: Nullable::some(cwd.display().to_string()),
+        cwd: Nullable::some(root.display().to_string()),
         dimensions: Nullable::null(),
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         palette: Nullable::null(),
@@ -857,7 +864,10 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
                 name: "PS1".to_owned(),
                 value: String::new(),
             },
-        ],
+        ]
+        .into_iter()
+        .chain(StartedEnvironment::within(root).snapshot_home())
+        .collect(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
         terminal: Nullable::null(),
     }
@@ -874,17 +884,6 @@ async fn create_with(
     extra: &[(&str, &str)],
 ) -> SessionCreateResult {
     let mut params = create_params(host.environment_id, host.temp.root());
-    // The shell is given a home inside the host's tree, not the person's.
-    #[cfg(unix)]
-    params
-        .environment_snapshot
-        .push(kr_protocol::session::EnvironmentVariable {
-            name: "HOME".to_owned(),
-            value: StartedEnvironment::within(host.temp.root())
-                .home()
-                .display()
-                .to_string(),
-        });
     params
         .environment_snapshot
         .extend(
@@ -2640,6 +2639,7 @@ async fn a_managed_create_whose_shell_never_qualifies_is_answered_with_the_worke
         inner: host.platform_supervisor(),
     }));
     let _controller = start_daemon(
+        host.temp.root(),
         &environment,
         supervisor,
         host.worker.clone(),
@@ -3243,9 +3243,15 @@ async fn a_daemon_for_its_parents_tree() {
         .read_line(&mut word)
         .expect("the parent's word that the jobs are in place");
     let supervisor = nested_daemon_supervisor(&environment, Path::new(&starter));
-    let _daemon = start_daemon(&environment, supervisor, PathBuf::from(worker), None)
-        .await
-        .expect("the daemon starts");
+    let _daemon = start_daemon(
+        paths.state_root(),
+        &environment,
+        supervisor,
+        PathBuf::from(worker),
+        None,
+    )
+    .await
+    .expect("the daemon starts");
     println!("daemon ready");
     std::future::pending::<()>().await;
 }
@@ -4507,9 +4513,15 @@ async fn a_worker_serves_no_held_method_to_a_local_caller_before_its_daemon_has_
         value: release.display().to_string(),
         inner: host.platform_supervisor(),
     }));
-    let daemon = start_daemon(&environment, supervisor, host.worker.clone(), None)
-        .await
-        .expect("the daemon starts");
+    let daemon = start_daemon(
+        host.temp.root(),
+        &environment,
+        supervisor,
+        host.worker.clone(),
+        None,
+    )
+    .await
+    .expect("the daemon starts");
     let mut client = host.client().await;
     let params = create_params(host.environment_id, host.temp.root());
     let create = tokio::spawn(async move {
@@ -4638,9 +4650,15 @@ async fn a_worker_that_dies_after_its_claim_and_before_it_reports_has_its_tree_s
         value: release.display().to_string(),
         inner: Box::new(DetachedSupervisor::new()),
     }));
-    let daemon = start_daemon(&environment, supervisor, host.worker.clone(), None)
-        .await
-        .expect("the daemon starts");
+    let daemon = start_daemon(
+        host.temp.root(),
+        &environment,
+        supervisor,
+        host.worker.clone(),
+        None,
+    )
+    .await
+    .expect("the daemon starts");
     let mut client = host.client().await;
     let mut params = create_params(host.environment_id, host.temp.root());
     params
