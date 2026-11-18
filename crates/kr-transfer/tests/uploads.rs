@@ -4302,7 +4302,7 @@ fn a_begin_that_a_limit_refuses_answers_its_own_refusal_over_a_refusal_kept_unde
         "this build lacks the word"
     );
     {
-        let mut store = kr_transfer::Store::open(
+        let store = kr_transfer::Store::open(
             kr_transfer::StagingArea::store_path(&harness.host.environment()),
             harness.host.environment_id(),
         )
