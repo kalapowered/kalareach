@@ -18,7 +18,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use futures_util::future::BoxFuture;
+use kr_crypto::secret::SecretVec;
 use kr_transport::config::ProxyUrl;
+use kr_transport::front::{Tunnel, TunnelOpener, TunnelRefusal};
+use kr_transport::proxy::{ProxyLoginKind, StopKind};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -169,16 +173,22 @@ pub enum TunnelFailure {
     Reason(&'static str),
     /// The proxy answered the request with a status other than 2xx.
     Refused(u16),
+    /// The proxy's login: it asked for one this host does not hold, it refused the one this host
+    /// sent, or it asked for a sign-in method this host does not send. A refusal of the login sets
+    /// the login's verdict before this is returned, and once the verdict is set no tunnel sends the
+    /// login again.
+    Login(ProxyLoginKind),
 }
 
 impl TunnelFailure {
     /// The words that say why the tunnel did not open: this client's reason, or for a refusal the
-    /// status after the words that name it.
+    /// status after the words that name it, or for a login the kind's sentence.
     #[must_use]
     pub fn reason(&self) -> String {
         match self {
             Self::Reason(reason) => (*reason).to_owned(),
             Self::Refused(status) => format!("{REFUSED} {status}"),
+            Self::Login(kind) => kind.sentence(),
         }
     }
 }
@@ -192,6 +202,12 @@ impl TunnelFailure {
 /// one byte at a time, so nothing that follows it is taken from the TLS that runs inside the
 /// tunnel. The caller bounds how long all of it may take.
 ///
+/// This is the one writer of a proxy's login. A proxy that holds one gets it in the `CONNECT`'s
+/// `Proxy-Authorization`, written only after TLS to an `https` proxy is up. The verdict on the
+/// login is read when this is called and again right before the write, with nothing that waits
+/// between the read and the write, so once the verdict is set no call writes the login except one
+/// that has passed its second read. A `407` to a login that was sent sets the verdict.
+///
 /// # Errors
 ///
 /// Returns why the tunnel did not open. Nothing has been sent to `host` when this fails.
@@ -201,6 +217,10 @@ pub async fn through(
     port: u16,
     tls: &Arc<ClientConfig>,
 ) -> Result<Carrier, TunnelFailure> {
+    let login = proxy.login();
+    if let Some(stop) = login.and_then(|login| login.stopped()) {
+        return Err(TunnelFailure::Login(stop.as_login_kind()));
+    }
     let address = proxy.as_url();
     let proxy_port = address
         .port_or_known_default()
@@ -237,9 +257,20 @@ pub async fn through(
     } else {
         format!("{host}:{port}")
     };
-    let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+    let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n").into_bytes();
+    if let Some(login) = login {
+        request.extend_from_slice(b"Proxy-Authorization: ");
+        request.extend_from_slice(login.authorization().as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    let request = SecretVec::new(request);
+    // The second read of the verdict. Nothing awaits between it and the first poll of the write.
+    if let Some(stop) = login.and_then(|login| login.stopped()) {
+        return Err(TunnelFailure::Login(stop.as_login_kind()));
+    }
     carrier
-        .write_all(request.as_bytes())
+        .write_all(request.expose())
         .await
         .map_err(|_| TunnelFailure::Reason(REQUEST_FAILED))?;
     carrier
@@ -260,8 +291,134 @@ pub async fn through(
     }
     match status(&head) {
         Some(status) if (200..300).contains(&status) => Ok(carrier),
+        Some(407) => Err(TunnelFailure::Login(the_login_was_refused(proxy, &head))),
         Some(status) => Err(TunnelFailure::Refused(status)),
         None => Err(TunnelFailure::Reason(NO_STATUS_LINE)),
+    }
+}
+
+/// What a `407` to a `CONNECT` means, and the verdict when a login was sent.
+///
+/// A proxy that offers challenges and none of them Basic asks for a method this host does not send,
+/// whether or not a login was sent. Otherwise the login that was sent was refused, or none was sent
+/// and one is needed. Nothing the proxy wrote is kept.
+fn the_login_was_refused(proxy: &ProxyUrl, head: &[u8]) -> ProxyLoginKind {
+    let kind = if offers_basic(head) {
+        if proxy.login().is_some() {
+            ProxyLoginKind::Refused
+        } else {
+            ProxyLoginKind::Needed
+        }
+    } else {
+        ProxyLoginKind::Unsupported
+    };
+    if let Some(login) = proxy.login() {
+        login.refuse(match kind {
+            ProxyLoginKind::Unsupported => StopKind::Unsupported,
+            _ => StopKind::Refused,
+        });
+    }
+    kind
+}
+
+/// Whether a `407`'s head leaves Basic open: `false` only when it offered challenges and none was
+/// Basic.
+///
+/// A header name is case-insensitive and may repeat, and its value is a list of challenges. A
+/// challenge is a scheme token followed by a token68 or by a comma-separated list of parameters,
+/// each `token BWS "=" BWS (token | quoted-string)`. The value splits at commas outside quoted
+/// strings, and a backslash inside one escapes the next character. A token that is followed by
+/// optional blanks and `=` is a parameter of the challenge before it and never a scheme. A head
+/// with no challenge, or none that can be read, leaves Basic open.
+fn offers_basic(head: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(head);
+    let mut offered = false;
+    for line in text.split("\r\n").skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("proxy-authenticate") {
+            continue;
+        }
+        for element in split_outside_quotes(value) {
+            let element = element.trim_matches([' ', '\t']);
+            let scheme_end = element.find([' ', '\t', '=']).unwrap_or(element.len());
+            if element.is_empty() || scheme_end == 0 {
+                continue;
+            }
+            if element[scheme_end..]
+                .trim_start_matches([' ', '\t'])
+                .starts_with('=')
+            {
+                // `name=value`, or `name = value`: a parameter, never a scheme.
+                continue;
+            }
+            offered = true;
+            if element[..scheme_end].eq_ignore_ascii_case("basic") {
+                return true;
+            }
+        }
+    }
+    !offered
+}
+
+/// Splits a header value at its commas that are outside quoted strings.
+fn split_outside_quotes(value: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, character) in value.char_indices() {
+        match (quoted, escaped, character) {
+            (true, true, _) => escaped = false,
+            (true, false, '\\') => escaped = true,
+            (true, false, '"') => quoted = false,
+            (false, _, '"') => quoted = true,
+            (false, _, ',') => {
+                parts.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
+/// The tunnels through one proxy, as the front of a login-holding endpoint opens them: each is
+/// [`through`], so the front never writes the login itself.
+pub struct ProxyTunnels {
+    proxy: ProxyUrl,
+    tls: Arc<ClientConfig>,
+}
+
+impl ProxyTunnels {
+    /// The tunnels through `proxy`, whose TLS is verified with `tls`.
+    #[must_use]
+    pub const fn new(proxy: ProxyUrl, tls: Arc<ClientConfig>) -> Self {
+        Self { proxy, tls }
+    }
+}
+
+impl std::fmt::Debug for ProxyTunnels {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ProxyTunnels")
+    }
+}
+
+impl TunnelOpener for ProxyTunnels {
+    fn open<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> BoxFuture<'a, Result<Tunnel, TunnelRefusal>> {
+        Box::pin(async move {
+            match through(&self.proxy, host, port, &self.tls).await {
+                Ok(carrier) => Ok(Tunnel::new(carrier)),
+                Err(TunnelFailure::Login(kind)) if kind.stops_until_restart() => {
+                    Err(TunnelRefusal::Stopped)
+                }
+                Err(_) => Err(TunnelRefusal::Failed),
+            }
+        })
     }
 }
 
@@ -283,6 +440,69 @@ fn status(head: &[u8]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The challenge reader leaves Basic open unless the head offers challenges and none is Basic:
+    /// a scheme is found by its place in the list, never inside a quoted string, a parameter or a
+    /// token68, and a head with nothing readable leaves Basic open.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[test]
+    fn the_challenge_reader_takes_basic_and_nothing_inside_a_realm() {
+        let head = |lines: &[&str]| {
+            let mut head = String::from("HTTP/1.1 407 Proxy Authentication Required\r\n");
+            for line in lines {
+                head.push_str(line);
+                head.push_str("\r\n");
+            }
+            head.push_str("\r\n");
+            head.into_bytes()
+        };
+        // (the Proxy-Authenticate lines, whether Basic stays open)
+        let table: [(&[&str], bool); 21] = [
+            (&["Proxy-Authenticate: Negotiate"], false),
+            (&["Proxy-Authenticate: NTLM"], false),
+            (&["Proxy-Authenticate: Negotiate, NTLM"], false),
+            (&["Proxy-Authenticate: Digest realm=\"x\""], false),
+            (&["Proxy-Authenticate: Bearer"], false),
+            (&["Proxy-Authenticate: Negotiate YII="], false),
+            (&["Proxy-Authenticate: Negotiate YII/AA=="], false),
+            (&["Proxy-Authenticate:"], true),
+            (&[], true),
+            (
+                &[
+                    "Proxy-Authenticate: NTLM",
+                    "proxy-authenticate: Basic realm=\"x\"",
+                ],
+                true,
+            ),
+            (&["PROXY-AUTHENTICATE: bAsIc realm=\"x\""], true),
+            (&["Proxy-Authenticate: Basic realm=\"NTLM\""], true),
+            (&["Proxy-Authenticate: Basic, NTLM"], true),
+            (&["Proxy-Authenticate: Digest realm=\"a, Basic\""], false),
+            (
+                &["Proxy-Authenticate: Digest realm=\"x\", Basic = \"parameter\""],
+                false,
+            ),
+            (
+                &["Proxy-Authenticate: Digest realm=\"a\\\",Basic,b\""],
+                false,
+            ),
+            (
+                &["Proxy-Authenticate: Digest realm=\"a\\\"b\", Basic"],
+                true,
+            ),
+            (&["Proxy-Authenticate: Basic YII="], true),
+            (&["Proxy-Authenticate: NTLM,, Basic"], true),
+            (
+                &["Proxy-Authenticate: Digest realm\t=\t\"x\",\tBasic"],
+                true,
+            ),
+            (&["Proxy-Authenticate: ,"], true),
+        ];
+        for (lines, basic) in table {
+            assert_eq!(offers_basic(&head(lines)), basic, "{lines:?}");
+        }
+    }
 
     /// A proxy's answer to a tunnel request is read by its status line, and only a status line of
     /// HTTP/1.x with three digits is one.
