@@ -8309,6 +8309,9 @@ enum Then {
     /// A daemon that answers the greeting and cuts the exchange that reads its process, and then
     /// ends.
     AnExchangeThatIsCut,
+    /// A daemon that gives a usable greeting and answers each request to stop, the one that asks
+    /// how it was started too, with an unknown outcome, as a daemon that owes a fence does.
+    AnUnknownOutcome,
 }
 
 /// What a restart that waited for a replaced successor leaves to read.
@@ -8414,6 +8417,10 @@ fn a_restart_that_waits_for_a_replaced_successor(
     let on_stop = match next {
         Then::AnAnswerFrom => OnStop::AnswerAndStay(answering.id()),
         Then::AnExchangeThatIsCut => OnStop::Cut,
+        Then::AnUnknownOutcome => OnStop::AnswerTheStopWithError {
+            code: an_error_code_of(kr_protocol::error::RetryCategory::OutcomeUnknown),
+            end: false,
+        },
     };
     let mut second = TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop, true, 2);
     events.note("the second daemon was listening");
@@ -8661,6 +8668,15 @@ struct NeverAnswered {
 /// exit 1. The case reads its text, which opens with the stop's own words for what the stop came to
 /// and then says what was read of the successor as an earlier reading.
 fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> NeverAnswered {
+    a_successor_answers_after(on_stop, None)
+}
+
+/// [`a_successor_never_answers_after`], where `successor_answers` is how a daemon that listens once
+/// the old one has ended answers: none listens where it is none.
+fn a_successor_answers_after(
+    on_stop: impl FnOnce(u32) -> OnStop,
+    successor_answers: Option<OnStop>,
+) -> NeverAnswered {
     let host = Standalone::create();
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
@@ -8704,6 +8720,17 @@ fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> Never
     old.kill().expect("ends the old daemon");
     old.wait().expect("collects it");
     events.note("the old process was ended and collected");
+    let mut second = successor_answers.map(|on_stop| {
+        while !daemon.has_let_go_of_the_endpoint() {
+            assert!(
+                Instant::now() < looked_for,
+                "the old daemon never let go of the endpoint
+{events}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop, true, 2)
+    });
     let output = running.finish("kr host restart");
     events.note("the command's output was read");
     let ids = (old.id(), successor.id());
@@ -8711,6 +8738,9 @@ fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> Never
     let _ = successor.wait();
     drop(held);
     daemon.end();
+    if let Some(second) = second.as_mut() {
+        second.end();
+    }
     NeverAnswered {
         host,
         output,
@@ -8752,6 +8782,66 @@ fn a_successor_that_never_answers_after_a_request_that_could_not_be_made_keeps_t
         "{message}\n{saw}"
     );
     assert!(silent.host.running().is_empty(), "nothing was started");
+}
+
+/// KR-REQ-07.12 (a holder that owes a fence): the daemon that holds the environment after the first
+/// one ended gives a usable greeting and answers each request to stop, the one that asks how it was
+/// started too, with an unknown outcome. No exchange is whole, so the command waits out its bound
+/// and says what the reads gave and that it asked for nothing, and no more.
+#[test]
+fn a_holder_that_greets_and_answers_each_stop_with_an_unknown_outcome_is_said_by_what_the_reads_gave()
+ {
+    let replaced = a_restart_that_waits_for_a_replaced_successor(
+        true,
+        OnStop::EndAtTheGreeting,
+        Then::AnUnknownOutcome,
+    );
+    let saw = what_the_case_saw(&replaced.events, &replaced.output);
+    let said = document(&replaced.output, "kr host restart");
+    assert_eq!(replaced.output.status.code(), Some(1), "{said}\n{saw}");
+    let message = said["message"].as_str().expect("a message");
+    let id = replaced.host.tree.environment_id();
+    assert_eq!(
+        message,
+        format!(
+            "The control daemon for environment {id} (process {}) ended, and this command could not make its request for it: the peer closed the connection. This command sent nothing. After it ended, a control daemon (process {}) held environment {id}. A control daemon gave a usable greeting and no whole answer. No control daemon gave a whole answer within 30 seconds. A control daemon holds environment {id}. This command started none. No session was stopped: its workers keep running, and a local attach keeps working. Paired devices' connections to the old daemon closed; their pairings stand. Run kr host restart again.",
+            replaced.old, replaced.successor
+        ),
+        "{saw}"
+    );
+    assert!(
+        !message.contains("answers now"),
+        "no daemon gave a whole answer: {message}"
+    );
+}
+
+/// KR-REQ-07.12 (a successor that owes a fence): after a stop whose answer is cut, the daemon that
+/// listens next gives a usable greeting and answers each request to stop with an unknown outcome.
+/// No exchange is whole, so the failure says that a daemon gave a greeting and no whole answer, and
+/// never that a daemon answers or that this command started one.
+#[test]
+fn a_successor_that_greets_and_answers_each_stop_with_an_unknown_outcome_is_said_by_what_the_reads_gave()
+ {
+    let silent = a_successor_answers_after(
+        OnStop::AnswerTheLaunchThenCut,
+        Some(OnStop::AnswerTheStopWithError {
+            code: an_error_code_of(kr_protocol::error::RetryCategory::OutcomeUnknown),
+            end: false,
+        }),
+    );
+    let saw = what_the_case_saw(&silent.events, &silent.output);
+    let said = document(&silent.output, "kr host restart");
+    assert_eq!(silent.output.status.code(), Some(1), "{said}\n{saw}");
+    let message = said["message"].as_str().expect("a message");
+    let id = silent.host.tree.environment_id();
+    assert_eq!(
+        message,
+        format!(
+            "The control daemon for environment {id} did not show whether it took the stop (the peer closed the connection), and it has ended. After it ended, a control daemon (process {}) held environment {id}. A control daemon gave a usable greeting and no whole answer. No control daemon gave a whole answer within 30 seconds. A control daemon holds environment {id}. This command started none. No session was stopped: its workers keep running, and a local attach keeps working. Paired devices' connections to the old daemon closed; their pairings stand. Run kr host restart again.",
+            silent.successor
+        ),
+        "{saw}"
+    );
 }
 
 /// KR-REQ-07.12 (a successor that never answers, after a request whose outcome is not known): the
