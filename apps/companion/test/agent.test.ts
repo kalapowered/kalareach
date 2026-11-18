@@ -498,7 +498,7 @@ describe("a package's control asks the host for its action only when it can (KR-
   const because = (call: ReturnType<typeof invocationOf>) =>
     call.kind === 'cannot' ? call.because : null
 
-  it('asks nothing of the host while the agent is unread, unrecognised or its input is unknown', () => {
+  it('asks nothing of the host while the agent is unread or its input is unknown', () => {
     expect(because(invocationOf(refresh, SESSION, null, binding(), here, null))).toContain(
       'no agent it can call'
     )
@@ -508,12 +508,6 @@ describe("a package's control asks the host for its action only when it can (KR-
     expect(because(invocationOf(refresh, SESSION, live, binding(), null, null))).toContain(
       'before the agent was read'
     )
-    const unrecognised = { ...live, plugin_id: null }
-    expect(
-      because(
-        invocationOf(refresh, SESSION, unrecognised, binding(), drawnUnder(unrecognised, binding()), null)
-      )
-    ).toContain('No package recognised')
     expect(
       because(invocationOf({ ...refresh, parameters: undefined }, SESSION, live, binding(), here, null))
     ).toContain('cannot tell what this action takes')
@@ -526,5 +520,55 @@ describe("a package's control asks the host for its action only when it can (KR-
       'conversation moved'
     )
     expect(invocationOf(refresh, SESSION, live, binding(), here, null).kind).toBe('call')
+  })
+})
+
+describe('a control says why it asks nothing of an agent no package is bound to (KR-REQ-12.23)', () => {
+  const refresh: Control = {
+    id: 'c-2',
+    revision: '1',
+    label: 'Refresh',
+    accessible_description: 'Reads the thread again.',
+    action_id: 'thread.refresh',
+    parameters: { parameters: [] }
+  }
+  // What the host writes in an instance's refusal when two packages recognise a program equally
+  // well, and when it adopts a program that a package is bound to.
+  const TIE =
+    'it was not launched through the integration, and openai.codex and acme.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+  const ADOPTED =
+    'it was not launched through the integration, so no registration names it and none of its bridges is admitted'
+  const adopted = (over: Partial<AgentInstanceSummary>): AgentInstanceSummary => ({
+    ...instance('i-1', '10'),
+    mode: 'native_terminal',
+    ...over
+  })
+  const pressed = (agent: AgentInstanceSummary) =>
+    invocationOf(refresh, SESSION, agent, binding(), drawnUnder(agent, binding()), null)
+  const because = (call: ReturnType<typeof invocationOf>) =>
+    call.kind === 'cannot' ? call.because : null
+
+  it("tells a tie in the host's own words, which name the packages", () => {
+    expect(because(pressed(adopted({ plugin_id: null, refusal: TIE })))).toBe(
+      `No package is bound to this agent. The host says ${TIE}.`
+    )
+  })
+
+  it("tells an agent no package recognised in the host's own words", () => {
+    expect(because(pressed(adopted({ plugin_id: null, refusal: ADOPTED })))).toBe(
+      `No package is bound to this agent. The host says ${ADOPTED}.`
+    )
+  })
+
+  it('tells an agent no package recognised that the host said nothing of', () => {
+    expect(because(pressed(adopted({ plugin_id: null, refusal: null })))).toBe(
+      'No package recognised this agent.'
+    )
+  })
+
+  it('calls the package an adopted agent is bound to, whatever its adoption refuses', () => {
+    const call = pressed(adopted({ refusal: ADOPTED }))
+    expect(call.kind).toBe('call')
+    expect(call.kind === 'call' ? call.params.plugin_id : null).toBe('openai.codex')
   })
 })
