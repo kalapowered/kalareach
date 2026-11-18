@@ -495,7 +495,11 @@ fn tree_digest(root: &std::path::Path, except: Option<&std::path::Path>) -> Stri
     let mut hasher = Sha256::new();
     hasher.update(format!("{:?}", left(root)).as_bytes());
     walk(root, root, except, &mut hasher);
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// KR-REQ-11.16, the clause that no unrelated user data is mutated: a probe pointed at one file
