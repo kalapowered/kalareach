@@ -1478,6 +1478,12 @@ pub(crate) mod tests {
         );
         // The start's words are the platform's own.
         let started = launched_said(Some(&standalone(77)));
+        if cfg!(windows) {
+            assert_eq!(
+                started.to_string(),
+                "This command asked this user's scheduled task to start a control daemon."
+            );
+        }
         assert_eq!(
             said.to_string(),
             format!(
@@ -1579,7 +1585,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             launched_of(Some(&standalone(77))).parts(),
-            Some(("standalone", Some(77)))
+            Some((standalone_word, Some(77)))
         );
         assert_eq!(launched_of(None).parts(), None);
     }
@@ -2301,8 +2307,8 @@ pub(crate) mod tests {
                 // A failed start that asked for a daemon says its kind and no process. The kind
                 // here is this table's own rule for the shape, not the product's choice of it
                 // (`StartFailed::facts`, which reads the environment's chosen start): the member
-                // case of `every_result_of_a_restart_says_what_it_started_or_asked_for` alone holds
-                // that function.
+                // case of `every_result_of_a_restart_says_what_it_started_or_asked_for` holds that
+                // function, and the start-up target's two Linux cases hold it end to end.
                 let asked = started.as_ref().map_or(Launched::Nothing, |started| {
                     Launched::Start(StartedFact {
                         pid: None,

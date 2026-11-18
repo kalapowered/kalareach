@@ -6829,6 +6829,51 @@ pub(crate) mod tests {
         }
     }
 
+    /// A look at a daemon that acknowledges the hello and never answers the read tells the
+    /// greeting, and then that nothing came in time: the greeting is told before the read, so the
+    /// bound that cuts the read does not discard it. The look has the bound for an answer, so that
+    /// the greeting is made well inside it, and a stand-in that did not read the request for
+    /// `host.info` fails the case as a set-up that did not finish, not as a look that told too
+    /// little.
+    #[tokio::test]
+    async fn a_look_at_a_daemon_that_never_answers_the_read_still_tells_the_greeting() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let id = environment.environment_id();
+        let endpoint = environment.controller_endpoint().expect("an endpoint");
+        let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("binds the endpoint");
+        let (asked, request_read) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            let (mut reader, _writer) = greet(&listener, id).await;
+            reader
+                .read_message::<ControlFrame>()
+                .await
+                .expect("the read request");
+            let _ = asked.send(());
+            std::future::pending::<()>().await;
+        });
+        let mut seen = Vec::new();
+        let gave = the_look_gave(&environment, LOOK_BOUND_FOR_AN_ANSWER, &mut |sight| {
+            seen.push(sight);
+        })
+        .await;
+        let read = tokio::time::timeout(seconds(10), request_read).await;
+        daemon.abort();
+        assert!(
+            matches!(read, Ok(Ok(()))),
+            "the stand-in read the request for host.info, so the greeting finished and the read was asked: {read:?}"
+        );
+        assert!(matches!(gave, Gave::NothingInTime), "{gave:?}");
+        assert_eq!(
+            seen,
+            [
+                Sight::Began,
+                Sight::Greeted,
+                Sight::Gave(Gave::NothingInTime)
+            ]
+        );
+    }
+
     /// A look takes no longer than one second, however much of the deadline is left: a daemon
     /// that says nothing to the hello is waited for until that second has gone, not until the
     /// deadline, and the look then shows nothing in time.
