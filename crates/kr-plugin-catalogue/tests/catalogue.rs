@@ -9117,6 +9117,52 @@ async fn a_receipt_kept_under_a_code_this_build_lacks_reads_as_an_unknown_outcom
     // 2. The record stays: the same row, with the same revision and the same bytes.
     assert_eq!(rows(&catalogue), before);
 
+    // A member kept twice is not read either, though the word is unknown too: the word is not all
+    // that this build cannot read, so the lookup and the claim stop, and the record stays.
+    let kept = refused
+        .4
+        .clone()
+        .expect("the receipt holds its error as it was kept");
+    let twice = kept.replacen("\"message\":", "\"message\":\"first\",\"message\":", 1);
+    assert_ne!(twice, kept, "the message is kept twice");
+    rusqlite::Connection::open(
+        catalogue
+            .root()
+            .join(kr_plugin_catalogue::db::DATABASE_FILE),
+    )
+    .expect("opens the database")
+    .execute(
+        "UPDATE receipts SET error = ?1 WHERE action = 'refused'",
+        [&twice],
+    )
+    .expect("the message is kept twice");
+    let duplicated = rows(&catalogue);
+    let lookup = catalogue
+        .receipt(&key)
+        .expect_err("a receipt that keeps a member twice cannot be read");
+    assert!(
+        matches!(lookup, CatalogueError::StorageUnavailable { .. }),
+        "{lookup:?}"
+    );
+    let claimed = catalogue.claim(&claim, 4).expect_err("nor can its claim");
+    assert!(
+        matches!(claimed, CatalogueError::StorageUnavailable { .. }),
+        "{claimed:?}"
+    );
+    assert_eq!(rows(&catalogue), duplicated, "and the record still stays");
+    rusqlite::Connection::open(
+        catalogue
+            .root()
+            .join(kr_plugin_catalogue::db::DATABASE_FILE),
+    )
+    .expect("opens the database")
+    .execute(
+        "UPDATE receipts SET error = ?1 WHERE action = 'refused'",
+        [&kept],
+    )
+    .expect("the receipt is kept as it was");
+    assert_eq!(rows(&catalogue), before);
+
     // Anything else that this build cannot read in the receipt is still unreadable: the unknown
     // word is not what the receipt fails for here, so the lookup and the claim stop.
     rusqlite::Connection::open(

@@ -1895,9 +1895,10 @@ fn a_receipt_kept_under_a_code_this_build_lacks_reads_as_an_unknown_outcome_to_t
 
 /// A writer reads a receipt before it writes, and a receipt kept under a word that a later build
 /// added reads as the unknown outcome: a repeat of its action gets the receipt, a move out of a
-/// settled state is refused, and an unknown receipt is settled by its own writer. Each write puts
-/// the writer's own outcome and nothing else: the kept word is never written back as the unknown
-/// outcome.
+/// settled state is refused, and an unknown receipt is settled by its own writer or by an
+/// observation. Each write puts the writer's own outcome and nothing else: the kept word is never
+/// written back as the unknown outcome, and an observation that brings no refusal leaves the error
+/// as it was kept.
 #[test]
 fn a_writer_that_reads_a_receipt_kept_under_a_code_this_build_lacks_writes_only_its_own_outcome() {
     let path = journal_path("writer-unknown-error-code");
@@ -2056,6 +2057,66 @@ fn a_writer_that_reads_a_receipt_kept_under_a_code_this_build_lacks_writes_only_
             "no write put the unknown outcome in the place of a kept word"
         );
     }
+
+    // 4. An authoritative observation settles an unknown receipt as refused and brings no refusal
+    // of its own: the receipt keeps the error it was kept with, under its word and its message.
+    let observed = kr_worker::journal::action_id_from([4; 16]);
+    journal
+        .accept(&submission(4, 4))
+        .expect("accepts the fourth action");
+    journal
+        .mark_dispatching(actor(), observed, TimestampMs::new(1_500))
+        .expect("marks the fourth action");
+    journal
+        .settle(
+            actor(),
+            observed,
+            ReceiptState::Unknown,
+            None,
+            Some(kr_protocol::error::ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "it was not confirmed here",
+            )),
+            TimestampMs::new(1_600),
+        )
+        .expect("settles the fourth action as unknown");
+    rusqlite::Connection::open(&path)
+        .expect("opens the journal")
+        .execute(
+            "UPDATE receipts SET error_code = ?1 WHERE action_id = ?2",
+            rusqlite::params![word, observed.get().as_bytes().as_slice()],
+        )
+        .expect("keeps the error of the fourth action under the word");
+    let waiting = find(&rows(), observed);
+    assert_eq!(waiting.1, "unknown");
+    assert_eq!(waiting.2.as_deref(), Some(word));
+    let observation = kr_protocol::action::ActionObservation {
+        action_id: observed,
+        provenance: kr_protocol::action::ObservationProvenance::AuthoritativeInterface,
+        subject: "agent.approval:upstream-request".to_owned(),
+        subject_revision: kr_protocol::scalars::Nullable::null(),
+        source_cursor: kr_protocol::scalars::Nullable::null(),
+        claimed_result: kr_protocol::action::ObservedResult::Refused,
+        observed_at_ms: TimestampMs::new(1_700),
+    };
+    let reconciled = journal.record_observation(&actor(), &observation);
+    let Ok(receipt) = reconciled else {
+        panic!("the observation settles the unknown receipt: {reconciled:?}");
+    };
+    assert_eq!(receipt.state, ReceiptState::Refused);
+    let observed_row = find(&rows(), observed);
+    assert_eq!(observed_row.1, "refused", "the observation moved the state");
+    assert!(observed_row.4 > waiting.4, "and the revision");
+    assert_eq!(
+        observed_row.2.as_deref(),
+        Some(word),
+        "the receipt keeps the word it was kept under"
+    );
+    assert_eq!(
+        observed_row.3.as_deref(),
+        Some("it was not confirmed here"),
+        "and the message it was kept with"
+    );
     drop(journal);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }

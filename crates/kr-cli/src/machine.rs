@@ -2125,6 +2125,149 @@ mod tests {
         assert_eq!(entries_beside(paths), listed, "no file was made or removed");
     }
 
+    /// A plan whose only refusal is an undo step under a code that a later build added is kept and
+    /// not read, as one whose merge step holds such a code is: one sentence, from every command
+    /// that reads the plan, with the file left exactly as it is. A code in the steps and in the
+    /// undo steps together reads the same way.
+    #[tokio::test]
+    async fn a_plan_whose_only_refusal_is_an_undo_step_under_a_code_this_build_lacks_is_kept_and_the_person_is_sent_to_a_release_that_reads_it()
+     {
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.paths();
+        let into = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16]));
+        let from = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+        let mut refused = step();
+        refused.state = StepState::Refused(ErrorCode::PermissionDenied, Why::Environment);
+        let word = "A_CODE_A_LATER_BUILD_ADDS";
+        assert!(
+            ErrorCode::from_wire(word).is_none(),
+            "this build lacks the word"
+        );
+        let sentence = "the merge plan this client keeps holds a refusal that a later release \
+                        wrote, and this release cannot read it; it is in this user's state \
+                        directory as machine-merge-plan and stays as it is, so run \
+                        `kr host update` to a release that can read it and then run this \
+                        command again";
+
+        // 1. The undo step is the plan's only refusal.
+        let undoing = Plan {
+            version: PLAN_FORMAT,
+            into,
+            from,
+            steps: vec![step()],
+            undo: vec![refused.clone()],
+            undoing: true,
+        };
+        save(paths, &undoing).expect("saves");
+        assert!(
+            load(paths).expect("reads").is_some(),
+            "a plan whose undo step holds a code this build knows is read"
+        );
+        let planted = kr_cbor::encode(&replace(
+            kr_cbor::decode(
+                &std::fs::read(plan_path(paths)).expect("reads"),
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect("the plan decodes"),
+            ErrorCode::PermissionDenied.as_str(),
+            word,
+        ));
+        std::fs::write(plan_path(paths), &planted).expect("the kept word is changed");
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}, a word in an undo step");
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+        let listed = entries_beside(paths);
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}, a word in an undo step, again");
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+        assert_eq!(entries_beside(paths), listed, "no file was made or removed");
+
+        // 2. A merge step and an undo step both hold a word.
+        let both = Plan {
+            steps: vec![step(), refused.clone()],
+            ..undoing
+        };
+        save(paths, &both).expect("saves");
+        let planted = kr_cbor::encode(&replace(
+            kr_cbor::decode(
+                &std::fs::read(plan_path(paths)).expect("reads"),
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect("the plan decodes"),
+            ErrorCode::PermissionDenied.as_str(),
+            word,
+        ));
+        std::fs::write(plan_path(paths), &planted).expect("both kept words are changed");
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}, a word in both");
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+        assert_eq!(entries_beside(paths), listed, "no file was made or removed");
+    }
+
+    /// A plan that states a later format is kept and not read, though a later release put into it
+    /// what this release cannot decode: one sentence, from every command that reads the plan, with
+    /// the file left exactly as it is. The same plan in this release's format is one that cannot be
+    /// read, and keeps the sentence that tells the owner to move it aside.
+    #[tokio::test]
+    async fn a_plan_of_a_later_format_with_a_step_state_this_build_lacks_is_kept_and_the_person_is_sent_to_a_release_that_reads_it()
+     {
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.paths();
+        let into = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16]));
+        let from = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+        // A later release added a state of a step, and the step of this plan is in it.
+        let variant = "A_STEP_STATE_A_LATER_BUILD_ADDS";
+        let kept_at = |version: u32| {
+            let plan = Plan {
+                version,
+                into,
+                from,
+                steps: vec![step()],
+                undo: Vec::new(),
+                undoing: false,
+            };
+            let CanonicalValue::Map(record) = kr_cbor::decode(
+                &kr_cbor::to_canonical_vec(&plan).expect("encodes"),
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect("the plan decodes") else {
+                panic!("a plan is a map");
+            };
+            kr_cbor::encode(&replace(CanonicalValue::Map(record), "Sent", variant))
+        };
+
+        // 1. In a later format: the plan is kept, and the person is sent to a release that reads it.
+        let planted = kept_at(PLAN_FORMAT + 1);
+        kr_ipc::paths::write_owner_only_file(&plan_path(paths), &planted).expect("keeps the plan");
+        let sentence = "the merge plan this client keeps was written by a later release in a \
+                        format this release cannot read; it is in this user's state directory \
+                        as machine-merge-plan and stays as it is, so run `kr host update` to a \
+                        release that can read it and then run this command again";
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}");
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+        let listed = entries_beside(paths);
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}, again");
+        }
+        assert_eq!(entries_beside(paths), listed, "no file was made or removed");
+
+        // 2. The same state of a step in this release's format is a plan that cannot be read.
+        let sentence = "the merge plan this client keeps cannot be read; it is in this user's \
+                        state directory as machine-merge-plan, and the owner selects the \
+                        environments again once it is moved aside";
+        let planted = kept_at(PLAN_FORMAT);
+        std::fs::write(plan_path(paths), &planted).expect("the plan is in this format");
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}, in this release's format");
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+    }
+
     /// KR-REQ-26.10: a plan is written only at the format the release `current` names lists for it.
     /// Where it lists the plan at another, neither the first write of a plan nor a later save writes
     /// anything; where it lists the same, or does not list it, both write.
