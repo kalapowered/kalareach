@@ -8529,7 +8529,7 @@ enum Then {
     AnExchangeThatIsCut,
     /// A daemon that gives a usable greeting and answers each request to stop, the one that asks
     /// how it was started too, with an unknown outcome, as a daemon that owes a fence does.
-    AnUnknownOutcome,
+    OwesAFence,
 }
 
 /// What a restart that waited for a replaced successor leaves to read.
@@ -8635,7 +8635,7 @@ fn a_restart_that_waits_for_a_replaced_successor(
     let on_stop = match next {
         Then::AnAnswerFrom => OnStop::AnswerAndStay(answering.id()),
         Then::AnExchangeThatIsCut => OnStop::Cut,
-        Then::AnUnknownOutcome => OnStop::AnswerTheStopWithError {
+        Then::OwesAFence => OnStop::AnswerTheStopWithError {
             code: an_error_code_of(kr_protocol::error::RetryCategory::OutcomeUnknown),
             end: false,
         },
@@ -9012,7 +9012,7 @@ fn a_holder_that_greets_and_answers_each_stop_with_an_unknown_outcome_is_said_by
     let replaced = a_restart_that_waits_for_a_replaced_successor(
         true,
         OnStop::EndAtTheGreeting,
-        Then::AnUnknownOutcome,
+        Then::OwesAFence,
     );
     let saw = what_the_case_saw(&replaced.events, &replaced.output);
     let said = document(&replaced.output, "kr host restart");
