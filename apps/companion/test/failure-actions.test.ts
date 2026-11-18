@@ -168,6 +168,14 @@ describe('the words for a failure, through the boundary', () => {
     )
   })
 
+  // The library names no action for a pairing's refusal, and the page holds no words for one: a key
+  // for such an action, from any native side, leaves the host's words as they are.
+  it('keep the host’s words alone when a pairing refusal comes with an action key the page has no words for', async () => {
+    expect(
+      failureMessage(await rejectedWith(native('PAIRING_EXPIRED', 'the invitation expired', 'pair_again')))
+    ).toBe('the invitation expired')
+  })
+
   it('hand on a rejection that is not a host failure as it came', async () => {
     const error = new Error('The call failed.')
     expect(await rejectedWith(error)).toBe(error)

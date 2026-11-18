@@ -9,12 +9,13 @@ import { describe, expect, it } from 'vitest'
 
 import type { DeviceSummary, GrantCreateParams } from '@kalareach/protocol'
 
-import { fakeHost } from '../src/host/fake'
-import { SHORT_TABLET } from '../src/host/fake-state'
+import { ScriptedSharing } from '../src/host/fake-sharing'
 import { SHORTEST_LEFT_MS, whyNot } from '../src/model/sharing'
 
 const NOW = 1_800_000_000_000
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+const ENVIRONMENT = '8a7b6c50-22bb-4c3d-8e4f-000000000001'
+const ISSUER = 'e8e8e8e8-0000-4000-8000-000000000001'
 
 /** A paired device that is not an owner and has a pairing that ends. */
 function device(over: Partial<DeviceSummary>): DeviceSummary {
@@ -80,30 +81,28 @@ describe('the scripted host refusing a share that would outlast a pairing', () =
     return found[1].replace(/\\\n\s*/g, '')
   }
 
-  it('says what the host says, the time left apart, and offers a second pairing only after the pairing has ended', async () => {
+  it('says what the host says, the time left apart, and offers a second pairing only after the pairing has ended', () => {
     const sentence = hostSentence()
-    // Each time is half a minute inside its form: the scripted host's clocks are read a few milliseconds
-    // apart, and a time on the edge of a minute would read as the one before it.
+    // Each time is the time left at the one clock the sharing is written against, at the edge of its
+    // form where the form has one.
     for (const [left, said] of [
-      [40 * 60_000 + 30_000, '40 minutes'],
-      [30_000, 'less than a minute'],
-      [90_000, '1 minute'],
-      [3 * 3_600_000 + 30_000, '3 hours'],
-      [2 * 86_400_000 + 3_600_000, '2 days']
+      [40 * 60_000, '40 minutes'],
+      [59_999, 'less than a minute'],
+      [60_000, '1 minute'],
+      [3 * 3_600_000, '3 hours'],
+      [2 * 86_400_000, '2 days']
     ] as const) {
-      // A host of its own for each time: it holds a refused attempt as under way. Its record of the
-      // short pairing is moved, which gives each time the host says; the pairing ends 40 minutes from
-      // the host's own clock until it is moved.
-      const { port } = fakeHost()
-      const listed = await port.deviceList({ include_revoked: true })
-      const tablet = listed.devices.find((each) => each.device_id === SHORT_TABLET)
-      if (tablet?.grant_expires_at_ms === null || tablet?.grant_expires_at_ms === undefined) {
-        throw new Error('the scripted host has no short pairing')
-      }
-      tablet.grant_expires_at_ms = String(Number(tablet.grant_expires_at_ms) - 40 * 60_000 + left)
+      // A sharing of its own for each time, with a list of one device whose pairing ends `left` after
+      // the sharing's clock: nothing is read from the clock of the machine the case runs on.
+      const tablet = device({ grant_expires_at_ms: String(NOW + left) })
+      const sharing = new ScriptedSharing(
+        { environment: ENVIRONMENT, session: SESSION_MAIN, nowMs: NOW, issuer: ISSUER },
+        () => [tablet],
+        () => undefined
+      )
       const invitation: GrantCreateParams = {
         session_id: SESSION_MAIN,
-        recipient_device_id: SHORT_TABLET,
+        recipient_device_id: tablet.device_id,
         parent_grant_id: null,
         selection: {
           role: 'viewer',
@@ -117,11 +116,12 @@ describe('the scripted host refusing a share that would outlast a pairing', () =
         accepted_notices: [],
         owner_confirmation: null
       }
-      const refused: unknown = await port.grantCreate(invitation, {}).then(
-        () => null,
-        (error: unknown) => error
-      )
-      const message = (refused as { message?: string } | null)?.message ?? ''
+      let message = ''
+      try {
+        sharing.grantCreate(invitation)
+      } catch (refused) {
+        message = (refused as { message?: string }).message ?? ''
+      }
       expect(message, `the scripted host refuses with ${said} left`).toContain('before this share would; ')
       // Every fixed word is compared; the time left is the one thing that is not, and it is one of
       // the five forms the host says it in.

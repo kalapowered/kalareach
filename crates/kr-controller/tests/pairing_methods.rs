@@ -2205,6 +2205,10 @@ async fn a_consumed_invitation_stays_consumed_across_a_host_restart() {
     host.stop().await;
 }
 
+/// How long the host has to answer a device that brings an invitation in: a host that keeps the
+/// request and gives no answer fails the case with a message of its own, not at the run's limit.
+const ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// KR-REQ-10.08: a device that forgot the host and brings in the direct invitation it already
 /// committed is refused for the invitation, with the rejection that the client reads as a pairing
 /// that did not finish. The host still lists the device, so neither remedy that the words offer
@@ -2236,7 +2240,12 @@ async fn a_device_that_brings_in_the_invitation_it_already_committed_is_refused_
     connection.close(0u32.into(), b"paired");
 
     // The device forgot the host, and brings the same invitation in again.
-    let refused = refused_challenge(&host, &device, committed.invitation_id).await;
+    let refused = tokio::time::timeout(
+        ANSWER_WITHIN,
+        refused_challenge(&host, &device, committed.invitation_id),
+    )
+    .await
+    .expect("the host answers the committed invitation brought in again");
     assert_eq!(refused.code, ErrorCode::PairingRejected, "{refused:?}");
     assert_eq!(
         kr_client::pairing::failure::refused_by_host(refused.code, true),
@@ -2263,7 +2272,12 @@ async fn a_device_that_brings_in_the_invitation_it_already_committed_is_refused_
     )
     .await
     .expect("a new invitation");
-    let redeemed = calls::try_redeem(&device.candidate(), &invited).await;
+    let redeemed = tokio::time::timeout(
+        ANSWER_WITHIN,
+        calls::try_redeem(&device.candidate(), &invited),
+    )
+    .await
+    .expect("the host answers the new invitation");
     let Err(kr_transport::error::TransportError::Refused(again)) = &redeemed.outcome else {
         panic!(
             "the host refuses the new invitation: {:?}",

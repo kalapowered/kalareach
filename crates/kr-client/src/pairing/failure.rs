@@ -357,10 +357,15 @@ mod tests {
             refused_by_host(ErrorCode::PairingExpired, true),
             FailureKind::Expired
         );
-        assert_eq!(
-            refused_by_host(ErrorCode::PairingRejected, false),
-            FailureKind::DidNotFinish
-        );
+        // A direct invitation's rejection, such as one for an invitation the device already
+        // committed, is read the same way as a code's.
+        for direct in [false, true] {
+            assert_eq!(
+                refused_by_host(ErrorCode::PairingRejected, direct),
+                FailureKind::DidNotFinish,
+                "direct: {direct}"
+            );
+        }
         assert_eq!(
             consumed(PairingConsumedReason::Denied),
             FailureKind::Declined
