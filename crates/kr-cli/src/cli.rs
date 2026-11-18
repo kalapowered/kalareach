@@ -1426,8 +1426,10 @@ pub enum HostCommand {
     /// and what was started. With `--json`, a result where a control daemon answers carries
     /// `stop`, `pid`, `unsettled`, `serving` (the process that the daemon's answer states, or
     /// null) and `launched` (what this command started or asked for, or null); a failure carries
-    /// `ok` false, `code`, `message` and `exit_code` beside `stop`, `pid` and `unsettled`, and
-    /// neither `serving` nor `launched`.
+    /// `ok` false, `code`, `message` and `exit_code` beside `stop`, `pid` and `unsettled`, no
+    /// `serving`, and `launched` as well: null where the command started and asked for nothing,
+    /// the kind of start that it asked for (with no process), or `unknown` where an interrupt
+    /// came while the start ran and the command cannot tell whether its request left.
     ///
     /// The command reads what answers and says what it read and what it did; it gives no verdict
     /// of whose start the daemon that answers is. Where the exchange with the daemon does not
