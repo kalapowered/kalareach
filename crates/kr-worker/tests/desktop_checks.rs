@@ -13,8 +13,8 @@ use kr_ipc::client::BoundLink;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::desktop::{
-    CapabilityEvidenceSource, CapabilityState, DesktopChecksAnswer, DesktopChecksRequest,
-    capabilities,
+    CapabilityEvidenceSource, CapabilityInvalidation, CapabilityState, DesktopChecksAnswer,
+    DesktopChecksRequest, capabilities,
 };
 use kr_protocol::envelope::{ControlFrame, Outcome};
 use kr_protocol::error::ErrorCode;
@@ -26,6 +26,8 @@ use kr_protocol::ids::{
 use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+use kr_worker::desktop::capability::facility_identity;
+use kr_worker::desktop::probe::{Fingerprint, stale};
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -451,4 +453,255 @@ async fn the_authorised_file_check_leaves_the_file_and_its_directory_as_they_wer
             "the person's files are as they were after request {id}"
         );
     }
+}
+
+/// Every name under `root` with what the person left in it, as one digest: for a file its bytes, its
+/// modification time and its mode bits (on Windows, its read-only attribute), and for a directory
+/// its modification time, which moves when a name is added, removed or renamed. `except` is left
+/// out of the digest, so that the file a probe was pointed at can be told apart from the rest.
+fn tree_digest(root: &std::path::Path, except: Option<&std::path::Path>) -> String {
+    use sha2::{Digest as _, Sha256};
+
+    fn walk(
+        directory: &std::path::Path,
+        root: &std::path::Path,
+        except: Option<&std::path::Path>,
+        hasher: &mut Sha256,
+    ) {
+        let mut paths: Vec<_> = std::fs::read_dir(directory)
+            .expect("lists the directory")
+            .map(|entry| entry.expect("an entry").path())
+            .collect();
+        paths.sort();
+        for path in paths {
+            if except == Some(path.as_path()) {
+                continue;
+            }
+            hasher.update(
+                path.strip_prefix(root)
+                    .expect("under the root")
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+            hasher.update(format!("{:?}", left(&path)).as_bytes());
+            if path.is_dir() {
+                walk(&path, root, except, hasher);
+            } else {
+                hasher.update(std::fs::read(&path).expect("reads the file"));
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{:?}", left(root)).as_bytes());
+    walk(root, root, except, &mut hasher);
+    format!("{:x}", hasher.finalize())
+}
+
+/// KR-REQ-11.16, the clause that no unrelated user data is mutated: a probe pointed at one file
+/// leaves every other file in the person's tree as it was.
+///
+/// The tree is the person's own, several directories deep, with the nominated file in the middle of
+/// it and other files above, beside and below it, each with a modification time and a mode that a
+/// probe which touched or rewrote it would change. A digest of everything but the nominated file
+/// is taken before the worker performs the probe and after each of two runs, and a second digest
+/// of the whole tree includes the nominated file too. A last step changes one file on purpose and
+/// shows that the digest sees it, so that equal digests mean an untouched tree and not a digest
+/// that sees nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_16_a_probe_leaves_every_file_it_was_not_pointed_at_as_it_was() {
+    let host = host().await;
+    let tree = kr_ipc::testing::PrivateTempDir::create();
+    let root = tree.path();
+    let at = |parts: &[&str]| {
+        parts
+            .iter()
+            .fold(root.to_path_buf(), |path, part| path.join(part))
+    };
+    let nominated = at(&["projects", "notes", "authorised.txt"]);
+    let others = [
+        at(&["projects", "notes", "beside.txt"]),
+        at(&["projects", "other", "report.txt"]),
+        at(&["archive", "2024", "ledger.csv"]),
+        at(&["top.txt"]),
+    ];
+    for path in std::iter::once(&nominated).chain(others.iter()) {
+        std::fs::create_dir_all(path.parent().expect("a parent")).expect("makes the directories");
+    }
+    std::fs::write(&nominated, b"the person nominated this").expect("the nominated file");
+    for (index, path) in others.iter().enumerate() {
+        std::fs::write(path, format!("not nominated {index}")).expect("another file");
+    }
+    // A modification time long ago and a mode that the process's umask would not give a new file,
+    // so that a probe that touched a file, or created it again, changes what is digested.
+    for (index, path) in std::iter::once(&nominated).chain(others.iter()).enumerate() {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("opens the file to date it");
+        file.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 + index as u64),
+        )
+        .expect("sets a modification time");
+        #[cfg(unix)]
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o640))
+            .expect("a mode of the test's choosing");
+    }
+    let rest_before = tree_digest(root, Some(&nominated));
+    let whole_before = tree_digest(root, None);
+
+    let mut link = daemon(&host, ControllerConnectionRole::Checks).await;
+    for id in 1..=2 {
+        match ask(&mut link, request(&host, id, nominated.to_str())).await {
+            Answer::Findings(found) => {
+                let [record] = &found.records[..] else {
+                    panic!("the read is the one check performed: {:?}", found.records);
+                };
+                assert_eq!(
+                    record.state,
+                    CapabilityState::QualifiedAvailable,
+                    "the probe ran and read the file: {:?}",
+                    record.disabled_reason
+                );
+            }
+            other => panic!("the checks were not performed: {other:?}"),
+        }
+        assert_eq!(
+            tree_digest(root, Some(&nominated)),
+            rest_before,
+            "every file the probe was not pointed at is as it was after request {id}"
+        );
+        assert_eq!(
+            tree_digest(root, None),
+            whole_before,
+            "the nominated file is as it was too after request {id}"
+        );
+    }
+
+    std::fs::write(&others[3], b"changed").expect("changes one file on purpose");
+    assert_ne!(
+        tree_digest(root, Some(&nominated)),
+        rest_before,
+        "the digest sees a file that was changed"
+    );
+}
+
+/// The record the worker gives for the read check, performed on a file of this test's own.
+async fn a_real_finding(host: &Host) -> kr_protocol::desktop::CapabilityRecord {
+    let directory = tempfile::tempdir().expect("a directory of this test's own");
+    let file = directory.path().join("authorised.txt");
+    std::fs::write(&file, b"the person nominated this").expect("the nominated file");
+    let mut link = daemon(host, ControllerConnectionRole::Checks).await;
+    match ask(&mut link, request(host, 1, file.to_str())).await {
+        Answer::Findings(found) => found.records[0].clone(),
+        other => panic!("the checks were not performed: {other:?}"),
+    }
+}
+
+/// KR-REQ-11.17, the desktop generation clause: a finding the worker made is ended by a new
+/// graphical login and by nothing else.
+///
+/// The record comes from the worker's own run over its checks connection, and what ends it is what
+/// the record says ends it: it names the desktop generation, it stands while the generation is the
+/// one it was taken in, it is ended by the next login, and a record that does not name the
+/// generation is not ended by one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_17_a_finding_ends_when_the_desktop_generation_it_was_taken_in_changes() {
+    let host = host().await;
+    let mut record = a_real_finding(&host).await;
+    assert!(
+        record
+            .invalidation
+            .contains(&CapabilityInvalidation::DesktopGeneration),
+        "the record names the generation among what ends it: {:?}",
+        record.invalidation
+    );
+    let taken = Fingerprint {
+        desktop_generation: Some(11),
+        ..Fingerprint::default()
+    };
+    assert!(
+        stale(&record, &taken, &taken).is_empty(),
+        "a finding stands while the login it was taken in is the one there is"
+    );
+    let next_login = Fingerprint {
+        desktop_generation: Some(12),
+        ..taken.clone()
+    };
+    assert_eq!(
+        stale(&record, &taken, &next_login),
+        vec![CapabilityInvalidation::DesktopGeneration]
+    );
+    record
+        .invalidation
+        .retain(|trigger| *trigger != CapabilityInvalidation::DesktopGeneration);
+    assert!(
+        stale(&record, &taken, &next_login).is_empty(),
+        "a record that does not name the generation is not ended by it"
+    );
+}
+
+/// KR-REQ-11.17, the binary clause: a finding the worker made is ended when the tool it was made
+/// with is replaced or can no longer be identified, and not while the tool is the same file.
+///
+/// The record comes from the worker's own run. The tool is a file of this test's own, identified by
+/// what the host digests of a facility, and an upgrade is its bytes being replaced in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_17_a_finding_ends_when_the_tool_it_was_taken_with_is_replaced() {
+    let host = host().await;
+    let record = a_real_finding(&host).await;
+    assert!(
+        record
+            .invalidation
+            .contains(&CapabilityInvalidation::BinaryIdentity),
+        "the record names the binary among what ends it: {:?}",
+        record.invalidation
+    );
+    let tree = kr_ipc::testing::PrivateTempDir::create();
+    let tool = tree.path().join("tool");
+    std::fs::write(&tool, b"the tool as it was installed").expect("the tool");
+    let identity = |path: &std::path::Path| {
+        facility_identity(path.to_str().expect("a UTF-8 path")).map(|said| format!("{said:?}"))
+    };
+    let taken = Fingerprint {
+        facility: identity(&tool),
+        ..Fingerprint::default()
+    };
+    assert!(taken.facility.is_some(), "the tool is identified");
+    assert!(
+        stale(
+            &record,
+            &taken,
+            &Fingerprint {
+                facility: identity(&tool),
+                ..Fingerprint::default()
+            }
+        )
+        .is_empty(),
+        "the same file is the same tool"
+    );
+
+    std::fs::write(&tool, b"the tool as an upgrade left it").expect("the upgraded tool");
+    let upgraded = Fingerprint {
+        facility: identity(&tool),
+        ..Fingerprint::default()
+    };
+    assert_eq!(
+        stale(&record, &taken, &upgraded),
+        vec![CapabilityInvalidation::BinaryIdentity]
+    );
+
+    std::fs::remove_file(&tool).expect("removes the tool");
+    let removed = Fingerprint {
+        facility: identity(&tool),
+        ..Fingerprint::default()
+    };
+    assert_eq!(
+        removed.facility, None,
+        "a tool that is gone has no identity"
+    );
+    assert_eq!(
+        stale(&record, &taken, &removed),
+        vec![CapabilityInvalidation::BinaryIdentity]
+    );
 }

@@ -14,11 +14,11 @@ use std::time::Duration;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::desktop::{
     CapabilityChecks, CapabilityChecksFailure, CapabilityChecksState, CapabilityEvidenceSource,
-    CapabilityState, EnvironmentCapabilitiesCheckParams, EnvironmentCapabilitiesParams,
-    EnvironmentCapabilitiesResult, capabilities,
+    CapabilityInvalidation, CapabilityState, EnvironmentCapabilitiesCheckParams,
+    EnvironmentCapabilitiesParams, EnvironmentCapabilitiesResult, capabilities,
 };
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::hostinfo::configuration::ConfigurationDocument;
+use kr_protocol::hostinfo::configuration::{Change, ConfigurationDocument};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{ActionId, EnvironmentId};
 use kr_protocol::method::Method;
@@ -643,4 +643,72 @@ async fn a_path_that_is_not_absolute_and_another_environment_are_refused() {
         "{elsewhere:?}"
     );
     host.stop().await;
+}
+
+/// KR-REQ-11.17, the profile clause: capability evidence taken under one execution profile is
+/// invalidated when the profile changes, and the evidence is not served again.
+///
+/// A real daemon adopts a real worker, the owner has the checks performed, and a configuration edit
+/// that changes the worker profile goes through the daemon's own path for such an edit. The edit
+/// names the evidence it invalidates, the finding is gone from the records, and the checks read as
+/// stale rather than as the run that is no longer about this host. A reading that changes nothing
+/// leaves the finding where it was, so what ended it is the profile and not the second reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_11_17_findings_taken_under_one_profile_end_when_the_profile_changes() {
+    let adopted = Adopted::start_with_document(1, &headless()).await;
+    let host = &adopted.host;
+
+    let directory = tempfile::tempdir().expect("a directory of this test's own");
+    let file = directory.path().join("authorised.txt");
+    std::fs::write(&file, b"the person nominated this").expect("the test's file");
+    ask(host, ActionId::new(kr_ipc::new_uuid()), Some(&file))
+        .await
+        .expect("asked");
+    let done = until(host, CapabilityChecksState::Current).await;
+    assert!(
+        done.desktop
+            .record(capabilities::AUTHORISED_FILE_READ)
+            .is_some_and(|record| record
+                .invalidation
+                .contains(&CapabilityInvalidation::WorkerProfile)),
+        "the finding names the profile change among what ends it"
+    );
+    let again = shown(host).await;
+    assert_eq!(
+        again.checks.state,
+        CapabilityChecksState::Current,
+        "a reading that changes nothing ends nothing"
+    );
+    assert!(
+        again
+            .desktop
+            .record(capabilities::AUTHORISED_FILE_READ)
+            .is_some()
+    );
+
+    let applied = host
+        .controller()
+        .apply_configuration(&Change::WorkerProfile(WorkerProfile::DesktopBound))
+        .await
+        .expect("the profile edit is applied");
+    assert_eq!(
+        applied.invalidated,
+        vec![CapabilityInvalidation::WorkerProfile]
+    );
+
+    let after = shown(host).await;
+    assert_eq!(
+        after.checks.state,
+        CapabilityChecksState::Stale,
+        "the run was taken under the profile this host no longer creates sessions in"
+    );
+    assert!(
+        after
+            .desktop
+            .record(capabilities::AUTHORISED_FILE_READ)
+            .is_none(),
+        "the finding is not served under the new profile: {:?}",
+        after.desktop.record(capabilities::AUTHORISED_FILE_READ)
+    );
+    adopted.stop().await;
 }
