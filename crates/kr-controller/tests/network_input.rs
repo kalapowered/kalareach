@@ -654,6 +654,12 @@ async fn a_copy_of_a_mutation_in_the_transport_queue_is_told_the_outcome_is_unkn
 /// KR-PERF-002: a lone Escape that follows a read on the device's connection reaches the
 /// application while that read waits at the worker for a session another connection's mutation is
 /// holding.
+///
+/// The read is `events.snapshot`. The host forwards it to the worker on the device's own link,
+/// which is the link the Escape travels on, and the worker takes the session for it and waits for
+/// it for as long as it is held. A device's `session.read` is no such read: the host asks the
+/// worker for it on its own link, and the worker answers it from the summary it published once a
+/// short bound has passed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_lone_escape_sent_after_a_read_waiting_for_the_session_reaches_the_application_while_it_is_held()
  {
@@ -685,9 +691,10 @@ async fn a_lone_escape_sent_after_a_read_waiting_for_the_session_reaches_the_app
     let read = rig
         .device
         .submit_read(
-            Method::SessionRead,
-            &kr_protocol::session::SessionReadParams {
+            Method::EventsSnapshot,
+            &kr_protocol::recovery::EventsSnapshotParams {
                 session_id: rig.worker.session_id,
+                agent_resources_from: Nullable::null(),
             },
         )
         .await;
