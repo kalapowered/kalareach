@@ -1244,6 +1244,11 @@ pub(super) fn a_workflow_install(
     )
 }
 
+/// The identifier of the workflow that [`a_workflow_install_of`] installs, at revision 1.
+fn the_installed_workflow() -> kr_protocol::ids::WorkflowId {
+    kr_protocol::ids::WorkflowId::new(kr_protocol::scalars::Uuid::from_bytes([43; 16]))
+}
+
 /// A workflow install of the one node `node`, whose grant carries `rights`.
 fn a_workflow_install_of(
     temp: &kr_ipc::testing::TempHost,
@@ -1258,7 +1263,7 @@ fn a_workflow_install_of(
     use kr_protocol::grant::{
         EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
     };
-    use kr_protocol::ids::{GrantId, WorkflowId};
+    use kr_protocol::ids::GrantId;
     use kr_protocol::scalars::{CanonicalSet, Uuid};
 
     // The grant the workflow acts under, with every right its node needs, as a person sharing a
@@ -1299,7 +1304,7 @@ fn a_workflow_install_of(
         .expect("the grant is written");
 
     let definition = WorkflowDefinition {
-        workflow_id: WorkflowId::new(Uuid::from_bytes([43; 16])),
+        workflow_id: the_installed_workflow(),
         revision: U64::new(1),
         name: "recorded by another copy".to_owned(),
         description: Nullable::null(),
@@ -1400,10 +1405,11 @@ async fn an_automation_action_another_copy_recorded_is_not_given_back_after_a_fe
     controller.hold_fence(false);
 }
 
-/// KR-REQ-09.09: a command is run as a session's root through a POSIX shell, which Windows has
-/// not, so an install whose node runs one is refused when it is offered, with the word of a host
-/// that carries out no action of that kind. The automation cases above install a node every
-/// platform carries out and show the journal's rule on each.
+/// KR-REQ-25.14 and 09.09: a command is run as a session's root through a POSIX shell, which
+/// Windows has not, so an install whose node runs one is refused when it is offered, with the word
+/// of a host that carries out no action of that kind, and no definition stands after the refusal.
+/// The automation cases above install a node every platform carries out and show the journal's
+/// rule on each.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_workflow_whose_node_runs_a_command_is_refused_where_no_posix_shell_is_run() {
@@ -1451,8 +1457,19 @@ async fn a_workflow_whose_node_runs_a_command_is_refused_where_no_posix_shell_is
         .expect_err("a node that runs a command is refused where no POSIX shell is run");
     assert_eq!(refused.code, ErrorCode::ResourceUnavailable, "{refused:?}");
     assert!(
-        refused.message.contains("run_tests"),
+        refused
+            .message
+            .contains("carries out no action of kind 'run_tests'"),
         "the word names the kind: {refused:?}"
+    );
+    assert!(
+        controller
+            .automation()
+            .journal()
+            .get_definition(the_installed_workflow(), 1)
+            .expect("the journal is read")
+            .is_none(),
+        "no definition stands after the refusal"
     );
 }
 
