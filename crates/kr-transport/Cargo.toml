@@ -9,6 +9,7 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64.workspace = true
 boot-time.workspace = true
 # A lookup answers as a stream, one item for each selected service.
 futures.workspace = true
@@ -27,7 +28,8 @@ reqwest.workspace = true
 serde.workspace = true
 rustls-pki-types.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# The loopback front listens and joins two sockets.
+tokio = { workspace = true, features = ["io-util", "net"] }
 # Read, not used to connect: a relay's WebSocket upgrade that the network refused is reported in
 # this crate's error types, which is where the refused status is found.
 tokio-websockets.workspace = true
@@ -53,7 +55,6 @@ iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 rcgen.workspace = true
 serde_json.workspace = true
 # The loopback proxy and relay front the network tests stand between an endpoint and its relay.
-tokio = { workspace = true, features = ["io-util", "net"] }
 tokio-rustls.workspace = true
 
 [lints]
