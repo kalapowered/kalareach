@@ -15,13 +15,53 @@
 //! storage recovery and the answers of the announcement), and the compiler does not stop a change
 //! there that lets a guard go early. That the guard is the service's own is not held by the
 //! compiler either: the two entries (`receipted` and `continue_prepared`) check it with
-//! [`DispatchGuard::is_of`] before any work. That no function takes the boundary a second time is
-//! held by a roster that counts, in every file of the crate, the mentions of each name that takes
-//! it (`tests/standing_takes.txt`), not by this module.
+//! [`DispatchGuard::is_of`] before any work.
+//!
+//! A thread that holds the boundary and waits for it again waits on itself for ever. The waiting
+//! take, [`DispatchBoundary::lock`], compares the calling thread with the thread that holds the
+//! boundary before it waits, and panics where they are the same, in every build. The boundary
+//! records its holder for this: one number, zero when nobody holds it, that the guard sets when the
+//! mutex gives it, also inside a poison error, and clears before the mutex is let go. The record is
+//! no lock, and nothing waits on it. Where the first guard is on the stack that the panic unwinds,
+//! the mutex is poisoned and every later take of it panics. The trying take, which cannot wait,
+//! does not compare: the holder gets "busy" as any other thread does. A take by another thread
+//! that the holder waits for is not refused. The tests of the roster in
+//! `tests/standing_takes.txt` show each new mention of a function that takes the boundary, by
+//! function, to a person; they prove nothing about the property.
 
+use std::cell::Cell;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::WorkerService;
+
+/// The number that the next thread to ask for one is given. A number is never given twice and is
+/// never zero, which stands for no holder.
+static NEXT_THREAD_NUMBER: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// This thread's number, zero until the thread first asks for it.
+    static THREAD_NUMBER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A number for the calling thread: the same for the thread's whole life, and different from the
+/// number of every other thread of the process. (The standard library's own thread number is not
+/// available at the pinned compiler.)
+fn this_thread() -> u64 {
+    THREAD_NUMBER.with(|cell| {
+        if cell.get() == 0 {
+            // A counter that would wrap ends the asking thread with a panic and is never handed
+            // out twice.
+            let number = NEXT_THREAD_NUMBER
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                    next.checked_add(1)
+                })
+                .expect("the process has used every thread number");
+            cell.set(number);
+        }
+        cell.get()
+    })
+}
 
 /// The dispatch boundary: a lock that says so when it is let go.
 ///
@@ -32,6 +72,9 @@ use super::WorkerService;
 pub(super) struct DispatchBoundary {
     lock: Mutex<()>,
     released: tokio::sync::Notify,
+    /// The number of the thread that holds the boundary, or zero. Only the holder writes it, and
+    /// the mutex orders the holders, so relaxed loads and stores are enough.
+    holder: AtomicU64,
 }
 
 impl DispatchBoundary {
@@ -39,33 +82,35 @@ impl DispatchBoundary {
         Self {
             lock: Mutex::new(()),
             released: tokio::sync::Notify::new(),
+            holder: AtomicU64::new(0),
         }
     }
 
-    /// Takes the boundary, waiting for whoever holds it.
+    /// Takes the boundary, waiting for whoever holds it. A thread that holds it already would wait
+    /// on itself for ever, so that thread is refused with a panic before it waits.
     fn lock(&self) -> std::sync::LockResult<DispatchGuard<'_>> {
+        assert!(
+            self.holder.load(Ordering::Relaxed) != this_thread(),
+            "the thread that holds the dispatch boundary took it again"
+        );
         self.lock
             .lock()
-            .map(|guard| DispatchGuard::new(guard, &self.released))
+            .map(|guard| DispatchGuard::new(guard, self))
             .map_err(|poisoned| {
-                std::sync::PoisonError::new(DispatchGuard::new(
-                    poisoned.into_inner(),
-                    &self.released,
-                ))
+                std::sync::PoisonError::new(DispatchGuard::new(poisoned.into_inner(), self))
             })
     }
 
-    /// Takes the boundary if nobody holds it, and never waits.
+    /// Takes the boundary if nobody holds it, and never waits. It cannot wait on itself, so it
+    /// does not compare: the thread that holds the boundary gets "busy", as any other does.
     fn try_lock(&self) -> std::sync::TryLockResult<DispatchGuard<'_>> {
         self.lock
             .try_lock()
-            .map(|guard| DispatchGuard::new(guard, &self.released))
+            .map(|guard| DispatchGuard::new(guard, self))
             .map_err(|refused| match refused {
-                std::sync::TryLockError::Poisoned(poisoned) => {
-                    std::sync::TryLockError::Poisoned(std::sync::PoisonError::new(
-                        DispatchGuard::new(poisoned.into_inner(), &self.released),
-                    ))
-                }
+                std::sync::TryLockError::Poisoned(poisoned) => std::sync::TryLockError::Poisoned(
+                    std::sync::PoisonError::new(DispatchGuard::new(poisoned.into_inner(), self)),
+                ),
                 std::sync::TryLockError::WouldBlock => std::sync::TryLockError::WouldBlock,
             })
     }
@@ -93,31 +138,37 @@ impl WorkerService {
 #[derive(Debug)]
 pub struct DispatchGuard<'a> {
     guard: Option<std::sync::MutexGuard<'a, ()>>,
-    released: &'a tokio::sync::Notify,
+    boundary: &'a DispatchBoundary,
 }
 
 impl<'a> DispatchGuard<'a> {
-    const fn new(guard: std::sync::MutexGuard<'a, ()>, released: &'a tokio::sync::Notify) -> Self {
+    /// The guard of a boundary whose mutex has just given `guard`: the calling thread is now the
+    /// holder.
+    fn new(guard: std::sync::MutexGuard<'a, ()>, boundary: &'a DispatchBoundary) -> Self {
+        boundary.holder.store(this_thread(), Ordering::Relaxed);
         Self {
             guard: Some(guard),
-            released,
+            boundary,
         }
     }
 }
 
 impl DispatchGuard<'_> {
-    /// Whether this guard holds `boundary`: the guard points at the release signal of the boundary
-    /// that it took, so one pointer comparison tells, and no lock is read or taken.
+    /// Whether this guard holds `boundary`: one pointer comparison tells, and no lock is read or
+    /// taken.
     pub(super) fn is_of(&self, boundary: &DispatchBoundary) -> bool {
-        std::ptr::eq(self.released, &boundary.released)
+        std::ptr::eq(self.boundary, boundary)
     }
 }
 
 impl Drop for DispatchGuard<'_> {
     fn drop(&mut self) {
-        // The lock goes first, so that a woken presentation finds it free.
+        // The record is cleared before the lock is let go: after it, the clear could erase the
+        // number of the thread that took the boundary next.
+        self.boundary.holder.store(0, Ordering::Relaxed);
+        // The lock goes next, so that a woken presentation finds it free.
         drop(self.guard.take());
-        self.released.notify_waiters();
+        self.boundary.released.notify_waiters();
     }
 }
 
@@ -143,7 +194,7 @@ mod tests {
     use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
     use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
 
-    use super::{DispatchBoundary, WorkerService};
+    use super::{DispatchBoundary, WorkerService, this_thread};
     use crate::runtime::SessionRuntime;
     use crate::service::{Caller, ConnectionState, Freshness, ServiceBinding};
     use crate::session::{Session, SessionConfig};
@@ -527,6 +578,78 @@ mod tests {
             );
         };
         assert_eq!(second, Taken::Refused(REFUSAL.to_owned()));
+    }
+
+    /// The record names the thread that holds the boundary while its guard stands, for the waiting
+    /// take and for the trying one, and is zero once the guard is dropped.
+    #[test]
+    fn the_record_names_the_holder_while_the_guard_stands_and_is_zero_after_the_drop() {
+        let boundary = Arc::new(DispatchBoundary::new());
+        let answered = on_a_thread_of_its_own({
+            let boundary = Arc::clone(&boundary);
+            move || {
+                let number = this_thread();
+                let held = boundary.lock().expect("the boundary is free");
+                let during_the_wait = boundary.holder.load(Ordering::Relaxed);
+                drop(held);
+                let after_the_wait = boundary.holder.load(Ordering::Relaxed);
+                let held = boundary.try_lock().expect("the boundary is free");
+                let during_the_try = boundary.holder.load(Ordering::Relaxed);
+                drop(held);
+                let after_the_try = boundary.holder.load(Ordering::Relaxed);
+                (
+                    number,
+                    [
+                        during_the_wait,
+                        after_the_wait,
+                        during_the_try,
+                        after_the_try,
+                    ],
+                )
+            }
+        });
+        let Ok((number, record)) = answered.recv_timeout(BOUND) else {
+            panic!("the thread that took the boundary gave no answer within {BOUND:?}");
+        };
+        assert_ne!(
+            number, 0,
+            "no thread has the number that stands for no holder"
+        );
+        assert_eq!(record, [number, 0, number, 0]);
+    }
+
+    /// A thread's number is the same for its whole life, never zero, and its own: no other thread
+    /// of the process has it.
+    #[test]
+    fn every_thread_has_a_number_of_its_own_that_is_never_zero() {
+        let mine = this_thread();
+        assert_ne!(mine, 0);
+        assert_eq!(this_thread(), mine, "the number does not change");
+        let answered = on_a_thread_of_its_own(|| (this_thread(), this_thread()));
+        let Ok((other, again)) = answered.recv_timeout(BOUND) else {
+            panic!("another thread gave no number within {BOUND:?}");
+        };
+        assert_ne!(other, 0);
+        assert_eq!(other, again, "the number does not change");
+        assert_ne!(other, mine, "two threads do not share a number");
+    }
+
+    /// The record belongs to one boundary: a thread that holds one boundary is not refused when it
+    /// waits for another.
+    #[test]
+    fn the_thread_that_holds_one_boundary_is_not_refused_when_it_waits_for_another() {
+        let first = Arc::new(DispatchBoundary::new());
+        let second = Arc::new(DispatchBoundary::new());
+        let answered = on_a_thread_of_its_own(move || {
+            let held = first.lock().expect("the first boundary is free");
+            let taken = waits(&second);
+            drop(held);
+            taken
+        });
+        let Ok(taken) = answered.recv_timeout(BOUND) else {
+            panic!("the thread that holds one boundary gave no answer within {BOUND:?}");
+        };
+        assert_eq!(taken, Taken::Free);
     }
 
     /// A guard that comes inside the poison error of a trying take holds the boundary like any
