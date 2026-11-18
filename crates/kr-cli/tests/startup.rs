@@ -5957,7 +5957,13 @@ fn a_restart_whose_start_fails_after_the_stop_says_so_and_leaves_the_sessions_al
     assert_eq!(output.status.code(), Some(1), "{failed}");
     assert_eq!(stop_of(&failed), "ended", "{failed}");
     assert_eq!(failed["pid"].as_u64(), Some(u64::from(old)), "{failed}");
-    assert_eq!(failed["launched"], Value::Null, "{failed}");
+    // The start's child began and ended with no daemon: a start was made, which names its kind and
+    // no process.
+    assert_eq!(
+        failed["launched"],
+        serde_json::json!({"start": "standalone", "pid": null}),
+        "{failed}"
+    );
     let message = failed["message"].as_str().expect("a message");
     let id = host.tree.environment_id();
     // Whole, except the start's own words, which the run gives.
@@ -8189,6 +8195,11 @@ fn a_restart_whose_request_could_not_be_made_and_whose_start_fails_says_both() {
     let failed = failure_of(&output, "kr host restart");
     assert_eq!(output.status.code(), Some(1), "{failed}");
     assert_eq!(stop_of(&failed), "ended", "{failed}");
+    assert_eq!(
+        failed["launched"],
+        serde_json::json!({"start": "standalone", "pid": null}),
+        "the start's child began and ended: a start was made: {failed}"
+    );
     let message = failed["message"].as_str().expect("a message");
     let id = host.tree.environment_id();
     assert!(

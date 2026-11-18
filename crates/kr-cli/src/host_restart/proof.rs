@@ -12,7 +12,6 @@
 //! more. It waits, within the start's bound counted from the cut, for a daemon to give a whole
 //! exchange.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kr_ipc::client::{Listed, LocalClient};
@@ -25,7 +24,7 @@ use super::{Old, StartFailed};
 use crate::error::Result;
 use crate::host_stop::{self, Asked, Gave, LOOK_EVERY, Progress, Sight};
 use crate::resolve::KnownEnvironment;
-use crate::startup::{self, Started};
+use crate::startup::{self, Launching, Started};
 
 /// What the reads of a wait make and read, given to them so that a case can supply each answer, with the
 /// runtime's clock in its own hands. [`Real`] is the command's own.
@@ -37,7 +36,7 @@ pub(super) trait Operations {
     /// `launched` is set as the start sets it. The start's own reads are written to `record`.
     async fn start(
         &self,
-        launched: &AtomicBool,
+        launched: &Launching,
         record: &Shared,
     ) -> Result<(Self::Connection, Option<Started>)>;
 
@@ -66,7 +65,7 @@ impl Operations for Real<'_> {
 
     async fn start(
         &self,
-        launched: &AtomicBool,
+        launched: &Launching,
         record: &Shared,
     ) -> Result<(LocalClient, Option<Started>)> {
         let told = record.clone();
@@ -233,13 +232,14 @@ pub(super) async fn prove<O: Operations>(
     bound: Duration,
     record: &Shared,
 ) -> std::result::Result<Option<Started>, StartFailed> {
-    let launched = AtomicBool::new(false);
+    let launched = Launching::default();
     let (mut connection, started) = match operations.start(&launched, record).await {
         Ok(found) => found,
         Err(error) => {
             return Err(StartFailed {
                 error: Some(error),
-                launched: launched.load(Ordering::SeqCst),
+                made: launched.was_made(),
+                may_still_start: launched.may_still_start(),
             });
         }
     };
@@ -258,7 +258,8 @@ pub(super) async fn prove<O: Operations>(
     }
     Err(StartFailed {
         error: None,
-        launched: launched.load(Ordering::SeqCst),
+        made: launched.was_made(),
+        may_still_start: launched.may_still_start(),
     })
 }
 
@@ -267,10 +268,13 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
+    use kr_client::shown::Shown;
+    use kr_protocol::error::ErrorCode;
     use kr_protocol::hostinfo::configuration::ControllerStartup;
     use kr_protocol::ids::ControllerGeneration;
 
     use super::*;
+    use crate::error::CliError;
 
     fn generation(number: u64) -> ControllerGeneration {
         ControllerGeneration::new(number)
@@ -302,6 +306,9 @@ mod tests {
         /// from then at which the read that it began was to end.
         origin: tokio::time::Instant,
         ends: Mutex<Vec<Duration>>,
+        /// What a start that fails sets in what it made of its request before it fails: none where
+        /// the start gives a connection.
+        fails_after: Option<fn(&Launching)>,
     }
 
     impl Supplied {
@@ -315,6 +322,15 @@ mod tests {
                 }),
                 origin: tokio::time::Instant::now(),
                 ends: Mutex::new(Vec::new()),
+                fails_after: None,
+            }
+        }
+
+        /// A start that fails once `made` has set what the start made of its request.
+        fn failing_after(made: fn(&Launching)) -> Self {
+            Self {
+                fails_after: Some(made),
+                ..Self::of(vec![Daemon::Silent(Duration::ZERO)])
             }
         }
 
@@ -339,9 +355,16 @@ mod tests {
 
         async fn start(
             &self,
-            _launched: &AtomicBool,
+            launched: &Launching,
             _record: &Shared,
         ) -> Result<(Daemon, Option<Started>)> {
+            if let Some(made) = self.fails_after {
+                made(launched);
+                return Err(CliError::Unfinished {
+                    code: ErrorCode::EnvironmentUnavailable,
+                    message: Shown::said("the start failed"),
+                });
+            }
             Ok((self.next(), self.started))
         }
 
@@ -395,6 +418,45 @@ mod tests {
         }
     }
 
+    /// The failure of a start that fails after `made` has set what the start made of its request.
+    async fn the_failure_after(made: fn(&Launching)) -> StartFailed {
+        let failed = prove(
+            &Supplied::failing_after(made),
+            Old::Generation(generation(1)),
+            Duration::from_secs(30),
+            &Shared::new(),
+        )
+        .await
+        .expect_err("the start fails");
+        assert!(failed.error.is_some(), "the start's own failure is kept");
+        failed
+    }
+
+    /// A start that asked and was not answered made a start whose daemon may still come up; one
+    /// that was refused before it asked made none.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_start_that_asked_made_a_start_and_one_refused_before_it_asked_made_none() {
+        let asked = the_failure_after(Launching::start_made).await;
+        assert!(asked.made && asked.may_still_start);
+        let refused = the_failure_after(|_| {}).await;
+        assert!(!refused.made && !refused.may_still_start);
+    }
+
+    /// A process that was started and was seen to end made a start that no daemon may still come
+    /// up for: the fact that a start was made stays apart from the fact that a daemon may still
+    /// come up.
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_start_whose_child_started_and_ended_made_a_start_with_no_daemon_to_come() {
+        let failed = the_failure_after(|launched| {
+            launched.start_made();
+            launched.process_ended();
+        })
+        .await;
+        assert!(failed.made, "a start was made");
+        assert!(!failed.may_still_start, "and no daemon may still come up");
+    }
+
     /// A start whose connection gives a whole exchange of another generation succeeds, and the
     /// record holds the process that the daemon stated.
     #[tokio::test(start_paused = true)]
@@ -407,7 +469,7 @@ mod tests {
             &record,
         )
         .await
-        .map_err(|failed| failed.launched)
+        .map_err(|failed| failed.may_still_start)
         .expect("a whole exchange of another generation");
         assert_eq!(started.and_then(|started| started.pid), Some(77));
         let read = record.read();
