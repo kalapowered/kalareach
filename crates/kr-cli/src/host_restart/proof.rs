@@ -27,7 +27,7 @@ use crate::host_stop::{self, Asked, Gave, LOOK_EVERY, Progress, Sight};
 use crate::resolve::KnownEnvironment;
 use crate::startup::{self, Started};
 
-/// What the proof makes and reads, given to it so that a case can supply each answer, with the
+/// What the reads of a wait make and read, given to them so that a case can supply each answer, with the
 /// runtime's clock in its own hands. [`Real`] is the command's own.
 pub(super) trait Operations {
     /// A connection to a daemon that gave a usable greeting.

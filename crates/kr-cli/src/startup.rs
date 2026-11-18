@@ -2863,6 +2863,45 @@ mod tests {
         );
     }
 
+    /// KR-REQ-07.12: each attempt of a start is told to the reader of the record as it begins and as
+    /// it ends, with what it gave where no daemon answered. Nothing listens for the first attempts, and
+    /// something that accepts the connection and never says hello listens for the last.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_attempt_of_a_start_is_told_as_it_begins_and_as_it_ends() {
+        let host = kr_ipc::testing::TempHost::create();
+        let endpoint = host
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint");
+        let told = std::sync::Mutex::new(Vec::new());
+        let seen = |sight| told.lock().expect("the sights").push(sight);
+        let late = endpoint.clone();
+        let binding = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Silent::listen(&late)
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        answered_by(&endpoint, deadline, &[], &seen, || {})
+            .await
+            .map(|_| ())
+            .expect_err("nothing answers");
+        let _silent = binding.await.expect("the listener was bound");
+        let told = told.into_inner().expect("the sights");
+        assert!(told.len() >= 4, "{told:?}");
+        assert!(
+            told.chunks(2)
+                .all(|pair| matches!(pair, [Sight::Began, Sight::Gave(_)])),
+            "each attempt is told as it begins and then as it ends: {told:?}"
+        );
+        assert_eq!(told[1], Sight::Gave(Gave::NothingListens), "{told:?}");
+        assert_eq!(
+            told[told.len() - 1],
+            Sight::Gave(Gave::NothingInTime),
+            "{told:?}"
+        );
+    }
+
     /// KR-REQ-07.12: with the standalone start chosen, a daemon that is listening and does not
     /// answer is reported as the environment being unavailable, and nothing is started beside it.
     #[cfg(unix)]
