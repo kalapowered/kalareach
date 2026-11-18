@@ -648,10 +648,54 @@ fn a_take_in_a_test_helper_of_the_crate_is_reported() {
 
 const BOUNDARY: &str = "crates/kr-worker/src/service/boundary.rs";
 
+/// A child module of the boundary: its file stands in the folder that the boundary's file names.
+const BOUNDARY_CHILD: &str = "crates/kr-worker/src/service/boundary/raw_child.rs";
+
 /// The finding that a plant of one more take of the boundary's own mutex brings.
 fn rawtake_finding(function: &str, name: &str, count: usize, row: usize) -> String {
-    format!("{BOUNDARY} {function} calls {name} {count} time(s) and its rawtake row says {row}: ")
+    rawtake_finding_in(BOUNDARY, function, name, count, row)
 }
+
+/// The same finding, for a function in the file `file`.
+fn rawtake_finding_in(file: &str, function: &str, name: &str, count: usize, row: usize) -> String {
+    format!("{file} {function} names {name} {count} time(s) and its rawtake row says {row}: ")
+}
+
+/// The finding that a function with a take of the boundary's own mutex and no `taker` row brings.
+fn taker_finding(file: &str, function: &str) -> String {
+    format!("{file} {function} takes the boundary's own mutex and has no `taker` row: ")
+}
+
+/// The text of `file` in the real tree.
+fn text_of(file: &str) -> String {
+    scan::tree()
+        .into_iter()
+        .find(|(name, _)| name == file)
+        .map(|(_, source)| source)
+        .unwrap_or_default()
+}
+
+/// The real tree with `source` as the text of `file`, which the tree gets where it lacks it.
+fn tree_with(file: &str, source: String) -> Vec<(String, String)> {
+    let mut files = scan::tree();
+    match files.iter_mut().find(|(name, _)| name == file) {
+        Some((_, text)) => *text = source,
+        None => files.push((file.to_owned(), source)),
+    }
+    files
+}
+
+/// What the scan finds over `files` with the roster's rows and then `rows` after them.
+fn found_with_rows(files: &[(String, String)], rows: &str) -> Vec<String> {
+    let text = format!("{}\n{rows}\n", include_str!("standing_takes.txt"));
+    scan::violations(files, &scan::parse(&text), TAKES)
+}
+
+/// The anchor in the boundary's file before which a plant puts a method of the service.
+const SERVICE_METHODS_OF_THE_BOUNDARY: &str = "impl WorkerService {\n    /// Takes the service's dispatch boundary, waiting for whoever holds it.";
+
+/// The declaration of the child module that the boundary's file gets with the plant of a child.
+const BOUNDARY_USES: &str = "use super::WorkerService;\n";
 
 #[test]
 fn a_new_method_over_the_boundarys_take_by_the_service_is_reported() {
@@ -663,7 +707,10 @@ fn a_new_method_over_the_boundarys_take_by_the_service_is_reported() {
     assert_eq!(
         finding_faults(
             &found,
-            &[rawtake_finding("hold_for_a_moment", "lock", 1, 0)]
+            &[
+                rawtake_finding("hold_for_a_moment", "lock", 1, 0),
+                taker_finding(BOUNDARY, "hold_for_a_moment"),
+            ]
         ),
         Vec::<String>::new(),
         "{found:?}"
@@ -678,7 +725,111 @@ fn a_new_method_over_the_boundarys_own_mutex_is_reported() {
         "    fn another_take(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {\n        self.lock.lock()\n    }\n\n    /// Completes when the boundary is next let go.",
     );
     assert_eq!(
-        finding_faults(&found, &[rawtake_finding("another_take", "lock", 1, 0)]),
+        finding_faults(
+            &found,
+            &[
+                rawtake_finding("another_take", "lock", 2, 0),
+                taker_finding(BOUNDARY, "another_take"),
+            ]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_raw_take_in_a_function_with_a_rawtake_row_and_no_taker_row_is_reported() {
+    let source = text_of(BOUNDARY);
+    assert_eq!(
+        source.matches(SERVICE_METHODS_OF_THE_BOUNDARY).count(),
+        1,
+        "{SERVICE_METHODS_OF_THE_BOUNDARY}"
+    );
+    let planted = source.replace(
+        SERVICE_METHODS_OF_THE_BOUNDARY,
+        "impl WorkerService {\n    pub(super) fn hold_for_a_moment(&self) -> std::sync::LockResult<DispatchGuard<'_>> {\n        self.dispatch.lock()\n    }\n\n    /// Takes the service's dispatch boundary, waiting for whoever holds it.",
+    );
+    // The roster is given the rawtake row that a person would add to quiet the count.
+    let found = found_with_rows(
+        &tree_with(BOUNDARY, planted),
+        &format!("rawtake {BOUNDARY} hold_for_a_moment lock 1"),
+    );
+    assert_eq!(
+        finding_faults(&found, &[taker_finding(BOUNDARY, "hold_for_a_moment")]),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn the_function_value_of_the_mutex_take_used_through_the_guard_constructor_is_reported() {
+    let source = text_of(BOUNDARY);
+    assert_eq!(
+        source.matches(SERVICE_METHODS_OF_THE_BOUNDARY).count(),
+        1,
+        "{SERVICE_METHODS_OF_THE_BOUNDARY}"
+    );
+    let planted = source.replace(
+        SERVICE_METHODS_OF_THE_BOUNDARY,
+        "impl WorkerService {\n    pub(super) fn sneak(&self) -> std::sync::LockResult<DispatchGuard<'_>> {\n        let take = Mutex::lock;\n        take(&self.dispatch.lock)\n            .map(|guard| DispatchGuard::new(guard, &self.dispatch))\n            .map_err(|poisoned| {\n                std::sync::PoisonError::new(DispatchGuard::new(poisoned.into_inner(), &self.dispatch))\n            })\n    }\n\n    /// Takes the service's dispatch boundary, waiting for whoever holds it.",
+    );
+    let found = found_with_rows(&tree_with(BOUNDARY, planted), "");
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[
+                rawtake_finding("sneak", "lock", 2, 0),
+                taker_finding(BOUNDARY, "sneak"),
+            ]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_child_module_of_the_boundary_that_takes_its_mutex_is_reported() {
+    let source = text_of(BOUNDARY);
+    assert_eq!(source.matches(BOUNDARY_USES).count(), 1, "{BOUNDARY_USES}");
+    let declared = source.replace(BOUNDARY_USES, &format!("mod raw_child;\n\n{BOUNDARY_USES}"));
+    let mut files = tree_with(BOUNDARY, declared);
+    files.push((
+        BOUNDARY_CHILD.to_owned(),
+        "use super::DispatchBoundary;\n\npub(super) fn hold_raw(boundary: &DispatchBoundary) {\n    let _held = boundary.lock.lock();\n}\n".to_owned(),
+    ));
+    let found = found_with_rows(&files, "");
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[
+                rawtake_finding_in(BOUNDARY_CHILD, "hold_raw", "lock", 2, 0),
+                taker_finding(BOUNDARY_CHILD, "hold_raw"),
+            ]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn a_child_module_function_that_is_named_like_a_boundary_method_is_reported() {
+    let source = text_of(BOUNDARY);
+    assert_eq!(source.matches(BOUNDARY_USES).count(), 1, "{BOUNDARY_USES}");
+    let declared = source.replace(BOUNDARY_USES, &format!("mod raw_child;\n\n{BOUNDARY_USES}"));
+    let mut files = tree_with(BOUNDARY, declared);
+    files.push((
+        BOUNDARY_CHILD.to_owned(),
+        "use super::DispatchBoundary;\n\npub(super) fn lock(boundary: &DispatchBoundary) {\n    let _held = boundary.lock.lock();\n}\n".to_owned(),
+    ));
+    let found = found_with_rows(&files, "");
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[
+                rawtake_finding_in(BOUNDARY_CHILD, "lock", "lock", 2, 0),
+                taker_finding(BOUNDARY_CHILD, "lock"),
+            ]
+        ),
         Vec::<String>::new(),
         "{found:?}"
     );
