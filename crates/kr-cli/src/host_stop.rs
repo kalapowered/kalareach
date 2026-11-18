@@ -6518,17 +6518,19 @@ pub(crate) mod tests {
 
     /// A stand-in daemon of `generation` that gives one connection a whole exchange: it greets the
     /// next connection on `listener`, answers `host.info`, and answers the request for the launch
-    /// alone with `process`. It ends where the command lets go of the connection.
+    /// alone with `process`. It ends where the command lets go of the connection, and gives the
+    /// number of requests that it answered.
     pub(crate) async fn answer_a_whole_exchange(
         listener: kr_ipc::endpoint::Listener,
         id: EnvironmentId,
         generation: ControllerGeneration,
         process: u64,
-    ) {
+    ) -> usize {
         use kr_protocol::envelope::ParamsValue;
         use kr_protocol::scalars::{Nullable, U64};
 
         let (mut reader, mut writer) = greet(&listener, id).await;
+        let mut answered = 0;
         while let Ok(frame) = reader.read_message::<ControlFrame>().await {
             let (request_id, value) = match frame {
                 ControlFrame::Request(request) => (
@@ -6547,7 +6549,9 @@ pub(crate) mod tests {
                 _ => continue,
             };
             write_outcome(&mut writer, request_id, Outcome::Ok(value)).await;
+            answered += 1;
         }
+        answered
     }
 
     /// A `host.info` result as a daemon of `generation` answers it.
@@ -6786,21 +6790,37 @@ pub(crate) mod tests {
     }
 
     /// A look tells the greeting before the read that follows it, so that a read that is never
-    /// answered still shows it, and tells none where the hello was refused.
+    /// answered (the link closes at it) still shows it, and tells none where the hello was
+    /// refused. Each peer ends the look by its own act and none by the look's bound: the look's
+    /// value is judged first, so that a look that ran out of time is told from a greeting that was
+    /// not written.
     #[tokio::test]
     async fn a_look_tells_the_greeting_before_the_read_that_follows_it() {
-        for (peer, greeted) in [
-            (Peer::Reports(ControllerGeneration::new(1)), true),
-            (Peer::RefusesTheRead, true),
-            (Peer::SaysNothingToTheRead, true),
-            (Peer::RefusesTheHello, false),
+        for (peer, greeted, ended) in [
+            (
+                Peer::Reports(ControllerGeneration::new(1)),
+                true,
+                "reported",
+            ),
+            (Peer::RefusesTheRead, true, "read_refused"),
+            (
+                Peer::ClosesAfterTheHello(Closure::Clean),
+                true,
+                "greeting_then_link_failed",
+            ),
+            (Peer::RefusesTheHello, false, "greeting_replied"),
         ] {
             let (_temp, environment, within, daemon) = a_stand_in_for(peer);
             let mut seen = Vec::new();
-            the_look_gave(&environment, within, &mut |sight| seen.push(sight)).await;
+            let gave = the_look_gave(&environment, within, &mut |sight| seen.push(sight)).await;
             if let Some(daemon) = daemon {
                 daemon.abort();
             }
+            assert_eq!(
+                gave.label(),
+                ended,
+                "the look at {peer:?} ended as its peer made it end, and not by its bound: {seen:?}"
+            );
             assert_eq!(
                 seen.contains(&Sight::Greeted),
                 greeted,
