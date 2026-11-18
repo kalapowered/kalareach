@@ -687,10 +687,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 5,
+        "version": 6,
         "migrates_from": 1
       },
-      "digest": "ad120754e50c7af247b3f52ed2ef52e2bd885cb34b595ed40cba314a0667043d",
+      "digest": "8f839dfe35f104126ebb6feb0190f8d74627495720c963ee2aab55486c17c5f9",
       "kept": [
         "UploadBeginResult",
         "UploadChunkResult",
@@ -698,6 +698,7 @@
         "UploadCancelResult",
         "DraftCreateResult",
         "DraftUpdateResult",
+        "DraftDiscardResult",
         "AgentDraftAddAttachmentResult",
         "AttachmentPreview"
       ]
