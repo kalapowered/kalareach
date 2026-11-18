@@ -3666,8 +3666,10 @@ impl TransferService {
     /// A precondition a request fails can be one its own first attempt created: the reservation it
     /// charged against the environment, or the revision it moved. Two concurrent copies of one
     /// action must not answer differently, so where a refusal could have that explanation the
-    /// record is consulted before the refusal is returned. An identifier carrying a different
-    /// payload is still a reused identifier.
+    /// record is consulted before the refusal is returned. What the record holds is the answer: the
+    /// result, or the refusal the action ended in, under its own code (the unknown outcome where
+    /// this build lacks the code). The refusal this request met is its answer only where no record
+    /// holds the action's. An identifier carrying a different payload is still a reused identifier.
     fn refuse_unless_performed<T: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
         action: Option<&Action>,
@@ -3680,6 +3682,9 @@ impl TransferService {
             Ok(result) => Ok(result),
             // A reused identifier is what it is whatever this request would have failed for.
             Err(conflict @ TransferError::IdConflict { .. }) => Err(conflict),
+            // The action ended in a refusal: that refusal is what every copy of it is owed.
+            Err(kept @ TransferError::Retained { .. }) => Err(kept),
+            // No record, or none this request can read: the refusal it met.
             Err(_) => Err(refusal),
         }
     }
