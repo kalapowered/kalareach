@@ -227,9 +227,9 @@ impl GrantLifetimes {
     /// over.
     pub fn deadline(&self, record: &DeviceRecord) -> Result<Option<ContinuousInstant>> {
         let over = || ControllerError::PermissionDenied {
-            detail: "this device's grant has run out; it can pair with this host again with a new \
-                     invitation after it forgets this host, and an owner device confirms the new \
-                     pairing"
+            detail: "this device's grant has run out; it can pair with this host again only if \
+                     another owner device can confirm the new pairing; then forget this host and \
+                     use a new invitation"
                 .to_owned(),
         };
         match self.lifetime(record)? {
@@ -1310,9 +1310,10 @@ mod tests {
             .expect("the device");
         assert!(recorded.expired_at_ms.is_some(), "the expiry is on record");
 
-        // What a device whose grant has run out is told names a way forward this host takes: a new
-        // invitation, after the device forgets this host. The end on record is read in a boot of
-        // its own, where no anchor is left.
+        // What a device whose grant has run out is told says what it takes to pair again: another
+        // owner device that confirms the new pairing, and only then the device forgets this host
+        // and uses a new invitation. The end on record is read in a boot of its own, where no
+        // anchor is left.
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
         let rebooted = lifetimes_at(
             &devices,
@@ -1329,11 +1330,15 @@ mod tests {
             panic!("a grant that has run out is refused its deadline: {refused:?}");
         };
         assert!(
-            detail.contains(
-                "again with a new invitation after it forgets this host, and an owner device \
-                 confirms the new pairing"
-            ),
+            detail.starts_with("this device's grant has run out; "),
             "{detail}"
+        );
+        assert!(
+            detail.ends_with(
+                "it can pair with this host again only if another owner device can confirm the \
+                 new pairing; then forget this host and use a new invitation"
+            ),
+            "the condition comes before the step that cannot be taken back: {detail}"
         );
         assert!(!detail.contains("has not paired before"), "{detail}");
     }

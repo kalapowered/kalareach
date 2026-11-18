@@ -49,8 +49,9 @@ The command line and the application keep the answers they could not deliver in 
 A failure the page shows says the host's own words and, where its code maps to something the person
 can do, that action after them: pair the device again, sign in, update, wait, refresh, check
 whether it went through, or change a setting. A pairing that the host refuses because it still lists
-the device is the exception and offers no retry: the person asks the host's owner to remove the
-device first, forgets the host on the device if it still lists it, and pairs with a new invitation.
+the device is the exception and offers no retry. This requires another owner device that can confirm
+the new pairing. The person asks the host's owner to remove the device first, forgets the host on
+the device if the device still lists it, and pairs with a new invitation.
 The client library says a host's refusal as its code,
 a colon and the host's words, and the page leaves the code out. A failure whose code asks nothing of
 the person says the host's words alone. Native code names the action by its key, and the page's

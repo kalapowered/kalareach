@@ -2875,8 +2875,8 @@ impl Controller {
             } else {
                 Err(ControllerError::PermissionDenied {
                     detail: "this device's grant has run out, so it cannot rotate its key; it can \
-                             pair with this host again with a new invitation after it forgets \
-                             this host"
+                             pair with this host again only if another owner device can confirm \
+                             the new pairing; then forget this host and use a new invitation"
                         .to_owned(),
                 })
             }
@@ -4130,8 +4130,17 @@ mod tests {
                     panic!("a grant that has run out is refused: {error}");
                 };
                 assert!(
-                    detail.contains("again with a new invitation after it forgets this host"),
+                    detail.starts_with(
+                        "this device's grant has run out, so it cannot rotate its key; "
+                    ),
                     "{detail}"
+                );
+                assert!(
+                    detail.ends_with(
+                        "it can pair with this host again only if another owner device can \
+                         confirm the new pairing; then forget this host and use a new invitation"
+                    ),
+                    "the condition comes before the step that cannot be taken back: {detail}"
                 );
                 assert!(!detail.contains("has not paired before"), "{detail}");
                 assert_eq!(host.revisions(), (1, Some(1)));

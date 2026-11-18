@@ -106,8 +106,9 @@ precedes a subscription, and everything a real host spends answering.
 | Everything else | Stop | The host's own message |
 
 A pairing that the host refuses because it still lists the device is the exception and offers no
-retry: the person asks the host's owner to remove the device first, forgets the host on the device
-if it still lists it, and pairs with a new invitation.
+retry. This requires another owner device that can confirm the new pairing. The person asks the
+host's owner to remove the device first, forgets the host on the device if the device still lists
+it, and pairs with a new invitation.
 
 `OUTCOME_UNKNOWN` never yields a retry, whatever class asks for one. Section 9 forbids dispatching
 the identifier again, and inventing a new one would submit the same intent twice.
