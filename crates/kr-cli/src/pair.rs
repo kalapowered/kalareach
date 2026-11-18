@@ -47,9 +47,7 @@ use kr_protocol::confirmation::{
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::OrganisationRequirement;
-use kr_protocol::ids::{
-    ActionId, BuildId, DeviceId, EnvironmentId, GrantId, InvitationId, OrganisationId,
-};
+use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, InvitationId, OrganisationId};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
     PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult, PairOwnerView,
@@ -1497,6 +1495,7 @@ fn not_confirmed(message: &'static str) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::ids::{DeviceId, GrantId};
     use kr_protocol::invitation::QrText;
     use kr_protocol::pairing::{CodeQrPayload, OwnerConfirmationRequest, QrPayload, ShortCode};
     use kr_protocol::scalars::{TimestampMs, Uuid};
