@@ -332,6 +332,140 @@ fn a_repeated_refusal_is_answered_as_it_was_decided() {
     assert_eq!(ProtocolError::from(reused).code, ErrorCode::IdConflict);
 }
 
+/// A later build can add an error code that this build lacks, and a refusal is kept under its wire
+/// word. The service's own read of a repeat takes such a record for one it cannot read: the caller
+/// is told that the outcome is not known, with nothing of the record in the message, the row
+/// stays as it was kept, and the action is not performed again under the first one's identifier.
+/// The case holds no Git and no daemon, so it runs wherever the library runs.
+#[test]
+fn a_repeat_of_a_refusal_kept_under_a_code_this_build_lacks_is_unreadable_and_nothing_runs_again() {
+    let directory = tempfile::tempdir().expect("a journal directory");
+    let service = AutomationService::open(
+        directory.path(),
+        common::host(
+            Arc::new(kr_automation::MockActionRunner::new()),
+            common::every_right(&[grant_id(4)]),
+            Arc::new(ManualClock::new(1_000)),
+        ),
+    )
+    .expect("the journal opens");
+    let definition = one_node(workflow_id(4), grant_id(4));
+    let enable = WorkflowEnableParams {
+        workflow_id: definition.workflow_id,
+        revision: definition.revision,
+    };
+    let key = common::fresh_action(Method::WorkflowEnable);
+    let submitted = Submitted {
+        answered: None,
+        key: &key,
+        admission: &common::admitted,
+        caller_grant: None,
+    };
+
+    // The first submission is refused, because nothing is installed to enable, and kept.
+    let first = ProtocolError::from(
+        service
+            .enable(&enable, &submitted, 1_000)
+            .expect_err("nothing is installed to enable"),
+    );
+    assert_eq!(first.code, ErrorCode::InvalidArgument);
+
+    // A later build added a code, and the refusal of this record was kept under it.
+    let word = "A_CODE_A_LATER_BUILD_ADDS";
+    assert!(
+        ErrorCode::from_wire(word).is_none(),
+        "this build lacks the word"
+    );
+    let journal = rusqlite::Connection::open(
+        directory
+            .path()
+            .join(kr_automation::store::WORKFLOW_DB_NAME),
+    )
+    .expect("the journal opens beside the service's own handle");
+    journal
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .expect("a busy timeout");
+    type KeptRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows = || -> Vec<KeptRow> {
+        let mut statement = journal
+            .prepare(
+                "SELECT actor_id, action_id, result_json, error_code, error_detail
+                   FROM action_records ORDER BY action_id",
+            )
+            .expect("the records are selected");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("the records are read")
+            .map(|row| row.expect("a record row"))
+            .collect()
+    };
+    let changed = journal
+        .execute(
+            "UPDATE action_records SET error_code = ?1 WHERE error_code IS NOT NULL",
+            [word],
+        )
+        .expect("the kept word is changed");
+    assert_eq!(changed, 1, "the one refusal this action kept");
+    let before = rows();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].3.as_deref(), Some(word));
+
+    // The workflow is installed now, so a second performance would enable it.
+    service
+        .submit_install(&install_params(&definition), 1_001)
+        .expect("installs");
+    let installed_rows = rows().len();
+
+    // 1. The reader's answer: the outcome is not known. It is not the refusal that was kept, and
+    // it is not a success.
+    for _ in 0..2 {
+        let repeated = service
+            .enable(&enable, &submitted, 1_002)
+            .expect_err("the repeat is told that the outcome is not known");
+        assert!(
+            matches!(repeated, AutomationError::RecordUnreadable { .. }),
+            "{repeated:?}"
+        );
+        let told = ProtocolError::from(repeated);
+        assert_eq!(told.code, ErrorCode::OutcomeUnknown);
+        assert!(!told.message.contains(word), "{}", told.message);
+
+        // 2. The record stays, and 3. nothing ran again: no row was added or changed beside the
+        // installation's own, and the workflow is not enabled.
+        assert_eq!(rows().len(), installed_rows);
+        assert_eq!(
+            rows()
+                .into_iter()
+                .filter(|row| row.3.is_some())
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert!(
+            !service
+                .store()
+                .get_definition(definition.workflow_id, 1)
+                .unwrap()
+                .expect("installed")
+                .enabled,
+            "the repeat enabled nothing"
+        );
+    }
+}
+
 /// A runner that cancels its own run while its action is running, and then reports success.
 #[derive(Default)]
 struct CancelledWhileRunning {

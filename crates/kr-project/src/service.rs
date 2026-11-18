@@ -5549,4 +5549,123 @@ UUID=2 /data ext4 defaults,nofail 0 2
             }
         }
     }
+
+    #[test]
+    fn the_reader_of_a_repeat_tells_a_refusal_kept_under_an_unknown_code_as_unknown_and_runs_nothing_again()
+     {
+        // No Git and no daemon stand in this case: the service opens on a host tree, and a repeat
+        // is read from the journal before anything else about the request is looked at. It runs
+        // wherever the library runs, Windows included. A later build can add an error code that
+        // this build lacks; a refusal kept under it is told as an unknown outcome with the detail
+        // that was kept, the row stays, and the cancellation is not performed again.
+        use kr_protocol::error::ErrorCode;
+        use kr_protocol::scalars::{Digest256, TimestampMs};
+
+        type ActionRow = (
+            Vec<u8>,
+            String,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+        );
+        let host = kr_ipc::testing::TempHost::create();
+        let service = ProjectService::open(&host.environment()).expect("the service opens");
+        let rows = || -> Vec<ActionRow> {
+            let store = service.locked().expect("the journal is held");
+            let mut statement = store
+                .connection()
+                .prepare(
+                    "SELECT action_id, method, result, error_code, error_detail
+                       FROM actions ORDER BY action_id",
+                )
+                .expect("the actions are selected");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .expect("the actions are read")
+                .map(|row| row.expect("an action row"))
+                .collect()
+        };
+        let actor = ActorId::new("local:test").expect("a valid principal");
+        let action = Action {
+            actor_id: actor.clone(),
+            action_id: Uuid::from_bytes([0x61; 16]),
+            method: "project.operation.cancel".to_owned(),
+            payload_digest: Digest256::from_bytes([0x61; 32]),
+        };
+        let params = ProjectOperationCancelParams {
+            operation_action_id: ActionId::new(Uuid::from_bytes([0x62; 16])),
+            through_location_id: Nullable(None),
+        };
+        let detail = "the operation was refused";
+        assert_eq!(
+            service
+                .locked()
+                .expect("the journal is held")
+                .record_action(
+                    &action.actor_id,
+                    action.action_id,
+                    &action.method,
+                    action.payload_digest,
+                    &RetainedOutcome::Error {
+                        code: ErrorCode::InvalidArgument,
+                        detail: detail.to_owned(),
+                    },
+                    TimestampMs::new(5),
+                )
+                .expect("the refusal is kept"),
+            None,
+            "the first writer keeps it"
+        );
+
+        // A later build added a code, and the refusal of this record was kept under it.
+        let word = "A_CODE_A_LATER_BUILD_ADDS";
+        assert!(
+            ErrorCode::from_wire(word).is_none(),
+            "this build lacks the word"
+        );
+        let changed = service
+            .locked()
+            .expect("the journal is held")
+            .connection()
+            .execute(
+                "UPDATE actions SET error_code = ?1 WHERE action_id = ?2",
+                rusqlite::params![word, action.action_id.as_bytes().to_vec()],
+            )
+            .expect("the kept word is changed");
+        assert_eq!(changed, 1, "the one refusal this action kept");
+        let before = rows();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].3.as_deref(), Some(word));
+
+        // 1. The reader's answer: the outcome is unknown, under the detail that was kept. A
+        // cancellation that ran again would answer that the operation is unknown, which is a
+        // different refusal, and would record it.
+        for _ in 0..2 {
+            let repeated = service
+                .project_operation_cancel(&actor, &params, Some(&action))
+                .expect_err("the repeat is told what is kept, as unknown");
+            assert!(
+                matches!(
+                    repeated,
+                    ProjectError::Retained {
+                        code: ErrorCode::OutcomeUnknown,
+                        ..
+                    }
+                ),
+                "{repeated:?}"
+            );
+            assert_eq!(repeated.to_string(), detail);
+
+            // 2. The record stays, and 3. nothing ran again: no row was added or changed.
+            assert_eq!(rows(), before);
+        }
+    }
 }
