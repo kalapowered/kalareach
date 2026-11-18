@@ -6145,10 +6145,38 @@ impl WorkerService {
         }
     }
 
+    /// The restriction count, at most `ceiling`, whose withdrawal is owed and not yet done, or
+    /// nothing when every withdrawal that `ceiling` covers is done. Reads two counters and holds
+    /// no lock.
+    fn withdrawal_owed_up_to(&self, ceiling: u64) -> Option<u64> {
+        let owed = self
+            .withdrawals_owed
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .min(ceiling);
+        (self
+            .withdrawals_done
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < owed)
+            .then_some(owed)
+    }
+
     /// Answers a statement of what the local owner may do only when no withdrawal it owes, or an
-    /// earlier statement owes, is pending: it waits for the hold in place when the gate changed,
-    /// runs the withdrawal that is owed itself, and waits for the detaches that exist once that
-    /// withdrawal is run. Nothing rests on the task of the statement that owed it.
+    /// earlier statement owes, is pending: where one is owed it waits for the hold in place when
+    /// the gate changed, runs the withdrawal that is owed itself, and waits for the detaches that
+    /// exist once that withdrawal is run. Nothing rests on the task of the statement that owed it.
+    ///
+    /// A statement that owes nothing does not wait for the hold: a repeat of the statement the
+    /// worker holds, a first statement and a statement that gives access have no withdrawal for a
+    /// hold to end. The daemon sends a statement ahead of each announcement of a revision, and an
+    /// announcement that meets a held boundary is refused so that the daemon asks again over the
+    /// same link; a statement that waited would keep that link until the daemon's bound ran out,
+    /// and the announcement would not be made.
+    ///
+    /// Whether a withdrawal is owed is read once, before the wait, from two counters that no lock
+    /// guards. The count owed is raised only inside the hold of the authority lock that changes
+    /// the gate, to the count that hold captured. So the reading, made after this statement's own
+    /// hold of that lock, sees what every earlier tightening statement owed, and a later statement
+    /// raises the count only above this statement's `ceiling`, which caps the reading.
     ///
     /// The statement completes what it captured and no more: the withdrawal it runs, and the mark
     /// that says it is done, stop at the restriction count it was made under. A restriction a later
@@ -6162,21 +6190,12 @@ impl WorkerService {
     async fn after_a_statement(&self, captured: Captured, answer: ControlFrame) -> ControlFrame {
         #[cfg(feature = "testing")]
         let _waiting = WaitingCount::begin(&self.statements_waiting);
-        self.wait_for_the_hold(captured.after).await;
+        if self.withdrawal_owed_up_to(captured.ceiling).is_some() {
+            self.wait_for_the_hold(captured.after).await;
+        }
         #[cfg(feature = "testing")]
         self.after_the_hold_stall.stand();
-        loop {
-            let owed = self
-                .withdrawals_owed
-                .load(std::sync::atomic::Ordering::SeqCst)
-                .min(captured.ceiling);
-            if self
-                .withdrawals_done
-                .load(std::sync::atomic::Ordering::SeqCst)
-                >= owed
-            {
-                break;
-            }
+        while let Some(owed) = self.withdrawal_owed_up_to(captured.ceiling) {
             off_the_executor(|| self.withdraw_local_connections());
             self.withdrawals_done
                 .fetch_max(owed, std::sync::atomic::Ordering::SeqCst);
