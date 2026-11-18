@@ -403,8 +403,8 @@ fn directory_state(directory: &std::path::Path) -> (Left, Vec<(String, Vec<u8>, 
     (left(directory), names)
 }
 
-/// KR-REQ-03.30: the authorised-file check leaves the file the person nominated and everything
-/// beside it as they were: the same names, bytes, modification times and mode bits (on Windows, the
+/// KR-REQ-03.30, KR-REQ-11.16: the authorised-file check leaves the file the person nominated and
+/// everything beside it as they were: the same names, bytes, modification times and mode bits (on Windows, the
 /// read-only attribute), in the same directory. The owner, extended attributes and access lists are
 /// not compared. The run performed the read: a headless session is asked for that check alone, so
 /// there is no check that sends a keystroke to hold back. That the one check which sends input is
