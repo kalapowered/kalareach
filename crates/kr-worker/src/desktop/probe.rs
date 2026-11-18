@@ -1082,7 +1082,8 @@ mod platform {
         let ran = bounded(
             check,
             LAUNCHER,
-            &["-g", "-j", "-n", "-a", application, "--args", &mark],
+            // Scratch mutation only: the application is started in front, as the person would.
+            &["-n", "-a", application, "--args", &mark],
             plan,
         );
         let outcome = match ran.exit {
