@@ -2959,6 +2959,8 @@ mod tests {
         dials: usize,
         /// Whether the loop ended within the run.
         ended: bool,
+        /// How much of the paused clock the loop took, from 0 s to its end or the end of the run.
+        elapsed: Duration,
         /// How the loop ended, when it did and it failed.
         failure: Option<FailureKind>,
     }
@@ -3054,6 +3056,7 @@ mod tests {
         let outcome = tokio::time::timeout(run, pairing.waiting(pending, Some(held), &progress))
             .await
             .ok();
+        let elapsed = start.elapsed();
         let ended = outcome.is_some();
         let failure = outcome
             .and_then(|outcome| outcome.err())
@@ -3069,6 +3072,7 @@ mod tests {
             asked,
             dials,
             ended,
+            elapsed,
             failure,
         }
     }
@@ -3197,6 +3201,14 @@ mod tests {
         )
         .await;
         assert!(run.ended, "the attempt ends at its deadline");
+        assert_eq!(
+            run.elapsed,
+            Duration::from_secs(120),
+            "the device waits to the attempt's deadline and not a moment less: it tried again after \
+             each answer it could not read ({} dials, asked at {:?})",
+            run.dials,
+            run.asked
+        );
         assert_eq!(
             run.failure,
             Some(FailureKind::ApprovalUnknown),
