@@ -32,8 +32,8 @@ use kr_protocol::ids::{ControllerGeneration, EnvironmentId};
 
 use crate::error::{CliError, Result};
 use crate::host_stop::{
-    self, Answer, Asked, AtStart, Before, Begun, Cut, End, Facts, Knows, Looked, Progress, Real,
-    Settled, Stage, Start, StartedFact, Which,
+    self, Answer, Asked, AtStart, Before, Begun, Cut, End, Facts, Knows, Launched, Looked,
+    Progress, Real, Settled, Stage, Start, StartedFact, Which,
 };
 use crate::report::Completion;
 use crate::resolve::KnownEnvironment;
@@ -265,7 +265,6 @@ async fn wait_for_the_holder(
                             pid: whole.process,
                             answer: Some(Answer {
                                 serving: whole.process,
-                                launched: None,
                             }),
                             ..begun.none.clone()
                         },
@@ -296,8 +295,8 @@ async fn wait_for_the_holder(
 /// answers now: that this command stopped none and started none.
 fn holder_answers_said(id: EnvironmentId, serving: Option<u64>) -> Shown {
     shown!(
-        "A control daemon held environment {} and did not answer, and a control daemon{} answers \
-         now. This command stopped none and started none.",
+        "Environment {} was held, no control daemon answered, and a control daemon{} answers now. \
+         This command stopped none and started none.",
         id,
         process_said(serving)
     )
@@ -762,7 +761,8 @@ async fn said_after(
             host_stop::done(
                 &said,
                 &Facts {
-                    answer: Some(answer_of(&read, started.as_ref())),
+                    answer: Some(answer_of(&read)),
+                    launched: Some(launched_of(started.as_ref())),
                     ..facts
                 },
                 json,
@@ -1201,6 +1201,7 @@ impl StartFailed {
         }
         let own = self.error.as_ref().map(Said::said);
         let message = failed_said(id, Some(came), &read, self.launched, own.as_ref());
+        let facts = self.facts(environment, facts);
         let error = match self.error {
             Some(CliError::HostUnavailable(_)) => CliError::HostUnavailable(message),
             Some(CliError::Unfinished { code, .. }) => CliError::Unfinished { code, message },
@@ -1209,7 +1210,21 @@ impl StartFailed {
                 message,
             },
         };
-        host_stop::failed(error, facts, json)
+        host_stop::failed(error, &facts, json)
+    }
+
+    /// The facts of the failure's result: what this command asked for. A start that asked for a
+    /// daemon says which start it asked for, without a process, since none was read; one that
+    /// asked for nothing says so.
+    fn facts(&self, environment: &KnownEnvironment, facts: &Facts) -> Facts {
+        Facts {
+            launched: Some(if self.launched {
+                Launched::Start(startup::chosen_start_fact(environment))
+            } else {
+                Launched::Nothing
+            }),
+            ..facts.clone()
+        }
     }
 }
 
@@ -1270,11 +1285,18 @@ async fn start_and_prove(
 
 /// What `--json` says of the daemon that answered, as the record shows it, and of what this command
 /// launched.
-fn answer_of(record: &Record, started: Option<&Started>) -> Answer {
+fn answer_of(record: &Record) -> Answer {
     Answer {
         serving: record.whole.and_then(|whole| whole.process),
-        launched: started.map(started_fact),
     }
+}
+
+/// What `--json` says of the start where the restart ended with a daemon that answers: what this
+/// command started or asked for, or that it started nothing.
+fn launched_of(started: Option<&Started>) -> Launched {
+    started.map_or(Launched::Nothing, |started| {
+        Launched::Start(started_fact(started))
+    })
 }
 
 /// The start as `--json` names it: the standalone child with its process, and the service manager
@@ -1302,12 +1324,22 @@ fn interrupted(progress: &Progress, stage: Stage, past: &Past, json: bool) -> Co
             code: ErrorCode::EnvironmentUnavailable,
             message: said,
         },
-        &Facts {
-            knows,
-            ..Facts::none(progress.said_earlier())
-        },
+        &interrupted_facts(knows, past, progress),
         json,
     )
+}
+
+/// The facts of an interrupt's result: what it knows of the stop, and, where the start was begun,
+/// that it cannot tell whether its request left.
+fn interrupted_facts(knows: Knows, past: &Past, progress: &Progress) -> Facts {
+    Facts {
+        knows,
+        launched: Some(match past.beyond() {
+            Beyond::Starting => Launched::Unknown,
+            Beyond::Stop | Beyond::Ended => Launched::Nothing,
+        }),
+        ..Facts::none(progress.said_earlier())
+    }
 }
 
 /// What an interrupt at `stage` knows of the stop, and says.
@@ -1443,10 +1475,12 @@ pub(crate) mod tests {
             Some(&standalone(77)),
             Shown::said(""),
         );
+        // The start's words are the platform's own.
+        let started = launched_said(Some(&standalone(77)));
         assert_eq!(
             said.to_string(),
             format!(
-                "Stopped the control daemon for environment {id} (process 90). A control daemon of another generation (process 91) answers now. This command started a control daemon (process 77) under the standalone start. No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
+                "Stopped the control daemon for environment {id} (process 90). A control daemon of another generation (process 91) answers now. {started} No session was stopped. Paired devices' connections to the old daemon closed; their pairings stand."
             )
         );
         // Where the stopped generation was never read no comparison is made, and a daemon that
@@ -1458,6 +1492,51 @@ pub(crate) mod tests {
                 "No control daemon was running for environment {id}. A control daemon answers now. This command started none."
             )
         );
+    }
+
+    /// Every result of a restart carries `launched`: null where nothing was started or asked, the
+    /// start's kind where a failed start asked for one (no process was read), `unknown` for an
+    /// interrupt while the start runs, and the success's own form; a stop's result carries none.
+    #[test]
+    fn every_result_of_a_restart_says_what_it_started_or_asked_for() {
+        let (_temp, environment) = an_environment();
+        let facts = Facts {
+            launched: Some(Launched::Nothing),
+            ..Facts::none(Vec::new())
+        };
+        assert!(
+            Facts::none(Vec::new()).launched.is_none(),
+            "a stop has no member"
+        );
+        for (asked, expected) in [(false, None), (true, Some(("standalone", None)))] {
+            let failed = StartFailed {
+                error: None,
+                launched: asked,
+            };
+            let said = failed
+                .facts(&environment, &facts)
+                .launched
+                .map(Launched::parts);
+            assert_eq!(said, Some(expected), "a failed start, asked: {asked}");
+        }
+        let progress = Progress::new(environment.environment_id);
+        for (beyond, expected) in [
+            (Beyond::Stop, None),
+            (Beyond::Ended, None),
+            (Beyond::Starting, Some(("unknown", None))),
+        ] {
+            let past = Past::new();
+            past.enter(beyond);
+            let said = interrupted_facts(Knows::NotAsked, &past, &progress)
+                .launched
+                .map(Launched::parts);
+            assert_eq!(said, Some(expected), "an interrupt at {beyond:?}");
+        }
+        assert_eq!(
+            launched_of(Some(&standalone(77))).parts(),
+            Some(("standalone", Some(77)))
+        );
+        assert_eq!(launched_of(None).parts(), None);
     }
 
     /// The `--json` start names the standalone child with its process, and the service manager or
@@ -2080,12 +2159,11 @@ pub(crate) mod tests {
         record: &Record,
         id: EnvironmentId,
     ) -> Vec<(String, String, String)> {
+        use crate::host_stop::StartedFact;
+
         let (label, came, own, started) = shape;
         let own = own.map(Shown::said);
-        let none = Answer {
-            serving: None,
-            launched: None,
-        };
+        let none = Answer { serving: None };
         let mut made = Vec::new();
         match came {
             None => {
@@ -2095,14 +2173,15 @@ pub(crate) mod tests {
                         holder_answers_said(id, whole.process),
                         Answer {
                             serving: whole.process,
-                            launched: None,
                         },
+                        Launched::Nothing,
                     ));
                 } else {
                     made.push((
                         (*label).to_owned(),
                         failed_said(id, None, record, false, None),
                         none,
+                        Launched::Nothing,
                     ));
                 }
             }
@@ -2113,7 +2192,8 @@ pub(crate) mod tests {
                     made.push((
                         (*label).to_owned(),
                         succeeded_said(id, came, record, started.as_ref(), Shown::said("")),
-                        answer_of(record, started.as_ref()),
+                        answer_of(record),
+                        launched_of(started.as_ref()),
                     ));
                 }
                 let late = if succeeds {
@@ -2121,22 +2201,36 @@ pub(crate) mod tests {
                 } else {
                     (*label).to_owned()
                 };
+                // A failed start that asked for a daemon says its kind and no process.
+                let asked = started.as_ref().map_or(Launched::Nothing, |started| {
+                    Launched::Start(StartedFact {
+                        pid: None,
+                        ..started_fact(started)
+                    })
+                });
                 made.push((
                     late,
                     failed_said(id, Some(came), record, started.is_some(), own.as_ref()),
                     none,
+                    asked,
                 ));
             }
         }
         made.into_iter()
-            .map(|(label, text, answer)| {
-                let launched = answer.launched.map(
-                    |launched| serde_json::json!({"start": launched.start, "pid": launched.pid}),
-                );
+            .map(|(label, text, answer, launched)| {
+                let launched = launched
+                    .parts()
+                    .map(|(start, pid)| serde_json::json!({"start": start, "pid": pid}));
                 let json = serde_json::json!({"serving": answer.serving, "launched": launched});
+                // The frozen file holds the Unix words of the standalone start; the platform's own
+                // words for it are put back to them where they differ.
+                let text = text.to_string().replace(
+                    &launched_said(Some(&standalone(77))).to_string(),
+                    "This command started a control daemon (process 77) under the standalone start.",
+                );
                 (
                     label,
-                    text.to_string().replace(&id.to_string(), "E"),
+                    text.replace(&id.to_string(), "E"),
                     json.to_string(),
                 )
             })
