@@ -66,11 +66,11 @@ const hostSource = import.meta.glob('../../../crates/kr-controller/src/service/a
 })
 
 describe('the scripted host refusing a share that would outlast a pairing', () => {
-  /** The sentence the host's refusal ends in, read from the host's own source. */
+  /** The host's whole refusal, read from the host's own source, with `{}` where the time left goes. */
   function hostSentence(): string {
     const [source] = Object.values(hostSource)
     if (typeof source !== 'string') throw new Error("the host's source is not there")
-    const found = /"that device's pairing ends in \{\}, before this share would; ((?:[^"\\]|\\\n\s*|\\.)*)"/.exec(
+    const found = /"(that device's pairing ends in \{\}, before this share would; (?:[^"\\]|\\\n\s*|\\.)*)"/.exec(
       source
     )
     if (found?.[1] === undefined) throw new Error("the host's refusal is not in its source")
@@ -78,7 +78,7 @@ describe('the scripted host refusing a share that would outlast a pairing', () =
     return found[1].replace(/\\\n\s*/g, '')
   }
 
-  it('says what the host says after the time left, and offers a second pairing only after the pairing has ended', async () => {
+  it('says what the host says, the time left apart, and offers a second pairing only after the pairing has ended', async () => {
     const { port } = fakeHost()
     const invitation: GrantCreateParams = {
       session_id: SESSION_MAIN,
@@ -101,9 +101,12 @@ describe('the scripted host refusing a share that would outlast a pairing', () =
       (error: unknown) => error
     )
     const message = (refused as { message?: string } | null)?.message ?? ''
-    const marker = 'before this share would; '
-    expect(message, 'the scripted host refuses').toContain(marker)
-    const said = message.slice(message.indexOf(marker) + marker.length)
+    expect(message, 'the scripted host refuses').toContain('before this share would; ')
+    // Every fixed word is compared; the time left, in minutes here, is the one thing that is not.
+    const said = message.replace(
+      /(?<=^that device's pairing ends in )\d+ minutes(?=, before this share would; )/,
+      '{}'
+    )
     expect(said).toBe(hostSentence())
     expect(said).toContain('pair the device again after the pairing has ended')
     expect(said).toContain('the host refuses a new pairing while this one stands')
