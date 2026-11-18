@@ -69,6 +69,9 @@ struct Page {
     /// Holds the page's publication, and so the view's own task, while a case needs the view slower
     /// than the host.
     gate: Arc<Gate>,
+    /// Holds one publication between the moment its state is recorded and the moment it meets the
+    /// gate, for a case that must order what it does against the two halves of one publication.
+    point: Arc<Point>,
     /// The waits of the input lanes this page's views open, when a case takes them from its own
     /// deadlines: the page ends them, and closes its views, when it is dropped.
     deadlines: Option<Arc<BarrierDeadlines>>,
@@ -128,6 +131,78 @@ impl Gate {
         *self.passes.lock().expect("the gate") = None;
         self.changed.notify_all();
     }
+
+    /// Whether another thread holds the gate's lock now.
+    fn busy(&self) -> bool {
+        matches!(
+            self.passes.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+}
+
+/// A point in the page's publication, after a state is recorded and before it meets the gate.
+/// Unarmed, it does nothing. A case that arms it holds the next publication there, does what it
+/// must between the publication's two halves, and lets the publication go from the point.
+#[derive(Default)]
+struct Point {
+    at: Mutex<PointAt>,
+    changed: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct PointAt {
+    armed: bool,
+    holding: bool,
+    released: bool,
+    passed: bool,
+}
+
+impl Point {
+    fn arm(&self) {
+        self.at.lock().expect("the point").armed = true;
+    }
+
+    /// The publication is at the point with its state recorded: when the point is armed it waits
+    /// here until the case lets it go, and says that it did. A case that failed before it let the
+    /// publication go ends it at the watchdog.
+    fn hold(&self) -> bool {
+        let mut at = self.at.lock().expect("the point");
+        if !at.armed {
+            return false;
+        }
+        at.armed = false;
+        at.holding = true;
+        self.changed.notify_all();
+        let (mut at, _) = self
+            .changed
+            .wait_timeout_while(at, WATCHDOG, |at| !at.released)
+            .expect("the point");
+        at.holding = false;
+        true
+    }
+
+    /// The held publication has met the gate and gone through it.
+    fn passed(&self) {
+        self.at.lock().expect("the point").passed = true;
+    }
+
+    /// Lets the held publication go from the point.
+    fn release(&self) {
+        self.at.lock().expect("the point").released = true;
+        self.changed.notify_all();
+    }
+
+    /// Waits, under [`STATE_BOUND`], until `reached` holds of the point.
+    async fn within(&self, reached: impl Fn(&PointAt) -> bool) -> bool {
+        tokio::time::timeout(STATE_BOUND, async {
+            while !reached(&self.at.lock().expect("the point")) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
 }
 
 /// Closes the page's gate, and opens it again when dropped, also when the case fails: a view held
@@ -169,6 +244,8 @@ impl Page {
         let heard = Arc::clone(&published);
         let gate = Arc::new(Gate::default());
         let gated = Arc::clone(&gate);
+        let point = Arc::new(Point::default());
+        let pointed = Arc::clone(&point);
         let builder = tauri::test::mock_builder()
             .manage(companion_tauri::AppState::new())
             .channel_interceptor(move |_webview, callback, _index, body| {
@@ -182,7 +259,13 @@ impl Page {
                         .push(state);
                     // The wait holds the view's task, and the runtime is told that this worker waits so
                     // that the session's reader, which the view does not hold, goes on reading.
-                    tokio::task::block_in_place(|| gated.pass());
+                    tokio::task::block_in_place(|| {
+                        let held = pointed.hold();
+                        gated.pass();
+                        if held {
+                            pointed.passed();
+                        }
+                    });
                 }
                 true
             })
@@ -215,6 +298,7 @@ impl Page {
             windows,
             published,
             gate,
+            point,
             deadlines: None,
             opened: Mutex::default(),
         }
@@ -7935,4 +8019,56 @@ async fn a_view_whose_connection_went_with_output_unread_serves_it_and_gives_not
         (1, "watching".to_owned()),
         "the page is not left showing control on the connection that is gone"
     );
+}
+
+/// A state that a case has seen is never stopped by the gate that the case closes after it. The
+/// page's publication records a state and then meets the gate, and a case that sees the state in
+/// the record and closes the gate has the earlier publication to reckon with: the view's task
+/// stands inside that publication, and what the case waits for next comes only from that task.
+///
+/// The page's point holds the view's first publication after its state is recorded, which is the
+/// order of a publisher slower than the case. The case has seen the state by then, and closes the
+/// gate. The publication is then let go from the point, and it must go through the gate: a
+/// publication that the closed gate stops after the case has seen its state leaves the view held
+/// for good.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_state_the_case_has_seen_is_never_stopped_by_the_gate_the_case_closes_after_it() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    page.point.arm();
+    let _view = page.open(worker.session_id, 10, 2, 3);
+    let mut link = worker.link().await;
+    link.attach().await;
+    assert!(
+        page.state_within(3, 0).await.is_some(),
+        "the view did not publish its first state within the bound"
+    );
+    assert!(
+        page.point.within(|point| point.holding).await,
+        "the first publication did not reach the page's point within the bound"
+    );
+    let gate = Arc::clone(&page.gate);
+    let held = if page.gate.busy() {
+        // The held publication has the gate's lock, and the close waits behind it until the
+        // publication has decided whether it waits: the publication is let go, and the close
+        // follows it.
+        let closing = tokio::task::spawn_blocking(move || Held::new(&gate));
+        page.point.release();
+        tokio::time::timeout(STATE_BOUND, closing)
+            .await
+            .unwrap_or_else(|_| panic!("the close of the gate did not return within the bound"))
+            .expect("joins")
+    } else {
+        // The gate's lock is free: the close takes effect while the publication is held at the
+        // point, and the publication goes on into the closed gate.
+        let held = Held::new(&gate);
+        page.point.release();
+        held
+    };
+    assert!(
+        page.point.within(|point| point.passed).await,
+        "the gate that the case closed after it had seen the state stopped the publication of that state: the view's task stands at the gate and publishes nothing more"
+    );
+    drop(held);
+    drop(link);
 }
