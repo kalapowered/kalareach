@@ -7,7 +7,7 @@
 //! read of the endpoint. One function writes an observation ([`Record::observe`]), and one says
 //! which states of the record can be reached ([`reachable`]).
 
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_protocol::ids::ControllerGeneration;
 
@@ -208,12 +208,12 @@ pub(crate) fn reachable(record: &Record) -> bool {
 
 /// The record that a wait and the reads inside it share: every read writes to it as it goes,
 /// from whichever step of the wait it is in.
-#[derive(Debug)]
-pub(crate) struct Shared(Mutex<Record>);
+#[derive(Clone, Debug)]
+pub(crate) struct Shared(Arc<Mutex<Record>>);
 
 impl Shared {
-    pub(crate) const fn new() -> Self {
-        Self(Mutex::new(Record::new()))
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(Record::new())))
     }
 
     pub(crate) fn observe(&self, seen: Observation) {
@@ -224,7 +224,6 @@ impl Shared {
     }
 
     /// What has been written so far.
-    #[allow(dead_code, reason = "read where a result is made from the record")]
     pub(crate) fn read(&self) -> Record {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -409,6 +408,30 @@ pub(crate) mod tests {
             Vec::<&String>::new(),
             "`reachable` names a state that no sequence of three reads reaches"
         );
+    }
+
+    /// Every record that a sequence of up to three reads of the endpoint, each with the lock read
+    /// after it or none, reaches through the writer, with no record twice.
+    pub(crate) fn every_record_that_up_to_three_reads_reach() -> Vec<Record> {
+        let mut all = BTreeSet::from([format!("{:?}", Record::new())]);
+        let mut found = vec![Record::new()];
+        let mut level = vec![Record::new()];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for record in &level {
+                for read in the_reads() {
+                    for lock in the_locks_after_a_read() {
+                        let after = written(*record, &read, lock);
+                        if all.insert(format!("{after:?}")) {
+                            next.push(after);
+                            found.push(after);
+                        }
+                    }
+                }
+            }
+            level = next;
+        }
+        found
     }
 
     fn after(sights: &[Observation]) -> Record {
