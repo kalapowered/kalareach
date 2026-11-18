@@ -31,7 +31,7 @@
 //! answer explains a failed dial for its keep time, while the asks for its entry are used up and the
 //! ten minutes after the last of them have not ended, and while the request made under it is alive,
 //! and never after a newer answer has replaced it. A stop of requests, below, holds back the next
-//! ask and keeps no answer standing.
+//! ask, and keeps every answer that stands to its end.
 //!
 //! A request is alive while its task has not finished: the entry holds the task, stored in the
 //! same locked step as the count and the time of the ask, so one request for an entry is alive at
@@ -51,8 +51,15 @@
 //! failure and an answer that is not the service's envelope explain nothing.
 //!
 //! A service that answers that it does not serve the request (it has no such route) or that this
-//! device is not allowed to ask stops every request for ten minutes. Nothing here ever turns that
-//! into a reason a person is told, and nothing here waits for the service past a short bound.
+//! device is not allowed to ask stops every request for ten minutes, and nothing renews an answer in
+//! that time. So while the stop lasts every answer that stands is kept standing to its end, whichever
+//! entry it is for and whenever it was read, an answer that a request on its way writes during the
+//! stop included, and a dial lost in that time is told what the service said and not that the host
+//! is out of reach. The end of the stop is the least an answer is kept: an answer that names a
+//! longer delay keeps it, and one that had stopped is not brought back. A newer answer that is no
+//! refusal replaces a kept one at once, in a stop as at any time, and a dial that connects clears no
+//! answer, so a kept one stands to its end after it. Nothing here ever turns the stop itself into a
+//! reason a person is told, and nothing here waits for the service past a short bound.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -393,7 +400,8 @@ enum Held {
     /// The service is unable, or failed on its side. `kept_until` is how long the answer explains
     /// a failed dial of itself (a live request for the entry keeps it standing too), and `retry_at` is
     /// when a dial asks again; a request that fails moves `retry_at`
-    /// later and lifts `kept_until` to it. `alternatives` is what the service named, with no entry
+    /// later and lifts `kept_until` to it, and a stop of requests lifts it to the stop's end while the
+    /// answer stands. `alternatives` is what the service named, with no entry
     /// for a fault; `retry_after_seconds` is the delay it named, as it named it, and `answered_at`
     /// is when the answer was read.
     Unavailable {
@@ -452,13 +460,14 @@ impl Entry {
     }
 
     /// Whether the entry holds an answer that the service is unable and that still explains a
-    /// failed dial: for as long as it is kept, while the asks for the entry are used up (three
-    /// requests with no connection, until the ten minutes after the last), because nothing renews it
-    /// while no request is made, and for as long as the request that was made while it stood is
-    /// alive. That request decides what the entry holds next, and a dial that is lost before then
-    /// is told no less than the entry said a moment before. A request that is made while the answer
-    /// has stopped drops it, so what is kept, counted or awaited here is an answer that stood when
-    /// the last request was made, and a newer answer replaces it as soon as it is read.
+    /// failed dial: for as long as it is kept (a stop of requests lifts that time to its end), while
+    /// the asks for the entry are used up (three requests with no connection, until the ten minutes
+    /// after the last), because nothing renews it while no request is made, and for as long as the
+    /// request that was made while it stood is alive. That request decides what the entry holds
+    /// next, and a dial that is lost before then is told no less than the entry said a moment
+    /// before. A request that is made while the answer has stopped drops it, so what is kept,
+    /// counted or awaited here is an answer that stood when the last request was made, and a newer
+    /// answer replaces it as soon as it is read.
     fn answer_stands(&self, now: Instant) -> bool {
         match self.held {
             Held::Unavailable { kept_until, .. } => {
@@ -468,6 +477,78 @@ impl Entry {
             }
             _ => false,
         }
+    }
+
+    /// Keeps an answer that stands at `now` until `until` at least, as a stop of requests holds back
+    /// every ask until then and nothing renews the answer. A time the answer is kept to that is
+    /// later stays, and an answer that has stopped is left as it is, so a stop brings back no old
+    /// answer.
+    fn keep_through(&mut self, now: Instant, until: Instant) {
+        if !self.answer_stands(now) {
+            return;
+        }
+        if let Held::Unavailable { kept_until, .. } = &mut self.held {
+            *kept_until = (*kept_until).max(until);
+        }
+    }
+
+    /// Keeps what a request got, read at `now`: an answer replaces what was held, whatever it is,
+    /// and a request that failed leaves an answer that is still held as it is.
+    fn settle(&mut self, answer: Result<AdmissionAnswer, ClientError>, now: Instant) {
+        self.held = match answer {
+            Ok(AdmissionAnswer::Admitted {
+                expires_in_seconds, ..
+            }) => Held::Admitted {
+                until: now + named_time(expires_in_seconds),
+            },
+            Ok(AdmissionAnswer::NotNeeded) => Held::Needs {
+                until: now + KEEP_NOT_NEEDED,
+            },
+            Ok(AdmissionAnswer::NotManaged) => Held::Needs {
+                until: now + KEEP_NOT_MANAGED,
+            },
+            Ok(AdmissionAnswer::Unavailable {
+                alternatives,
+                retry_after_seconds,
+                ..
+            }) => Held::Unavailable {
+                kept_until: now + kept_for(retry_after_seconds),
+                retry_at: now + retry_after_seconds.map_or(DOUBT_AFTER, named_time),
+                alternatives: Alternatives::named(alternatives),
+                retry_after_seconds,
+                answered_at: now,
+            },
+            // Asked again as any other refusal is, and explained for as long as an unavailable
+            // answer is.
+            Ok(AdmissionAnswer::Faulted {
+                retry_after_seconds,
+                ..
+            }) => Held::Unavailable {
+                kept_until: now + kept_for(retry_after_seconds),
+                retry_at: now + after_a_refusal(retry_after_seconds),
+                alternatives: Alternatives::none(),
+                retry_after_seconds,
+                answered_at: now,
+            },
+            Err(error) => {
+                let retry = now + retry_delay(&error);
+                // A request that failed says nothing about what the service last said. A word that
+                // is still held stood as the request was made (one that had stopped was dropped
+                // then), so it is kept as it is until a dial asks again, and only that time moves.
+                // It moves later: a request is made only once the word's own retry time has come.
+                if let Held::Unavailable {
+                    kept_until,
+                    retry_at,
+                    ..
+                } = &mut self.held
+                {
+                    *retry_at = retry;
+                    *kept_until = (*kept_until).max(retry);
+                    return;
+                }
+                Held::Failed { retry_at: retry }
+            }
+        };
     }
 
     /// Whether a dial that starts `now` asks for this entry again. Never while the request for it
@@ -499,6 +580,21 @@ struct State {
     entries: HashMap<Key, Entry>,
     /// Until when no request is made, because the service said it does not serve them.
     suspended_until: Option<Instant>,
+}
+
+impl State {
+    /// While a stop of requests lasts at `now`, keeps every answer that stands to the stop's end,
+    /// whichever entry holds it: the stop holds back every ask, so nothing can renew an answer in
+    /// that time. It runs after each answer is kept, so that an answer written during the stop is
+    /// kept too.
+    fn keep_for_the_stop(&mut self, now: Instant) {
+        let Some(until) = self.suspended_until.filter(|until| *until > now) else {
+            return;
+        };
+        for entry in self.entries.values_mut() {
+            entry.keep_through(now, until);
+        }
+    }
 }
 
 /// What a test hangs on a dial just after its locked step: it is given the candidate the dial was
@@ -646,7 +742,6 @@ impl PairingAdmissions {
         host: &EndpointKey,
         candidate: EndpointKey,
     ) {
-        let now = self.clock.now();
         let dialled = self.dialled_key(network, host);
         let mut started = Vec::new();
 
@@ -662,6 +757,9 @@ impl PairingAdmissions {
             };
             let asked = {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                // The time is read under the lock, so that a dial that was paused before it cannot
+                // keep, as it makes a request, an answer that has stopped since.
+                let now = self.clock.now();
                 let suspended = state.suspended_until.is_some_and(|until| now < until);
                 let entry = state.entries.entry(key.clone()).or_insert_with(Entry::new);
                 let mut asked = None;
@@ -711,8 +809,11 @@ impl PairingAdmissions {
     /// Asks the service, and keeps what it answers.
     async fn ask(&self, key: Key, request: AdmissionRequest) {
         let answer = self.service.admit(&request).await;
-        let now = self.clock.now();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        // The time is read under the lock, so that answers are applied at times that are in order: a
+        // task that was paused between the answer and the lock cannot bring back an answer that has
+        // stopped, and an earlier stop cannot replace the end of a later one.
+        let now = self.clock.now();
         let refused = match &answer {
             Err(error) => Some(error.code()),
             Ok(AdmissionAnswer::Faulted { code, .. }) => Some(*code),
@@ -728,63 +829,10 @@ impl PairingAdmissions {
         }) {
             state.suspended_until = Some(now + SUSPEND);
         }
-        let Some(entry) = state.entries.get_mut(&key) else {
-            return;
-        };
-        entry.held = match answer {
-            Ok(AdmissionAnswer::Admitted {
-                expires_in_seconds, ..
-            }) => Held::Admitted {
-                until: now + named_time(expires_in_seconds),
-            },
-            Ok(AdmissionAnswer::NotNeeded) => Held::Needs {
-                until: now + KEEP_NOT_NEEDED,
-            },
-            Ok(AdmissionAnswer::NotManaged) => Held::Needs {
-                until: now + KEEP_NOT_MANAGED,
-            },
-            Ok(AdmissionAnswer::Unavailable {
-                alternatives,
-                retry_after_seconds,
-                ..
-            }) => Held::Unavailable {
-                kept_until: now + kept_for(retry_after_seconds),
-                retry_at: now + retry_after_seconds.map_or(DOUBT_AFTER, named_time),
-                alternatives: Alternatives::named(alternatives),
-                retry_after_seconds,
-                answered_at: now,
-            },
-            // Asked again as any other refusal is, and explained for as long as an unavailable
-            // answer is.
-            Ok(AdmissionAnswer::Faulted {
-                retry_after_seconds,
-                ..
-            }) => Held::Unavailable {
-                kept_until: now + kept_for(retry_after_seconds),
-                retry_at: now + after_a_refusal(retry_after_seconds),
-                alternatives: Alternatives::none(),
-                retry_after_seconds,
-                answered_at: now,
-            },
-            Err(error) => {
-                let retry = now + retry_delay(&error);
-                // A request that failed says nothing about what the service last said. A word that
-                // is still held stood as the request was made (one that had stopped was dropped
-                // then), so it is kept as it is until a dial asks again, and only that time moves.
-                // It moves later: a request is made only once the word's own retry time has come.
-                if let Held::Unavailable {
-                    kept_until,
-                    retry_at,
-                    ..
-                } = &mut entry.held
-                {
-                    *retry_at = retry;
-                    *kept_until = (*kept_until).max(retry);
-                    return;
-                }
-                Held::Failed { retry_at: retry }
-            }
-        };
+        if let Some(entry) = state.entries.get_mut(&key) {
+            entry.settle(answer, now);
+        }
+        state.keep_for_the_stop(now);
     }
 
     /// Records that a dial to `host` connected: what the entry was doubtful about is settled.
