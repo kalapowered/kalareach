@@ -7115,9 +7115,8 @@ fn a_daemon_that_closed_the_connection_and_goes_is_waited_for_to_its_end_whichev
 #[cfg(target_os = "linux")]
 #[test]
 fn a_login_item_and_the_service_start_are_independent_offers_on_a_real_user_manager() {
-    let host = ServiceHost::create().expect(
-        "this case needs a user service manager: run it with KR_REQUIRE_SERVICE_MANAGER=1",
-    );
+    let host = ServiceHost::create()
+        .expect("this case needs a user service manager: run it with KR_REQUIRE_SERVICE_MANAGER=1");
     let run = |arguments: &[&str]| {
         let what = format!("kr {}", arguments.join(" "));
         let output = start(host.kr(arguments)).finish(&what);
@@ -7135,7 +7134,10 @@ fn a_login_item_and_the_service_start_are_independent_offers_on_a_real_user_mana
     assert!(host.answers(), "the daemon answers");
     let said = run(&["host", "login-item", "install"]);
     assert!(said.contains("login item: installed: "), "{said}");
-    assert!(host.answers(), "the daemon keeps answering across the install");
+    assert!(
+        host.answers(),
+        "the daemon keeps answering across the install"
+    );
     let directory = host.home.join(".config/autostart");
     let item = std::fs::read_dir(&directory)
         .expect("the autostart directory")
@@ -7157,8 +7159,16 @@ fn a_login_item_and_the_service_start_are_independent_offers_on_a_real_user_mana
         std::fs::read(&login_record).expect("the record"),
     );
     run(&["host", "startup", "--clear"]);
-    assert_eq!(std::fs::read(&item).expect("kept"), item_bytes, "--clear leaves the entry");
-    assert_eq!(std::fs::read(&login_record).expect("kept"), record_bytes, "and its record");
+    assert_eq!(
+        std::fs::read(&item).expect("kept"),
+        item_bytes,
+        "--clear leaves the entry"
+    );
+    assert_eq!(
+        std::fs::read(&login_record).expect("kept"),
+        record_bytes,
+        "and its record"
+    );
     host.select_service();
     let (unit, record) = (
         std::fs::read(host.definition()).expect("the unit"),
@@ -7166,8 +7176,16 @@ fn a_login_item_and_the_service_start_are_independent_offers_on_a_real_user_mana
     );
     let removed = run(&["host", "login-item", "remove"]);
     assert!(removed.contains("removed "), "{removed}");
-    assert_eq!(std::fs::read(host.definition()).expect("kept"), unit, "the unit is as it was");
-    assert_eq!(std::fs::read(host.record()).expect("kept"), record, "so is its record");
+    assert_eq!(
+        std::fs::read(host.definition()).expect("kept"),
+        unit,
+        "the unit is as it was"
+    );
+    assert_eq!(
+        std::fs::read(host.record()).expect("kept"),
+        record,
+        "so is its record"
+    );
     assert!(!item.exists(), "the login item is gone");
 }
 
@@ -7190,7 +7208,14 @@ fn installing_and_removing_the_login_item_neither_start_nor_end_a_daemon() {
             String::from_utf8_lossy(&output.stdout).contains("login item: "),
             "{what} says the login item's state"
         );
-        assert_eq!(host.one_daemon(), daemon, "{what} left the daemon's process number");
-        assert!(lock_is_held(&host), "{what} left the daemon holding the lock");
+        assert_eq!(
+            host.one_daemon(),
+            daemon,
+            "{what} left the daemon's process number"
+        );
+        assert!(
+            lock_is_held(&host),
+            "{what} left the daemon holding the lock"
+        );
     }
 }

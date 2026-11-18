@@ -2671,7 +2671,7 @@ mod tests {
             SERVICE_LOCK_HOLDS,
             Duration::from_millis(100),
         )
-            .expect_err("the second waits and gives up");
+        .expect_err("the second waits and gives up");
         assert!(refused.as_str().contains(LOCK_FILE), "{refused}");
         drop(held);
         Lock::take_within(&environment, LOCK_FILE, SERVICE_LOCK_HOLDS, Duration::ZERO)
