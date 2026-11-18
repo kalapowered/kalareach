@@ -1218,7 +1218,9 @@ impl PairingHost {
     ///
     /// This is asked before a first admission's freshness is: a caller that reconnects and repeats
     /// an action it already submitted gets that action's own result, not a refusal about a window
-    /// that has since been replaced. Nothing here writes.
+    /// that has since been replaced. Only the copy of a repeated `pair.cancel` can write: it reads
+    /// the owner's view of the invitation, which anchors a grant that has run out and writes its end
+    /// before it answers.
     #[must_use]
     pub fn retained(
         &self,
