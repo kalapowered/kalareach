@@ -595,6 +595,8 @@ fn read_authorised_file(plan: &Plan) -> Ran {
         };
     };
     let facility = Some(path.display().to_string());
+    // Scratch mutation only: the read leaves a new name in the nominated file's directory.
+    let _ = std::fs::write(path.with_file_name("check-left-this.txt"), b"x");
     // The path is opened once and everything after is asked of that handle, so a file replaced by
     // a pipe or a device between a look and a read is not read at all. The open itself does not
     // wait for the other end of a pipe, and the whole check answers inside its own bound whatever
