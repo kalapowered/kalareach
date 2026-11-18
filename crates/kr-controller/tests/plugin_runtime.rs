@@ -1937,7 +1937,7 @@ async fn a_process_that_is_not_a_sessions_worker_reads_claims_and_settles_nothin
                     session_id: Nullable::some(session_id),
                     application_instance_id: Nullable::null(),
                     text: "a draft".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )

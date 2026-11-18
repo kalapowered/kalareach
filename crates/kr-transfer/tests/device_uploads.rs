@@ -270,7 +270,7 @@ fn an_attachment_a_prompt_has_sent_to_a_session_stops_counting() {
                 session_id: Nullable::some(session_id),
                 application_instance_id: Nullable::null(),
                 text: "look at these".to_owned(),
-            },
+            }, None,
             None,
             None,
         )

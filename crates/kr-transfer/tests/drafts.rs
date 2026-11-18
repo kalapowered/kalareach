@@ -45,7 +45,7 @@ fn draft(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
                     Uuid::from_bytes([10; 16]),
                 )),
                 text: "have a look at this".to_owned(),
-            },
+            }, Some(crate::support::a_binding()),
             None,
             None,
         )
@@ -605,7 +605,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 session_id: Nullable::some(other_session),
                 application_instance_id: Nullable::null(),
                 text: "not this session".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -640,7 +640,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
                 text: "someone else's draft".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -677,7 +677,7 @@ fn a_binding_needs_one_principal_and_one_session() {
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
                 text: "this session".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -861,7 +861,7 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
                     session_id: Nullable::some(session),
                     application_instance_id: Nullable::null(),
                     text: "for the session".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )
@@ -879,7 +879,7 @@ fn ending_a_session_fails_only_the_insertions_its_agent_never_confirmed() {
                     session_id: Nullable::null(),
                     application_instance_id: Nullable::null(),
                     text: "no session yet".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )
@@ -1083,7 +1083,7 @@ fn ending_a_session_fails_an_insertion_whose_upload_it_owns_though_the_draft_nam
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "names no session".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -1196,7 +1196,7 @@ fn ending_a_session_fails_its_unconfirmed_insertion_and_leaves_a_full_draft_read
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
                 text: "for a session that is gone".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -1338,7 +1338,7 @@ fn ending_a_session_fails_an_insertion_by_its_draft_when_its_upload_names_no_ses
                     session_id: session,
                     application_instance_id: Nullable::null(),
                     text: "a draft".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )
@@ -1555,6 +1555,7 @@ fn a_draft_for_another_application_is_a_conflict_and_a_wrong_session_keeps_its_o
                     application_instance_id,
                     text: "have a look at this".to_owned(),
                 },
+                application_instance_id.0.map(|_| crate::support::a_binding()),
                 None,
                 None,
             )
@@ -1606,7 +1607,7 @@ fn a_sessionless_draft(
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "an open draft".to_owned(),
-            },
+            }, None,
             None,
             limit,
         )
@@ -1704,7 +1705,7 @@ fn a_draft_whose_session_has_ended_stops_counting_against_the_bound() {
                 session_id: Nullable::some(session),
                 application_instance_id: Nullable::null(),
                 text: "for a session".to_owned(),
-            },
+            }, None,
             None,
             limit,
         )
@@ -1747,18 +1748,18 @@ fn a_repeat_of_the_create_that_took_the_last_place_is_answered_from_its_record()
     let last = action_for(b"the last place");
     let made = harness
         .service
-        .draft_create(&device, &params, Some(&last), Some(1))
+        .draft_create(&device, &params, None, Some(&last), Some(1))
         .expect("the one place is free");
     let again = harness
         .service
-        .draft_create(&device, &params, Some(&last), Some(1))
+        .draft_create(&device, &params, None, Some(&last), Some(1))
         .expect("the repeat is answered from the record");
     assert_eq!(again, made, "one action, one draft");
 
     let refused_action = action_for(b"the last place");
     let refused = harness
         .service
-        .draft_create(&device, &params, Some(&refused_action), Some(1))
+        .draft_create(&device, &params, None, Some(&refused_action), Some(1))
         .expect_err("a new action finds no place");
     assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
 
@@ -1775,7 +1776,7 @@ fn a_repeat_of_the_create_that_took_the_last_place_is_answered_from_its_record()
         .expect("the prompt sends the draft");
     harness
         .service
-        .draft_create(&device, &params, Some(&refused_action), Some(1))
+        .draft_create(&device, &params, None, Some(&refused_action), Some(1))
         .expect("the service wrote no record of the refusal");
 }
 
@@ -2329,7 +2330,7 @@ fn a_draft_a_session_of_an_earlier_build_may_have_been_sent_is_kept() {
                 session_id: Nullable::some(other_session),
                 application_instance_id: Nullable::null(),
                 text: "for another session".to_owned(),
-            },
+            }, None,
             None,
             None,
         )

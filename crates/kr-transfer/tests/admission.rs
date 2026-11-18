@@ -589,7 +589,7 @@ fn a_draft_write_the_host_refuses_inside_the_lock_changes_nothing() {
         let host = Host::new(refuses);
         let created = harness.service.draft_create(
             &harness.actor,
-            &draft_params(&harness),
+            &draft_params(&harness), None,
             Some(&action(&harness, "draft.create", b"create", &host)),
             None,
         );
@@ -598,7 +598,7 @@ fn a_draft_write_the_host_refuses_inside_the_lock_changes_nothing() {
         // A draft that exists, to update and to bind an attachment to.
         let existing = harness
             .service
-            .draft_create(&harness.actor, &draft_params(&harness), None, None)
+            .draft_create(&harness.actor, &draft_params(&harness), None, None, None)
             .expect("creates the draft")
             .draft;
         let handle = harness.publish(&pattern(2048), "image/png", "photo.png");
@@ -655,7 +655,7 @@ fn a_draft_write_the_host_refuses_inside_the_lock_changes_nothing() {
         .service
         .draft_create(
             &harness.actor,
-            &draft_params(&harness),
+            &draft_params(&harness), None,
             Some(&action(&harness, "draft.create", b"create", &host)),
             None,
         )
@@ -675,13 +675,13 @@ fn a_create_at_the_bound_whose_admission_is_gone_is_told_that_and_not_the_count(
         for _ in 0..2 {
             harness
                 .service
-                .draft_create(&harness.actor, &draft_params(&harness), None, Some(2))
+                .draft_create(&harness.actor, &draft_params(&harness), None, None, Some(2))
                 .expect("a place is free");
         }
         let host = Host::new(refuses);
         let refused = harness.service.draft_create(
             &harness.actor,
-            &draft_params(&harness),
+            &draft_params(&harness), None,
             Some(&action(&harness, "draft.create", b"create", &host)),
             Some(2),
         );
@@ -692,7 +692,7 @@ fn a_create_at_the_bound_whose_admission_is_gone_is_told_that_and_not_the_count(
             .service
             .draft_create(
                 &harness.actor,
-                &draft_params(&harness),
+                &draft_params(&harness), None,
                 Some(&action(&harness, "draft.create", b"create", &host)),
                 Some(2),
             )
@@ -709,7 +709,7 @@ fn a_create_at_the_bound_whose_admission_is_gone_is_told_that_and_not_the_count(
 fn a_draft_holding_an_attachment(harness: &Harness) -> kr_protocol::transfer::DraftRecord {
     let draft = harness
         .service
-        .draft_create(&harness.actor, &draft_params(harness), None, None)
+        .draft_create(&harness.actor, &draft_params(harness), None, None, None)
         .expect("creates the draft")
         .draft;
     let handle = harness.publish(&pattern(2048), "image/png", "photo.png");
@@ -914,7 +914,7 @@ fn a_binding_at_the_bound_whose_admission_is_gone_is_told_that_and_not_the_count
         for _ in 0..2 {
             harness
                 .service
-                .draft_create(&harness.actor, &draft_params(&harness), None, Some(2))
+                .draft_create(&harness.actor, &draft_params(&harness), None, None, Some(2))
                 .expect("a place is free");
         }
         let handle = harness.publish(&pattern(4096), "image/png", "second.png");
@@ -1005,7 +1005,7 @@ fn a_repeat_answered_from_its_record_asks_the_host_nothing() {
         .service
         .draft_create(
             &harness.actor,
-            &draft_params(&harness),
+            &draft_params(&harness), None,
             Some(&performed),
             None,
         )
@@ -1017,7 +1017,7 @@ fn a_repeat_answered_from_its_record_asks_the_host_nothing() {
     };
     let again = harness
         .service
-        .draft_create(&harness.actor, &draft_params(&harness), Some(&repeat), None)
+        .draft_create(&harness.actor, &draft_params(&harness), None, Some(&repeat), None)
         .expect("the repeat is answered from the record");
     assert_eq!(again, created, "one action, one answer");
     assert_eq!(

@@ -54,7 +54,7 @@ fn draft_for(harness: &Harness, session: Option<SessionId>) -> DraftRecord {
                     Uuid::from_bytes([10; 16]),
                 )),
                 text: "a private draft, never shown to a worker".to_owned(),
-            },
+            }, Some(crate::support::a_binding()),
             None,
             None,
         )
@@ -1353,7 +1353,7 @@ fn a_draft_is_not_made_for_a_session_that_has_ended() {
                 session_id: Nullable::some(session()),
                 application_instance_id: Nullable::null(),
                 text: "for a session that is gone".to_owned(),
-            },
+            }, None,
             None,
             None,
         )

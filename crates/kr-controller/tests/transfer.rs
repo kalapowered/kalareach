@@ -1906,7 +1906,7 @@ fn offer(
                 session_id: Nullable::some(session_id),
                 application_instance_id: Nullable::null(),
                 text: "have a look at this".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -2074,7 +2074,7 @@ async fn a_daemon_that_stopped_after_recording_a_closure_ends_its_insertions_whe
                 session_id,
                 application_instance_id: Nullable::null(),
                 text: "too late".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -2137,7 +2137,7 @@ async fn the_sweep_ends_the_insertions_of_a_session_closed_beneath_a_running_dae
                 session_id,
                 application_instance_id: Nullable::null(),
                 text: "too late".to_owned(),
-            },
+            }, None,
             None,
             None,
         )

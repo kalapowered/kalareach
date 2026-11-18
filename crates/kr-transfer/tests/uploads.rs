@@ -1281,7 +1281,7 @@ fn a_submitted_attachment_follows_its_sessions_retention() {
                     session_id: carried,
                     application_instance_id: Nullable::null(),
                     text: "look at this".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )
@@ -1353,7 +1353,7 @@ fn a_draft_sent_to_a_session_holds_the_attachments_it_gets_afterwards() {
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "look at this".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -1497,7 +1497,7 @@ fn an_attachment_that_belongs_to_another_session_is_not_taken_by_a_prompt_to_a_s
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "look at this".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -1608,7 +1608,7 @@ fn a_session_retention_that_ends_early_expires_what_was_submitted_to_it() {
                 session_id: Nullable::some(session_id),
                 application_instance_id: Nullable::null(),
                 text: "look at this".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -2503,7 +2503,7 @@ fn the_sweep_keeps_what_a_noted_session_whose_prompts_the_host_does_not_see_name
                     session_id: Nullable(session),
                     application_instance_id: Nullable::null(),
                     text: "look at this".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )
@@ -2652,7 +2652,7 @@ fn settling_the_noted_sessions_puts_what_each_names_under_its_retention_and_forg
                     session_id: Nullable(session),
                     application_instance_id: Nullable::null(),
                     text: "look at this".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )
@@ -2798,7 +2798,7 @@ fn settling_does_not_name_an_attachment_by_one_the_settling_has_just_named() {
                     session_id: Nullable::null(),
                     application_instance_id: Nullable::null(),
                     text: "look at this".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )
@@ -3044,7 +3044,7 @@ fn an_attachment_a_noted_session_names_outlasts_a_later_submission_to_another_se
                     session_id: Nullable(session),
                     application_instance_id: Nullable::null(),
                     text: "look at this".to_owned(),
-                },
+                }, None,
                 None,
                 None,
             )
@@ -3447,7 +3447,7 @@ fn an_attachment_bound_to_a_session_draft_becomes_that_sessions() {
                 session_id: Nullable::some(first),
                 application_instance_id: Nullable::null(),
                 text: "for the first session".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -3490,7 +3490,7 @@ fn an_attachment_bound_to_a_session_draft_becomes_that_sessions() {
                 session_id: Nullable::some(second),
                 application_instance_id: Nullable::null(),
                 text: "for the second session".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
@@ -3528,7 +3528,7 @@ fn a_draft_too_large_to_send_is_refused_before_it_is_written() {
                 session_id: Nullable::null(),
                 application_instance_id: Nullable::null(),
                 text: "short enough".to_owned(),
-            },
+            }, None,
             None,
             None,
         )
