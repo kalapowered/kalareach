@@ -1102,6 +1102,12 @@ pub fn verify(environment: &EnvironmentPaths) -> std::result::Result<Verified, R
 }
 
 impl Verified {
+    /// The manager that the checked definition is for, which a start request is made to.
+    #[must_use]
+    pub const fn manager(&self) -> Manager {
+        self.record.manager
+    }
+
     /// Asks the manager to start the daemon from the checked definition, loading it first where
     /// the manager holds nothing under its label, and lets go of the environment's lock.
     ///
