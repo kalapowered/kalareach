@@ -232,7 +232,8 @@ pub fn import_journal(path: impl AsRef<Path>) -> Result<Imported, ImportRefusal>
             detail: difference(&expected, &produced),
         });
     }
-    // Every receipt, read as the running host reads one, in the shape it will be read in.
+    // Every receipt, in the shape it will be read in. A receipt kept under a code this build lacks
+    // is refused here, where the running host reads it as an unknown outcome.
     let kept =
         crate::journal::read_every_receipt(&transaction).map_err(|detail| ImportRefusal::Row {
             table: "receipts".to_owned(),

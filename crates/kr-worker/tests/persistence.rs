@@ -1798,7 +1798,9 @@ fn a_journal_the_importer_cannot_read_is_refused_by_name_and_left_as_it_was() {
         },
         "closure",
     );
-    // Every field a receipt keeps is read as the running host reads it, the error included.
+    // Every field a receipt keeps is read as the running host reads it. The error is read more
+    // strictly: a code this build lacks is refused here, where the running host reads it as an
+    // unknown outcome.
     refused(
         "import-unknown-error-code",
         &|connection| {
