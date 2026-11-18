@@ -54,12 +54,14 @@
 //! device is not allowed to ask stops every request for ten minutes, and nothing renews an answer in
 //! that time. So while the stop lasts every answer that stands is kept standing to its end, whichever
 //! entry it is for and whenever it was read, an answer that a request on its way writes during the
-//! stop included, and a dial lost in that time is told what the service said and not that the host
-//! is out of reach. The end of the stop is the least an answer is kept: an answer that names a
-//! longer delay keeps it, and one that had stopped is not brought back. A newer answer that is no
-//! refusal replaces a kept one at once, in a stop as at any time, and a dial that connects clears no
-//! answer, so a kept one stands to its end after it. Nothing here ever turns the stop itself into a
-//! reason a person is told, and nothing here waits for the service past a short bound.
+//! stop included. Where a dial's entry holds a standing answer, a dial lost in that time is told
+//! what that answer said, not that the host is out of reach; a dial whose entry holds no answer is
+//! told that the host is out of reach, as at any other time. The end of the stop is the least an
+//! answer is kept: an answer that names a longer delay keeps it, and one that had stopped is not
+//! brought back. A newer answer that is no refusal replaces a kept one at once, in a stop as at any
+//! time, and a dial that connects clears no answer, so a kept one stands to its end after it.
+//! Nothing here ever turns the stop itself into a reason a person is told, and nothing here waits
+//! for the service past a short bound.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -492,8 +494,10 @@ impl Entry {
         }
     }
 
-    /// Keeps what a request got, read at `now`: an answer replaces what was held, whatever it is,
-    /// and a request that failed leaves an answer that is still held as it is.
+    /// Keeps what a request got, read at `now`: an answer replaces what was held, whatever it is.
+    /// A request that failed leaves an answer that is still held as it is, apart from two times: the
+    /// time the entry asks again moves to the one that the failure gives, and the time the answer is
+    /// kept to is lifted to that time when it is earlier.
     fn settle(&mut self, answer: Result<AdmissionAnswer, ClientError>, now: Instant) {
         self.held = match answer {
             Ok(AdmissionAnswer::Admitted {
