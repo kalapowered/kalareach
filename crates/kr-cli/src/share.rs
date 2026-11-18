@@ -205,9 +205,8 @@ fn lifetime(asked: Option<Lasts>, pairing_ends_at_ms: Option<u64>, now_ms: u64) 
     };
     if milliseconds < MIN_LIFETIME_MS {
         return Err(CliError::Usage(Shown::said(
-            "that device's pairing has too little time left for this share, so a share to it \
-             would hardly begin; once it has ended, the device has to be paired again before a \
-             session is shared with it",
+            "that device's pairing has too little time left for this share; once it has ended, \
+             the device has to be paired again before a session is shared with it",
         )));
     }
     Ok(milliseconds)
@@ -2069,7 +2068,7 @@ mod tests {
                 "{left_ms} ms left: {said}"
             );
             assert!(
-                !said.contains("less than a minute"),
+                !said.contains("less than a minute") && !said.contains("hardly begin"),
                 "{left_ms} ms left: {said}"
             );
             assert!(said.contains("once it has ended"), "it says when: {said}");
