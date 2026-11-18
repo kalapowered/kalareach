@@ -797,8 +797,18 @@ fn plan_path(paths: &HostPaths) -> PathBuf {
 /// file over it each time it is saved, which no lock on the plan itself could outlast. The file is
 /// never removed: removing a lock file lets a second command lock the one that is gone.
 struct PlanLock {
-    /// Held open: the lock is released when the file is closed.
-    _file: std::fs::File,
+    /// Held open for as long as the lock is held.
+    file: std::fs::File,
+}
+
+impl Drop for PlanLock {
+    fn drop(&mut self) {
+        // The lock belongs to the open file, not to this descriptor: a program started while it is
+        // held can keep a copy of the descriptor until its exec, or for as long as it runs where it
+        // inherits the file. Letting go here frees the lock for every copy, so the next command
+        // takes it at once and not when the last copy closes.
+        let _ = self.file.unlock();
+    }
 }
 
 /// Takes the plan's lock, or says that another command holds it.
@@ -818,7 +828,7 @@ fn lock_plan(paths: &HostPaths) -> Result<PlanLock> {
     };
     let file = options.open(&path).map_err(unusable)?;
     match file.try_lock() {
-        Ok(()) => Ok(PlanLock { _file: file }),
+        Ok(()) => Ok(PlanLock { file }),
         Err(std::fs::TryLockError::WouldBlock) => Err(CliError::Other(Shown::said(
             "another kr host machine command is working on the merge plan: run this one again \
              once it has ended",
@@ -2329,6 +2339,74 @@ mod tests {
         // A release that lists other stores does not read the plan.
         let unlisted = crate::barrier::testing::Listing::of(&[("registry", 7)]);
         save_under(paths, &plan, &unlisted.writers).expect("saved: the release does not read it");
+    }
+
+    /// The plan's lock is free the moment its holder lets go, whatever else still names the lock
+    /// file.
+    ///
+    /// A program started while the lock is held can keep a copy of the file's descriptor until its
+    /// exec, or for as long as it runs where it inherits the file. The lock belongs to the open file
+    /// and not to one descriptor, so a holder that only closed its own descriptor would leave the
+    /// next command told that another command is working on the plan, by a program that has nothing
+    /// to do with the plan. Here a started program is given such a copy and the holder lets go while
+    /// it runs; the next command, which waits for nothing, is told what the release itself did.
+    /// Unix only: the program is `/bin/cat` with the lock file as its output.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_plan_lock_is_free_once_its_holder_lets_go_though_a_started_program_still_holds_a_copy()
+     {
+        use kr_client::shown::Said as _;
+
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.paths();
+        let held = lock_plan(paths).expect("the holder takes the lock");
+        let copy = held
+            .file
+            .try_clone()
+            .expect("a second descriptor onto the locked file");
+        // It reads from a pipe this test holds the other end of, so it runs until this test lets it
+        // go, and the copy is beyond doubt at the moment the next command takes the lock.
+        let mut started = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(copy))
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("starts a program while the lock is held");
+        drop(held);
+        // No plan is kept, so a command that gets the lock says so and stops.
+        let after = finish(paths, false, None).await;
+        let still_running = started
+            .try_wait()
+            .expect("the started program can be asked whether it runs")
+            .is_none();
+        // Let it go and wait for it before the verdict, so a refusal leaves nothing running.
+        drop(started.stdin.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match started.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                _ => {
+                    let _ = started.kill();
+                    let _ = started.wait();
+                    panic!("the started program did not end once its input closed");
+                }
+            }
+        }
+        assert!(
+            still_running,
+            "the started program was still running when the next command took the lock"
+        );
+        let said = match after {
+            Ok(_) => panic!("a plan that is not kept is not finished"),
+            Err(error) => error.said().as_str().to_owned(),
+        };
+        assert_eq!(
+            said, "no merge plan is kept",
+            "the next command reached the plan once the holder had let go"
+        );
     }
 
     fn at_the_precondition() -> MachineGroup {
