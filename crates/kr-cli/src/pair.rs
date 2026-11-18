@@ -47,10 +47,13 @@ use kr_protocol::confirmation::{
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::OrganisationRequirement;
-use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, InvitationId, OrganisationId};
+use kr_protocol::ids::{
+    ActionId, BuildId, DeviceId, EnvironmentId, GrantId, InvitationId, OrganisationId,
+};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
-    PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult,
+    PairConfirmParams, PairConfirmResult, PairInviteParams, PairInviteResult, PairOwnerView,
+    PairingApproval,
 };
 use kr_protocol::method::Method;
 use kr_protocol::organisation::{
@@ -228,7 +231,7 @@ async fn approve(
         &PairStatusParams { invitation_id },
     )
     .await?;
-    let view = status.owner.0.ok_or_else(|| {
+    let view = status.owner.0.as_ref().ok_or_else(|| {
         refused(
             ErrorCode::PermissionDenied,
             "only the owner who issued this invitation approves the device that answers it",
@@ -239,12 +242,44 @@ async fn approve(
         view.proposed_grant.session_selector,
         kr_protocol::grant::SessionSelector::None
     );
-    let (Some(candidate), Some(approval)) = (view.candidate.0, view.approval.0) else {
-        return Err(refused(
-            ErrorCode::PermissionDenied,
-            "no device has answered this invitation yet: approve it once the new device shows \
-             its verification value",
-        ));
+    let (candidate, approval) = match found(invitation_id, &status, view) {
+        Found::Waiting {
+            candidate,
+            approval,
+        } => (candidate, approval),
+        Found::Paired {
+            device_id,
+            grant_id,
+            candidate,
+        } => {
+            if json {
+                let mut document = Document::new()
+                    .with("ok", true)
+                    .with("invitation_id", output::said(&invitation_id))
+                    .with("device_id", closed(&device_id))
+                    .with("grant_id", closed(&grant_id));
+                if let Some(candidate) = &candidate {
+                    document = document
+                        .with("device_name", device_name(candidate))
+                        .with("platform", crate::shown::platform(candidate.platform));
+                }
+                output::document(&document);
+            } else {
+                output::line(&stdout_line!(
+                    "Invitation {} is approved already: paired as device {}, with grant {}.",
+                    invitation_id,
+                    device_id,
+                    grant_id
+                ));
+            }
+            return Ok(());
+        }
+        Found::Nothing { said, then } => {
+            if !json {
+                output::lines(&said);
+            }
+            return Err(then);
+        }
     };
     let effect = Effect::Confirm(PairConfirmParams {
         invitation_id,
@@ -1381,6 +1416,44 @@ fn capacity_in_its_own_words(error: CliError) -> CliError {
 
 fn refused(code: ErrorCode, message: impl Into<Shown>) -> CliError {
     CliError::refused_in_its_own_words(code, message)
+}
+
+/// What `kr pair confirm` finds in an invitation's status.
+enum Found {
+    /// A device waits for the owner's approval, and this is what the owner approves it with.
+    Waiting {
+        candidate: PairCandidateView,
+        approval: PairingApproval,
+    },
+    /// The invitation was approved already, and this is what the host recorded.
+    Paired {
+        device_id: DeviceId,
+        grant_id: GrantId,
+        candidate: Option<PairCandidateView>,
+    },
+    /// Nothing waits for approval: the lines that `kr pair status` says of the invitation, which
+    /// the command says first, and what the command ends with.
+    Nothing { said: Vec<Line>, then: CliError },
+}
+
+/// Decides what `kr pair confirm` does with the status of an invitation that its issuing owner
+/// reads.
+fn found(invitation_id: InvitationId, status: &PairStatusResult, view: &PairOwnerView) -> Found {
+    let _ = (invitation_id, status);
+    match (view.candidate.0.clone(), view.approval.0) {
+        (Some(candidate), Some(approval)) => Found::Waiting {
+            candidate,
+            approval,
+        },
+        _ => Found::Nothing {
+            said: Vec::new(),
+            then: refused(
+                ErrorCode::PermissionDenied,
+                "no device has answered this invitation yet: approve it once the new device shows \
+                 its verification value",
+            ),
+        },
+    }
 }
 
 fn not_confirmed(message: &'static str) -> CliError {
