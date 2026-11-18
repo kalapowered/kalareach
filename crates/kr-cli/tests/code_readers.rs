@@ -1103,4 +1103,37 @@ type | stored | the demo store | crates/kr-demo/src/store.rs | Kept | - | a memb
             "a type that holds no code needs a row"
         );
     }
+
+    #[test]
+    fn a_protocol_type_that_a_store_or_a_known_line_keeps_is_found_by_its_path() {
+        let path = "kr_demo::store::Kept";
+        // A store that keeps the type by its protocol path, with no stored row that names the store.
+        let mut other = keeping("other-store", &[]);
+        other.kept = vec![Kept::Protocol("Kept", serde_json::Value::Null, path)];
+        let said = wrong_for(ROSTER, &[other]);
+        assert!(
+            said.contains("the store other-store keeps type Kept"),
+            "a store that keeps a protocol type is found by the type's path: {said}"
+        );
+        // A known line of a store that no stored row names, with the same type.
+        let line = Known {
+            store: "other-store",
+            name: "Kept",
+            is: KnownIs::Protocol(serde_json::Value::Null, path),
+            pinned: "",
+        };
+        let said = failures(tree(STORE).path(), ROSTER, &[], &[line]).join("\n");
+        assert!(
+            said.contains("the store other-store keeps type Kept"),
+            "a known line that keeps a protocol type is found by the type's path: {said}"
+        );
+        // The store that a stored row names passes with the same type.
+        let mut demo = keeping("demo", &[]);
+        demo.kept = vec![Kept::Protocol("Kept", serde_json::Value::Null, path)];
+        assert_eq!(
+            wrong_for(ROSTER, &[demo]),
+            "",
+            "a protocol type of a store that a stored row names is not refused"
+        );
+    }
 }
