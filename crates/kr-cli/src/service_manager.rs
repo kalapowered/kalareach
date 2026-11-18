@@ -368,10 +368,21 @@ impl Record {
 /// The service start's lock for one environment, held for as long as its holder looks at or
 /// changes the definition or the manager's job.
 pub struct Lock {
-    _file: std::fs::File,
+    file: std::fs::File,
 }
 
 kr_client::debug_as_name!(Lock);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        // On Unix the lock belongs to the open file, not to this descriptor: a program started while
+        // it is held can keep a copy of the descriptor until its exec, or for as long as it runs
+        // where it inherits the file. Letting go here frees the lock for every copy, so the next
+        // command takes it at once and not when the last copy closes. On Windows the system's
+        // release at close can lag, so its documentation asks for an explicit unlock.
+        let _ = self.file.unlock();
+    }
+}
 
 /// Takes an environment's service lock for a change `kr host startup` makes, which holds it until
 /// the configuration document is written as well.
@@ -416,7 +427,7 @@ impl Lock {
         let deadline = Instant::now() + wait;
         loop {
             match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
+                Ok(()) => return Ok(Self { file }),
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -2676,6 +2687,77 @@ mod tests {
         drop(held);
         Lock::take_within(&environment, LOCK_FILE, SERVICE_LOCK_HOLDS, Duration::ZERO)
             .expect("free once the first lets go");
+    }
+
+    /// The lock is free the moment its holder lets go, whatever else still names the file.
+    ///
+    /// A program a command starts while it holds the lock can be given a descriptor onto the same
+    /// open file, and the lock lives on that open file, so a holder that only closed its own
+    /// descriptor would leave the lock held by a program that has nothing to do with it. Here the
+    /// started program is given exactly such a descriptor, and the next take, which waits for
+    /// nothing, is told what the release itself did and not what a close or an exec happened to
+    /// do. Unix only: the program is `/bin/cat` with the locked file as its output, and on Windows
+    /// the lock belongs to the handle that took it.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_is_free_once_its_holder_lets_go_though_a_started_program_still_holds_a_copy() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let held = Lock::take_within(&environment, LOCK_FILE, SERVICE_LOCK_HOLDS, Duration::ZERO)
+            .expect("the holder takes it");
+        let copy = held
+            .file
+            .try_clone()
+            .expect("a second descriptor onto the locked file");
+        // It reads from a pipe this test holds the other end of, so it runs until this test lets
+        // it go, and the copy is beyond doubt at the moment the lock is taken again below.
+        let mut started = std::process::Command::new("/bin/cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::from(copy))
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("starts a program while the lock is held");
+        drop(held);
+        let taken = Lock::take_within(&environment, LOCK_FILE, SERVICE_LOCK_HOLDS, Duration::ZERO);
+        let still_running = started.try_wait().map(|status| status.is_none());
+        // Let it go and see it end before any verdict, so a refusal or a failed question leaves
+        // nothing running. Each wait has a bound, and the case ends within them on every path.
+        drop(started.stdin.take());
+        if !matches!(
+            ended_within(&mut started, Duration::from_secs(10)),
+            Ok(true)
+        ) {
+            let killed = started.kill();
+            let after_kill = ended_within(&mut started, Duration::from_secs(10));
+            panic!(
+                "the started program did not end once its input closed: kill gave {killed:?}, \
+                 and the program had ended after it: {after_kill:?}"
+            );
+        }
+        assert!(
+            still_running.expect("the started program can be asked whether it runs"),
+            "the started program was still running when the lock was taken again"
+        );
+        assert!(
+            taken.is_ok(),
+            "the lock is free once its holder has let go: {:?}",
+            taken.as_ref().err().map(Shown::as_str)
+        );
+    }
+
+    /// Asks `child` whether it has ended until it has or `within` is over, and says which.
+    #[cfg(unix)]
+    fn ended_within(child: &mut std::process::Child, within: Duration) -> std::io::Result<bool> {
+        let deadline = Instant::now() + within;
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok(true);
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Opens `file` with a handle that shares reading and writing but not its deletion, as a
