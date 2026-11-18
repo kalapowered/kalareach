@@ -5963,13 +5963,13 @@ fn a_restart_whose_start_fails_after_the_stop_says_so_and_leaves_the_sessions_al
     // Whole, except the start's own words, which the run gives.
     assert!(
         message.starts_with(&format!(
-            "The control daemon for environment {id} (process {old}) was stopped and the start failed: "
+            "Stopped the control daemon for environment {id} (process {old}). This command's start failed: "
         )),
         "{message}"
     );
     assert!(
         message.ends_with(
-            ". No session was stopped: its workers keep running and a local attach still works. Paired devices cannot connect until a control daemon runs. Fix the cause and run kr host restart again."
+            ". No control daemon answers now: nothing listens. No session was stopped: its workers keep running, and a local attach keeps working. Paired devices cannot connect until a control daemon runs. Paired devices' connections to the old daemon closed; their pairings stand. Fix the cause and run kr host restart again."
         ),
         "{message}"
     );
@@ -8157,7 +8157,7 @@ fn a_restart_whose_request_could_not_be_made_and_whose_start_fails_says_both() {
     );
     assert!(
         message.ends_with(
-            ". No session was stopped: its workers keep running and a local attach still works. Paired devices cannot connect until a control daemon runs. Fix the cause and run kr host restart again."
+            ". No control daemon answers now: nothing listens. No session was stopped: its workers keep running, and a local attach keeps working. Paired devices cannot connect until a control daemon runs. Paired devices' connections to the old daemon closed; their pairings stand. Fix the cause and run kr host restart again."
         ),
         "{message}"
     );
