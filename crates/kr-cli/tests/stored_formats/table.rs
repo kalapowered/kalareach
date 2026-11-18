@@ -1339,6 +1339,26 @@ pub fn table() -> Vec<Store> {
         },
         Store {
             levels: None,
+            writers: Writers::Barred(&kr_cli::login_item::WRITTEN),
+            entry: entry(
+                kr_cli::login_item::WRITTEN.store,
+                StoreScope::Environment,
+                kr_cli::login_item::RECORD_FILE,
+                member("version", 0),
+                kr_cli::login_item::WRITTEN.version,
+                0,
+            ),
+            owned: Vec::new(),
+            kept: vec![
+                Kept::Source(
+                    "crates/kr-cli/src/login_item/record.rs",
+                    &["Record", "Pending", "Operation"],
+                ),
+                Kept::Source("crates/kr-cli/src/login_item/render.rs", &["Kind"]),
+            ],
+        },
+        Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "native-bridges",
@@ -1639,6 +1659,11 @@ pub fn named() -> Vec<Named> {
             StoreScope::Environment,
             "controller-service.lock",
             "the lock on the service definition; empty",
+        ),
+        leaf(
+            StoreScope::Environment,
+            kr_cli::login_item::LOCK_FILE,
+            "the lock on the login item; empty",
         ),
         leaf(
             StoreScope::Environment,
