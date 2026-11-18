@@ -4830,4 +4830,351 @@ mod tests {
             "a reading from before the owner's last act refuses nothing, folded or not"
         );
     }
+
+    /// The wall clock where the owner's clock stands: `level` at the continuous reading `began`,
+    /// and on from there at the pace of the continuous clock.
+    fn right_time(held: &Holdup, level: u64, began: u64) -> u64 {
+        level + (held.continuous.boot_elapsed_ms() - began)
+    }
+
+    /// A worker that has taken its first look and has met no confirmation, one that trusts its
+    /// clock or one that found a rollback and does not.
+    fn no_confirmation_yet(
+        trusting: bool,
+    ) -> (Arc<kr_ipc::floor::SharedFloor>, Arc<Holdup>, TimeContract) {
+        if !trusting {
+            return found_a_rollback();
+        }
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        (floor, held, contract)
+    }
+
+    /// The owner acts and the daemon publishes the act only after two looks. The first look reads
+    /// the wall clock ten minutes ahead of the owner's, one second after the act; the second reads
+    /// it right again, a second later. The look after the publication reads it right, or ten
+    /// minutes ahead again with `ahead`.
+    fn two_looks_came_between_the_act_and_its_publication(
+        trusting: bool,
+        ahead: bool,
+    ) -> WallClockTrust {
+        let (floor, held, contract) = no_confirmation_yet(trusting);
+        let level = held.wall.now_ms().get();
+        let acted_at = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, acted_at) + 600_000);
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, acted_at));
+        contract.observe();
+        floor.establish(level, acted_at);
+        held.pass(Duration::from_secs(1));
+        if ahead {
+            held.wall.set(right_time(&held, level, acted_at) + 600_000);
+        }
+        contract.observe();
+        contract.trust()
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a worker that does not trust its clock keeps the readings it
+    /// takes while no confirmation is published. The owner acts; a look one second later reads the
+    /// wall clock ten minutes ahead of the owner's and the look a second after that reads it right;
+    /// the daemon publishes the act after both, and the look that follows the publication reads it
+    /// right. The clock went back ten minutes from a reading taken after the owner's act, which no
+    /// confirmation was in force to receive.
+    #[test]
+    fn a_peak_read_before_the_publication_refuses_it_for_a_worker_that_does_not_trust_its_clock() {
+        assert_eq!(
+            two_looks_came_between_the_act_and_its_publication(false, false),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken after the owner's act"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the same two looks and a third that reads the wall clock ten
+    /// minutes ahead again, after the publication, for a worker that does not trust its clock. The
+    /// third look's reading is behind nothing, and the second look's was ten minutes behind the
+    /// first look's, which was taken after the owner's act: the confirmation is refused.
+    #[test]
+    fn a_look_ahead_and_a_look_right_before_the_publication_refuse_it_for_a_worker_that_does_not_trust_its_clock()
+     {
+        assert_eq!(
+            two_looks_came_between_the_act_and_its_publication(false, true),
+            WallClockTrust::Unresolved,
+            "the second look was ten minutes behind the first, taken after the owner's act"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the same order for a worker that trusts its clock, whose mark
+    /// holds the first look's reading.
+    #[test]
+    fn a_look_ahead_and_a_look_right_before_the_publication_refuse_it_for_a_worker_that_trusts_its_clock()
+     {
+        assert_eq!(
+            two_looks_came_between_the_act_and_its_publication(true, true),
+            WallClockTrust::Unresolved,
+            "the second look was ten minutes behind the first, taken after the owner's act"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a withdrawal does not hide what the worker reads after the next
+    /// act. The worker followed the first confirmation, found the clock 8 s back and distrusts it,
+    /// and the daemon withdrew that confirmation. The owner then acts again; the look a second
+    /// later reads the wall clock ten minutes ahead, with the floor showing no confirmation, and
+    /// the look after it reads it right; the act is published after both.
+    #[test]
+    fn a_peak_read_while_the_daemon_had_withdrawn_its_confirmation_refuses_the_next() {
+        let (floor, held, contract) = trusting_and_confirmed();
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 8_000);
+        assert!(
+            contract.observe().rolled_back,
+            "the worker finds the clock 8 s back"
+        );
+        floor.withdraw();
+        held.pass(Duration::from_secs(1));
+        let level = held.wall.now_ms().get();
+        let acted_at = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, acted_at) + 600_000);
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, acted_at));
+        contract.observe();
+        floor.establish(level, acted_at);
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken after the owner's last act"
+        );
+    }
+
+    /// The first confirmation is pending and refuted: a deadline check read the wall clock 20 s
+    /// behind the owner's, a second after the owner's act, and the clock is right again. Nothing has
+    /// decided the confirmation. Returns the owner's level and the continuous reading it stands at.
+    fn the_first_confirmation_is_pending_and_refuted() -> (
+        Arc<kr_ipc::floor::SharedFloor>,
+        Arc<Holdup>,
+        TimeContract,
+        u64,
+        u64,
+    ) {
+        let (floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let level = held.wall.now_ms().get();
+        let began = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) - 20_000);
+        contract.wall_reading();
+        held.wall.set(right_time(&held, level, began));
+        (floor, held, contract, level, began)
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: what the decision of one confirmation reads is not lost to the
+    /// next. The first confirmation is refuted by a reading 20 s behind the owner's. The owner acts
+    /// again and the daemon publishes that act late; the look after the act reads the wall clock ten
+    /// minutes ahead, and so does the following of the first confirmation, which decides it; the
+    /// second confirmation is published, and the next look reads the clock right.
+    #[test]
+    fn a_peak_read_before_a_second_confirmation_was_published_is_not_lost_with_the_first_decision()
+    {
+        let (floor, held, contract, level, began) = the_first_confirmation_is_pending_and_refuted();
+        held.pass(Duration::from_secs(1));
+        let second_wall = right_time(&held, level, began);
+        let second_at = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) + 600_000);
+        contract.observe();
+        floor.establish(second_wall, second_at);
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken after the owner's second act"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the owner confirms again inside the first try of the following
+    /// of the first confirmation, which that try's pause held up, and the following's second try is
+    /// narrow and reads the wall clock ten minutes ahead of the owner's, at the second act. The
+    /// following decides the first confirmation, which a reading 20 s behind the owner's refutes;
+    /// the next look reads the clock right and decides the second.
+    #[test]
+    fn a_peak_read_by_the_narrow_try_after_a_second_confirmation_inside_the_following_is_not_lost_with_the_first_decision()
+     {
+        let (floor, held, contract, level, began) = the_first_confirmation_is_pending_and_refuted();
+        held.pass(Duration::from_secs(1));
+        held.confirms_after_landing(1, Arc::clone(&floor));
+        held.sets_the_wall_before_reading(3, right_time(&held, level, began) + 10_000 + 600_000);
+        held.arm(1, 1);
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken at the owner's second act"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the same, with the peak read by a second try that is held up
+    /// too, and the narrow third try reading the clock right.
+    #[test]
+    fn a_peak_read_by_a_held_up_try_after_a_second_confirmation_inside_the_following_is_not_lost_with_the_first_decision()
+     {
+        let (floor, held, contract, level, began) = the_first_confirmation_is_pending_and_refuted();
+        held.pass(Duration::from_secs(1));
+        held.confirms_after_landing(1, Arc::clone(&floor));
+        held.sets_the_wall_before_reading(3, right_time(&held, level, began) + 10_000 + 600_000);
+        held.sets_the_wall_after_landing(2, right_time(&held, level, began) + 20_000);
+        held.arm(1, 2);
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken after the owner's second act"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the first confirmation is refused by its own readings when the
+    /// second is published inside its following. A deadline check read the wall clock ten minutes
+    /// ahead of the owner's a second after the first act; the owner then confirms again inside the
+    /// first try of the following, which is held up, and the narrow second try reads the clock
+    /// right. The first confirmation is refused, though the reading that refuses it came before the
+    /// second act; the second is followed at the next look, since nothing taken after its act is
+    /// behind anything.
+    #[test]
+    fn the_first_confirmation_is_refused_by_a_peak_read_after_its_act_when_a_second_is_published_inside_its_following()
+     {
+        let (floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let level = held.wall.now_ms().get();
+        let began = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) + 600_000);
+        contract.wall_reading();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        held.confirms_after_landing(1, Arc::clone(&floor));
+        held.arm(1, 1);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the first confirmation is refused: the clock went back ten minutes from a reading \
+             taken after its act"
+        );
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Trusted,
+            "the second is followed: the peak was read before its act"
+        );
+    }
+
+    /// A peak is read a second after the first confirmation's act, as a deadline check would read
+    /// it, and `readings` more readings follow the owner's second act, which is published after
+    /// them; the next look reads the clock right and decides the second confirmation.
+    fn readings_came_between_the_second_act_and_its_publication(readings: u64) -> WallClockTrust {
+        let (floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let level = held.wall.now_ms().get();
+        let began = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) + 600_000);
+        contract.wall_reading();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        let second_wall = right_time(&held, level, began);
+        let second_at = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        for _ in 0..readings {
+            contract.wall_reading();
+        }
+        floor.establish(second_wall, second_at);
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        contract.trust()
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a busy worker follows a confirmation whose act came after the
+    /// only peak it saw, whatever the number of readings between the act and the decision. A peak
+    /// ten minutes ahead is read, the owner puts the clock right and confirms, and no look is taken
+    /// until the daemon has published the act; 0, 20 and 5,000 readings of the right time come
+    /// between the act and the publication. The peak was read before the act and refuses nothing.
+    #[test]
+    fn a_worker_that_took_thousands_of_readings_after_the_owners_act_still_follows_it() {
+        for readings in [0, 20, 5_000] {
+            assert_eq!(
+                readings_came_between_the_second_act_and_its_publication(readings),
+                WallClockTrust::Trusted,
+                "the peak was read before the owner's act, after {readings} readings"
+            );
+        }
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a reading from before the owner's act refuses nothing, though
+    /// the same attempt read after it. The look is held up in its first two tries, the first of
+    /// which reads the wall clock ten minutes ahead of the owner's; the owner confirms inside the
+    /// second, and the narrow third try reads the clock right. The peak is stamped before the act.
+    #[test]
+    fn a_peak_read_before_the_owners_act_in_the_attempt_that_read_after_it_refuses_nothing() {
+        let (floor, held, contract) = no_confirmation_yet(false);
+        let start = held.wall.now_ms().get();
+        held.sets_the_wall_before_reading(1, start + 600_000);
+        held.sets_the_wall_after_landing(1, start + 10_000);
+        held.confirms_after_landing(2, Arc::clone(&floor));
+        held.arm(0, 2);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Trusted,
+            "a reading from before the owner's act refuses nothing"
+        );
+    }
+
+    /// KR-REQ-09.18: what the one-second band costs. Two readings whose levels are within a second
+    /// of each other stand for one another at the lower level and the later time, so a low reading
+    /// taken before the owner's act is carried past it by later readings that are within a second
+    /// above it, and refuses a confirmation that no reading taken after the act is behind. Here a
+    /// reading at 1,000 ms is 0.1 ms above a base level, the owner acts at 1,500 ms with a wall
+    /// 6,750 ms above the base, and readings at 2,000 ms and 3,000 ms are 500.2 ms and 500.3 ms
+    /// above it: each is 250 ms above the level the confirmation is refuted below, and the merged
+    /// reading, stamped at 3,000 ms at 0.1 ms, refutes it.
+    #[test]
+    fn a_low_reading_within_a_second_of_later_ones_is_carried_past_the_owners_act_and_refuses_it() {
+        let confirmation = Establishment {
+            count: 1,
+            restated: false,
+            wall_ms: WALL + 6_750,
+            boot_ms: 1_500,
+        };
+        assert!(
+            !behind_the_confirmation(&confirmation, 2_000, WALL + 2_500)
+                && !behind_the_confirmation(&confirmation, 3_000, WALL + 3_500),
+            "neither reading taken after the act is behind it"
+        );
+        let mut kept = Readings::default();
+        kept.keep(1_000, WALL + 1_000);
+        kept.keep(2_000, WALL + 2_500);
+        kept.keep(3_000, WALL + 3_500);
+        assert_eq!(kept.kept.len(), 1, "the three readings stand as one");
+        assert!(
+            kept.refute(&confirmation),
+            "the reading from before the act, carried to 3,000 ms, refutes the confirmation"
+        );
+    }
 }
