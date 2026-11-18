@@ -803,10 +803,11 @@ struct PlanLock {
 
 impl Drop for PlanLock {
     fn drop(&mut self) {
-        // The lock belongs to the open file, not to this descriptor: a program started while it is
-        // held can keep a copy of the descriptor until its exec, or for as long as it runs where it
-        // inherits the file. Letting go here frees the lock for every copy, so the next command
-        // takes it at once and not when the last copy closes.
+        // On Unix the lock belongs to the open file, not to this descriptor: a program started
+        // while it is held can keep a copy of the descriptor until its exec, or for as long as it
+        // runs where it inherits the file. Letting go here frees the lock for every copy, so the
+        // next command takes it at once and not when the last copy closes. On Windows the system's
+        // release at close can lag, so its documentation asks for an explicit unlock.
         let _ = self.file.unlock();
     }
 }
@@ -2307,7 +2308,8 @@ mod tests {
     /// A plan whose `version` is past every version a release reads is not one of a later release's
     /// format: no release reads such a version, so the plan cannot be read and keeps the sentence
     /// that tells the owner to move it aside, as the update reads the version a plan records. The
-    /// largest version a release reads is still a later release's.
+    /// largest version a release reads is still a later release's, whether or not this build decodes
+    /// the rest of the plan.
     #[tokio::test]
     async fn a_plan_whose_version_is_past_any_a_release_reads_is_one_that_cannot_be_read_and_not_one_of_a_later_release()
      {
@@ -2315,7 +2317,8 @@ mod tests {
         let paths = host.paths();
         let into = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16]));
         let from = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
-        let kept_at = |version: u64| {
+        // The step of the plan is in `state`: the one it has, or one that a later build adds.
+        let kept_at = |version: u64, state: &str| {
             let plan = Plan {
                 version: PLAN_FORMAT,
                 into,
@@ -2342,29 +2345,38 @@ mod tests {
                 CanonicalValue::integer(i128::from(version)).expect("an integer"),
             ));
             let map = CanonicalMap::from_entries(entries).expect("a map");
-            kr_cbor::encode(&CanonicalValue::Map(map))
+            kr_cbor::encode(&replace(CanonicalValue::Map(map), "Sent", state))
         };
+        let later = "the merge plan this client keeps was written by a later release in a \
+                     format this release cannot read; it is in this user's state directory \
+                     as machine-merge-plan and stays as it is, so run `kr host update` to a \
+                     release that can read it and then run this command again";
+        let unreadable = "the merge plan this client keeps cannot be read; it is in this user's \
+                          state directory as machine-merge-plan, and the owner selects the \
+                          environments again once it is moved aside";
 
-        // 1. The largest version a release reads, past this release's: a later release's plan.
-        let planted = kept_at(u64::from(u32::MAX));
+        // 1. The largest version a release reads, with a state of a step that this build lacks: the
+        // plan does not decode, and its version is read from the bytes, past this release's.
+        let planted = kept_at(u64::from(u32::MAX), "A_STEP_STATE_A_LATER_BUILD_ADDS");
         kr_ipc::paths::write_owner_only_file(&plan_path(paths), &planted).expect("keeps the plan");
-        let sentence = "the merge plan this client keeps was written by a later release in a \
-                        format this release cannot read; it is in this user's state directory \
-                        as machine-merge-plan and stays as it is, so run `kr host update` to a \
-                        release that can read it and then run this command again";
         for (command, said) in what_each_command_says(paths, into, from).await {
-            assert_eq!(said, sentence, "{command}");
+            assert_eq!(said, later, "{command}, undecodable");
         }
         assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
 
-        // 2. One past it: no release reads such a version, and the plan cannot be read.
-        let planted = kept_at(u64::from(u32::MAX) + 1);
-        std::fs::write(plan_path(paths), &planted).expect("the plan is past every version");
-        let sentence = "the merge plan this client keeps cannot be read; it is in this user's \
-                        state directory as machine-merge-plan, and the owner selects the \
-                        environments again once it is moved aside";
+        // 2. The same version in a plan this build decodes: a later release's plan, by its version.
+        let planted = kept_at(u64::from(u32::MAX), "Sent");
+        std::fs::write(plan_path(paths), &planted).expect("the plan decodes");
         for (command, said) in what_each_command_says(paths, into, from).await {
-            assert_eq!(said, sentence, "{command}, past every version");
+            assert_eq!(said, later, "{command}");
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+
+        // 3. One past it: no release reads such a version, and the plan cannot be read.
+        let planted = kept_at(u64::from(u32::MAX) + 1, "Sent");
+        std::fs::write(plan_path(paths), &planted).expect("the plan is past every version");
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, unreadable, "{command}, past every version");
         }
         assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
     }
@@ -2412,12 +2424,14 @@ mod tests {
     /// file.
     ///
     /// A program started while the lock is held can keep a copy of the file's descriptor until its
-    /// exec, or for as long as it runs where it inherits the file. The lock belongs to the open file
-    /// and not to one descriptor, so a holder that only closed its own descriptor would leave the
-    /// next command told that another command is working on the plan, by a program that has nothing
-    /// to do with the plan. Here a started program is given such a copy and the holder lets go while
-    /// it runs; the next command, which waits for nothing, is told what the release itself did.
-    /// Unix only: the program is `/bin/cat` with the lock file as its output.
+    /// exec, or for as long as it runs where it inherits the file. On Unix the lock belongs to the
+    /// open file and not to one descriptor, so a holder that only closed its own descriptor would
+    /// leave the next command told that another command is working on the plan, by a program that
+    /// has nothing to do with the plan. Here a started program is given such a copy and the holder
+    /// lets go while it runs; the next command, which waits for nothing, is told what the release
+    /// itself did.
+    /// Unix only: the program is `/bin/cat` with the lock file as its output, and on Windows the
+    /// lock belongs to the handle that took it.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_plan_lock_is_free_once_its_holder_lets_go_though_a_started_program_still_holds_a_copy()
@@ -2442,28 +2456,23 @@ mod tests {
         drop(held);
         // No plan is kept, so a command that gets the lock says so and stops.
         let after = finish(paths, false, None).await;
-        let still_running = started
-            .try_wait()
-            .expect("the started program can be asked whether it runs")
-            .is_none();
-        // Let it go and wait for it before the verdict, so a refusal leaves nothing running.
+        let still_running = started.try_wait().map(|status| status.is_none());
+        // Let it go and see it end before any verdict, so a refusal or a failed question leaves
+        // nothing running. Each wait has a bound, and the case ends within them on every path.
         drop(started.stdin.take());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match started.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                _ => {
-                    let _ = started.kill();
-                    let _ = started.wait();
-                    panic!("the started program did not end once its input closed");
-                }
-            }
+        if !matches!(
+            ended_within(&mut started, std::time::Duration::from_secs(10)),
+            Ok(true)
+        ) {
+            let killed = started.kill();
+            let after_kill = ended_within(&mut started, std::time::Duration::from_secs(10));
+            panic!(
+                "the started program did not end once its input closed: kill gave {killed:?}, \
+                 and the program had ended after it: {after_kill:?}"
+            );
         }
         assert!(
-            still_running,
+            still_running.expect("the started program can be asked whether it runs"),
             "the started program was still running when the next command took the lock"
         );
         let said = match after {
@@ -2474,6 +2483,24 @@ mod tests {
             said, "no merge plan is kept",
             "the next command reached the plan once the holder had let go"
         );
+    }
+
+    /// Asks `child` whether it has ended until it has or `within` is over, and says which.
+    #[cfg(unix)]
+    fn ended_within(
+        child: &mut std::process::Child,
+        within: std::time::Duration,
+    ) -> std::io::Result<bool> {
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     fn at_the_precondition() -> MachineGroup {
