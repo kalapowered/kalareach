@@ -3174,7 +3174,12 @@ async fn a_host_configured_for_the_service_its_owner_runs_restores_from_a_kit_th
             None,
         )
         .await;
-    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    assert!(
+        preview.status.success(),
+        "{}{}",
+        text(&preview.stderr),
+        text(&preview.stdout)
+    );
     let digest = digest_of(&preview);
     let restored = rig
         .run(
@@ -3192,7 +3197,12 @@ async fn a_host_configured_for_the_service_its_owner_runs_restores_from_a_kit_th
             None,
         )
         .await;
-    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    assert!(
+        restored.status.success(),
+        "{}{}",
+        text(&restored.stderr),
+        text(&restored.stdout)
+    );
     for (name, at) in [
         ("session-0001.json", 0),
         ("session-0002.json", 1),
