@@ -291,6 +291,25 @@
     },
     {
       "entry": {
+        "store": "desktop-host-login",
+        "scope": "environment",
+        "path": "desktop-host-login.json",
+        "recording": {
+          "kind": "json_member",
+          "member": "version",
+          "absent": 0
+        },
+        "version": 1,
+        "migrates_from": 0
+      },
+      "digest": "f10d37e9fd23a8a8524ea1900df914d43f7dd422d86b952cc2ddae1203cf4004",
+      "kept": [
+        "Record, Pending, Operation (crates/kr-cli/src/login_item/record.rs)",
+        "Kind (crates/kr-cli/src/login_item/render.rs)"
+      ]
+    },
+    {
+      "entry": {
         "store": "environments",
         "scope": "environment",
         "path": "environments.json",
@@ -842,6 +861,14 @@
       "scope": "environment",
       "path": "controller.log",
       "reason": "the daemon's log, as text",
+      "children": [],
+      "opaque": false,
+      "databases": false
+    },
+    {
+      "scope": "environment",
+      "path": "desktop-host-login.lock",
+      "reason": "the lock on the login item; empty",
       "children": [],
       "opaque": false,
       "databases": false
