@@ -662,6 +662,19 @@ async fn eventually(what: &str, holds: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("it never came about: {what}"));
 }
 
+/// Waits until the page has been shown the hosts as the desk has them now. A run changes what the
+/// desk shows before it tells the page, so a wait for a state returns while the run's last notice is
+/// still to be sent, and a count of the notices read then is one short. It holds where the change
+/// just waited for moves the view: the page has the view that stands only once that notice is sent.
+async fn until_the_page_is_told(desk: &PushDesk, views: &Mutex<Vec<PushView>>) {
+    eventually("the page was shown the hosts as the desk has them", || {
+        let standing = desk.view().hosts;
+        let shown = views.lock().expect("the views");
+        shown.last().map(|view| &view.hosts) == Some(&standing)
+    })
+    .await;
+}
+
 /// What the gateway was proposed, in order.
 fn proposed(gateway: &Gateway) -> Vec<String> {
     gateway.proposed.lock().expect("the proposals").clone()
@@ -3682,6 +3695,7 @@ async fn a_phone_with_notifications_on() -> (Host, Desk, String) {
         .enable(&reference, None)
         .expect("the person asks");
     phone.until(|states| states == [PushState::On]).await;
+    until_the_page_is_told(&phone.desk, &phone.views).await;
     (host, phone, reference)
 }
 
@@ -4499,6 +4513,7 @@ async fn previews_turned_off_reach_the_host_though_the_key_cannot_be_taken_out_i
 
     // A look a minute later files the keys alone: it claims no host and tells the page nothing, the
     // host that was told is not registered again, and the gateway is asked for nothing more.
+    until_the_page_is_told(&restarted.desk, &restarted.views).await;
     let page = restarted.changes.load(Ordering::SeqCst);
     restarted.let_time_pass();
     look(&restarted.desk).await;
@@ -4545,6 +4560,8 @@ async fn keys_the_receivers_cannot_be_handed_leave_the_host_registered_and_a_loo
         [true],
         "the host was told, though the receivers hold no key of it"
     );
+    until_the_page_is_told(&phone.desk, &phone.views).await;
+    let page = told(&phone);
     let asked = |phone: &Desk| {
         phone
             .receiver
@@ -4558,12 +4575,15 @@ async fn keys_the_receivers_cannot_be_handed_leave_the_host_registered_and_a_loo
     // Looks a minute and more apart try the filing and nothing else.
     phone.let_time_pass();
     look(&phone.desk).await;
-    let page = told(&phone);
     phone.let_time_pass();
     look(&phone.desk).await;
     states_until(&phone.desk, |states| states != [PushState::Working]).await;
     assert!(asked(&phone) >= filings + 2, "each look tried the filing");
-    assert_eq!(told(&phone), page, "the page has nothing new to be told");
+    assert_eq!(
+        told(&phone),
+        page,
+        "the page has nothing new to be told by either look"
+    );
     assert_eq!(proposed(&phone.gateway), [FIRST_TOKEN]);
     assert_eq!(phone.gateway.issue_requests(), 1);
     assert_eq!(
