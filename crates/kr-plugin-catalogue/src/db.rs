@@ -1910,22 +1910,35 @@ fn stored_error(text: &str) -> CatalogueResult<ProtocolError> {
     }
 }
 
+/// A stored error as [`ProtocolError`] reads it, except that its code is the text it was kept
+/// under: every member and every rule of the strict type holds here too, so a duplicate member, a
+/// member no build made or a member of the wrong type still fails.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ErrorKeptAsText {
+    code: String,
+    message: String,
+    retry: kr_protocol::error::RetryCategory,
+    diagnostic_id: kr_protocol::scalars::Nullable<kr_protocol::ids::DiagnosticId>,
+    #[serde(default)]
+    link_fenced: bool,
+}
+
 /// The error in `text` with its unknown code read as the unknown outcome, when that code is the
 /// only thing this build cannot read in it.
 fn read_as_unknown(text: &str) -> Option<ProtocolError> {
-    let mut value: serde_json::Value = serde_json::from_str(text).ok()?;
-    let code = value.get_mut("code")?;
-    if kr_protocol::error::ErrorCode::from_wire(code.as_str()?).is_some() {
+    let kept: ErrorKeptAsText = serde_json::from_str(text).ok()?;
+    if kr_protocol::error::ErrorCode::from_wire(&kept.code).is_some() {
         return None;
     }
-    *code = serde_json::Value::String(
-        kr_protocol::error::ErrorCode::OutcomeUnknown
-            .as_str()
-            .to_owned(),
-    );
-    let mut error: ProtocolError = serde_json::from_value(value).ok()?;
-    error.retry = kr_protocol::error::ErrorCode::OutcomeUnknown.retry_category();
-    Some(error)
+    let unknown = kr_protocol::error::ErrorCode::OutcomeUnknown;
+    Some(ProtocolError {
+        code: unknown,
+        message: kept.message,
+        retry: unknown.retry_category(),
+        diagnostic_id: kept.diagnostic_id,
+        link_fenced: kept.link_fenced,
+    })
 }
 
 fn number(value: u64) -> CatalogueResult<i64> {
