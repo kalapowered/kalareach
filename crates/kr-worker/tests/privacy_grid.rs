@@ -302,6 +302,10 @@ fn reaches_the_first_row(rows: &[String], word: &str) -> bool {
     numbers(rows, word).contains(&0)
 }
 
+/// KR-REQ-24.27: enabling privacy mode removes the retained local output of the host's own
+/// terminal: a row that was above the live page before it went on is not served when the terminal
+/// scrolls up, and the live screen is drawn by the same bytes as before. The control is the same
+/// scroll without privacy mode, which reaches the oldest row.
 #[test]
 fn rows_printed_before_privacy_mode_are_not_scrolled_to_after_it_goes_on() {
     let mut rig = Rig::open();
@@ -330,6 +334,9 @@ fn rows_printed_before_privacy_mode_are_not_scrolled_to_after_it_goes_on() {
     );
 }
 
+/// KR-REQ-24.27: while privacy mode is on the grid keeps no row above the live page: a row printed
+/// while it is on is not served when the host's own terminal scrolls up, and the session holds no
+/// retained output.
 #[test]
 fn rows_printed_while_privacy_mode_is_on_are_not_scrolled_to() {
     let mut rig = Rig::open();
@@ -353,6 +360,9 @@ fn rows_printed_while_privacy_mode_is_on_are_not_scrolled_to() {
     assert_eq!(rig.session.retained_output_bytes(), 0);
 }
 
+/// KR-REQ-24.28: disabling privacy mode starts new retention from that point and cannot
+/// reconstruct omitted history: after it goes off, no row from before it went on or from the
+/// interval it was on is above the live page, and the rows printed afterwards are kept.
 #[test]
 fn nothing_comes_back_when_privacy_mode_goes_off_and_new_rows_are_kept() {
     let mut rig = Rig::open();
@@ -381,6 +391,10 @@ fn nothing_comes_back_when_privacy_mode_goes_off_and_new_rows_are_kept() {
     );
 }
 
+/// KR-REQ-24.27: a session that is opened again while privacy mode is on keeps no row above the
+/// live page.
+/// KR-REQ-24.28: when privacy mode then goes off, no row of that interval comes back and the rows
+/// printed after it are kept.
 #[test]
 fn a_session_opened_under_privacy_mode_keeps_no_rows() {
     let mut rig = Rig::open();
@@ -495,6 +509,8 @@ fn a_session_that_cannot_read_its_state_keeps_none_when_the_retry_reads_it_on() 
     assert!(shows_only_the_screen(&scrolled, "known"), "{scrolled:?}");
 }
 
+/// KR-REQ-24.27: rows above the live page are removed when privacy mode goes on during a
+/// full-screen program: none of them is above the live page when the program leaves.
 #[test]
 fn rows_given_up_while_a_full_screen_program_runs_are_gone_when_it_leaves() {
     let mut rig = Rig::open();
@@ -515,6 +531,9 @@ fn rows_given_up_while_a_full_screen_program_runs_are_gone_when_it_leaves() {
     assert!(shows_only_the_screen(&scrolled, "while"), "{scrolled:?}");
 }
 
+/// KR-REQ-24.28: when privacy mode goes on and off again inside a full-screen program, no row from
+/// before comes back, those that were on the screen included, and the rows printed afterwards are
+/// kept.
 #[test]
 fn privacy_mode_going_off_inside_a_full_screen_program_keeps_no_earlier_row() {
     let mut rig = Rig::open();
@@ -539,6 +558,8 @@ fn privacy_mode_going_off_inside_a_full_screen_program_keeps_no_earlier_row() {
     );
 }
 
+/// KR-REQ-24.27: a terminal whose window is above the live page when privacy mode goes on is
+/// installed again with the live screen and nothing above it.
 #[test]
 fn a_window_above_the_live_page_when_privacy_mode_goes_on_is_installed_again() {
     let mut rig = Rig::open();
@@ -807,6 +828,11 @@ fn before_the_program_then_the_enabling(enter: &str) -> Owned {
     rig
 }
 
+/// KR-REQ-24.27: a resize under a full-screen program, after privacy mode went on, hands the host's
+/// own terminal no row from above the screen at the enabling, while the program shows and after it
+/// leaves.
+/// KR-REQ-24.28: the same holds after privacy mode has gone off: no row removed at the enabling is
+/// reconstructed.
 #[test]
 fn a_host_served_the_raw_stream_is_handed_no_earlier_row_when_a_resize_comes_under_a_full_screen_program()
  {
@@ -861,6 +887,9 @@ fn a_host_served_the_raw_stream_is_handed_no_earlier_row_when_a_resize_comes_und
     );
 }
 
+/// KR-REQ-24.27: a terminal installed in band after a resize under a full-screen program, once
+/// privacy mode is on, is given no row from above the screen at the enabling, both while the
+/// program shows and after it leaves.
 #[test]
 fn a_terminal_installed_in_band_is_given_no_earlier_row_when_a_resize_comes_under_a_full_screen_program()
  {
@@ -911,6 +940,9 @@ fn a_terminal_installed_in_band_is_given_no_earlier_row_when_a_resize_comes_unde
     );
 }
 
+/// KR-REQ-24.27: the grid keeps no row above the screen while privacy mode is on: a row that a
+/// shorter screen pushes above it is not handed back by a taller one, and no row from before it
+/// went on is.
 #[test]
 fn rows_a_shorter_resize_pushed_above_the_screen_are_not_handed_back_by_a_taller_one() {
     let mut rig = Owned::open();
