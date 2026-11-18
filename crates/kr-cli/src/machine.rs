@@ -891,7 +891,8 @@ fn of_a_later_format() -> CliError {
 }
 
 /// Whether the plan in `bytes` states a format later than [`PLAN_FORMAT`]: a map whose `version`
-/// member is a whole number past it, as the update reads the version a plan records.
+/// member is a whole number past it that a release can read as a version, as the update reads the
+/// version a plan records.
 fn states_a_later_format(bytes: &[u8], limits: &kr_cbor::Limits) -> bool {
     let Ok(kr_cbor::CanonicalValue::Map(plan)) = kr_cbor::decode(bytes, limits) else {
         return false;
@@ -899,7 +900,8 @@ fn states_a_later_format(bytes: &[u8], limits: &kr_cbor::Limits) -> bool {
     plan.get("version")
         .and_then(kr_cbor::CanonicalValue::as_integer)
         .and_then(kr_cbor::Integer::as_u64)
-        .is_some_and(|version| version > u64::from(PLAN_FORMAT))
+        .and_then(|version| u32::try_from(version).ok())
+        .is_some_and(|version| version > PLAN_FORMAT)
 }
 
 /// Whether the plan in `bytes` fails to decode only because a refused step holds a code that this
@@ -2298,6 +2300,71 @@ mod tests {
         std::fs::write(plan_path(paths), &planted).expect("the plan is in this format");
         for (command, said) in what_each_command_says(paths, into, from).await {
             assert_eq!(said, sentence, "{command}, in this release's format");
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+    }
+
+    /// A plan whose `version` is past every version a release reads is not one of a later release's
+    /// format: no release reads such a version, so the plan cannot be read and keeps the sentence
+    /// that tells the owner to move it aside, as the update reads the version a plan records. The
+    /// largest version a release reads is still a later release's.
+    #[tokio::test]
+    async fn a_plan_whose_version_is_past_any_a_release_reads_is_one_that_cannot_be_read_and_not_one_of_a_later_release()
+     {
+        let host = kr_ipc::testing::TempHost::create();
+        let paths = host.paths();
+        let into = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16]));
+        let from = MachineId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16]));
+        let kept_at = |version: u64| {
+            let plan = Plan {
+                version: PLAN_FORMAT,
+                into,
+                from,
+                steps: vec![step()],
+                undo: Vec::new(),
+                undoing: false,
+            };
+            let CanonicalValue::Map(record) = kr_cbor::decode(
+                &kr_cbor::to_canonical_vec(&plan).expect("encodes"),
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .expect("the plan decodes") else {
+                panic!("a plan is a map");
+            };
+            let mut entries: Vec<(String, CanonicalValue)> = record
+                .entries()
+                .iter()
+                .filter(|(name, _)| name != "version")
+                .cloned()
+                .collect();
+            entries.push((
+                "version".to_owned(),
+                CanonicalValue::integer(i128::from(version)).expect("an integer"),
+            ));
+            let map = CanonicalMap::from_entries(entries).expect("a map");
+            kr_cbor::encode(&CanonicalValue::Map(map))
+        };
+
+        // 1. The largest version a release reads, past this release's: a later release's plan.
+        let planted = kept_at(u64::from(u32::MAX));
+        kr_ipc::paths::write_owner_only_file(&plan_path(paths), &planted).expect("keeps the plan");
+        let sentence = "the merge plan this client keeps was written by a later release in a \
+                        format this release cannot read; it is in this user's state directory \
+                        as machine-merge-plan and stays as it is, so run `kr host update` to a \
+                        release that can read it and then run this command again";
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}");
+        }
+        assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
+
+        // 2. One past it: no release reads such a version, and the plan cannot be read.
+        let planted = kept_at(u64::from(u32::MAX) + 1);
+        std::fs::write(plan_path(paths), &planted).expect("the plan is past every version");
+        let sentence = "the merge plan this client keeps cannot be read; it is in this user's \
+                        state directory as machine-merge-plan, and the owner selects the \
+                        environments again once it is moved aside";
+        for (command, said) in what_each_command_says(paths, into, from).await {
+            assert_eq!(said, sentence, "{command}, past every version");
         }
         assert_eq!(std::fs::read(plan_path(paths)).expect("reads"), planted);
     }
