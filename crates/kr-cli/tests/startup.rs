@@ -5619,11 +5619,10 @@ impl Typing {
     }
 }
 
-/// A host with a daemon and one live session, the daemon's process and the session.
+/// A host with a daemon and one live session, the daemon's process and the session, or none where
+/// this run did not ask for the account's own launchd.
 fn a_host_with_a_session() -> Option<(Standalone, SessionId, Value, u32)> {
-    let Some(host) = Standalone::create() else {
-        return;
-    };
+    let host = Standalone::create()?;
     host.select_standalone();
     let output = host.finish_through_a_slow_start("kr new", || host.new_session());
     let created = document(&output, "kr new");
