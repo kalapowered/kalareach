@@ -112,10 +112,13 @@ the code stays after the host issues the next invitation or restarts. In code mo
 `pair.finish` gets it only while the refused invitation is the host's current one; after the host
 issues the next invitation or restarts, a repeat gets `PERMISSION_DENIED`. `pair.status` reports the
 reason to that device while the host keeps that invitation: the current one, or one of the sixteen it
-keeps. Another device that presents the ended invitation over iroh gets `PAIRING_REJECTED` with the
-message "the invitation is no longer open", the message that a denied, a withdrawn and an unfinished
-invitation get, so no device is told that the host lists a device that it does not list. A room
-admission that arrives after the end gets only the code.
+keeps. Another device that presents the ended invitation over iroh gets the answer that a denied, a
+withdrawn or an unfinished invitation of the same mode gets. In direct mode that is
+`PAIRING_REJECTED` with the message "the invitation is no longer open". In code mode it is
+`PAIRING_REJECTED` with that message while the ended invitation is still the host's current one, and
+`PERMISSION_DENIED` after the host issues the next invitation or restarts. No device is told that
+the host lists a device that it does not list. A room admission that arrives after the end gets at
+most the code and the count of confirmation attempts left, and no message.
 
 The issuing owner's view of that invitation carries `existing`, the name and pairing date from the
 host's own record, only while the host lists that record. Before it answers, the host records the
