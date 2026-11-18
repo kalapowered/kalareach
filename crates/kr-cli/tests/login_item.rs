@@ -838,10 +838,11 @@ mod written {
             ("a|b", true),
             (".dot", false),
             ("zoë", false),
+            // A space at the end of a name in the middle of a path is a space like any other.
+            (" a", true),
+            ("a ", true),
         ];
-        let refused = [
-            "a\"b", "a`b", "a$b", "a\\b", "a%b", "a\tb", "a\nb", " a", "a ",
-        ];
+        let refused = ["a\"b", "a`b", "a$b", "a\\b", "a%b", "a\tb", "a\nb"];
         let mut cases: Vec<(&str, &str, Option<bool>)> = Vec::new();
         for position in ["daemon", "runtime", "state"] {
             for (name, quoted) in accepted {
@@ -955,6 +956,39 @@ mod written {
             assert!(
                 unit.lines().any(|line| line == working_directory),
                 "the generator's working directory for the {position} path {name:?} is not {working_directory:?}: {unit}"
+            );
+        }
+        // A path that itself ends in a space cannot be written exactly either.
+        for input in ["runtime", "state"] {
+            let setup = Setup::new();
+            let root = setup.root.join(input).join("a ");
+            let before = setup.snapshot();
+            let mut command = setup.command_in(
+                &setup.bin.join("kr"),
+                &setup.home,
+                &["host", "login-item", "install"],
+            );
+            command.env(
+                if input == "runtime" {
+                    "KR_RUNTIME_DIR"
+                } else {
+                    "KR_STATE_DIR"
+                },
+                &root,
+            );
+            let output = command.output().expect("kr runs");
+            let said = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                !output.status.success(),
+                "the {input} root {root:?} is refused"
+            );
+            assert!(
+                said.contains("cannot be written into a desktop entry exactly"),
+                "{input} {root:?}: {said}"
+            );
+            assert!(
+                setup.snapshot() == before && !root.exists(),
+                "{input} {root:?}: nothing was written"
             );
         }
         // `TryExec` is read by the generator too: it makes no unit once the program is not
