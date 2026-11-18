@@ -414,9 +414,9 @@ pub enum RestoreError {
     /// The kit does not name the service the restore reads from.
     ///
     /// A restore through the daemon reads from the one storage service the host is configured for,
-    /// the managed account service or one its owner runs, and no other; a restore from an export
-    /// file reads from the service the file was made at. A kit that names only another service
-    /// cannot be restored from it.
+    /// the managed account service or one its owner runs, and no other. A restore from an export
+    /// file reaches no service, and the kit must name the service the file was made at. A kit that
+    /// names only another service is refused.
     #[error("the recovery kit names no service this host is configured for")]
     OriginNotConfigured,
     /// The kit, the bundle or the service refused at the recovery layer.
