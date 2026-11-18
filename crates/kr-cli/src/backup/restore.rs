@@ -556,14 +556,14 @@ pub async fn restore_with<P: Privacy, C: Conversation>(
     .await
     {
         Ok(prepared) => prepared,
-        Err(error) => return Err(explain(error, privacy, run.began).await),
+        Err(error) => return Err(explain(error, privacy, &run).await),
     };
     let configuration = match run.configuration {
         Some(host) => match plan_configuration(&prepared, host).await {
             Ok(Some(applying)) => Asked::Yes(Box::new(applying)),
             Ok(None) => Asked::NothingToApply,
             Err(error) => match error {
-                Planning::Restore(error) => return Err(explain(error, privacy, run.began).await),
+                Planning::Restore(error) => return Err(explain(error, privacy, &run).await),
                 Planning::Refused(error) => return Err(error),
             },
         },
@@ -599,7 +599,7 @@ pub async fn restore_with<P: Privacy, C: Conversation>(
     for (member, file, _) in planned.plan.restored() {
         let plaintext = match prepared.member(member.object_id).await {
             Ok(plaintext) => plaintext,
-            Err(error) => return Err(explain(error, privacy, run.began).await),
+            Err(error) => return Err(explain(error, privacy, &run).await),
         };
         folder.write_member(file, plaintext.expose())?;
         written.push(member.object_id);
@@ -829,15 +829,11 @@ fn changed() -> CliError {
 }
 
 /// Says why a restore stopped, and what a person does about it.
-async fn explain<P: Privacy>(
-    error: RestoreError,
-    privacy: &mut P,
-    began: &PrivacyReport,
-) -> CliError {
+async fn explain<P: Privacy>(error: RestoreError, privacy: &mut P, run: &Run<'_>) -> CliError {
     match error {
         RestoreError::NotSignedIn { cause, policy, .. } => CliError::refused_in_its_own_words(
             ErrorCode::PermissionDenied,
-            shown!("{}. {}", cause.why(), cause.remedy(policy)),
+            shown!("{}. {}", cause.why(policy), cause.remedy(policy)),
         ),
         RestoreError::OlderThanTheCheckpoint { checkpoint, held } => CliError::Usage(shown!(
             "the service holds generation {} of this archive, which is older than generation {} \
@@ -861,6 +857,12 @@ async fn explain<P: Privacy>(
             "--accept-older names a generation older than the one the recovery bundle last \
              verified, and this bundle records none for that archive, so there is nothing to \
              accept past",
+        )),
+        // A restore from an export file compares the kit with the service the file was made at, so
+        // the host's configuration cannot mend it.
+        RestoreError::OriginNotConfigured if run.bundles.is_none() => CliError::Usage(Shown::said(
+            "the recovery kit does not name the service the export file was made at, so this kit \
+             does not open that export; restore it with the kit it was made with",
         )),
         RestoreError::OriginNotConfigured => CliError::Usage(Shown::said(
             "the recovery kit names no storage service this host is configured for. This host \
@@ -913,7 +915,7 @@ async fn explain<P: Privacy>(
                 .status()
                 .await
                 .ok()
-                .map(|now| (now.enabled, now.generation != began.generation));
+                .map(|now| (now.enabled, now.generation != run.began.generation));
             match state {
                 Some((true, _)) => CliError::refused_in_its_own_words(
                     ErrorCode::PermissionDenied,

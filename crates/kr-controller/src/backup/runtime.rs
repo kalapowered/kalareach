@@ -149,9 +149,18 @@ pub(crate) enum TokenState {
 }
 
 impl TokenState {
-    const fn words(self) -> &'static str {
+    // The doctor's words for it. For a storage service the owner runs the signed-out words name
+    // that service, because the managed account can be signed in while the storage account is not.
+    const fn words(self, storage: bool) -> &'static str {
         match self {
-            Self::Absent => "no account is signed in on this host",
+            Self::Absent => {
+                if storage {
+                    "this host is signed in to no account at the storage service its storage.origin \
+                     names"
+                } else {
+                    "no account is signed in on this host"
+                }
+            }
             Self::SigningIn => "a sign-in on this host is waiting to finish",
             Self::Ended => "the service ended the sign-in on this host",
             Self::WithoutScope => "the account signed in on this host lacks the backup.write scope",
@@ -974,7 +983,7 @@ impl BackupRuntime {
             .stated(if other_account {
                 "this host is signed in as another account than the one its backups belong to"
             } else {
-                state.words()
+                state.words(storage)
             })
             .stated("; ");
         detail = match (&observed.status, observed.status_refusal) {

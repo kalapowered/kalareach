@@ -1242,7 +1242,7 @@ However the command ends, it puts the terminal back and throws away input still 
 
 ## `kr backup restore`
 
-`kr backup restore` allows you to open a backup of this host's data by providing the recovery kit. The data is written to a folder you create. It is not imported into this host. That is, no keys or grants or devices come back, and any host configuration in the backup is written for you to read, and is applied only if you pass `--apply-configuration`. This command requires this host to be signed in (`kr account sign-in`) to the managed account service that `storage.origin` names. A kit that names only a self-hosted service is refused by name. This host is permitted to read backup data only from the managed account service.
+`kr backup restore` allows you to open a backup of this host's data by providing the recovery kit. The data is written to a folder you create. It is not imported into this host. That is, no keys or grants or devices come back, and any host configuration in the backup is written for you to read, and is applied only if you pass `--apply-configuration`. A restore through the daemon requires this host to be signed in to the storage service that `storage.origin` names: the managed account service with `kr account sign-in`, or a service you run with `kr account sign-in --storage`. A kit that names only another service is refused by name, and the restore reads backup data only from that one service. A restore from an export file (`--from-export`) opens only with the kit that the file was made with.
 
 ```text
 kr backup restore --into <folder> [--kit-file <path>] [--archive <id>] [--from-export <path>] [--accept-older <generation>] [--apply-configuration] [--preview | --confirm-plan <digest>]

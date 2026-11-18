@@ -18,10 +18,10 @@ use crate::services::SyncBackupService;
 
 /// How a fresh restore is meant to reach the service that holds the ciphertext.
 ///
-/// It is the owner's configuration rather than the restore's choice, which is why it is carried
-/// rather than inferred: the managed service and a service the owner runs each have accounts of
-/// their own, and the restore signs in to an account of the service the owner configured and
-/// reaches nothing at another.
+/// It is the owner's configuration rather than the restore's choice, which is why it is taken
+/// from the configured origin, never from the kit: the managed service and a service the owner
+/// runs each have accounts of their own, and the restore signs in to an account of the service
+/// the owner configured and reaches nothing at another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RetrievalPolicy {
     /// The managed service. The restore signs in to the managed account, and signing in gets it
