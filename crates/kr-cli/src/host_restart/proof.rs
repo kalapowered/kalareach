@@ -302,10 +302,8 @@ mod tests {
     struct Supplied {
         script: Mutex<VecDeque<Daemon>>,
         started: Option<Started>,
-        /// Where the clock stood when the operations were made, and, for each connect, the time
-        /// from then at which the read that it began was to end.
-        origin: tokio::time::Instant,
-        ends: Mutex<Vec<Duration>>,
+        /// The bound that each connect of the operations was given, in order.
+        withins: Mutex<Vec<Duration>>,
         /// What a start that fails sets in what it made of its request before it fails: none where
         /// the start gives a connection.
         fails_after: Option<fn(&Launching)>,
@@ -320,8 +318,7 @@ mod tests {
                     start: ControllerStartup::Standalone,
                     manager: None,
                 }),
-                origin: tokio::time::Instant::now(),
-                ends: Mutex::new(Vec::new()),
+                withins: Mutex::new(Vec::new()),
                 fails_after: None,
             }
         }
@@ -334,10 +331,9 @@ mod tests {
             }
         }
 
-        /// The time, from the start of the case, at which each read that the operations began was
-        /// to end.
-        fn the_ends_of_the_reads(&self) -> Vec<Duration> {
-            self.ends.lock().expect("the ends").clone()
+        /// The bound that each read that the operations began was given, in order.
+        fn the_bounds_of_the_reads(&self) -> Vec<Duration> {
+            self.withins.lock().expect("the bounds").clone()
         }
 
         fn next(&self) -> Daemon {
@@ -390,10 +386,7 @@ mod tests {
         }
 
         async fn connect(&self, within: Duration, record: &Shared) -> Option<Daemon> {
-            self.ends
-                .lock()
-                .expect("the ends")
-                .push(self.origin.elapsed() + within);
+            self.withins.lock().expect("the bounds").push(within);
             record.observe(Observation::Sight(Sight::Began));
             let daemon = self.next();
             if let Daemon::Silent(takes) = daemon {
@@ -526,20 +519,27 @@ mod tests {
     }
 
     /// One deadline for the wait: where each read of the wait would use its full bound the wait
-    /// still ends at its own bound, no read is given time past it, and what a read saw before the
-    /// time-out is in the record.
+    /// still ends at its own bound, each read is given the less of its own bound and the time that
+    /// is left, so that none is given time past the deadline, and what a read saw before the
+    /// time-out is in the record. The bounds that the reads were given are told by their values.
     #[tokio::test(start_paused = true)]
     async fn a_wait_does_not_pass_its_bound_where_each_read_uses_its_full_time() {
         let bound = Duration::from_secs(30);
+        let every = host_stop::LOOK_EVERY;
         let record = Shared::new();
         let began = tokio::time::Instant::now();
         let operations = Supplied::of(vec![Daemon::Hangs]);
         assert!(!until_whole(&operations, &record, began + bound).await);
-        let ends = operations.the_ends_of_the_reads();
+        // Two reads that use their own bound, each followed by the pause between reads, and a last
+        // read that is given what is left of the wait.
         assert_eq!(
-            ends.iter().copied().max().map(|latest| latest <= bound),
-            Some(true),
-            "no read of a wait that ends at {bound:?} ends after it: {ends:?}"
+            operations.the_bounds_of_the_reads(),
+            [
+                startup::ANSWER_BOUND,
+                startup::ANSWER_BOUND,
+                bound - 2 * startup::ANSWER_BOUND - 2 * every
+            ],
+            "the bound of each read of a wait that ends at {bound:?}"
         );
         let took = began.elapsed();
         assert!(took <= bound, "the wait ended after {took:?}");
@@ -556,11 +556,16 @@ mod tests {
         let operations = Supplied::of(vec![Daemon::Hangs]);
         let failed = prove(&operations, Old::None, bound, &record).await;
         assert!(failed.is_err());
-        let ends = operations.the_ends_of_the_reads();
+        // The start's own exchange ends at the answer bound and is no connect; the wait after it
+        // has what is left of the start's bound: one read of its own bound, a pause, and a read
+        // that is given the rest.
         assert_eq!(
-            ends.iter().copied().max().map(|latest| latest <= bound),
-            Some(true),
-            "no read of a start's wait that ends at {bound:?} ends after it: {ends:?}"
+            operations.the_bounds_of_the_reads(),
+            [
+                startup::ANSWER_BOUND,
+                bound - 2 * startup::ANSWER_BOUND - every
+            ],
+            "the bound of each read of a start's wait that ends at {bound:?}"
         );
         let took = began.elapsed();
         assert!(took <= bound, "the start's wait ended after {took:?}");

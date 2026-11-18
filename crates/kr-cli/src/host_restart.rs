@@ -1720,23 +1720,33 @@ pub(crate) mod tests {
         let record = record::Shared::new();
         let connection = proof::connect(&environment.paths, startup::ANSWER_BOUND, &record).await;
         let greeted = record.read();
+        // The stand-in greets at once: a connection that was not made in time is none, and the
+        // record is judged only where the connection was made.
+        let Some(mut connection) = connection else {
+            panic!(
+                "the stand-in's greeting is usable and comes within the bound: {:?}",
+                greeted.last
+            );
+        };
         assert!(
             greeted.greeted,
             "the greeting is in the record where the connection was made"
         );
         assert_eq!(greeted.last, Some(Last::Greeting(None)));
-        let Some(mut connection) = connection else {
-            panic!("a usable greeting gives the connection");
-        };
         proof::exchange(&mut connection, id, &Progress::new(id), &record).await;
-        let read = record.read();
-        assert_eq!(read.last, Some(Last::Whole(generation_of(2))));
-        assert_eq!(read.whole.and_then(|whole| whole.process), Some(7));
         drop(connection);
-        tokio::time::timeout(std::time::Duration::from_secs(10), daemon)
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(10), daemon)
             .await
             .expect("the stand-in daemon ends where the command lets go of its connection")
             .expect("the stand-in daemon ran");
+        // Both requests were answered: what the record lacks now is a write that was not made.
+        assert_eq!(
+            answered, 2,
+            "the stand-in answered `host.info` and the request for the launch alone"
+        );
+        let read = record.read();
+        assert_eq!(read.last, Some(Last::Whole(generation_of(2))));
+        assert_eq!(read.whole.and_then(|whole| whole.process), Some(7));
     }
 
     /// The record of an attempt says that this command's start failed only where this command
