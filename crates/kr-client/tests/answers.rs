@@ -486,8 +486,11 @@ impl Keeper for Refused {
     }
 }
 
-fn store() -> (tempfile::TempDir, AnswerDrafts) {
-    let directory = tempfile::TempDir::new().expect("a directory");
+/// A store in an owner-only directory, as the client's own state is: on Windows a file takes the
+/// access list of its directory, and the reader refuses a list that names another account, which a
+/// plain temporary directory inherits where the temporary folder's list does.
+fn store() -> (kr_ipc::testing::PrivateTempDir, AnswerDrafts) {
+    let directory = kr_ipc::testing::PrivateTempDir::create();
     let drafts = AnswerDrafts::open(directory.path().join("answers")).expect("the store opens");
     (directory, drafts)
 }
