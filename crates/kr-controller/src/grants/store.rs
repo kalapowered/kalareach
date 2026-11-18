@@ -5524,12 +5524,13 @@ mod a_devices_revocation {
                 true,
             ),
             (
-                "two held rows whose grants have one identifier",
+                "two held rows whose grants have one identifier and different parents",
                 Box::new(move || {
                     store_written_by_hand(&[
                         (held(3, None), Some(4)),
-                        (held(4, None), None),
+                        (held(4, Some(6)), None),
                         (held(5, Some(4)), None),
+                        (held(6, None), None),
                     ])
                 }),
                 false,
