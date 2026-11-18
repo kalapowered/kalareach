@@ -3245,7 +3245,7 @@ impl Journal {
             )
             .optional()
             .map_err(|error| faulted(&self.health, error))?
-            .map(|raw| raw.into_receipt(actor_id, action_id))
+            .map(|raw| raw.into_receipt(actor_id, action_id, UnknownCode::ReadAsUnknown))
             .transpose()
     }
 
@@ -4761,11 +4761,13 @@ impl Journal {
     }
 }
 
-/// Reads every receipt a connection's `receipts` table holds, as [`Journal::read`] reads one, and
-/// returns how many there are, or what the first one it cannot read is.
+/// Reads every receipt a connection's `receipts` table holds, as [`Journal::read`] reads one, except
+/// that a receipt kept under an error code this build lacks cannot be read here, and returns how
+/// many there are, or what the first one it cannot read is.
 ///
-/// The explicit importer asks this of a journal before it commits, so a receipt the running host
-/// would refuse to read is refused there, while the journal can still be left as it was.
+/// The explicit importer asks this of a journal before it commits, so a journal that holds a
+/// receipt the running host reads only as an unknown outcome is refused there, while the journal
+/// can still be left as it was.
 pub(crate) fn read_every_receipt(connection: &Connection) -> std::result::Result<u64, String> {
     let mut statement = connection
         .prepare(
@@ -4797,11 +4799,21 @@ pub(crate) fn read_every_receipt(connection: &Connection) -> std::result::Result
             error_message: row.get(10).map_err(read)?,
             updated_at_ms: row.get(11).map_err(read)?,
         }
-        .into_receipt(actor_id, action_id)
+        .into_receipt(actor_id, action_id, UnknownCode::Refuse)
         .map_err(|error| format!("a receipt of {actor} cannot be read: {error}"))?;
         count += 1;
     }
     Ok(count)
+}
+
+/// How a receipt kept under an error code that this build lacks is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnknownCode {
+    /// The receipt cannot be read: the importer refuses a journal that holds one.
+    Refuse,
+    /// The error reads as the unknown outcome under the message it was kept with: the running
+    /// worker's lookup of one receipt. The state is as kept and nothing is written.
+    ReadAsUnknown,
 }
 
 struct RawReceipt {
@@ -4818,14 +4830,25 @@ struct RawReceipt {
 }
 
 impl RawReceipt {
-    fn into_receipt(self, actor_id: ActorId, action_id: ActionId) -> Result<Receipt> {
+    fn into_receipt(
+        self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        unknown: UnknownCode,
+    ) -> Result<Receipt> {
         let digest = <[u8; 32]>::try_from(self.payload_digest.as_slice())
             .map_err(|_| unavailable_detail("a stored payload digest is not 32 bytes"))?;
         let error = match (self.error_code, self.error_message) {
             (Some(code), Some(message)) => {
-                let code = code.parse::<ErrorCode>().map_err(|_| {
-                    unavailable_detail("a stored error code is not in the registry")
-                })?;
+                let code = match (code.parse::<ErrorCode>(), unknown) {
+                    (Ok(code), _) => code,
+                    (Err(_), UnknownCode::ReadAsUnknown) => ErrorCode::OutcomeUnknown,
+                    (Err(_), UnknownCode::Refuse) => {
+                        return Err(unavailable_detail(
+                            "a stored error code is not in the registry",
+                        ));
+                    }
+                };
                 Some(ProtocolError::new(code, message))
             }
             _ => None,
