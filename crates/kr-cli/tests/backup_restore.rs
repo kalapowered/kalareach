@@ -3378,9 +3378,10 @@ async fn a_host_signed_in_to_no_account_at_the_service_its_owner_runs_is_told_to
 }
 
 /// A host that is signed in to no account says so, and sends no bundle read, because the service
-/// answers a read with no token as a bundle that is not there. The binary picks the remedy from the
-/// managed origin it is built with, and this rig's stand-in is not that origin, so the remedy is
-/// not asserted here; the library's table holds both policies' remedies.
+/// answers a read with no token as a bundle that is not there. The binary picks the cause's words
+/// and the remedy from the managed origin it is built with. This rig's stand-in is not that origin,
+/// so the binary uses the words for a service the owner runs: this case reads that cause and does
+/// not assert the remedy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_is_signed_in_to_no_account_says_so_and_sends_no_read() {
     let world = World::new();
