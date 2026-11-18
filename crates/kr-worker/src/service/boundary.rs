@@ -123,7 +123,10 @@ impl Drop for DispatchGuard<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, TryLockError, mpsc};
+    use std::time::Duration;
 
     use kr_ipc::peer::PeerIdentity;
     use kr_ipc::verify::WorkerIdentity;
@@ -140,7 +143,7 @@ mod tests {
     use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
     use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
 
-    use super::WorkerService;
+    use super::{DispatchBoundary, WorkerService};
     use crate::runtime::SessionRuntime;
     use crate::service::{Caller, ConnectionState, Freshness, ServiceBinding};
     use crate::session::{Session, SessionConfig};
@@ -313,5 +316,239 @@ mod tests {
         assert!(second.service.try_take_boundary().is_err());
         drop(foreign);
         assert!(second.service.try_take_boundary().is_ok());
+    }
+
+    /// How long a case waits for the answer of a scene that runs on a thread of its own. A scene
+    /// in which a thread waits on itself never answers, so this bound ends the case.
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// The words that the boundary's waiting take panics with when its caller holds the boundary.
+    const REFUSAL: &str = "the thread that holds the dispatch boundary took it again";
+
+    /// What a take of a boundary came to.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Taken {
+        /// The take gave a guard of a boundary that no panic had poisoned, and it was let go.
+        Free,
+        /// The take gave a guard inside a poison error, and it was let go.
+        Poisoned,
+        /// The trying take found the boundary held.
+        Busy,
+        /// The take panicked, with this text.
+        Refused(String),
+    }
+
+    /// The waiting take, with a panic of the take caught and its text kept.
+    fn waits(boundary: &DispatchBoundary) -> Taken {
+        catch_unwind(AssertUnwindSafe(|| match boundary.lock() {
+            Ok(_guard) => Taken::Free,
+            Err(_poisoned) => Taken::Poisoned,
+        }))
+        .unwrap_or_else(|panic| Taken::Refused(said(&*panic)))
+    }
+
+    /// The trying take, with a panic of the take caught and its text kept.
+    fn tries(boundary: &DispatchBoundary) -> Taken {
+        catch_unwind(AssertUnwindSafe(|| match boundary.try_lock() {
+            Ok(_guard) => Taken::Free,
+            Err(TryLockError::Poisoned(_poisoned)) => Taken::Poisoned,
+            Err(TryLockError::WouldBlock) => Taken::Busy,
+        }))
+        .unwrap_or_else(|panic| Taken::Refused(said(&*panic)))
+    }
+
+    /// Runs `scene` on a thread of its own and gives the receiver of its answer. The case receives
+    /// with `BOUND`, so a scene that never answers fails the case and does not stand.
+    fn on_a_thread_of_its_own<T: Send + 'static>(
+        scene: impl FnOnce() -> T + Send + 'static,
+    ) -> mpsc::Receiver<T> {
+        let (answer, answered) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer.send(scene());
+        });
+        answered
+    }
+
+    /// A boundary that a panic poisoned: a thread took it and panicked while it held the guard.
+    fn a_poisoned_boundary() -> Arc<DispatchBoundary> {
+        let boundary = Arc::new(DispatchBoundary::new());
+        let poisoner = Arc::clone(&boundary);
+        let ended = std::thread::spawn(move || {
+            let _guard = poisoner.lock().expect("the boundary is free");
+            panic!("a panic under the boundary");
+        })
+        .join();
+        assert!(ended.is_err(), "the thread ended by its panic");
+        boundary
+    }
+
+    /// The thread that holds the boundary and waits for it again waits on itself for ever. The
+    /// waiting take refuses it with a panic. The whole scene runs on a thread of its own, with the
+    /// first guard held outside the catch, so that a take without the refusal fails the case at
+    /// its bound.
+    #[test]
+    fn the_thread_that_holds_the_boundary_is_refused_when_it_waits_for_it_again() {
+        let boundary = Arc::new(DispatchBoundary::new());
+        let answered = on_a_thread_of_its_own({
+            let boundary = Arc::clone(&boundary);
+            move || {
+                let first = boundary.lock().expect("the boundary is free");
+                let second = waits(&boundary);
+                drop(first);
+                second
+            }
+        });
+        let Ok(second) = answered.recv_timeout(BOUND) else {
+            panic!(
+                "the thread that holds the boundary waited for it again and gave no answer \
+                 within {BOUND:?}: it waits on itself"
+            );
+        };
+        assert_eq!(second, Taken::Refused(REFUSAL.to_owned()));
+        assert_eq!(
+            tries(&boundary),
+            Taken::Free,
+            "the boundary is free once the holder has dropped its guard"
+        );
+    }
+
+    /// The trying take cannot wait on itself, so it does not refuse: the holder gets "busy", as
+    /// any other thread does.
+    #[test]
+    fn the_thread_that_holds_the_boundary_gets_busy_when_it_tries_for_it_again() {
+        let boundary = DispatchBoundary::new();
+        let first = boundary.lock().expect("the boundary is free");
+        assert_eq!(tries(&boundary), Taken::Busy);
+        drop(first);
+        assert_eq!(tries(&boundary), Taken::Free);
+    }
+
+    /// Another thread's try finds the boundary busy, and another thread that waits for it is not
+    /// refused: it gets the boundary once the holder has dropped its guard.
+    #[test]
+    fn another_thread_gets_busy_when_it_tries_and_the_boundary_after_the_drop_when_it_waits() {
+        let boundary = Arc::new(DispatchBoundary::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let held = boundary.lock().expect("the boundary is free");
+        let tried = on_a_thread_of_its_own({
+            let boundary = Arc::clone(&boundary);
+            move || tries(&boundary)
+        });
+        let Ok(tried) = tried.recv_timeout(BOUND) else {
+            panic!("another thread's try gave no answer within {BOUND:?}");
+        };
+        assert_eq!(tried, Taken::Busy);
+        let waiting = on_a_thread_of_its_own({
+            let boundary = Arc::clone(&boundary);
+            let dropped = Arc::clone(&dropped);
+            move || {
+                catch_unwind(AssertUnwindSafe(|| {
+                    let _guard = boundary.lock().expect("the boundary is not poisoned");
+                    dropped.load(Ordering::SeqCst)
+                }))
+                .map_err(|panic| said(&*panic))
+            }
+        });
+        dropped.store(true, Ordering::SeqCst);
+        drop(held);
+        let Ok(came_after_the_drop) = waiting.recv_timeout(BOUND) else {
+            panic!("another thread that waited for the boundary got it within {BOUND:?}: never");
+        };
+        assert_eq!(
+            came_after_the_drop,
+            Ok(true),
+            "the waiting thread is not refused, and gets the boundary only after the drop"
+        );
+    }
+
+    /// After the drop, the same thread takes the boundary again, waiting or trying, with no
+    /// refusal.
+    #[test]
+    fn the_same_thread_takes_the_boundary_again_after_the_drop() {
+        let boundary = Arc::new(DispatchBoundary::new());
+        let answered = on_a_thread_of_its_own({
+            let boundary = Arc::clone(&boundary);
+            move || {
+                let first = boundary.lock().expect("the boundary is free");
+                drop(first);
+                let waited = waits(&boundary);
+                let tried = tries(&boundary);
+                (waited, tried)
+            }
+        });
+        let Ok(again) = answered.recv_timeout(BOUND) else {
+            panic!("the thread that dropped its guard gave no answer within {BOUND:?}");
+        };
+        assert_eq!(again, (Taken::Free, Taken::Free));
+    }
+
+    /// A panic that unwinds the guard lets the boundary go, and poisons it, as a std mutex does:
+    /// the next take by that thread is no refusal. It is a poison error, for the waiting form and
+    /// for the trying form.
+    #[test]
+    fn a_panic_that_unwinds_the_guard_clears_the_holder_and_poisons_the_boundary() {
+        let boundary = Arc::new(DispatchBoundary::new());
+        let answered = on_a_thread_of_its_own({
+            let boundary = Arc::clone(&boundary);
+            move || {
+                let unwound = catch_unwind(AssertUnwindSafe(|| {
+                    let _guard = boundary.lock().expect("the boundary is free");
+                    panic!("a panic under the boundary");
+                }));
+                let waited = waits(&boundary);
+                let tried = tries(&boundary);
+                (unwound.is_err(), waited, tried)
+            }
+        });
+        let Ok(after) = answered.recv_timeout(BOUND) else {
+            panic!("the thread whose guard a panic unwound gave no answer within {BOUND:?}");
+        };
+        assert_eq!(after, (true, Taken::Poisoned, Taken::Poisoned));
+    }
+
+    /// A guard that comes inside the poison error of a waiting take holds the boundary like any
+    /// other: the holder's second waiting take is refused.
+    #[test]
+    fn a_guard_that_comes_inside_a_poison_error_of_a_wait_holds_the_boundary() {
+        let boundary = a_poisoned_boundary();
+        let answered = on_a_thread_of_its_own(move || {
+            let Err(poisoned) = boundary.lock() else {
+                return Taken::Free;
+            };
+            let first = poisoned.into_inner();
+            let second = waits(&boundary);
+            drop(first);
+            second
+        });
+        let Ok(second) = answered.recv_timeout(BOUND) else {
+            panic!(
+                "the thread that holds the boundary through a poison error waited for it again \
+                 and gave no answer within {BOUND:?}: it waits on itself"
+            );
+        };
+        assert_eq!(second, Taken::Refused(REFUSAL.to_owned()));
+    }
+
+    /// A guard that comes inside the poison error of a trying take holds the boundary like any
+    /// other: the holder's waiting take is refused.
+    #[test]
+    fn a_guard_that_comes_inside_a_poison_error_of_a_try_holds_the_boundary() {
+        let boundary = a_poisoned_boundary();
+        let answered = on_a_thread_of_its_own(move || {
+            let Err(TryLockError::Poisoned(poisoned)) = boundary.try_lock() else {
+                return Taken::Free;
+            };
+            let first = poisoned.into_inner();
+            let second = waits(&boundary);
+            drop(first);
+            second
+        });
+        let Ok(second) = answered.recv_timeout(BOUND) else {
+            panic!(
+                "the thread that holds the boundary through the poison error of a try waited for \
+                 it again and gave no answer within {BOUND:?}: it waits on itself"
+            );
+        };
+        assert_eq!(second, Taken::Refused(REFUSAL.to_owned()));
     }
 }
