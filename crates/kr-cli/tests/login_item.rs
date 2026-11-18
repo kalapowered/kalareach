@@ -246,6 +246,70 @@ mod written {
         serde_json::from_slice(&output.stdout).expect("a JSON vector")
     }
 
+    /// Where a distribution puts the generator that turns autostart entries into user units.
+    #[cfg(target_os = "linux")]
+    const GENERATORS: [&str; 3] = [
+        "/usr/lib/systemd/user-generators/systemd-xdg-autostart-generator",
+        "/lib/systemd/user-generators/systemd-xdg-autostart-generator",
+        "/usr/libexec/systemd/user-generators/systemd-xdg-autostart-generator",
+    ];
+
+    #[cfg(target_os = "linux")]
+    fn generator() -> Option<PathBuf> {
+        GENERATORS
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+    }
+
+    /// Whether `desktop-file-validate` can be started from `PATH`.
+    #[cfg(target_os = "linux")]
+    fn validator_is_installed() -> bool {
+        Command::new("desktop-file-validate")
+            .arg("--help")
+            .output()
+            .is_ok()
+    }
+
+    /// The unit the autostart generator makes from the entries under the setup's own
+    /// `XDG_CONFIG_HOME`, or nothing when it makes none. The generator runs by hand, writes only
+    /// under the setup's temporary folder and reads no configuration directory but an empty one.
+    /// `tag` keeps the output of two runs in one setup apart.
+    #[cfg(target_os = "linux")]
+    fn generated_unit(setup: &Setup, generator: &Path, tag: &str) -> Option<String> {
+        let output_root = setup.root.join("generated").join(tag);
+        let empty = setup.root.join("no-config-directories");
+        let directories = ["normal", "early", "late"].map(|name| output_root.join(name));
+        std::fs::create_dir_all(&empty).expect("a directory");
+        for directory in &directories {
+            std::fs::create_dir_all(directory).expect("a directory");
+        }
+        let output = Command::new(generator)
+            .args(&directories)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &setup.home)
+            .env("XDG_CONFIG_HOME", setup.home.join(".config"))
+            .env("XDG_CONFIG_DIRS", &empty)
+            .output()
+            .expect("the autostart generator starts");
+        assert!(
+            output.status.success(),
+            "the autostart generator exits 0: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A user generator writes its units to the last of its three directories.
+        std::fs::read_dir(&directories[2])
+            .ok()?
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "service")
+            })
+            .map(|path| std::fs::read_to_string(path).expect("the unit's text"))
+    }
+
     #[test]
     fn the_login_item_is_written_for_this_platform_and_recorded_exactly() {
         let setup = Setup::new();
@@ -746,86 +810,170 @@ mod written {
     #[test]
     fn a_path_a_desktop_entry_cannot_hold_exactly_is_refused_and_every_other_path_reads_back_whole()
     {
+        assert!(
+            validator_is_installed(),
+            "desktop-file-validate is not installed (the desktop-file-utils package): this case \
+             validates every entry it writes with it"
+        );
+        let generator = generator();
+        assert!(
+            generator.is_some(),
+            "the autostart generator is not installed (the systemd package; looked in \
+             {GENERATORS:?}): this case converts every entry it writes with it"
+        );
+        let generator = generator.expect("checked above");
+        // The second field is whether the generator double-quotes the word in its `ExecStart=`
+        // line; it leaves the others bare. The entry's own words are all quoted.
         let accepted = [
-            "a b", "a'b", "a#b", "a;b", "a(b", "a&b", "a<b>", "a~b", "a*b", "a?b", "a|b", ".dot",
-            "zoë",
+            ("a b", true),
+            ("a'b", true),
+            ("a#b", false),
+            ("a;b", true),
+            ("a(b", true),
+            ("a&b", true),
+            ("a<b>", true),
+            ("a~b", false),
+            ("a*b", true),
+            ("a?b", true),
+            ("a|b", true),
+            (".dot", false),
+            ("zoë", false),
         ];
-        for name in accepted {
+        let refused = [
+            "a\"b", "a`b", "a$b", "a\\b", "a%b", "a\tb", "a\nb", " a", "a ",
+        ];
+        let mut cases: Vec<(&str, &str, Option<bool>)> = Vec::new();
+        for position in ["daemon", "runtime", "state"] {
+            for (name, quoted) in accepted {
+                cases.push((name, position, Some(quoted)));
+            }
+            for name in refused {
+                cases.push((name, position, None));
+            }
+            // An equals sign is refused in the daemon's path and read back in a root.
+            cases.push(("a=b", position, (position != "daemon").then_some(false)));
+        }
+        for (name, position, quoted) in cases {
             let setup = Setup::new();
-            let layout = setup.root.join(name).join("bin");
-            setup.layout(&layout);
-            let output = setup.run_with(
-                &layout.join("kr"),
-                &setup.home,
-                &["host", "login-item", "install"],
-            );
+            let mut kr = setup.bin.join("kr");
+            let mut runtime = setup.runtime.clone();
+            let mut state = setup.state.clone();
+            match position {
+                "daemon" => {
+                    let layout = setup.root.join(name).join("bin");
+                    setup.layout(&layout);
+                    kr = layout.join("kr");
+                }
+                "runtime" => runtime = setup.root.join(name).join("run"),
+                _ => state = setup.root.join(name).join("state"),
+            }
+            let before = setup.snapshot();
+            let mut command =
+                setup.command_in(&kr, &setup.home, &["host", "login-item", "install"]);
+            command.env("KR_RUNTIME_DIR", &runtime);
+            command.env("KR_STATE_DIR", &state);
+            let output = command.output().expect("kr runs");
+            let said = String::from_utf8_lossy(&output.stderr).into_owned();
+            let Some(quoted) = quoted else {
+                assert!(
+                    !output.status.success(),
+                    "the {position} path {name:?} is refused"
+                );
+                assert!(
+                    said.contains("cannot be written into a desktop entry exactly"),
+                    "{position} {name:?}: {said}"
+                );
+                assert!(
+                    setup.snapshot() == before && !runtime.exists() && !state.exists(),
+                    "{position} {name:?}: nothing was written"
+                );
+                continue;
+            };
             assert!(
                 output.status.success(),
-                "the daemon path {name}: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "the {position} path {name:?} is written: {said}"
             );
-            let controller = std::fs::canonicalize(layout.join("kr-controller")).expect("resolves");
+            let entry = setup.item_in(&setup.home).expect("the entry is written");
+            let controller =
+                std::fs::canonicalize(kr.with_file_name("kr-controller")).expect("resolves");
+            // GLib's shell parser: the quoting subset of `Exec`, word by word.
             assert_eq!(
-                read_vector(&setup.item())[0],
-                controller.to_string_lossy(),
-                "the daemon path {name}"
+                read_vector(&entry),
+                vec![
+                    controller.to_string_lossy().into_owned(),
+                    "--runtime-dir".to_owned(),
+                    runtime.to_string_lossy().into_owned(),
+                    "--state-dir".to_owned(),
+                    state.to_string_lossy().into_owned(),
+                ],
+                "GLib reads the {position} path {name:?} back to the vector kr was given"
             );
-            for input in ["runtime", "state"] {
-                let setup = Setup::new();
-                let root = setup.root.join(name).join(input);
-                let mut command = setup.command_in(
-                    &setup.bin.join("kr"),
-                    &setup.home,
-                    &["host", "login-item", "install"],
-                );
-                command.env(
-                    if input == "runtime" {
-                        "KR_RUNTIME_DIR"
-                    } else {
-                        "KR_STATE_DIR"
-                    },
-                    &root,
-                );
-                assert!(
-                    command.output().expect("kr runs").status.success(),
-                    "the {input} root {name}"
-                );
-                let vector = read_vector(&setup.item_in(&setup.home).expect("written"));
-                assert!(
-                    vector.contains(&root.to_string_lossy().into_owned()),
-                    "the {input} root {name}"
-                );
-            }
-        }
-        for bad in ["a\"b", "a`b", "a$b", "a\\b", "a%b", "a\tb", " a", "a "] {
-            let setup = Setup::new();
-            let layout = setup.root.join(bad).join("bin");
-            setup.layout(&layout);
-            let before = setup.snapshot();
-            let output = setup.run_with(
-                &layout.join("kr"),
-                &setup.home,
-                &["host", "login-item", "install"],
+            // The validator: the entry is valid, `TryExec` and `Path` included.
+            let validated = Command::new("desktop-file-validate")
+                .arg(&entry)
+                .output()
+                .expect("desktop-file-validate starts");
+            assert!(
+                validated.status.success(),
+                "desktop-file-validate refuses the entry for the {position} path {name:?}: {}{}",
+                String::from_utf8_lossy(&validated.stdout),
+                String::from_utf8_lossy(&validated.stderr)
+            );
+            // The generator: the unit it makes, `ExecStart=` and the working directory read back
+            // from `Path`.
+            let unit = generated_unit(&setup, &generator, "entry");
+            assert!(
+                unit.is_some(),
+                "the autostart generator makes no unit from the entry for the {position} path {name:?}"
+            );
+            let unit = unit.expect("checked above");
+            let word = |path: &Path, tested: bool| {
+                let text = path.to_string_lossy();
+                if tested && quoted {
+                    format!("\"{text}\"")
+                } else {
+                    text.into_owned()
+                }
+            };
+            let exec_start = format!(
+                "ExecStart=:{} --runtime-dir {} --state-dir {}",
+                word(&controller, position == "daemon"),
+                word(&runtime, position == "runtime"),
+                word(&state, position == "state"),
             );
             assert!(
-                !output.status.success(),
-                "the daemon path {bad:?} is refused"
+                unit.lines().any(|line| line == exec_start),
+                "the generator's ExecStart for the {position} path {name:?} is not {exec_start:?}: {unit}"
             );
+            let environment = std::fs::read_dir(state.join("environments"))
+                .expect("the state root holds the environment")
+                .flatten()
+                .map(|entry| entry.path())
+                .next()
+                .expect("an environment directory");
+            let working_directory = format!("WorkingDirectory=-{}", environment.display());
             assert!(
-                String::from_utf8_lossy(&output.stderr)
-                    .contains("cannot be written into a desktop entry exactly")
+                unit.lines().any(|line| line == working_directory),
+                "the generator's working directory for the {position} path {name:?} is not {working_directory:?}: {unit}"
             );
-            assert!(setup.snapshot() == before, "{bad:?}: nothing was written");
         }
+        // `TryExec` is read by the generator too: it makes no unit once the program is not
+        // executable.
         let setup = Setup::new();
-        let layout = setup.root.join("a=b").join("bin");
-        setup.layout(&layout);
-        let output = setup.run_with(
-            &layout.join("kr"),
-            &setup.home,
-            &["host", "login-item", "install"],
+        setup.ok("install");
+        assert!(
+            generated_unit(&setup, &generator, "executable").is_some(),
+            "the generator makes a unit while the program is executable"
         );
-        assert!(!output.status.success(), "= in the daemon path is refused");
+        std::fs::set_permissions(
+            setup.bin.join("kr-controller"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("a mode");
+        assert!(
+            generated_unit(&setup, &generator, "not-executable").is_none(),
+            "the generator makes no unit once TryExec names a program that cannot be run"
+        );
     }
 
     #[test]
