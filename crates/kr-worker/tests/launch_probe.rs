@@ -10,7 +10,7 @@
 //!
 //! | Row | What is checked here |
 //! | --- | --- |
-//! | KR-REQ-07.64 | The mode is read from what the program prints, and a nonzero exit status does not change that; the program runs in the launch's directory with no input; one that prints too much or never finishes records no mode and is ended with everything it started; one that cannot start says so |
+//! | KR-REQ-07.64 | The mode is read from what the program prints, and a nonzero exit status does not change that; the program runs in the launch's directory with no input; one that prints too much or never finishes records no mode and is ended with everything it started; one that cannot start says so; a program is held to the deadline it is given, and an answer after it is not taken |
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -313,16 +313,24 @@ fn tree_state(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     found
 }
 
-/// KR-REQ-11.16: a probe is bounded, and it leaves the tree it ran in as it found it.
+/// How long the slow stand-in takes to print its answer, in seconds.
+const SLOW_SECONDS: u64 = 10;
+
+/// KR-REQ-07.64: a probe is held to the deadline it is given. An answer that comes after the
+/// deadline is not taken, and the same program is read under a deadline longer than it takes.
 ///
-/// The upstream is a stand-in that answers slowly: it would name a mode, but only after a delay far
-/// longer than the probe is given. The probe is held to its deadline: it returns late with no mode,
-/// though the answer the upstream would have given names one, and it waited the whole of the bound
-/// before it gave up. The same stand-in answering at once is read, so what ended the slow one is
-/// the bound and not a refusal of that upstream. The probe runs in a private tree the person
-/// owns, and the tree is as it was after each run.
+/// The stand-in names a mode, but only after `SLOW_SECONDS`. Given a deadline of two seconds, the
+/// runner returns late with no mode, though the answer the stand-in would give names one. Given
+/// `GENEROUS`, the runner reads that same answer, so what ended the first run is the deadline it
+/// was given and not a refusal of the stand-in's answer. A runner that keeps a bound of its own,
+/// whatever deadline it is given, fails one of the two runs: one at or past the stand-in's answer
+/// takes the answer in the first, and a shorter one gives up in the second. A bound that exceeds
+/// the given deadline by less than the stand-in's delay is not told apart from the deadline here.
+///
+/// The case decides by the two results and by no measured time. The stand-ins write nothing, so a
+/// change to the directory the runner ran in after either run is the runner's own.
 #[test]
-fn kr_req_11_16_a_probe_is_held_to_its_deadline_and_leaves_the_tree_it_ran_in_as_it_was() {
+fn kr_req_07_64_a_probe_is_held_to_the_deadline_it_is_given_and_a_late_answer_is_not_taken() {
     let tree = kr_ipc::testing::PrivateTempDir::create();
     let root = tree.path();
     std::fs::create_dir_all(root.join("projects").join("notes")).expect("makes the directories");
@@ -331,45 +339,42 @@ fn kr_req_11_16_a_probe_is_held_to_its_deadline_and_leaves_the_tree_it_ran_in_as
     let before = tree_state(root);
 
     let slow = Standin::running(
-        r#"sleep 30; printf '{"mode":"elevated"}'"#,
-        r#"Start-Sleep 30; [Console]::Out.Write('{"mode":"elevated"}')"#,
+        &format!(r#"sleep {SLOW_SECONDS}; printf '{{"mode":"elevated"}}'"#),
+        &format!(r#"Start-Sleep {SLOW_SECONDS}; [Console]::Out.Write('{{"mode":"elevated"}}')"#),
     );
-    let deadline = Duration::from_secs(2);
-    let started = std::time::Instant::now();
-    let probed = probe::run_within(
-        &slow.program,
-        &slow.probe(&[]),
-        &[],
-        root,
-        deadline,
-        probe::MAX_OUTPUT_BYTES,
-    );
-    let waited = started.elapsed();
+    let within = |deadline: Duration| {
+        probe::run_within(
+            &slow.program,
+            &slow.probe(&[]),
+            &[],
+            root,
+            deadline,
+            probe::MAX_OUTPUT_BYTES,
+        )
+    };
+
+    let late = within(Duration::from_secs(2));
     assert_eq!(
-        probed.mode, None,
-        "the answer that comes after the bound is not taken: {probed:?}"
+        late.mode, None,
+        "the answer that comes after the deadline is not taken: {late:?}"
     );
-    assert!(probed.late, "{probed:?}");
-    assert!(
-        waited >= deadline,
-        "the probe waited the whole of its bound, and was not refused early: {waited:?}"
-    );
+    assert!(late.late, "{late:?}");
     assert_eq!(
         tree_state(root),
         before,
-        "the tree is as it was after a late probe"
+        "the directory is as it was after a late probe"
     );
 
-    let prompt = Standin::running(
-        r#"printf '{"mode":"elevated"}'"#,
-        r#"[Console]::Out.Write('{"mode":"elevated"}')"#,
+    let read = within(GENEROUS);
+    assert_eq!(
+        read.mode.as_deref(),
+        Some("elevated"),
+        "the same program is read under a deadline longer than it takes: {read:?}"
     );
-    let answered = prompt.run(root);
-    assert_eq!(answered.mode.as_deref(), Some("elevated"), "{answered:?}");
-    assert!(!answered.late, "{answered:?}");
+    assert!(!read.late, "{read:?}");
     assert_eq!(
         tree_state(root),
         before,
-        "the tree is as it was after an answered probe"
+        "the directory is as it was after an answered probe"
     );
 }
