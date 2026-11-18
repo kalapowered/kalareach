@@ -77,5 +77,6 @@ pub mod test_reports;
 pub mod testing;
 pub mod transfer;
 pub mod voice;
+pub mod voice_start_holds;
 
 pub use crate::error::{ControllerError, Result};
