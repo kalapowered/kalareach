@@ -1673,8 +1673,9 @@ impl PairingHost {
     ///
     /// An invitation that ended because the host lists the device it was refused for answers that
     /// device's endpoint, and no other, under the code that says so. Any other peer is told what
-    /// every other ending tells it, so it is not told that the host lists a device that it does
-    /// not.
+    /// every other ending tells it, under the same code and in the same words, so it is not told
+    /// that the host lists a device that it does not, and cannot tell this ending from a denial, a
+    /// withdrawal or a restart by what it is told.
     fn refusal_to(
         &self,
         endpoint: &EndpointKey,
@@ -1694,7 +1695,7 @@ impl PairingHost {
                 }
                 // The general rejection, in the general words: neither its code nor its message
                 // says that the invitation ended because the host lists a device.
-                Ok(false) => ProtocolError::new(ErrorCode::PairingRejected, NO_LONGER_OPEN),
+                Ok(false) => protocol_refusal(error),
                 Err(unreadable) => protocol_refusal(unreadable),
             };
         }
@@ -2006,11 +2007,19 @@ fn protocol_refusal(error: kr_pairing::PairingError) -> ProtocolError {
     if code == ErrorCode::PairingAuthFailed {
         return ProtocolError::new(code, AUTHENTICATION_FAILED);
     }
+    // An ending that reports as a rejection says so in one set of words, whichever ending it was:
+    // a peer that names the invitation could otherwise compare the messages of the endings and
+    // learn the reason, among them that the host lists a device.
+    if code == ErrorCode::PairingRejected
+        && matches!(error, kr_pairing::PairingError::Consumed { .. })
+    {
+        return ProtocolError::new(code, NO_LONGER_OPEN);
+    }
     ProtocolError::new(code, error.to_string())
 }
 
-/// The one thing a peer that did not use an invitation is told of an invitation that ended because
-/// the host lists the device that did.
+/// What a peer is told of an invitation that ended under the rejected code, whichever ending it
+/// was: the words give no reason, so no ending can be told from another by them.
 const NO_LONGER_OPEN: &str = "the invitation is no longer open";
 
 /// The one thing a candidate is told when its pairing could not be authenticated.
@@ -2106,11 +2115,15 @@ mod tests {
                 ErrorCode::PairingRejected,
             ),
         ] {
-            assert_eq!(
-                protocol_refusal(ended_as(state)).code,
-                code,
-                "an invitation in {state:?}"
-            );
+            let told = protocol_refusal(ended_as(state));
+            assert_eq!(told.code, code, "an invitation in {state:?}");
+            // Every ending that is rejected is told in the same words, so no reason shows in them.
+            if code == ErrorCode::PairingRejected && state != InvitationState::Committed {
+                assert_eq!(
+                    told.message, NO_LONGER_OPEN,
+                    "an invitation in {state:?} is told with no reason"
+                );
+            }
         }
     }
 
