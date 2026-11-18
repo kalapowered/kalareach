@@ -17,11 +17,16 @@
 //! the checks that each piece calls, the session guard that a function holds where it calls them,
 //! read from the text before the call, and the session that each call hands on, read from the
 //! call's argument. The dispatch barrier's guard is not read here: the compiler holds it for nine
-//! functions that take a borrow of it as a parameter, and scope alone holds the rest. What the
-//! roster says of a second take of the boundary is a count: for every name that takes the
-//! boundary (a list that a person keeps), the number of times that it stands in the code of each
-//! file of the crate (`taker` and `mention` rows), so a take that stands anywhere but in a listed
-//! place changes a number and fails the main case.
+//! functions that take a borrow of it as a parameter, and scope alone holds the rest. A second take
+//! of the boundary by the thread that holds it is ended by the waiting take itself, which panics
+//! (`service/boundary.rs`); what this roster says of it is for a person to read. For every name that
+//! takes the boundary (a list that a person keeps) it counts the times that the name stands in the
+//! code of each function of each file of the crate, test modules included (`taker` and `mention`
+//! rows), and it reads two rules on them (a mention stands in a taker or an async function, and in
+//! no function that takes a guard); it counts the calls of the boundary's own mutex by function
+//! (`rawtake` rows) and the words that bring in source or run a future to its end (`reference`
+//! rows). A new mention changes a number and fails the main case, so that a person reads it. The
+//! rows prove nothing about the property.
 //!
 //! The cases after the first plant a fault in the real source and show the scan reporting it with
 //! the finding that names the place: a take in a function that may take none, a clock reader that
@@ -35,6 +40,13 @@
 //! is gone. Two cases plant a reading kept under the contract's lock in the proven or the wall
 //! reader; the take that they find is the lock of the helper that keeps the reading
 //! (`wall_reading`), so their finding names that helper and not the call that reaches it.
+//!
+//! Further cases plant a mention of a name that takes the boundary and show the findings that name
+//! the function: in the first admission, in an argument, after the prepared pass, as a function
+//! value, by the wrapper, in a new function (sync, or in another file), a plain call of each sync
+//! wrapper under the held boundary, a take moved from one function to another, a take in a test
+//! helper and in a test module that a macro strips; a new method over the boundary's own mutex; an
+//! `include!`, a path attribute and a `block_on`; and a session held where either entry is called.
 
 #[path = "standing_scan/mod.rs"]
 mod scan;
@@ -253,42 +265,102 @@ fn no_session_handed_to_the_second_limits_call_is_reported() {
 }
 
 /// The finding that a plant of one more mention of a name that takes the boundary brings.
-fn mention_finding(file: &str, name: &str, count: usize, row: usize) -> String {
+fn mention_finding(file: &str, function: &str, name: &str, count: usize, row: usize) -> String {
     format!(
-        "crates/kr-worker/src/{file} mentions {name} {count} time(s) and its mention row says {row}: "
+        "crates/kr-worker/src/{file} {function} mentions {name} {count} time(s) and its mention row says {row}: "
     )
 }
 
-/// The one finding of a plant that is read as a changed number of mentions.
-fn only_mentions(found: &[String], file: &str, name: &str, count: usize, row: usize) {
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert!(
-        found[0].starts_with(&mention_finding(file, name, count, row)),
-        "{found:?}"
-    );
+/// The finding of the rule that a mention stands in a taker or in an async function.
+fn sync_finding(file: &str, function: &str, name: &str) -> String {
+    format!(
+        "crates/kr-worker/src/{file} {function} mentions {name} and is neither a taker nor an async function: "
+    )
 }
+
+/// The finding of the rule that a function with a guard parameter mentions no taker.
+fn guard_finding(file: &str, function: &str, name: &str) -> String {
+    format!(
+        "crates/kr-worker/src/{file} {function} takes a DispatchGuard, so it runs under the dispatch boundary, and mentions {name}: "
+    )
+}
+
+/// The findings of a plant are exactly these, each one the beginning of one finding.
+fn findings_are(found: &[String], expected: &[String]) {
+    assert_eq!(
+        found.len(),
+        expected.len(),
+        "{found:?} against {expected:?}"
+    );
+    for beginning in expected {
+        assert_eq!(
+            found
+                .iter()
+                .filter(|line| line.starts_with(beginning.as_str()))
+                .count(),
+            1,
+            "{beginning} is not one finding of {found:?}"
+        );
+    }
+}
+
+/// The one finding of a plant that is read as a changed number of mentions.
+fn only_mentions(
+    found: &[String],
+    file: &str,
+    function: &str,
+    name: &str,
+    count: usize,
+    row: usize,
+) {
+    findings_are(found, &[mention_finding(file, function, name, count, row)]);
+}
+
+/// The real tree with each `before` replaced by its `after`, in the file `file`.
+fn planted_all(file: &str, edits: &[(&str, &str)]) -> Vec<String> {
+    let mut files = scan::tree();
+    let (_, source) = files
+        .iter_mut()
+        .find(|(name, _)| name == file)
+        .expect("the file is in the tree");
+    for (before, after) in edits {
+        assert_eq!(source.matches(before).count(), 1, "{before}");
+        *source = source.replace(before, after);
+    }
+    scan::violations(&files, &roster(), TAKES)
+}
+
+const REVALIDATE: &str = "    fn revalidate_time(&self, _barrier: &DispatchGuard<'_>) {\n";
+const RECEIPTED_CALL: &str = "            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))";
 
 #[test]
 fn a_take_of_the_dispatch_boundary_planted_in_the_first_admission_is_reported() {
-    // The first admission runs inside the barrier that its caller holds, so a take of the boundary
-    // in its own body would wait on itself: the roster counts the names that take it, so the number
-    // of mentions of `take_boundary` is one more, wherever the take stands.
+    // The first admission runs inside the boundary that its caller holds, so a take of the boundary
+    // in its own body would wait on itself: the count of `take_boundary` in `receipted` is one more,
+    // and `receipted` is a sync function that is no taker and has a guard parameter.
     let found = planted(
         SERVICE,
         "        let actor_id = caller.actor_id.clone();\n        self.wait_inside_boundary();\n",
         "        let actor_id = caller.actor_id.clone();\n        let _again = self.take_boundary();\n        self.wait_inside_boundary();\n",
     );
-    only_mentions(&found, "service.rs", "take_boundary", 8, 7);
+    findings_are(
+        &found,
+        &[
+            mention_finding("service.rs", "receipted", "take_boundary", 1, 0),
+            sync_finding("service.rs", "receipted", "take_boundary"),
+            guard_finding("service.rs", "receipted", "take_boundary"),
+        ],
+    );
 }
 
 #[test]
 fn a_take_of_the_dispatch_boundary_inside_an_argument_of_the_first_admission_is_reported() {
     let found = planted(
         SERVICE,
-        "            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
+        RECEIPTED_CALL,
         "            Tried::Done(self.receipted({ let _again = self.take_boundary(); state }, mutation, method, entry, caller, freshness, &barrier))",
     );
-    only_mentions(&found, "service.rs", "take_boundary", 8, 7);
+    only_mentions(&found, "service.rs", "receipt_once", "take_boundary", 1, 0);
 }
 
 #[test]
@@ -298,17 +370,17 @@ fn a_take_of_the_dispatch_boundary_after_the_prepared_pass_is_reported() {
         "            Tried::Done((pending, finished))",
         "            let _again = self.take_boundary();\n            Tried::Done((pending, finished))",
     );
-    only_mentions(&found, "service.rs", "take_boundary", 8, 7);
+    only_mentions(&found, "service.rs", "prepared_once", "take_boundary", 1, 0);
 }
 
 #[test]
 fn a_function_value_of_a_take_of_the_dispatch_boundary_is_reported() {
     let found = planted(
         SERVICE,
-        "            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
+        RECEIPTED_CALL,
         "            let take = Self::take_boundary;\n            let _again = take(self);\n            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
     );
-    only_mentions(&found, "service.rs", "take_boundary", 8, 7);
+    only_mentions(&found, "service.rs", "receipt_once", "take_boundary", 1, 0);
 }
 
 #[test]
@@ -317,10 +389,10 @@ fn a_try_of_the_dispatch_boundary_by_the_wrapper_is_reported() {
     // and a person reads it all the same.
     let found = planted(
         SERVICE,
-        "            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
+        RECEIPTED_CALL,
         "            let _again = self.try_boundary();\n            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
     );
-    only_mentions(&found, "service.rs", "try_boundary", 5, 4);
+    only_mentions(&found, "service.rs", "receipt_once", "try_boundary", 2, 1);
 }
 
 #[test]
@@ -330,17 +402,126 @@ fn a_function_that_takes_the_dispatch_boundary_and_that_nothing_lists_is_reporte
         "    /// Takes the dispatch boundary when nobody holds it, and never waits.\n    fn try_boundary(",
         "    fn second_take(&self) {\n        let _again = self.try_take_boundary();\n    }\n\n    /// Takes the dispatch boundary when nobody holds it, and never waits.\n    fn try_boundary(",
     );
-    only_mentions(&found, "service.rs", "try_take_boundary", 3, 2);
+    findings_are(
+        &found,
+        &[
+            mention_finding("service.rs", "second_take", "try_take_boundary", 1, 0),
+            sync_finding("service.rs", "second_take", "try_take_boundary"),
+        ],
+    );
 }
 
 #[test]
 fn a_call_of_a_blocking_taker_planted_in_a_body_that_runs_under_the_boundary_is_reported() {
     let found = planted(
         SERVICE,
-        "    fn revalidate_time(&self, _barrier: &DispatchGuard<'_>) {\n",
-        "    fn revalidate_time(&self, _barrier: &DispatchGuard<'_>) {\n        let _ = self.maintain_once();\n",
+        REVALIDATE,
+        &format!("{REVALIDATE}        let _ = self.maintain_once();\n"),
     );
-    only_mentions(&found, "service.rs", "maintain_once", 3, 2);
+    findings_are(
+        &found,
+        &[
+            mention_finding("service.rs", "revalidate_time", "maintain_once", 1, 0),
+            sync_finding("service.rs", "revalidate_time", "maintain_once"),
+            guard_finding("service.rs", "revalidate_time", "maintain_once"),
+        ],
+    );
+}
+
+#[test]
+fn a_plain_call_of_each_sync_wrapper_of_a_taker_under_the_held_boundary_is_reported() {
+    // The five sync functions that take the boundary through a taker are takers themselves: a call
+    // of one of them under the held boundary changes a number, whatever the file's totals.
+    for (name, call) in [
+        ("maintain_pass", "let _ = self.maintain_pass();"),
+        ("maintain_now", "self.maintain_now();"),
+        (
+            "present_once",
+            "let _ = self.present_once(&mut None, &nonce, token);",
+        ),
+        (
+            "receipt_once",
+            "let _ = self.receipt_once(state, mutation, method, entry, caller, freshness);",
+        ),
+        (
+            "prepared_once",
+            "let _ = self.prepared_once(state, &mut None);",
+        ),
+    ] {
+        let found = planted(
+            SERVICE,
+            REVALIDATE,
+            &format!("{REVALIDATE}        {call}\n"),
+        );
+        findings_are(
+            &found,
+            &[
+                mention_finding("service.rs", "revalidate_time", name, 1, 0),
+                sync_finding("service.rs", "revalidate_time", name),
+                guard_finding("service.rs", "revalidate_time", name),
+            ],
+        );
+    }
+}
+
+#[test]
+fn a_new_sync_wrapper_of_a_blocking_taker_is_reported() {
+    let found = planted(
+        SERVICE,
+        "    fn maintain_pass(&self) -> MaintenancePass {",
+        "    fn maintain_twice(&self) {\n        let _ = self.maintain_once();\n    }\n\n    fn maintain_pass(&self) -> MaintenancePass {",
+    );
+    findings_are(
+        &found,
+        &[
+            mention_finding("service.rs", "maintain_twice", "maintain_once", 1, 0),
+            sync_finding("service.rs", "maintain_twice", "maintain_once"),
+        ],
+    );
+}
+
+#[test]
+fn a_taker_mentioned_in_a_function_that_takes_a_guard_is_reported() {
+    let found = planted(
+        SERVICE,
+        "    fn fence_what_is_owed(&self, barrier: &DispatchGuard<'_>) {\n",
+        "    fn fence_what_is_owed(&self, barrier: &DispatchGuard<'_>) {\n        let _again = self.try_boundary();\n",
+    );
+    findings_are(
+        &found,
+        &[
+            mention_finding("service.rs", "fence_what_is_owed", "try_boundary", 1, 0),
+            sync_finding("service.rs", "fence_what_is_owed", "try_boundary"),
+            guard_finding("service.rs", "fence_what_is_owed", "try_boundary"),
+        ],
+    );
+}
+
+#[test]
+fn the_take_of_the_storage_recovery_moved_to_the_time_revalidation_is_reported() {
+    // The file's total of `take_boundary` stays; the two functions' numbers change.
+    let found = planted_all(
+        SERVICE,
+        &[
+            (
+                "            let _barrier = self\n                .take_boundary()\n                .expect(\"the dispatch barrier is not poisoned\");\n            self.runtime.session().recover_journal();",
+                "            let _barrier = self\n                .stand_in()\n                .expect(\"the dispatch barrier is not poisoned\");\n            self.runtime.session().recover_journal();",
+            ),
+            (
+                REVALIDATE,
+                &format!("{REVALIDATE}        let _again = self.take_boundary();\n"),
+            ),
+        ],
+    );
+    findings_are(
+        &found,
+        &[
+            mention_finding("service.rs", "recover_storage_now", "take_boundary", 0, 1),
+            mention_finding("service.rs", "revalidate_time", "take_boundary", 1, 0),
+            sync_finding("service.rs", "revalidate_time", "take_boundary"),
+            guard_finding("service.rs", "revalidate_time", "take_boundary"),
+        ],
+    );
 }
 
 #[test]
@@ -350,12 +531,12 @@ fn a_take_planted_in_another_file_of_the_crate_is_reported() {
         "impl WorkerService {\n    /// Starts a pass of the standing function in `mode`",
         "impl WorkerService {\n    fn rogue(&self) {\n        let _again = self.take_boundary();\n    }\n\n    /// Starts a pass of the standing function in `mode`",
     );
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert!(
-        found[0].starts_with(
-            "crates/kr-worker/src/service/standing.rs mentions take_boundary 1 time(s) and its mention row says 0: "
-        ),
-        "{found:?}"
+    findings_are(
+        &found,
+        &[
+            mention_finding("service/standing.rs", "rogue", "take_boundary", 1, 0),
+            sync_finding("service/standing.rs", "rogue", "take_boundary"),
+        ],
     );
 }
 
@@ -366,14 +547,15 @@ fn a_taker_that_is_renamed_leaves_a_row_with_no_mention() {
         "    pub fn recover_storage_now(&self) {",
         "    pub fn recover_storage_later(&self) {",
     );
-    assert_eq!(found.len(), 2, "{found:?}");
-    assert!(
-        found[0].starts_with(&mention_finding("service.rs", "recover_storage_now", 0, 1)),
-        "{found:?}"
-    );
-    assert_eq!(
-        found[1],
-        "taker recover_storage_now: no file of the crate mentions it"
+    findings_are(
+        &found,
+        &[
+            sync_finding("service.rs", "recover_storage_later", "take_boundary"),
+            mention_finding("service.rs", "(declaration)", "recover_storage_now", 0, 1),
+            mention_finding("service.rs", "recover_storage_later", "take_boundary", 1, 0),
+            mention_finding("service.rs", "recover_storage_now", "take_boundary", 0, 1),
+            "taker recover_storage_now: no file of the crate mentions it".to_owned(),
+        ],
     );
 }
 
@@ -381,10 +563,169 @@ fn a_taker_that_is_renamed_leaves_a_row_with_no_mention() {
 fn a_name_in_a_comment_or_a_string_is_not_a_mention() {
     let found = planted(
         SERVICE,
-        "    fn revalidate_time(&self, _barrier: &DispatchGuard<'_>) {\n",
-        "    fn revalidate_time(&self, _barrier: &DispatchGuard<'_>) {\n        // self.take_boundary() would wait on itself.\n        let _words = \"take_boundary\";\n",
+        REVALIDATE,
+        &format!(
+            "{REVALIDATE}        // self.take_boundary() would wait on itself.\n        let _words = \"take_boundary\";\n"
+        ),
     );
     assert_eq!(found, Vec::<String>::new());
+}
+
+#[test]
+fn a_take_that_a_macro_hides_in_a_test_module_it_strips_is_reported() {
+    // The macro drops the attribute and the module around the take, so a shipped build runs it; the
+    // mentions are counted in test modules too.
+    let found = planted(
+        SERVICE,
+        RECEIPTED_CALL,
+        "            macro_rules! again {\n                (#[$a:meta] mod ignored { $($body:tt)* }) => { $($body)* };\n            }\n            again! {\n                #[cfg(test)] mod ignored {\n                    let _again = self.take_boundary();\n                }\n            }\n            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
+    );
+    only_mentions(&found, "service.rs", "receipt_once", "take_boundary", 1, 0);
+}
+
+#[test]
+fn a_take_in_a_test_helper_of_the_crate_is_reported() {
+    let found = planted(
+        PIECES,
+        "impl WorkerService {\n    /// Starts a pass of the standing function in `mode`",
+        "#[cfg(test)]\nmod rogue {\n    fn again(service: &super::WorkerService) {\n        let _again = service.take_boundary();\n    }\n}\n\nimpl WorkerService {\n    /// Starts a pass of the standing function in `mode`",
+    );
+    findings_are(
+        &found,
+        &[
+            mention_finding("service/standing.rs", "again", "take_boundary", 1, 0),
+            sync_finding("service/standing.rs", "again", "take_boundary"),
+        ],
+    );
+}
+
+const BOUNDARY: &str = "crates/kr-worker/src/service/boundary.rs";
+
+/// The finding that a plant of one more take of the boundary's own mutex brings.
+fn rawtake_finding(function: &str, name: &str, count: usize, row: usize) -> String {
+    format!("{BOUNDARY} {function} calls {name} {count} time(s) and its rawtake row says {row}: ")
+}
+
+#[test]
+fn a_new_method_over_the_boundarys_take_by_the_service_is_reported() {
+    let found = planted(
+        BOUNDARY,
+        "impl WorkerService {\n    /// Takes the service's dispatch boundary, waiting for whoever holds it.",
+        "impl WorkerService {\n    pub(super) fn hold_for_a_moment(&self) -> std::sync::LockResult<DispatchGuard<'_>> {\n        self.dispatch.lock()\n    }\n\n    /// Takes the service's dispatch boundary, waiting for whoever holds it.",
+    );
+    findings_are(
+        &found,
+        &[rawtake_finding("hold_for_a_moment", "lock", 1, 0)],
+    );
+}
+
+#[test]
+fn a_new_method_over_the_boundarys_own_mutex_is_reported() {
+    let found = planted(
+        BOUNDARY,
+        "    /// Completes when the boundary is next let go.",
+        "    fn another_take(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, ()>> {\n        self.lock.lock()\n    }\n\n    /// Completes when the boundary is next let go.",
+    );
+    findings_are(&found, &[rawtake_finding("another_take", "lock", 1, 0)]);
+}
+
+#[test]
+fn a_try_planted_in_the_service_take_of_the_boundary_is_reported() {
+    let found = planted(
+        BOUNDARY,
+        "    pub(super) fn take_boundary(&self) -> std::sync::LockResult<DispatchGuard<'_>> {\n        self.dispatch.lock()",
+        "    pub(super) fn take_boundary(&self) -> std::sync::LockResult<DispatchGuard<'_>> {\n        drop(self.dispatch.try_lock());\n        self.dispatch.lock()",
+    );
+    findings_are(
+        &found,
+        &[rawtake_finding("take_boundary", "try_lock", 1, 0)],
+    );
+}
+
+#[test]
+fn a_raw_take_that_is_gone_from_the_boundary_is_reported() {
+    let found = planted(
+        BOUNDARY,
+        "        self.dispatch.try_lock()\n",
+        "        self.dispatch.try_lock_stand_in()\n",
+    );
+    findings_are(
+        &found,
+        &[rawtake_finding("try_take_boundary", "try_lock", 0, 1)],
+    );
+}
+
+/// The finding that a plant of one more word that brings in source brings.
+fn reference_finding(file: &str, word: &str, count: usize, row: usize) -> String {
+    format!("crates/kr-worker/src/{file} has {count} `{word}` and its reference row says {row}: ")
+}
+
+#[test]
+fn an_include_planted_in_the_crate_is_reported() {
+    let found = planted(
+        SERVICE,
+        REVALIDATE,
+        &format!("{REVALIDATE}        include!(\"second_take.inc\");\n"),
+    );
+    findings_are(&found, &[reference_finding("service.rs", "include", 1, 0)]);
+}
+
+#[test]
+fn a_path_attribute_planted_in_the_crate_is_reported() {
+    let found = planted(
+        SERVICE,
+        "    /// Takes the dispatch boundary when nobody holds it, and never waits.\n    fn try_boundary(",
+        "    #[path = \"second_take.rs\"]\n    mod second_take;\n\n    /// Takes the dispatch boundary when nobody holds it, and never waits.\n    fn try_boundary(",
+    );
+    findings_are(&found, &[reference_finding("service.rs", "path", 1, 0)]);
+}
+
+#[test]
+fn a_block_on_planted_in_the_crate_is_reported() {
+    let found = planted(
+        SERVICE,
+        REVALIDATE,
+        &format!("{REVALIDATE}        futures_util::future::block_on(self.again());\n"),
+    );
+    findings_are(&found, &[reference_finding("service.rs", "block_on", 1, 0)]);
+    let found = planted(
+        "crates/kr-worker/src/bin/kr-worker.rs",
+        "    match runtime.block_on(run(arguments)) {",
+        "    runtime.block_on(run(arguments));\n    match runtime.block_on(run(arguments)) {",
+    );
+    findings_are(
+        &found,
+        &[reference_finding("bin/kr-worker.rs", "block_on", 2, 1)],
+    );
+}
+
+#[test]
+fn a_session_held_where_the_first_admission_is_called_is_reported() {
+    let found = planted(
+        SERVICE,
+        RECEIPTED_CALL,
+        "            let _session = self.runtime.session();\n            Tried::Done(self.receipted(state, mutation, method, entry, caller, freshness, &barrier))",
+    );
+    only_finding(
+        &found,
+        "service.rs receipt_once calls receipted holding {\"SES\"} and its held row says {}",
+    );
+}
+
+#[test]
+fn a_session_taken_before_the_call_of_the_prepared_path_is_reported() {
+    // The prepared path takes the session where the accept's hold does, inside `continue_prepared`
+    // and not before it: a session held in `prepared_once` at the call is refused by the same kind
+    // of row.
+    let found = planted(
+        SERVICE,
+        "            let ReadyPreparation {\n",
+        "            let _session = self.runtime.session();\n            let ReadyPreparation {\n",
+    );
+    only_finding(
+        &found,
+        "service.rs prepared_once calls continue_prepared holding {\"SES\"} and its held row says {}",
+    );
 }
 
 #[test]

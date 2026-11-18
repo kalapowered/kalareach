@@ -169,9 +169,13 @@ only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
 # of this crate's `src`), or what the rest of the work under the boundary does with its guard (the
 # expiry task's release, the maintenance pass's session work, the storage recovery and the answers:
 # scope alone holds them).
+# The two rows below that say `none` at the entries' callers (`receipt_once` and `prepared_once`)
+# read the session only: a session held where either calls its entry is a finding, since the entry
+# takes the session itself.
 # The first admission asks the authority and the limits under no guard that the reader sees, the
 # envelope under a session of its own, and takes the session for the limits itself.
 only receipted crates/kr-worker/src/service.rs receipt_once 1
+held crates/kr-worker/src/service.rs receipt_once receipted none
 only admit_and_dispatch crates/kr-worker/src/service.rs receipted 1
 held crates/kr-worker/src/service.rs receipted authority none
 held crates/kr-worker/src/service.rs receipted envelope SES
@@ -245,6 +249,7 @@ site crates/kr-worker/src/broker/bridge.rs attested_thread state 1
 only dispatch_accepted crates/kr-worker/src/service.rs admit_and_dispatch 1
 only dispatch_accepted crates/kr-worker/src/service.rs continue_prepared 1
 only continue_prepared crates/kr-worker/src/service.rs prepared_once 1
+held crates/kr-worker/src/service.rs prepared_once continue_prepared none
 held crates/kr-worker/src/service.rs continue_prepared dispatch_accepted SES
 supplies crates/kr-worker/src/service.rs admit_and_dispatch dispatch_accepted 1 session
 supplies crates/kr-worker/src/service.rs continue_prepared dispatch_accepted 1 session
@@ -459,17 +464,32 @@ calls crates/kr-worker/src/session.rs geometry geometry crates/kr-worker/src/att
 calls crates/kr-worker/src/session.rs lease lease crates/kr-worker/src/input_domain.rs
 calls crates/kr-worker/src/session.rs output_cursor next_cursor crates/kr-worker/src/history.rs
 
-# The takes of the dispatch boundary, by enumeration. A take under the held boundary waits on itself,
-# and every reading of the shape of a take (before a call, in a binding, in a body that the scan
-# reads) was found too narrow. So the roster lists, by hand, every function that takes the boundary
-# (the functions of the nine take sites) and the two methods that take it, and for each name the
-# number of times that it stands in the code of each file of the crate: a declaration, a call, an
-# argument, a statement after a call, a function value. A number that differs fails the main case
-# wherever the new mention stands. What to do: read the new text (the lock audit's table of takers is
-# the record of who may take the boundary, and where), then set the row; a new function that takes
-# the boundary is added as a `taker` row first, with its mentions. The one limit, which the crate
-# does not hold: a take that is reached with none of these names in the text (a name that a macro
-# makes, or a function that a macro writes).
+# The takes of the dispatch boundary, listed for a person to read. The waiting take of the boundary
+# panics when the calling thread already holds it (`service/boundary.rs`), and that, not these rows,
+# is what ends a second take. These rows show a person each new mention of a function that takes the
+# boundary, by file and function, so that new text that could take it twice is read.
+#
+# What each kind says. `taker <name>` is a function that takes the boundary (one of the nine take
+# sites, a wrapper of one, or one of the two methods that take it); the lock audit's table of takers
+# is the record of who may take it, and where. `mention <name> <file> <function> <count>` is how many
+# times the taker stands in the code of that function, a test module included (`(declaration)` is the
+# name after `fn`, and `(top)` a place outside every function). A number that differs fails the main
+# case wherever the new text stands. Two rules read each mention that is not a declaration: it stands
+# in a taker or in an async function (a sync function that calls a taker takes the boundary too, so
+# it is a taker), and not in a function that takes a `DispatchGuard` parameter. `rawtake <file>
+# <function> <name> <count>` is the calls of the boundary's own mutex (`lock` and `try_lock`) in the
+# product text of `service/boundary.rs`, by function. `reference <word> <file> <count>` is the
+# `include!`, the path attributes and the `block_on` in the code of a file (none but the worker
+# program's own `block_on`, which runs the whole program).
+#
+# What to do when a row fails: read the new text, then set the row; a new function that takes the
+# boundary is added as a `taker` row first, with its mentions, and to the lock audit's table of
+# takers.
+#
+# What the rows do not see: a call that a macro writes (one mention at the definition, none at each
+# use), an async taker that a sync body runs to its end (the count of `block_on` shows a new such
+# body), and a take on a thread that the holder waits for. A take that moves inside one function
+# keeps that function's number.
 taker take_boundary
 taker try_take_boundary
 taker try_boundary
@@ -478,17 +498,53 @@ taker fence_what_is_owed_for_tests
 taker hold_the_boundary_for_this_announcement
 taker release_expired_grants
 taker maintain_once
+taker maintain_pass
+taker maintain_now
+taker present_once
+taker receipt_once
+taker prepared_once
 taker recover_storage_now
 taker acknowledge_revision
-mention acknowledge_revision crates/kr-worker/src/service.rs 2
-mention fence_what_is_owed_for_tests crates/kr-worker/src/service.rs 1
-mention hold_the_boundary_for_this_announcement crates/kr-worker/src/service.rs 2
-mention hold_the_dispatch_boundary crates/kr-worker/src/service.rs 1
-mention maintain_once crates/kr-worker/src/service.rs 2
-mention recover_storage_now crates/kr-worker/src/service.rs 1
-mention release_expired_grants crates/kr-worker/src/service.rs 2
-mention take_boundary crates/kr-worker/src/service.rs 7
-mention take_boundary crates/kr-worker/src/service/boundary.rs 1
-mention try_boundary crates/kr-worker/src/service.rs 4
-mention try_take_boundary crates/kr-worker/src/service.rs 2
-mention try_take_boundary crates/kr-worker/src/service/boundary.rs 1
+mention acknowledge_revision crates/kr-worker/src/service.rs (declaration) 1
+mention acknowledge_revision crates/kr-worker/src/service.rs handle 1
+mention fence_what_is_owed_for_tests crates/kr-worker/src/service.rs (declaration) 1
+mention hold_the_boundary_for_this_announcement crates/kr-worker/src/service.rs (declaration) 1
+mention hold_the_boundary_for_this_announcement crates/kr-worker/src/service.rs acknowledge_revision 1
+mention hold_the_dispatch_boundary crates/kr-worker/src/service.rs (declaration) 1
+mention maintain_now crates/kr-worker/src/service.rs (declaration) 1
+mention maintain_once crates/kr-worker/src/service.rs (declaration) 1
+mention maintain_once crates/kr-worker/src/service.rs maintain_pass 1
+mention maintain_pass crates/kr-worker/src/service.rs (declaration) 1
+mention maintain_pass crates/kr-worker/src/service.rs maintain 1
+mention maintain_pass crates/kr-worker/src/service.rs maintain_now 1
+mention prepared_once crates/kr-worker/src/service.rs (declaration) 1
+mention prepared_once crates/kr-worker/src/service.rs dispatch_prepared 1
+mention present_once crates/kr-worker/src/service.rs (declaration) 1
+mention present_once crates/kr-worker/src/service.rs present_generation 1
+mention receipt_once crates/kr-worker/src/service.rs (declaration) 1
+mention receipt_once crates/kr-worker/src/service.rs mutation 1
+mention recover_storage_now crates/kr-worker/src/service.rs (declaration) 1
+mention release_expired_grants crates/kr-worker/src/service.rs (declaration) 1
+mention release_expired_grants crates/kr-worker/src/service.rs serve 1
+mention take_boundary crates/kr-worker/src/service.rs fence_what_is_owed_for_tests 1
+mention take_boundary crates/kr-worker/src/service.rs hold_the_boundary_for_this_announcement 2
+mention take_boundary crates/kr-worker/src/service.rs hold_the_dispatch_boundary 1
+mention take_boundary crates/kr-worker/src/service.rs maintain_once 1
+mention take_boundary crates/kr-worker/src/service.rs recover_storage_now 1
+mention take_boundary crates/kr-worker/src/service.rs release_expired_grants 1
+mention take_boundary crates/kr-worker/src/service/boundary.rs (declaration) 1
+mention take_boundary crates/kr-worker/src/service/boundary.rs a_guard_of_another_service_is_refused_by_the_first_admission 2
+mention try_boundary crates/kr-worker/src/service.rs (declaration) 1
+mention try_boundary crates/kr-worker/src/service.rs prepared_once 1
+mention try_boundary crates/kr-worker/src/service.rs present_once 1
+mention try_boundary crates/kr-worker/src/service.rs receipt_once 1
+mention try_take_boundary crates/kr-worker/src/service.rs acknowledge_revision 1
+mention try_take_boundary crates/kr-worker/src/service.rs try_boundary 1
+mention try_take_boundary crates/kr-worker/src/service/boundary.rs (declaration) 1
+mention try_take_boundary crates/kr-worker/src/service/boundary.rs a_guard_of_another_service_is_refused_by_the_first_admission 2
+rawtake crates/kr-worker/src/service/boundary.rs lock lock 1
+rawtake crates/kr-worker/src/service/boundary.rs try_lock try_lock 1
+rawtake crates/kr-worker/src/service/boundary.rs take_boundary lock 1
+rawtake crates/kr-worker/src/service/boundary.rs try_take_boundary try_lock 1
+# The one `block_on` of the crate: the worker program runs its whole async main on it.
+reference block_on crates/kr-worker/src/bin/kr-worker.rs 1
