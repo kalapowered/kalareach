@@ -65,13 +65,6 @@ struct Host {
     _temp: kr_ipc::testing::TempHost,
 }
 
-impl Host {
-    /// The tree the daemon runs on.
-    fn root(&self) -> &Path {
-        self._temp.root()
-    }
-}
-
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -115,7 +108,6 @@ async fn host(shell_packages: Option<std::path::PathBuf>) -> Host {
 
 fn create(
     environment_id: EnvironmentId,
-    root: &Path,
     mode: ShellMode,
     shell: Option<&str>,
 ) -> SessionCreateParams {
@@ -127,7 +119,7 @@ fn create(
         cwd: Nullable::some("/".to_owned()),
         dimensions: Nullable::null(),
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
-        environment_snapshot: StartedEnvironment::within(root).snapshot_home(),
+        environment_snapshot: Vec::new(),
         palette: Nullable::null(),
         launch_profile: kr_protocol::session::LaunchProfile::default(),
         terminal: Nullable::null(),
@@ -213,7 +205,7 @@ async fn a_managed_create_without_a_qualified_package_is_refused_before_anything
             Method::SessionCreate,
             ActionId::new(kr_ipc::new_uuid()),
             target(host.environment_id),
-            &create(host.environment_id, host.root(), ShellMode::Managed, None),
+            &create(host.environment_id, ShellMode::Managed, None),
         )
         .await
         .expect("reaches the daemon")
@@ -227,12 +219,7 @@ async fn a_managed_create_without_a_qualified_package_is_refused_before_anything
             Method::SessionCreate,
             ActionId::new(kr_ipc::new_uuid()),
             target(host.environment_id),
-            &create(
-                host.environment_id,
-                host.root(),
-                ShellMode::Managed,
-                Some("/bin/ksh"),
-            ),
+            &create(host.environment_id, ShellMode::Managed, Some("/bin/ksh")),
         )
         .await
         .expect("reaches the daemon")
@@ -252,7 +239,6 @@ async fn a_managed_create_without_a_qualified_package_is_refused_before_anything
             target(host.environment_id),
             &create(
                 host.environment_id,
-                host.root(),
                 ShellMode::Managed,
                 Some("zsh -c 'make release'"),
             ),
@@ -724,13 +710,11 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
         .await
         .expect("connects");
 
-    let mut request = create(
-        environment_id,
-        temp.root(),
-        ShellMode::NativeCompat,
-        Some("/bin/sh"),
-    );
+    let mut request = create(environment_id, ShellMode::NativeCompat, Some("/bin/sh"));
+    // A create that is shown takes its creator's snapshot and nothing of the daemon's, so the
+    // snapshot gives the shell the home of the tree; an invisible create carries none.
     request.presentation = Presentation::Terminal;
+    request.environment_snapshot = StartedEnvironment::within(temp.root()).snapshot_home();
     request.cwd = Nullable::some(temp.root().display().to_string());
     let mutation = client
         .compose(
@@ -1049,7 +1033,6 @@ impl Daemon {
             .expect("connects");
         let mut request = create(
             self.environment_id,
-            self.tree.root(),
             ShellMode::NativeCompat,
             Some(&script.display().to_string()),
         );

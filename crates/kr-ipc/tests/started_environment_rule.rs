@@ -339,6 +339,13 @@ const NO_WORKER_CREATES: &str = "every daemon it starts names a worker program t
 const NO_WORKER_CREATES_REMOVAL: &str = "none while its daemons name a worker program that does not exist; the condition is \
      tested, and the row goes when a daemon of the source gets a real worker";
 
+/// Why a source writes no snapshot for a create it sends: the create is invisible.
+const INVISIBLE_CREATE: &str = "its place is an invisible create, which the daemon refuses when it carries a variable (a \
+     session started with the host's environment carries none); the session takes the host's \
+     environment, which the harness gives the daemon";
+const INVISIBLE_CREATE_REMOVAL: &str =
+    "none while the daemon refuses a variable on an invisible create";
+
 /// The sources that write a creator's snapshot of the environment without the helper's home, with
 /// the number of places each excuses.
 const SNAPSHOTS: &[Counted] = &[
@@ -365,11 +372,13 @@ const SNAPSHOTS: &[Counted] = &[
     },
     Counted {
         file: "crates/kr-cli/tests/update.rs",
-        places: 1,
-        reason: "the place is the bytes of a recorded create that the case writes into a daemon's \
-                 journal, to read back that its variables were not kept; no session starts from them",
-        removal: "none while the function only returns the recorded bytes",
-        holds: |text| text.contains("fn recorded_create(secret: &str) -> Vec<u8>"),
+        places: 2,
+        reason: "one place is the bytes of a recorded create that the case writes into a daemon's journal, to read back that its variables were not kept, and no session starts from them; the other is an invisible create, which the daemon refuses when it carries a variable",
+        removal: "none while the function only returns the recorded bytes and the daemon refuses a variable on an invisible create",
+        holds: |text| {
+            text.contains("fn recorded_create(secret: &str) -> Vec<u8>")
+                && text.contains("fn headless_create_params(")
+        },
     },
     Counted {
         file: "crates/kr-controller/tests/a_repeat_of_a_create_that_failed.rs",
@@ -389,12 +398,10 @@ const SNAPSHOTS: &[Counted] = &[
     },
     Counted {
         file: "crates/kr-controller/tests/automation.rs",
-        places: 1,
-        reason: "the place is a create-session node's parameters, which the product refuses when they \
-                 carry a variable: a session a workflow creates takes the host's environment, which \
-                 the harness gives the daemon",
-        removal: "none while a workflow's create-session node may carry no environment",
-        holds: |text| text.contains("fn create_session_node("),
+        places: 3,
+        reason: "every place is an invisible create (a create-session node, which the product also refuses when it carries a variable, and two creates from the client): the daemon refuses an invisible create that carries a variable, and the session takes the host environment that the harness gives the daemon",
+        removal: INVISIBLE_CREATE_REMOVAL,
+        holds: |text| text.contains("fn create_session_node(") && text.contains("fn session_in("),
     },
     Counted {
         file: "crates/kr-controller/tests/barrier.rs",
@@ -466,12 +473,13 @@ const SNAPSHOTS: &[Counted] = &[
     },
     Counted {
         file: "crates/kr-controller/tests/shell.rs",
-        places: 1,
-        reason: "the place is the snapshot a case of the real-worker daemon sends to see what reaches \
-                 the shell; the shell is a placed script that reports its environment and then runs \
-                 a shell that is not a login shell",
-        removal: "none while those cases are about which variables reach the worker",
-        holds: |text| text.contains("exec /bin/sh -i"),
+        places: 2,
+        reason: "the maker of the file's create parameters is invisible, which the daemon refuses when it carries a variable, and the one case that shows its create sets the presentation and the home itself; the other place is the snapshot a case of the real-worker daemon sends to see what reaches the shell, a placed script that reports its environment and then runs a shell that is not a login shell",
+        removal: "none while the daemon refuses a variable on an invisible create, and while those cases are about which variables reach the worker",
+        holds: |text| {
+            text.contains("exec /bin/sh -i")
+                && text.contains("request.presentation = Presentation::Terminal;")
+        },
     },
     Counted {
         file: "crates/kr-worker/tests/session.rs",
@@ -489,6 +497,27 @@ const SNAPSHOTS: &[Counted] = &[
                  the harness gives it",
         removal: "none while the daemon refuses an app's snapshot",
         holds: |text| text.contains("\"presentation\": \"invisible\""),
+    },
+    Counted {
+        file: "crates/kr-controller/tests/binding.rs",
+        places: 2,
+        reason: INVISIBLE_CREATE,
+        removal: INVISIBLE_CREATE_REMOVAL,
+        holds: |text| text.contains("Presentation::Invisible"),
+    },
+    Counted {
+        file: "crates/kr-controller/tests/plugin_runtime.rs",
+        places: 1,
+        reason: INVISIBLE_CREATE,
+        removal: INVISIBLE_CREATE_REMOVAL,
+        holds: |text| text.contains("Presentation::Invisible"),
+    },
+    Counted {
+        file: "crates/kr-worker/tests/launchd_jobs.rs",
+        places: 1,
+        reason: INVISIBLE_CREATE,
+        removal: INVISIBLE_CREATE_REMOVAL,
+        holds: |text| text.contains("Presentation::Invisible"),
     },
 ];
 
@@ -532,7 +561,7 @@ const DAEMON_STARTS: &[Counted] = &[
         places: 1,
         reason: CHILD_DAEMON,
         removal: CHILD_DAEMON_REMOVAL,
-        holds: |text| text.contains("StartedEnvironment::within(self.tree.root()).apply("),
+        holds: |text| text.contains(".apply_keeping(&mut command, &USER_MANAGER_VARIABLES)"),
     },
     Counted {
         file: "crates/kr-controller/tests/plugin_world/mod.rs",
@@ -990,11 +1019,11 @@ fn counted_faults(
             )),
             (count, Some(row)) if count != row.places => faults.push(format!(
                 "{file}: its row counts {} place(s) and the source has {count}, at line(s) {lines:?} \
-                 (the row says: {}; it goes when {})",
+                 (the row says: {}; removal: {})",
                 row.places, row.reason, row.removal
             )),
             (_, Some(row)) if !(row.holds)(text) => faults.push(format!(
-                "{file}: the condition its row rests on no longer holds ({}; it goes when {})",
+                "{file}: the condition its row rests on no longer holds ({}; removal: {})",
                 row.reason, row.removal
             )),
             _ => {}
@@ -1030,12 +1059,7 @@ fn a_test_that_starts_a_program_gives_it_an_environment_of_its_own() {
     let stale: Vec<String> = KEPT
         .iter()
         .filter(|row| !found.iter().any(|(file, _, _)| *file == row.file))
-        .map(|row| {
-            format!(
-                "{} ({}; it goes when {})",
-                row.file, row.reason, row.removal
-            )
-        })
+        .map(|row| format!("{} ({}; removal: {})", row.file, row.reason, row.removal))
         .collect();
     assert!(
         stale.is_empty(),
@@ -1086,7 +1110,7 @@ fn a_source_that_keeps_the_real_environment_on_purpose_still_says_what_its_row_s
         })
         .map(|row| {
             format!(
-                "{} no longer holds `{}` ({}; it goes when {})",
+                "{} no longer holds `{}` ({}; removal: {})",
                 row.file, row.mark, row.reason, row.removal
             )
         })
