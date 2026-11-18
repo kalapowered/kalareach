@@ -5647,7 +5647,7 @@ UUID=2 /data ext4 defaults,nofail 0 2
 
         // 1. The reader's answer: the outcome is unknown, under the detail that was kept. A
         // cancellation that ran again would answer that the operation is unknown, which is a
-        // different refusal, and would record it.
+        // different refusal.
         for _ in 0..2 {
             let repeated = service
                 .project_operation_cancel(&actor, &params, Some(&action))
