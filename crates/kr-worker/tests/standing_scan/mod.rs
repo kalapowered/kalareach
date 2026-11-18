@@ -6,8 +6,9 @@
 //! row with no function and a row outside the scope each fail.
 //!
 //! What it reads. Source text with the comments, the string literals and the test modules taken
-//! out. A call is a name that an opening parenthesis follows; a counted call is one that follows a
-//! `.` or a `::`.
+//! out (the `taker`, `mention` and `reference` rows below read it with the test modules kept). A
+//! call is a name that an opening parenthesis follows; a counted call is one that follows a `.` or a
+//! `::`.
 //!
 //! What it does not see. It reads names and not types: where a name is declared by several
 //! functions, a `calls` row or an `allow` row says which definition a body calls, and the row is
@@ -26,7 +27,10 @@
 //!   maintenance pass's session work, the storage recovery, the answers). The compiler does not
 //!   hold that the guard is the service's own: the two entries `receipted` and `continue_prepared`
 //!   check that before any work, and a test shows the check. A second take under the held barrier
-//!   is held by the `taker` and `mention` rows below, which count names and read no guard;
+//!   is ended by the waiting take itself, which panics when the calling thread holds the boundary
+//!   (`service/boundary.rs`); the `taker`, `mention`, `rawtake` and `reference` rows below show a
+//!   person each new mention of a function that takes the boundary, count names and read no guard,
+//!   and prove nothing about that;
 //! * what a guard is, beyond the names it knows: a `let` that calls `session` (SES) and a
 //!   parameter whose type names `Session` (SES, held or not: a `supplies` row tells two calls
 //!   apart). `let Some(x) =` and `let Ok(x) =` bind `x`, with the initialiser after the pattern,
@@ -76,8 +80,9 @@
 //! crate needs an `allow` row, or the scan reads the crate's function of that name.
 //!
 //! The roster has these kinds of row, one to a line, with `#` for a comment. A kind that holds one
-//! value for a key (`site`, `caller` and `only`, `held`, `supplies`, `mention`) refuses a second row for the
-//! same key, so that a later row never replaces an earlier one:
+//! value for a key (`site`, `caller` and `only`, `held`, `supplies`, `mention`, `rawtake`,
+//! `reference`) refuses a second row for the same key, so that a later row never replaces an
+//! earlier one:
 //!
 //! * `scope <file> <function>`: a function that has to exist and whose body is read. The row seeds
 //!   the read set and judges no call: a call is judged by the boundary and the `site` rows in
@@ -100,21 +105,37 @@
 //! * `held <file> <function> <callee> <guards>`: the guards that `function` holds where it calls
 //!   `callee`, as a comma list of `SES` (the session) or `none`.
 //! * `taker <name>`: a function that takes the dispatch boundary, or one of the two methods that
-//!   take it, in a list that a person keeps (the functions of the nine take sites and the two
-//!   methods). For each `taker` the reader counts, in every file of the crate, the times that the
-//!   name stands in code: a declaration, a call, an argument, a function value. Comments, string
-//!   literals and test modules are taken out.
-//! * `mention <name> <file> <count>`: how many times the `taker` `name` stands in the code of
-//!   `file`; a file with no row has none. A different number in any file fails the main case,
-//!   wherever the new mention stands (an argument, a helper, a statement after a call): a take
-//!   under the held barrier waits on itself, so a person reads the new text and then sets the
-//!   number, adding a `taker` row first for a new function that takes the boundary. One limit,
-//!   which the crate does not hold: a take that is reached with none of these names in the text
-//!   (a name that a macro makes, or a function that a macro writes).
+//!   take it, in a list that a person keeps (the functions of the nine take sites, the sync
+//!   functions that call one of them, and the two methods). For each `taker` the reader counts, in
+//!   every file of the crate, the times that the name stands in code: a declaration, a call, an
+//!   argument, a function value. Comments and string literals are taken out; test modules stay.
+//! * `mention <name> <file> <function> <count>`: how many times the `taker` `name` stands in the
+//!   code of `function` in `file` (`(declaration)` for the name after `fn`, `(top)` for a place
+//!   outside every function); a key with no row has none. A different number fails the main case
+//!   wherever the new mention stands (an argument, a helper, a statement after a call), and the
+//!   finding names the function: a person reads the new text and then sets the number, adding a
+//!   `taker` row first, and an entry in the lock audit's table of takers, for a new function that
+//!   takes the boundary. Two rules read each mention that is not a declaration: it stands in a
+//!   taker or in an `async` function (a sync function that calls a taker takes the boundary too),
+//!   and not in a function that takes a `DispatchGuard` parameter (such a function runs under the
+//!   boundary).
+//! * `rawtake <file> <function> <name> <count>`: how many times `function` calls `lock` or
+//!   `try_lock` in the product text of `file`, for each file that has a row (`service/boundary.rs`,
+//!   whose mutex is private to it): a take that does not go through a taker is a row too.
+//! * `reference <word> <file> <count>`: how many times `include` (followed by `!`), a path
+//!   attribute (`path` after `[`, `(` or `,`, followed by `=`) or `block_on` stands in the code of
+//!   `file`; a file with no row has none. These bring in source that this reading does not see, or
+//!   run a future to its end in a sync body.
 //! * `supplies <file> <function> <callee> <position> <text>`: the argument at `position` (from
 //!   zero) of every call of `callee` from `function`, with its white space taken out, is `text`. A
 //!   row for each argument of one call stands beside the others. It reads what a call hands on
 //!   where `held` reads what is live there.
+//!
+//! What the `taker` and `mention` rows do not see: a call that a macro writes (one mention at the
+//! definition and none at each use), an async taker that a sync body runs to its end (the count of
+//! `block_on` shows a new such body), and a take on a thread that the holder waits for. A function
+//! is known by its name, so two functions of one name in a file share a number, and a take that
+//! moves inside one function keeps that function's number.
 //!
 //! The boundary. A call from any body that the scan reads, scoped or followed, to a name that
 //! several functions of this crate declare fails unless the name is one the scan counts, an
@@ -419,17 +440,27 @@ pub struct Roster {
     /// The functions that take the dispatch boundary and the two methods that take it, by name: a
     /// list that a person keeps.
     pub takers: BTreeSet<String>,
-    /// How many times each such name stands in the code of a file, by name and file.
-    pub mentions: BTreeMap<(String, String), usize>,
+    /// How many times each such name stands in the code of a file, by name, file and function
+    /// (`(declaration)` for the name after `fn`, `(top)` for a place outside every function).
+    pub mentions: BTreeMap<(String, String, String), usize>,
+    /// The calls of the two takes of the boundary's own mutex (`lock` and `try_lock`) in a file that
+    /// has a row, by file, function and name.
+    pub rawtakes: BTreeMap<(String, String, String), usize>,
+    /// How many times a word that brings in source from another place stands in the code of a
+    /// file (`include!`, a path attribute, `block_on`), by word and file.
+    pub references: BTreeMap<(String, String), usize>,
 }
+
+/// The words that `reference` rows count.
+const REFERENCE_WORDS: [&str; 3] = ["include", "path", "block_on"];
 
 /// Reads a roster.
 ///
 /// # Panics
 ///
-/// Panics on a row that is not one of the eleven kinds, and on a row of a kind that holds one value
-/// per key (`site`, `supplies`, `caller` and `only`, `held`, `mention`) whose key an earlier row already
-/// holds: a later row never replaces an earlier one unseen. A `scope`, `outside` or `allow` row
+/// Panics on a row that is not one of the thirteen kinds, and on a row of a kind that holds one value
+/// per key (`site`, `supplies`, `caller` and `only`, `held`, `mention`, `rawtake`, `reference`)
+/// whose key an earlier row already holds: a later row never replaces an earlier one unseen. A `scope`, `outside` or `allow` row
 /// that repeats is a set's member again, and a `calls` row adds a file to the body's set of
 /// targets, so neither can replace anything.
 pub fn parse(roster: &str) -> Roster {
@@ -533,14 +564,40 @@ pub fn parse(roster: &str) -> Roster {
             ["taker", name] => {
                 rows.takers.insert((*name).to_owned());
             }
-            ["mention", name, file, count] => {
+            ["mention", name, file, function, count] => {
                 insert_once(
                     &mut rows.mentions,
-                    ((*name).to_owned(), (*file).to_owned()),
+                    (
+                        (*name).to_owned(),
+                        (*file).to_owned(),
+                        (*function).to_owned(),
+                    ),
                     count.parse().expect("a count"),
                 );
             }
-            other => panic!("a roster row that is none of the eleven kinds: {other:?}"),
+            ["rawtake", file, function, name, count] => {
+                insert_once(
+                    &mut rows.rawtakes,
+                    (
+                        (*file).to_owned(),
+                        (*function).to_owned(),
+                        (*name).to_owned(),
+                    ),
+                    count.parse().expect("a count"),
+                );
+            }
+            ["reference", word, file, count] => {
+                assert!(
+                    REFERENCE_WORDS.contains(word),
+                    "a reference row names one of {REFERENCE_WORDS:?}: {word}"
+                );
+                insert_once(
+                    &mut rows.references,
+                    ((*word).to_owned(), (*file).to_owned()),
+                    count.parse().expect("a count"),
+                );
+            }
+            other => panic!("a roster row that is none of the thirteen kinds: {other:?}"),
         }
     }
     rows
@@ -691,7 +748,20 @@ pub fn violations(files: &[(String, String)], roster: &Roster, callees: &[&str])
     problems.extend(callers(files, roster, callees, &read));
     problems.extend(held(files, roster));
     problems.extend(supplied(files, roster));
-    problems.extend(mentioned(files, roster));
+    // The text with its comments, strings and characters blanked and its test modules kept, which
+    // the mentions and the references read: a macro can strip a test attribute, and a helper that
+    // only a test build compiles is code that a person reads too.
+    let kept: Vec<Vec<char>> = if roster.takers.is_empty() && roster.references.is_empty() {
+        Vec::new()
+    } else {
+        files
+            .iter()
+            .map(|(_, source)| blank(source).chars().collect())
+            .collect()
+    };
+    problems.extend(mentioned(files, &kept, roster));
+    problems.extend(referenced(files, &kept, roster));
+    problems.extend(raw_takes(files, roster));
     problems
 }
 
@@ -1400,14 +1470,50 @@ fn held(files: &[(String, String)], roster: &Roster) -> Vec<String> {
     problems
 }
 
-/// The mentions of the names that take the dispatch boundary: for every `taker` name and every file
-/// of the crate, the times that the name stands in the file's code are the `mention` row's number,
-/// or none where there is no row. A name counts wherever it stands (a call, an argument, a
-/// statement after a call, a function value), so a second take of the boundary under a held one
-/// changes a number, whatever its shape. It is a count of names and reads no guard.
-fn mentioned(files: &[(String, String)], roster: &Roster) -> Vec<String> {
+/// The functions of a text that are `async`: the word before `fn`, past `unsafe`, `extern` and
+/// `const`, is `async`.
+fn async_functions(words: &[(usize, String)]) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for (index, pair) in words.windows(2).enumerate() {
+        if pair[0].1 != "fn" {
+            continue;
+        }
+        for before in words[..index].iter().rev() {
+            match before.1.as_str() {
+                "async" => {
+                    found.insert(pair[1].1.clone());
+                    break;
+                }
+                "unsafe" | "extern" | "const" => {}
+                _ => break,
+            }
+        }
+    }
+    found
+}
+
+/// Whether a signature has a parameter whose type names the dispatch boundary's guard (a return
+/// type does not count: a function that hands a guard out is a taker, not a function under one).
+fn guard_parameter(signature: &[char]) -> bool {
+    parameters(signature).iter().any(|parameter| {
+        let text: Vec<char> = parameter.chars().collect();
+        idents(&text)
+            .iter()
+            .any(|(_, word)| word == "DispatchGuard")
+    })
+}
+
+/// The mentions of the names that take the dispatch boundary. For every `taker` name, file and
+/// function, the times that the name stands in the code are the `mention` row's number, or none
+/// where there is no row. A name counts wherever it stands (a call, an argument, a statement after
+/// a call, a function value), in a test module as in the rest of the file. Beside the count, two
+/// rules read each mention that is not a declaration: it stands in a taker or in an `async`
+/// function (a sync function that calls a taker is a taker), and not in a function that takes a
+/// `DispatchGuard` parameter (such a function runs under the boundary). It is a count of names and
+/// reads no guard.
+fn mentioned(files: &[(String, String)], kept: &[Vec<char>], roster: &Roster) -> Vec<String> {
     let mut problems = Vec::new();
-    for (name, file) in roster.mentions.keys() {
+    for (name, file, _) in roster.mentions.keys() {
         if !roster.takers.contains(name) {
             problems.push(format!("mention {name} {file}: the name has no taker row"));
         }
@@ -1417,32 +1523,171 @@ fn mentioned(files: &[(String, String)], roster: &Roster) -> Vec<String> {
             ));
         }
     }
-    let mut stands: BTreeMap<&str, usize> = BTreeMap::new();
-    for (file, source) in files {
-        let text: Vec<char> = without_test_modules(&blank(source)).chars().collect();
-        let words = idents(&text);
-        for name in &roster.takers {
-            let count = words.iter().filter(|(_, word)| word == name).count();
-            *stands.entry(name.as_str()).or_default() += count;
-            let listed = roster
-                .mentions
-                .get(&(name.clone(), file.clone()))
-                .copied()
-                .unwrap_or(0);
-            if count != listed {
+    let mut found: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+    for ((file, _), text) in files.iter().zip(kept) {
+        let words = idents(text);
+        let inside = function_at(text);
+        let asynchronous = async_functions(&words);
+        let functions = spans(text);
+        for (index, (at, name)) in words.iter().enumerate() {
+            if !roster.takers.contains(name) {
+                continue;
+            }
+            let declared = index > 0 && words[index - 1].1 == "fn";
+            let stands_in = inside[*at].clone();
+            let function = if declared {
+                "(declaration)".to_owned()
+            } else {
+                stands_in.clone().unwrap_or_else(|| "(top)".to_owned())
+            };
+            *found
+                .entry((name.clone(), file.clone(), function.clone()))
+                .or_default() += 1;
+            if declared {
+                continue;
+            }
+            let allowed = stands_in.as_ref().is_some_and(|caller| {
+                roster.takers.contains(caller) || asynchronous.contains(caller)
+            });
+            if !allowed {
                 problems.push(format!(
-                    "{file} mentions {name} {count} time(s) and its mention row says {listed}: a name \
-                     that takes the dispatch boundary stands where it did not, or does not where it \
-                     did. Read the new text (a take under the held boundary waits on itself; the \
-                     lock audit's table of takers is the record), then set `mention {name} {file} \
-                     {count}`, and add `taker <name>` first for a new function that takes the boundary"
+                    "{file} {function} mentions {name} and is neither a taker nor an async function: a \
+                     function that calls a taker takes the dispatch boundary too. Read it, add \
+                     `taker {function}` first and its mention rows, and add it to the lock audit's \
+                     table of takers"
                 ));
             }
+            for span in &functions {
+                if span.open < *at && *at < span.close && guard_parameter(&text[span.at..span.open])
+                {
+                    problems.push(format!(
+                        "{file} {} takes a DispatchGuard, so it runs under the dispatch boundary, and \
+                         mentions {name}: a function that runs under the boundary mentions no taker",
+                        span.name
+                    ));
+                }
+            }
+        }
+    }
+    let mut keys: BTreeSet<(String, String, String)> = found.keys().cloned().collect();
+    keys.extend(roster.mentions.keys().cloned());
+    let mut stands: BTreeMap<&str, usize> = BTreeMap::new();
+    for key in &keys {
+        let (name, file, function) = key;
+        if !files.iter().any(|(known, _)| known == file) {
+            continue;
+        }
+        let count = found.get(key).copied().unwrap_or(0);
+        *stands.entry(name.as_str()).or_default() += count;
+        let listed = roster.mentions.get(key).copied().unwrap_or(0);
+        if count != listed {
+            problems.push(format!(
+                "{file} {function} mentions {name} {count} time(s) and its mention row says {listed}: a \
+                 name that takes the dispatch boundary stands where it did not, or does not where it \
+                 did. Read the new text (a thread that holds the boundary and waits for it again \
+                 waits on itself), then set `mention {name} {file} {function} {count}`. A new \
+                 function that takes the boundary, or that calls a taker, is a taker: add `taker \
+                 <function>` first, and add it to the lock audit's table of takers"
+            ));
         }
     }
     for name in &roster.takers {
         if stands.get(name.as_str()).copied().unwrap_or(0) == 0 {
             problems.push(format!("taker {name}: no file of the crate mentions it"));
+        }
+    }
+    problems
+}
+
+/// The words of a text that bring in source from another place, with how many times each stands:
+/// `include!`, a path attribute and `block_on`.
+fn reference_counts(text: &[char]) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::new();
+    for (at, word) in idents(text) {
+        let after = at + word.len();
+        let next = (after..text.len()).find(|&place| !text[place].is_whitespace());
+        let then = |c: char| next.is_some_and(|place| text[place] == c);
+        let not_double = next.is_none_or(|place| text.get(place + 1) != Some(&'='));
+        let before = text[..at].iter().rev().find(|c| !c.is_whitespace());
+        let which = match word.as_str() {
+            "include" if then('!') && not_double => "include",
+            "block_on" => "block_on",
+            "path" if then('=') && not_double && matches!(before, Some('[' | '(' | ',')) => "path",
+            _ => continue,
+        };
+        *counts.entry(which).or_default() += 1;
+    }
+    counts
+}
+
+/// The places that bring in source from another place or run a future to its end: for every word
+/// of `REFERENCE_WORDS` and every file of the crate, the times that it stands in the code are the
+/// `reference` row's number, or none where there is no row. Test modules are counted. A roster with
+/// no taker and no `reference` row reads none of this.
+fn referenced(files: &[(String, String)], kept: &[Vec<char>], roster: &Roster) -> Vec<String> {
+    let mut problems = Vec::new();
+    if roster.takers.is_empty() && roster.references.is_empty() {
+        return problems;
+    }
+    let mut found: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for ((file, _), text) in files.iter().zip(kept) {
+        for (word, count) in reference_counts(text) {
+            found.insert((word.to_owned(), file.clone()), count);
+        }
+    }
+    let mut keys: BTreeSet<(String, String)> = found.keys().cloned().collect();
+    keys.extend(roster.references.keys().cloned());
+    for key in &keys {
+        let (word, file) = key;
+        if !files.iter().any(|(known, _)| known == file) {
+            problems.push(format!(
+                "reference {word} {file}: the file is not in the crate"
+            ));
+            continue;
+        }
+        let count = found.get(key).copied().unwrap_or(0);
+        let listed = roster.references.get(key).copied().unwrap_or(0);
+        if count != listed {
+            problems.push(format!(
+                "{file} has {count} `{word}` and its reference row says {listed}: a place that brings in \
+                 source from another place, or runs a future to its end in a sync body, hides a take \
+                 of the dispatch boundary from this reading. Read the new text, then set `reference \
+                 {word} {file} {count}`"
+            ));
+        }
+    }
+    problems
+}
+
+/// The takes of the boundary's own mutex (`lock` and `try_lock`) in the product text of every file
+/// that has a `rawtake` row, by function: the only takes that do not go through a taker.
+fn raw_takes(files: &[(String, String)], roster: &Roster) -> Vec<String> {
+    let mut problems = Vec::new();
+    let rowed: BTreeSet<&String> = roster.rawtakes.keys().map(|(file, _, _)| file).collect();
+    let mut found: BTreeMap<(String, String, String), usize> = BTreeMap::new();
+    for (file, source) in files {
+        if !rowed.contains(file) {
+            continue;
+        }
+        for site in sites(file, source, &["lock", "try_lock"]) {
+            *found
+                .entry((site.file, site.function, site.callee))
+                .or_default() += 1;
+        }
+    }
+    let mut keys: BTreeSet<(String, String, String)> = found.keys().cloned().collect();
+    keys.extend(roster.rawtakes.keys().cloned());
+    for key in &keys {
+        let (file, function, name) = key;
+        let count = found.get(key).copied().unwrap_or(0);
+        let listed = roster.rawtakes.get(key).copied().unwrap_or(0);
+        if count != listed {
+            problems.push(format!(
+                "{file} {function} calls {name} {count} time(s) and its rawtake row says {listed}: a \
+                 take of the boundary's own mutex stands where it did not, or does not where it did. \
+                 Read the new text (every take has to set the record of its holder, which the \
+                 guard's constructor does), then set `rawtake {file} {function} {name} {count}`"
+            ));
         }
     }
     problems
