@@ -103,7 +103,7 @@ or a new one, gets the same code, and `pair.status` reports the reason. The issu
 that invitation carries `existing`, the name and pairing date from the host's own record. The device
 shows `host_still_lists_device` and offers no retry: the owner removes the listed pairing, the
 person forgets the host on the device if the device still lists it, and a new invitation pairs it
-as a new device with a new identity.
+as a new device with a new device identifier.
 
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
