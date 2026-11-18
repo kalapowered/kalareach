@@ -2889,7 +2889,7 @@ arrives or the challenge times out after two minutes, as `kr pair invite` does. 
 shown the organisation and, for its first key and the key signing now, the whole key identifier, the
 revision and the moment it took over signing, and confirms exactly those. `kr` prints the same
 identifiers and moments, so a person can compare them with what the organisation's administrator
-reads out. If there is no owner device, `kr` refuses at once and names `kr pair invite --owner`: an
+reads out. If the host has no owner yet, `kr` refuses at once and names `kr pair invite --owner`: an
 enrolment is not confirmed at the host's own terminal. With `--json`, the command returns the
 organisation, the enrolment revision, the highest key revision accepted and the identifier of the
 first key.
