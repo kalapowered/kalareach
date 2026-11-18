@@ -1751,8 +1751,20 @@ pub(crate) mod tests {
             "the greeting is in the record where the connection was made"
         );
         assert_eq!(greeted.last, Some(Last::Greeting(None)));
-        proof::exchange(&mut connection, id, &Progress::new(id), &record).await;
+        let (gave, asked) = proof::exchange(&mut connection, id, &Progress::new(id), &record).await;
         drop(connection);
+        // The exchange ended as the daemon made it end, before the record is read: the read gave
+        // the generation and the request for the launch alone was taken. What the record lacks
+        // after this is a write that was not made, and no exchange that ran out of time.
+        assert_eq!(
+            gave,
+            host_stop::Gave::Reported(generation_of(2)),
+            "the read of `host.info` gave the generation"
+        );
+        let Some(host_stop::Asked::Taken(taken)) = asked else {
+            panic!("the request for the launch alone was taken: it was made after the read");
+        };
+        assert_eq!(taken.pid.get(), 7, "the answer states the daemon's process");
         let answered = tokio::time::timeout(std::time::Duration::from_secs(10), daemon)
             .await
             .expect("the stand-in daemon ends where the command lets go of its connection")
