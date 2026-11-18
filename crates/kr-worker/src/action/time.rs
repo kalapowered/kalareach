@@ -321,8 +321,8 @@ struct Taken {
 /// Its wall reading proves one thing, that the wall clock had read that much by `second_ms`, and a
 /// pause cannot make that wrong, because the continuous clock is read after the wall clock. It
 /// does not say where the wall clock stood at `first_ms`, so it is no comparison against a mark
-/// and no entry of the staircase of [`Readings`]; it is kept as a proof ([`KeptProofs`]), as is a
-/// narrow reading, which proves the same.
+/// and no entry of the staircase of the lowest readings of [`Readings`]; it is an entry of the
+/// staircase of the highest, as a narrow reading is, which proves the same.
 #[derive(Clone, Copy, Debug)]
 struct HeldUp {
     /// The continuous clock after the others were read: where the reading is stamped.
@@ -336,78 +336,6 @@ struct HeldUp {
 struct Attempt {
     narrow: Option<Taken>,
     held_up: Vec<HeldUp>,
-}
-
-/// What every wall reading this contract took proved about the owner's confirmation in force,
-/// kept until that confirmation is decided.
-///
-/// A reading, narrow or held up, proves that the wall clock had read its wall by its second
-/// reading ([`HeldUp`]). One that is stamped at or after the owner's act came after it, so a
-/// narrow reading that is far behind it, carried forward, is a step back that the owner did not
-/// see, whichever reading saw it and whether or not the worker trusts its clock. Every reading
-/// comes here through [`TimeContract::take`], the one function that reads the wall clock, so no
-/// reading taken while a confirmation is pending is missing. At most [`Self::CAPACITY`] are kept.
-///
-/// What the set holds is not tied to one confirmation: another confirmation keeps the proofs
-/// stamped at or after its act and drops the older ones, since a reading from before the owner
-/// spoke last says nothing of a clock that the owner has put right since. The proofs live in
-/// memory only: a pending confirmation is decided in the process that met it, and a contract that
-/// restored a record meets none of what was pending before, because it marks the confirmation in
-/// force as met and takes only one made after it restored.
-#[derive(Debug, Default)]
-struct KeptProofs {
-    /// The confirmation, by its count, that the proofs were last kept for.
-    count: u64,
-    /// The proofs, in the order they were read.
-    tries: Vec<HeldUp>,
-}
-
-impl KeptProofs {
-    /// At most this many proofs are kept.
-    const CAPACITY: usize = 16;
-
-    /// Keeps `proofs` for the confirmation `count`, which the owner made at `act_ms` on the
-    /// continuous clock. A change of the confirmation keeps what is stamped at or after its act
-    /// and drops the older proofs first.
-    fn keep(&mut self, count: u64, act_ms: u64, proofs: impl IntoIterator<Item = HeldUp>) {
-        if self.count != count {
-            self.count = count;
-            self.tries.retain(|tried| tried.second_ms >= act_ms);
-        }
-        for tried in proofs {
-            self.tries.push(tried);
-            if self.tries.len() > Self::CAPACITY {
-                self.fold_oldest();
-            }
-        }
-    }
-
-    /// Hands over the proofs for the decision of the confirmation `count` made at `act_ms`, by a
-    /// narrow reading at `decided_ms`: those stamped at or before it, which the decision uses up,
-    /// because a decided confirmation is not decided again. A proof stamped after it is another
-    /// caller's later reading; it is no evidence for this decision, since nothing carries a
-    /// reading back, and stays for the next confirmation's.
-    fn take(&mut self, count: u64, act_ms: u64, decided_ms: u64) -> Vec<HeldUp> {
-        self.keep(count, act_ms, []);
-        let (used, later) = std::mem::take(&mut self.tries)
-            .into_iter()
-            .partition(|tried| tried.second_ms <= decided_ms);
-        self.tries = later;
-        used
-    }
-
-    /// Folds the oldest two proofs into one that keeps the later stamp and the greater wall, the
-    /// earlier wall carried forward to the later stamp. That errs toward refusing: the one proof
-    /// is behind a narrow reading wherever either of the two was, and is stamped no earlier.
-    fn fold_oldest(&mut self) {
-        let oldest = self.tries.remove(0);
-        if let Some(next) = self.tries.first_mut() {
-            let carried = oldest.wall_ms.saturating_add(kr_ipc::clock::credited(
-                next.second_ms.saturating_sub(oldest.second_ms),
-            ));
-            next.wall_ms = next.wall_ms.max(carried);
-        }
-    }
 }
 
 /// What a caller is told when this host could take no narrow bracket in three tries.
@@ -567,7 +495,7 @@ struct Reference {
     proved_at: u64,
 }
 
-/// A wall reading as the staircase keeps it: when it was taken, as a continuous reading, and its
+/// A wall reading as a staircase keeps it: when it was taken, as a continuous reading, and its
 /// level ([`level_of`]).
 #[derive(Clone, Copy, Debug)]
 struct Kept {
@@ -582,6 +510,14 @@ fn level_of(continuous_ms: u64, wall_ms: u64) -> i128 {
     i128::from(wall_ms) * 1_000_000 - kr_ipc::clock::credited_micros(continuous_ms)
 }
 
+/// The wall reading that `level` stands for at the continuous reading `continuous_ms`: the reading
+/// carried forward by the continuous clock, less the rate allowance, as a mark is projected, to
+/// the millisecond above.
+fn wall_at(level: i128, continuous_ms: u64) -> u64 {
+    let micros = level + kr_ipc::clock::credited_micros(continuous_ms);
+    u64::try_from((micros + 999_999).div_euclid(1_000_000)).unwrap_or(0)
+}
+
 /// The level below which a reading taken at or after the owner's confirmation is behind it: the
 /// owner's reading less what the continuous clock has credited up to the time it was made, less the
 /// rollback tolerance. A reading is behind the owner's reading, carried forward by the continuous
@@ -591,35 +527,66 @@ fn refuting_level(established: &Establishment) -> i128 {
         - i128::from(MAX_WALL_CLOCK_ROLLBACK_MS) * 1_000_000
 }
 
-/// The lowest readings of the wall clock this contract took.
+/// Why the readings refuse the owner's confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    /// A reading taken at or after the owner's act is behind the owner's reading.
+    BehindTheOwner,
+    /// A narrow reading taken at or after the owner's act is behind an earlier reading taken at or
+    /// after it: the clock went back from a reading the owner did not see.
+    SteppedBack,
+    /// A reading from the confirmation's time or later was let go, so the readings that are left
+    /// cannot show that it holds. Nothing observed a rollback.
+    HistoryLetGo,
+}
+
+/// The readings of the wall clock this contract took, kept as two staircases that answer the two
+/// ways a reading refutes the owner's confirmation.
 ///
-/// The owner's confirmation is followed only if every reading taken at or after the time it was
-/// made agrees with it ([`refuting_level`]), whenever the contract meets it: a confirmation
-/// published late is met after readings it has to answer to, and a clock that is right again by
-/// the next look does not take them back. Whether a reading agrees depends only on its level, and
-/// on when the confirmation was made. So a reading that a later one is not higher than adds
-/// nothing: any confirmation the earlier one refutes, the later one refutes too. What is kept is
-/// the staircase of readings each lower than every later one, which is as small as the clock lets
-/// it be, and exact.
+/// The confirmation is followed only if no narrow reading in the run of readings from the owner's
+/// act up to the decision's own is behind the owner's reading, or behind an earlier reading of the
+/// run, by more than the rollback tolerance, each carried forward by the continuous clock. A
+/// reading stamped before the act takes no part. Whether a reading is behind another depends only
+/// on their levels ([`level_of`]) and on when each was taken, so a reading that a later one is not
+/// beyond adds nothing to the staircase of its kind.
 ///
-/// Two things keep it small, and both err toward refusing. Two readings whose levels are within a
-/// second of each other stand for one another, at the lower level and the later time, which can
-/// refuse a confirmation by up to a second that the readings taken would not have refused. And at
-/// most [`Readings::CAPACITY`] readings are kept: the oldest is let go, and a confirmation made at
-/// or before the time of the latest reading let go is refused, whatever the readings kept say.
+/// The staircase of the lowest readings answers whether a reading is behind the owner's: each
+/// entry is lower than every later one, and the confirmation is refused when an entry at or after
+/// its act is below [`refuting_level`], whenever the contract meets it: a confirmation published
+/// late is met after readings it has to answer to, and a clock that is right again by the next
+/// look does not take them back. The staircase of the highest readings, narrow, held up or taken
+/// with no bracket, answers whether the clock went back from an earlier reading: each entry is
+/// higher than every later one, and a narrow reading that is behind the latest entry above it by
+/// more than the tolerance raises `stepped_back` to that entry's stamp. A held-up or unbracketed
+/// reading is only ever the earlier of the two. A clock that keeps pace leaves one entry in the
+/// staircase of the highest, whatever the rate of readings.
 ///
-/// The staircase answers whether a reading is behind the owner's. The proofs beside it answer the
-/// other half of the decision, whether the clock went back from a reading taken after the owner
-/// spoke, and they are kept here so that [`TimeContract::take`] can keep every reading it takes
-/// whoever calls it and whether or not that caller holds the contract's state.
+/// What is kept is as small as the clock lets it be, and exact, except that three things err toward
+/// refusing. Two readings whose levels are within a second of each other stand for one another, at
+/// the level the staircase holds and the later time: a confirmation can be refused by up to a
+/// second of level that the readings taken would not have refused. At most
+/// [`Readings::CAPACITY`] readings are kept in each staircase: the oldest is let go, and a
+/// confirmation made at or before the time of the latest reading let go is refused, whatever the
+/// readings kept say. And a reading that comes after a later one counts as taken at the later one's
+/// time.
+///
+/// Every reading comes here through [`TimeContract::take`] and the unbracketed read of
+/// [`TimeContract::wall_reading`], the two places that read the wall clock, each reading its clocks
+/// and noting what it read in one hold of the lock that guards this. The readings are noted in the
+/// order they were taken, and no reading is in flight when a confirmation is decided. Nothing here
+/// belongs to a confirmation: a decision uses up nothing and applies its own act. The readings
+/// are never written down.
 #[derive(Debug, Default)]
 struct Readings {
+    /// The lowest readings, each lower than every later one.
     kept: Vec<Kept>,
-    /// The time of the latest reading let go, if one was.
+    /// The highest readings, each higher than every later one.
+    highest: Vec<Kept>,
+    /// The time of the latest reading let go from either staircase, if one was.
     let_go: Option<u64>,
-    /// Every reading as a proof for the confirmation in force ([`KeptProofs`]), until it is
-    /// decided. It is never written down.
-    proofs: KeptProofs,
+    /// The stamp of the latest reading that a later narrow reading was behind by more than the
+    /// tolerance, if there was one.
+    stepped_back: Option<u64>,
 }
 
 impl Readings {
@@ -627,8 +594,9 @@ impl Readings {
     /// A second, in the millionths of a millisecond a level is in.
     const SAME_LEVEL: i128 = 1_000_000_000;
 
-    /// Keeps a reading taken at `continuous_ms`. A reading that comes after a later one counts as
-    /// taken at the later one's time, which errs toward refusing.
+    /// Keeps a reading taken at `continuous_ms` in the staircase of the lowest readings. A reading
+    /// that comes after a later one counts as taken at the later one's time, which errs toward
+    /// refusing.
     fn keep(&mut self, continuous_ms: u64, wall_ms: u64) {
         let continuous_ms =
             continuous_ms.max(self.kept.last().map_or(0, |last| last.continuous_ms));
@@ -652,15 +620,85 @@ impl Readings {
         }
     }
 
-    /// Whether `established` is refused: it was made at or before the latest reading let go, or a
-    /// reading kept that was taken at or after it is behind it.
-    fn refute(&self, established: &Establishment) -> bool {
-        let refuting = refuting_level(established);
-        self.let_go.is_some_and(|time| established.boot_ms <= time)
-            || self
-                .kept
+    /// Keeps a reading taken at `continuous_ms` in the staircase of the highest readings: it
+    /// removes the entries at or below its level, and an entry less than a second above it takes
+    /// its time and keeps its level. A reading that comes after a later one is stamped at the
+    /// later one's time and keeps the level it was read at, which errs toward refusing.
+    fn peak(&mut self, continuous_ms: u64, wall_ms: u64) {
+        let level = level_of(continuous_ms, wall_ms);
+        let continuous_ms =
+            continuous_ms.max(self.highest.last().map_or(0, |last| last.continuous_ms));
+        while self.highest.last().is_some_and(|last| last.level <= level) {
+            self.highest.pop();
+        }
+        if let Some(last) = self.highest.last_mut()
+            && last.level - level < Self::SAME_LEVEL
+        {
+            last.continuous_ms = continuous_ms;
+            return;
+        }
+        self.highest.push(Kept {
+            continuous_ms,
+            level,
+        });
+        if self.highest.len() > Self::CAPACITY {
+            let oldest = self.highest.remove(0);
+            self.let_go = self.let_go.max(Some(oldest.continuous_ms));
+        }
+    }
+
+    /// Notes what an attempt read: the wall of each try that was held up goes in the staircase of
+    /// the highest readings first, then the narrow reading is compared with it, so a step back that
+    /// a held-up reading shows is found, and goes in both staircases. A reading is noted whatever
+    /// the floor shows and whichever confirmation is in force: it belongs to none.
+    fn note(&mut self, attempt: &Attempt) {
+        for tried in &attempt.held_up {
+            self.peak(tried.second_ms, tried.wall_ms);
+        }
+        if let Some(taken) = attempt.narrow {
+            let level = level_of(taken.second_ms, taken.wall_ms);
+            let tolerance = i128::from(MAX_WALL_CLOCK_ROLLBACK_MS) * 1_000_000;
+            if let Some(source) = self
+                .highest
                 .iter()
-                .any(|kept| kept.continuous_ms >= established.boot_ms && kept.level < refuting)
+                .rev()
+                .find(|above| above.level - level > tolerance)
+            {
+                self.stepped_back = self.stepped_back.max(Some(source.continuous_ms));
+            }
+            self.keep(taken.second_ms, taken.wall_ms);
+            self.peak(taken.second_ms, taken.wall_ms);
+        }
+    }
+
+    /// Why the readings refuse `established`, if they do. A reading kept that was taken at or
+    /// after its act is behind it, or a step back that was found came from a reading taken at or
+    /// after its act: these are rollbacks that were observed. Only when none was is it the readings
+    /// let go that refuse it: it was made at or before the latest of them.
+    fn refusal(&self, established: &Establishment) -> Option<Refusal> {
+        let act_ms = established.boot_ms;
+        let refuting = refuting_level(established);
+        if self
+            .kept
+            .iter()
+            .any(|kept| kept.continuous_ms >= act_ms && kept.level < refuting)
+        {
+            Some(Refusal::BehindTheOwner)
+        } else if self.stepped_back.is_some_and(|time| act_ms <= time) {
+            Some(Refusal::SteppedBack)
+        } else if self.let_go.is_some_and(|time| act_ms <= time) {
+            Some(Refusal::HistoryLetGo)
+        } else {
+            None
+        }
+    }
+
+    /// The highest reading taken at or after `act_ms`, if there is one.
+    fn highest_since(&self, act_ms: u64) -> Option<Kept> {
+        self.highest
+            .iter()
+            .find(|entry| entry.continuous_ms >= act_ms)
+            .copied()
     }
 }
 
@@ -760,8 +798,9 @@ pub struct TimeContract {
     /// The host's clock floor, which every reading taken here is published in.
     floor: Option<Arc<kr_ipc::floor::SharedFloor>>,
     /// The readings of the wall clock this contract took, as [`Readings`] keeps them: what a
-    /// confirmation the owner made before them is held to. Locked alone, or after `state`, never
-    /// before it.
+    /// confirmation the owner made before them is held to. Held across the clock reads of one
+    /// attempt and the note of what they read. Locked alone, or after `state`, never before it, and
+    /// nothing is taken beneath it.
     readings: Mutex<Readings>,
     state: Mutex<TimeState>,
 }
@@ -1257,30 +1296,6 @@ impl TimeContract {
             })
     }
 
-    /// Returns what a confirmation is decided against, each reference by itself: [`Self::reference`]
-    /// and each proof kept, every one projected to `continuous_ms` and carrying its own stamp,
-    /// which for a proof is its reading's second reading, none stamped after `continuous_ms`
-    /// ([`KeptProofs::take`]). A held-up try gives no comparison of its own and the mark does not
-    /// move: the proofs are kept only through the decision. No reference stands for another,
-    /// because the stamp of the one that is furthest ahead can be older than the owner's act while
-    /// a nearer one is not.
-    fn references_kept(
-        &self,
-        state: &TimeState,
-        continuous_ms: u64,
-        proofs: &[HeldUp],
-    ) -> Vec<Reference> {
-        self.reference(state, continuous_ms)
-            .into_iter()
-            .chain(proofs.iter().map(|tried| Reference {
-                wall_ms: tried.wall_ms.saturating_add(kr_ipc::clock::credited(
-                    continuous_ms.saturating_sub(tried.second_ms),
-                )),
-                proved_at: tried.second_ms,
-            }))
-            .collect()
-    }
-
     /// Returns the earliest the wall clock can honestly read now.
     ///
     /// Expiry against a UTC deadline uses this rather than the clock itself, so a reading the
@@ -1644,13 +1659,17 @@ impl TimeContract {
     /// is not held against a confirmation, as it is not held against a worker that never
     /// distrusted its clock: forward steps expire conservatively.
     ///
-    /// Every wall reading that this contract takes while the confirmation is pending, narrow or
-    /// held up, in a look or in the following, is kept until the confirmation is decided, in every
-    /// trust state and through attempts that end with no narrow reading ([`KeptProofs`]). The
-    /// narrow reading of the following is compared with the mark and with each proof by itself,
-    /// and the rollback it is behind is the one proved latest: a peak that only one reading saw
-    /// after the owner spoke, and a clock that then went back, refuses the confirmation even where
-    /// the mark projects further and was proved before, or the worker does not trust its clock.
+    /// Every wall reading that this contract takes, narrow, held up or taken with no bracket, in a
+    /// look, in a following or by any other caller, is noted in its readings ([`Readings`]) whatever
+    /// the floor shows and whatever the worker thinks of its clock, and the decision finds it
+    /// whenever the confirmation is published. The confirmation is refused when a reading taken at
+    /// or after the owner's act is behind the owner's reading, or when a narrow reading is behind an
+    /// earlier reading taken at or after the act: a peak that one reading saw after the owner
+    /// spoke, and a clock that then went back, refuses it even where the mark projects further and
+    /// was proved before, or the worker does not trust its clock. A reading from before the act
+    /// takes no part. The exceptions add refusals only: a reading read before the act and stamped
+    /// after it, a reading within a second of another, the readings let go at the bound, and a
+    /// restored record that distrusts the clock.
     ///
     /// The reading is taken after the confirmation is loaded, never before: a worker that sampled
     /// its clock and was paused while the owner corrected it and confirmed would otherwise spend
@@ -1681,10 +1700,9 @@ impl TimeContract {
             state.followed = established.count;
             return true;
         }
-        // Every reading of this following, narrow or held up, is kept as a proof by `take`, with
-        // those of every look since the owner spoke: evidence of how far the clock had got after
-        // the owner's act, in every trust state and through attempts that end with no narrow
-        // reading, until the confirmation is decided.
+        // Every reading of this following, narrow or held up, is noted by `take`, with every
+        // reading since the owner spoke and before it: evidence of how far the clock had got, in
+        // every trust state and through attempts that end with no narrow reading.
         let Attempt { narrow, held_up } = self.take();
         let Some(Taken {
             first_ms: continuous_ms,
@@ -1701,26 +1719,24 @@ impl TimeContract {
         };
         state.adopting = false;
         state.followed = established.count;
-        // The decision is made against the mark and against each proof kept, each by itself: a
-        // peak that only a held-up try saw, and a clock that then went back, is the rollback the
-        // owner did not see, whatever the mark projects to. The decision clears the proofs.
-        let proofs = self.proofs_taken(&established, second_ms);
-        let references = self.references_kept(state, second_ms, &proofs);
+        // The mark, or the checkpoint where there is none, is one reference, and the readings are
+        // the others: a peak that only a held-up try saw, and a clock that then went back, is the
+        // rollback the owner did not see, whatever the mark projects to. The decision applies its
+        // own act and uses up no reading.
+        let reference = self.reference(state, second_ms);
         let mut behind_its_reference = false;
-        for reference in &references {
-            if reference.wall_ms.saturating_sub(wall_ms) > MAX_WALL_CLOCK_ROLLBACK_MS {
-                behind_its_reference = true;
-                state.unanswered_rollback =
-                    state.unanswered_rollback.max(Some(reference.proved_at));
-            }
+        if let Some(reference) = reference
+            && reference.wall_ms.saturating_sub(wall_ms) > MAX_WALL_CLOCK_ROLLBACK_MS
+        {
+            behind_its_reference = true;
+            state.unanswered_rollback = state.unanswered_rollback.max(Some(reference.proved_at));
         }
-        // The furthest carried wall is what a restatement answers to and never lowers.
-        let reference = references.iter().max_by_key(|reference| reference.wall_ms);
+        let (refusal, peak) = self.readings_say(&established);
         // A restatement answers to the worker's reading whatever its age. An action of the owner
         // answers only to a reading proved at or after it: the owner may be correcting a clock
         // that ran ahead of the truth, so a mark proved before the owner spoke is not held against
         // it, and the clock behind a reading proved after it is a rollback the owner did not see.
-        let refused = self.readings_refute(&established)
+        let refused = refusal.is_some()
             || state
                 .unanswered_rollback
                 .is_some_and(|proved_at| established.boot_ms <= proved_at)
@@ -1735,11 +1751,20 @@ impl TimeContract {
         }
         self.trust_again(state, continuous_ms, wall_ms, reading.clone(), true);
         // A restatement adds nothing to what the worker has proved, so it does not lower it: a
-        // clock inside the tolerance behind the worker's reading leaves the mark where it was.
+        // clock inside the tolerance behind the worker's reading, or behind the highest reading
+        // taken since the restatement, leaves the mark where it was.
         if established.restated
-            && let (Some(reference), Some(mark)) = (reference, state.high_water.as_mut())
+            && let Some(mark) = state.high_water.as_mut()
         {
-            mark.wall_ms = mark.wall_ms.max(reference.wall_ms);
+            let carried = peak.map(|entry| wall_at(entry.level, second_ms));
+            let furthest = reference
+                .map(|reference| reference.wall_ms)
+                .into_iter()
+                .chain(carried)
+                .max();
+            if let Some(furthest) = furthest {
+                mark.wall_ms = mark.wall_ms.max(furthest);
+            }
         }
         true
     }
@@ -1817,24 +1842,33 @@ impl TimeContract {
         }
     }
 
-    /// Reads the clocks together, between two readings of the continuous clock, and keeps every
-    /// wall reading against the owner's confirmation: every reading this contract takes of the
-    /// wall clock comes through here ([`Self::note`]).
+    /// Reads the clocks together, between two readings of the continuous clock, and notes every
+    /// wall reading in the readings: every reading this contract takes of the wall clock comes
+    /// through here or through [`Self::wall_reading`] ([`Readings`]).
     ///
     /// A try is used for a comparison only where the two readings of the continuous clock are no
     /// further apart than [`DISCONTINUITY_TOLERANCE`], and the clocks are read again, at most three
     /// times in all, where they are not. A try that was held up gives no comparison, so a pause
     /// between the pair cannot put a reading wrongly ahead of or behind the continuous clock. Its
-    /// wall reading is still evidence of how far the wall clock had got, so it is published in the
-    /// host's floor here, kept as a proof for the owner's confirmation, and handed back, stamped at
-    /// its second reading, for a caller that moves a mark to move it. This takes no lock of the
-    /// contract's state, so a caller that holds it may call this.
+    /// wall reading is still evidence of how far the wall clock had got, so it is noted, published
+    /// in the host's floor, and handed back, stamped at its second reading, for a caller that
+    /// moves a mark to move it.
+    ///
+    /// The clocks are read, and the attempt is noted, in one hold of the readings' lock, so that
+    /// readings are noted in the order they were taken and a decision finds none in flight. The
+    /// lock's order is the state's, then the readings': a caller that holds the state's lock may
+    /// call this, and nothing is taken under the readings' lock but the clocks, which take no lock
+    /// of the contract. The walls that were held up go to the floor after the hold.
     ///
     /// The narrow reading is kept at its second reading, which errs toward refusing a
     /// confirmation.
     fn take(&self) -> Attempt {
         let mut held_up = Vec::new();
         let mut narrow = None;
+        let mut readings = self
+            .readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for _ in 0..BRACKET_TRIES {
             let first_ms = self.continuous.boot_elapsed_ms();
             let active_ms = self.active.active_elapsed_ms();
@@ -1849,78 +1883,48 @@ impl TimeContract {
                 });
                 break;
             }
-            self.publish(wall_ms);
             held_up.push(HeldUp { second_ms, wall_ms });
         }
         let attempt = Attempt { narrow, held_up };
-        self.note(&attempt);
+        readings.note(&attempt);
+        drop(readings);
+        for tried in &attempt.held_up {
+            self.publish(tried.wall_ms);
+        }
         attempt
-    }
-
-    /// Keeps what an attempt read, in the one lock that this takes, after every clock was read:
-    /// the narrow reading in the staircase of the lowest readings, and every reading of it, narrow
-    /// or held up, as a proof for the confirmation in force ([`KeptProofs`]). The confirmation is
-    /// loaded after the readings, so a reading that the owner's act came after is stamped before
-    /// the act and cannot refuse it.
-    fn note(&self, attempt: &Attempt) {
-        let confirmation = self.floor.as_ref().and_then(|floor| floor.established());
-        let mut readings = self
-            .readings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(taken) = attempt.narrow {
-            readings.keep(taken.second_ms, taken.wall_ms);
-        }
-        if let Some(established) = confirmation {
-            readings.proofs.keep(
-                established.count,
-                established.boot_ms,
-                attempt
-                    .held_up
-                    .iter()
-                    .copied()
-                    .chain(attempt.narrow.map(|taken| HeldUp {
-                        second_ms: taken.second_ms,
-                        wall_ms: taken.wall_ms,
-                    })),
-            );
-        }
     }
 
     /// Reads the wall clock for a caller that needs the reading and no clock beside it: a stamp, a
     /// deadline, a comparison with another host's reading. No narrow reading here raises a mark,
-    /// so the walls of the tries held up before it are only published and kept as proofs, as
+    /// so the walls of the tries held up before it are only published and noted, as
     /// [`Self::take`] does. Where no narrow bracket could be taken, the clock is read once more
-    /// with no bracket, and that reading is stamped after it and kept as a proof the same way.
+    /// with no bracket, in one hold of the readings' lock, and that reading is stamped after it and
+    /// noted the same way.
     fn wall_reading(&self) -> u64 {
         if let Some(taken) = self.take().narrow {
             return taken.wall_ms;
         }
+        let mut readings = self
+            .readings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let wall_ms = self.wall.now_ms().get();
         let second_ms = self.continuous.boot_elapsed_ms();
-        self.note(&Attempt {
-            narrow: None,
-            held_up: vec![HeldUp { second_ms, wall_ms }],
-        });
+        readings.peak(second_ms, wall_ms);
         wall_ms
     }
 
-    /// Hands over the proofs kept for the decision of `established` by a narrow reading at
-    /// `decided_ms` ([`KeptProofs::take`]).
-    fn proofs_taken(&self, established: &Establishment, decided_ms: u64) -> Vec<HeldUp> {
-        self.readings
+    /// What the readings say of `established`, in one hold of their lock: why they refuse it, if
+    /// they do ([`Readings::refusal`]), and the highest reading taken at or after its act.
+    fn readings_say(&self, established: &Establishment) -> (Option<Refusal>, Option<Kept>) {
+        let readings = self
+            .readings
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .proofs
-            .take(established.count, established.boot_ms, decided_ms)
-    }
-
-    /// Whether the readings this contract took refuse `established` ([`Readings::refute`]).
-    fn readings_refute(&self, established: &Establishment) -> bool {
-        self.readings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .refute(established)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            readings.refusal(established),
+            readings.highest_since(established.boot_ms),
+        )
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, TimeState> {
@@ -1960,6 +1964,11 @@ mod tests {
             < i128::from(established.wall_ms) * 1_000_000 + elapsed * (1_000_000 - allowance)
     }
 
+    /// Whether the readings refuse `established`, whatever the cause.
+    fn refuted(readings: &Readings, established: &Establishment) -> bool {
+        readings.refusal(established).is_some()
+    }
+
     /// KR-REQ-09.18: a reading the staircase replaces still refutes what it refuted, to the
     /// millisecond. A reading's level is exact, so the rate allowance's rounding to a millisecond
     /// cannot separate two readings of one level, and the merge moves a level only to a later time.
@@ -1989,7 +1998,7 @@ mod tests {
             let mut kept = Readings::default();
             kept.keep(first.0, first.1);
             kept.keep(second.0, second.1);
-            assert!(kept.refute(&established), "and the staircase still does");
+            assert!(refuted(&kept, &established), "and the staircase still does");
         }
     }
 
@@ -2017,18 +2026,21 @@ mod tests {
         assert_eq!(kept.kept.len(), Readings::CAPACITY, "the staircase is full");
         assert_eq!(kept.let_go, Some(10_000), "and the first reading went");
         assert!(
-            kept.refute(&confirmation(10_000)),
+            refuted(&kept, &confirmation(10_000)),
             "a confirmation made at the time of the reading let go is refused"
         );
         assert!(
-            !kept.refute(&confirmation(10_001)),
+            !refuted(&kept, &confirmation(10_001)),
             "one made after it, with every reading kept agreeing with it, is not"
         );
         assert!(
-            kept.refute(&Establishment {
-                wall_ms: WALL + 10_001 + 200_000,
-                ..confirmation(10_001)
-            }),
+            refuted(
+                &kept,
+                &Establishment {
+                    wall_ms: WALL + 10_001 + 200_000,
+                    ..confirmation(10_001)
+                }
+            ),
             "and the readings kept still refute a confirmation they are behind"
         );
 
@@ -2044,7 +2056,7 @@ mod tests {
             "the reading let go is behind it"
         );
         assert!(
-            !kept.refute(&after),
+            !refuted(&kept, &after),
             "and the readings kept, all of which agree with it, do not refuse it"
         );
     }
@@ -2124,7 +2136,7 @@ mod tests {
                     at >= established.boot_ms && behind_the_confirmation(&established, at, wall)
                 });
                 assert!(
-                    !refuted_by_history || kept.refute(&established),
+                    !refuted_by_history || refuted(&kept, &established),
                     "the kept readings accepted a confirmation a reading taken after it refutes"
                 );
             }
@@ -4443,14 +4455,14 @@ mod tests {
         );
     }
 
-    /// KR-REQ-09.18, KR-REQ-09.19: what the held-up tries of the following kept is bounded, and at
-    /// the bound it is the older proofs that fold, into one with the later stamp and the greater
-    /// wall. The first try of the first attempt reads a peak and the clock goes back to the
-    /// owner's before the second; five more attempts are held up in all three tries, so the proofs
-    /// pass the bound twice; the narrow reading that follows is far behind the peak and the
-    /// confirmation is refused.
+    /// KR-REQ-09.18, KR-REQ-09.19: a peak that the first held-up try of the following read is held
+    /// against the confirmation however many held-up tries come after it. The first try of the
+    /// first attempt reads a peak and the clock goes back to the owner's before the second; five
+    /// more attempts are held up in all three tries, which is more readings than a staircase
+    /// holds entries; the narrow reading that follows is far behind the peak and the confirmation
+    /// is refused.
     #[test]
-    fn a_peak_among_the_oldest_held_up_proofs_of_the_following_survives_the_bound() {
+    fn a_peak_among_the_oldest_held_up_readings_of_the_following_survives_the_bound() {
         let (_floor, held, contract) = found_a_rollback_and_was_confirmed();
         let owner_level = held.wall.now_ms().get();
         held.sets_the_wall_before_reading(2, owner_level + 600_000);
@@ -4477,7 +4489,7 @@ mod tests {
     /// the tries have ended; the following of the new confirmation takes its own readings, which
     /// agree with the owner, and is not refused by a reading from before the owner's act.
     #[test]
-    fn a_new_confirmation_does_not_inherit_the_held_up_proofs_kept_for_the_one_it_replaces() {
+    fn a_new_confirmation_is_not_refused_by_held_up_readings_from_before_its_act() {
         let (floor, held, contract) = found_a_rollback_and_was_confirmed();
         let owner_level = held.wall.now_ms().get();
         held.sets_the_wall_before_reading(2, owner_level + 600_000);
@@ -4658,98 +4670,6 @@ mod tests {
         );
     }
 
-    /// Four more looks, each held up in all three tries, and then one look with a following that
-    /// decides the confirmation: the first look of the caller, the four, and this one keep seventeen
-    /// proofs before the decision, one more than the set holds, so the oldest two are folded.
-    fn four_held_up_looks_and_a_deciding_one(held: &Holdup, contract: &TimeContract) {
-        for _ in 0..4 {
-            held.pass(Duration::from_secs(1));
-            held.arm(0, 3);
-            assert!(contract.observe().suspended);
-        }
-        held.pass(Duration::from_secs(1));
-        contract.observe();
-    }
-
-    /// KR-REQ-09.18, KR-REQ-09.19: at the bound the two oldest proofs fold into one that is stamped
-    /// at the later of the two. The owner confirms inside the second try of the first look, so the
-    /// first try is stamped before the owner's act and the second, which read a peak ten minutes
-    /// ahead, at it; the look is held up in all three tries and four more looks are; the
-    /// seventeenth proof folds the first two, and the folded proof has to be stamped at the peak's
-    /// try for the confirmation to be refused: a proof stamped before the owner's act cannot be.
-    #[test]
-    fn the_fold_of_the_oldest_proofs_keeps_the_later_stamp() {
-        let (floor, held, contract) = found_a_rollback();
-        let start = held.wall.now_ms().get();
-        held.sets_the_wall_before_reading(2, start + 610_000);
-        held.sets_the_wall_after_landing(2, start + 20_000);
-        held.confirms_after_landing(2, Arc::clone(&floor));
-        held.arm(0, 3);
-        assert!(contract.observe().suspended);
-        four_held_up_looks_and_a_deciding_one(&held, &contract);
-        assert_eq!(
-            contract.trust(),
-            WallClockTrust::Unresolved,
-            "the clock went back ten minutes from a peak that a folded proof stands for"
-        );
-    }
-
-    /// KR-REQ-09.18, KR-REQ-09.19: at the bound the older of the two proofs is carried to the later
-    /// stamp with its credit, so the folded proof refuses wherever the older one did. The first
-    /// try of the first look reads the wall six seconds ahead of the owner's clock and the others
-    /// keep its pace; the narrow reading of the deciding look is on the owner's clock, six seconds
-    /// behind what the older proof carries, and the seventeenth proof folds that proof into the
-    /// next, which reads lower.
-    #[test]
-    fn the_fold_of_the_oldest_proofs_carries_the_older_wall_with_its_credit() {
-        let (floor, held, contract) = found_a_rollback();
-        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
-        held.pass(Duration::from_secs(1));
-        let start = held.wall.now_ms().get();
-        held.sets_the_wall_before_reading(1, start + 6_000);
-        held.sets_the_wall_after_landing(1, start + 10_000);
-        held.arm(0, 3);
-        assert!(contract.observe().suspended);
-        four_held_up_looks_and_a_deciding_one(&held, &contract);
-        assert_eq!(
-            contract.trust(),
-            WallClockTrust::Unresolved,
-            "the clock went back six seconds from a reading that a folded proof stands for"
-        );
-    }
-
-    /// KR-REQ-09.18, KR-REQ-09.19: the decision uses up the proofs stamped at or before its
-    /// reading. A proof stamped after it is another caller's later reading, no evidence for this
-    /// decision, and stays for the next confirmation, which keeps what is stamped at or after its
-    /// own act.
-    #[test]
-    fn a_proof_stamped_after_a_decision_stays_for_the_next_confirmation() {
-        let proof = |second_ms| HeldUp {
-            second_ms,
-            wall_ms: WALL,
-        };
-        let stamps = |proofs: &[HeldUp]| {
-            proofs
-                .iter()
-                .map(|tried| tried.second_ms)
-                .collect::<Vec<_>>()
-        };
-        let mut kept = KeptProofs::default();
-        kept.keep(1, 100, [proof(120), proof(130), proof(200)]);
-        assert_eq!(
-            stamps(&kept.take(1, 100, 150)),
-            [120, 130],
-            "the decision uses up what is stamped at or before its reading"
-        );
-        kept.keep(2, 160, [proof(210)]);
-        assert_eq!(
-            stamps(&kept.take(2, 160, 300)),
-            [200, 210],
-            "the proof stamped after the first decision is in the second"
-        );
-        assert!(kept.tries.is_empty(), "and the second decision uses it up");
-    }
-
     /// KR-REQ-09.18, KR-REQ-09.19: a reading that no narrow bracket could be taken for is evidence for
     /// the pending confirmation too. A caller that needs only a wall reading, as a tombstone's stamp
     /// does, is held up in all three tries and reads the clock once more with no bracket, which
@@ -4775,14 +4695,14 @@ mod tests {
         );
     }
 
-    /// KR-REQ-09.18, KR-REQ-09.19: a confirmation that is published after readings were taken
-    /// keeps the proofs stamped at or after its act and drops the older. The first look is held up
+    /// KR-REQ-09.18, KR-REQ-09.19: a confirmation that is published after readings were taken is
+    /// answered to by those stamped at or after its act, not by the older. The first look is held up
     /// in all three tries and reads a peak ten minutes ahead of the owner's clock in the first,
     /// while one confirmation is pending; the owner's second confirmation, made five seconds into
     /// the look, is published only after it, and the clock is at the owner's level for the next
     /// look. The peak is stamped after the second confirmation's act, so it refuses it.
     #[test]
-    fn a_confirmation_published_late_keeps_the_proofs_stamped_after_its_act() {
+    fn a_confirmation_published_late_is_refused_by_a_peak_stamped_after_its_act() {
         let (floor, held, contract) = found_a_rollback_and_was_confirmed();
         let start = held.wall.now_ms().get();
         let began = held.continuous.boot_elapsed_ms();
@@ -4800,15 +4720,13 @@ mod tests {
         );
     }
 
-    /// KR-REQ-09.18, KR-REQ-09.19: the proofs from before the owner's act are dropped when another
-    /// confirmation is met, so the bound does not fold one of them into a proof that is stamped
-    /// after the act. The first look is held up in all three tries and reads a peak in the first;
-    /// the owner then confirms again, and five more looks are held up in all three tries, which
-    /// would fill the set past the bound if the old proofs were still in it. The clock is at the
-    /// owner's level in the look that decides, and the peak, which came before the owner spoke,
-    /// refuses nothing.
+    /// KR-REQ-09.18, KR-REQ-09.19: a reading from before the owner's act takes no part, however many
+    /// readings come after it. The first look is held up in all three tries and reads a peak in the
+    /// first; the owner then confirms again, and five more looks are held up in all three tries,
+    /// which is more readings than a staircase holds entries. The clock is at the owner's level in
+    /// the look that decides, and the peak, which came before the owner spoke, refuses nothing.
     #[test]
-    fn a_proof_from_before_the_owners_act_is_not_folded_into_one_stamped_after_it() {
+    fn a_peak_from_before_the_owners_act_refuses_nothing_however_many_readings_follow_it() {
         let (floor, held, contract) = found_a_rollback_and_was_confirmed();
         let start = held.wall.now_ms().get();
         held.sets_the_wall_before_reading(1, start + 600_000);
@@ -4827,7 +4745,7 @@ mod tests {
         assert_eq!(
             contract.trust(),
             WallClockTrust::Trusted,
-            "a reading from before the owner's last act refuses nothing, folded or not"
+            "a reading from before the owner's last act refuses nothing"
         );
     }
 
@@ -5173,8 +5091,490 @@ mod tests {
         kept.keep(3_000, WALL + 3_500);
         assert_eq!(kept.kept.len(), 1, "the three readings stand as one");
         assert!(
-            kept.refute(&confirmation),
+            refuted(&kept, &confirmation),
             "the reading from before the act, carried to 3,000 ms, refutes the confirmation"
+        );
+    }
+
+    /// An attempt that took a narrow reading at `ms` on both clocks, with the wall at `wall_ms`.
+    fn narrow_at(ms: u64, wall_ms: u64) -> Attempt {
+        Attempt {
+            narrow: Some(Taken {
+                first_ms: ms,
+                second_ms: ms,
+                active_ms: ms,
+                wall_ms,
+            }),
+            held_up: Vec::new(),
+        }
+    }
+
+    /// The stamps of the entries of a staircase, in order.
+    fn stamps(steps: &[Kept]) -> Vec<u64> {
+        steps.iter().map(|step| step.continuous_ms).collect()
+    }
+
+    /// KR-REQ-09.18: a reading removes the entries of the staircase of the highest readings that are
+    /// at or below its level, and stands above what it does not remove. The readings are 90, 50 and
+    /// 10 seconds of level above a base, a fourth at 20 s removes the lowest only, and a fifth at
+    /// exactly the level of the second removes the second, the fourth and itself replaces nothing
+    /// above.
+    #[test]
+    fn a_reading_removes_the_highest_entries_at_or_below_its_level() {
+        let mut readings = Readings::default();
+        readings.peak(10_000, WALL + 100_000);
+        readings.peak(20_000, WALL + 70_000);
+        readings.peak(30_000, WALL + 40_000);
+        assert_eq!(stamps(&readings.highest), [10_000, 20_000, 30_000]);
+        readings.peak(40_000, WALL + 60_000);
+        assert_eq!(
+            stamps(&readings.highest),
+            [10_000, 20_000, 40_000],
+            "a reading above the lowest entry removes it and stands below the others"
+        );
+        readings.peak(50_000, WALL + 99_997);
+        assert_eq!(
+            level_of(50_000, WALL + 99_997),
+            level_of(20_000, WALL + 70_000),
+            "the fifth reading is at the second's level"
+        );
+        assert_eq!(
+            stamps(&readings.highest),
+            [10_000, 50_000],
+            "a reading at the level of an entry removes it, with every entry below"
+        );
+    }
+
+    /// KR-REQ-09.18: an entry of the staircase of the highest readings that is less than a second
+    /// above a new reading takes the new reading's stamp and keeps its own level, and one a second
+    /// above it does not. A clock that keeps pace gains a little level at each reading, so
+    /// however many readings it is read at, one entry stands.
+    #[test]
+    fn a_highest_entry_less_than_a_second_above_a_reading_takes_its_stamp_and_keeps_its_level() {
+        let mut readings = Readings::default();
+        readings.peak(10_000, WALL + 100_000);
+        let level = readings.highest[0].level;
+        readings.peak(20_000, WALL + 109_499);
+        assert_eq!(
+            level - level_of(20_000, WALL + 109_499),
+            500_000_000,
+            "the second reading is half a second below the first"
+        );
+        assert_eq!(
+            stamps(&readings.highest),
+            [20_000],
+            "the one entry has the later stamp"
+        );
+        assert_eq!(readings.highest[0].level, level, "and keeps its level");
+        readings.peak(30_000, WALL + 118_998);
+        assert_eq!(
+            level - level_of(30_000, WALL + 118_998),
+            1_000_000_000,
+            "the third reading is a second below the first"
+        );
+        assert_eq!(
+            stamps(&readings.highest),
+            [20_000, 30_000],
+            "an entry a second above is not merged"
+        );
+
+        let mut pacing = Readings::default();
+        for step in 0..5_000_u64 {
+            pacing.peak(10_000 + step * 10, WALL + 10_000 + step * 10);
+        }
+        assert_eq!(
+            stamps(&pacing.highest),
+            [10_000 + 4_999 * 10],
+            "a clock that keeps pace leaves one entry"
+        );
+    }
+
+    /// KR-REQ-09.18: past its capacity the staircase of the highest readings lets its oldest
+    /// entry go and folds nothing. The readings are two seconds of level apart, so none merges. The
+    /// oldest is let go at the seventeenth, a confirmation made at or before its time is refused
+    /// for it, and the cause is the readings let go, not a rollback that anything observed; a
+    /// confirmation made after it is not.
+    #[test]
+    fn the_highest_readings_let_go_refuse_a_confirmation_made_before_them_for_a_cause_of_their_own()
+    {
+        let mut readings = Readings::default();
+        for step in 0..=Readings::CAPACITY as u64 {
+            readings.peak(
+                1_000 * (step + 1),
+                WALL + 1_000 * (step + 1) + 200_000 - 2_000 * step,
+            );
+        }
+        assert_eq!(
+            readings.highest.len(),
+            Readings::CAPACITY,
+            "the staircase is full"
+        );
+        assert_eq!(readings.let_go, Some(1_000), "and the first reading went");
+        assert_eq!(
+            stamps(&readings.highest)[0],
+            2_000,
+            "the oldest two did not fold: the second stands at its own stamp"
+        );
+        let confirmation = |boot_ms: u64| Establishment {
+            count: 1,
+            restated: false,
+            wall_ms: WALL + 200_000 + boot_ms,
+            boot_ms,
+        };
+        assert_eq!(
+            readings.refusal(&confirmation(1_000)),
+            Some(Refusal::HistoryLetGo),
+            "a confirmation made at the time of the reading let go is refused for that"
+        );
+        assert_eq!(
+            readings.refusal(&confirmation(1_001)),
+            None,
+            "one made after it is not"
+        );
+        readings.stepped_back = Some(5_000);
+        assert_eq!(
+            readings.refusal(&confirmation(1_000)),
+            Some(Refusal::SteppedBack),
+            "a step back that was observed is named before the readings let go"
+        );
+    }
+
+    /// KR-REQ-09.18: a narrow reading that is behind the latest entry above it by more than the
+    /// tolerance raises the stamp of a step back to that entry's, and the stamp is never lowered.
+    /// A reading 590 s above is the source of the first step back; a later reading 270 s above is
+    /// the latest source for the one after, and a reading that only the first source is above
+    /// leaves the stamp where the later source put it.
+    #[test]
+    fn a_step_back_raises_the_stamp_of_the_latest_source_and_never_lowers_it() {
+        let mut readings = Readings::default();
+        readings.note(&narrow_at(10_000, WALL + 600_000));
+        assert_eq!(
+            readings.stepped_back, None,
+            "nothing is behind the first reading"
+        );
+        readings.note(&narrow_at(20_000, WALL + 30_000));
+        assert_eq!(
+            readings.stepped_back,
+            Some(10_000),
+            "the second is behind the first"
+        );
+        readings.note(&narrow_at(30_000, WALL + 300_000));
+        assert_eq!(
+            readings.stepped_back,
+            Some(10_000),
+            "the third is behind the first and above the second"
+        );
+        readings.note(&narrow_at(40_000, WALL + 40_000));
+        assert_eq!(
+            readings.stepped_back,
+            Some(30_000),
+            "the fourth is behind the first and the third: the latest of them is the source"
+        );
+        readings.note(&narrow_at(50_000, WALL + 350_000));
+        assert_eq!(
+            readings.stepped_back,
+            Some(30_000),
+            "a reading that only the first is above does not lower the stamp"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a held-up reading is only ever the earlier of a step back. An
+    /// attempt held up in two tries, the first reading a peak and the second reading the clock
+    /// right, finds no step back, and its narrow reading, which agrees with the second, is behind
+    /// the peak.
+    #[test]
+    fn a_held_up_reading_is_only_ever_the_earlier_of_a_step_back() {
+        let mut readings = Readings::default();
+        readings.note(&Attempt {
+            narrow: None,
+            held_up: vec![
+                HeldUp {
+                    second_ms: 10_000,
+                    wall_ms: WALL + 600_000,
+                },
+                HeldUp {
+                    second_ms: 20_000,
+                    wall_ms: WALL + 20_000,
+                },
+            ],
+        });
+        assert_eq!(
+            readings.stepped_back, None,
+            "a held-up reading behind an earlier one is no comparison"
+        );
+        assert_eq!(stamps(&readings.highest), [10_000, 20_000], "both stand");
+        readings.note(&narrow_at(30_000, WALL + 30_000));
+        assert_eq!(
+            readings.stepped_back,
+            Some(10_000),
+            "the narrow reading is behind the held-up peak"
+        );
+    }
+
+    /// KR-REQ-09.18: a reading stamped before the latest entry of the staircase of the highest
+    /// readings is stamped at the later time and keeps the level it was read at, which errs toward
+    /// refusing, as the staircase of the lowest readings does.
+    #[test]
+    fn a_highest_reading_that_comes_after_a_later_one_is_stamped_at_the_later_time() {
+        let mut readings = Readings::default();
+        readings.peak(20_000, WALL + 100_000);
+        readings.peak(10_000, WALL + 50_000);
+        assert_eq!(
+            stamps(&readings.highest),
+            [20_000, 20_000],
+            "the earlier reading is stamped at the later time"
+        );
+        assert_eq!(
+            readings.highest[1].level,
+            level_of(10_000, WALL + 50_000),
+            "and keeps its own level"
+        );
+    }
+
+    /// KR-REQ-09.18: the highest reading taken at or after an act is the first entry at or after
+    /// it, and carried to a later reading of the continuous clock it stands for the wall reading
+    /// plus what the clock credits since.
+    #[test]
+    fn the_highest_reading_since_an_act_is_carried_to_the_decision() {
+        let mut readings = Readings::default();
+        readings.peak(10_000, WALL + 600_000);
+        readings.peak(20_000, WALL + 300_000);
+        readings.peak(30_000, WALL + 40_000);
+        let since = |act_ms| {
+            readings
+                .highest_since(act_ms)
+                .map(|entry| entry.continuous_ms)
+        };
+        assert_eq!(since(0), Some(10_000));
+        assert_eq!(
+            since(10_000),
+            Some(10_000),
+            "an entry stamped at the act is at the act"
+        );
+        assert_eq!(since(10_001), Some(20_000));
+        assert_eq!(since(30_001), None);
+        let first = readings.highest[0];
+        assert_eq!(wall_at(first.level, 10_000), WALL + 600_000);
+        assert_eq!(
+            wall_at(first.level, 70_000),
+            WALL + 600_000 + kr_ipc::clock::credited(60_000),
+            "carried to a later reading it adds what the continuous clock credits"
+        );
+        assert_eq!(
+            wall_at(first.level, 70_001),
+            WALL + 600_000 + kr_ipc::clock::credited(60_001),
+            "and rounds up to the millisecond, as a mark is projected"
+        );
+    }
+
+    /// A wall clock that stands inside one chosen reading of itself until it is let go: it says
+    /// on a channel that it has entered and waits for the release, with a bound.
+    #[derive(Debug)]
+    struct Gated {
+        held: Arc<Holdup>,
+        stands_at: std::sync::atomic::AtomicI64,
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl WallClock for Gated {
+        fn now_ms(&self) -> TimestampMs {
+            if self
+                .stands_at
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                == 1
+            {
+                let _ = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .send(());
+                let _ = self
+                    .release
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv_timeout(Duration::from_secs(30));
+            }
+            self.held.now_ms()
+        }
+    }
+
+    /// Runs `read` on a thread of a contract whose wall clock stands inside its `stands_at`th
+    /// reading, and returns whether the readings' lock was held while it stood, and whether
+    /// `read`'s reading was noted when it was let go. `tries_held_up` of the readings before it
+    /// are held up.
+    fn the_readings_lock_while_a_reading_stands(
+        stands_at: i64,
+        tries_held_up: i64,
+        read: impl Fn(&TimeContract) + Sync,
+    ) -> (bool, usize) {
+        let held = Holdup::new(HELD_UP, false);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let gated = Arc::new(Gated {
+            held: Arc::clone(&held),
+            stands_at: std::sync::atomic::AtomicI64::new(0),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        });
+        let contract = TimeContract::new(
+            boot(1),
+            AUTHORITY,
+            TimeSources {
+                continuous: Arc::new(Slipping {
+                    held: Arc::clone(&held),
+                }),
+                active: Arc::new(held.active.clone()),
+                wall: Arc::clone(&gated) as Arc<dyn WallClock>,
+                adapter: Arc::new(RecordedTimeAdapter::new(qualified())),
+                floor: None,
+            },
+        );
+        gated
+            .stands_at
+            .store(stands_at, std::sync::atomic::Ordering::SeqCst);
+        held.arm(0, tries_held_up);
+        let mut locked = false;
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| read(&contract));
+            let entered = entered_rx.recv_timeout(Duration::from_secs(10));
+            locked = entered.is_ok() && contract.readings.try_lock().is_err();
+            let _ = release_tx.send(());
+            reader.join().expect("the reading thread ended");
+        });
+        let noted = contract
+            .readings
+            .try_lock()
+            .expect("the lock is free when the reading ends")
+            .highest
+            .len();
+        (locked, noted)
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the clocks are read, and what they read is noted, in one hold of
+    /// the readings' lock. A reading that stands inside its wall clock holds the lock, so no
+    /// other reading is taken or noted until it is let go and noted. This holds for the attempt of
+    /// a look, whose first reading stands, and for the reading with no bracket that follows three
+    /// tries that were held up, whose fourth stands.
+    #[test]
+    fn the_clocks_are_read_and_noted_in_one_hold_of_the_readings_lock() {
+        let (locked, noted) = the_readings_lock_while_a_reading_stands(1, 0, |contract| {
+            contract.take();
+        });
+        assert!(
+            locked,
+            "the lock is held while the first reading of an attempt stands"
+        );
+        assert_eq!(noted, 1, "and the reading is noted when it ends");
+        let (locked, noted) = the_readings_lock_while_a_reading_stands(4, 3, |contract| {
+            contract.wall_reading();
+        });
+        assert!(
+            locked,
+            "the lock is held while the reading with no bracket stands"
+        );
+        assert!(noted >= 1, "and the reading is noted when it ends");
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a restatement that a worker takes does not lower its mark below
+    /// a reading taken after it. The worker, which has met nothing, trusts its clock and has a
+    /// mark. The daemon states its record; a deadline check, which raises no mark, then reads the
+    /// wall clock 3 s above the clock's right time, and the look that takes the restatement reads
+    /// it right, which is inside the tolerance behind that reading. The next look reads the clock
+    /// 3.5 s behind the right time: more than the tolerance behind the reading taken after the
+    /// restatement, which the mark stands at, and so a step back.
+    #[test]
+    fn a_restatement_a_worker_takes_does_not_lower_its_mark_below_a_reading_taken_after_it() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        let level = held.wall.now_ms().get();
+        let began = held.continuous.boot_elapsed_ms();
+        assert!(floor.restate(level, began), "the daemon states its record");
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) + 3_000);
+        contract.wall_reading();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        assert!(!contract.observe().rolled_back);
+        assert!(
+            contract.durable_state().0.owner_confirmed,
+            "the look takes the restatement"
+        );
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) - 3_500);
+        assert!(
+            contract.observe().rolled_back,
+            "the mark stands at the reading taken after the restatement, 6.5 s above this one"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a reading within a second below an earlier peak stands for it at
+    /// the later time. A worker that does not trust its clock reads the wall clock ten minutes
+    /// ahead of the right time, as a deadline check would; the owner then confirms the right time
+    /// while the clock stays ahead, and the next reading, taken after the owner's act, is half a
+    /// second below the peak's level; the clock then goes back to the owner's time, and the look
+    /// after the publication reads it. The peak stands at the time of the reading taken after the
+    /// act, so the clock went back ten minutes from a reading taken after it.
+    #[test]
+    fn a_clock_that_stays_ahead_of_the_owner_within_a_second_of_a_peak_and_then_goes_back_refuses_it()
+     {
+        let (floor, held, contract) = found_a_rollback();
+        let level = held.wall.now_ms().get();
+        let began = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) + 600_000);
+        contract.wall_reading();
+        held.pass(Duration::from_secs(1));
+        let acted_wall = right_time(&held, level, began);
+        let acted_at = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall
+            .set(right_time(&held, level, began) + 600_000 - 500);
+        contract.wall_reading();
+        floor.establish(acted_wall, acted_at);
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken after the owner's act"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the source of a step back is the latest peak above the reading
+    /// that is behind it. A worker that does not trust its clock reads the wall clock fifteen
+    /// minutes ahead of the right time before the owner acts; the owner confirms the right time,
+    /// and a second peak, ten minutes ahead, is read after the act; the clock then goes back to the
+    /// owner's time. The higher peak came before the act and refuses nothing, and the second came
+    /// after it and does.
+    #[test]
+    fn a_peak_after_the_act_refuses_it_though_a_higher_peak_came_before_the_act() {
+        let (floor, held, contract) = found_a_rollback();
+        let level = held.wall.now_ms().get();
+        let began = held.continuous.boot_elapsed_ms();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) + 900_000);
+        contract.wall_reading();
+        held.pass(Duration::from_secs(1));
+        floor.establish(
+            right_time(&held, level, began),
+            held.continuous.boot_elapsed_ms(),
+        );
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began) + 600_000);
+        contract.wall_reading();
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right_time(&held, level, began));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading taken after the owner's act"
         );
     }
 }
