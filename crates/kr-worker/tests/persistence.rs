@@ -1899,8 +1899,8 @@ fn a_receipt_kept_under_a_code_this_build_lacks_reads_as_an_unknown_outcome_to_t
 /// added reads as the unknown outcome: a repeat of its action gets the receipt, a move out of a
 /// settled state is refused, and an unknown receipt is settled by its own writer or by an
 /// observation. Each write puts the writer's own outcome and nothing else: the kept word is never
-/// written back as the unknown outcome, and an observation that brings no refusal leaves the error
-/// as it was kept.
+/// written back as the unknown outcome, and an observation that settles it as refused with no
+/// refusal leaves the error as it was kept.
 #[test]
 fn a_writer_that_reads_a_receipt_kept_under_a_code_this_build_lacks_writes_only_its_own_outcome() {
     let path = journal_path("writer-unknown-error-code");
