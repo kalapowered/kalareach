@@ -1,54 +1,55 @@
-//! The proof that the daemon which answers after a restart's start is the one the command started,
-//! and what the command does where the exchange that proves it is cut.
+//! The reads of the daemon that a restart makes after its stop, and the start that follows.
 //!
-//! The proof reads the daemon's generation and its process on the one connection that answered. An
-//! exchange that does not complete leaves no proof, and that is not yet a failure: the daemon that
-//! the connection reached may have been stopped by another command, as this one stopped the daemon
+//! Every read writes what it saw into the record of the wait as it sees it: that it began, the
+//! greeting, what `host.info` gave and the answer to the request for the launch alone, so that a
+//! time-out or a failure that comes later discards none of it. A read is whole where it gave a
+//! usable greeting, the daemon's generation and the answer to the launch-only request on the one
+//! connection that answered.
+//!
+//! A start that does not give a whole exchange is not yet a failure: the daemon that the
+//! connection reached may have been stopped by another command, as this one stopped the daemon
 //! before it, and a daemon of that command's start comes up next. The command then starts nothing
 //! more. It waits, within the start's bound counted from the cut, for a daemon to give a whole
-//! exchange, and judges what answers by that one exchange on its connection.
+//! exchange.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use kr_client::shown;
-use kr_client::shown::{Said, Shown};
-use kr_ipc::client::LocalClient;
-use kr_ipc::paths::HostPaths;
-use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ControllerGeneration, EnvironmentId};
+use kr_ipc::client::{Listed, LocalClient};
+use kr_ipc::paths::{EnvironmentPaths, HostPaths};
+use kr_protocol::ids::EnvironmentId;
+use kr_protocol::method::Method;
 
-use super::{Answering, Old, Proved, StartFailed, judge};
-use crate::error::{CliError, Result};
-use crate::host_stop::{self, Asked, LOOK_EVERY, Progress};
+use super::record::{Last, Launch, Observation, Record, Shared};
+use super::{Old, StartFailed};
+use crate::error::Result;
+use crate::host_stop::{self, Asked, Gave, LOOK_EVERY, Progress, Sight};
 use crate::resolve::KnownEnvironment;
 use crate::startup::{self, Started};
 
 /// What the proof makes and reads, given to it so that a case can supply each answer, with the
 /// runtime's clock in its own hands. [`Real`] is the command's own.
 pub(super) trait Operations {
-    /// A connection to a daemon that answered.
+    /// A connection to a daemon that gave a usable greeting.
     type Connection;
 
     /// The start as `kr new` makes it, or the connection of a daemon that already answers.
-    /// `launched` is set as the start sets it.
-    async fn start(&self, launched: &AtomicBool) -> Result<(Self::Connection, Option<Started>)>;
-
-    /// The generation the daemon states on `connection`, or why it could not be read.
-    async fn generation(
+    /// `launched` is set as the start sets it. The start's own reads are written to `record`.
+    async fn start(
         &self,
-        connection: &mut Self::Connection,
-    ) -> std::result::Result<ControllerGeneration, Shown>;
+        launched: &AtomicBool,
+        record: &Shared,
+    ) -> Result<(Self::Connection, Option<Started>)>;
 
-    /// The process the daemon states on `connection`: none where the daemon says it states none,
-    /// and an error where the exchange was cut.
-    async fn process(
-        &self,
-        connection: &mut Self::Connection,
-    ) -> std::result::Result<Option<u64>, Shown>;
+    /// The exchange on `connection`, whose greeting is in the record: `host.info`, and the request
+    /// for the launch alone where it gave a generation. Each step is written to `record` as it is
+    /// seen.
+    async fn exchange(&self, connection: &mut Self::Connection, record: &Shared);
 
-    /// One attempt to connect to the daemon that answers now, bounded by `within`.
-    async fn connect(&self, within: Duration) -> Option<Self::Connection>;
+    /// One attempt to connect to the daemon that answers now, bounded by `within`. It writes that
+    /// it began and what it gave to `record`.
+    async fn connect(&self, within: Duration, record: &Shared) -> Option<Self::Connection>;
 
     /// Waits `time` between two attempts.
     async fn pause(&self, time: Duration);
@@ -64,44 +65,32 @@ pub(super) struct Real<'a> {
 impl Operations for Real<'_> {
     type Connection = LocalClient;
 
-    async fn start(&self, launched: &AtomicBool) -> Result<(LocalClient, Option<Started>)> {
-        startup::open_or_start_telling(self.host, self.environment, launched).await
-    }
-
-    async fn generation(
+    async fn start(
         &self,
-        connection: &mut LocalClient,
-    ) -> std::result::Result<ControllerGeneration, Shown> {
-        match tokio::time::timeout(
-            startup::ANSWER_BOUND,
-            host_stop::host_info(connection, &self.environment.paths),
+        launched: &AtomicBool,
+        record: &Shared,
+    ) -> Result<(LocalClient, Option<Started>)> {
+        let told = record.clone();
+        let seen = Arc::new(move |sight| told.observe(Observation::Sight(sight)));
+        startup::telling_sights(
+            seen,
+            startup::open_or_start_telling(self.host, self.environment, launched),
         )
         .await
-        {
-            Ok(Ok(info)) => Ok(info.generation),
-            Ok(Err(error)) => Err(shown!(
-                "a control daemon answered and its generation could not be read: {}",
-                error.said()
-            )),
-            Err(_) => Err(Shown::said(
-                "a control daemon answered and did not state its generation in time",
-            )),
-        }
     }
 
-    async fn process(
-        &self,
-        connection: &mut LocalClient,
-    ) -> std::result::Result<Option<u64>, Shown> {
-        process_stated(connection, self.environment.environment_id, self.progress).await
+    async fn exchange(&self, connection: &mut LocalClient, record: &Shared) {
+        exchange(
+            connection,
+            self.environment.environment_id,
+            self.progress,
+            record,
+        )
+        .await;
     }
 
-    async fn connect(&self, within: Duration) -> Option<LocalClient> {
-        let endpoint = self.environment.paths.controller_endpoint().ok()?;
-        match startup::reach(&endpoint, within, &[]).await {
-            startup::Reached::Answered(listed) => startup::ours(*listed).ok(),
-            startup::Reached::Silent | startup::Reached::Refused(_) => None,
-        }
+    async fn connect(&self, within: Duration, record: &Shared) -> Option<LocalClient> {
+        connect(&self.environment.paths, within, record).await
     }
 
     async fn pause(&self, time: Duration) {
@@ -109,835 +98,390 @@ impl Operations for Real<'_> {
     }
 }
 
-/// The process the daemon states on `connection`. It comes from a request for the launch alone,
-/// which answers the daemon's process and stops nothing: none where the daemon refuses the
-/// request, and an error where the exchange was cut.
-pub(super) async fn process_stated(
-    connection: &mut LocalClient,
-    id: EnvironmentId,
-    progress: &Progress,
-) -> std::result::Result<Option<u64>, Shown> {
-    match host_stop::ask(connection, id, false, progress, true).await {
-        Asked::Taken(result) => Ok(Some(result.pid.get())),
-        // A daemon that refuses the request states no process.
-        Asked::Refused(_) => Ok(None),
-        Asked::Unknown(why) => Err(shown!(
-            "a control daemon answered and its process could not be read: {}",
-            why
-        )),
-        Asked::NotComposed { error } => Err(shown!(
-            "a control daemon answered and its process could not be read: {}",
-            Shown::ipc(&error)
-        )),
+/// One attempt to connect to the daemon at the environment's endpoint, bounded by `within`: it
+/// began, and the connection and the greeting gave what they gave. A daemon that gave a usable
+/// greeting is the connection that is returned.
+pub(super) async fn connect(
+    environment: &EnvironmentPaths,
+    within: Duration,
+    record: &Shared,
+) -> Option<LocalClient> {
+    let sight = |sight| record.observe(Observation::Sight(sight));
+    sight(Sight::Began);
+    let Ok(endpoint) = environment.controller_endpoint() else {
+        sight(Sight::Gave(Gave::NoAddress));
+        return None;
+    };
+    match startup::reach(&endpoint, within, &[]).await {
+        startup::Reached::Silent => {
+            sight(Sight::Gave(Gave::NothingInTime));
+            None
+        }
+        startup::Reached::Refused(error) => {
+            sight(Sight::Gave(host_stop::gave_by_the_greeting(&error)));
+            None
+        }
+        startup::Reached::Answered(listed) => match *listed {
+            Listed::Other(_) => {
+                sight(Sight::Gave(Gave::GreetingOfAnotherMajor));
+                None
+            }
+            Listed::Ours(client) => {
+                sight(Sight::Greeted);
+                Some(*client)
+            }
+        },
     }
 }
 
-/// What one connection says of the daemon behind it: its generation, and then its process, both
-/// read on that connection, so that they are of one process. Two reads on two connections cannot
-/// be told from a daemon that ended and another that took its place.
-pub(super) async fn answering<O: Operations>(
-    operations: &O,
-    connection: &mut O::Connection,
-) -> std::result::Result<Answering, Shown> {
-    let generation = operations.generation(connection).await?;
-    let pid = operations.process(connection).await?;
-    Ok(Answering { generation, pid })
+/// The exchange on a connection that gave a usable greeting: `host.info`, and then the request for
+/// the launch alone, which answers the daemon's process and stops nothing, on the same connection.
+/// The process is none where the daemon refuses the request; an exchange that is cut, withheld or
+/// not answered is not whole.
+pub(super) async fn exchange(
+    connection: &mut LocalClient,
+    id: EnvironmentId,
+    progress: &Progress,
+    record: &Shared,
+) {
+    let gave = host_stop::gave_by_the_read(connection.request(Method::HostInfo, &()).await);
+    record.observe(Observation::Sight(Sight::Gave(gave)));
+    if !matches!(gave, Gave::Reported(_)) {
+        return;
+    }
+    let launch = match host_stop::ask(connection, id, false, progress, true).await {
+        Asked::Taken(result) => Launch::Stated(Some(result.pid.get())),
+        // A daemon that refuses the request states no process.
+        Asked::Refused(_) => Launch::Stated(None),
+        Asked::Unknown(_) | Asked::NotComposed { .. } => Launch::NotWhole,
+    };
+    record.observe(Observation::Launch(launch));
 }
 
-/// Starts a daemon as `kr new` does and proves that the daemon which answers is the one this
-/// command started: the connection that answered gives a generation newer than the one that was
-/// stopped and, where the start knows its process, that process.
-///
-/// Where the exchange on that connection is cut, nothing more is started: see [`after_a_cut`].
-pub(super) async fn prove<O: Operations>(
-    operations: &O,
-    stopped: Old,
-    bound: Duration,
-) -> std::result::Result<Proved, StartFailed> {
-    let launched = AtomicBool::new(false);
-    let (mut connection, started) = match operations.start(&launched).await {
-        Ok(found) => found,
-        Err(error) => {
-            return Err(StartFailed {
-                error,
-                launched: launched.load(Ordering::SeqCst),
-                answered: false,
-            });
+/// One read of the daemon at the environment's endpoint, as a whole bounded by `within`: the
+/// connection, the greeting and the exchange. What it saw is in `record` where the time-out ends
+/// it.
+pub(super) async fn read(
+    environment: &KnownEnvironment,
+    progress: &Progress,
+    record: &Shared,
+    within: Duration,
+) {
+    let _ = tokio::time::timeout(within, async {
+        if let Some(mut connection) = connect(&environment.paths, within, record).await {
+            exchange(
+                &mut connection,
+                environment.environment_id,
+                progress,
+                record,
+            )
+            .await;
         }
-    };
-    // A daemon answered, so there is no requested daemon that may still start.
-    let (answering, cut) = match answering(operations, &mut connection).await {
-        Ok(answering) => (answering, false),
-        Err(_) => (after_a_cut(operations, started, bound).await?, true),
-    };
-    let proved = judge(started, stopped, &answering).map_err(|message| StartFailed {
-        error: CliError::Unfinished {
-            code: ErrorCode::EnvironmentUnavailable,
-            message: Shown::said(message),
-        },
-        launched: started.is_some(),
-        answered: true,
-    })?;
-    Ok(if cut { proved.after_a_cut() } else { proved })
+    })
+    .await;
 }
 
-/// The exchange on the connection that the start gave did not complete: it failed, it reached its
-/// bound, or the daemon gave no process that could be read. This starts nothing: the daemon may
-/// have been stopped by another command, whose own start comes up next. It waits, within `bound`
-/// counted from here, for a daemon to give a whole exchange, and gives what that daemon says on
-/// its connection. A wait that runs out is the failure of a proof that was cut, which says that
-/// the command could not read which daemon serves the environment and that none gave a whole answer within
-/// the bound.
-async fn after_a_cut<O: Operations>(
+/// What one read of a wait that ends at `deadline` is given: its own bound, or the time that is
+/// left of the wait, whichever is less.
+pub(super) fn within(deadline: tokio::time::Instant) -> Duration {
+    startup::ANSWER_BOUND.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+}
+
+/// Whether the last read of `record` was a whole exchange, and its generation is not the one of
+/// the daemon that was told to stop: where the stopped generation was never read the later answer
+/// stands, and no comparison is made.
+pub(super) fn answers_as_another_daemon(record: &Record, stopped: Old) -> bool {
+    match (record.last, stopped) {
+        (Some(Last::Whole(generation)), Old::Generation(old)) => generation > old,
+        (Some(Last::Whole(_)), Old::None | Old::Unread) => true,
+        _ => false,
+    }
+}
+
+/// Reads until a read gives a whole exchange or `deadline` passes; each read is given the less of
+/// its own bound and the time that is left. Says whether the last read was whole.
+pub(super) async fn until_whole<O: Operations>(
     operations: &O,
-    started: Option<Started>,
-    bound: Duration,
-) -> std::result::Result<Answering, StartFailed> {
-    let deadline = tokio::time::Instant::now() + bound;
+    record: &Shared,
+    deadline: tokio::time::Instant,
+) -> bool {
     let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     loop {
-        if let Some(mut connection) = operations.connect(left()).await
-            && let Ok(Ok(answering)) =
-                tokio::time::timeout(left(), answering(operations, &mut connection)).await
-        {
-            return Ok(answering);
+        let within = startup::ANSWER_BOUND.min(left());
+        let _ = tokio::time::timeout(within, async {
+            if let Some(mut connection) = operations.connect(within, record).await {
+                operations.exchange(&mut connection, record).await;
+            }
+        })
+        .await;
+        if matches!(record.read().last, Some(Last::Whole(_))) {
+            return true;
         }
         if left().is_zero() {
-            let message = cut_failed_said(started, bound);
-            return Err(StartFailed {
-                error: CliError::Unfinished {
-                    code: ErrorCode::EnvironmentUnavailable,
-                    message,
-                },
-                // A daemon answered, so there is no requested daemon that may still start.
-                launched: false,
-                answered: true,
-            });
+            return false;
         }
         operations.pause(LOOK_EVERY.min(left())).await;
     }
 }
 
-/// What a proof whose exchange was cut says where no daemon gave a whole exchange within `bound`:
-/// that this command could not read which control daemon serves the environment, and the process
-/// it launched where it launched one. It says nothing of an end that the command did not see.
-fn cut_failed_said(started: Option<Started>, bound: Duration) -> Shown {
-    match started {
-        Some(started) => shown!(
-            "this command started a control daemon{} but could not read which control daemon \
-             serves the environment, and no control daemon gave a whole answer within {} seconds",
-            super::process_said(started.pid.map(u64::from)),
-            bound.as_secs()
-        ),
-        None => shown!(
-            "this command could not read which control daemon serves the environment, and no \
-             control daemon gave a whole answer within {} seconds",
-            bound.as_secs()
-        ),
+/// Starts a daemon as `kr new` does and reads what answers: the exchange on the connection that
+/// the start gave, and, where it is not whole, nothing more is started and the reads go on within
+/// `bound` counted from the start. What the daemon that answers is, is in `record`; what this
+/// command launched is returned, none where the look found a daemon already there. A start is a
+/// failure where it gave no whole exchange within the bound, or where the daemon that answers is
+/// of the generation that was told to stop.
+pub(super) async fn prove<O: Operations>(
+    operations: &O,
+    stopped: Old,
+    bound: Duration,
+    record: &Shared,
+) -> std::result::Result<Option<Started>, StartFailed> {
+    let launched = AtomicBool::new(false);
+    let (mut connection, started) = match operations.start(&launched, record).await {
+        Ok(found) => found,
+        Err(error) => {
+            return Err(StartFailed {
+                error: Some(error),
+                launched: launched.load(Ordering::SeqCst),
+            });
+        }
+    };
+    let deadline = tokio::time::Instant::now() + bound;
+    // The start's connection gave a usable greeting.
+    record.observe(Observation::Sight(Sight::Greeted));
+    let _ = tokio::time::timeout(
+        startup::ANSWER_BOUND.min(bound),
+        operations.exchange(&mut connection, record),
+    )
+    .await;
+    let whole = matches!(record.read().last, Some(Last::Whole(_)))
+        || until_whole(operations, record, deadline).await;
+    if whole && answers_as_another_daemon(&record.read(), stopped) {
+        return Ok(started);
     }
+    Err(StartFailed {
+        error: None,
+        launched: launched.load(Ordering::SeqCst),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     use kr_protocol::hostinfo::configuration::ControllerStartup;
+    use kr_protocol::ids::ControllerGeneration;
 
     use super::*;
 
-    /// One answer of an operation, and the time it takes on the clock.
-    struct Step<T> {
-        gives: T,
-        takes: Duration,
+    fn generation(number: u64) -> ControllerGeneration {
+        ControllerGeneration::new(number)
     }
 
-    fn at_once<T>(gives: T) -> Step<T> {
-        Step {
-            gives,
-            takes: Duration::ZERO,
-        }
+    /// What one connection of a case does.
+    #[derive(Clone, Copy)]
+    enum Daemon {
+        /// Nothing answers within `0`.
+        Silent(Duration),
+        /// A usable greeting, then a whole exchange after `takes`.
+        Whole {
+            generation: u64,
+            process: Option<u64>,
+            takes: Duration,
+        },
+        /// A usable greeting, the generation, and then the launch-only answer is cut.
+        Cut(u64),
+        /// A usable greeting, and then nothing.
+        Hangs,
     }
 
-    /// The answers an operation gives in turn, the last one for every call after them.
-    struct Script<T>(Mutex<Vec<Step<T>>>);
-
-    impl<T: Clone> Script<T> {
-        fn of(steps: Vec<Step<T>>) -> Self {
-            Self(Mutex::new(steps))
-        }
-
-        fn next(&self) -> Step<T> {
-            let mut steps = self.0.lock().expect("the script");
-            let step = if steps.len() > 1 {
-                steps.remove(0)
-            } else {
-                let last = steps.first().expect("a step");
-                Step {
-                    gives: last.gives.clone(),
-                    takes: last.takes,
-                }
-            };
-            drop(steps);
-            step
-        }
-    }
-
-    /// What one daemon says on its connection.
-    #[derive(Clone)]
-    struct Says {
-        generation: std::result::Result<u64, &'static str>,
-        process: std::result::Result<Option<u64>, &'static str>,
-        /// Whether its generation is never said.
-        hangs: bool,
-    }
-
-    fn says(generation: u64, process: Option<u64>) -> Says {
-        Says {
-            generation: Ok(generation),
-            process: Ok(process),
-            hangs: false,
-        }
-    }
-
-    /// A daemon whose exchange is cut before it says its generation.
-    fn cut() -> Says {
-        Says {
-            generation: Err("the connection was cut"),
-            process: Err("the connection was cut"),
-            hangs: false,
-        }
-    }
-
-    /// A daemon that answers the connection and then never says its generation.
-    fn hangs() -> Says {
-        Says {
-            hangs: true,
-            ..says(6, Some(100))
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Call {
-        Start,
-        Generation(usize),
-        Process(usize),
-        Connect(Duration),
-        Pause(Duration),
-    }
-
-    /// The operations of a case. The start gives connection 0 and what the case says it started;
-    /// a later connection is the next one the script of connects gives, and each connection is the
-    /// daemon of the same number in `daemons`. Every call is recorded with the time on the paused
-    /// clock.
+    /// The operations of a case: each start and each connect takes the next daemon of the script,
+    /// the last one for every call after it.
     struct Supplied {
-        began: tokio::time::Instant,
-        calls: Mutex<Vec<(Duration, Call)>>,
-        start_takes: Duration,
+        script: Mutex<VecDeque<Daemon>>,
         started: Option<Started>,
-        daemons: Vec<Says>,
-        connects: Script<Option<usize>>,
     }
 
     impl Supplied {
-        fn new(
-            start_takes: Duration,
-            started: Option<Started>,
-            daemons: Vec<Says>,
-            connects: Vec<Step<Option<usize>>>,
-        ) -> Self {
+        fn of(script: Vec<Daemon>) -> Self {
             Self {
-                began: tokio::time::Instant::now(),
-                calls: Mutex::new(Vec::new()),
-                start_takes,
-                started,
-                daemons,
-                connects: Script::of(connects),
+                script: Mutex::new(script.into()),
+                started: Some(Started {
+                    pid: Some(77),
+                    start: ControllerStartup::Standalone,
+                    manager: None,
+                }),
             }
         }
 
-        fn record(&self, call: Call) {
-            self.calls
-                .lock()
-                .expect("the calls")
-                .push((self.began.elapsed(), call));
-        }
-
-        fn calls(&self) -> Vec<(Duration, Call)> {
-            self.calls.lock().expect("the calls").clone()
-        }
-
-        fn count(&self, wanted: impl Fn(&Call) -> bool) -> usize {
-            self.calls().iter().filter(|(_, call)| wanted(call)).count()
-        }
-
-        fn starts(&self) -> usize {
-            self.count(|call| matches!(call, Call::Start))
+        fn next(&self) -> Daemon {
+            let mut script = self.script.lock().expect("the script");
+            if script.len() > 1 {
+                script.pop_front().expect("a daemon")
+            } else {
+                *script.front().expect("a daemon")
+            }
         }
     }
 
     impl Operations for Supplied {
-        type Connection = usize;
+        type Connection = Daemon;
 
-        async fn start(&self, _launched: &AtomicBool) -> Result<(usize, Option<Started>)> {
-            self.record(Call::Start);
-            tokio::time::advance(self.start_takes).await;
-            Ok((0, self.started))
-        }
-
-        async fn generation(
+        async fn start(
             &self,
-            connection: &mut usize,
-        ) -> std::result::Result<ControllerGeneration, Shown> {
-            self.record(Call::Generation(*connection));
-            if self.daemons[*connection].hangs {
-                std::future::pending::<()>().await;
+            _launched: &AtomicBool,
+            _record: &Shared,
+        ) -> Result<(Daemon, Option<Started>)> {
+            Ok((self.next(), self.started))
+        }
+
+        async fn exchange(&self, connection: &mut Daemon, record: &Shared) {
+            let sight = |gave| record.observe(Observation::Sight(Sight::Gave(gave)));
+            match *connection {
+                Daemon::Whole {
+                    generation: number,
+                    process,
+                    takes,
+                } => {
+                    tokio::time::sleep(takes).await;
+                    sight(Gave::Reported(generation(number)));
+                    record.observe(Observation::Launch(Launch::Stated(process)));
+                }
+                Daemon::Cut(number) => {
+                    sight(Gave::Reported(generation(number)));
+                    record.observe(Observation::Launch(Launch::NotWhole));
+                }
+                Daemon::Hangs => tokio::time::sleep(Duration::from_secs(3600)).await,
+                Daemon::Silent(_) => {}
             }
-            self.daemons[*connection]
-                .generation
-                .map(ControllerGeneration::new)
-                .map_err(Shown::said)
         }
 
-        async fn process(&self, connection: &mut usize) -> std::result::Result<Option<u64>, Shown> {
-            self.record(Call::Process(*connection));
-            self.daemons[*connection].process.map_err(Shown::said)
-        }
-
-        async fn connect(&self, within: Duration) -> Option<usize> {
-            self.record(Call::Connect(within));
-            let step = self.connects.next();
-            tokio::time::advance(step.takes).await;
-            step.gives
+        async fn connect(&self, within: Duration, record: &Shared) -> Option<Daemon> {
+            record.observe(Observation::Sight(Sight::Began));
+            let daemon = self.next();
+            if let Daemon::Silent(takes) = daemon {
+                tokio::time::sleep(takes.min(within)).await;
+                record.observe(Observation::Sight(Sight::Gave(Gave::NothingInTime)));
+                return None;
+            }
+            record.observe(Observation::Sight(Sight::Greeted));
+            Some(daemon)
         }
 
         async fn pause(&self, time: Duration) {
-            self.record(Call::Pause(time));
-            tokio::time::advance(time).await;
+            tokio::time::sleep(time).await;
         }
     }
 
-    const BOUND: Duration = Duration::from_secs(30);
-
-    fn started(pid: u32) -> Option<Started> {
-        Some(Started {
-            pid: Some(pid),
-            start: ControllerStartup::Standalone,
-            manager: None,
-            held: true,
-        })
-    }
-
-    fn failed_with(proved: std::result::Result<Proved, StartFailed>) -> (String, bool) {
-        match proved {
-            Err(failed) => (failed.error.said().to_string(), failed.launched),
-            Ok(_) => panic!("the proof should have failed"),
+    fn whole(number: u64, process: Option<u64>) -> Daemon {
+        Daemon::Whole {
+            generation: number,
+            process,
+            takes: Duration::ZERO,
         }
     }
 
-    /// The proof's exchange is one connection: the generation and then the process are read on the
-    /// connection the start gave, and nothing connects again to read either.
+    /// A start whose connection gives a whole exchange of another generation succeeds, and the
+    /// record holds the process that the daemon stated.
     #[tokio::test(start_paused = true)]
-    async fn the_exchange_reads_the_generation_and_the_process_on_the_one_connection() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![says(5, Some(100))],
-            vec![at_once(None)],
-        );
-        let proved = prove(
-            &supplied,
-            Old::Generation(ControllerGeneration::new(4)),
-            BOUND,
-        )
-        .await;
-        assert!(matches!(proved, Ok(Proved::Ours(ours)) if ours.pid == Some(100)));
-        assert_eq!(
-            supplied.calls(),
-            vec![
-                (Duration::ZERO, Call::Start),
-                (Duration::ZERO, Call::Generation(0)),
-                (Duration::ZERO, Call::Process(0)),
-            ],
-            "one start, two reads on its connection, no second connection"
-        );
-    }
-
-    /// The exchange gives what the connection said, and a daemon that refuses the request states
-    /// no process.
-    #[tokio::test(start_paused = true)]
-    async fn the_exchange_gives_what_the_connection_said_and_none_for_a_refused_process() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![says(5, Some(100)), says(7, None)],
-            vec![at_once(None)],
-        );
-        assert_eq!(
-            answering(&supplied, &mut 0).await.expect("answers"),
-            Answering {
-                generation: ControllerGeneration::new(5),
-                pid: Some(100)
-            }
-        );
-        assert_eq!(
-            answering(&supplied, &mut 1).await.expect("answers"),
-            Answering {
-                generation: ControllerGeneration::new(7),
-                pid: None
-            }
-        );
-        assert_eq!(supplied.count(|call| matches!(call, Call::Connect(_))), 0);
-    }
-
-    /// A cut exchange followed by the started process answering is proved: nothing is started a
-    /// second time, the wait connects first at the cut with the whole bound and pauses a look's
-    /// interval between attempts, and the answer comes from the one exchange on the new connection.
-    #[tokio::test(start_paused = true)]
-    async fn a_cut_then_the_started_process_is_proved_and_nothing_is_started_again() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![cut(), says(6, Some(100))],
-            vec![at_once(None), at_once(Some(1))],
-        );
-        let proved = prove(
-            &supplied,
-            Old::Generation(ControllerGeneration::new(4)),
-            BOUND,
-        )
-        .await;
-        assert!(matches!(proved, Ok(Proved::Ours(ours)) if ours.pid == Some(100)));
-        assert_eq!(
-            supplied.calls(),
-            vec![
-                (Duration::ZERO, Call::Start),
-                (Duration::ZERO, Call::Generation(0)),
-                (Duration::ZERO, Call::Connect(BOUND)),
-                (Duration::ZERO, Call::Pause(LOOK_EVERY)),
-                (LOOK_EVERY, Call::Connect(BOUND - LOOK_EVERY)),
-                (LOOK_EVERY, Call::Generation(1)),
-                (LOOK_EVERY, Call::Process(1)),
-            ]
-        );
-        assert_eq!(supplied.starts(), 1, "no second start");
-    }
-
-    /// A cut exchange followed by another process answering, of a generation newer than the daemon
-    /// that was stopped, is the outcome for another daemon, which carries what this command
-    /// launched and that the exchange was cut.
-    #[tokio::test(start_paused = true)]
-    async fn a_cut_then_another_process_is_another_and_carries_what_was_launched() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![cut(), says(6, Some(200))],
-            vec![at_once(Some(1))],
-        );
-        let proved = prove(
-            &supplied,
-            Old::Generation(ControllerGeneration::new(4)),
-            BOUND,
-        )
-        .await;
-        assert!(matches!(
-            proved,
-            Ok(Proved::Another {
-                serving: Some(200),
-                launched: Some(launched),
-                cut: true
-            }) if launched.pid == Some(100)
-        ));
-        assert_eq!(supplied.starts(), 1, "no second start");
-        assert_eq!(
-            supplied.count(|call| matches!(call, Call::Pause(_))),
-            0,
-            "the first attempt answered"
-        );
-    }
-
-    /// A cut exchange after which a daemon answers that is not newer than the one that was
-    /// stopped proves nothing, as an exchange that was not cut does not.
-    #[tokio::test(start_paused = true)]
-    async fn a_cut_then_the_generation_that_was_stopped_is_no_proof() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![cut(), says(4, Some(100))],
-            vec![at_once(Some(1))],
-        );
-        let (said, launched) = failed_with(
-            prove(
-                &supplied,
-                Old::Generation(ControllerGeneration::new(4)),
-                BOUND,
-            )
-            .await,
-        );
-        assert!(said.contains("generation that was told to stop"), "{said}");
-        assert!(launched, "a daemon was started and did not prove itself");
-    }
-
-    /// A cut exchange after which nothing answers fails at the bound, and the bound is counted
-    /// from the cut: the start and the read that was cut took 7 seconds, and the wait ran its own
-    /// 30 after them. Nothing is started a second time, and no call comes after the bound.
-    #[tokio::test(start_paused = true)]
-    async fn a_cut_then_nothing_to_the_bound_fails_with_the_bound_counted_from_the_cut() {
-        let supplied = Supplied::new(
-            Duration::from_secs(7),
-            started(100),
-            vec![cut()],
-            vec![at_once(None)],
-        );
-        let (said, launched) = failed_with(
-            prove(
-                &supplied,
-                Old::Generation(ControllerGeneration::new(4)),
-                BOUND,
-            )
-            .await,
-        );
-        assert_eq!(
-            said,
-            "this command started a control daemon (process 100) but could not read which control \
-             daemon serves the environment, and no control daemon gave a whole answer within 30 seconds"
-        );
-        assert!(!launched, "a daemon answered, so none may still start");
-        let cut_at = Duration::from_secs(7);
-        assert_eq!(supplied.began.elapsed(), cut_at + BOUND);
-        assert_eq!(supplied.starts(), 1, "no second start");
-        let calls = supplied.calls();
-        assert!(
-            calls.iter().all(|(at, call)| *at <= cut_at + BOUND
-                && !matches!(call, Call::Pause(time) if *time > LOOK_EVERY)),
-            "no call after the bound and no pause longer than a look's interval"
-        );
-        assert!(
-            calls.len() > 100,
-            "it looked again and again: {}",
-            calls.len()
-        );
-        assert_eq!(
-            calls.get(2),
-            Some(&(cut_at, Call::Connect(BOUND))),
-            "the first attempt is at the cut with the whole bound"
-        );
-    }
-
-    /// What the start gives where the task's request was withdrawn before a starter took it and a
-    /// daemon answered: the launch is none, as the start on Windows says it.
-    #[cfg(windows)]
-    fn a_withdrawn_task_request() -> Option<Started> {
-        let task = Started {
-            pid: None,
-            start: ControllerStartup::Standalone,
-            manager: None,
-            held: false,
-        };
-        let launched = AtomicBool::new(true);
-        let launch = crate::startup::launched_after_the_answer(
-            Ok(kr_ipc::starter::Withdrawal::Withdrawn),
-            task,
-            &launched,
-        );
-        assert!(!launched.load(Ordering::SeqCst));
-        launch
-    }
-
-    /// KR-REQ-07.12 (Windows, a withdrawn task request and a whole proof): another daemon answers,
-    /// and the proof names no launch of this command's, where an unproved launch would say that a
-    /// daemon was asked for and cannot be told from the one that answers.
-    #[cfg(windows)]
-    #[tokio::test(start_paused = true)]
-    async fn a_withdrawn_task_request_with_a_whole_proof_is_another_daemon_with_no_launch() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            a_withdrawn_task_request(),
-            vec![says(5, Some(900))],
-            vec![],
-        );
-        let proved = prove(
-            &supplied,
-            Old::Generation(ControllerGeneration::new(4)),
-            BOUND,
-        )
-        .await;
-        assert!(
-            matches!(
-                proved,
-                Ok(Proved::Another {
-                    serving: Some(900),
-                    launched: None,
-                    cut: false
-                })
-            ),
-            "another daemon, no launch"
-        );
-    }
-
-    /// KR-REQ-07.12 (Windows, a withdrawn task request and a proof that is cut): no daemon gives a
-    /// whole answer at the bound, and the failure says that this command could not read which
-    /// daemon serves the environment, and never that it started one.
-    #[cfg(windows)]
-    #[tokio::test(start_paused = true)]
-    async fn a_withdrawn_task_request_with_a_cut_proof_never_says_that_a_daemon_was_started() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            a_withdrawn_task_request(),
-            vec![cut()],
-            vec![at_once(None)],
-        );
-        let (said, launched) = failed_with(
-            prove(
-                &supplied,
-                Old::Generation(ControllerGeneration::new(4)),
-                BOUND,
-            )
-            .await,
-        );
-        assert_eq!(
-            said,
-            "this command could not read which control daemon serves the environment, and no \
-             control daemon gave a whole answer within 30 seconds"
-        );
-        assert!(!launched);
-    }
-
-    /// Each failure of a proof says that a control daemon answered: the generation that was told to
-    /// stop, a daemon that states no process, and an exchange that stayed cut to the bound.
-    #[tokio::test(start_paused = true)]
-    async fn the_failures_of_a_proof_say_that_a_daemon_answered() {
-        let old = Old::Generation(ControllerGeneration::new(4));
-        let not_newer = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![says(4, Some(100))],
-            vec![],
-        );
-        let no_process = Supplied::new(Duration::ZERO, started(100), vec![says(5, None)], vec![]);
-        let cut_to_the_bound = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![cut()],
-            vec![at_once(None)],
-        );
-        for supplied in [not_newer, no_process, cut_to_the_bound] {
-            let failed = prove(&supplied, old, BOUND)
-                .await
-                .err()
-                .expect("the proof fails");
-            assert!(failed.answered, "a daemon answered");
-        }
-    }
-
-    /// A daemon that answers the information request and withholds the answer to the launch-only
-    /// request, on every connection, as a host does that owes a fence it has not yet raised: the
-    /// proof never has a whole exchange, and ends at the bound with a failure that says that no
-    /// control daemon gave a whole answer, which is true, and not that none answered, which is not.
-    /// The failure is an unfinished command (exit 1) and names the process this command launched.
-    #[tokio::test(start_paused = true)]
-    async fn an_information_request_answered_and_a_launch_only_answer_withheld_fails_at_the_bound()
-    {
-        let withheld = Says {
-            generation: Ok(5),
-            process: Err("the answer is withheld as an unknown outcome"),
-            hangs: false,
-        };
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![withheld.clone()],
-            vec![at_once(Some(0))],
-        );
-        let proved = prove(
-            &supplied,
-            Old::Generation(ControllerGeneration::new(4)),
-            BOUND,
-        )
-        .await;
-        let Err(failed) = proved else {
-            panic!("the proof should have failed");
-        };
-        assert!(
-            matches!(
-                &failed.error,
-                CliError::Unfinished {
-                    code: ErrorCode::EnvironmentUnavailable,
-                    ..
-                }
-            ),
-            "an unfinished command, which ends with exit 1"
-        );
-        assert_eq!(
-            failed.error.said().to_string(),
-            "this command started a control daemon (process 100) but could not read which control \
-             daemon serves the environment, and no control daemon gave a whole answer within 30 seconds"
-        );
-        assert!(
-            !failed.launched,
-            "a daemon answered, so none may still start"
-        );
-        assert!(
-            supplied
-                .calls()
-                .iter()
-                .any(|(_, call)| matches!(call, Call::Generation(0))),
-            "the information request was answered on the connection the start gave"
-        );
-    }
-
-    /// The exchange is not complete where the generation was not read and where the generation was
-    /// read and the process was not: the failure at the bound says the same of both, with the
-    /// process this command launched, and with no launch where the start's look found a daemon.
-    #[tokio::test(start_paused = true)]
-    async fn each_way_the_exchange_is_not_complete_says_that_the_daemon_could_not_be_read() {
-        let process_not_read = Says {
-            process: Err("the process could not be read"),
-            ..says(5, Some(100))
-        };
-        for first in [cut(), process_not_read] {
-            let supplied = Supplied::new(
-                Duration::ZERO,
-                started(100),
-                vec![first],
-                vec![at_once(None)],
-            );
-            let (said, launched) = failed_with(
-                prove(
-                    &supplied,
-                    Old::Generation(ControllerGeneration::new(4)),
-                    BOUND,
-                )
-                .await,
-            );
-            assert_eq!(
-                said,
-                "this command started a control daemon (process 100) but could not read which \
-                 control daemon serves the environment, and no control daemon gave a whole answer within \
-                 30 seconds"
-            );
-            assert!(!launched);
-        }
-        let supplied = Supplied::new(Duration::ZERO, None, vec![cut()], vec![at_once(None)]);
-        let (said, launched) = failed_with(
-            prove(
-                &supplied,
-                Old::Generation(ControllerGeneration::new(4)),
-                BOUND,
-            )
-            .await,
-        );
-        assert_eq!(
-            said,
-            "this command could not read which control daemon serves the environment, and no \
-             control daemon gave a whole answer within 30 seconds"
-        );
-        assert!(!launched);
-    }
-
-    /// The failure at the bound says where the start was made by a manager that states no process:
-    /// the launch without a process.
-    #[tokio::test(start_paused = true)]
-    async fn the_failure_at_the_bound_names_no_process_where_the_start_states_none() {
-        let started = Some(Started {
-            pid: None,
-            start: ControllerStartup::Standalone,
-            manager: None,
-            held: false,
-        });
-        let supplied = Supplied::new(Duration::ZERO, started, vec![cut()], vec![at_once(None)]);
-        let (said, _) = failed_with(
-            prove(
-                &supplied,
-                Old::Generation(ControllerGeneration::new(4)),
-                BOUND,
-            )
-            .await,
-        );
-        assert_eq!(
-            said,
-            "this command started a control daemon but could not read which control daemon \
-             serves the environment, and no control daemon gave a whole answer within 30 seconds"
-        );
-    }
-
-    /// A daemon that answers the connection and is cut again is waited through, not a failure and
-    /// not a reason to start: the next daemon that answers whole is judged.
-    #[tokio::test(start_paused = true)]
-    async fn a_cut_again_is_waited_through_and_the_next_answer_is_judged() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![cut(), cut(), says(6, Some(100))],
-            vec![at_once(Some(1)), at_once(Some(2))],
-        );
-        let proved = prove(
-            &supplied,
-            Old::Generation(ControllerGeneration::new(4)),
-            BOUND,
-        )
-        .await;
-        assert!(matches!(proved, Ok(Proved::Ours(_))));
-        assert_eq!(supplied.starts(), 1, "no second start");
-        assert_eq!(supplied.count(|call| matches!(call, Call::Connect(_))), 2);
-    }
-
-    /// An answer that is never read is not waited for past the bound: the wait ends there, and it
-    /// starts nothing.
-    #[tokio::test(start_paused = true)]
-    async fn an_answer_that_is_never_read_ends_the_wait_at_the_bound() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            started(100),
-            vec![cut(), hangs()],
-            vec![at_once(Some(1))],
-        );
-        // The case's own bound, past the proof's: a proof that waits on the answer that is never
-        // read ends here, by this message, and not by the limit of the test program.
-        let proved = tokio::time::timeout(
-            BOUND + Duration::from_secs(5),
-            prove(
-                &supplied,
-                Old::Generation(ControllerGeneration::new(4)),
-                BOUND,
-            ),
+    async fn a_start_whose_connection_gives_a_whole_exchange_of_another_generation_succeeds() {
+        let record = Shared::new();
+        let started = prove(
+            &Supplied::of(vec![whole(2, Some(91))]),
+            Old::Generation(generation(1)),
+            Duration::from_secs(30),
+            &record,
         )
         .await
-        .expect(
-            "the proof ended at its own bound and did not wait for an answer that is never read",
-        );
-        let (said, _) = failed_with(proved);
-        assert!(
-            said.contains("no control daemon gave a whole answer within 30 seconds"),
-            "{said}"
-        );
-        assert_eq!(supplied.began.elapsed(), BOUND);
-        assert_eq!(supplied.starts(), 1, "no second start");
+        .map_err(|failed| failed.launched)
+        .expect("a whole exchange of another generation");
+        assert_eq!(started.and_then(|started| started.pid), Some(77));
+        let read = record.read();
+        assert_eq!(read.last, Some(Last::Whole(generation(2))));
+        assert_eq!(read.whole.and_then(|whole| whole.process), Some(91));
     }
 
-    /// Where the start's look found a daemon (none was started), a cut exchange is waited through
-    /// the same way, and what answers is named by what it states and carries no launch.
+    /// The generation that was told to stop is no success where it gives a whole exchange, and
+    /// where the stopped generation was never read the answer stands.
     #[tokio::test(start_paused = true)]
-    async fn a_cut_after_a_daemon_that_the_look_found_names_the_one_that_answers_next() {
-        let supplied = Supplied::new(
-            Duration::ZERO,
-            None,
-            vec![cut(), says(6, Some(200))],
-            vec![at_once(Some(1))],
-        );
-        let proved = prove(
-            &supplied,
-            Old::Generation(ControllerGeneration::new(4)),
-            BOUND,
+    async fn the_generation_that_was_told_to_stop_is_a_failure_and_an_unread_one_is_not() {
+        let record = Shared::new();
+        let failed = prove(
+            &Supplied::of(vec![whole(1, Some(91))]),
+            Old::Generation(generation(1)),
+            Duration::from_secs(30),
+            &record,
         )
         .await;
-        assert!(matches!(
-            proved,
-            Ok(Proved::Another {
-                serving: Some(200),
-                launched: None,
-                cut: false
-            })
-        ));
-        assert_eq!(supplied.starts(), 1, "no second start");
+        assert!(failed.is_err());
+        assert_eq!(record.read().last, Some(Last::Whole(generation(1))));
+        let record = Shared::new();
+        assert!(
+            prove(
+                &Supplied::of(vec![whole(1, None)]),
+                Old::Unread,
+                Duration::from_secs(30),
+                &record,
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    /// An exchange that is cut starts nothing more: the reads go on, and a later whole exchange
+    /// ends the wait; the greeting of the cut read stays in the record.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_exchange_is_read_again_and_a_later_whole_exchange_succeeds() {
+        let record = Shared::new();
+        let result = prove(
+            &Supplied::of(vec![
+                Daemon::Cut(2),
+                Daemon::Silent(Duration::ZERO),
+                whole(2, None),
+            ]),
+            Old::None,
+            Duration::from_secs(30),
+            &record,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(record.read().greeted);
+        assert_eq!(record.read().last, Some(Last::Whole(generation(2))));
+    }
+
+    /// One deadline for the wait: where each read of the wait would use its full bound the wait
+    /// still ends at its own bound, and what a read saw before the time-out is in the record.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_does_not_pass_its_bound_where_each_read_uses_its_full_time() {
+        let record = Shared::new();
+        let began = tokio::time::Instant::now();
+        let operations = Supplied::of(vec![Daemon::Hangs]);
+        let deadline = began + Duration::from_secs(30);
+        assert!(!until_whole(&operations, &record, deadline).await);
+        assert!(
+            tokio::time::Instant::now() <= deadline,
+            "the wait ended after {:?}",
+            began.elapsed()
+        );
+        let read = record.read();
+        assert!(
+            read.greeted,
+            "the greeting that came before the time-out stays"
+        );
+        assert!(matches!(read.last, Some(Last::Greeting(None))));
+        // A start whose exchange hangs ends within the start's bound as well.
+        let record = Shared::new();
+        let began = tokio::time::Instant::now();
+        let failed = prove(
+            &Supplied::of(vec![Daemon::Hangs]),
+            Old::None,
+            Duration::from_secs(30),
+            &record,
+        )
+        .await;
+        assert!(failed.is_err());
+        assert!(began.elapsed() <= Duration::from_secs(30));
+        assert!(record.read().greeted);
     }
 }

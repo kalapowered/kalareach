@@ -5979,14 +5979,13 @@ fn kr_host_restart_starts_a_daemon_where_none_runs_and_says_which() {
     assert!(output.status.success(), "{said}");
     assert_eq!(said["ok"], true, "{said}");
     assert_eq!(stop_of(&said), "not_asked", "{said}");
-    assert_eq!(said["started"]["start"], "standalone", "{said}");
+    assert_eq!(said["launched"]["start"], "standalone", "{said}");
     assert_eq!(
-        said["started"]["pid"].as_u64(),
+        said["launched"]["pid"].as_u64(),
         Some(u64::from(host.one_daemon())),
         "the process this command started is the daemon that answers: {said}"
     );
-    assert_eq!(said["serving"], said["started"]["pid"], "{said}");
-    assert_eq!(said["launched"], said["started"], "{said}");
+    assert_eq!(said["serving"], said["launched"]["pid"], "{said}");
     assert!(host.answers(), "a daemon answers");
     assert_eq!(host.running().len(), 1, "one daemon runs");
     assert!(attempts(&host).is_empty(), "the command removed its record");
@@ -6015,16 +6014,15 @@ fn kr_host_restart_replaces_the_daemon_and_the_new_one_is_the_one_it_started() {
     assert_eq!(said["ok"], true, "{said}");
     assert_eq!(stop_of(&said), "ended", "{said}");
     assert_eq!(said["pid"].as_u64(), Some(u64::from(old)), "{said}");
-    assert_eq!(said["started"]["start"], "standalone", "{said}");
+    assert_eq!(said["launched"]["start"], "standalone", "{said}");
     let new = host.one_daemon();
     assert_ne!(new, old, "a new daemon");
     assert_eq!(
-        said["started"]["pid"].as_u64(),
+        said["launched"]["pid"].as_u64(),
         Some(u64::from(new)),
         "{said}"
     );
     assert_eq!(said["serving"].as_u64(), Some(u64::from(new)), "{said}");
-    assert_eq!(said["launched"], said["started"], "{said}");
     assert_eq!(host.running(), vec![new], "the old process has gone");
     assert!(host.answers(), "the new daemon answers");
     assert!(attempts(&host).is_empty(), "the command removed its record");
@@ -6080,8 +6078,8 @@ fn two_kr_host_restarts_at_once_converge_on_one_daemon_and_neither_fails() {
         if output.status.success() {
             succeeded += 1;
             assert_eq!(said["ok"], true, "{said}");
-            if !said["started"].is_null() {
-                let pid = said["started"]["pid"].as_u64().expect("a process");
+            if !said["launched"].is_null() {
+                let pid = said["launched"]["pid"].as_u64().expect("a process");
                 assert!(
                     launched.iter().any(|ran| u64::from(*ran) == pid),
                     "a command that says it started a daemon named one that ran: {said}"
@@ -6123,7 +6121,7 @@ fn a_restart_whose_start_fails_after_the_stop_says_so_and_leaves_the_sessions_al
     assert_eq!(output.status.code(), Some(1), "{failed}");
     assert_eq!(stop_of(&failed), "ended", "{failed}");
     assert_eq!(failed["pid"].as_u64(), Some(u64::from(old)), "{failed}");
-    assert_eq!(failed["started"], Value::Null, "{failed}");
+    assert_eq!(failed["launched"], Value::Null, "{failed}");
     let message = failed["message"].as_str().expect("a message");
     let id = host.tree.environment_id();
     // Whole, except the start's own words, which the run gives.
@@ -6190,7 +6188,7 @@ fn kr_host_restart_refuses_before_it_stops_where_no_start_is_chosen() {
     assert_eq!(output.status.code(), Some(3), "{refused}");
     assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
     assert_eq!(stop_of(&refused), "not_asked", "{refused}");
-    assert_eq!(refused["started"], Value::Null, "{refused}");
+    assert_eq!(refused["launched"], Value::Null, "{refused}");
     let message = refused["message"].as_str().expect("a message");
     assert!(
         message.contains("this environment chooses no start for a control daemon"),
@@ -6234,7 +6232,7 @@ fn kr_host_restart_refuses_before_it_stops_where_the_daemon_program_cannot_be_ru
     assert_eq!(output.status.code(), Some(3), "{refused}");
     assert_eq!(refused["code"], "HOST_NOT_CONFIGURED", "{refused}");
     assert_eq!(stop_of(&refused), "not_asked", "{refused}");
-    assert_eq!(refused["started"], Value::Null, "{refused}");
+    assert_eq!(refused["launched"], Value::Null, "{refused}");
     let message = refused["message"].as_str().expect("a message");
     assert!(message.contains("cannot be run by this user"), "{message}");
     assert!(message.contains("Nothing was stopped."), "{message}");
@@ -8232,7 +8230,6 @@ fn a_restart_where_the_greeting_fails_because_the_daemon_is_ending_goes_on_to_st
         "the process this command started is the daemon that answers: {said}"
     );
     assert_eq!(said["serving"], said["launched"]["pid"], "{said}");
-    assert_eq!(said["started"], said["launched"], "{said}");
     assert!(host.answers(), "a daemon answers");
     assert_eq!(host.running().len(), 1, "one daemon runs");
     assert!(
@@ -8269,9 +8266,7 @@ fn a_restart_whose_request_could_not_be_made_because_the_daemon_ended_goes_on_to
     assert!(
         out.starts_with("The control daemon for environment ")
             && out.contains(" ended, and this command could not make its request for it: ")
-            && out.contains(
-                " This command sent nothing. This command then started a control daemon (process "
-            ),
+            && out.contains(" This command sent nothing. A control daemon of another generation"),
         "the stop's words for the state, then what the start did: {out}"
     );
     assert!(
@@ -8319,9 +8314,7 @@ fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
     assert!(
         out.starts_with("The control daemon for environment ")
             && out.contains(" did not show whether it took the stop (")
-            && out.contains(
-                "), and it has ended. This command then started a control daemon (process "
-            ),
+            && out.contains("), and it has ended. A control daemon of another generation"),
         "the stop's words for an unknown outcome, then what the start did: {out}"
     );
     assert!(!out.contains("Stopped the control daemon"), "{out}");
@@ -8685,10 +8678,10 @@ fn a_restart_whose_successor_was_replaced_says_what_it_read_and_when() {
     );
     assert!(
         out.contains(&format!(
-            " This command sent nothing. After it ended, a control daemon (process {}) held environment {id}, and a control daemon (process {}) answers now. This command started none. No session was stopped.",
+            " This command sent nothing. After it ended, a control daemon (process {}) held environment {id}. A control daemon (process {}) answers now. This command started none. No session was stopped.",
             replaced.successor, replaced.answering
         )),
-        "the earlier reading in the past tense, then the process that answers: {saw}"
+        "the earlier reading in the past tense, then the process that answers: {out}\n{saw}"
     );
     assert!(!out.contains(" now holds environment "), "{saw}");
 }
@@ -8899,13 +8892,15 @@ fn a_successor_that_never_answers_after_a_request_that_could_not_be_made_keeps_t
             "The control daemon for environment {id} (process {}) ended, and this command could not make its request for it: ",
             silent.old
         )) && message.contains(&format!(
-            ". This command sent nothing. After it ended, a control daemon (process {}) held environment {id}, and no control daemon answered within 30 seconds: ",
+            ". This command sent nothing. After it ended, a control daemon (process {}) held environment {id}. No control daemon answers now: nothing listens. No control daemon answered within 30 seconds. The lock of environment {id} is held.",
             silent.successor
         )),
         "the stop's words, then the earlier reading of the successor: {message}\n{saw}"
     );
     assert!(
-        message.ends_with(". This command started none. Run kr host restart again."),
+        message.ends_with(
+            " This command started none. No session was stopped: its workers keep running, and a local attach keeps working. Paired devices cannot connect until a control daemon runs. Paired devices' connections to the old daemon closed; their pairings stand. Run kr host restart again."
+        ),
         "{message}\n{saw}"
     );
     assert!(
@@ -8928,16 +8923,17 @@ fn a_successor_that_never_answers_after_an_unknown_stop_keeps_the_stops_words() 
     let id = silent.host.tree.environment_id();
     assert!(
         message.starts_with(&format!(
-            "The control daemon for environment {id} (process {}) did not show whether it took the stop (",
-            silent.old
+            "The control daemon for environment {id} did not show whether it took the stop ("
         )) && message.contains(&format!(
-            "), and it has ended. After it ended, a control daemon (process {}) held environment {id}, and no control daemon answered within 30 seconds: ",
+            "), and it has ended. After it ended, a control daemon (process {}) held environment {id}. No control daemon answers now: nothing listens. No control daemon answered within 30 seconds. The lock of environment {id} is held.",
             silent.successor
         )),
         "the stop's words, then the earlier reading of the successor: {message}\n{saw}"
     );
     assert!(
-        message.ends_with(". This command started none. Run kr host restart again."),
+        message.ends_with(
+            " This command started none. No session was stopped: its workers keep running, and a local attach keeps working. Paired devices cannot connect until a control daemon runs. Paired devices' connections to the old daemon closed; their pairings stand. Run kr host restart again."
+        ),
         "{message}\n{saw}"
     );
     assert!(
@@ -8979,12 +8975,13 @@ fn a_restart_whose_holder_answers_and_ends_before_the_read_of_who_serves_never_s
     assert_eq!(output.status.code(), Some(1), "{said}");
     let message = said["message"].as_str().expect("a message");
     assert!(
-        message.contains(
-            " A control daemon answered during the wait, and none gave a usable greeting after that: "
-        ),
+        message.contains("A control daemon gave a usable greeting"),
         "{message}"
     );
-    assert!(!message.contains("answers now"), "{message}");
+    assert!(
+        !message.contains("A control daemon answers now"),
+        "{message}"
+    );
     assert!(host.running().is_empty(), "nothing was started");
     assert!(attempts(&host).is_empty(), "no record stands");
     let _ = holder.kill();
@@ -9011,9 +9008,9 @@ fn a_successor_whose_exchange_is_cut_is_no_proof_of_another_daemon() {
     let id = replaced.host.tree.environment_id();
     assert!(
         message.contains(&format!(
-            " After it ended, a control daemon (process {}) held environment {id}, and no control daemon answered within 30 seconds: ",
+            " After it ended, a control daemon (process {}) held environment {id}.",
             replaced.successor
-        )),
+        )) && message.contains("No control daemon gave a whole answer within 30 seconds."),
         "{message}\n{saw}"
     );
     assert!(replaced.host.running().is_empty(), "nothing was started");
