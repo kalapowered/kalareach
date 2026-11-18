@@ -61,7 +61,7 @@ fn makes_help(source: &str) -> bool {
 /// text and is no marker.
 const TEST_MODULE_MARKERS: [&str; 2] = [
     "\n#[cfg(test)]\nmod ",
-    "\n#[cfg(test)]\npub(crate) mod tests",
+    "\n#[cfg(test)]\npub(crate) mod tests {",
 ];
 
 /// What a source file tells a person: its strings, and its `///` lines where they become help.
@@ -210,19 +210,36 @@ fn a_crate_visible_test_module_ends_the_product_part() {
     assert!(!part.contains("taskkill"), "{part}");
 }
 
-/// The cut is at the earlier marker, whichever form comes first, and a crate-visible module of
-/// another name is product text that the scan keeps.
+/// The cut is at the earlier marker, whichever form comes first: what stands inside the first
+/// module is not product text, and what stands inside the second is not either. A crate-visible
+/// module of another name is product text that the scan keeps, even where its name begins with
+/// `tests`.
 #[test]
 fn the_product_part_ends_at_the_earlier_marker_only() {
-    let private_first = "const A: &str = \"first\";\n#[cfg(test)]\nmod tests {\n}\n#[cfg(test)]\npub(crate) mod tests {\n    const B: &str = \"second\";\n}\n";
+    let private_first = "const A: &str = \"first\";\n#[cfg(test)]\nmod tests {\n    const M: &str = \"between\";\n}\n#[cfg(test)]\npub(crate) mod tests {\n    const B: &str = \"second\";\n}\n";
     let part = product_part(private_first);
-    assert!(part.contains("first") && !part.contains("second"), "{part}");
+    assert!(part.contains("first"), "{part}");
+    assert!(
+        !part.contains("between") && !part.contains("second"),
+        "{part}"
+    );
 
-    let visible_first = "const A: &str = \"first\";\n#[cfg(test)]\npub(crate) mod tests {\n}\n#[cfg(test)]\nmod more {\n    const B: &str = \"second\";\n}\n";
+    let visible_first = "const A: &str = \"first\";\n#[cfg(test)]\npub(crate) mod tests {\n    const M: &str = \"between\";\n}\n#[cfg(test)]\nmod more {\n    const B: &str = \"second\";\n}\n";
     let part = product_part(visible_first);
-    assert!(part.contains("first") && !part.contains("second"), "{part}");
+    assert!(part.contains("first"), "{part}");
+    assert!(
+        !part.contains("between") && !part.contains("second"),
+        "{part}"
+    );
 
-    let other_name = "const A: &str = \"first\";\n#[cfg(test)]\npub(crate) mod fixtures {\n}\nconst B: &str = \"second\";\n";
-    let part = product_part(other_name);
-    assert!(part.contains("first") && part.contains("second"), "{part}");
+    for name in ["fixtures", "tests_more"] {
+        let other_name = format!(
+            "const A: &str = \"first\";\n#[cfg(test)]\npub(crate) mod {name} {{\n}}\nconst B: &str = \"second\";\n"
+        );
+        let part = product_part(&other_name);
+        assert!(
+            part.contains("first") && part.contains("second"),
+            "{name}: {part}"
+        );
+    }
 }
