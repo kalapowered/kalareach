@@ -5754,4 +5754,58 @@ mod tests {
             "the following's reading is 6,000 ms behind the restored mark"
         );
     }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a narrow reading is compared with the readings above it at its
+    /// second reading of the continuous clock, where its level is lowest. The worker does not trust
+    /// its clock, the owner confirmed the right time, and every look is held up 200 ms after its
+    /// wall clock was read. The look, a second after the act, reads the wall clock a second ahead
+    /// of the owner's. The following's narrow reading, taken in the same instant and held up inside
+    /// its bracket, reads 4,900 ms behind the look's reading and 4,100 ms behind the owner's reading
+    /// carried to it. At its second reading it is 5,100 ms behind the look's reading, a step back
+    /// that the owner did not see; at its first it would be 4,900 ms behind and none.
+    #[test]
+    fn a_narrow_reading_held_up_inside_its_bracket_is_a_step_back_at_its_second_reading() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(Duration::from_millis(200), true);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(60));
+        held.wall.set(held.wall.now_ms().get() - 8_000);
+        assert!(contract.observe().rolled_back);
+        held.pass(Duration::from_secs(1));
+        let right = held.wall.now_ms().get();
+        floor.establish(right, held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        held.wall.set(right + 2_000);
+        held.sets_the_wall_before_reading(2, right - 2_900);
+        held.arm(1, 1);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the following's reading is 5,100 ms behind the look's at its second reading"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a reading with no bracket is stamped after its wall clock is read,
+    /// as a held-up try is. The worker does not trust its clock and the owner confirmed the right
+    /// time. A deadline check finds all three tries of its attempt held up for 10 s and reads the
+    /// clock a fourth time with no bracket, held up for 10 s inside the clock's reading. Stamped
+    /// after that reading, the wall stands where the clock was at the stamp. Stamped before it, the
+    /// wall would stand 10 s above its stamp, and the look a second later, which reads the right
+    /// time, would be 10 s behind it: a step back that no one made.
+    #[test]
+    fn a_pause_inside_the_wall_reading_of_a_reading_with_no_bracket_is_no_step_back() {
+        let (_floor, held, contract) = found_a_rollback_and_was_confirmed();
+        held.arm(0, 4);
+        contract.wall_reading();
+        held.pass(Duration::from_secs(1));
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Trusted,
+            "the clock never went back: the pause was in the reading, not in the clock"
+        );
+    }
 }
