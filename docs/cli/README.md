@@ -3279,7 +3279,9 @@ A direct invitation has `"mode": "direct"` and no `code` or `rendezvous_origin`.
 ```
 
 `kr pair confirm --json` returns `ok`, `invitation_id`, `device_id`, `grant_id`, `device_name` and
-`platform`.
+`platform`. Run again on an invitation that was approved already, it returns the same object, and it
+leaves `device_name` and `platform` out when the host's record of the pairing holds no display
+bundle for the device.
 
 `kr organisation enrol --json` returns `ok`, `organisation_id`, `enrolment_revision`,
 `accepted_head` and `root_key_id`, the identifier of the organisation's first key in hexadecimal.

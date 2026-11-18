@@ -99,27 +99,36 @@ the candidate provides an identifier this host never issued as a direct invitati
 complete with the error code `PERMISSION_DENIED`. That is all the candidate is told.
 
 A device that the host still lists as paired cannot be paired again. The host reads its list of
-devices before the invitation changes state, and refuses the device at `pair.finish` (code mode) or
+devices before `pair.finish` or the first `pair.redeem` changes the invitation, and refuses the
+device at `pair.finish` (code mode) or
 `pair.redeem` (direct mode) once the code or secret and the endpoint proofs have held, so before the
 owner is shown a candidate. The refusal carries the code `PAIRING_ENDPOINT_PAIRED`, and the
 invitation ends with the reason `endpoint_paired`. A read of the list that fails changes nothing:
 the invitation stays as it was and the same request can be made again.
 
-A repeat of the request from that device, on the same connection or a new one, gets the same code
-while the host keeps that invitation: the current one, or one of the sixteen it keeps. In code mode
-a repeat of `pair.finish` gets it only while the refused invitation is the host's current one;
-after the host issues the next invitation or restarts, a repeat gets `PERMISSION_DENIED`.
-`pair.status` reports the reason to that device. Another device that presents the ended invitation,
-or a room admission that arrives after the end, gets `PAIRING_REJECTED` like any other ending, so
-no device is told that the host lists a device that it does not list.
+A repeat of the request from that device, on the same connection or a new one, gets the same code.
+In direct mode the host answers a repeat of `pair.redeem` from the invitation's stored record, so
+the code stays after the host issues the next invitation or restarts. In code mode a repeat of
+`pair.finish` gets it only while the refused invitation is the host's current one; after the host
+issues the next invitation or restarts, a repeat gets `PERMISSION_DENIED`. `pair.status` reports the
+reason to that device while the host keeps that invitation: the current one, or one of the sixteen it
+keeps. Another device that presents the ended invitation, or a room admission that arrives after
+the end, gets `PAIRING_REJECTED` with the message "the invitation is no longer open", like any other
+ending, so no device is told that the host lists a device that it does not list.
 
 The issuing owner's view of that invitation carries `existing`, the name and pairing date from the
-host's own record, only while that record is in force. After the owner removed the record, or its
-grant ran out, the view carries no record and says that the pairing has ended. The device shows
-`host_still_lists_device` and offers no retry: the owner removes the listed pairing, the person
-forgets the host on the device if the device still lists it, and a new invitation pairs it as a new
-device with a new identity. That pairing needs the owner's confirmation on an owner device, as every
-pairing does, so where this device was the host's only owner device no device can confirm it.
+host's own record, only while the host lists that record. Before it answers, the host records the
+end of a grant that has run out, as the binding does. After the owner removed the record, or its
+grant ran out, the view carries no record and says that the pairing has ended. While the host's
+clock is not trusted, the host cannot end the record, and the view still names it. The owner's own
+repeat of `pair.confirm`, after the refusal at the commit, gets the invitation's recorded ending
+under `PAIRING_REJECTED`, with the same action identifier or a new one, in direct mode and in code
+mode; the repeat spends no answer of the owner's, and `kr pair confirm` says what `kr pair status`
+says of the ended invitation. The device shows `host_still_lists_device` and offers no retry: the
+owner removes the listed pairing, the person forgets the host on the device if the device still
+lists it, and a new invitation pairs it as a new device with a new identity. That pairing needs the
+owner's confirmation on an owner device, as every pairing does, so where this device was the host's
+only owner device no device can confirm it.
 
 **The candidate** permits five attempts per entered code, and never retries a failed key
 confirmation automatically. The counter is keyed by an HMAC of the configured origin and the
