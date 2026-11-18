@@ -467,6 +467,159 @@ pub fn admit(proxy: Option<&ProxyUrl>, url: &Url) -> Result<(), ProxyLoginKind> 
     Ok(())
 }
 
+/// hyper-util's words for a `CONNECT` the proxy answered `407`, which it says of that status only.
+///
+/// The layer matches it by equality on each link of the error chain, so a change of the library's
+/// words fails the case that reads a real chain instead of silently missing a refusal.
+pub const TUNNEL_PROXY_AUTH_REQUIRED: &str = "tunnel error: proxy authorization required";
+/// hyper-util's words for every other refusal of a `CONNECT`, an `HTTP/1.0 407` among them.
+pub const TUNNEL_UNSUCCESSFUL: &str = "tunnel error: unsuccessful";
+
+type BoxError = Box<dyn Error + Send + Sync>;
+
+/// Whether a link of `error`'s chain says exactly `text`.
+fn chain_holds(error: &(dyn Error + 'static), text: &str) -> bool {
+    let mut current = Some(error);
+    while let Some(link) = current {
+        if link.to_string() == text {
+            return true;
+        }
+        current = link.source();
+    }
+    false
+}
+
+/// A client's connector layer for a proxy: it stops a connect once the verdict is set, and reads a
+/// `407` to the `CONNECT` that carried the login.
+///
+/// It is generic over the request type because the library's own cannot be named outside it. It is
+/// installed whether or not a login is held, so a proxy that asks for a login that nothing holds
+/// is `Needed`.
+#[derive(Clone)]
+pub struct ProxyLoginLayer {
+    login: Option<ProxyCredential>,
+}
+
+impl ProxyLoginLayer {
+    /// The layer for a proxy whose login is `login`, if it holds one.
+    #[must_use]
+    pub const fn new(login: Option<ProxyCredential>) -> Self {
+        Self { login }
+    }
+}
+
+impl<S> tower_layer::Layer<S> for ProxyLoginLayer {
+    type Service = ProxyLoginService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        ProxyLoginService {
+            inner,
+            login: self.login.clone(),
+        }
+    }
+}
+
+/// The service [`ProxyLoginLayer`] makes.
+#[derive(Clone)]
+pub struct ProxyLoginService<S> {
+    inner: S,
+    login: Option<ProxyCredential>,
+}
+
+impl<S, R> tower_service::Service<R> for ProxyLoginService<S>
+where
+    S: tower_service::Service<R, Error = BoxError> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    R: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = BoxError;
+    type Future =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<S::Response, BoxError>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), BoxError>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: R) -> Self::Future {
+        // The clone is the one that was not made ready, so the one that was is used for the call.
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let login = self.login.clone();
+        Box::pin(async move {
+            let stopped = |kind: StopKind| -> BoxError {
+                Box::new(ProxyLoginFailure::new(kind.as_login_kind()))
+            };
+            if let Some(kind) = login.as_ref().and_then(ProxyCredential::stopped) {
+                return Err(stopped(kind));
+            }
+            let connecting = inner.call(request);
+            let outcome = match &login {
+                // The verdict is polled first, so one set before a poll cannot lose to a connect
+                // that finishes in that poll, and the inner future is dropped when it wins.
+                Some(login) => tokio::select! {
+                    biased;
+                    kind = login.stopped_wait() => return Err(stopped(kind)),
+                    outcome = connecting => outcome,
+                },
+                None => connecting.await,
+            };
+            outcome.map_err(|error| {
+                if !chain_holds(error.as_ref(), TUNNEL_PROXY_AUTH_REQUIRED) {
+                    return error;
+                }
+                let kind = if let Some(login) = &login {
+                    login.refuse(StopKind::Refused);
+                    ProxyLoginKind::Refused
+                } else {
+                    ProxyLoginKind::Needed
+                };
+                Box::new(ProxyLoginFailure::following(kind, error))
+            })
+        })
+    }
+}
+
+/// Points a client at `proxy`: every request goes through it, a login it holds travels in the
+/// `CONNECT` as one sensitive `Proxy-Authorization` value built from the raw bytes, and the
+/// connector layer reads the proxy's answer. No login is in any URL, so the library's `Debug` of
+/// the proxy prints none.
+///
+/// # Errors
+///
+/// Returns the library's error when the proxy's address is not one it takes.
+pub fn proxied(
+    builder: reqwest::ClientBuilder,
+    proxy: &ProxyUrl,
+) -> Result<reqwest::ClientBuilder, reqwest::Error> {
+    let mut selected = reqwest::Proxy::all(proxy.as_url().clone())?;
+    if let Some(login) = proxy.login() {
+        selected = selected.custom_http_auth(login.authorization());
+    }
+    Ok(builder
+        .proxy(selected)
+        .connector_layer(ProxyLoginLayer::new(proxy.login().cloned())))
+}
+
+/// Notes a failed send through `proxy` to `url`: a `CONNECT` that failed with the library's words
+/// for any refusal but `407` may have been an `HTTP/1.0 407`, which the library does not name, so
+/// the target is queued for the one bounded re-check through the host's writer. A proxy with no
+/// login has nothing to check.
+pub fn note_failure(proxy: &ProxyUrl, url: &Url, error: &(dyn Error + 'static)) {
+    let Some(login) = proxy.login() else {
+        return;
+    };
+    if chain_holds(error, TUNNEL_UNSUCCESSFUL)
+        && let Some(target) = Target::of(url)
+    {
+        login.suspicion().suspect(target);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

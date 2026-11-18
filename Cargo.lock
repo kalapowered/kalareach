@@ -5311,6 +5311,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-websockets",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "url",
 ]
