@@ -47,11 +47,13 @@ A send whose outcome the host could not establish is shown first. The host refus
 The command line and the application keep the answers they could not deliver in separate stores, and the two share nothing. (The phone has no command line so only has the application's store of answers.) The host will only accept the first answer it receives to any given question. If the host receives an answer to a question from one store of answers, it will not accept an answer from the other store of answers.
 
 A failure the page shows says the host's own words and, where its code maps to something the person
-can do, that action after them: pair the device again, sign in, update, wait, refresh, check
-whether it went through, or change a setting. A pairing that the host refuses because it still lists
-the device is the exception and offers no retry. This requires another owner device that can confirm
-the new pairing. The person asks the host's owner to remove the device first, forgets the host on
-the device if the device still lists it, and pairs with a new invitation.
+can do, that action after them: sign in, update, wait, refresh, check whether it went through, or
+change a setting. A refusal of a pairing names no action, because the person who reads it may be
+the owner whose invitation ended and not the device that was refused. A pairing that the host
+refuses because it still lists the device offers no retry either. Pairing the device again requires
+another owner device that can confirm the new pairing. The person asks the host's owner to remove
+the device first, forgets the host on the device if the device still lists it, and pairs with a new
+invitation.
 The client library says a host's refusal as its code,
 a colon and the host's words, and the page leaves the code out. A failure whose code asks nothing of
 the person says the host's words alone. Native code names the action by its key, and the page's

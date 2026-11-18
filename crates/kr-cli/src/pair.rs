@@ -2049,6 +2049,40 @@ mod tests {
         assert!(matches!(refused, Err(CliError::Refused(_))));
     }
 
+    /// KR-REQ-23.57: an owner whose confirmation the host refuses because the invitation expired,
+    /// or was cancelled, while the command waited is told the host's own words and nothing that
+    /// tells the owner to pair a device: the next step is a new invitation, and the words say what
+    /// ended.
+    #[tokio::test(start_paused = true)]
+    async fn a_confirmation_refused_for_an_invitation_that_ended_while_it_waited_says_only_the_hosts_words()
+     {
+        let completed = || OwnerConfirmationCompleteResult {
+            confirmation_id: kr_protocol::ids::ConfirmationId::new(Uuid::from_bytes([1; 16])),
+            channel: ConfirmationChannel::LocalBootstrapTerminal,
+            answered_at_ms: TimestampMs::new(1),
+        };
+        for ended in [
+            kr_pairing::PairingError::Expired,
+            kr_pairing::PairingError::Consumed {
+                reason: PairingConsumedReason::Cancelled,
+            },
+        ] {
+            let hosts_words = ended.to_string();
+            let refusal = ProtocolError::new(ended.code(), hosts_words.clone());
+            let refused = completed_and_performed(
+                &mut (),
+                async |_| Ok(completed()),
+                async |_| Ok(Err(refusal.clone())),
+            )
+            .await;
+            let Err(refused @ CliError::Refused(_)) = refused else {
+                panic!("the host's refusal ends the command: {refused:?}");
+            };
+            assert_eq!(refused.code(), ended.code());
+            assert_eq!(refused.to_string(), hosts_words, "{ended:?}");
+        }
+    }
+
     /// The value a person types is compared with the host's without regard to case, spaces or
     /// hyphens, and nothing typed is never a match.
     #[test]

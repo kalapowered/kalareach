@@ -133,8 +133,6 @@ impl RequestClass {
 /// would be showing the code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum UserAction {
-    /// Pair this device with the host again.
-    PairAgain,
     /// Sign in to the managed account.
     SignIn,
     /// Update this client or the host: the two builds do not agree on the contract.
@@ -153,8 +151,7 @@ pub enum UserAction {
 
 impl UserAction {
     /// Every action, in declaration order.
-    pub const ALL: [Self; 8] = [
-        Self::PairAgain,
+    pub const ALL: [Self; 7] = [
         Self::SignIn,
         Self::Update,
         Self::Wait,
@@ -168,7 +165,6 @@ impl UserAction {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::PairAgain => "pair_again",
             Self::SignIn => "sign_in",
             Self::Update => "update",
             Self::Wait => "wait",
@@ -183,7 +179,6 @@ impl UserAction {
     #[must_use]
     pub const fn message(self) -> &'static str {
         match self {
-            Self::PairAgain => "Pair this device with the host again.",
             Self::SignIn => "Sign in to your account.",
             Self::Update => "Update this app or the host: their versions do not agree.",
             Self::Wait => "Wait a moment and try again.",
@@ -327,10 +322,13 @@ pub const fn entry(code: ErrorCode) -> Entry {
             (Step::Stop, UserAction::Update)
         }
         ErrorCode::PermissionDenied => (Step::Stop, UserAction::FixConfiguration),
+        // A pairing's refusal is read by the device that was refused and by the owner whose
+        // invitation or confirmation it was, and no one remedy is true for both: the host's own
+        // words say what ended, and the person reads the next step from them.
         ErrorCode::PairingExpired
         | ErrorCode::PairingRejected
         | ErrorCode::PairingAuthFailed
-        | ErrorCode::PairingAttemptsExhausted => (Step::Stop, UserAction::PairAgain),
+        | ErrorCode::PairingAttemptsExhausted => (Step::Stop, UserAction::Nothing),
         // A second pairing cannot work while the host lists the device, and nothing on this device
         // changes that: the host's owner removes the pairing first.
         ErrorCode::PairingEndpointPaired => (Step::Stop, UserAction::Nothing),
@@ -616,6 +614,25 @@ mod tests {
         assert_eq!(decision.action, UserAction::Resync);
     }
 
+    /// KR-REQ-23.57: a pairing's refusal is read by the device that was refused and by the owner
+    /// whose invitation or confirmation it was, so under each code that the host gives it names no
+    /// action: the host's own words are all that a person is told.
+    #[test]
+    fn a_pairings_refusal_stops_and_names_no_action_for_the_device_or_the_owner() {
+        for code in [
+            ErrorCode::PairingAuthFailed,
+            ErrorCode::PairingExpired,
+            ErrorCode::PairingRejected,
+            ErrorCode::PairingAttemptsExhausted,
+        ] {
+            let decision = decision(Failure::new(code), RequestClass::IdempotentRead);
+            assert_eq!(decision.recovery, Recovery::Stop, "{}", code.as_str());
+            assert_eq!(decision.action, UserAction::Nothing, "{}", code.as_str());
+            assert_eq!(user_action(code), UserAction::Nothing, "{}", code.as_str());
+            assert_eq!(decision.action.message(), "", "{}", code.as_str());
+        }
+    }
+
     /// KR-REQ-10.08: a pairing the host refuses because it still lists the device is not retried
     /// and names nothing the person can do on the device: pairing again is what fails.
     #[test]
@@ -633,10 +650,6 @@ mod tests {
     #[test]
     fn authentication_pairing_and_schema_failures_need_a_change_rather_than_a_delay() {
         for code in [
-            ErrorCode::PairingAuthFailed,
-            ErrorCode::PairingExpired,
-            ErrorCode::PairingRejected,
-            ErrorCode::PairingAttemptsExhausted,
             ErrorCode::UnsupportedSchema,
             ErrorCode::UnsupportedCapability,
             ErrorCode::InvalidArgument,
@@ -651,7 +664,7 @@ mod tests {
             );
             assert!(matches!(
                 decision.action,
-                UserAction::PairAgain | UserAction::Update | UserAction::FixConfiguration
+                UserAction::Update | UserAction::FixConfiguration
             ));
         }
         // The codes section 23 calls authentication and schema failures are the ones the protocol

@@ -104,7 +104,6 @@ export const CONFIRMATIONS_EVENT = 'kr://confirmations'
  * Only `receivedFailure` reads this table.
  */
 const ACTION_WORDS: Readonly<Record<string, string>> = {
-  pair_again: 'Pair this device with the host again.',
   sign_in: 'Sign in to your account.',
   update: 'Update this app or the host: their versions do not agree.',
   wait: 'Wait a moment and try again.',

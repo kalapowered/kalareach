@@ -102,13 +102,15 @@ precedes a subscription, and everything a real host spends answering.
 | `RESYNC_REQUIRED` | Take a new snapshot and resume from its cursor | Refresh |
 | `RATE_LIMITED`, `SERVICE_CAPACITY`, `QUOTA_EXCEEDED` | Wait the delay the host asked for, or the bounded backoff | Wait |
 | Transient conditions | An eligible request is sent again | Wait |
-| Authentication, pairing and schema failures | Stop | Pair again, sign in, or change a setting |
+| Authentication and schema failures | Stop | Sign in, update, or change a setting |
 | Everything else | Stop | The host's own message |
 
-A pairing that the host refuses because it still lists the device is the exception and offers no
-retry. This requires another owner device that can confirm the new pairing. The person asks the
-host's owner to remove the device first, forgets the host on the device if the device still lists
-it, and pairs with a new invitation.
+A refusal of a pairing, such as an invitation that ended, is in the last row: the host's own
+message, with no action added, because the person who reads it may be the owner whose invitation
+ended and not the device that was refused. A pairing that the host refuses because it still lists
+the device offers no retry either. Pairing the device again requires another owner device that can
+confirm the new pairing. The person asks the host's owner to remove the device first, forgets the
+host on the device if the device still lists it, and pairs with a new invitation.
 
 `OUTCOME_UNKNOWN` never yields a retry, whatever class asks for one. Section 9 forbids dispatching
 the identifier again, and inventing a new one would submit the same intent twice.

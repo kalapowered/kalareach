@@ -103,7 +103,7 @@ describe('the words for a failure, through the boundary', () => {
 
   it('say the host’s own words first and the action after them, for each action the library has', async () => {
     const actions = libraryActions()
-    expect(Object.keys(actions)).toHaveLength(7)
+    expect(Object.keys(actions)).toHaveLength(6)
     for (const [key, words] of Object.entries(actions)) {
       expect(
         failureMessage(await rejectedWith(native('PERMISSION_DENIED', 'The host said no.', key))),
@@ -148,8 +148,8 @@ describe('the words for a failure, through the boundary', () => {
 
   it('offer the action of a failure that came with no words of its own too', async () => {
     expect(
-      failureMessage(await rejectedWith(native('PAIRING_EXPIRED', ' ', 'pair_again')))
-    ).toBe('Something went wrong. Pair this device with the host again.')
+      failureMessage(await rejectedWith(native('OUTCOME_UNKNOWN', ' ', 'check_the_outcome')))
+    ).toBe('Something went wrong. Check whether this went through before trying it again.')
   })
 
   it('keep the words alone for an action that asks nothing of the person, and for one it does not know', async () => {
