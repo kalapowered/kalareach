@@ -118,12 +118,12 @@ describe('a pairing that failed after the host locked its invitation', () => {
   })
 
   // A kind that the mark does not change is not changed by it.
-  it('leaves the words of a failure that no sentence is ruled for as they are', async () => {
+  it('leaves the words and "Try again" of a failure that the mark does not change as they are', async () => {
     const { controls } = start()
     await screen.findByLabelText('Pairing code')
     attempt(controls, ended({ kind: 'did_not_finish', tries_left: null, invitation_spent: true }))
     expect((await screen.findByTestId('failure-sentence')).textContent).toBe(
-      'Pairing did not finish. Try again, or ask the host for a new invitation.'
+      'Pairing did not finish. Try again, or ask the host for a new invitation. If the host still lists this device as paired, a new invitation works only after that pairing has ended.'
     )
     expect(screen.getByTestId('failure-action').textContent).toBe('Try again')
   })

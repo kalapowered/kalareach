@@ -40,6 +40,13 @@ export function readingFrom(sources: PairingSources | undefined): Reading {
   return sources?.photo === true ? 'photo' : 'pasteboard'
 }
 
+/**
+ * The condition on a new invitation, said wherever a sentence offers one: the host refuses a new
+ * pairing of a device that it still lists, however the attempt ended.
+ */
+const NEW_INVITATION_WHEN =
+  'If the host still lists this device as paired, a new invitation works only after that pairing has ended.'
+
 /** What a person does to bring the same invitation in again, as a clause that starts a sentence. */
 function bringItInAgain(reading: Reading): string {
   switch (reading) {
@@ -76,7 +83,7 @@ export function failureWords(
       }
     case 'did_not_finish':
       return {
-        sentence: `Pairing did not finish. ${bringItInAgain(reading)}, or ask the host for a new one. If the host still lists this device as paired, a new invitation works only after that pairing has ended.`,
+        sentence: `Pairing did not finish. ${bringItInAgain(reading)}, or ask the host for a new one. ${NEW_INVITATION_WHEN}`,
         action: 'new_invitation'
       }
     default:
@@ -132,7 +139,7 @@ function codeWords(
       }
     case 'expired':
       return {
-        sentence: 'The host reports that the invitation expired. Ask it for a new one.',
+        sentence: `The host reports that the invitation expired. Ask it for a new one. ${NEW_INVITATION_WHEN}`,
         action: 'start_again'
       }
     case 'timed_out':
@@ -253,7 +260,7 @@ function codeWords(
     default:
       // A kind this build does not know, from a newer native side, says no more than this.
       return {
-        sentence: 'Pairing did not finish. Try again, or ask the host for a new invitation.',
+        sentence: `Pairing did not finish. Try again, or ask the host for a new invitation. ${NEW_INVITATION_WHEN}`,
         action: 'try_again'
       }
   }

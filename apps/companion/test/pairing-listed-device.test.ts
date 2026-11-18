@@ -50,3 +50,31 @@ describe('a direct invitation that did not finish', () => {
     }
   })
 })
+
+// Each sentence that offers a new invitation says when it can work: the host refuses a new
+// invitation for a device it still lists, however the attempt ended.
+describe('the other sentences that offer a new invitation', () => {
+  const WHEN =
+    'If the host still lists this device as paired, a new invitation works only after that pairing has ended.'
+
+  it('say when a new invitation works after an invitation that expired, in either mode', () => {
+    for (const [mode, action] of [
+      ['code', 'start_again'],
+      ['direct', 'new_invitation']
+    ] as const) {
+      const words = failureWords({ kind: 'expired' }, 'rendezvous.example', mode)
+      expect(words.sentence, mode).toBe(
+        `The host reports that the invitation expired. Ask it for a new one. ${WHEN}`
+      )
+      expect(words.action, mode).toBe(action)
+    }
+  })
+
+  it('say when a new invitation works after a code pairing that did not finish', () => {
+    const words = failureWords({ kind: 'did_not_finish' }, 'rendezvous.example', 'code')
+    expect(words.sentence).toBe(
+      `Pairing did not finish. Try again, or ask the host for a new invitation. ${WHEN}`
+    )
+    expect(words.action).toBe('try_again')
+  })
+})
