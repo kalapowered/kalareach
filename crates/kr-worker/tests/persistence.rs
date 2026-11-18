@@ -1813,6 +1813,87 @@ fn a_journal_the_importer_cannot_read_is_refused_by_name_and_left_as_it_was() {
     );
 }
 
+/// The running worker reads one receipt by its identifier. A receipt whose error was kept under a
+/// word that a later build added cannot be read by this build: the lookup of that receipt answers
+/// that the journal is unavailable, which is the storage-unavailable answer of a class that says to
+/// try again, and it is not the unknown outcome. The receipt stays as it was, the lookup writes
+/// nothing, and no action is claimed or carried out by it.
+#[test]
+fn a_receipt_kept_under_a_code_this_build_lacks_is_unavailable_to_the_running_lookup_and_stays() {
+    use kr_worker::persistence::import::import_journal;
+    let path = journal_path("lookup-unknown-error-code");
+    write_version_one_fixture(&path);
+    import_journal(&path).expect("brings the fixture to the current version");
+    let word = "A_CODE_A_LATER_BUILD_ADDS";
+    assert!(
+        ErrorCode::from_wire(word).is_none(),
+        "this build lacks the word"
+    );
+    rusqlite::Connection::open(&path)
+        .expect("opens the journal")
+        .execute(
+            "UPDATE receipts SET error_code = ?1, error_message = 'it was refused'",
+            [word],
+        )
+        .expect("keeps the error under the word");
+    type Row = (Vec<u8>, String, Option<String>, Option<String>, i64);
+    let rows = || -> Vec<Row> {
+        let connection = rusqlite::Connection::open(&path).expect("opens the journal");
+        let mut statement = connection
+            .prepare(
+                "SELECT action_id, state, error_code, error_message, updated_at_ms
+                   FROM receipts ORDER BY action_id",
+            )
+            .expect("selects the receipts");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("reads the receipts")
+            .map(|row| row.expect("a receipt row"))
+            .collect()
+    };
+    let before = rows();
+    assert_eq!(before.len(), 1, "the one receipt of the fixture");
+    assert_eq!(before[0].2.as_deref(), Some(word));
+
+    let journal = Journal::open_existing(&path).expect("a current journal");
+    for attempt in 0..2 {
+        let failure = journal
+            .read(actor(), kr_worker::journal::action_id_from([7; 16]))
+            .expect_err("the receipt cannot be read");
+        assert!(
+            matches!(
+                failure,
+                kr_worker::error::WorkerError::JournalUnavailable { .. }
+            ),
+            "attempt {attempt}: {failure:?}"
+        );
+        assert_eq!(
+            failure.code(),
+            ErrorCode::StorageUnavailable,
+            "the lookup says to try again, as the other places that read an unknown word do"
+        );
+        assert!(
+            failure.to_string().contains("error code"),
+            "the answer names what it could not read: {failure}"
+        );
+    }
+    drop(journal);
+    assert_eq!(
+        rows(),
+        before,
+        "the receipt stays as it was after each lookup, and no claim or effect was recorded"
+    );
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
 #[test]
 fn an_import_that_fails_after_its_changes_leaves_the_journal_as_it_was() {
     // Every refusal above comes before the import changes anything. This one comes after all of

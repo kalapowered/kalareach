@@ -815,8 +815,10 @@ fn failures(root: &Path, roster: &str, stores: &[Store], known: &[Known]) -> Vec
         }
     }
     for row in rows.iter().filter(|row| row.class == "stored") {
-        if let Err(missing) = case_exists(root, &sources, &row.case) {
-            failures.push(format!("row `{}`: {missing}", row.text));
+        for case in row.case.split(',').map(str::trim) {
+            if let Err(missing) = case_exists(root, &sources, case) {
+                failures.push(format!("row `{}`: {missing}", row.text));
+            }
         }
     }
     failures

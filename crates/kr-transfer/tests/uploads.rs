@@ -4276,6 +4276,134 @@ fn a_refusal_kept_under_a_code_this_build_lacks_is_an_unknown_outcome_on_every_p
     );
 }
 
+/// A refusal kept under a word that a later build added is not what `upload.begin` answers where a
+/// limit of the call's own refuses first: the call answers the limit's refusal, as the service gives
+/// it today, and the kept record stays, with nothing reserved and no claim made. The host reads the
+/// record before it calls the service and answers the unknown outcome, so a caller of the host
+/// never meets this answer; the later change that makes the service answer the kept refusal changes
+/// the assertion on the code and no other.
+#[test]
+fn a_begin_that_a_limit_refuses_answers_its_own_refusal_over_a_refusal_kept_under_an_unknown_code()
+{
+    let harness = Harness::create();
+    harness.set_limits(Limits {
+        max_file_len: 1024,
+        max_staged_len: 100,
+        max_concurrent_transfers: 8,
+    });
+    let held = harness
+        .begin(&pattern(60), "application/octet-stream", "held.bin")
+        .expect("holds 60 of the 100 staged bytes");
+    let bytes = pattern(60);
+    let begin = action(&harness, "upload.begin", &bytes);
+    let word = "A_CODE_A_LATER_BUILD_ADDS";
+    assert!(
+        ErrorCode::from_wire(word).is_none(),
+        "this build lacks the word"
+    );
+    {
+        let mut store = kr_transfer::Store::open(
+            kr_transfer::StagingArea::store_path(&harness.host.environment()),
+            harness.host.environment_id(),
+        )
+        .expect("opens the journal");
+        store
+            .record_action(
+                &begin.actor_id,
+                begin.action_id,
+                &kr_transfer::store::ActionRecord {
+                    method: begin.method.clone(),
+                    payload_digest: begin.payload_digest,
+                    result: None,
+                    error_code: Some(word.to_owned()),
+                    error_detail: Some("it was refused".to_owned()),
+                    recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
+                },
+            )
+            .expect("records the refusal under the word");
+    }
+    type Row = (String, Option<Vec<u8>>, Option<String>, Option<String>);
+    let rows = || -> Vec<Row> {
+        let journal = rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
+            &harness.host.environment(),
+        ))
+        .expect("opens the journal");
+        let mut statement = journal
+            .prepare("SELECT method, result, error_code, error_detail FROM actions")
+            .expect("selects the actions");
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("reads the actions")
+            .map(|row| row.expect("an action row"))
+            .collect()
+    };
+    let before = rows();
+    assert_eq!(before.len(), 1, "one action, kept under the word");
+    assert_eq!(before[0].2.as_deref(), Some(word));
+
+    // The lookup that the host makes before it calls the service says the outcome is unknown.
+    let looked_up = harness
+        .service
+        .retained_action(
+            &harness.actor,
+            begin.action_id,
+            &begin.method,
+            begin.payload_digest,
+        )
+        .expect("the lookup reads")
+        .expect("the action is recorded");
+    assert_eq!(
+        looked_up,
+        kr_transfer::service::RetainedOutcome::Error {
+            code: ErrorCode::OutcomeUnknown,
+            detail: "it was refused".to_owned(),
+        }
+    );
+
+    // The call itself: a limit refuses the 60 bytes more, and the service answers that refusal
+    // where a kept refusal is what the action was answered with.
+    let params = UploadBeginParams {
+        environment_id: harness.environment_id(),
+        session_id: Nullable::null(),
+        device_id: Nullable::null(),
+        declared_byte_len: U64::new(bytes.len() as u64),
+        declared_digest: digest(&bytes),
+        declared_media_type: "application/octet-stream".to_owned(),
+        original_file_name: "again.bin".to_owned(),
+    };
+    let refusal = harness
+        .service
+        .upload_begin(&harness.actor, &params, Some(&begin), None)
+        .expect_err("a limit refuses the call");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::QuotaExceeded,
+        "the call's own limit is answered in place of the kept refusal"
+    );
+
+    // The record stays, the refused call reserved nothing, and no claim was made.
+    assert_eq!(rows(), before, "the record is the same row after the call");
+    harness
+        .begin(&pattern(40), "application/octet-stream", "fits.bin")
+        .expect("the 40 bytes still fit: the refused call reserved none of its 60");
+    assert_eq!(
+        rows(),
+        before,
+        "no claim was made and no effect was recorded"
+    );
+    harness
+        .service
+        .upload_status(
+            &harness.actor,
+            &UploadStatusParams {
+                transfer_id: held.transfer_id,
+            },
+        )
+        .expect("the upload that held the staged bytes is as it was");
+}
+
 /// KR-REQ-24.09: a finish whose completion lost to another copy's is answered with what that copy
 /// recorded, not with the result it computed.
 ///
