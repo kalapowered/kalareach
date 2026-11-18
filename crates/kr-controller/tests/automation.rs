@@ -1544,6 +1544,37 @@ async fn a_repeat_whose_record_in_the_journal_makes_no_sense_is_told_the_outcome
         )
         .expect("the installation's record");
 
+    type KeptRow = (
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows = || -> Vec<KeptRow> {
+        let mut statement = journal
+            .prepare(
+                "SELECT actor_id, action_id, result_json, run_id, error_code, error_detail
+                   FROM action_records ORDER BY action_id",
+            )
+            .expect("the records are selected");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .expect("the records are read")
+            .map(|row| row.expect("a record row"))
+            .collect()
+    };
+
     // The installation's record, made to say what no build writes.
     for (what, set) in [
         (
@@ -1558,6 +1589,7 @@ async fn a_repeat_whose_record_in_the_journal_makes_no_sense_is_told_the_outcome
         ),
     ] {
         journal.execute(set, []).expect("the record is made to say it");
+        let before = rows();
         let told = failure(
             client(&host)
                 .await
@@ -1566,6 +1598,8 @@ async fn a_repeat_whose_record_in_the_journal_makes_no_sense_is_told_the_outcome
                 .expect("the call reaches the daemon"),
         );
         assert_eq!(told.code, ErrorCode::OutcomeUnknown, "{what}: {told:?}");
+        // The record stays as it was kept, and the repeat made no claim and no run.
+        assert_eq!(rows(), before, "{what}");
         journal
             .execute(
                 "UPDATE action_records SET result_json = ?1, error_code = NULL,
