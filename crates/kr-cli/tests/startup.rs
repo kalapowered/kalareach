@@ -6463,6 +6463,13 @@ fn a_copy_of_this_program_that_holds_still_for_a_case_that_names_it() {
     }
 }
 
+/// Names the process that replaces a test daemon in the lock file, where the daemon is given one.
+fn name_the_successor(naming: Option<&(PathBuf, u32)>) {
+    if let Some((lock, successor)) = naming {
+        std::fs::write(lock, format!("{successor}\n")).expect("names the successor");
+    }
+}
+
 /// What a test daemon does with a request to stop.
 #[derive(Clone)]
 enum OnStop {
@@ -6534,6 +6541,8 @@ const LOOKS_BEFORE_THE_END: u32 = 2;
 /// `kr` meets, nothing more.
 struct TestDaemon {
     received: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The `launch_only` parameter of each request to stop that the daemon received, in order.
+    launch_only: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
     release: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set when the daemon left its accept loop, so that it listens no more: taken before the
@@ -6558,17 +6567,34 @@ impl TestDaemon {
         probe_answered: bool,
         generation: u64,
     ) -> Self {
+        Self::serve_generation_naming(host, build, on_stop, probe_answered, generation, None)
+    }
+
+    /// The same, where `naming` is the lock file and the process that replaces the daemon: the
+    /// lock file names that process at the moment the daemon receives the frame that it cuts, so
+    /// that what the command read of the lock before that frame is the daemon's own and every
+    /// later reading names the one that replaced it.
+    fn serve_generation_naming(
+        host: &Standalone,
+        build: &str,
+        on_stop: OnStop,
+        probe_answered: bool,
+        generation: u64,
+        naming: Option<(PathBuf, u32)>,
+    ) -> Self {
         use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
 
         let environment = host.tree.environment();
         let environment_id = host.tree.environment_id();
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let launch_only = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stopped_listening = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let (heard, released, over, stopped) = (
+        let (heard, asked, released, over, stopped) = (
             received.clone(),
+            launch_only.clone(),
             release.clone(),
             ended.clone(),
             stopped_listening.clone(),
@@ -6627,6 +6653,7 @@ impl TestDaemon {
                         let mut then_close = false;
                         let answer = match frame {
                             ControlFrame::Hello(_) if matches!(on_stop, OnStop::EndAtTheGreeting) => {
+                                name_the_successor(naming.as_ref());
                                 over.store(true, std::sync::atomic::Ordering::SeqCst);
                                 break;
                             }
@@ -6669,12 +6696,18 @@ impl TestDaemon {
                                 if request.method.method() == Some(Method::HostInfo)
                                     && matches!(on_stop, OnStop::EndAtTheLook) =>
                             {
+                                name_the_successor(naming.as_ref());
                                 over.store(true, std::sync::atomic::Ordering::SeqCst);
                                 break;
                             }
                             ControlFrame::Request(request) => {
                                 let method = request.method.as_str().to_owned();
                                 heard.lock().expect("the record").push(method.clone());
+                                if request.method.method() == Some(Method::HostInfo)
+                                    && matches!(on_stop, OnStop::CloseAfterTheLookAndEnd)
+                                {
+                                    name_the_successor(naming.as_ref());
+                                }
                                 let held = match request.method.method() {
                                     Some(Method::HostInfo) => {
                                         matches!(on_stop, OnStop::HoldTheLook)
@@ -6742,12 +6775,19 @@ impl TestDaemon {
                                     .expect("the record")
                                     .push(mutation.method.as_str().to_owned());
                                 stops_received += 1;
+                                if let Ok(params) =
+                                    mutation.params.to_typed::<kr_protocol::update::HostStopParams>()
+                                {
+                                    asked.lock().expect("the record").push(params.launch_only);
+                                }
                                 match &on_stop {
                                     OnStop::Cut => {
+                                        name_the_successor(naming.as_ref());
                                         over.store(true, std::sync::atomic::Ordering::SeqCst);
                                         break;
                                     }
                                     OnStop::AnswerTheLaunchThenCut(_) if stops_received > 1 => {
+                                        name_the_successor(naming.as_ref());
                                         over.store(true, std::sync::atomic::Ordering::SeqCst);
                                         break;
                                     }
@@ -6895,6 +6935,7 @@ impl TestDaemon {
         });
         Self {
             received,
+            launch_only,
             release,
             ended,
             stopped_listening,
@@ -6919,6 +6960,11 @@ impl TestDaemon {
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The `launch_only` parameter of each request to stop that the daemon received.
+    fn launch_only_asked(&self) -> Vec<bool> {
+        self.launch_only.lock().expect("the record").clone()
     }
 
     fn received(&self) -> Vec<String> {
@@ -8490,6 +8536,8 @@ struct Replaced {
     old: u32,
     successor: u32,
     answering: u32,
+    /// The `launch_only` parameter of each request to stop that the second daemon received.
+    second_asked: Vec<bool>,
     events: Events,
 }
 
@@ -8518,7 +8566,14 @@ fn a_restart_that_waits_for_a_replaced_successor(
     let mut replacement = a_process_named_kr_controller(&host, "replacement");
     let mut answering = a_process_named_kr_controller(&host, "answering");
     std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
-    let mut first = TestDaemon::serve_generation(&host, "kr-controller/9.9.9", first_ends, true, 0);
+    let mut first = TestDaemon::serve_generation_naming(
+        &host,
+        "kr-controller/9.9.9",
+        first_ends,
+        true,
+        0,
+        Some((lock.clone(), successor.id())),
+    );
     let arguments: &[&str] = if json {
         &["--json", "host", "restart"]
     } else {
@@ -8553,10 +8608,10 @@ fn a_restart_that_waits_for_a_replaced_successor(
         std::thread::sleep(Duration::from_millis(20));
     }
     events.note("the first daemon let go of the endpoint");
-    // The successor takes the lock and a listener that never answers is bound while the old
-    // daemon still runs; the old daemon ends only then.
-    std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
-    events.note("the successor was named in the lock file");
+    // The first daemon named the successor in the lock file when it received the frame that it
+    // cut; a listener that never answers is bound while the old process still runs, and the old
+    // process ends only then.
+    events.note("the successor was named in the lock file when the frame was cut");
     let mut silent = SilentListener::bind(&host);
     events.note("the silent listener was bound");
     old.kill().expect("ends the old daemon");
@@ -8594,6 +8649,7 @@ fn a_restart_that_waits_for_a_replaced_successor(
     let _ = answering.wait();
     drop(held);
     first.end();
+    let second_asked = second.launch_only_asked();
     second.end();
     Replaced {
         host,
@@ -8601,6 +8657,7 @@ fn a_restart_that_waits_for_a_replaced_successor(
         old: ids.0,
         successor: ids.1,
         answering: ids.2,
+        second_asked,
         events,
     }
 }
@@ -8832,9 +8889,16 @@ fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> Never
     let mut successor = a_process_named_kr_controller(&host, "successor");
     std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
     // The daemon that answers states the process that the lock file named: the connection that
-    // carries the request is the old daemon's.
-    let mut daemon =
-        TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop(old.id()), true, 0);
+    // carries the request is the old daemon's. It names the successor in the lock file when it
+    // receives the frame that it cuts.
+    let mut daemon = TestDaemon::serve_generation_naming(
+        &host,
+        "kr-controller/9.9.9",
+        on_stop(old.id()),
+        true,
+        0,
+        Some((lock.clone(), successor.id())),
+    );
     let mut events = Events::begin();
     let running = start(host.kr(&["--json", "host", "restart"]));
     events.note(&format!(
@@ -8853,13 +8917,11 @@ fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> Never
     if let Some(at) = daemon.stopped_listening_at() {
         events.note_at(at, "the daemon that was asked stopped listening");
     }
-    // The old daemon ends, and the lock is held again by the one that replaces it, which never
-    // answers: nothing listens.
+    // The old daemon ends, and the lock is held by the one that replaced it when the frame was
+    // cut, which never answers: nothing listens.
     old.kill().expect("ends the old daemon");
     old.wait().expect("collects it");
     events.note("the old process was ended and collected");
-    std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
-    events.note("the successor was named in the lock file");
     let output = running.finish("kr host restart");
     events.note("the command's output was read");
     let ids = (old.id(), successor.id());
@@ -9004,6 +9066,11 @@ fn a_successor_whose_exchange_is_cut_is_no_proof_of_another_daemon() {
     let saw = what_the_case_saw(&replaced.events, &replaced.output);
     let said = document(&replaced.output, "kr host restart");
     assert_eq!(replaced.output.status.code(), Some(1), "{said}\n{saw}");
+    assert_eq!(
+        replaced.second_asked,
+        vec![true],
+        "the one request that the daemon received asked only how it was started\n{saw}"
+    );
     let message = said["message"].as_str().expect("a message");
     let id = replaced.host.tree.environment_id();
     assert!(

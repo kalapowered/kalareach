@@ -6,9 +6,10 @@
 //! boundary. It stops no session: workers belong to the service manager or to the account and a
 //! daemon that starts later finds them again.
 //!
-//! A restart is not done when the old daemon has ended. It says it restarted the daemon only once
-//! a daemon that it started, or that the service manager started on its ask, answers; a daemon that
-//! something else started after the old one ended is named for what it is.
+//! A restart is not done when the old daemon has ended. It reads what answers, and says what it
+//! read and what it did: that a control daemon of another generation answers, and what this
+//! command started or asked for, or that it started none. It gives no verdict of whose start the
+//! daemon that answers is.
 //!
 //! Before it stops anything the command looks at what the start it would make needs (`preflight`)
 //! and at how the daemon was started (the launch comparison): a restart that would stop a daemon
@@ -109,7 +110,7 @@ pub async fn run(paths: &HostPaths, json: bool) -> Result<Completion> {
     .await
 }
 
-/// The command, from the guard to the proof of the daemon it started.
+/// The command, from the guard to the last read of the daemon that answers.
 async fn restart(
     host: &HostPaths,
     environment: &KnownEnvironment,
@@ -403,7 +404,8 @@ fn stop_clause(id: EnvironmentId, named: Option<u64>, unknown: Option<&Shown>) -
 }
 
 /// A control daemon answers: asks how it was started, refuses before it stops anything where the
-/// start would not give what it has, stops the daemon, and then starts one and proves it.
+/// start would not give what it has, stops the daemon, and then starts one and reads what
+/// answers.
 /// `holder` is the process that held the environment before the reach.
 // One argument for each fact its steps read: the paths, the environment, the start, the connection, the output form, the progress, where the restart is past its stop and what it read before the daemon.
 #[allow(clippy::too_many_arguments)]
@@ -847,7 +849,7 @@ enum Came {
 }
 
 impl Came {
-    /// What the proof knows of the daemon that was stopped.
+    /// What the restart read of the daemon that was stopped.
     fn old(&self) -> Old {
         match self {
             Self::Stopped(stopped) => stopped.generation,
@@ -1213,7 +1215,7 @@ fn begin_the_record(
     Ok(())
 }
 
-/// What the proof knows of the daemon that was stopped.
+/// What the restart read of the daemon that was stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Old {
     /// No daemon ran, so none is older than the one that answers.
@@ -1456,6 +1458,58 @@ pub(crate) mod tests {
             manager: Some(crate::service_manager::Manager::Systemd),
         });
         assert_eq!((managed.start, managed.pid), ("systemd", None));
+    }
+
+    /// KR-REQ-07.12: a failed start says the lock that it read after its last read of the
+    /// endpoint: where nothing listens and the lock is held, the text says so in that order, and
+    /// where the lock is free it says nothing of a hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_start_reports_the_lock_it_read_after_its_last_read_of_the_endpoint() {
+        use kr_client::shown::Said as _;
+
+        async fn said_by_a_failed_start(
+            temp: &kr_ipc::testing::TempHost,
+            environment: &KnownEnvironment,
+        ) -> String {
+            let completion = StartFailed {
+                error: None,
+                launched: false,
+            }
+            .reported(
+                temp.paths(),
+                environment,
+                &taken(Old::Generation(generation(1))),
+                &record::Shared::new(),
+                false,
+                &Progress::new(environment.environment_id),
+                &Facts::none(Vec::new()),
+            )
+            .await;
+            let Completion::Reported(error) = completion else {
+                panic!("a failed start is reported");
+            };
+            error.said().to_string()
+        }
+
+        let (temp, environment) = an_environment();
+        let id = environment.environment_id;
+        let lock = environment.paths.singleton_lock();
+        let held = kr_controller::singleton::SingletonLock::hold(&lock, id).expect("holds");
+        let said = said_by_a_failed_start(&temp, &environment).await;
+        let nothing = said
+            .find("No control daemon answers now: nothing listens.")
+            .expect("what the last read of the endpoint gave");
+        let hold = said
+            .find(&format!("The lock of environment {id} is held."))
+            .expect("the lock that was read after it");
+        assert!(nothing < hold, "{said}");
+        drop(held);
+        let said = said_by_a_failed_start(&temp, &environment).await;
+        assert!(
+            said.contains("No control daemon answers now: nothing listens."),
+            "{said}"
+        );
+        assert!(!said.contains("is held."), "{said}");
     }
 
     /// A holder that neither answers nor lets go says only what the reads showed: a held lock
@@ -1906,6 +1960,80 @@ pub(crate) mod tests {
         )
     }
 
+    /// Phrases that claim whose start the daemon that answers is, or that its identity is proved: no
+    /// text of the table holds one, since the command gives no verdict of ownership.
+    const CLAIMS_OF_OWNERSHIP: &[&str] = &[
+        "own start",
+        "proved",
+        "already serves",
+        "is the one",
+        "the daemon that this command started",
+        "the daemon this command started",
+        "started the daemon that answers",
+        "this command's own",
+    ];
+
+    /// The second check of the table, beside the frozen file: no text holds a claim of ownership,
+    /// and each present-tense phrase of a text is one that the record's last read allows, each
+    /// phrase about the whole wait one that the reads of any kind allow, and each phrase about the
+    /// lock one that the lock read after the last read allows.
+    fn the_phrases_of_a_text_match_its_record(text: &str, came: Option<&Came>, record: &Record) {
+        for claim in CLAIMS_OF_OWNERSHIP {
+            assert!(!text.contains(claim), "{claim:?} is in a text: {text}");
+        }
+        let last = record.last;
+        let held = matches!(record.lock.map(|read| read.lock), Some(Lock::Held));
+        let greeted_or_replied = record.greeted || record.replied;
+        let reads = matches!(last, Some(Last::Whole(_) | Last::Greeting(_) | Last::Reply));
+        let phrases: [(&str, bool); 12] = [
+            (
+                " answers now.",
+                matches!(last, Some(Last::Whole(_))) && record.whole.is_some(),
+            ),
+            (
+                "No control daemon answers now: nothing listens.",
+                matches!(last, Some(Last::NothingListens)),
+            ),
+            (
+                "A control daemon gave a usable greeting and no whole answer.",
+                matches!(last, Some(Last::Greeting(_))),
+            ),
+            (
+                "A control daemon replied, and this command cannot use its reply.",
+                matches!(last, Some(Last::Reply)),
+            ),
+            (
+                "got no answer in time.",
+                matches!(last, Some(Last::NothingInTime)),
+            ),
+            (
+                "could not check whether a control daemon answers.",
+                matches!(last, Some(Last::CheckFailed)),
+            ),
+            ("No control daemon answered within", !greeted_or_replied),
+            (
+                "No control daemon gave a whole answer within",
+                greeted_or_replied && record.whole.is_none(),
+            ),
+            ("A control daemon holds environment", reads && held),
+            ("The lock of environment E is held.", held),
+            (
+                "Paired devices cannot connect",
+                came.is_some_and(Came::ended) && matches!(last, Some(Last::NothingListens)),
+            ),
+            (
+                "Paired devices' connections to the old daemon closed",
+                came.is_some_and(Came::ended),
+            ),
+        ];
+        for (phrase, allowed) in phrases {
+            assert!(
+                !text.contains(phrase) || allowed,
+                "{phrase:?} is said for a record that does not show it ({record:?}): {text}"
+            );
+        }
+    }
+
     /// The table of the words: for each shape of a result and each record that up to three reads of
     /// the endpoint reach, the whole text and the `--json` members that the makers write, one row for
     /// each distinct pair with the number of records that give it. A new or changed word is a change
@@ -1922,6 +2050,7 @@ pub(crate) mod tests {
         for shape in &shapes() {
             for record in &records {
                 let (text, json) = words_of(shape, record, id);
+                the_phrases_of_a_text_match_its_record(&text, shape.1.as_ref(), record);
                 *rows.entry((shape.0, text, json)).or_default() += 1;
             }
         }
