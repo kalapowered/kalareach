@@ -146,7 +146,15 @@ export function invocationOf(
     }
   }
   if (instance.plugin_id === null) {
-    return { kind: 'cannot', because: 'No package recognised this agent.' }
+    // The host adopts an agent that two packages recognise equally well bound to neither, and says
+    // why in the instance's refusal: those are its words to show, as it wrote them.
+    return {
+      kind: 'cannot',
+      because:
+        instance.refusal === null
+          ? 'No package recognised this agent.'
+          : `No package is bound to this agent. The host says ${instance.refusal}.`
+    }
   }
   if (input !== null) {
     return { kind: 'cannot', because: input }
