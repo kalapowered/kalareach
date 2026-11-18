@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use stored_formats::{Kept, Known, KnownIs, Store};
 
 /// The table of stored formats, which names what each store keeps.
-#[allow(dead_code, unused_imports)]
+#[allow(unused_imports)]
 mod stored_formats;
 
 /// The folder the scan reads, and the roster inside it. A planted run points this at a copy.
