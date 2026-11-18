@@ -127,7 +127,7 @@
         "version": 1,
         "migrates_from": 0
       },
-      "digest": "6699b8806b8192a662269fcf6d1ad6b2a468c0a0bc388f01d7c04575df597bc4",
+      "digest": "010c1982c2dc1140e9375ad801c3922d3a51e5b2424c9a75c663bf3bbef9bd9a",
       "kept": [
         "EnrolmentBudgets",
         "CatalogueAddResult",
@@ -531,7 +531,7 @@
         "migrates_from": 1,
         "reads_through": 19
       },
-      "digest": "c19c278f3139d878885d28b429b2ffc8628b061fcb06e72c95894e74e773ad31",
+      "digest": "37e71bc8305c02537227e990d2db99344e8d23cbeb178a2cab214dd0840d420f",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",

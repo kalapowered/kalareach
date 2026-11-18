@@ -99,7 +99,7 @@ fn observed(version: u32, base: &str, document: &Value, release: &Release) -> Ob
         entry: entry(version),
         digest: base.to_owned(),
         kept: vec!["ConfigurationDocument".to_owned()],
-        levels: Some(levels_view(document, release)),
+        levels: Some(levels_view(document, release).expect("the sections are read")),
     }
 }
 
@@ -108,7 +108,7 @@ fn messages(found: &[String]) -> String {
 }
 
 fn designs(document: &Value, release: &Release) -> Vec<String> {
-    super::design_findings(&levels_view(document, release))
+    super::design_findings(&levels_view(document, release).expect("the sections are read"))
 }
 
 /// A section arrives with a level at the same version and the lock follows it; the section is held
@@ -435,10 +435,10 @@ fn the_folding_and_the_metric_of_the_near_miss_rule_are_pinned() {
 #[test]
 fn a_definition_two_sections_share_is_in_both_digests_and_not_in_the_base() {
     let three = release(3, &[TELEMETRY, RELAYS]);
-    let before = levels_view(&document(), &three);
+    let before = levels_view(&document(), &three).expect("the sections are read");
     let mut changed = document();
     changed["$defs"]["Limits"]["properties"]["bytes"] = nullable(json!({ "type": "string" }));
-    let after = levels_view(&changed, &three);
+    let after = levels_view(&changed, &three).expect("the sections are read");
     for (was, now) in before.members.iter().zip(&after.members) {
         assert_ne!(
             was.digest, now.digest,

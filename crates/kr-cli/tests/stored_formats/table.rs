@@ -282,10 +282,16 @@ pub fn known() -> Vec<Known> {
             "DiffApplyResult",
             "abc53b830959780d6135382f1285f66ca4884f25549b1f3394f08e4cccce4087",
         ),
+        // A store keeps the protocol's error code as its wire word, so a code the protocol gains is not
+        // a change of what a store keeps, and every line of the code holds the digest of the marker
+        // that stands for the code. A store that keeps the code has such a line until it declares
+        // the code by its schema, and no line gives the code by its source or by a set of its words.
+        // Change sets keep the code of a refused action in `actions.error_code`, read back as the
+        // code it names.
         known_protocol::<error::ErrorCode>(
             "changesets",
             "ErrorCode",
-            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
+            "620a05ed8a54c321c58627d543d0c3f03c8961dc5bf3208a1201bc7a1fda3f65",
         ),
         // The answer of a draft a device ended, which the transfers store keeps in `actions.result`
         // as the bytes the method answered, beside the answers its own declaration lists.
@@ -294,12 +300,23 @@ pub fn known() -> Vec<Known> {
             "DraftDiscardResult",
             "da7f26b9971c4e3450b20922b3573827c5bffd47956665dd06ab3d9ddb647e78",
         ),
+        // The code a refused action keeps in `actions.error_code`, read back as the code it names.
+        known_protocol::<error::ErrorCode>(
+            "projects",
+            "ErrorCode",
+            "620a05ed8a54c321c58627d543d0c3f03c8961dc5bf3208a1201bc7a1fda3f65",
+        ),
+        known_protocol::<error::ErrorCode>(
+            "transfers",
+            "ErrorCode",
+            "620a05ed8a54c321c58627d543d0c3f03c8961dc5bf3208a1201bc7a1fda3f65",
+        ),
         // The code a refused workflow action keeps in `action_records.error_code`, read back as the
         // code it names.
         known_protocol::<error::ErrorCode>(
             "workflows",
             "ErrorCode",
-            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
+            "620a05ed8a54c321c58627d543d0c3f03c8961dc5bf3208a1201bc7a1fda3f65",
         ),
         // The parameters of the nodes a stored workflow holds, which admission decodes at each
         // admission. The store declares the rest of them.
@@ -338,7 +355,7 @@ pub fn known() -> Vec<Known> {
         known_protocol::<error::ErrorCode>(
             "machine-merge-plan",
             "ErrorCode",
-            "1adf42bfb02be22cdba273eadccfff60f55bf8bac135c476a56678a211e3f353",
+            "620a05ed8a54c321c58627d543d0c3f03c8961dc5bf3208a1201bc7a1fda3f65",
         ),
     ]
 }
@@ -358,6 +375,8 @@ pub fn kept_without_a_holder() -> Vec<(&'static str, &'static str)> {
         ("changesets", "DiffApplyResult"),
         ("changesets", "ErrorCode"),
         ("transfers", "DraftDiscardResult"),
+        ("transfers", "ErrorCode"),
+        ("projects", "ErrorCode"),
         ("workflows", "ErrorCode"),
         // The parameters of a stored workflow's node, which admission decodes at each admission.
         ("workflows", "ChangesetMaterializeParams"),

@@ -40,12 +40,15 @@
 
 #![allow(dead_code)]
 
+#[cfg(test)]
+mod code_marker_tests;
 pub mod resolve;
 pub mod table;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::configuration::{BASE_LEVEL, Levelled, NEAR_MISS, Release, VERSION};
 use kr_protocol::update::{Recording, ReleaseStore, StoreScope};
 use schemars::JsonSchema;
@@ -327,7 +330,7 @@ pub fn digest(store: &Store, ddl: &[String]) -> Result<String, String> {
     let mut kept = BTreeMap::new();
     for item in &store.kept {
         let value = match item {
-            Kept::Protocol(_, schema, _) => normalise_schema(schema),
+            Kept::Protocol(_, schema, _) => normalise_schema(schema)?,
             Kept::Source(file, items) => {
                 let mut definitions = Vec::new();
                 for name in *items {
@@ -389,28 +392,147 @@ const SCHEMA_PROSE: [&str; 6] = [
 /// A schema with its prose left out and every reference to a definition replaced by the
 /// definition, so that neither a doc comment nor the name of a type moves the digest, and a
 /// property called `description` stays what it is.
-#[must_use]
-pub fn normalise_schema(root: &Value) -> Value {
-    let definitions = root.get("$defs").cloned().unwrap_or_else(|| json!({}));
-    let mut open = Vec::new();
-    inline(root, &definitions, &mut open, false)
+///
+/// The protocol's error code is the one type that stands for itself. A store keeps a code as its
+/// wire word, so a code the protocol gains is not a change of what the store keeps: wherever the
+/// schema holds the code, a reference to it or the root, the digest's input holds
+/// [`code_marker`] and none of the words the code lists. The members around the code, their
+/// nullability, the `required` list, every other enumeration and the retry class stay in the
+/// input. The protocol's own schema carries no marker.
+///
+/// # Errors
+///
+/// Returns what stops the code being told from a type that is not it: see
+/// [`normalise_with_code`].
+pub fn normalise_schema(root: &Value) -> Result<Value, String> {
+    normalise_with_code(root, &kr_protocol::schema::schema_for::<ErrorCode>())
 }
 
-fn inline(value: &Value, definitions: &Value, open: &mut Vec<String>, named: bool) -> Value {
-    match value {
+/// What stands for the protocol's error code in the input of a digest: a string, and a member
+/// that says the words of a store's column are the code's wire words and no more.
+#[must_use]
+pub fn code_marker() -> Value {
+    json!({ "type": "string", "x-kr-stored-word": "protocol-error-code" })
+}
+
+/// [`normalise_schema`] with `code`, the schema this build generates for the protocol's error code.
+///
+/// A definition, or the root, is the code when what the normaliser makes of it equals what it
+/// makes of `code`, whatever the definition is called. One that is called what the code is called
+/// and is not equal to it fails: an identity that is not certain is never guessed. `code` must be
+/// a plain list of strings, since the marker says nothing of any other form.
+///
+/// # Errors
+///
+/// Returns that `code` is not a plain list of strings, or that a definition or the root has the
+/// code's name and is not the code.
+pub fn normalise_with_code(root: &Value, code: &Value) -> Result<Value, String> {
+    let code = Code::of(code)?;
+    let definitions = root.get("$defs").cloned().unwrap_or_else(|| json!({}));
+    let normal = inline(root, &definitions, &mut Vec::new(), false, Some(&code))?;
+    if normal == code.plain {
+        return Ok(code_marker());
+    }
+    if root.get("title").and_then(Value::as_str) == Some(code.name.as_str()) {
+        return Err(format!(
+            "the root of a kept schema is called {}, as the protocol's error code is, and is not the code: a store keeps the code as its wire word, and a type that only has the name is not it",
+            code.name
+        ));
+    }
+    Ok(normal)
+}
+
+/// The protocol's error code as the digest knows it.
+struct Code {
+    /// The name the protocol's schema gives the type.
+    name: String,
+    /// The schema as the normaliser reads it, with no marker.
+    plain: Value,
+}
+
+impl Code {
+    fn of(schema: &Value) -> Result<Self, String> {
+        let name = schema
+            .get("title")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "the schema of the protocol's error code has no name".to_owned())?;
+        let definitions = schema.get("$defs").cloned().unwrap_or_else(|| json!({}));
+        let plain = inline(schema, &definitions, &mut Vec::new(), false, None)?;
+        check_code_form(&plain)?;
+        Ok(Self {
+            name: name.to_owned(),
+            plain,
+        })
+    }
+}
+
+/// That the protocol's error code is a plain list of strings: one object whose only keyword is
+/// `oneOf`, whose every entry is a string constant, with no word twice. An integer, an object, a
+/// variant that carries a value or a new validation keyword fails, since a store that keeps the
+/// code as its wire word does not keep that.
+fn check_code_form(plain: &Value) -> Result<(), String> {
+    let refuse = |why: &str| {
+        format!(
+            "the protocol's error code is not a plain list of strings ({why}): the digest holds a stored code as its wire word, so it has to be taught the new form first"
+        )
+    };
+    let Some(object) = plain.as_object() else {
+        return Err(refuse("it is not an object"));
+    };
+    let Some(Value::Array(variants)) = object.get("oneOf") else {
+        return Err(refuse("it has no list of variants"));
+    };
+    if object.len() != 1 {
+        return Err(refuse("it has a keyword besides the list of variants"));
+    }
+    if variants.is_empty() {
+        return Err(refuse("the list is empty"));
+    }
+    let mut words = BTreeSet::new();
+    for variant in variants {
+        let Some(variant) = variant.as_object() else {
+            return Err(refuse("a variant is not an object"));
+        };
+        let keywords: BTreeSet<&str> = variant.keys().map(String::as_str).collect();
+        if keywords != BTreeSet::from(["const", "type"]) || variant["type"] != json!("string") {
+            return Err(refuse("a variant is more than a string constant"));
+        }
+        let Some(word) = variant["const"].as_str() else {
+            return Err(refuse("a constant is not a string"));
+        };
+        if !words.insert(word) {
+            return Err(refuse("a word is listed twice"));
+        }
+    }
+    Ok(())
+}
+
+fn inline(
+    value: &Value,
+    definitions: &Value,
+    open: &mut Vec<String>,
+    named: bool,
+    code: Option<&Code>,
+) -> Result<Value, String> {
+    Ok(match value {
         Value::Array(items) => Value::Array(
             items
                 .iter()
-                .map(|item| inline(item, definitions, open, false))
-                .collect(),
+                .map(|item| inline(item, definitions, open, false, code))
+                .collect::<Result<_, _>>()?,
         ),
         Value::Object(members) if named => {
             // The members are names, each of a schema: none is a keyword.
             Value::Object(
                 members
                     .iter()
-                    .map(|(name, schema)| (name.clone(), inline(schema, definitions, open, false)))
-                    .collect(),
+                    .map(|(name, schema)| {
+                        Ok((
+                            name.clone(),
+                            inline(schema, definitions, open, false, code)?,
+                        ))
+                    })
+                    .collect::<Result<_, String>>()?,
             )
         }
         Value::Object(members) => {
@@ -422,10 +544,25 @@ fn inline(value: &Value, definitions: &Value, open: &mut Vec<String>, named: boo
                     out.insert("$recursive".to_owned(), json!(open.len()));
                 } else if let Some(definition) = definitions.get(name) {
                     open.push(name.to_owned());
-                    if let Value::Object(inlined) = inline(definition, definitions, open, false) {
-                        out.extend(inlined);
-                    }
+                    let inlined = inline(definition, definitions, open, false, code)?;
                     open.pop();
+                    match code {
+                        Some(code) if inlined == code.plain => {
+                            if let Value::Object(marker) = code_marker() {
+                                out.extend(marker);
+                            }
+                        }
+                        Some(code) if name == code.name => {
+                            return Err(format!(
+                                "the definition {name} of a kept schema has the name of the protocol's error code and is not the code: a store keeps the code as its wire word, and a type that only has the name is not it"
+                            ));
+                        }
+                        _ => {
+                            if let Value::Object(inlined) = inlined {
+                                out.extend(inlined);
+                            }
+                        }
+                    }
                 }
             }
             for (key, member) in members {
@@ -436,12 +573,12 @@ fn inline(value: &Value, definitions: &Value, open: &mut Vec<String>, named: boo
                     key.as_str(),
                     "properties" | "patternProperties" | "dependentSchemas"
                 );
-                out.insert(key.clone(), inline(member, definitions, open, names));
+                out.insert(key.clone(), inline(member, definitions, open, names, code)?);
             }
             Value::Object(out)
         }
         other => other.clone(),
-    }
+    })
 }
 
 /// SQL as the digest reads it: comments gone, runs of white space one space, and no space beside
@@ -683,7 +820,7 @@ pub fn observe(store: &Store, ddl: &[String]) -> Result<Observed, String> {
         entry: store.entry.clone(),
         digest: digest(store, ddl)?,
         kept: store.kept.iter().map(Kept::label).collect(),
-        levels: store.levels.as_ref().map(observe_levels),
+        levels: store.levels.as_ref().map(observe_levels).transpose()?,
     })
 }
 
@@ -742,17 +879,23 @@ pub struct Property {
 
 /// What the code says of the levels of a store's document, with the checks that need the real
 /// reader and writer run: a section of the table is held to what `load_in` and `contents_in` do.
-#[must_use]
-pub fn observe_levels(levels: &Levels) -> ObservedLevels {
-    let mut observed = levels_view(&levels.document, &levels.release);
+///
+/// # Errors
+///
+/// Returns what stops a section's schema being read: see [`normalise_schema`].
+pub fn observe_levels(levels: &Levels) -> Result<ObservedLevels, String> {
+    let mut observed = levels_view(&levels.document, &levels.release)?;
     observed.eligibility = eligibility(&levels.release, &observed.properties);
-    observed
+    Ok(observed)
 }
 
 /// What the code says of the levels of a document of this schema, from the schema and the
 /// release's table alone.
-#[must_use]
-pub fn levels_view(document: &Value, release: &Release) -> ObservedLevels {
+///
+/// # Errors
+///
+/// Returns what stops a section's schema being read: see [`normalise_schema`].
+pub fn levels_view(document: &Value, release: &Release) -> Result<ObservedLevels, String> {
     let definitions = document.get("$defs").cloned().unwrap_or_else(|| json!({}));
     let names = kr_protocol::hostinfo::configuration::names_by_member_of(document);
     let properties: Vec<Property> = document
@@ -772,19 +915,19 @@ pub fn levels_view(document: &Value, release: &Release) -> ObservedLevels {
             if let Value::Object(members) = &mut root {
                 members.insert("$defs".to_owned(), definitions.clone());
             }
-            Property {
+            Ok(Property {
                 name: name.clone(),
                 level: release
                     .levelled
                     .iter()
                     .find(|entry| entry.member == name)
                     .map(|entry| entry.level),
-                schema: normalise_schema(&root),
+                schema: normalise_schema(&root)?,
                 names: names.get(name).cloned().unwrap_or_default(),
                 unresolved,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     let members = release
         .levelled
         .iter()
@@ -799,13 +942,13 @@ pub fn levels_view(document: &Value, release: &Release) -> ObservedLevels {
                 }),
         })
         .collect();
-    ObservedLevels {
+    Ok(ObservedLevels {
         level: release.level,
         near_miss: u32::try_from(NEAR_MISS).expect("a small number"),
         members,
         properties,
         eligibility: Vec::new(),
-    }
+    })
 }
 
 /// Every reference in `schema`, and in each definition it reaches, that is not a reference to a
@@ -1484,7 +1627,13 @@ fn scope_name(scope: StoreScope) -> &'static str {
 /// store; each store declares its known types at its next raise and deletes the lines here. Until
 /// then a change to a known type moves no digest, so the pinned digest does: the check below fails
 /// when it does not equal the one the type has now, and the remedy is to declare the type at a
-/// raise, never to edit the digest.
+/// raise, never to edit the digest to pass a change to what the type is.
+///
+/// One change edits the pinned digests: a reviewed change to the function that makes a digest, such
+/// as the marker that stands for the protocol's error code. It moves the digest of every line it
+/// reaches and no other, and it is shown, line by line, to give the value it gave before for any
+/// input but the one it reads differently. A line is never re-pinned to pass a change to a stored
+/// format.
 pub struct Known {
     /// The store that keeps it, by name.
     pub store: &'static str,
@@ -1528,7 +1677,7 @@ impl Known {
     /// Returns what stops a type being read from the source.
     pub fn now(&self) -> Result<String, String> {
         let basis = match &self.is {
-            KnownIs::Protocol(schema, _) => normalise_schema(schema),
+            KnownIs::Protocol(schema, _) => normalise_schema(schema)?,
             KnownIs::Source(file) => json!(definition(file, self.name)?),
             KnownIs::Words(words, anchor, enums) => {
                 words_basis(&repository(), words, *anchor, enums)?
@@ -1593,6 +1742,66 @@ pub fn known_protocol<T: JsonSchema>(
         ),
         pinned,
     }
+}
+
+/// Where the table keeps the protocol's error code in a form that the marker does not see: a source
+/// item of its name, which hashes the macro that lists the codes and not the codes, and a set of
+/// words that holds a code's wire word or names the enumeration, which fixes the codes at the ones
+/// of the day. Each is a line for the store and the name.
+#[must_use]
+pub fn code_forms_in(stores: &[Store], known: &[Known]) -> Vec<String> {
+    let name = std::any::type_name::<ErrorCode>()
+        .rsplit("::")
+        .next()
+        .unwrap_or_default();
+    fn word(words: &[String]) -> Option<&String> {
+        words
+            .iter()
+            .find(|word| ErrorCode::from_wire(word).is_some())
+    }
+    let mut found = Vec::new();
+    for kept in stores {
+        let store = &kept.entry.store;
+        for item in &kept.kept {
+            match item {
+                Kept::Source(file, items) if items.iter().any(|item| *item == name) => found.push(format!(
+                    "the store {store} pins {name} by its source in {file}, which holds the macro that lists the codes and not the codes: declare the type by its schema"
+                )),
+                Kept::Words(label, words) => {
+                    if let Some(word) = word(words) {
+                        found.push(format!(
+                            "the store {store} keeps {label}, which holds the code {word}: a set of words fixes the codes at the ones of the day, so the code is declared by its schema"
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for line in known {
+        let store = line.store;
+        match &line.is {
+            KnownIs::Source(file) if line.name == name => found.push(format!(
+                "the store {store} lists {name} as known by its source in {file}, which holds the macro that lists the codes and not the codes: list the type by its schema"
+            )),
+            KnownIs::Words(words, _, enums) => {
+                if let Some(word) = word(words) {
+                    found.push(format!(
+                        "the store {store} lists {} as known words that hold the code {word}: a set of words fixes the codes at the ones of the day, so the code is listed by its schema",
+                        line.name
+                    ));
+                }
+                if enums.iter().any(|(_, item)| *item == name) {
+                    found.push(format!(
+                        "the store {store} lists {} as known words that name {name} as their enumeration, which holds the macro that lists the codes and not the codes",
+                        line.name
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    found
 }
 
 /// What the table accounts for in a store: the types the store declares and lists as known, by where
@@ -1817,7 +2026,7 @@ pub fn known_that_changed(
         if now != line.pinned {
             found.push(format!(
                 "{} is known for the store {} and has changed: its digest is {now} and the pinned one is {}; \
-                 declare it at the store's next raise and delete its line, never edit the digest",
+                 declare it at the store's next raise and delete its line; a pinned digest is edited by a reviewed change to the function that makes it, never to pass a change to what the type is",
                 line.name, line.store, line.pinned
             ));
         }

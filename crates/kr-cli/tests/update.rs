@@ -11560,17 +11560,19 @@ fn the_digest_follows_what_a_store_keeps_and_not_how_it_is_written() {
         })
     };
     assert_eq!(
-        normalise_schema(&schema("Create", "the first words", "intent")),
-        normalise_schema(&schema("Created", "other words", "intent")),
+        normalise_schema(&schema("Create", "the first words", "intent"))
+            .expect("the schema is read"),
+        normalise_schema(&schema("Created", "other words", "intent")).expect("the schema is read"),
         "neither a doc comment nor the name of a type moves it"
     );
     assert_ne!(
-        normalise_schema(&schema("Create", "words", "intent")),
-        normalise_schema(&schema("Create", "words", "purpose")),
+        normalise_schema(&schema("Create", "words", "intent")).expect("the schema is read"),
+        normalise_schema(&schema("Create", "words", "purpose")).expect("the schema is read"),
         "a property does"
     );
     assert_eq!(
-        normalise_schema(&schema("Create", "words", "description"))["properties"]["description"]["type"],
+        normalise_schema(&schema("Create", "words", "description")).expect("the schema is read")["properties"]
+            ["description"]["type"],
         "string",
         "a property that is called description is a property, not prose"
     );
