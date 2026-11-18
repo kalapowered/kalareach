@@ -32,7 +32,6 @@
 //! second one from serving beside it.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -567,12 +566,13 @@ pub async fn open_or_start(
     paths: &HostPaths,
     environment: &KnownEnvironment,
 ) -> Result<(LocalClient, Option<Started>)> {
-    open_or_start_within(paths, environment, BOUNDS, &AtomicBool::new(false)).await
+    open_or_start_within(paths, environment, BOUNDS, &AtomicBool::new(false), &unseen).await
 }
 
 /// [`open_or_start`] for a command that must tell a start that was never made from one that was
 /// made and not answered: `launched` is set when a daemon has been started, or the service manager
 /// or the scheduled task has been asked to start one, and stays unset where the start failed before.
+/// Each attempt of the start to reach the daemon is told to `seen` as it is made and ends.
 ///
 /// # Errors
 ///
@@ -581,8 +581,9 @@ pub(crate) async fn open_or_start_telling(
     paths: &HostPaths,
     environment: &KnownEnvironment,
     launched: &AtomicBool,
+    seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
-    open_or_start_within(paths, environment, BOUNDS, launched).await
+    open_or_start_within(paths, environment, BOUNDS, launched, seen).await
 }
 
 async fn open_or_start_within(
@@ -590,13 +591,23 @@ async fn open_or_start_within(
     environment: &KnownEnvironment,
     bounds: Bounds,
     launched: &AtomicBool,
+    seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
     let endpoint = environment.paths.controller_endpoint()?;
     let error = match find(environment, &endpoint, bounds, &[]).await? {
         Found::Answering(client) => return Ok((ours(*client)?, None)),
         Found::Vacant(error) => error,
     };
-    start_vacant(paths, environment, &endpoint, &error, bounds, launched).await
+    start_vacant(
+        paths,
+        environment,
+        &endpoint,
+        &error,
+        bounds,
+        launched,
+        seen,
+    )
+    .await
 }
 
 /// The part of a start that follows the look, for `kr new` and `kr host restart` alike: nothing
@@ -608,6 +619,7 @@ async fn start_vacant(
     error: &kr_ipc::IpcError,
     bounds: Bounds,
     launched: &AtomicBool,
+    seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
     // The daemon beside this command serves the environment its roots name as this installation's
     // own, and no other, so for any other environment there is nothing to choose here.
@@ -626,11 +638,18 @@ async fn start_vacant(
     let chosen = Chosen::read(&environment.paths);
     match chosen.controller {
         Some(ControllerStartup::Standalone) => {
-            standalone(paths, &environment.paths, endpoint, bounds, launched).await
+            standalone(paths, &environment.paths, endpoint, bounds, launched, seen).await
         }
         Some(ControllerStartup::Service) => {
-            let (client, started) =
-                managed(&environment.paths, endpoint, error, bounds, &[], launched).await?;
+            let (client, started) = managed(
+                &environment.paths,
+                endpoint,
+                error,
+                bounds,
+                &[],
+                (launched, seen),
+            )
+            .await?;
             Ok((ours(client)?, started))
         }
         None => Err(resolve::not_running(
@@ -861,7 +880,7 @@ pub async fn start_by_service(
         &endpoint,
         BOUNDS,
         majors,
-        &AtomicBool::new(false),
+        (&AtomicBool::new(false), &unseen),
     )
     .await?;
     Ok(started)
@@ -894,7 +913,7 @@ pub async fn start_by_service(
         &error,
         BOUNDS,
         majors,
-        &AtomicBool::new(false),
+        (&AtomicBool::new(false), &unseen),
     )
     .await?;
     Ok(started)
@@ -961,48 +980,36 @@ pub(crate) fn nothing_listening(error: &kr_ipc::IpcError) -> bool {
     )
 }
 
-tokio::task_local! {
-    /// Where the reads that a start makes tell what they saw, set by [`telling_sights`].
-    static SIGHTS: Arc<dyn Fn(Sight) + Send + Sync>;
-}
+/// Where the reads of a start tell what they saw.
+pub(crate) type Seen<'a> = &'a (dyn Fn(Sight) + Sync);
 
-/// Runs `start` with each of its attempts to reach the daemon told to `seen` as the attempt is made
-/// and ends: that it began, and what it gave where no daemon answered. The attempt that finds a
-/// daemon is told by the caller, which holds the connection.
-pub(crate) async fn telling_sights<T>(
-    seen: Arc<dyn Fn(Sight) + Send + Sync>,
-    start: impl Future<Output = T>,
-) -> T {
-    SIGHTS.scope(seen, start).await
-}
-
-/// Tells the reads of the running start, if it is told, what one of them saw.
-fn saw(sight: Sight) {
-    let _ = SIGHTS.try_with(|seen| seen(sight));
-}
+/// A start whose reads are told to no one.
+pub(crate) fn unseen(_: Sight) {}
 
 /// Tries the daemon at `endpoint` until one answers or `deadline` passes, each attempt bounded by
 /// what is left of the deadline, and runs `between` after every attempt that failed. Each attempt
-/// is told to the running start's reader, if there is one ([`telling_sights`]).
+/// is told to `seen` as it is made and ends: that it began, and what it gave where no daemon
+/// answered. The attempt that finds a daemon is told by the caller, which holds the connection.
 ///
 /// Returns the connection, or what the last attempt found.
 pub(crate) async fn answered_by(
     endpoint: &kr_ipc::paths::Endpoint,
     deadline: tokio::time::Instant,
     majors: &[u16],
+    seen: Seen<'_>,
     mut between: impl FnMut(),
 ) -> std::result::Result<Listed, Shown> {
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        saw(Sight::Began);
+        seen(Sight::Began);
         let last = match reach(endpoint, left, majors).await {
             Reached::Answered(client) => return Ok(*client),
             Reached::Silent => {
-                saw(Sight::Gave(Gave::NothingInTime));
+                seen(Sight::Gave(Gave::NothingInTime));
                 Shown::said("the endpoint accepted the connection and did not answer")
             }
             Reached::Refused(error) => {
-                saw(Sight::Gave(gave_by_the_greeting(&error)));
+                seen(Sight::Gave(gave_by_the_greeting(&error)));
                 Shown::ipc(&error)
             }
         };
@@ -1128,6 +1135,7 @@ async fn standalone(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
     launched: &AtomicBool,
+    seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
     // Held until the daemon answers or the start fails; the daemon takes its own hold on starting.
     let (program, _held) = standalone_program()?;
@@ -1164,7 +1172,7 @@ async fn standalone(
     // environment has its daemon, and it is the one the lock let through. The one started here is
     // collected as soon as it ends, so a daemon that could not take the environment is not left
     // waiting on this command.
-    let last = match answered_by(endpoint, deadline, &[], || {
+    let last = match answered_by(endpoint, deadline, &[], seen, || {
         let _ = child.try_wait();
     })
     .await
@@ -1312,7 +1320,7 @@ async fn managed(
     error: &kr_ipc::IpcError,
     bounds: Bounds,
     majors: &[u16],
-    launched: &AtomicBool,
+    (launched, seen): (&AtomicBool, Seen<'_>),
 ) -> Result<(Listed, Option<Started>)> {
     let refused = |refusal| match refusal {
         service_manager::Refusal::NotSetUp(why) => resolve::not_running(environment, error, why),
@@ -1356,7 +1364,7 @@ async fn managed(
         manager: Some(asked.manager),
     };
     let deadline = tokio::time::Instant::now() + bounds.start;
-    let last = match answered_by(endpoint, deadline, majors, || {}).await {
+    let last = match answered_by(endpoint, deadline, majors, seen, || {}).await {
         Ok(client) => return Ok((client, Some(started))),
         Err(last) => last,
     };
@@ -1386,7 +1394,7 @@ async fn managed(
     error: &kr_ipc::IpcError,
     _bounds: Bounds,
     _majors: &[u16],
-    _launched: &AtomicBool,
+    _told: (&AtomicBool, Seen<'_>),
 ) -> Result<(Listed, Option<Started>)> {
     Err(resolve::not_running(
         environment,
@@ -1439,8 +1447,10 @@ async fn standalone(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
     launched: &AtomicBool,
+    seen: Seen<'_>,
 ) -> Result<(LocalClient, Option<Started>)> {
-    let (client, started) = start_by_task(environment, endpoint, bounds, &[], launched).await?;
+    let (client, started) =
+        start_by_task(environment, endpoint, bounds, &[], (launched, seen)).await?;
     Ok((ours(client)?, started))
 }
 
@@ -1452,7 +1462,7 @@ async fn start_by_task(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
     majors: &[u16],
-    launched: &AtomicBool,
+    (launched, seen): (&AtomicBool, Seen<'_>),
 ) -> Result<(Listed, Option<Started>)> {
     let deadline = tokio::time::Instant::now() + bounds.start;
     let program = standalone_program()?;
@@ -1477,7 +1487,7 @@ async fn start_by_task(
         endpoint,
         bounds,
         (deadline, majors),
-        launched,
+        (launched, seen),
         (&asked, &log),
     )
     .await
@@ -1493,7 +1503,7 @@ async fn wait_for_the_task_start(
     endpoint: &kr_ipc::paths::Endpoint,
     bounds: Bounds,
     (deadline, majors): (tokio::time::Instant, &[u16]),
-    launched: &AtomicBool,
+    (launched, seen): (&AtomicBool, Seen<'_>),
     (asked, log): (&windows::Asked, &Log),
 ) -> Result<(Listed, Option<Started>)> {
     let started = Started {
@@ -1501,7 +1511,7 @@ async fn wait_for_the_task_start(
         start: ControllerStartup::Standalone,
         manager: None,
     };
-    let last = match answered_by(endpoint, deadline, majors, || {}).await {
+    let last = match answered_by(endpoint, deadline, majors, seen, || {}).await {
         Ok(client) => {
             // A daemon answered, whichever start it came from. The request is withdrawn, so no
             // starter the Task Scheduler runs later acts on it; one that took it already is past
@@ -2840,7 +2850,7 @@ mod tests {
         ));
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
         let mut attempts = 0;
-        let last = answered_by(&endpoint, deadline, &[], || attempts += 1)
+        let last = answered_by(&endpoint, deadline, &[], &unseen, || attempts += 1)
             .await
             .map(|_| ())
             .expect_err("nothing answers");
@@ -2878,6 +2888,7 @@ mod tests {
                 start: Duration::from_secs(1),
             },
             &AtomicBool::new(false),
+            &unseen,
         )
         .await
         else {
@@ -3450,7 +3461,7 @@ mod tests {
             &endpoint,
             BOUNDS,
             (tokio::time::Instant::now() + START_BOUND, &[]),
-            &launched,
+            (&launched, &unseen),
             (&asked, &log),
         )
         .await
