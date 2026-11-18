@@ -663,9 +663,12 @@ async fn eventually(what: &str, holds: impl Fn() -> bool) {
 }
 
 /// Waits until the page has been shown the hosts as the desk has them now. A run changes what the
-/// desk shows before it tells the page, so a wait for a state returns while the run's last notice is
-/// still to be sent, and a count of the notices read then is one short. It holds where the change
-/// just waited for moves the view: the page has the view that stands only once that notice is sent.
+/// desk shows before it tells the page, so a wait for a state can return while the run's last
+/// notice is still to be sent, and a count of the notices read then can be one short. The wait is
+/// exact only while no earlier notice shows the final hosts. `enable` starts the run and can be
+/// paused before its own notice while the run finishes, and that notice then shows the final hosts,
+/// so a caller holds the gateway's answer across `enable`: that notice shows the run at work, and
+/// only the run's last notice shows the view that stands.
 async fn until_the_page_is_told(desk: &PushDesk, views: &Mutex<Vec<PushView>>) {
     eventually("the page was shown the hosts as the desk has them", || {
         let standing = desk.view().hosts;
@@ -3690,10 +3693,14 @@ async fn a_phone_with_notifications_on() -> (Host, Desk, String) {
     let host = Host::start(&owner).await;
     let phone = desk(&[&host], &owner, Receiver::new(FIRST_TOKEN)).await;
     let reference = phone.references().remove(0);
+    // The gateway's answer is held while `enable` tells the page, so that notice shows the run at
+    // work and the run's last notice is the one the wait below is for.
+    phone.gateway.hold_issue(true);
     phone
         .desk
         .enable(&reference, None)
         .expect("the person asks");
+    phone.gateway.hold_issue(false);
     phone.until(|states| states == [PushState::On]).await;
     until_the_page_is_told(&phone.desk, &phone.views).await;
     (host, phone, reference)
@@ -4494,7 +4501,10 @@ async fn previews_turned_off_reach_the_host_though_the_key_cannot_be_taken_out_i
     let restarted = reopened(&phone);
     phone.receiver.with(|state| state.keys_fail = true);
 
+    // The gateway's answer is held while `enable` tells the page, as in the setup.
+    restarted.gateway.hold_issue(true);
     restarted.desk.enable(&reference, None).expect("Try again");
+    restarted.gateway.hold_issue(false);
 
     states_until(&restarted.desk, |states| {
         states == [PushState::NeedsAttention]
@@ -4540,10 +4550,13 @@ async fn keys_the_receivers_cannot_be_handed_leave_the_host_registered_and_a_loo
     let reference = phone.references().remove(0);
     phone.receiver.with(|state| state.keys_fail = true);
 
+    // The gateway's answer is held while `enable` tells the page, as in the setup.
+    phone.gateway.hold_issue(true);
     phone
         .desk
         .enable(&reference, None)
         .expect("the person asks");
+    phone.gateway.hold_issue(false);
 
     phone
         .until(|states| states == [PushState::NeedsAttention])
