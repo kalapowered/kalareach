@@ -105,6 +105,11 @@ impl Drop for Page {
 /// A gate in the page's publication. Open, a state passes at once. Closed, a state the view
 /// publishes is recorded and then waits inside the publication, which holds the view's task, until
 /// the gate lets it pass: the view is as slow as the case makes it.
+///
+/// Three locks meet in the page's publication, always in one order: the gate's, then the record's
+/// (the states each channel was sent), then the point's. A publication takes the gate's lock first,
+/// and records its state and meets the point while it holds it; a case reads the record, and
+/// closes, opens or lets pass the gate, each under one lock of its own and never under another.
 #[derive(Default)]
 struct Gate {
     /// None while the gate is open, and otherwise how many more states may pass.
@@ -113,8 +118,14 @@ struct Gate {
 }
 
 impl Gate {
-    fn pass(&self) {
+    /// A publication meets the gate. `record` adds the publication's state to the page's record,
+    /// and runs under the gate's lock, which the publication keeps until it has decided whether it
+    /// waits: a case that has seen the state in the record, and closes the gate after that, closes
+    /// it behind this publication and never in front of it. A publication that waits does so with
+    /// the lock released.
+    fn pass(&self, record: impl FnOnce()) {
         let mut passes = self.passes.lock().expect("the gate");
+        record();
         loop {
             match *passes {
                 None => return,
@@ -251,17 +262,19 @@ impl Page {
             .channel_interceptor(move |_webview, callback, _index, body| {
                 if let tauri::ipc::InvokeResponseBody::Json(json) = body {
                     let state: Value = serde_json::from_str(json).expect("a state the page reads");
-                    heard
-                        .lock()
-                        .expect("the record")
-                        .entry(callback.0)
-                        .or_default()
-                        .push(state);
                     // The wait holds the view's task, and the runtime is told that this worker waits so
                     // that the session's reader, which the view does not hold, goes on reading.
                     tokio::task::block_in_place(|| {
-                        let held = pointed.hold();
-                        gated.pass();
+                        let mut held = false;
+                        gated.pass(|| {
+                            heard
+                                .lock()
+                                .expect("the record")
+                                .entry(callback.0)
+                                .or_default()
+                                .push(state);
+                            held = pointed.hold();
+                        });
                         if held {
                             pointed.passed();
                         }
