@@ -2478,6 +2478,12 @@ async fn kr_req_17_48_a_capacity_answer_for_a_pair_with_no_lease_leaves_its_row_
         );
         assert!(rig.live_lease_for(&owner).is_none());
         assert_eq!(rig.requests(ISSUE), 1, "asked once");
+        // The keeper finishes a pass before it asks for the wait that follows, so the wait is
+        // waited for: the count of passes changes only after the wait is asked for.
+        rig.until("the keeper has asked to wait out the delay", || {
+            rig.timer.asked_for().into_iter().max() >= Some(Duration::from_secs(owed))
+        })
+        .await;
         assert_eq!(
             rig.timer.asked_for().into_iter().max(),
             Some(Duration::from_secs(owed)),
