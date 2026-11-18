@@ -676,6 +676,11 @@ fn the_install_in_a_process_of_its_own() {
     });
 }
 
+/// How many runs of a call whose wait is to fail the case makes before it says that the wait never
+/// failed: a run is made again where this host's poll read the end of the program before the thread
+/// that takes every end did.
+const FAILED_WAIT_ATTEMPTS: usize = 20;
+
 /// What the install says and leaves where this host cannot make a call: the failure of this host, the
 /// path that failed and the system's error, at each question, in a dry run and in a real run, and
 /// the home as it was. Two ways need a state of the whole process, so each question is asked in a run
@@ -688,7 +693,10 @@ fn the_install_in_a_process_of_its_own() {
 ///   wait sees it (`KR_WALK_REAP`), so the wait for the program fails with `ECHILD`. The program
 ///   answers rightly after a second and ends with code 0, so a wait that is read as a time-out
 ///   would show the sentence for a PowerShell that did not answer, with a complete answer in the
-///   file.
+///   file. The thread and this host's poll for the program's end race for it, and under load the
+///   poll can read it first: a run where it did (the program started more than once, or the install
+///   said nothing) is made again, as many as [`FAILED_WAIT_ATTEMPTS`] times, and the case counts
+///   them on the program's own error stream.
 ///
 /// What no case of this suite shows is that no kill follows a failed wait: the program is not this
 /// host's child to find then, so nothing observable tells a kill from none. A system-call trace of
@@ -699,72 +707,115 @@ fn a_call_that_this_host_cannot_make_says_the_path_and_the_error() {
         "a_call_that_this_host_cannot_make_says_the_path_and_the_error",
         CASE_BOUND,
         || {
+            use std::io::Write as _;
+
+            let (mut waited, mut discarded_all) = (0, 0);
             for stand in stands()
                 .into_iter()
                 .filter(|stand| stand.way == "not_prepared" || stand.way == "wait_failed")
             {
                 for dry_run in [true, false] {
-                    let ground = ground();
                     let name = format!(
                         "{} {}, dry run {dry_run}",
                         question_name(stand.question),
                         stand.way
                     );
-                    let body = if stand.way == "wait_failed" {
-                        format!("sleep 1\n{}", the_right_answers(&ground.home))
-                    } else {
-                        stand.body.clone()
-                    };
-                    let program = a_program_that(&ground.root, &body);
-                    assert!(program.is_file());
-                    let temporary = ground.root.join("not-a-folder");
-                    let mut run =
-                        std::process::Command::new(std::env::current_exe().expect("this program"));
-                    if stand.way == "wait_failed" {
-                        run.env("KR_WALK_REAP", "1");
-                    } else {
-                        std::fs::write(&temporary, "").expect("a file");
-                        run.env("TMPDIR", &temporary);
+                    let mut discarded = 0;
+                    loop {
+                        let ground = ground();
+                        let body = if stand.way == "wait_failed" {
+                            format!(
+                                "printf x >> '{}'\nsleep 1\n{}",
+                                ground.root.join("runs").display(),
+                                the_right_answers(&ground.home)
+                            )
+                        } else {
+                            stand.body.clone()
+                        };
+                        let program = a_program_that(&ground.root, &body);
+                        assert!(program.is_file());
+                        let temporary = ground.root.join("not-a-folder");
+                        let mut run = std::process::Command::new(
+                            std::env::current_exe().expect("this program"),
+                        );
+                        if stand.way == "wait_failed" {
+                            run.env("KR_WALK_REAP", "1");
+                        } else {
+                            std::fs::write(&temporary, "").expect("a file");
+                            run.env("TMPDIR", &temporary);
+                        }
+                        let before = held_under(&ground.home);
+                        let ran = run
+                            .args([
+                                "--exact",
+                                "shell::tests::question_table::the_install_in_a_process_of_its_own",
+                                "--ignored",
+                                "--test-threads=1",
+                            ])
+                            .env("KR_WALK_ROOT", &ground.root)
+                            .env("KR_WALK_QUESTION", question_name(stand.question))
+                            .env("KR_WALK_DRY", if dry_run { "1" } else { "0" })
+                            .stdin(std::process::Stdio::null())
+                            .output()
+                            .expect("starts this test program");
+                        assert!(
+                            ran.status.success(),
+                            "{name}: {}",
+                            String::from_utf8_lossy(&ran.stdout)
+                        );
+                        let said = std::fs::read_to_string(ground.root.join("said.txt"))
+                            .expect("what was said");
+                        if stand.way == "wait_failed" {
+                            waited += 1;
+                            // The wait fails only where the helper's thread that takes the end of every
+                            // child takes the end of the program before this host's poll reads it. Where
+                            // the poll reads it first the question is answered rightly: the install says
+                            // nothing, or asks the next question and starts the program again. That run
+                            // did not make the failure that the stand names, so it shows nothing of the
+                            // failure and is made again in a ground of its own. The program notes each
+                            // of its starts in `runs`; nothing but those and what the install said
+                            // decides it.
+                            let starts = std::fs::read_to_string(ground.root.join("runs"))
+                                .unwrap_or_default()
+                                .len();
+                            if starts != 1 || said.is_empty() {
+                                discarded += 1;
+                                assert!(
+                                    discarded < FAILED_WAIT_ATTEMPTS,
+                                    "{name}: the wait did not fail at the question in {FAILED_WAIT_ATTEMPTS} runs \
+                                 (the program was started {starts} times; the install said {said:?})"
+                                );
+                                continue;
+                            }
+                        }
+                        let temporary = if stand.way == "wait_failed" {
+                            std::env::temp_dir()
+                        } else {
+                            temporary
+                        };
+                        assert_eq!(
+                            as_the_table_says(&said, &ground, &temporary),
+                            cell(stand.question, stand.way),
+                            "{name}"
+                        );
+                        assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
+                        assert!(
+                            stand.question != Question::Profiles
+                                || !ground.state.join("state").exists(),
+                            "{name}: a record was written"
+                        );
+                        discarded_all += discarded;
+                        break;
                     }
-                    let before = held_under(&ground.home);
-                    let ran = run
-                        .args([
-                            "--exact",
-                            "shell::tests::question_table::the_install_in_a_process_of_its_own",
-                            "--ignored",
-                            "--test-threads=1",
-                        ])
-                        .env("KR_WALK_ROOT", &ground.root)
-                        .env("KR_WALK_QUESTION", question_name(stand.question))
-                        .env("KR_WALK_DRY", if dry_run { "1" } else { "0" })
-                        .stdin(std::process::Stdio::null())
-                        .output()
-                        .expect("starts this test program");
-                    assert!(
-                        ran.status.success(),
-                        "{name}: {}",
-                        String::from_utf8_lossy(&ran.stdout)
-                    );
-                    let said = std::fs::read_to_string(ground.root.join("said.txt"))
-                        .expect("what was said");
-                    let temporary = if stand.way == "wait_failed" {
-                        std::env::temp_dir()
-                    } else {
-                        temporary
-                    };
-                    assert_eq!(
-                        as_the_table_says(&said, &ground, &temporary),
-                        cell(stand.question, stand.way),
-                        "{name}"
-                    );
-                    assert_eq!(held_under(&ground.home), before, "{name}: the home changed");
-                    assert!(
-                        stand.question != Question::Profiles
-                            || !ground.state.join("state").exists(),
-                        "{name}: a record was written"
-                    );
                 }
             }
+            // Written to the stream of the program itself, which a passing case's captured output
+            // does not hold, so that a log shows how often the poll read the end first.
+            let _ = writeln!(
+                std::io::stderr(),
+                "a_call_that_this_host_cannot_make_says_the_path_and_the_error: {discarded_all} of {waited} runs \
+                 that were to fail the wait were made again, the host having read the end of the program first"
+            );
         },
     );
 }
