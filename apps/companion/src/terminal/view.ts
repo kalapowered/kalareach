@@ -41,11 +41,14 @@ import {
   type TerminalGrid,
   type TerminalInput,
   type TerminalMove,
+  type TerminalNote,
+  type TerminalPlace,
   type TerminalRoom,
   type TerminalScreen,
   type TerminalView,
   type TerminalViewState
 } from '../host/port'
+import type { KeptPlace } from '../app/state'
 import { SLOW_MS } from './modes'
 import { replay, roomLeft, STILL, within, type Cells } from './pan'
 
@@ -66,6 +69,16 @@ export interface TerminalViewing {
    * with it.
    */
   readonly openingKey: string
+  /**
+   * What native code says of the place this opening restored, when it is not the place the person
+   * left; null once a move is made after it, and when none was restored.
+   */
+  readonly note: TerminalNote | null
+  /**
+   * Whether this opening was asked to restore a place and no screen has come yet: the window has
+   * no frame to move, and the surface says so.
+   */
+  readonly restoring: boolean
   /** Where the frame is drawn from its own place: moved by the moves not yet settled. */
   readonly shift: Cells
   /** How far the window can still move each way once those moves are applied, or null with none. */
@@ -127,6 +140,16 @@ export const FALLBACK_GRID: TerminalGrid = { columns: 80, rows: 24 }
 
 /** One opening of a view: what the page last reported, and the view once native code holds it. */
 interface Opening {
+  /**
+   * The place native code last said the window is at, and where a return to the live screen would
+   * put it: what is kept when the pane is left. It starts as the place the opening restores.
+   */
+  place: TerminalPlace
+  /**
+   * The number of the opening's return to the live screen that native code has not said is
+   * settled, while there is one. What is kept then is the live place, not the window's.
+   */
+  liveNumber: number | null
   grid: TerminalGrid
   view: TerminalView | null
   /** Whether the page measured a grid before the view was held, which goes once it is. */
@@ -210,7 +233,8 @@ export function useTerminalView(
   measure: () => TerminalGrid,
   showing = true,
   token: string | undefined = undefined,
-  mayControl = true
+  mayControl = true,
+  kept: KeptPlace
 ): TerminalViewing {
   // What a view's state belongs to: the session, and under a paired host the opening it runs under.
   // The last frame, the moves waiting and the control asked for are an opening's: another opening of
@@ -250,6 +274,18 @@ export function useTerminalView(
     readonly since: number | null
   } | null>(null)
   const [movingSlowSince, setMovingSlowSince] = useState<number | null>(null)
+  // The opening that has shown a screen or ended, which is then no longer waiting for its place.
+  const [settledOpening, setSettledOpening] = useState<{
+    readonly sessionId: string
+    readonly attempt: number
+  } | null>(null)
+  // Whether this opening is asked to restore a place: the one kept when the pane was left, read as
+  // the opening begins.
+  const restoreAsked = useMemo(
+    () => showing && kept.read()?.anchor != null,
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- read afresh for each opening
+    [showing, scope, attempt, kept]
+  )
   // The person's newest control request, with the opening it belongs to.
   const [askedControl, setAskedControl] = useState<{
     readonly sessionId: string
@@ -286,7 +322,12 @@ export function useTerminalView(
   useEffect(() => {
     if (!showing) return
     let current = true
+    // Read once: the place the pane was left at is this opening's to restore, and nothing it does
+    // until it has a screen is a reason to ask for another.
+    const restored = kept.read()
     const open: Opening = {
+      place: restored ?? { anchor: null, live: null },
+      liveNumber: null,
       grid: measuring.current(),
       view: null,
       owed: false,
@@ -313,6 +354,13 @@ export function useTerminalView(
             // Held at once as well, so a move made before the next render measures from this frame.
             frameNow.current = next.screen
             setFramed({ sessionId: scope, screen: next.screen })
+            open.place = { anchor: next.anchor, live: next.live }
+          }
+          if (next.state !== 'waiting') setSettledOpening({ sessionId: scope, attempt })
+          // A return to the live screen is no longer unsettled once native code says it is settled;
+          // an end does not say so.
+          if (next.state !== 'ended' && open.liveNumber !== null && Number(next.settled) >= open.liveNumber) {
+            open.liveNumber = null
           }
           // What native code has settled goes, with the frame that holds it; an end settles all, and
           // the view takes no move after it.
@@ -321,7 +369,8 @@ export function useTerminalView(
           const left = open.pending.filter((move) => move.number > settled)
           if (left.length !== open.pending.length) keepMoves(open, left)
         },
-        token
+        token,
+        restored?.anchor ?? null
       )
       .then(
         (view) => {
@@ -350,6 +399,18 @@ export function useTerminalView(
       if (opening.current === open) opening.current = null
       // A view still opening is closed when its open answers, above.
       if (open.view !== null) void open.view.close()
+      // What is kept for the next opening of this session: the place the window was last said to be
+      // at, or, when the person asked for the live screen and native code has not settled it, the
+      // live place. Through the `kept` this effect closed over, never through a render's: a pane
+      // that changed session has already rendered the next one. A frame left from before a live
+      // that was never settled is not the place that is kept, so the next opening draws none.
+      const where = open.liveNumber !== null ? open.place.live : open.place.anchor
+      kept.keep(where === null ? null : { anchor: where, live: open.liveNumber !== null ? where : open.place.live })
+      if (open.liveNumber !== null) {
+        setFramed(null)
+        frameNow.current = null
+      }
+      setSettledOpening(null)
       // What this opening said ends with it: the next one starts from attaching. Its last frame is
       // kept, as the session's, until the next one has a screen of its own. Its moves go with it:
       // native code closed the view that would have settled them. Its control goes too: the next
@@ -360,7 +421,7 @@ export function useTerminalView(
       setAskedControl(null)
       setUnsentInput(null)
     }
-  }, [port, sessionId, scope, attempt, showing, keepMoves, token])
+  }, [port, sessionId, scope, attempt, showing, keepMoves, token, kept])
 
   const resize = useCallback((grid: TerminalGrid) => {
     const open = opening.current
@@ -410,6 +471,7 @@ export function useTerminalView(
     const open = opening.current
     if (open?.view == null || open.ended) return
     send(open, open.view, (number) => ({ number, live: true }))
+    open.liveNumber = open.number
   }, [send])
 
   /** Makes the person's next control request, and sends it. */
@@ -591,6 +653,8 @@ export function useTerminalView(
     resize,
     again,
     openingKey: `${scope}:${attempt}`,
+    note: state?.state === 'showing' ? state.note : null,
+    restoring: restoreAsked && !(settledOpening?.sessionId === scope && settledOpening.attempt === attempt),
     shift: frame === null ? STILL : replay(frame, pending),
     room: frame === null || state?.state === 'ended' ? null : roomLeft(frame, pending),
     moving,

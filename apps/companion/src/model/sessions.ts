@@ -18,6 +18,7 @@ import type {
   PendingResource
 } from '@kalareach/protocol'
 
+import type { TerminalPlace } from '../host/port'
 import type { WithheldCount } from './agent'
 import { emptyConversation, type ConversationState } from './conversation'
 import { emptyOutput, type OutputWindow } from './output'
@@ -87,6 +88,8 @@ export interface SessionState {
   readonly output: OutputWindow
   /** What the raw terminal view drew while it was open, for the recording export. */
   readonly recording: Recording
+  /** Where the raw terminal view's window was when the pane was left; kept with the tab. */
+  readonly terminal: TerminalPlace | null
   /** What this device has sent, and what became of it. */
   readonly submissions: readonly Submission[]
   /** Images the person explicitly imported, by URL. */
@@ -102,6 +105,7 @@ export function emptySessionState(): SessionState {
     agent: unreadAgent(),
     output: emptyOutput(),
     recording: emptyRecording(),
+    terminal: null,
     submissions: [],
     images: new Map(),
     loaded: false

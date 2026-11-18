@@ -20,7 +20,7 @@ import {
 
 import type { ActionRight } from '@kalareach/protocol'
 
-import type { HostPort } from '../host/port'
+import type { HostPort, TerminalPlace } from '../host/port'
 import { AnnouncementScope } from '../components/announcements'
 import { closeSheets, type ToastAction, type ToastMessage } from '../components/ui'
 import { DraftBook } from '../model/draft-book'
@@ -335,6 +335,32 @@ export function useApp(): AppValue {
   const value = useContext(AppContext)
   if (!value) throw new Error('This component must be rendered inside the application.')
   return value
+}
+
+/** What a raw terminal view keeps of its place for the next one: read once at open, written at close. */
+export interface KeptPlace {
+  readonly read: () => TerminalPlace | null
+  readonly keep: (place: TerminalPlace | null) => void
+}
+
+/**
+ * The place the raw terminal view of `sessionId` was left at. The functions are the same for as long
+ * as the session is, and each reaches this session's state alone: a view that closes after the pane
+ * moved on to another session still writes the session it was opened for.
+ */
+export function useKeptPlace(sessionId: string): KeptPlace {
+  const { sessions } = useApp()
+  return useMemo(
+    () => ({
+      read: () => sessions.get(sessionId).terminal,
+      keep: (place: TerminalPlace | null) => {
+        sessions.update(sessionId, (current) =>
+          current.terminal === place ? current : { ...current, terminal: place }
+        )
+      }
+    }),
+    [sessions, sessionId]
+  )
 }
 
 /**

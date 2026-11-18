@@ -27,7 +27,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { flushSync } from 'react-dom'
 
-import { useApp, useSession } from '../../app/state'
+import { useApp, useKeptPlace, useSession } from '../../app/state'
 import { useSessionAgent } from '../../app/agent'
 import { useSessionOpening } from '../../app/opening'
 import { useHeldConnection } from '../../app/rights'
@@ -91,6 +91,7 @@ import { cellUnder, dragRows, heldTurns, type TerminalCell } from '../../termina
 import {
   ATTACHING,
   modeOf,
+  noteWords,
   placeOf,
   presentationOf,
   WAITING,
@@ -495,14 +496,16 @@ export function MobileSession({
     toProgram,
     controlTake,
     refuse,
-    unsent
+    unsent,
+    note
   } = useTerminalView(
     port,
     sessionId,
     measure,
     pane === 'terminal' && showsLiveScreen,
     token,
-    canControl
+    canControl,
+    useKeptPlace(sessionId)
   )
   const mode = modeOf(control)
   const controlling = control?.state === 'controlling'
@@ -1364,6 +1367,14 @@ export function MobileSession({
                  */}
                 <div className="m-terminal-status">
                   <div id={statusId} data-expanded={statusOpen}>
+                    {/* Mounted before its words arrive, first, so the one-line collapse applies to it. */}
+                    <p className="terminal-place-note" role="status">
+                      {note === null ? null : (
+                        <Badge tone="warning" data-testid="terminal-place-note" data-kind={note}>
+                          {noteWords(note)}
+                        </Badge>
+                      )}
+                    </p>
                     {terminalWarnings.length > 0 || terminalPosition !== null ? (
                       <p>
                         {terminalWarnings.map((warning) => (

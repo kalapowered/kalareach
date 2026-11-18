@@ -396,13 +396,14 @@ export function tauriPort(): HostPort {
 
     // Each view has a channel of its own, which native code publishes that view's states on and
     // nothing else: no protocol event and no other view's state ever reaches its listener.
-    openTerminalView: async (sessionId, grid, listener, opening): Promise<TerminalView> => {
+    openTerminalView: async (sessionId, grid, listener, opening, anchor): Promise<TerminalView> => {
       const states = new Channel<TerminalViewState>()
       states.onmessage = listener
       const view = await call<string>('terminal_view_open', {
         sessionId,
         ...viewSizeArguments(grid),
         opening,
+        anchor,
         onState: states
       })
       return {

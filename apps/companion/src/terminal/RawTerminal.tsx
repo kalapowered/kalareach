@@ -53,7 +53,7 @@ import type { PaletteState } from '@kalareach/protocol'
 import { Badge, Button } from '../components/ui'
 import { useLaunchSurface } from '../app/launch-surface'
 import { useHeldConnection } from '../app/rights'
-import { useApp } from '../app/state'
+import { useApp, useKeptPlace } from '../app/state'
 import type { TerminalGrid, TerminalScreen } from '../host/port'
 import { LaunchSurface } from '../views/LaunchSurface'
 import { styleOf } from './cells'
@@ -77,6 +77,8 @@ import {
   ATTACHING,
   describeProvenance,
   modeOf,
+  MOVES_LATER,
+  noteWords,
   placeOf,
   presentationOf,
   routeWheel,
@@ -332,8 +334,10 @@ export function RawTerminal({
     controlTake,
     refuse,
     unsent,
-    launch
-  } = useTerminalView(port, sessionId, measure)
+    launch,
+    note,
+    restoring
+  } = useTerminalView(port, sessionId, measure, true, undefined, true, useKeptPlace(sessionId))
 
   // What a launch could do at the session's prompt, read on this view's own link: the link that
   // holds the session's input once the person takes control, so it is the one whose answer can
@@ -569,7 +573,8 @@ export function RawTerminal({
   // controls the program, why the last input did not reach it, until one does.
   const sentence =
     control === null || control.state === 'watching'
-      ? (control?.ended ?? 'Scroll or drag to move around the session. The program gets nothing.')
+      ? (control?.ended ??
+        (restoring ? MOVES_LATER : 'Scroll or drag to move around the session. The program gets nothing.'))
       : control.state === 'taking'
         ? ASKING
         : (unsent ??
@@ -604,9 +609,23 @@ export function RawTerminal({
           >
             {mode === 'view' ? 'Take control' : 'Look around'}
           </Button>
-          <span className="small faint" role="status" id={sentenceId} data-testid="terminal-mode-sentence">
+          <span
+            className="small faint"
+            role="status"
+            id={sentenceId}
+            data-testid="terminal-mode-sentence"
+            data-moves={restoring ? 'later' : undefined}
+          >
             {sentence}
           </span>
+        </span>
+        {/* Mounted before its words arrive, outside the frame, so they are announced when they do. */}
+        <span className="terminal-place-note" role="status">
+          {note === null ? null : (
+            <Badge tone="warning" data-testid="terminal-place-note" data-kind={note}>
+              {noteWords(note)}
+            </Badge>
+          )}
         </span>
         {frame ? (
           <span className="row">
@@ -786,7 +805,7 @@ export function RawTerminal({
               <Button
                 key={move.name}
                 aria-label={`Move the window ${move.name}`}
-                disabled={mode !== 'view' || room === null || room[move.limit] === 0}
+                disabled={mode !== 'view' || restoring || room === null || room[move.limit] === 0}
                 onClick={() => {
                   if (frame === null) return
                   pan({

@@ -2109,14 +2109,16 @@ export interface HostPort {
    * Opens a raw terminal view of one session, `grid` in size. Native code attaches it to the
    * session and holds its screen; every state it is in reaches `listener`, and nothing else does.
    * Resolves with the view as soon as native code holds it, before the host has answered anything.
-   * A session identifier native code cannot parse, or a size outside a terminal's bounds, is
-   * refused with `INVALID_ARGUMENT`, and nothing opens.
+   * A session identifier native code cannot parse, a size outside a terminal's bounds, or an
+   * `anchor` that is not one native code minted is refused with `INVALID_ARGUMENT`, and nothing
+   * opens. With an `anchor` the view asks the host for that place before it shows anything.
    */
   openTerminalView(
     sessionId: string,
     grid: TerminalGrid,
     listener: (state: TerminalViewState) => void,
-    opening?: string
+    opening: string | undefined,
+    anchor: TerminalAnchor | null
   ): Promise<TerminalView>
 
   /**
@@ -2657,8 +2659,41 @@ export type TerminalViewState =
       readonly screen: TerminalScreen
       readonly settled: number
       readonly control: TerminalControl
+      /** Where the window is, to keep and give back; null at the live screen's first line and column. */
+      readonly anchor: TerminalAnchor | null
+      /** Where the window would be after a return to the live screen. */
+      readonly live: TerminalAnchor | null
+      /** What native code says of a restored place, when it is not the one the person left. */
+      readonly note: TerminalNote | null
     }
   | { readonly state: 'ended'; readonly reason: string }
+
+/**
+ * A window's place in a session, minted by native code and kept by the page as it came: the page
+ * reads none of it. A row and a generation are decimal strings, so the page never rounds them.
+ */
+export interface TerminalAnchor {
+  readonly row: string | null
+  readonly line: number
+  readonly column: number
+  readonly buffer: 'primary' | 'alternate'
+  readonly columns: number
+  readonly generation: string
+  readonly fingerprint: string | null
+}
+
+/** What the page keeps of a terminal view's place: where the window was and where a return goes. */
+export interface TerminalPlace {
+  readonly anchor: TerminalAnchor | null
+  readonly live: TerminalAnchor | null
+}
+
+/**
+ * What native code says of the place a restored window landed at, when it is not the place the
+ * person left: the row is older than the session keeps, the session changed under it, or the place
+ * could not be restored.
+ */
+export type TerminalNote = 'gone' | 'different' | 'unavailable'
 
 /**
  * Whether a view controls the program: it watches, and nothing of the person's reaches the program;
