@@ -48,8 +48,10 @@ describe('a device whose pairing ends within a minute', () => {
   })
 
   it('says a pairing that is out of force cannot be used now, and is paired again only after it has ended', () => {
+    // The list marks the pairing as unusable while its end is still ahead: the host may hold the
+    // record as live, so the end that lets a new pairing in has not been reached.
     const outOfForce = whyNot(
-      device({ grant_expired: true, grant_expires_at_ms: String(NOW - 1_000) }),
+      device({ grant_expired: true, grant_expires_at_ms: String(NOW + 3_600_000) }),
       NOW
     )
     expect(outOfForce).toBe(
@@ -80,35 +82,54 @@ describe('the scripted host refusing a share that would outlast a pairing', () =
 
   it('says what the host says, the time left apart, and offers a second pairing only after the pairing has ended', async () => {
     const { port } = fakeHost()
-    const invitation: GrantCreateParams = {
-      session_id: SESSION_MAIN,
-      recipient_device_id: SHORT_TABLET,
-      parent_grant_id: null,
-      selection: {
-        role: 'viewer',
-        history_from_cursor_ms: null,
-        include_live_screen: false,
-        include_question_respond: false,
-        named_questions: [],
-        named_approvals: []
-      },
-      lifetime_ms: String(2 * 3_600_000),
-      accepted_notices: [],
-      owner_confirmation: null
+    // The scripted host's own record of a short pairing: moving its end gives each time the host
+    // says. The pairing ends 40 minutes from the host's own clock until it is moved.
+    const listed = await port.deviceList({ include_revoked: true })
+    const tablet = listed.devices.find((each) => each.device_id === SHORT_TABLET)
+    if (tablet?.grant_expires_at_ms === null || tablet?.grant_expires_at_ms === undefined) {
+      throw new Error('the scripted host has no short pairing')
     }
-    const refused: unknown = await port.grantCreate(invitation, {}).then(
-      () => null,
-      (error: unknown) => error
-    )
-    const message = (refused as { message?: string } | null)?.message ?? ''
-    expect(message, 'the scripted host refuses').toContain('before this share would; ')
-    // Every fixed word is compared; the time left, in minutes here, is the one thing that is not.
-    const said = message.replace(
-      /(?<=^that device's pairing ends in )\d+ minutes(?=, before this share would; )/,
-      '{}'
-    )
-    expect(said).toBe(hostSentence())
-    expect(said).toContain('pair the device again after the pairing has ended')
-    expect(said).toContain('the host refuses a new pairing while this one stands')
+    const hostNow = Number(tablet.grant_expires_at_ms) - 40 * 60_000
+    const sentence = hostSentence()
+    for (const [left, said] of [
+      [40 * 60_000, '40 minutes'],
+      [30_000, 'less than a minute'],
+      [90_000, '1 minute'],
+      [3 * 3_600_000, '3 hours'],
+      [2 * 86_400_000 + 3_600_000, '2 days']
+    ] as const) {
+      tablet.grant_expires_at_ms = String(hostNow + left)
+      const invitation: GrantCreateParams = {
+        session_id: SESSION_MAIN,
+        recipient_device_id: SHORT_TABLET,
+        parent_grant_id: null,
+        selection: {
+          role: 'viewer',
+          history_from_cursor_ms: null,
+          include_live_screen: false,
+          include_question_respond: false,
+          named_questions: [],
+          named_approvals: []
+        },
+        lifetime_ms: String(left + 3_600_000),
+        accepted_notices: [],
+        owner_confirmation: null
+      }
+      const refused: unknown = await port.grantCreate(invitation, {}).then(
+        () => null,
+        (error: unknown) => error
+      )
+      const message = (refused as { message?: string } | null)?.message ?? ''
+      expect(message, `the scripted host refuses with ${said} left`).toContain('before this share would; ')
+      // Every fixed word is compared; the time left is the one thing that is not, and it is one of
+      // the five forms the host says it in.
+      const time = new RegExp(
+        "(?<=^that device's pairing ends in )(less than a minute|1 minute|\\d+ minutes|\\d+ hours|\\d+ days)(?=, before this share would; )"
+      )
+      expect(time.exec(message)?.[1], `${said} left`).toBe(said)
+      expect(message.replace(time, '{}'), `${said} left`).toBe(sentence)
+    }
+    expect(sentence).toContain('pair the device again after the pairing has ended')
+    expect(sentence).toContain('the host refuses a new pairing while this one stands')
   })
 })

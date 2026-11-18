@@ -59,6 +59,19 @@ function refuse(code: string, message: string): never {
   throw new FakeHostError(code, message).toPayload()
 }
 
+/**
+ * A span in the words the host's refusal uses: whole days, hours or minutes, rounded down, and
+ * "less than a minute" and "1 minute" where a plural would not read.
+ */
+function howLong(ms: number): string {
+  const minutes = Math.floor(ms / 60_000)
+  if (minutes === 0) return 'less than a minute'
+  if (minutes === 1) return '1 minute'
+  if (minutes < 120) return `${String(minutes)} minutes`
+  if (minutes < 2_880) return `${String(Math.floor(minutes / 60))} hours`
+  return `${String(Math.floor(minutes / 1_440))} days`
+}
+
 /** The identities and the clock the sharing is written against. */
 export interface SharingIds {
   readonly environment: string
@@ -957,13 +970,10 @@ export class ScriptedSharing implements FakeSharing {
     }
     const endsAt = this.#ids.nowMs + lifetime
     if (recipient.grant_expires_at_ms !== null && endsAt > Number(recipient.grant_expires_at_ms)) {
-      const minutes = Math.max(
-        0,
-        Math.floor((Number(recipient.grant_expires_at_ms) - this.#ids.nowMs) / 60_000)
-      )
+      const left = Math.max(0, Number(recipient.grant_expires_at_ms) - this.#ids.nowMs)
       refuse(
         'INVALID_ARGUMENT',
-        `that device's pairing ends in ${String(minutes)} minutes, before this share would; choose a shorter lifetime, or pair the device again after the pairing has ended (the host refuses a new pairing while this one stands)`
+        `that device's pairing ends in ${howLong(left)}, before this share would; choose a shorter lifetime, or pair the device again after the pairing has ended (the host refuses a new pairing while this one stands)`
       )
     }
     let live: GrantCreateResult['preview']['live_screen'] = null

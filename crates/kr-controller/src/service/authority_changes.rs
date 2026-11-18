@@ -954,10 +954,10 @@ impl Controller {
     /// Refuses a share that a recipient's pairing cannot carry.
     ///
     /// A device's pairing bounds everything it does, so a share to a device this host does not
-    /// pair with, one that was revoked, one whose pairing has run out, or one that would outlast
-    /// its pairing, is a share that ends early or never works. It is refused here, with the reason,
-    /// and never clamped to the pairing's end: an invitation silently shortened is one whose issuer
-    /// believes something untrue about it. A paired device that delegates is told in one sentence
+    /// pair with, one that was revoked, one whose pairing cannot be used now, or one that would
+    /// outlast its pairing, is a share that ends early or never works. It is refused here, with the
+    /// reason, and never clamped to the pairing's end: an invitation silently shortened is one
+    /// whose issuer believes something untrue about it. A paired device that delegates is told in one sentence
     /// that does not say anything about another device's pairing, because `device.list` needs
     /// `host.manage` and this would be a way round it.
     ///
@@ -3850,7 +3850,7 @@ mod tests {
     use crate::service::authority_changes::{
         AuthorityCaller, barrier_read_again, carries_what_was_given,
     };
-    use crate::service::net::devices::DeviceRecord;
+    use crate::service::net::devices::{ClaimRefusal, DeviceRecord, claim_endpoint};
     use crate::service::net::tests::{daemon_on, manual_clocks};
 
     fn uuid(byte: u8) -> Uuid {
@@ -3962,6 +3962,31 @@ mod tests {
                 connection_id,
                 admitted_revision: revision,
                 deadline: self.controller.continuous_now().checked_add(lifetime),
+            }
+        }
+
+        /// A share of the viewer role to this device that lasts `lifetime_ms` from `now_ms`.
+        fn share(&self, now_ms: u64, lifetime_ms: u64) -> crate::sharing::ShareRequest {
+            use kr_protocol::sharing::{AuthorityNotice, RoleSelection, SessionRole};
+
+            let selection = RoleSelection::plain(SessionRole::Viewer);
+            crate::sharing::ShareRequest {
+                invitation_id: kr_protocol::ids::InvitationId::new(uuid(41)),
+                grant_id: GrantId::new(uuid(42)),
+                environment_id: self.controller.paths().environment_id(),
+                session_id: kr_protocol::ids::SessionId::new(uuid(43)),
+                issuer_device_id: self.controller.host_device_id(),
+                recipient_device_id: self.device_id,
+                parent_grant_id: None,
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: Some(lifetime_ms),
+                live_screen: None,
+                named_questions: Vec::new(),
+                named_approvals: Vec::new(),
+                authority_revision: self.controller.policy().authority_revision(),
+                owner_confirmed: false,
+                now_ms,
             }
         }
 
@@ -4159,8 +4184,6 @@ mod tests {
     /// a second pairing only after the pairing has ended.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_share_past_the_pairings_end_is_told_when_the_device_can_be_paired_again() {
-        use kr_protocol::sharing::{AuthorityNotice, RoleSelection, SessionRole};
-
         let now = kr_ipc::now_ms().get();
         let host = Host::start(
             GrantExpiry::At {
@@ -4169,27 +4192,7 @@ mod tests {
             false,
         )
         .await;
-        let share = |lifetime_ms: u64| {
-            let selection = RoleSelection::plain(SessionRole::Viewer);
-            crate::sharing::ShareRequest {
-                invitation_id: kr_protocol::ids::InvitationId::new(uuid(41)),
-                grant_id: GrantId::new(uuid(42)),
-                environment_id: host.controller.paths().environment_id(),
-                session_id: kr_protocol::ids::SessionId::new(uuid(43)),
-                issuer_device_id: host.controller.host_device_id(),
-                recipient_device_id: host.device_id,
-                parent_grant_id: None,
-                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
-                selection,
-                lifetime_ms: Some(lifetime_ms),
-                live_screen: None,
-                named_questions: Vec::new(),
-                named_approvals: Vec::new(),
-                authority_revision: host.controller.policy().authority_revision(),
-                owner_confirmed: false,
-                now_ms: now,
-            }
-        };
+        let share = |lifetime_ms: u64| host.share(now, lifetime_ms);
 
         let refused = host
             .controller
@@ -4229,6 +4232,78 @@ mod tests {
         assert!(
             said.contains("(the host refuses a new pairing while it stands)"),
             "{said}"
+        );
+    }
+
+    /// KR-REQ-25.10: a pairing whose end the host cannot prove, because its clock continuity is
+    /// lost, takes no share, and the refusal says the pairing cannot be used now and that the
+    /// device is paired again only after the pairing has ended. The host still lists the device:
+    /// its record has neither an end mark nor a revocation mark, and a second pairing of the
+    /// endpoint is refused as live, so a refusal that told a person to pair the device again at
+    /// once would be untrue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_share_to_a_pairing_the_host_cannot_prove_has_ended_is_refused_while_its_record_stands()
+     {
+        let now = kr_ipc::now_ms().get();
+        let host = Host::start(
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 30 * 60_000),
+            },
+            false,
+        )
+        .await;
+        host.controller
+            .check_recipient_pairing(AuthorityCaller::Owner, &host.share(now, 10 * 60_000))
+            .expect("a share inside the pairing is accepted while the host's clock is proven");
+
+        host.controller.utc_floor().lose_continuity();
+        let refused = host
+            .controller
+            .check_recipient_pairing(AuthorityCaller::Owner, &host.share(now, 10 * 60_000))
+            .expect_err("a pairing that cannot be proven in force takes no share");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        let said = refused.to_string();
+        assert!(
+            said.contains(
+                "that device's pairing cannot be used now; it can be paired again after the \
+                 pairing has ended (the host refuses a new pairing while it stands)"
+            ),
+            "{said}"
+        );
+
+        let record = host
+            .controller
+            .devices()
+            .record_for_device(host.device_id)
+            .expect("the registry reads")
+            .expect("the device's record");
+        assert!(
+            record.expired_at_ms.is_none() && record.revoked_at_ms.is_none(),
+            "nothing has marked the record: {record:?}"
+        );
+        let second = host
+            .controller
+            .devices()
+            .transaction(|transaction| {
+                claim_endpoint(
+                    transaction,
+                    Some(host.controller.lifetimes().as_ref()),
+                    &record.endpoint_id,
+                )
+            })
+            .expect("the registry reads");
+        assert_eq!(
+            second.err(),
+            Some(ClaimRefusal::Live(host.device_id)),
+            "a second pairing of the endpoint is refused while the host lists the device"
+        );
+        assert!(
+            host.controller
+                .devices()
+                .record_for_device(host.device_id)
+                .expect("the registry reads")
+                .is_some_and(|after| after.expired_at_ms.is_none() && after.revoked_at_ms.is_none()),
+            "the refusal wrote no mark"
         );
     }
 

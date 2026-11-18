@@ -218,7 +218,7 @@ fn lifetime(asked: Option<Lasts>, pairing_ends_at_ms: Option<u64>, now_ms: u64) 
 ///
 /// Returns a usage mistake when none is meant or several are, and says why a device that cannot
 /// take a share cannot: it manages this host, its pairing already opens every session, its pairing
-/// has run out, or it was revoked.
+/// cannot be used now, or it was revoked.
 fn pick_device<'a>(
     listed: &'a [DeviceSummary],
     text: &str,
@@ -2057,7 +2057,7 @@ mod tests {
     fn a_device_is_paired_again_only_after_its_pairing_has_ended() {
         // The host dates a share a moment after the person pressed enter, so the margin comes off
         // what is left before the minimum is tested: 65 seconds left is refused too.
-        for left_ms in [30_000, 65_000] {
+        for left_ms in [65_000, 30_000] {
             let refused = lifetime(None, Some(NOW + left_ms), NOW).expect_err("too little left");
             let CliError::Usage(said) = refused else {
                 panic!("a usage mistake: {refused:?}");
@@ -2082,7 +2082,10 @@ mod tests {
         }
         lifetime(None, Some(NOW + 75_000), NOW).expect("a minute and a quarter is enough");
 
+        // The list marks the pairing as unusable while its end is still ahead: the host may hold
+        // its record as live, and no end has been reached that would let a new pairing in.
         let mut ran_out = device(3, "old phone");
+        ran_out.grant_expires_at_ms = Nullable::some(TimestampMs::new(NOW + 60 * 60_000));
         ran_out.grant_expired = true;
         let refused = pick_device(&[ran_out], "old phone", &Shown::said(""))
             .expect_err("a pairing that has run out takes no share");
