@@ -851,6 +851,9 @@ fn load(paths: &HostPaths) -> Result<Option<Plan>> {
                  that can read it and then run this command again",
             )));
         }
+        // A plan that states a later release's format holds that release's members, which this
+        // build need not be able to decode: it stays where it is for the release that can read it.
+        Err(_) if states_a_later_format(&bytes, &limits) => return Err(of_a_later_format()),
         Err(_) => {
             return Err(CliError::Other(Shown::said(
                 "the merge plan this client keeps cannot be read; it is in this user's state \
@@ -861,20 +864,39 @@ fn load(paths: &HostPaths) -> Result<Option<Plan>> {
     };
     // A later release's format is not read as this one.
     if plan.version > PLAN_FORMAT {
-        return Err(CliError::Other(Shown::said(
-            "the merge plan this client keeps was written by a later release in a format this \
-             release cannot read; it is in this user's state directory as machine-merge-plan \
-             and stays as it is, so run `kr host update` to a release that can read it and then \
-             run this command again",
-        )));
+        return Err(of_a_later_format());
     }
     Ok(Some(plan))
+}
+
+/// What a command stops with when the plan this client keeps was written in a later release's
+/// format.
+fn of_a_later_format() -> CliError {
+    CliError::Other(Shown::said(
+        "the merge plan this client keeps was written by a later release in a format this \
+         release cannot read; it is in this user's state directory as machine-merge-plan \
+         and stays as it is, so run `kr host update` to a release that can read it and then \
+         run this command again",
+    ))
+}
+
+/// Whether the plan in `bytes` states a format later than [`PLAN_FORMAT`]: a map whose `version`
+/// member is a whole number past it, as the update reads the version a plan records.
+fn states_a_later_format(bytes: &[u8], limits: &kr_cbor::Limits) -> bool {
+    let Ok(kr_cbor::CanonicalValue::Map(plan)) = kr_cbor::decode(bytes, limits) else {
+        return false;
+    };
+    plan.get("version")
+        .and_then(kr_cbor::CanonicalValue::as_integer)
+        .and_then(kr_cbor::Integer::as_u64)
+        .is_some_and(|version| version > u64::from(PLAN_FORMAT))
 }
 
 /// Whether the plan in `bytes` fails to decode only because a refused step holds a code that this
 /// build lacks: the same bytes decode once each such code is read as the unknown outcome.
 ///
-/// A step's state is kept as `{"Refused": [code, why]}` in a step of the plan's `steps`.
+/// A step's state is kept as `{"Refused": [code, why]}` in a step of the plan's `steps` or of its
+/// `undo` steps.
 fn holds_a_code_this_build_lacks(bytes: &[u8], limits: &kr_cbor::Limits) -> bool {
     use kr_cbor::{CanonicalMap, CanonicalValue};
     use std::cell::Cell;
@@ -932,7 +954,9 @@ fn holds_a_code_this_build_lacks(bytes: &[u8], limits: &kr_cbor::Limits) -> bool
     let Ok(CanonicalValue::Map(plan)) = kr_cbor::decode(bytes, limits) else {
         return false;
     };
-    let Some(known) = changed(&plan, "steps", &steps_known) else {
+    let Some(known) =
+        changed(&plan, "steps", &steps_known).and_then(|plan| changed(&plan, "undo", &steps_known))
+    else {
         return false;
     };
     found.get() && kr_cbor::from_canonical_value::<Plan>(&CanonicalValue::Map(known)).is_ok()
