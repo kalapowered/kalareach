@@ -1403,10 +1403,20 @@ fn on_a_runtime<T>(work: impl std::future::Future<Output = T>) -> T {
     }
 }
 
+/// Whether a statement that takes access away had been acknowledged, read while a holder kept the
+/// dispatch boundary that may have checked under the earlier statement.
+struct AcknowledgedWhileHeld {
+    /// At the first step that can tell whether the statement waits.
+    on_reaching_the_wait: bool,
+    /// After the window's requests were refused, right before the hold was let go.
+    before_the_hold_was_let_go: bool,
+}
+
 /// What a statement that waits for a hold of the dispatch boundary has already done to the
 /// requests of a window that holds an attachment and the input lease: the gate refuses them from
-/// the moment the worker has the statement, not from the moment it can withdraw.
-async fn the_requests_of_a_window_while_a_statement_waits() {
+/// the moment the worker has the statement, not from the moment it can withdraw. Returns whether
+/// the statement was acknowledged while the hold stood, for the case to assert.
+async fn the_requests_of_a_window_while_a_statement_waits() -> AcknowledgedWhileHeld {
     let world = Arc::new(world("exec cat", true).await);
     let mut window = world.window().await;
     let mut daemon = world.authority(1).await;
@@ -1446,11 +1456,7 @@ async fn the_requests_of_a_window_while_a_statement_waits() {
         .await,
         "the statement neither waited for the hold nor was acknowledged"
     );
-    assert!(
-        !is_set(&acknowledged),
-        "the statement was acknowledged while a hold of the dispatch boundary that may have checked \
-         under the earlier statement stood"
-    );
+    let on_reaching_the_wait = is_set(&acknowledged);
 
     // Held, the window's requests meet the host that is closed: they are refused while the hold
     // stands.
@@ -1476,6 +1482,10 @@ async fn the_requests_of_a_window_while_a_statement_waits() {
     let error = typed.expect_err("input is refused while the statement waits");
     assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
 
+    // Read again before the hold goes: a statement that does not wait can be counted as waiting
+    // at the first step, and acknowledged only after it.
+    let before_the_hold_was_let_go = is_set(&acknowledged);
+
     // Let the hold go: the statement is acknowledged, and the window holds nothing.
     let _ = let_go.send(());
     assert!(
@@ -1489,17 +1499,32 @@ async fn the_requests_of_a_window_while_a_statement_waits() {
     );
     drop(window);
     world.close();
+    AcknowledgedWhileHeld {
+        on_reaching_the_wait,
+        before_the_hold_was_let_go,
+    }
 }
 
 /// KR-REQ-17.54: a statement that takes access away changes what the gate refuses at once, and
 /// acknowledges only when it has withdrawn what the window held.
 ///
 /// A holder keeps the dispatch boundary and the statement waits for it. While it waits, a held
-/// read and an input write of the window are refused, since the gate already has the statement;
-/// when the hold ends the statement is acknowledged and the window holds nothing.
+/// read and an input write of the window are refused, since the gate already has the statement,
+/// and the statement is not acknowledged; when the hold ends the statement is acknowledged and
+/// the window holds nothing.
 #[test]
 fn a_statement_that_waits_for_a_hold_of_the_boundary_has_already_refused_what_a_window_asks() {
-    on_a_runtime(the_requests_of_a_window_while_a_statement_waits());
+    let held = on_a_runtime(the_requests_of_a_window_while_a_statement_waits());
+    assert!(
+        !held.on_reaching_the_wait,
+        "the statement was acknowledged while a hold of the dispatch boundary that may have checked \
+         under the earlier statement stood"
+    );
+    assert!(
+        !held.before_the_hold_was_let_go,
+        "the statement was acknowledged before the hold of the dispatch boundary that may have \
+         checked under the earlier statement was let go"
+    );
 }
 
 /// What a statement that takes nothing away meets while a holder keeps the dispatch boundary:
