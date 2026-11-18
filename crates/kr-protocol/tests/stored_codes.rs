@@ -97,9 +97,16 @@ fn retained_surfaces() -> Vec<(String, Value)> {
         let mut levels: Vec<_> = std::fs::read_dir(manifest.join(folder))
             .unwrap_or_else(|error| panic!("the folder {folder} does not read: {error}"))
             .map(|entry| entry.expect("a folder entry reads").path())
-            .filter(|level| level.join("surface.schema.json").is_file())
+            .filter(|level| level.is_dir())
             .collect();
         levels.sort();
+        for level in &levels {
+            assert!(
+                level.join("surface.schema.json").is_file(),
+                "the level folder {} holds no surface.schema.json, so the list is not held against it",
+                level.display()
+            );
+        }
         assert!(
             !levels.is_empty(),
             "the folder {folder} holds no retained surface, so the list is held against nothing there"

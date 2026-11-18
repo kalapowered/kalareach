@@ -290,8 +290,9 @@ fn a_definition_equal_to_the_code_under_another_name_is_not_the_code_and_fails()
     definitions_of(&mut beside)["OtherWords"] = own.clone();
     beside["properties"]["other"] = json!({ "$ref": "#/$defs/OtherWords" });
     assert!(
-        normalise_with_code(&beside, &own, None)
-            .is_err_and(|error| error.contains("equal to the protocol's error code")),
+        normalise_with_code(&beside, &own, None).is_err_and(
+            |error| error.contains("equal to the protocol's error code and is not called")
+        ),
         "an enumeration with the code's words under another name beside the code is taken for it"
     );
     // The code itself under another name.
