@@ -5654,4 +5654,95 @@ mod tests {
             "the clock is ten minutes behind the worker's mark: the restatement is not taken"
         );
     }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the narrow reading of the following answers to the worker's
+    /// mark, which no staircase takes the place of. A look's mark is taken at the first reading of
+    /// its bracket and its reading goes into the staircases at the second, so a reading can be
+    /// behind the mark by more than the tolerance and behind the look's entry by less. The worker
+    /// trusts its clock, maps a floor, and every look is held up 200 ms after its wall clock was
+    /// read. The owner acts at 3,661,000 ms of the continuous clock, at WALL + 61,000. At 3,662,000
+    /// the wall clock steps a second ahead: the look reads WALL + 63,000, its second reading is at
+    /// 3,662,200, and its mark (WALL + 63,000 at 3,662,000) projects to WALL + 63,200 there. The
+    /// following's narrow reading at 3,662,200 reads WALL + 58,100: 5,100 ms behind the mark,
+    /// 4,900 ms behind the look's entry, which is stamped at 3,662,200, and 4,100 ms behind the
+    /// owner's reading carried to it. Only the mark refuses the confirmation.
+    #[test]
+    fn the_mark_of_a_look_refuses_a_following_that_the_readings_of_the_look_do_not() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(Duration::from_millis(200), true);
+        let contract = held.contract(Some(Arc::clone(&floor)));
+        held.pass(Duration::from_secs(60));
+        contract.observe();
+        held.pass(Duration::from_secs(1));
+        floor.establish(held.wall.now_ms().get(), held.continuous.boot_elapsed_ms());
+        held.pass(Duration::from_secs(1));
+        held.wall.set(held.wall.now_ms().get() + 1_000);
+        held.sets_the_wall_before_reading(2, WALL + 58_100);
+        held.arm(0, 1);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the following's reading is 5,100 ms behind the mark of the look, which was taken at the \
+             first reading of its bracket"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a mark that a record of this boot put back is no reading in any
+    /// staircase, and the following's narrow reading still answers to it. The record holds the mark
+    /// WALL + 65,000, proved at 3,662,000 ms of the continuous clock; the contract restores at
+    /// 3,670,000, and only then does the floor show the owner's act at 3,661,000, WALL + 61,000.
+    /// The look reads WALL + 70,000, 3,000 ms behind the restored mark, inside the stricter
+    /// tolerance of a restored mark (4,750 ms). The following reads WALL + 67,000: 6,000 ms behind
+    /// the mark and 3,000 ms behind both the look's reading and the owner's, carried to it. Only
+    /// the mark refuses the confirmation.
+    #[test]
+    fn a_mark_this_boots_record_put_back_refuses_a_following_that_no_reading_does() {
+        let floor = Arc::new(kr_ipc::floor::SharedFloor::in_process(0));
+        let held = Holdup::new(HELD_UP, false);
+        held.pass(Duration::from_secs(70));
+        let record = HostTimeState {
+            checkpoint: Nullable::some(TimeCheckpoint {
+                boot_identity: boot(1),
+                wall_clock_ms: TimestampMs::new(WALL + 65_000),
+                continuous_ms: U64::new(3_662_000),
+                reading: qualified(),
+                trust: WallClockTrust::Trusted,
+            }),
+            trust: WallClockTrust::Trusted,
+            owner_confirmed: false,
+            proven: Nullable::some(ProvenWallClock {
+                boot_identity: boot(1),
+                wall_clock_ms: TimestampMs::new(WALL + 65_000),
+                continuous_ms: U64::new(3_662_000),
+            }),
+            tombstones: Vec::new(),
+        };
+        let contract = TimeContract::restore(
+            boot(1),
+            AUTHORITY,
+            TimeSources {
+                continuous: Arc::new(Slipping {
+                    held: Arc::clone(&held),
+                }),
+                active: Arc::new(held.active.clone()),
+                wall: Arc::clone(&held) as Arc<dyn WallClock>,
+                adapter: Arc::new(RecordedTimeAdapter::new(qualified())),
+                floor: Some(Arc::clone(&floor)),
+            },
+            Some(record),
+        );
+        assert_eq!(contract.trust(), WallClockTrust::Trusted);
+        floor.establish(WALL + 61_000, 3_661_000);
+        held.sets_the_wall_before_reading(2, WALL + 67_000);
+        assert!(
+            !contract.observe().rolled_back,
+            "the look reads inside the tolerance of a restored mark"
+        );
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the following's reading is 6,000 ms behind the restored mark"
+        );
+    }
 }
