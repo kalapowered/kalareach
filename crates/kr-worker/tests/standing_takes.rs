@@ -46,8 +46,14 @@
 //! the function: in the first admission, in an argument, after the prepared pass, as a function
 //! value, by the wrapper, in a new function (sync, or in another file), a plain call of each sync
 //! wrapper under the held boundary, a take moved from one function to another, a take in a test
-//! helper and in a test module that a macro strips; a new method over the boundary's own mutex; an
-//! `include!`, a path attribute and a `block_on`; and a session held where either entry is called.
+//! helper and in a test module that a macro strips; a new method over the boundary's own mutex, with
+//! a row or none, and one that names the mutex's take as a function value; a child module of the
+//! boundary that takes the mutex; an `include!`, a path attribute and a `block_on`; and a session
+//! held where either entry is called.
+//!
+//! One case plants nothing: it reads the text of the boundary's file and holds that the drop of the
+//! guard clears the record of the holder before it lets the mutex go, an order that no case can
+//! test by stopping a thread between the two statements.
 
 #[path = "standing_scan/mod.rs"]
 mod scan;
@@ -867,6 +873,60 @@ fn a_raw_take_that_is_gone_from_the_boundary_is_reported() {
         ),
         Vec::<String>::new(),
         "{found:?}"
+    );
+}
+
+/// The text of the boundary's file as it stood when this program was built, so that a program
+/// built from changed text reads the changed text.
+const BOUNDARY_TEXT: &str = include_str!("../src/service/boundary.rs");
+
+/// Where the drop of the guard (`impl Drop for DispatchGuard`) clears the holder and lets the
+/// mutex go: how many such blocks the text has, and the offset of each statement in the first.
+struct DropOrder {
+    blocks: usize,
+    clear: Option<usize>,
+    unlock: Option<usize>,
+}
+
+fn drop_order(source: &str) -> DropOrder {
+    let code = scan::blank(source);
+    let head = "impl Drop for DispatchGuard";
+    let body = code
+        .find(head)
+        .map(|at| &code[at..])
+        .and_then(|rest| rest.find("\n}\n").map(|end| &rest[..end]))
+        .unwrap_or("");
+    DropOrder {
+        blocks: code.matches(head).count(),
+        clear: body.find("holder.store(0"),
+        unlock: body.find("drop(self.guard.take())"),
+    }
+}
+
+/// The record of the holder is cleared before the mutex is let go: after it, the clear could erase
+/// the number of the thread that took the boundary next, and that thread's second waiting take
+/// would wait on itself. No case can stop a thread between the two statements, so the order is
+/// held by the text.
+#[test]
+fn the_drop_of_the_guard_clears_the_holder_before_it_lets_the_mutex_go() {
+    let order = drop_order(BOUNDARY_TEXT);
+    assert_eq!(
+        order.blocks, 1,
+        "`impl Drop for DispatchGuard` stands once in the boundary's file"
+    );
+    assert!(
+        order.clear.is_some(),
+        "the drop of the guard has no clear of the holder (`holder.store(0`)"
+    );
+    assert!(
+        order.unlock.is_some(),
+        "the drop of the guard has no unlock of the mutex (`drop(self.guard.take())`)"
+    );
+    assert!(
+        order.clear < order.unlock,
+        "the drop of the guard lets the mutex go (`drop(self.guard.take())`) before it clears the \
+         holder (`holder.store(0`): the clear can erase the number of the thread that took the \
+         boundary next"
     );
 }
 
