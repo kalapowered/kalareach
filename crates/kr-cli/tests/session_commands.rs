@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
-use kr_ipc::testing::started_environment::StartedEnvironment;
+use kr_ipc::testing::started_environment::{StartedEnvironment, USER_MANAGER_VARIABLES};
 use kr_protocol::ids::{BuildId, SessionId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
@@ -86,8 +86,10 @@ impl Host {
         let log = std::fs::File::create(temp.root().join("daemon.log")).expect("the daemon's log");
         let mut command = std::process::Command::new(&controller);
         // The daemon's sessions run a login shell: they are given a home inside the tree, not the
-        // person's.
-        StartedEnvironment::within(temp.root()).apply(&mut command);
+        // person's. The daemon itself keeps the variables of the user's service manager, which it
+        // chooses its supervisor by.
+        StartedEnvironment::within(temp.root())
+            .apply_keeping(&mut command, &USER_MANAGER_VARIABLES);
         let child = command
             .current_dir(temp.root())
             .arg("--runtime-dir")
