@@ -1918,6 +1918,7 @@ fn stored_error(text: &str) -> CatalogueResult<ProtocolError> {
 struct ErrorKeptAsText {
     code: String,
     message: String,
+    #[expect(dead_code, reason = "held to the strict type's member and never read")]
     retry: kr_protocol::error::RetryCategory,
     diagnostic_id: kr_protocol::scalars::Nullable<kr_protocol::ids::DiagnosticId>,
     #[serde(default)]
