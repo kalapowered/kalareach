@@ -27,6 +27,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::config::{ProxyUrl, Url};
+use crate::proxy::{self, FollowFailure, Following, ProxyLoginKind};
 
 /// How an answer from a Pkarr server is labelled among the endpoint's lookup services, which is how
 /// iroh's own resolver labels it.
@@ -39,6 +40,10 @@ const PROVENANCE: &str = "pkarr";
 /// lapse after its time to live. A request that runs out of its time fails as any failed request
 /// does, and a lookup or a publication goes on from there.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many redirects a request to a Pkarr server follows when its proxy holds a login: the
+/// library's own limit, which the other clients keep.
+const REDIRECT_LIMIT: usize = 10;
 
 /// When a name that has had no answer is asked of the DNS resolver's servers again, in
 /// milliseconds after the first question: the delays iroh's own lookups use.
@@ -72,6 +77,7 @@ impl AddressLookupBuilder for Publisher {
         let (records, current) = watch::channel(None);
         let publishing = Publishing {
             client,
+            proxy: self.proxy,
             server: self.server.clone(),
             secret_key: endpoint.secret_key().clone(),
             ttl_seconds: self.ttl_seconds,
@@ -130,6 +136,7 @@ impl AddressLookup for PublishedRecord {
 /// What the publishing task holds.
 struct Publishing {
     client: reqwest::Client,
+    proxy: Option<ProxyUrl>,
     server: Url,
     secret_key: SecretKey,
     ttl_seconds: u32,
@@ -182,13 +189,13 @@ impl Publishing {
         let packet = record
             .to_pkarr_signed_packet(&self.secret_key, self.ttl_seconds)
             .map_err(PkarrError::Signing)?;
-        let response = self
+        let request = self
             .client
             .put(record_url(&self.server, &packet.public_key().to_z32())?)
             .body(packet.to_relay_payload())
-            .send()
-            .await
-            .map_err(PkarrError::Request)?;
+            .build()
+            .map_err(request_error)?;
+        let response = send(&self.client, self.proxy.as_ref(), request).await?;
         if !response.status().is_success() {
             return Err(PkarrError::Status(response.status().as_u16()));
         }
@@ -212,6 +219,7 @@ impl AddressLookupBuilder for Resolver {
     ) -> Result<impl AddressLookup, AddressLookupBuilderError> {
         Ok(Resolving {
             client: http_client(endpoint, self.proxy.as_ref())?,
+            proxy: self.proxy,
             server: self.server,
         })
     }
@@ -220,6 +228,7 @@ impl AddressLookupBuilder for Resolver {
 /// A [`Resolver`], as the endpoint's lookup services hold it.
 struct Resolving {
     client: reqwest::Client,
+    proxy: Option<ProxyUrl>,
     server: Url,
 }
 
@@ -238,9 +247,10 @@ impl AddressLookup for Resolving {
         endpoint_id: EndpointId,
     ) -> Option<futures::stream::BoxStream<'static, Result<Item, LookupError>>> {
         let client = self.client.clone();
+        let proxy = self.proxy.clone();
         let server = self.server.clone();
         let lookup = async move {
-            let info = read_record(&client, &server, endpoint_id)
+            let info = read_record(&client, proxy.as_ref(), &server, endpoint_id)
                 .await
                 .map_err(|error| LookupError::from_err(PROVENANCE, error))?;
             Ok(Item::new(info, PROVENANCE, None))
@@ -252,14 +262,15 @@ impl AddressLookup for Resolving {
 /// Reads `endpoint_id`'s record from `server` and verifies that the endpoint signed it.
 async fn read_record(
     client: &reqwest::Client,
+    proxy: Option<&ProxyUrl>,
     server: &Url,
     endpoint_id: EndpointId,
 ) -> Result<EndpointInfo, PkarrError> {
-    let response = client
+    let request = client
         .get(record_url(server, &endpoint_id.to_z32())?)
-        .send()
-        .await
-        .map_err(PkarrError::Request)?;
+        .build()
+        .map_err(request_error)?;
+    let response = send(client, proxy, request).await?;
     if !response.status().is_success() {
         return Err(PkarrError::Status(response.status().as_u16()));
     }
@@ -274,7 +285,7 @@ async fn read_record(
 /// The server's answer is read before it is verified, so it is bounded before it is read whole.
 async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, PkarrError> {
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(PkarrError::Request)? {
+    while let Some(chunk) = response.chunk().await.map_err(request_error)? {
         if body.len() + chunk.len() > SignedPacket::MAX_BYTES {
             return Err(PkarrError::TooLong);
         }
@@ -308,15 +319,53 @@ fn http_client(
         .tls_backend_preconfigured(endpoint.tls_config().clone())
         .dns_resolver(EndpointDns(endpoint.dns_resolver()?.clone()));
     let builder = match proxy {
-        Some(proxy) => builder.proxy(
-            reqwest::Proxy::all(proxy.as_url().clone())
-                .map_err(|error| AddressLookupBuilderError::from_err(PROVENANCE, error))?,
-        ),
+        Some(proxy) => proxy::proxied(builder, proxy)
+            .map_err(|error| AddressLookupBuilderError::from_err(PROVENANCE, error))?,
         None => builder.no_proxy(),
     };
     builder
         .build()
         .map_err(|error| AddressLookupBuilderError::from_err(PROVENANCE, error))
+}
+
+/// Sends `request`. A client whose proxy holds a login follows redirects through
+/// [`proxy::follow`], so the gate runs for each hop and a refusal names the hop that failed; any
+/// other client keeps the library's policy.
+async fn send(
+    client: &reqwest::Client,
+    proxy: Option<&ProxyUrl>,
+    request: reqwest::Request,
+) -> Result<reqwest::Response, PkarrError> {
+    let Some(proxy) = proxy.filter(|proxy| proxy.login().is_some()) else {
+        return client.execute(request).await.map_err(request_error);
+    };
+    let following = Following {
+        limit: REDIRECT_LIMIT,
+        deadline: REQUEST_TIMEOUT,
+    };
+    proxy::follow(client, request, following, |url| {
+        proxy::admit(Some(proxy), url)
+    })
+    .await
+    .map_err(|error| {
+        proxy::note_failure(proxy, &error.url, &error);
+        if let Some(kind) = proxy::proxy_login_kind(&error) {
+            return PkarrError::ProxyLogin(kind);
+        }
+        match error.failure {
+            FollowFailure::Send(error) => PkarrError::Request(error),
+            other => PkarrError::Redirect(other),
+        }
+    })
+}
+
+/// A failed request as an error of this module: the proxy's refusal of the login when the chain
+/// holds one, and the library's error otherwise.
+fn request_error(error: reqwest::Error) -> PkarrError {
+    match proxy::proxy_login_kind(&error) {
+        Some(kind) => PkarrError::ProxyLogin(kind),
+        None => PkarrError::Request(error),
+    }
 }
 
 /// The endpoint's own DNS resolver, as the HTTP client asks it for a server's addresses.
@@ -348,6 +397,13 @@ enum PkarrError {
     /// The request did not complete.
     #[error("the request to the Pkarr server failed: {0}")]
     Request(reqwest::Error),
+    /// The proxy refused the login this host holds, or asks for a sign-in method this host does not
+    /// support, or the request was not sent for a login's sake.
+    #[error("the request to the Pkarr server was not sent: {}", .0.sentence())]
+    ProxyLogin(ProxyLoginKind),
+    /// The server's redirects could not be followed.
+    #[error("the request to the Pkarr server could not follow its redirects: {0}")]
+    Redirect(FollowFailure),
     /// The server answered with something other than success.
     #[error("the Pkarr server answered with HTTP status {0}")]
     Status(u16),
@@ -371,5 +427,136 @@ struct StopOnDrop(JoinHandle<()>);
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+// The stand-in proxy and the certificates of the suites that run it from `tests/`.
+#[cfg(test)]
+#[path = "../../kr-client/tests/support/connect_proxy.rs"]
+#[allow(dead_code)]
+mod connect_proxy;
+#[cfg(test)]
+#[path = "../tests/support/tls.rs"]
+#[allow(dead_code)]
+mod tls;
+
+#[cfg(test)]
+mod tests {
+    use super::connect_proxy::{ConnectProxy, Login};
+    use super::tls;
+    use kr_crypto::secret::SecretVec;
+
+    use super::*;
+    use crate::proxy::{ProxyCredential, StopKind, Target};
+
+    fn login(password: &str) -> ProxyCredential {
+        ProxyCredential::new(
+            SecretVec::new(b"user".to_vec()),
+            SecretVec::new(password.as_bytes().to_vec()),
+        )
+        .expect("a login")
+    }
+
+    fn through(proxy: &ConnectProxy, login: &ProxyCredential) -> (ProxyUrl, reqwest::Client) {
+        let url = proxy
+            .url
+            .parse::<ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let builder = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .tls_backend_preconfigured((*tls::client_config(&[])).clone());
+        let client = proxy::proxied(builder, &url)
+            .expect("a proxy the library takes")
+            .build()
+            .expect("a client");
+        (url, client)
+    }
+
+    async fn get(
+        client: &reqwest::Client,
+        proxy: &ProxyUrl,
+        address: &str,
+    ) -> Result<reqwest::Response, PkarrError> {
+        let request = client.get(address).build().expect("a request");
+        send(client, Some(proxy), request).await
+    }
+
+    /// A Pkarr request whose login the proxy refuses ends with the kind and sets the verdict, and the
+    /// next request is stopped before it reaches the proxy.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pkarr_request_the_proxy_refuses_ends_with_its_kind_and_is_not_sent_again() {
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let login = login("wrong");
+        let (url, client) = through(&proxy, &login);
+        let refused = get(&client, &url, "https://127.0.0.1:9/key")
+            .await
+            .expect_err("a refusal");
+        assert!(matches!(
+            refused,
+            PkarrError::ProxyLogin(ProxyLoginKind::Refused)
+        ));
+        assert_eq!(login.stopped(), Some(StopKind::Refused));
+        let again = get(&client, &url, "https://127.0.0.1:9/key")
+            .await
+            .expect_err("stopped");
+        assert!(matches!(
+            again,
+            PkarrError::ProxyLogin(ProxyLoginKind::Refused)
+        ));
+        assert_eq!(proxy.logins(), vec![Login::Wrong], "no second login");
+    }
+
+    /// With the verdict set, a Pkarr request writes nothing, and a plain `http` server is refused
+    /// before any connection while a login is held.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pkarr_request_after_the_verdict_or_to_plain_http_reaches_no_proxy() {
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let login = login("password");
+        let (url, client) = through(&proxy, &login);
+        let clear = get(&client, &url, "http://127.0.0.1:9/key")
+            .await
+            .expect_err("plain http");
+        assert!(matches!(
+            clear,
+            PkarrError::ProxyLogin(ProxyLoginKind::ClearTextTarget)
+        ));
+        login.refuse(StopKind::Refused);
+        let stopped = get(&client, &url, "https://127.0.0.1:9/key")
+            .await
+            .expect_err("stopped");
+        assert!(matches!(
+            stopped,
+            PkarrError::ProxyLogin(ProxyLoginKind::Refused)
+        ));
+        assert_eq!(proxy.accepted(), 0, "the proxy saw no connection");
+        assert_eq!(proxy.bytes_read(), 0);
+    }
+
+    /// A refusal the library cannot name, an `HTTP/1.0 407`, is a failed request that queues the
+    /// target the failed hop named for the one re-check.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pkarr_request_refused_in_http_one_point_zero_queues_its_target() {
+        let proxy = ConnectProxy::authenticating_in_http10("user", "password", "Basic").await;
+        let login = login("wrong");
+        let (url, client) = through(&proxy, &login);
+        let failed = get(&client, &url, "https://127.0.0.1:9/key")
+            .await
+            .expect_err("an unreadable refusal");
+        assert!(matches!(failed, PkarrError::Request(_)));
+        assert_eq!(login.stopped(), None);
+        assert_eq!(
+            login.suspicion().take(),
+            Some(Target {
+                host: "127.0.0.1".to_owned(),
+                port: 9
+            })
+        );
     }
 }
