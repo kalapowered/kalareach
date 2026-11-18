@@ -136,30 +136,43 @@ async fn host() -> Host {
     }
 }
 
-/// A connection of the daemon's, declared for `role` and speaking for generation one.
+/// Runs one whole operation of a case under `LIVENESS`, so a worker that stops answering at any
+/// step of it ends the case at that limit and not at the runner's.
+async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(LIVENESS, work).await.expect(what)
+}
+
+/// A connection of the daemon's, declared for `role` and speaking for generation one: made, given
+/// its role and accepted for the generation, all within `LIVENESS`.
 async fn daemon(host: &Host, role: ControllerConnectionRole) -> BoundLink {
-    let mut client = BoundLink::connect(&host.endpoint, build())
-        .await
-        .expect("connects");
-    client
-        .send(&ControlFrame::ControllerRole(role))
-        .await
-        .expect("declares the role");
-    match client.recv().await.expect("the worker answers") {
-        ControlFrame::ControllerRole(declared) => assert_eq!(declared, role),
-        other => panic!("the worker answered {other:?}"),
-    }
-    let identity = Arc::clone(&host.controller);
-    let boot = host.boot.clone();
-    client
-        .present_generation(move |nonce| {
-            identity
-                .generation_token(ControllerGeneration::new(1), &boot, nonce)
-                .map_err(kr_ipc::IpcError::from)
-        })
-        .await
-        .expect("the worker accepts the generation");
-    client
+    within(
+        "the daemon's connection to the worker is made in time",
+        async {
+            let mut client = BoundLink::connect(&host.endpoint, build())
+                .await
+                .expect("connects");
+            client
+                .send(&ControlFrame::ControllerRole(role))
+                .await
+                .expect("declares the role");
+            match client.recv().await.expect("the worker answers") {
+                ControlFrame::ControllerRole(declared) => assert_eq!(declared, role),
+                other => panic!("the worker answered {other:?}"),
+            }
+            let identity = Arc::clone(&host.controller);
+            let boot = host.boot.clone();
+            client
+                .present_generation(move |nonce| {
+                    identity
+                        .generation_token(ControllerGeneration::new(1), &boot, nonce)
+                        .map_err(kr_ipc::IpcError::from)
+                })
+                .await
+                .expect("the worker accepts the generation");
+            client
+        },
+    )
+    .await
 }
 
 fn request(host: &Host, id: u64, file: Option<&str>) -> DesktopChecksRequest {
@@ -197,11 +210,18 @@ async fn answer(link: &mut BoundLink) -> Answer {
     .expect("the worker answers in time")
 }
 
+/// Writes the request and waits for the answer, both within `LIVENESS`.
 async fn ask(link: &mut BoundLink, request: DesktopChecksRequest) -> Answer {
-    link.send(&ControlFrame::DesktopChecks(request))
-        .await
-        .expect("writes the request");
-    answer(link).await
+    within(
+        "the worker takes the request and answers it in time",
+        async {
+            link.send(&ControlFrame::DesktopChecks(request))
+                .await
+                .expect("writes the request");
+            answer(link).await
+        },
+    )
+    .await
 }
 
 /// KR-REQ-03.29: the checks connection takes the checks request and nothing else, is the one place a request is
@@ -602,13 +622,15 @@ async fn a_real_finding(host: &Host) -> kr_protocol::desktop::CapabilityRecord {
     }
 }
 
-/// KR-REQ-11.17, the desktop generation clause: a finding the worker made is ended by a new
-/// graphical login and by nothing else.
+/// KR-REQ-11.17, the desktop generation clause: the record the worker makes names the desktop
+/// generation among what ends it, and the detector the controller applies to held evidence
+/// ([`stale`]) ends such a record when the generation differs, and does not end a record that
+/// does not name the generation.
 ///
-/// The record comes from the worker's own run over its checks connection, and what ends it is what
-/// the record says ends it: it names the desktop generation, it stands while the generation is the
-/// one it was taken in, it is ended by the next login, and a record that does not name the
-/// generation is not ended by one.
+/// The record comes from the worker's own run over its checks connection. The generations are
+/// values of this test's own, given to the detector with the record: this checks the record's
+/// trigger list and the detector's filter, and not the controller withdrawing held evidence after
+/// a graphical login.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_17_a_finding_ends_when_the_desktop_generation_it_was_taken_in_changes() {
     let host = host().await;
@@ -645,11 +667,15 @@ async fn kr_req_11_17_a_finding_ends_when_the_desktop_generation_it_was_taken_in
     );
 }
 
-/// KR-REQ-11.17, the binary clause: a finding the worker made is ended when the tool it was made
-/// with is replaced or can no longer be identified, and not while the tool is the same file.
+/// KR-REQ-11.17, the binary clause: the record the worker makes names the binary among what ends
+/// it, and the detector the controller applies to held evidence ([`stale`]) ends such a record
+/// when the identity of the facility the findings were taken against changes or can no longer be
+/// taken, and not while that identity is the same.
 ///
-/// The record comes from the worker's own run. The tool is a file of this test's own, identified by
-/// what the host digests of a facility, and an upgrade is its bytes being replaced in place.
+/// The record comes from the worker's own run. The facility is a file of this test's own,
+/// identified by what the host digests of a facility, and a replaced tool is its bytes being
+/// replaced in place. This checks the record's trigger list and the detector, and not a tool the
+/// worker's own check used: the read check's facility is the person's file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_17_a_finding_ends_when_the_tool_it_was_taken_with_is_replaced() {
     let host = host().await;
