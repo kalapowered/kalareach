@@ -2316,3 +2316,490 @@ async fn kr_req_17_48_a_failed_request_keeps_the_answer_that_still_stands() {
         }
     }
 }
+
+/// A request that the service refuses with a code that stops every request for ten minutes: this
+/// device is not allowed to ask.
+fn stops_requests() -> Result<AdmissionAnswer> {
+    Err(Error::refusal(
+        ErrorCode::PermissionDenied,
+        "not allowed".into(),
+    ))
+}
+
+/// A refusal in the service's own envelope under a 5xx status, with a code that stops no request.
+fn fault_that_stops_nothing() -> Result<AdmissionAnswer> {
+    Ok(AdmissionAnswer::Faulted {
+        code: ErrorCode::OutcomeUnknown,
+        retry_after_seconds: None,
+    })
+}
+
+const HOST_A: u8 = 0x11;
+const HOST_B: u8 = 0x33;
+const HOST_C: u8 = 0x44;
+
+/// The hosts of one managed relay on one clock, asked of a scripted service, for the orders in which
+/// a stop of requests meets answers that stand, answers that are on their way and answers that have
+/// not come. A service that holds its requests lets one through when the test says so, and the script
+/// is read in the order they pass.
+struct Hosts {
+    clock: AdmissionClock,
+    service: Arc<Scripted>,
+    gate: Option<Arc<tokio::sync::Notify>>,
+    admissions: PairingAdmissions,
+    relays: NetworkConfig,
+    /// Seconds since the clock's start.
+    at: u64,
+}
+
+impl Hosts {
+    /// A service that answers each request at once, so that a dial returns with its answer kept.
+    fn answering(script: Vec<Result<AdmissionAnswer>>) -> Self {
+        let clock = AdmissionClock::default();
+        let service = Scripted::new(script);
+        let admissions = scripted_admissions(Arc::clone(&service), &clock);
+        Self {
+            clock,
+            service,
+            gate: None,
+            admissions,
+            relays: network(&[MANAGED]),
+            at: 0,
+        }
+    }
+
+    /// A service that holds each request until the test lets one through.
+    fn holding(script: Vec<Result<AdmissionAnswer>>) -> Self {
+        let clock = AdmissionClock::default();
+        let (service, gate) = Scripted::gated_script(script);
+        let admissions =
+            scripted_admissions(Arc::clone(&service), &clock).waiting(Duration::from_millis(20));
+        Self {
+            clock,
+            service,
+            gate: Some(gate),
+            admissions,
+            relays: network(&[MANAGED]),
+            at: 0,
+        }
+    }
+
+    /// Moves the clock to `seconds` after its start.
+    fn go_to(&mut self, seconds: u64) {
+        self.clock.advance(Duration::from_secs(seconds - self.at));
+        self.at = seconds;
+    }
+
+    /// A dial to `host` that starts now, as the candidate's link makes one.
+    async fn dial(&self, host: u8) {
+        self.admissions
+            .before_dial(&self.relays, &key(host), key(0x22))
+            .await;
+    }
+
+    fn asks(&self) -> usize {
+        self.service.asks()
+    }
+
+    fn refusal(&self, host: u8) -> Option<RelayRefusal> {
+        self.admissions.refusal(&self.relays, &key(host))
+    }
+
+    /// What a dial to `host` that is lost now is reported as.
+    fn told(&self, host: u8) -> (FailureKind, Vec<String>) {
+        reported_as(self.refusal(host))
+    }
+
+    fn gate(&self) -> &tokio::sync::Notify {
+        self.gate.as_deref().expect("a service that holds requests")
+    }
+
+    fn answered(&self) -> usize {
+        self.service.answered.load(Ordering::SeqCst)
+    }
+
+    /// A dial whose request is let through as it is made: waits until the cache has the answer.
+    async fn dial_and_answer(&self, host: u8) {
+        let answered = self.answered();
+        self.gate().notify_one();
+        self.dial(host).await;
+        self.service.answered_to(answered + 1).await;
+    }
+
+    /// Lets the request that has waited longest through, and waits until the cache has its answer.
+    async fn lets_the_oldest_through(&self) {
+        let answered = self.answered();
+        self.gate().notify_one();
+        self.service.answered_to(answered + 1).await;
+    }
+
+    /// Lets the request that was made last through, and waits until the cache has its answer.
+    async fn lets_the_newest_through(&self) {
+        let answered = self.answered();
+        self.gate().notify_last();
+        self.service.answered_to(answered + 1).await;
+    }
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a failed request that stops every request for ten
+/// minutes does not end the answer that stood when it began: a lost dial is told the lack of
+/// capacity, with the paths and the wait that is left of the stop, until the stop ends, and not
+/// that the host could not be reached. The answer comes at 0 s; the request at 25 s fails with a
+/// refusal of this device, so no request is made until 625 s, though the answer's own keep time ends
+/// at 60 s. What a person is sent at 61 s is the failure of the relay's capacity, by its wire kind.
+#[tokio::test]
+async fn kr_req_17_48_a_stop_of_requests_keeps_the_capacity_answer_that_stood_when_it_began() {
+    let mut hosts = Hosts::answering(vec![unable(None), stops_requests()]);
+    hosts.go_to(0);
+    hosts.dial(HOST_A).await;
+    hosts.go_to(25);
+    hosts.dial(HOST_A).await;
+    assert_eq!(hosts.asks(), 2, "the request at 25 s is the second");
+
+    for (second, wait) in [(26, 599), (61, 564), (300, 325), (624, 1)] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 2, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_A), no_capacity(wait), "at {second} s");
+        let refusal = hosts.refusal(HOST_A).expect("the answer stands");
+        assert_eq!(
+            serde_json::to_value(PairingFailure::of_relay(refusal)).expect("a failure is sent"),
+            serde_json::json!({
+                "kind": "relay_capacity",
+                "tries_left": null,
+                "alternatives": STILL_WORK,
+                "retry_after_seconds": wait,
+            }),
+            "what a person is sent at {second} s"
+        );
+    }
+
+    hosts.go_to(625);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the stop has ended");
+    hosts.dial(HOST_A).await;
+    assert_eq!(hosts.asks(), 3, "the first dial after the stop asks again");
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: the same when the request that stops requests is the
+/// third, whose window of ten minutes ends before the stop does. The asks are at 0, 25 and 50 s; the
+/// third is answered at 65 s with a refusal of this device. The window ends at 650 s and the stop at
+/// 665 s, and the answer is told to the stop's end.
+#[tokio::test]
+async fn kr_req_17_48_a_stop_that_the_third_ask_begins_keeps_the_answer_to_its_end() {
+    let mut hosts = Hosts::holding(vec![unable(None), unable(None), stops_requests()]);
+    hosts.go_to(0);
+    hosts.dial_and_answer(HOST_A).await;
+    hosts.go_to(25);
+    hosts.dial_and_answer(HOST_A).await;
+    hosts.go_to(50);
+    hosts.dial(HOST_A).await;
+    hosts.service.asked_to(3).await;
+    hosts.go_to(65);
+    hosts.lets_the_oldest_through().await;
+
+    for (second, wait) in [(655, 10), (664, 1)] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 3, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_A), no_capacity(wait), "at {second} s");
+    }
+    hosts.go_to(665);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the stop has ended");
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: an answer that is written while a stop lasts, by a
+/// request that was on its way when the stop began, is kept to the stop's end too. Host A's answer
+/// comes at 0 s and its second request is made at 25 s and held; host B's request at 30 s is
+/// refused, so no request is made until 630 s; A's held request is answered at 40 s that the service
+/// is unable. At 101 s, when that new answer's own keep time has passed, a lost dial is still told
+/// the lack of capacity.
+#[tokio::test]
+async fn kr_req_17_48_a_word_written_during_a_stop_is_kept_to_its_end() {
+    let mut hosts = Hosts::holding(vec![unable(None), stops_requests(), unable(None)]);
+    hosts.go_to(0);
+    hosts.dial_and_answer(HOST_A).await;
+    hosts.go_to(25);
+    hosts.dial(HOST_A).await;
+    hosts.service.asked_to(2).await;
+    hosts.go_to(30);
+    hosts.dial(HOST_B).await;
+    hosts.service.asked_to(3).await;
+    hosts.lets_the_newest_through().await;
+    hosts.go_to(40);
+    hosts.lets_the_oldest_through().await;
+
+    for (second, wait) in [(101, 529), (629, 1)] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 3, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_A), no_capacity(wait), "at {second} s");
+    }
+    hosts.go_to(630);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the stop has ended");
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: the first answer of a host that arrives while a stop
+/// lasts is kept to the stop's end, whether it says the service is unable or that it failed on its
+/// side with a code that stops nothing. Host C's first request is made at 5 s and held; host B's
+/// request at 30 s is refused, so no request is made until 630 s; C's request is answered at 40 s.
+#[tokio::test]
+async fn kr_req_17_48_a_first_answer_that_arrives_during_a_stop_is_kept_to_its_end() {
+    for (answer, told) in [
+        (unable(None), no_capacity(529)),
+        (fault_that_stops_nothing(), a_fault(529)),
+    ] {
+        let mut hosts = Hosts::holding(vec![stops_requests(), answer]);
+        hosts.go_to(5);
+        hosts.dial(HOST_C).await;
+        hosts.service.asked_to(1).await;
+        hosts.go_to(30);
+        hosts.dial(HOST_B).await;
+        hosts.service.asked_to(2).await;
+        hosts.lets_the_newest_through().await;
+        hosts.go_to(40);
+        hosts.lets_the_oldest_through().await;
+
+        hosts.go_to(101);
+        hosts.dial(HOST_C).await;
+        assert_eq!(hosts.asks(), 2, "a dial at 101 s asks nothing");
+        assert_eq!(hosts.told(HOST_C), told, "at 101 s");
+        hosts.go_to(630);
+        assert_eq!(hosts.told(HOST_C), out_of_reach(), "the stop has ended");
+    }
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: an answer that needs no explanation of a failed dial
+/// replaces a kept answer at once, during a stop as at any time, and the stop is unchanged. As the
+/// order of the case with a request on its way, but A's held request is answered at 40 s that the
+/// pair needs no admission, and in a second order that an admission is installed: no refusal is
+/// held from 41 s, and no request is made until the stop ends at 630 s.
+#[tokio::test]
+async fn kr_req_17_48_a_newer_answer_that_is_no_refusal_replaces_a_kept_word_at_once_during_a_stop()
+{
+    let admitted = || {
+        Ok(AdmissionAnswer::Admitted {
+            expires_in_seconds: 3600,
+            byte_ceiling: 1_000_000,
+        })
+    };
+    for newer in [Ok(AdmissionAnswer::NotNeeded), admitted()] {
+        let mut hosts = Hosts::holding(vec![unable(None), stops_requests(), newer]);
+        hosts.go_to(0);
+        hosts.dial_and_answer(HOST_A).await;
+        hosts.go_to(25);
+        hosts.dial(HOST_A).await;
+        hosts.service.asked_to(2).await;
+        hosts.go_to(30);
+        hosts.dial(HOST_B).await;
+        hosts.service.asked_to(3).await;
+        hosts.lets_the_newest_through().await;
+        hosts.go_to(40);
+        hosts.lets_the_oldest_through().await;
+
+        hosts.go_to(41);
+        assert!(hosts.refusal(HOST_A).is_none(), "the newer answer at 41 s");
+        hosts.go_to(101);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 3, "no request is made during the stop");
+        assert!(hosts.refusal(HOST_A).is_none(), "the newer answer at 101 s");
+        hosts.go_to(630);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 4, "the first dial after the stop asks again");
+    }
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a stop that another host's request begins keeps this
+/// host's answer to the stop's end, since the stop holds back every host's request and nothing renews
+/// the answer. Host A's answer comes at 0 s; host B's request at 10 s is refused, so no request is
+/// made until 610 s; at 61 s, when A's own keep time has passed, a lost dial to A is told the lack of
+/// capacity.
+#[tokio::test]
+async fn kr_req_17_48_a_stop_that_another_host_begins_keeps_this_hosts_answer() {
+    let mut hosts = Hosts::answering(vec![unable(None), stops_requests()]);
+    hosts.go_to(0);
+    hosts.dial(HOST_A).await;
+    hosts.go_to(10);
+    hosts.dial(HOST_B).await;
+    assert_eq!(hosts.asks(), 2, "B's request at 10 s is the second");
+
+    for (second, wait) in [(61, 549), (609, 1)] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 2, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_A), no_capacity(wait), "at {second} s");
+    }
+    hosts.go_to(610);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the stop has ended");
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a stop does not bring back an answer that had stopped.
+/// Host C's answer comes at 0 s and stops at 60 s, with no request made for it since; host B's
+/// request at 100 s is refused. C's lost dial is told the host could not be reached, as before the
+/// stop.
+#[tokio::test]
+async fn kr_req_17_48_a_stop_that_another_host_begins_does_not_bring_back_an_answer_that_had_stopped()
+ {
+    let mut hosts = Hosts::answering(vec![unable(None), stops_requests()]);
+    hosts.go_to(0);
+    hosts.dial(HOST_C).await;
+    hosts.go_to(100);
+    hosts.dial(HOST_B).await;
+    assert_eq!(hosts.asks(), 2, "B's request at 100 s is the second");
+
+    for second in [101, 300] {
+        hosts.go_to(second);
+        hosts.dial(HOST_C).await;
+        assert_eq!(hosts.asks(), 2, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_C), out_of_reach(), "at {second} s");
+    }
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a failure of the service itself that stops requests
+/// is told as that failure, with the wait that is left of the stop, to the stop's end. The service
+/// answers in its envelope that it is not configured, naming 30 seconds: its new answer is kept for
+/// 60, and the stop for 600.
+#[tokio::test]
+async fn kr_req_17_48_a_service_fault_that_begins_a_stop_stands_as_long_as_the_stop() {
+    let mut hosts = Hosts::answering(vec![Ok(AdmissionAnswer::Faulted {
+        code: ErrorCode::HostNotConfigured,
+        retry_after_seconds: Some(30),
+    })]);
+    hosts.go_to(0);
+    hosts.dial(HOST_A).await;
+    assert_eq!(hosts.asks(), 1);
+
+    for (second, wait) in [(26, 574), (61, 539), (599, 1)] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 1, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_A), a_fault(wait), "at {second} s");
+    }
+    hosts.go_to(601);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the stop has ended");
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a request that fails with a code that stops nothing,
+/// after its answer's keep time and while another host's request has begun a stop, does not end the
+/// answer before the stop ends. A's second request is made at 55 s and held; B's request at 65 s is
+/// refused, so no request is made until 665 s; A's request fails at 70 s. At 91 s, when the failed
+/// request's own time to ask again has passed, a lost dial is still told the lack of capacity.
+#[tokio::test]
+async fn kr_req_17_48_a_request_that_fails_after_the_keep_time_does_not_end_the_answer_before_the_stop()
+ {
+    let mut hosts = Hosts::holding(vec![unable(None), stops_requests(), no_answer()]);
+    hosts.go_to(0);
+    hosts.dial_and_answer(HOST_A).await;
+    hosts.go_to(55);
+    hosts.dial(HOST_A).await;
+    hosts.service.asked_to(2).await;
+    hosts.go_to(65);
+    hosts.dial(HOST_B).await;
+    hosts.service.asked_to(3).await;
+    hosts.lets_the_newest_through().await;
+    hosts.go_to(70);
+    hosts.lets_the_oldest_through().await;
+
+    for (second, wait) in [(91, 574), (664, 1)] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 3, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_A), no_capacity(wait), "at {second} s");
+    }
+    hosts.go_to(665);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the stop has ended");
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: an answer that stands through the window of ten minutes
+/// after its third request, because the asks are used up, is kept to the end of a stop that begins
+/// inside the window, though the window ends first. Host A asks at 0, 21 and 41 s and gets that the
+/// service is unable twice and then no answer; its keep time ends at 81 s and its window at 641 s.
+/// Host B's request at 100 s is refused, so no request is made until 700 s. At 650 s a lost dial to A
+/// is told the lack of capacity.
+#[tokio::test]
+async fn kr_req_17_48_an_answer_that_stands_through_the_third_ask_window_is_kept_to_the_stops_end()
+{
+    let mut hosts = Hosts::answering(vec![
+        unable(None),
+        unable(None),
+        no_answer(),
+        stops_requests(),
+    ]);
+    for second in [0, 21, 41] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+    }
+    assert_eq!(hosts.asks(), 3, "A is asked three times");
+    hosts.go_to(100);
+    hosts.dial(HOST_B).await;
+    assert_eq!(hosts.asks(), 4, "B's request at 100 s is the fourth");
+
+    for (second, wait) in [(650, 50), (699, 1)] {
+        hosts.go_to(second);
+        hosts.dial(HOST_A).await;
+        assert_eq!(hosts.asks(), 4, "a dial at {second} s asks nothing");
+        assert_eq!(hosts.told(HOST_A), no_capacity(wait), "at {second} s");
+    }
+    hosts.go_to(700);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the stop has ended");
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: the stop's end is a least keep, and not an expiry: an
+/// answer that names a delay of an hour is kept for that hour, though a stop that begins at 10 s ends
+/// at 610 s. A lost dial at 700 s is told the lack of capacity with the wait that is left of the
+/// hour.
+#[tokio::test]
+async fn kr_req_17_48_a_longer_named_delay_outlasts_the_stop() {
+    let mut hosts = Hosts::answering(vec![unable(Some(3600)), stops_requests()]);
+    hosts.go_to(0);
+    hosts.dial(HOST_A).await;
+    hosts.go_to(10);
+    hosts.dial(HOST_B).await;
+    assert_eq!(hosts.asks(), 2, "B's request at 10 s is the second");
+
+    hosts.go_to(700);
+    hosts.dial(HOST_A).await;
+    assert_eq!(
+        hosts.asks(),
+        2,
+        "the delay the service named has not passed"
+    );
+    assert_eq!(hosts.told(HOST_A), no_capacity(2900), "at 700 s");
+}
+
+/// KR-REQ-17.48, KR-REQ-10.54, KR-REQ-17.40: a failure that begins no stop keeps the answer no longer
+/// than before. A's second request at 25 s fails with a code that stops nothing: the answer stands to
+/// its keep time at 60 s and a dial then asks again. In a second order the service answers in its
+/// envelope with a failure that stops nothing: that is a new answer, kept for its own 60 seconds,
+/// to 85 s.
+#[tokio::test]
+async fn kr_req_17_48_a_failure_that_begins_no_stop_keeps_the_answer_no_longer_than_before() {
+    let mut hosts = Hosts::answering(vec![unable(None), no_answer()]);
+    hosts.go_to(0);
+    hosts.dial(HOST_A).await;
+    hosts.go_to(25);
+    hosts.dial(HOST_A).await;
+    assert_eq!(hosts.asks(), 2, "the request at 25 s is the second");
+    for (second, wait) in [(26, 19), (59, 0)] {
+        hosts.go_to(second);
+        assert_eq!(hosts.told(HOST_A), no_capacity(wait), "at {second} s");
+    }
+    hosts.go_to(61);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the answer has stopped");
+    hosts.dial(HOST_A).await;
+    assert_eq!(hosts.asks(), 3, "no stop held the dial back");
+
+    let mut hosts = Hosts::answering(vec![unable(None), fault_that_stops_nothing()]);
+    hosts.go_to(0);
+    hosts.dial(HOST_A).await;
+    hosts.go_to(25);
+    hosts.dial(HOST_A).await;
+    assert_eq!(hosts.asks(), 2, "the request at 25 s is the second");
+    for (second, wait) in [(26, 19), (84, 0)] {
+        hosts.go_to(second);
+        assert_eq!(hosts.told(HOST_A), a_fault(wait), "at {second} s");
+    }
+    hosts.go_to(86);
+    assert_eq!(hosts.told(HOST_A), out_of_reach(), "the answer has stopped");
+    hosts.dial(HOST_A).await;
+    assert_eq!(hosts.asks(), 3, "no stop held the dial back");
+}
