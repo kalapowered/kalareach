@@ -5557,6 +5557,32 @@ mod a_devices_revocation {
             .collect()
     }
 
+    /// A store with two faults at once: a grant of the device whose row is keyed by another
+    /// grant's identifier (the row keyed 3 carries grant 4, and no row is keyed 4), and a row of
+    /// another device that holds no grant at all. A revocation returns the first fault it meets. It
+    /// reads the row of each grant it walks before it reads the table, so which fault comes first
+    /// depends on the order the device's grants are listed in. This store is not in `every_store`:
+    /// a case that reads every row of a store cannot read this one.
+    fn store_with_two_faults() -> GrantDirectory {
+        let held = |number: u32| Node {
+            number,
+            parent: None,
+            holder: DEVICE,
+        };
+        let store = store_written_by_hand(&[(held(1), None), (held(3), Some(4))]);
+        store
+            .in_transaction(|connection| {
+                let other = Node {
+                    number: 9,
+                    parent: None,
+                    holder: OTHER_DEVICE,
+                };
+                write_grant(connection, &record_of(&other), b"not a grant")
+            })
+            .expect("the other device's row is written");
+        store
+    }
+
     /// Every store the comparison cases run: the shapes at `size` grants, then the stores an edit
     /// by hand leaves, each with whether the device's revocation is refused.
     fn every_store(size: u32) -> Vec<(String, Build, bool)> {
@@ -5764,11 +5790,21 @@ mod a_devices_revocation {
     /// keeps it, and the grants of a root come breadth first. Reading one root at a time also made
     /// an entry with no grant in it for each root an earlier root had taken; such an entry
     /// withdraws nothing (the case below shows the result and the rows are the same without it),
-    /// and the comparison leaves it out.
+    /// and the comparison leaves it out. In a store with two faults at once the two readings return
+    /// the same fault in each order the grants are listed in.
     #[test]
     fn withdraws_what_a_walk_from_each_of_its_grants_in_turn_withdrew_whatever_the_order_and_the_shape()
      {
-        for (name, build, _) in every_store(64) {
+        let two_faults: Build = Box::new(store_with_two_faults);
+        let stores = every_store(64)
+            .into_iter()
+            .map(|(name, build, _)| (name, build))
+            .chain([(
+                "a grant with no row of its own and a row of another device that holds no grant"
+                    .to_owned(),
+                two_faults,
+            )]);
+        for (name, build) in stores {
             let store = build();
             let held = store
                 .in_transaction(|connection| read_for_device(connection, device_of(DEVICE)))
