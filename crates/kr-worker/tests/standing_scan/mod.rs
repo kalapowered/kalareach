@@ -26,11 +26,11 @@
 //!   alone holds the rest of the work that runs under the boundary (the expiry task's release, the
 //!   maintenance pass's session work, the storage recovery, the answers). The compiler does not
 //!   hold that the guard is the service's own: the two entries `receipted` and `continue_prepared`
-//!   check that before any work, and a test shows the check. A second take under the held barrier
-//!   is ended by the waiting take itself, which panics when the calling thread holds the boundary
-//!   (`service/boundary.rs`); the `taker`, `mention`, `rawtake` and `reference` rows below show a
-//!   person each new mention of a function that takes the boundary, count names and read no guard,
-//!   and prove nothing about that;
+//!   check that before any work, and a test shows the check. A second waiting take under the held
+//!   barrier is ended by the waiting take itself, which panics when the calling thread holds the
+//!   boundary (`service/boundary.rs`); the `taker`, `mention`, `rawtake` and `reference` rows below
+//!   show a person each new mention of a function that takes the boundary, count names and read no
+//!   guard, and prove nothing about that;
 //! * what a guard is, beyond the names it knows: a `let` that calls `session` (SES) and a
 //!   parameter whose type names `Session` (SES, held or not: a `supplies` row tells two calls
 //!   apart). `let Some(x) =` and `let Ok(x) =` bind `x`, with the initialiser after the pattern,
@@ -139,7 +139,11 @@
 //! definition and none at each use), an async taker that a sync body runs to its end (the count of
 //! `block_on` shows a new such body), and a take on a thread that the holder waits for. A function
 //! is known by its name, so two functions of one name in a file share a number, and a take that
-//! moves inside one function keeps that function's number.
+//! moves inside one function keeps that function's number. The rule that a mention stands in a
+//! taker or an async function knows an async function only by its name in the file, so a sync
+//! function that has the name of an async function of its file passes it. A function named `lock`
+//! or `try_lock` in the file of a `rawtake` row is read as one of the boundary's two methods, so
+//! it needs no `taker` row.
 //!
 //! The boundary. A call from any body that the scan reads, scoped or followed, to a name that
 //! several functions of this crate declare fails unless the name is one the scan counts, an

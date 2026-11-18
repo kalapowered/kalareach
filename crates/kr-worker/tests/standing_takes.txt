@@ -466,8 +466,8 @@ calls crates/kr-worker/src/session.rs output_cursor next_cursor crates/kr-worker
 
 # The takes of the dispatch boundary, listed for a person to read. The waiting take of the boundary
 # panics when the calling thread already holds it (`service/boundary.rs`), and that, not these rows,
-# is what ends a second take. These rows show a person each new mention of a function that takes the
-# boundary, by file and function, so that new text that could take it twice is read.
+# is what ends a second waiting take. These rows show a person each new mention of a function that
+# takes the boundary, by file and function, so that new text that could take it twice is read.
 #
 # What each kind says. `taker <name>` is a function that takes the boundary (one of the nine take
 # sites, a wrapper of one, or one of the two methods that take it); the lock audit's table of takers
@@ -491,7 +491,10 @@ calls crates/kr-worker/src/session.rs output_cursor next_cursor crates/kr-worker
 # What the rows do not see: a call that a macro writes (one mention at the definition, none at each
 # use), an async taker that a sync body runs to its end (the count of `block_on` shows a new such
 # body), and a take on a thread that the holder waits for. A take that moves inside one function
-# keeps that function's number.
+# keeps that function's number. The rule that a mention stands in a taker or an async function knows
+# an async function only by its name in the file, so a sync function that has the name of an async
+# function of its file passes it. A function named `lock` or `try_lock` in `service/boundary.rs` is
+# read as one of the boundary's two methods, so it needs no `taker` row.
 taker take_boundary
 taker try_take_boundary
 taker try_boundary

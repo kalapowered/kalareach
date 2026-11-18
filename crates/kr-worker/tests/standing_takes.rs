@@ -17,16 +17,17 @@
 //! the checks that each piece calls, the session guard that a function holds where it calls them,
 //! read from the text before the call, and the session that each call hands on, read from the
 //! call's argument. The dispatch barrier's guard is not read here: the compiler holds it for nine
-//! functions that take a borrow of it as a parameter, and scope alone holds the rest. A second take
-//! of the boundary by the thread that holds it is ended by the waiting take itself, which panics
-//! (`service/boundary.rs`); what this roster says of it is for a person to read. For every name that
-//! takes the boundary (a list that a person keeps) it counts the times that the name stands in the
-//! code of each function of each file of the crate, test modules included (`taker` and `mention`
-//! rows), and it reads two rules on them (a mention stands in a taker or an async function, and in
-//! no function that takes a guard); it counts the calls of the boundary's own mutex by function
-//! (`rawtake` rows) and the words that bring in source or run a future to its end (`reference`
-//! rows). A new mention changes a number and fails the main case, so that a person reads it. The
-//! rows prove nothing about the property.
+//! functions that take a borrow of it as a parameter, and scope alone holds the rest. A second
+//! waiting take of the boundary by the thread that holds it is ended by the waiting take itself,
+//! which panics (`service/boundary.rs`); what this roster says of it is for a person to read. For
+//! every name that takes the boundary (a list that a person keeps) it counts the times that the
+//! name stands in the code of each function of each file of the crate, test modules included
+//! (`taker` and `mention` rows), and it reads two rules on them (a mention stands in a taker or an
+//! async function, and in no function that takes a guard); it counts the names of the boundary's
+//! own mutex's takes in the boundary's module and its child modules by function (`rawtake` rows),
+//! and it holds that each function with one is a taker; and it counts the words that bring in
+//! source or run a future to its end (`reference` rows). A new mention changes a number and fails
+//! the main case, so that a person reads it. The rows prove nothing about the property.
 //!
 //! The cases after the first plant a fault in the real source and show the scan reporting it with
 //! the finding that names the place: a take in a function that may take none, a clock reader that

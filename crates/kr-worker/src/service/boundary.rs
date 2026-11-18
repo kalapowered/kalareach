@@ -23,11 +23,12 @@
 //! records its holder for this: one number, zero when nobody holds it, that the guard sets when the
 //! mutex gives it, also inside a poison error, and clears before the mutex is let go. The record is
 //! no lock, and nothing waits on it. Where the first guard is on the stack that the panic unwinds,
-//! the mutex is poisoned: a later take gives a poison error, which the waiting sites turn into a
-//! panic, and the announcement reads as a held boundary. The trying take, which cannot wait, does
-//! not compare: the holder gets "busy", as any other thread does. A take by another thread that
-//! the holder waits for is not refused, and a guard handed to another thread that then waits for
-//! the boundary is not seen (the guard is not sendable, so only a borrow can be).
+//! the mutex is poisoned: a later take gives a poison error, which the waiting sites and
+//! `try_boundary` turn into a panic, and the announcement reads as a held boundary. The trying
+//! take, which cannot wait, does not compare: the holder gets "busy", as any other thread does. A
+//! take by another thread that the holder waits for is not refused, and a guard handed to another
+//! thread that then waits for the boundary is not seen (the guard is not sendable, so only a
+//! borrow can be).
 //!
 //! The roster in `tests/standing_takes.txt` shows each new mention of a function that takes the
 //! boundary, by function, to a person. It proves nothing about the property, and it does not see a
@@ -55,8 +56,8 @@ thread_local! {
 fn this_thread() -> u64 {
     THREAD_NUMBER.with(|cell| {
         if cell.get() == 0 {
-            // A counter that would wrap ends the asking thread with a panic and is never handed
-            // out twice.
+            // A counter that would wrap panics in the asking thread before it assigns a number, so
+            // no number is handed out twice.
             let number = NEXT_THREAD_NUMBER
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     next.checked_add(1)
