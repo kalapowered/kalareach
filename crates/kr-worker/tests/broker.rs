@@ -3335,6 +3335,68 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
     );
 }
 
+/// KR-REQ-11.17, the binding clause: when the instance's binding moves to another conversation,
+/// the evidence that names the binding is ended with a reason, and evidence that does not name it
+/// is left as it was.
+///
+/// The move is the broker's own, the one a launched agent's stream makes when it selects a
+/// conversation, and nothing here withdraws evidence by hand. The approval evidence the broker is
+/// equipped with names the binding; the prompt evidence recorded here names the binary.
+#[test]
+fn kr_req_11_17_a_rebind_ends_the_evidence_that_names_the_binding_and_no_other() {
+    let broker = broker_with(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
+    broker
+        .record_capability(evidence(
+            "agent.prompt",
+            InstanceCapabilityState::QualifiedAvailable,
+            InstanceInvalidation::BinaryChanged,
+            instance(2),
+        ))
+        .expect("recorded");
+    let held = |name: &str| {
+        broker
+            .capabilities(instance(2))
+            .record(&capability(name))
+            .cloned()
+            .expect("recorded")
+    };
+    assert_eq!(
+        held("agent.approval").state,
+        InstanceCapabilityState::QualifiedAvailable
+    );
+
+    broker
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-7").expect("valid")),
+            TimestampMs::new(5),
+        )
+        .expect("the instance selects another conversation");
+
+    let approval = held("agent.approval");
+    assert_eq!(
+        approval.state,
+        InstanceCapabilityState::NotTested,
+        "evidence about the old binding is not evidence about the new one"
+    );
+    assert!(
+        approval.disabled_reason.0.is_some(),
+        "the person is told why the capability is not usable"
+    );
+    assert_eq!(
+        approval.revision,
+        CapabilityRevision::new(2),
+        "the revision moves, so an action prepared against the old evidence is refused"
+    );
+    let prompt = held("agent.prompt");
+    assert_eq!(
+        prompt.state,
+        InstanceCapabilityState::QualifiedAvailable,
+        "evidence about something the rebind did not change stays"
+    );
+    assert_eq!(prompt.revision, CapabilityRevision::new(1));
+}
+
 /// KR-REQ-01.02: the capability map is per installation, and no source that cannot try something
 /// here can say it works here.
 #[test]
