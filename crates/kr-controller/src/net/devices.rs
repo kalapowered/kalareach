@@ -3087,11 +3087,12 @@ mod tests {
     }
 
     #[test]
-    fn a_declaration_kept_as_a_refusal_under_a_code_this_build_lacks_is_unavailable_and_declares_nothing_again()
+    fn a_declaration_kept_as_a_refusal_under_a_code_this_build_lacks_reads_as_an_unknown_outcome_and_declares_nothing_again()
      {
-        // A kept refusal under a word that a later build added cannot be decoded here. It is told
-        // as unavailable, which is a try-again class for a kept refusal; the record stays, and the
-        // repeat that would have declared keys declares none.
+        // A kept refusal under a word that a later build added is read as a refusal whose outcome
+        // is not known, under the message it was kept with; the record stays, and the repeat that
+        // would have declared keys declares none. A record that holds anything else this build
+        // cannot decode is still unavailable.
         let directory = DeviceDirectory::in_memory().expect("a directory");
         let earlier = an_earlier_device(&directory, 12);
         let keys = declared(&earlier, 0x82);
@@ -3167,20 +3168,28 @@ mod tests {
         assert_eq!(changed, 1);
         let before = table(&directory);
 
-        // 1. The reader's answer: the registry is unavailable, on the lookup and on the repeat.
-        let lookup = directory
-            .recorded_declaration(&earlier.principal(), action(1))
-            .expect_err("the record cannot be decoded");
-        assert!(
-            matches!(lookup, ControllerError::RegistryUnavailable { .. }),
-            "{lookup:?}"
+        // 1. The reader's answer: a refusal whose outcome is not known, with the kept message, on
+        // the lookup and on the repeat.
+        let unknown = KeyDeclaration::Refused {
+            code: ErrorCode::OutcomeUnknown,
+            message: "the declaration is not signed by the recorded key".to_owned(),
+        };
+        let lookup = directory.recorded_declaration(&earlier.principal(), action(1));
+        let Ok(Some(recorded)) = lookup else {
+            panic!("the lookup reads the record as a refusal: {lookup:?}");
+        };
+        assert_eq!(
+            recorded.outcome, unknown,
+            "the lookup reads the unknown outcome under the kept message"
         );
-        assert_eq!(lookup.code(), ErrorCode::StorageUnavailable);
-        let repeat = declare(&directory, &earlier, 1, Ok(keys))
-            .expect_err("the repeat reads the record first and stops");
-        assert!(
-            matches!(repeat, ControllerError::RegistryUnavailable { .. }),
-            "{repeat:?}"
+        assert_eq!(recorded.payload_digest, digest(1));
+        let repeat = declare(&directory, &earlier, 1, Ok(keys));
+        let Ok(repeated) = repeat else {
+            panic!("the repeat reads the record first and answers it: {repeat:?}");
+        };
+        assert_eq!(
+            repeated.outcome, unknown,
+            "the repeat is given the same unknown outcome"
         );
 
         // 2. The record stays, and 3. nothing was declared again: no key is on record for the
@@ -3190,6 +3199,50 @@ mod tests {
             keys_of(&directory, &earlier).is_none(),
             "the repeat declared no key"
         );
+
+        // Anything else that this build cannot decode in the record is still unavailable: the
+        // unknown word is not all that the record fails for, so the lookup and the repeat stop.
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Stranger {
+            Refused {
+                code: String,
+                message: String,
+                a_member_no_build_made: u8,
+            },
+        }
+        let spoiled = kr_cbor::to_canonical_vec(&Stranger::Refused {
+            code: word.to_owned(),
+            message: "the declaration is not signed by the recorded key".to_owned(),
+            a_member_no_build_made: 1,
+        })
+        .expect("encodes");
+        directory
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute(
+                "UPDATE network_key_declarations SET outcome = ?1 WHERE action_id = ?2",
+                params![spoiled, action(1).get().as_bytes().as_slice()],
+            )
+            .expect("the record holds another fault too");
+        let held = table(&directory);
+        let unreadable = directory
+            .recorded_declaration(&earlier.principal(), action(1))
+            .expect_err("a record with another fault cannot be decoded");
+        assert!(
+            matches!(unreadable, ControllerError::RegistryUnavailable { .. }),
+            "{unreadable:?}"
+        );
+        assert_eq!(unreadable.code(), ErrorCode::StorageUnavailable);
+        let repeat = declare(&directory, &earlier, 1, Ok(keys))
+            .expect_err("the repeat reads the record first and stops");
+        assert!(
+            matches!(repeat, ControllerError::RegistryUnavailable { .. }),
+            "{repeat:?}"
+        );
+        assert_eq!(table(&directory), held, "and the record still stays");
+        assert!(keys_of(&directory, &earlier).is_none());
     }
 
     #[test]

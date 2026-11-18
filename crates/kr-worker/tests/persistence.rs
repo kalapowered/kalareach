@@ -1814,12 +1814,13 @@ fn a_journal_the_importer_cannot_read_is_refused_by_name_and_left_as_it_was() {
 }
 
 /// The running worker reads one receipt by its identifier. A receipt whose error was kept under a
-/// word that a later build added cannot be read by this build: the lookup of that receipt answers
-/// that the journal is unavailable, which is the storage-unavailable answer of a class that says to
-/// try again, and it is not the unknown outcome. The receipt stays as it was, the lookup writes
-/// nothing, and no action is claimed or carried out by it.
+/// word that a later build added is read as a receipt whose outcome is not known: the lookup gives
+/// the receipt with its state as kept and its error as the unknown outcome under the kept message.
+/// The receipt stays as it was, the lookup writes nothing, and no action is claimed or carried out
+/// by it.
 #[test]
-fn a_receipt_kept_under_a_code_this_build_lacks_is_unavailable_to_the_running_lookup_and_stays() {
+fn a_receipt_kept_under_a_code_this_build_lacks_reads_as_an_unknown_outcome_to_the_running_lookup_and_stays()
+ {
     use kr_worker::persistence::import::import_journal;
     let path = journal_path("lookup-unknown-error-code");
     write_version_one_fixture(&path);
@@ -1865,29 +1866,194 @@ fn a_receipt_kept_under_a_code_this_build_lacks_is_unavailable_to_the_running_lo
 
     let journal = Journal::open_existing(&path).expect("a current journal");
     for attempt in 0..2 {
-        let failure = journal
-            .read(actor(), kr_worker::journal::action_id_from([7; 16]))
-            .expect_err("the receipt cannot be read");
-        assert!(
-            matches!(
-                failure,
-                kr_worker::error::WorkerError::JournalUnavailable { .. }
-            ),
-            "attempt {attempt}: {failure:?}"
+        let looked_up = journal.read(actor(), kr_worker::journal::action_id_from([7; 16]));
+        let Ok(Some(receipt)) = looked_up else {
+            panic!("attempt {attempt}: the lookup reads the receipt: {looked_up:?}");
+        };
+        assert_eq!(
+            receipt.error.0,
+            Some(kr_protocol::error::ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "it was refused"
+            )),
+            "attempt {attempt}: the error reads as the unknown outcome under the kept message"
         );
         assert_eq!(
-            failure.code(),
-            ErrorCode::StorageUnavailable,
-            "the lookup says to try again, as the other places that read an unknown word do"
-        );
-        assert!(
-            failure.to_string().contains("error code"),
-            "the answer names what it could not read: {failure}"
+            receipt.state,
+            ReceiptState::Accepted,
+            "attempt {attempt}: the state is as kept"
         );
         assert_eq!(
             rows(),
             before,
             "attempt {attempt}: the receipt stays as it was after the lookup, and no claim or effect was recorded"
+        );
+    }
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+/// A writer reads a receipt before it writes, and a receipt kept under a word that a later build
+/// added reads as the unknown outcome: a repeat of its action gets the receipt, a move out of a
+/// settled state is refused, and an unknown receipt is settled by its own writer. Each write puts
+/// the writer's own outcome and nothing else: the kept word is never written back as the unknown
+/// outcome.
+#[test]
+fn a_writer_that_reads_a_receipt_kept_under_a_code_this_build_lacks_writes_only_its_own_outcome() {
+    let path = journal_path("writer-unknown-error-code");
+    let mut journal = Journal::open(&path).expect("opens");
+    let refused = kr_worker::journal::action_id_from([2; 16]);
+    let uncertain = kr_worker::journal::action_id_from([3; 16]);
+    for (action, digest) in [(2, 2), (3, 3)] {
+        journal
+            .accept(&submission(action, digest))
+            .expect("accepts");
+        journal
+            .mark_dispatching(
+                actor(),
+                kr_worker::journal::action_id_from([action; 16]),
+                TimestampMs::new(1_100),
+            )
+            .expect("marks");
+    }
+    journal
+        .settle(
+            actor(),
+            refused,
+            ReceiptState::Refused,
+            None,
+            Some(kr_protocol::error::ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "it was refused",
+            )),
+            TimestampMs::new(1_200),
+        )
+        .expect("settles as refused");
+    journal
+        .settle(
+            actor(),
+            uncertain,
+            ReceiptState::Unknown,
+            None,
+            Some(kr_protocol::error::ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "it was not confirmed",
+            )),
+            TimestampMs::new(1_200),
+        )
+        .expect("settles as unknown");
+    let word = "A_CODE_A_LATER_BUILD_ADDS";
+    assert!(
+        ErrorCode::from_wire(word).is_none(),
+        "this build lacks the word"
+    );
+    rusqlite::Connection::open(&path)
+        .expect("opens the journal")
+        .execute("UPDATE receipts SET error_code = ?1", [word])
+        .expect("keeps both errors under the word");
+    type Row = (Vec<u8>, String, Option<String>, Option<String>, i64);
+    let rows = || -> Vec<Row> {
+        let connection = rusqlite::Connection::open(&path).expect("opens the journal");
+        let mut statement = connection
+            .prepare(
+                "SELECT action_id, state, error_code, error_message, revision
+                   FROM receipts ORDER BY action_id",
+            )
+            .expect("selects the receipts");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("reads the receipts")
+            .map(|row| row.expect("a receipt row"))
+            .collect()
+    };
+    let before = rows();
+    assert_eq!(before.len(), 2);
+    assert!(
+        before.iter().all(|row| row.2.as_deref() == Some(word)),
+        "both receipts are kept under the word"
+    );
+
+    // 1. A repeat of the refused action gets the receipt as it stands, and writes nothing.
+    let repeat = journal.accept(&submission(2, 2));
+    let Ok(admission) = repeat else {
+        panic!("the repeat is given the receipt: {repeat:?}");
+    };
+    assert!(admission.deduplicated, "it is a repeat");
+    assert_eq!(
+        admission.receipt.error.0.as_ref().map(|error| error.code),
+        Some(ErrorCode::OutcomeUnknown),
+        "the receipt reads as the unknown outcome"
+    );
+    assert_eq!(rows(), before, "the repeat wrote nothing");
+
+    // 2. A move out of a settled state is refused, and the kept word is not rewritten.
+    let moved = journal.settle(
+        actor(),
+        refused,
+        ReceiptState::Applied,
+        Some(b"result"),
+        None,
+        TimestampMs::new(1_300),
+    );
+    let Err(refusal) = moved else {
+        panic!("a settled receipt moves no further: {moved:?}");
+    };
+    assert!(
+        matches!(refusal, kr_worker::error::WorkerError::InvalidArgument(_)),
+        "the transition is refused as a transition, not as an unreadable receipt: {refusal:?}"
+    );
+    assert_eq!(rows(), before, "the refused move wrote nothing");
+
+    // 3. The writer of the unknown receipt settles it, and writes its own outcome only: the other
+    // receipt keeps the word it was kept under.
+    let settled = journal.settle(
+        actor(),
+        uncertain,
+        ReceiptState::Refused,
+        None,
+        Some(kr_protocol::error::ProtocolError::new(
+            ErrorCode::InvalidArgument,
+            "it did not apply",
+        )),
+        TimestampMs::new(1_400),
+    );
+    let Ok(receipt) = settled else {
+        panic!("the unknown receipt is settled: {settled:?}");
+    };
+    assert_eq!(receipt.state, ReceiptState::Refused);
+    let after = rows();
+    let find = |rows: &[Row], action: ActionId| {
+        rows.iter()
+            .find(|row| row.0 == action.get().as_bytes().as_slice())
+            .cloned()
+            .expect("the receipt's row")
+    };
+    let written = find(&after, uncertain);
+    assert_eq!(written.1, "refused");
+    assert_eq!(
+        written.2.as_deref(),
+        Some(ErrorCode::InvalidArgument.as_str()),
+        "the settled receipt holds the writer's own code"
+    );
+    assert_eq!(written.3.as_deref(), Some("it did not apply"));
+    assert_eq!(
+        find(&after, refused),
+        find(&before, refused),
+        "the other receipt is as it was kept, under its word"
+    );
+    for row in &after {
+        assert_ne!(
+            row.2.as_deref(),
+            Some(ErrorCode::OutcomeUnknown.as_str()),
+            "no write put the unknown outcome in the place of a kept word"
         );
     }
     drop(journal);

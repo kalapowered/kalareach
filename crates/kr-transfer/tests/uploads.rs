@@ -4276,56 +4276,66 @@ fn a_refusal_kept_under_a_code_this_build_lacks_is_an_unknown_outcome_on_every_p
     );
 }
 
-/// A refusal kept under a word that a later build added is not what `upload.begin` answers where a
-/// limit of the call's own refuses first: the call answers the limit's refusal, as the service gives
-/// it today, and the kept record stays, with nothing reserved and no claim made. The host reads the
-/// record before it calls the service and answers the unknown outcome, so a caller of the host
-/// never meets this answer; the later change that makes the service answer the kept refusal changes
-/// the assertion on the code and no other.
-#[test]
-fn a_begin_that_a_limit_refuses_answers_its_own_refusal_over_a_refusal_kept_under_an_unknown_code()
-{
-    let harness = Harness::create();
-    harness.set_limits(Limits {
-        max_file_len: 1024,
-        max_staged_len: 100,
-        max_concurrent_transfers: 8,
-    });
-    let held = harness
-        .begin(&pattern(60), "application/octet-stream", "held.bin")
-        .expect("holds 60 of the 100 staged bytes");
-    let bytes = pattern(60);
-    let begin = action(&harness, "upload.begin", &bytes);
-    let word = "A_CODE_A_LATER_BUILD_ADDS";
-    assert!(
-        ErrorCode::from_wire(word).is_none(),
-        "this build lacks the word"
-    );
-    {
+type ActionRow = (String, Option<Vec<u8>>, Option<String>, Option<String>);
+
+/// What a limit of `upload.begin` meets: 60 of the 100 staged bytes are held, so a begin of 60 more
+/// is refused by the staged limit, and the action of that begin may have a record.
+struct LimitedBegin {
+    harness: Harness,
+    held: TransferId,
+    bytes: Vec<u8>,
+    begin: kr_transfer::service::Action,
+}
+
+impl LimitedBegin {
+    fn create() -> Self {
+        let harness = Harness::create();
+        harness.set_limits(Limits {
+            max_file_len: 1024,
+            max_staged_len: 100,
+            max_concurrent_transfers: 8,
+        });
+        let held = harness
+            .begin(&pattern(60), "application/octet-stream", "held.bin")
+            .expect("holds 60 of the 100 staged bytes")
+            .transfer_id;
+        let bytes = pattern(60);
+        let begin = action(&harness, "upload.begin", &bytes);
+        Self {
+            harness,
+            held,
+            bytes,
+            begin,
+        }
+    }
+
+    /// Keeps a refusal for the begin's action under `word`, as a store of another build would.
+    fn keep_refusal(&self, word: &str, detail: &str) {
         let store = kr_transfer::Store::open(
-            kr_transfer::StagingArea::store_path(&harness.host.environment()),
-            harness.host.environment_id(),
+            kr_transfer::StagingArea::store_path(&self.harness.host.environment()),
+            self.harness.host.environment_id(),
         )
         .expect("opens the journal");
         store
             .record_action(
-                &begin.actor_id,
-                begin.action_id,
+                &self.begin.actor_id,
+                self.begin.action_id,
                 &kr_transfer::store::ActionRecord {
-                    method: begin.method.clone(),
-                    payload_digest: begin.payload_digest,
+                    method: self.begin.method.clone(),
+                    payload_digest: self.begin.payload_digest,
                     result: None,
                     error_code: Some(word.to_owned()),
-                    error_detail: Some("it was refused".to_owned()),
+                    error_detail: Some(detail.to_owned()),
                     recorded_at_ms: kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
                 },
             )
             .expect("records the refusal under the word");
     }
-    type Row = (String, Option<Vec<u8>>, Option<String>, Option<String>);
-    let rows = || -> Vec<Row> {
+
+    /// Every action row of the journal, as it is kept.
+    fn rows(&self) -> Vec<ActionRow> {
         let journal = rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
-            &harness.host.environment(),
+            &self.harness.host.environment(),
         ))
         .expect("opens the journal");
         let mut statement = journal
@@ -4338,19 +4348,68 @@ fn a_begin_that_a_limit_refuses_answers_its_own_refusal_over_a_refusal_kept_unde
             .expect("reads the actions")
             .map(|row| row.expect("an action row"))
             .collect()
-    };
-    let before = rows();
+    }
+
+    /// The begin of the action's own bytes, which the staged limit refuses.
+    fn call(&self, action: &kr_transfer::service::Action) -> kr_transfer::TransferError {
+        let params = UploadBeginParams {
+            environment_id: self.harness.environment_id(),
+            session_id: Nullable::null(),
+            device_id: Nullable::null(),
+            declared_byte_len: U64::new(self.bytes.len() as u64),
+            declared_digest: digest(&self.bytes),
+            declared_media_type: "application/octet-stream".to_owned(),
+            original_file_name: "again.bin".to_owned(),
+        };
+        self.harness
+            .service
+            .upload_begin(&self.harness.actor, &params, Some(action), None)
+            .expect_err("a limit refuses the call")
+    }
+
+    /// What the refused call must leave: nothing reserved, the held upload as it was.
+    fn assert_nothing_was_reserved(&self) {
+        self.harness
+            .begin(&pattern(40), "application/octet-stream", "fits.bin")
+            .expect("the 40 bytes still fit: the refused call reserved none of its 60");
+        self.harness
+            .service
+            .upload_status(
+                &self.harness.actor,
+                &UploadStatusParams {
+                    transfer_id: self.held,
+                },
+            )
+            .expect("the upload that held the staged bytes is as it was");
+    }
+}
+
+/// A refusal kept under a word that a later build added is answered by `upload.begin` as the
+/// refusal that was kept, read as an unknown outcome under its stored detail, where a limit of the
+/// call's own refuses first. The record stays, with nothing reserved and no claim made.
+#[test]
+fn a_begin_that_a_limit_refuses_answers_a_refusal_kept_under_an_unknown_code_as_an_unknown_outcome()
+{
+    let limited = LimitedBegin::create();
+    let word = "A_CODE_A_LATER_BUILD_ADDS";
+    assert!(
+        ErrorCode::from_wire(word).is_none(),
+        "this build lacks the word"
+    );
+    limited.keep_refusal(word, "it was refused");
+    let before = limited.rows();
     assert_eq!(before.len(), 1, "one action, kept under the word");
     assert_eq!(before[0].2.as_deref(), Some(word));
 
     // The lookup that the host makes before it calls the service says the outcome is unknown.
-    let looked_up = harness
+    let looked_up = limited
+        .harness
         .service
         .retained_action(
-            &harness.actor,
-            begin.action_id,
-            &begin.method,
-            begin.payload_digest,
+            &limited.harness.actor,
+            limited.begin.action_id,
+            &limited.begin.method,
+            limited.begin.payload_digest,
         )
         .expect("the lookup reads")
         .expect("the action is recorded");
@@ -4362,46 +4421,79 @@ fn a_begin_that_a_limit_refuses_answers_its_own_refusal_over_a_refusal_kept_unde
         }
     );
 
-    // The call itself: a limit refuses the 60 bytes more, and the service answers that refusal
-    // where a kept refusal is what the action was answered with.
-    let params = UploadBeginParams {
-        environment_id: harness.environment_id(),
-        session_id: Nullable::null(),
-        device_id: Nullable::null(),
-        declared_byte_len: U64::new(bytes.len() as u64),
-        declared_digest: digest(&bytes),
-        declared_media_type: "application/octet-stream".to_owned(),
-        original_file_name: "again.bin".to_owned(),
-    };
-    let refusal = harness
-        .service
-        .upload_begin(&harness.actor, &params, Some(&begin), None)
-        .expect_err("a limit refuses the call");
+    // The call itself: a limit refuses the 60 bytes more, and the service answers the kept refusal.
+    let refusal = limited.call(&limited.begin);
     assert_eq!(
         refusal.code(),
-        ErrorCode::QuotaExceeded,
-        "the call's own limit is answered in place of the kept refusal"
+        ErrorCode::OutcomeUnknown,
+        "the kept refusal is answered in place of the call's own limit"
+    );
+    assert!(
+        refusal.to_string().contains("it was refused"),
+        "under the detail it was kept with: {refusal}"
     );
 
     // The record stays, the refused call reserved nothing, and no claim was made.
-    assert_eq!(rows(), before, "the record is the same row after the call");
-    harness
-        .begin(&pattern(40), "application/octet-stream", "fits.bin")
-        .expect("the 40 bytes still fit: the refused call reserved none of its 60");
     assert_eq!(
-        rows(),
+        limited.rows(),
+        before,
+        "the record is the same row after the call"
+    );
+    limited.assert_nothing_was_reserved();
+    assert_eq!(
+        limited.rows(),
         before,
         "no claim was made and no effect was recorded"
     );
-    harness
-        .service
-        .upload_status(
-            &harness.actor,
-            &UploadStatusParams {
-                transfer_id: held.transfer_id,
-            },
-        )
-        .expect("the upload that held the staged bytes is as it was");
+}
+
+/// A kept refusal that this build knows is answered as it was kept, under its own code and detail,
+/// where a limit of the call's own refuses first; an action with no record is answered with the
+/// limit's refusal. A kept refusal is told apart from an absent record, and the first writes
+/// nothing.
+#[test]
+fn a_begin_that_a_limit_refuses_answers_a_known_kept_refusal_as_kept_and_an_absent_record_as_its_own()
+ {
+    let limited = LimitedBegin::create();
+
+    // An action with no record: the call's own refusal, and the journal gains no row.
+    let absent = limited.call(&limited.begin);
+    assert_eq!(
+        absent.code(),
+        ErrorCode::QuotaExceeded,
+        "an absent record gives the call's own limit"
+    );
+    assert!(
+        limited.rows().is_empty(),
+        "a refusal that no record stands behind records nothing here"
+    );
+
+    // The same action, once a refusal under a code this build knows is kept for it.
+    limited.keep_refusal(ErrorCode::PermissionDenied.as_str(), "kept for good");
+    let before = limited.rows();
+    assert_eq!(before.len(), 1, "one action, kept under a known code");
+    let kept = limited.call(&limited.begin);
+    assert_eq!(
+        kept.code(),
+        ErrorCode::PermissionDenied,
+        "the kept refusal is answered under its own code"
+    );
+    assert!(
+        kept.to_string().contains("kept for good"),
+        "and its own detail: {kept}"
+    );
+    assert_eq!(limited.rows(), before, "the record is the same row");
+
+    // Another action, whose payload differs, is a reused identifier and stays one.
+    let mut reused = action(&limited.harness, "upload.begin", &pattern(61));
+    reused.action_id = limited.begin.action_id;
+    let conflict = limited.call(&reused);
+    assert!(
+        matches!(conflict, kr_transfer::TransferError::IdConflict { .. }),
+        "a reused identifier is what it is: {conflict:?}"
+    );
+    limited.assert_nothing_was_reserved();
+    assert_eq!(limited.rows(), before, "nothing was written");
 }
 
 /// KR-REQ-24.09: a finish whose completion lost to another copy's is answered with what that copy
