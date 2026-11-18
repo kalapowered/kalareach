@@ -400,11 +400,12 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
         },
         Compatible {
             at: "ErrorCode#const:PAIRING_ENDPOINT_PAIRED",
-            reason: "A code that only the host's pairing surface reports: to a device that is \
-                 pairing, and to the issuing owner's `pair.confirm` when the device becomes \
-                 listed between its redemption and the approval. A worker is never a party to a \
-                 pairing, so no frame of the retained level carries the code in either direction \
-                 and no worker of that level is sent it. The readers of the code are a pairing \
+            reason: "A code that only the host's pairing service reports: to a device that is \
+                 pairing, at `pair.redeem` or `pair.finish`, and to the issuing owner's \
+                 `pair.confirm` when the device becomes listed between that request and the \
+                 approval. A worker is never a party to a pairing, so no frame of the retained \
+                 level carries the code in either direction and no worker of that level is sent \
+                 it. The readers of the code are a pairing \
                  client, which reads an unknown code as a lost connection, and an owner's client \
                  of `pair.confirm`, which cannot decode an answer under a code it lacks and keeps \
                  the action unresolved; no client was released, so there is no shim.",
