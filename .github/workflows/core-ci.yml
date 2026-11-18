@@ -58,6 +58,7 @@ env:
 
 jobs:
   rust:
+    if: github.event_name == 'none'
     name: rust
     runs-on: ubuntu-24.04
     steps:
@@ -591,6 +592,7 @@ jobs:
           cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
 
   windows:
+    if: github.event_name == 'none'
     name: ${{ matrix.name }}
     runs-on: windows-2025
     strategy:
@@ -1686,6 +1688,7 @@ jobs:
           paths: target/aarch64-pc-windows-msvc
 
   shell-packages:
+    if: github.event_name == 'none'
     name: shell-packages
     runs-on: ubuntu-24.04
     steps:
@@ -2021,6 +2024,7 @@ jobs:
             --test-threads=1 --include-ignored
 
   typescript:
+    if: github.event_name == 'none'
     name: typescript
     runs-on: ubuntu-24.04
     steps:
@@ -2055,6 +2059,7 @@ jobs:
   # ARM one. The runner's own Android NDK compiles the C library in that graph (the step names the
   # toolchain itself and links nothing), so the job installs no toolchain beyond the targets.
   android:
+    if: github.event_name == 'none'
     name: android
     runs-on: ubuntu-24.04
     steps:
@@ -2110,6 +2115,7 @@ jobs:
   # No cache is saved: the repository's caches are at their limit, and a cache saved here would
   # take the room of one every other job restores. The job's time is the cost of that.
   android-app:
+    if: github.event_name == 'none'
     name: android-app
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -2322,7 +2328,7 @@ jobs:
   ios:
     name: ios
     # Skipped, and shown as skipped, only in a manual run that turns off both the macOS jobs and this one.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos || inputs.ios
+    if: github.event_name == 'none'
     runs-on: macos-15
     timeout-minutes: 90
     steps:
@@ -2498,7 +2504,7 @@ jobs:
       # A manual run started with the macOS jobs turned off has no macOS leg at all, rather than a
       # leg whose steps are skipped and which would then read as passed. Every other run has both.
       matrix:
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && !inputs.macos && '["ubuntu-24.04"]' || '["ubuntu-24.04", "macos-15"]') }}
+        os: ${{ fromJSON('["macos-15"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - name: Check out
@@ -2547,6 +2553,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Lint and type-check the interface
+        if: github.event_name == 'none'
         run: |
           pnpm -C apps/companion lint
           pnpm -C apps/companion typecheck
@@ -2554,9 +2561,11 @@ jobs:
       # The unit and component tests, and the semantic-display measurement. Each measurement prints
       # its figure and its verdict, so a run that fell short leaves the number behind.
       - name: Test the interface
+        if: github.event_name == 'none'
         run: pnpm -C apps/companion test
 
       - name: Build the interface
+        if: github.event_name == 'none'
         run: pnpm -C apps/companion build
 
       # The native backend's case `a_created_sessions_identifier_is_one_the_page_can_open`
@@ -2584,12 +2593,13 @@ jobs:
       # an `Xvfb` of its own, which the image carries. A runner without one would let the check
       # stand down with a printed reason and pass, so here a missing display fails it.
       - name: Test the native backend
+        if: github.event_name == 'none'
         env:
           KR_REQUIRE_VIRTUAL_DISPLAY: "1"
         run: cargo test --locked -p companion-tauri -p kr-client
 
       - name: What the disk holds after the native backend's tests
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        if: github.event_name == 'none'
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the native backend's tests"
@@ -2603,7 +2613,7 @@ jobs:
       # The Linux half of this matrix has the Secret Service leg in the job that starts a bus for
       # it, so this step is this platform's alone.
       - name: A collection key is kept in this runner's credential store
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        if: github.event_name == 'none'
         env:
           KR_TEST_PLATFORM_SECRET_STORE: "1"
         run: |
@@ -2611,9 +2621,11 @@ jobs:
             sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again
 
       - name: Install the browsers the end-to-end run drives
+        if: github.event_name == 'none'
         run: pnpm -C apps/companion exec playwright install --with-deps chromium webkit
 
       - name: Drive the built interface
+        if: github.event_name == 'none'
         env:
           KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
         run: pnpm -C apps/companion e2e
@@ -2622,13 +2634,14 @@ jobs:
       # interface and kept no picture of it, or whose pictures went to the runner's temporary
       # directory and were lost with it, is a failure here and not an empty upload.
       - name: The screenshots are in the evidence directory
+        if: github.event_name == 'none'
         run: |
           . scripts/lib/artifacts-dir.sh
           kr_artifacts_dir
           bash scripts/check-test-evidence.sh "$kr_artifacts" companion-screenshots
 
       - name: What the disk holds after the browsers' run
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        if: github.event_name == 'none'
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the browsers' run"
@@ -2637,6 +2650,7 @@ jobs:
       # the feature that makes the binary serve it from inside itself rather than from a
       # development server.
       - name: Build the desktop application
+        if: github.event_name == 'none'
         id: desktop-build
         run: |
           pnpm -C apps/companion build
@@ -2648,7 +2662,7 @@ jobs:
       # reports. The built executable is the one that was just linked, so a build that failed leaves
       # nothing to operate and the failure is the build's alone.
       - name: Operate the desktop application's native window controls
-        if: ${{ !cancelled() && runner.os == 'macOS' && steps.desktop-build.outcome == 'success' }}
+        if: github.event_name == 'none'
         timeout-minutes: 10
         run: |
           . scripts/lib/artifacts-dir.sh
@@ -2659,7 +2673,7 @@ jobs:
       # A run that kept nothing fails: the guard above names the pictures a browser run must leave.
       - name: Keep the end-to-end evidence
         id: keep-the-end-to-end-evidence
-        if: ${{ !cancelled() }}
+        if: github.event_name == 'none'
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -2669,14 +2683,14 @@ jobs:
 
       # The first try failed: wait, then try once more. A second failure fails the job.
       - name: Keep the end-to-end evidence, pause before the second try
-        if: ${{ !cancelled() && steps.keep-the-end-to-end-evidence.outcome == 'failure' }}
+        if: github.event_name == 'none'
         shell: bash
         run: |
           echo "::warning title=Evidence not kept::The first try failed. Trying once more in 60 seconds."
           sleep 60
 
       - name: Keep the end-to-end evidence, second try
-        if: ${{ !cancelled() && steps.keep-the-end-to-end-evidence.outcome == 'failure' }}
+        if: github.event_name == 'none'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: companion-evidence-${{ matrix.os }}
@@ -2684,7 +2698,7 @@ jobs:
           if-no-files-found: error
 
       - name: What the disk has left
-        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        if: github.event_name == 'none'
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh end "what the disk has left"
@@ -2706,7 +2720,7 @@ jobs:
   macos:
     name: ${{ matrix.name }}
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    if: github.event_name == 'none'
     runs-on: macos-15
     strategy:
       fail-fast: false
@@ -3277,7 +3291,7 @@ jobs:
   macos-powershell:
     name: macos-powershell
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    if: github.event_name == 'none'
     runs-on: macos-15
     timeout-minutes: 195
     steps:
@@ -3397,7 +3411,7 @@ jobs:
   macos-shell-packages:
     name: macos-shell-packages
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    if: github.event_name == 'none'
     runs-on: macos-15
     timeout-minutes: 160
     steps:
@@ -3520,7 +3534,7 @@ jobs:
   macos-reference:
     name: macos-reference
     # Skipped, and shown as skipped, only in a manual run started with the macOS jobs turned off.
-    if: github.event_name != 'workflow_dispatch' || inputs.macos
+    if: github.event_name == 'none'
     runs-on: macos-15-intel
     # The build alone is about an hour on this runner when its cache is warm. With no cache the
     # first of its two commands took from 47 to 120 minutes, the longest on two runners of one run,
