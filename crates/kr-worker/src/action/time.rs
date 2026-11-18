@@ -570,6 +570,12 @@ enum Refusal {
 /// readings kept say. And a reading that comes after a later one counts as taken at the later one's
 /// time.
 ///
+/// The decision answers to more than these readings: it also compares the narrow reading with the
+/// worker's mark, or with its checkpoint where there is no mark. That can refuse a confirmation
+/// that the readings do not, because the mark is stamped at the first reading of its bracket where
+/// a staircase enters the same reading at its second, and because a mark or checkpoint that this
+/// boot's record put back is in no staircase.
+///
 /// Every reading comes here through [`TimeContract::take`] and the unbracketed read of
 /// [`TimeContract::wall_reading`], the two places that read the wall clock, each reading its clocks
 /// and noting what it read in one hold of the lock that guards this. The readings are noted in the
@@ -1668,8 +1674,14 @@ impl TimeContract {
     /// spoke, and a clock that then went back, refuses it even where the mark projects further and
     /// was proved before, or the worker does not trust its clock. A reading from before the act
     /// takes no part. The exceptions add refusals only: a reading read before the act and stamped
-    /// after it, a reading within a second of another, the readings let go at the bound, and a
-    /// restored record that distrusts the clock.
+    /// after it, a reading within a second of another, the readings let go at the bound, a restored
+    /// record that distrusts the clock, the mark at the first reading of its bracket (a staircase
+    /// enters that reading at its second), a mark or checkpoint that this boot's record put back
+    /// (no staircase holds it), and a reading that another caller notes between the following's own
+    /// reading and its question to the readings. No product caller makes that last one: the looks
+    /// are taken one at a time, the deadline checks and the expiry of an object take the state
+    /// guard that this function holds, and the owner's retrust, which does not, has no product
+    /// caller.
     ///
     /// The reading is taken after the confirmation is loaded, never before: a worker that sampled
     /// its clock and was paused while the owner corrected it and confirmed would otherwise spend
