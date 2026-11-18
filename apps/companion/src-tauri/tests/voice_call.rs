@@ -1522,6 +1522,67 @@ async fn a_delegation_is_answered_to_the_model_that_nothing_was_done_once() {
     scene.stop_host().await;
 }
 
+/// KR-REQ-15.17: the provider's acknowledgement of an append proves that the model received it, and
+/// nothing that was done or played. The model is told that nothing was done about a delegation, the
+/// service admits that commentary as the provider does, and an acknowledgement of a request this
+/// device never made claims that an action was performed: no row of the call changes, and nothing
+/// shows that audio played.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_providers_acknowledgement_of_what_the_model_was_told_does_not_make_a_request_done() {
+    let mut scene = scene().await;
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    scene.stand_in.control().announce("d-1", 1200);
+    // The service writes the provider's acknowledgement of what the model was told of d-1 as soon
+    // as it has read it, so what the device is sent next comes after the acknowledgement.
+    scene
+        .stand_in
+        .control()
+        .until("what the model was told of d-1", |report| {
+            report
+                .sent
+                .iter()
+                .any(|sent| sent.delegation.as_deref() == Some("d-1"))
+        })
+        .await;
+    scene.stand_in.control().say(&json!({
+        "type": "context_admitted",
+        "id": "ctx-unsolicited",
+        "note": "The action was performed.",
+        "startMs": null,
+        "endMs": null,
+    }));
+    // News is read in the order it was sent: once a second delegation is a row, both
+    // acknowledgements have been read.
+    scene.stand_in.control().announce("d-2", 2400);
+    scene
+        .state_where("the second delegation listed", |state| {
+            row_of(state, "d-2").is_some()
+        })
+        .await;
+
+    let state = scene.state();
+    for id in ["d-1", "d-2"] {
+        let row = row_of(&state, id).expect("the row");
+        assert_eq!(row["state"], "not_done", "{id}: {row}");
+        assert!(row["cause"].is_null(), "{id}: {row}");
+    }
+    let told = told_of(&scene, "d-1");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].contains("Nothing was done"), "{told:?}");
+    assert!(
+        state.get("first_audio_ms").is_none(),
+        "an acknowledgement is no playout: {state}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
 /// A delegation the voice service lists when the control attaches was announced before this device
 /// was listening, and the service gives no offset for it: the row has none, rather than saying it
 /// was asked at the start of the call.
@@ -6528,6 +6589,234 @@ async fn a_request_written_before_the_host_was_lost_stays_unknown_and_the_end_sa
     let words = state["ended"]["words"].as_str().expect("words");
     assert!(words.contains("may or may not"), "{words}");
     assert!(!words.contains("nothing was done"), "{words}");
+    scene.stop_host().await;
+}
+
+/// Whether the model has been told `count` things of the delegation `id` by now: the service has
+/// read them, and has written the provider's acknowledgement of each before anything it writes next.
+fn told_at_the_service_of(
+    id: &str,
+    count: usize,
+) -> impl Fn(&voice_support::control_route::Report) -> bool {
+    let id = id.to_owned();
+    move |report| {
+        report
+            .sent
+            .iter()
+            .filter(|sent| sent.delegation.as_deref() == Some(id.as_str()))
+            .count()
+            >= count
+    }
+}
+
+/// KR-REQ-15.17: a request whose answer was lost is unknown, the model is told so, and the provider's
+/// acknowledgement of that commentary leaves it unknown: it was neither done nor said to be. The
+/// host's answer to the question about it, from its own record, is what makes it done, and the
+/// model is then told what the host reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_answer_leaves_the_request_unknown_until_the_hosts_own_answer_whatever_the_provider_acknowledges()
+ {
+    let timings = Timings {
+        repeat_delays: [Duration::from_millis(20); 3],
+        // The held question is not to give up on the host while the case waits for it.
+        host_within: Duration::from_secs(600),
+        ..delegating_timings()
+    };
+    let mut scene = delegating_with(timings, 1).await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    // The answer to the first request is lost, and the question that follows is held.
+    scene
+        .link
+        .lose_only_the_answer_after(0, HostMethod::VoiceDelegate);
+    scene.link.hold_request_after(1, HostMethod::VoiceDelegate);
+    ask(&scene, "d-1", end - 200).await;
+    scene.link.until_request_held().await;
+    scene
+        .stand_in
+        .control()
+        .until(
+            "the model told it is not known",
+            told_at_the_service_of("d-1", 1),
+        )
+        .await;
+    // The announcement is read after the acknowledgement of what the model was told.
+    scene.stand_in.control().announce("d-9", 9_000);
+    until_announced(&scene, "d-9", 9_000).await;
+
+    let state = scene.state();
+    let row = row_of(&state, "d-1").expect("the row");
+    assert_eq!(row["state"], "unknown", "{row}");
+    assert!(row["cause"].is_null(), "{row}");
+    assert_eq!(at_the_host(&scene), 1, "the question waits at the writer");
+    let told = told_of(&scene, "d-1");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].contains("not known"), "{told:?}");
+    assert!(
+        state.get("first_audio_ms").is_none(),
+        "an acknowledgement is no playout: {state}"
+    );
+
+    scene.link.release_request();
+    scene
+        .stand_in
+        .control()
+        .until(
+            "the model told what the host reports",
+            told_at_the_service_of("d-1", 2),
+        )
+        .await;
+
+    let row = row_of(&scene.state(), "d-1").expect("the row");
+    assert_eq!(row["state"], "performed", "{row}");
+    let told = told_of(&scene, "d-1");
+    assert_eq!(told.len(), 2, "{told:?}");
+    assert!(
+        told[1].starts_with("The person's computer read it"),
+        "{told:?}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("an end", |state| state["ended"].is_object())
+        .await;
+    let words = ended["ended"]["words"].as_str().expect("words");
+    assert!(!words.contains("may or may not"), "{words}");
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.17: a request the host has not answered is being asked about, and the provider's
+/// acknowledgement of an append that the model really received, which comes while the host still
+/// holds the request, leaves it so: nothing was told of it, and the host's answer alone makes it
+/// done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_has_not_answered_stays_asking_whatever_the_provider_acknowledges() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    // Both delegations are announced before the service is held: a service that holds the requests it
+    // reads writes nothing else meanwhile.
+    speak(&scene, 0, "hello there");
+    scene.stand_in.control().announce("d-0", 200);
+    scene.stand_in.control().announce("d-1", 6_600);
+    until_announced(&scene, "d-0", 200).await;
+    until_announced(&scene, "d-1", 6_600).await;
+    // The service reads what the model is told of the first sentence and answers none of it while it
+    // is held: its acknowledgement comes once the request for the second waits at the writer.
+    scene.stand_in.control().hold_requests(true);
+    scene.platform.tell_provider(&delegation_event("d-0", 200));
+    let spent = row_reaching(&scene, "d-0", "refused").await;
+    assert_eq!(spent["cause"], "first_fragment");
+    let end = speak(&scene, 6_000, "what is the status");
+    assert_eq!(end - 200, 6_600);
+    scene.link.hold_next_request(HostMethod::VoiceDelegate);
+    scene
+        .platform
+        .tell_provider(&delegation_event("d-1", end - 200));
+    scene.link.until_request_held().await;
+    scene.stand_in.control().hold_requests(false);
+    scene
+        .stand_in
+        .control()
+        .until(
+            "what the model was told of d-0",
+            told_at_the_service_of("d-0", 1),
+        )
+        .await;
+    // The announcement is read after the acknowledgement of what the model was told.
+    scene.stand_in.control().announce("d-9", 9_000);
+    until_announced(&scene, "d-9", 9_000).await;
+
+    let state = scene.state();
+    let row = row_of(&state, "d-1").expect("the row");
+    assert_eq!(row["state"], "asking", "{row}");
+    assert!(
+        told_of(&scene, "d-1").is_empty(),
+        "nothing was told of a request the host has not answered: {:?}",
+        told_of(&scene, "d-1")
+    );
+    assert!(
+        state.get("first_audio_ms").is_none(),
+        "an acknowledgement is no playout: {state}"
+    );
+
+    scene.link.release_request();
+    scene
+        .stand_in
+        .control()
+        .until(
+            "the model told what the host reports",
+            told_at_the_service_of("d-1", 1),
+        )
+        .await;
+
+    let row = row_of(&scene.state(), "d-1").expect("the row");
+    assert_eq!(row["state"], "performed", "{row}");
+    let told = told_of(&scene, "d-1");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].starts_with("The person's computer read it"),
+        "{told:?}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// KR-REQ-15.17: a request the host took and did not perform is admitted, whatever the provider
+/// acknowledges. The host here reads the request for real and the call is handed what a host that
+/// did not dispatch the action would answer: the row stays admitted, the model is told that
+/// whether it was carried out is not known, and the end of the call says it may or may not have
+/// been.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_took_and_did_not_perform_stays_admitted_whatever_the_provider_acknowledges()
+ {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    scene.link.answer_the_next_delegation_as_admitted();
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200).await;
+    scene
+        .stand_in
+        .control()
+        .until(
+            "the model told what the host answered",
+            told_at_the_service_of("d-1", 1),
+        )
+        .await;
+    // An acknowledgement of a request this device never made claims the action was performed.
+    scene.stand_in.control().say(&json!({
+        "type": "context_admitted",
+        "id": "ctx-unsolicited",
+        "note": "The action was performed.",
+        "startMs": null,
+        "endMs": null,
+    }));
+    // The announcement is read after both acknowledgements.
+    scene.stand_in.control().announce("d-9", 9_000);
+    until_announced(&scene, "d-9", 9_000).await;
+
+    let state = scene.state();
+    let row = row_of(&state, "d-1").expect("the row");
+    assert_eq!(row["state"], "admitted", "{row}");
+    assert!(row["cause"].is_null(), "{row}");
+    assert_eq!(at_the_host(&scene), 1, "the host was asked once");
+    let told = told_of(&scene, "d-1");
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].contains("Whether it was carried out is not known"),
+        "{told:?}"
+    );
+    assert!(!told[0].contains("read it"), "{told:?}");
+    assert!(
+        state.get("first_audio_ms").is_none(),
+        "an acknowledgement is no playout: {state}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("an end", |state| state["ended"].is_object())
+        .await;
+    let words = ended["ended"]["words"].as_str().expect("words");
+    assert!(words.contains("may or may not"), "{words}");
     scene.stop_host().await;
 }
 

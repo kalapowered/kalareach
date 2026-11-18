@@ -1238,6 +1238,9 @@ struct LinkState {
     /// Whether the next `voice.delegate` is answered with a receipt, as a host that held the action
     /// and said no more would, and not with the method's result.
     receipting_delegate: bool,
+    /// Whether the next `voice.delegate` is answered as a host that took the action and did not
+    /// dispatch it would answer, with an admission in place of the performed result.
+    admitting_delegate: bool,
     /// Whether the next answer to a `session.read` is for another session than the one asked for,
     /// as a host at fault would give.
     answering_read_for_another: bool,
@@ -1427,6 +1430,14 @@ impl LinkControl {
     /// all the same, and the caller is handed the receipt.
     pub fn answer_the_next_delegation_with_a_receipt(&self) {
         self.state.lock().expect("the record").receipting_delegate = true;
+    }
+
+    /// Answers the next `voice.delegate` as a host that took the action and did not dispatch it
+    /// would: the host reads the request and acts on it for real, and the caller is handed an
+    /// admission of the action in place of the result. The host's own grammar reads no request that
+    /// it admits and does not perform, so this is the one way a case gives a call that answer.
+    pub fn answer_the_next_delegation_as_admitted(&self) {
+        self.state.lock().expect("the record").admitting_delegate = true;
     }
 
     /// Makes the next answer to a `session.read`, once, a read of another session than the one
@@ -1692,6 +1703,18 @@ impl LinkControl {
             .then_some((request.request_id, request.action_id))
     }
 
+    /// The request `frame` is, when it is a `voice.delegate` whose answer is to be an admission.
+    fn admitted_request(&self, frame: &ControlFrame) -> Option<kr_protocol::ids::RequestId> {
+        let ControlFrame::Mutation(request) = frame else {
+            return None;
+        };
+        if request.method.as_str() != kr_protocol::method::Method::VoiceDelegate.as_str() {
+            return None;
+        }
+        let mut state = self.state.lock().expect("the record");
+        std::mem::take(&mut state.admitting_delegate).then_some(request.request_id)
+    }
+
     /// What the next challenge is to be changed to, taking it, when `response` carries one.
     fn challenge_changed(
         &self,
@@ -1897,6 +1920,7 @@ impl ControlledLink {
             control: Arc::clone(&self.control),
             garbled: Mutex::new(Vec::new()),
             receipted: Mutex::new(Vec::new()),
+            admitted: Mutex::new(Vec::new()),
             asked: Mutex::new(std::collections::HashMap::new()),
             refusing_connection,
             refused: std::sync::atomic::AtomicBool::new(false),
@@ -2021,6 +2045,9 @@ struct Tapped {
     /// The requests on this connection whose answers are to be a receipt, with the action each
     /// carried.
     receipted: Mutex<Vec<(kr_protocol::ids::RequestId, kr_protocol::ids::ActionId)>>,
+    /// The requests on this connection whose answers are to be an admission of the action in place
+    /// of the performed result.
+    admitted: Mutex<Vec<kr_protocol::ids::RequestId>>,
     /// The method of each request sent on this connection that has not been answered.
     asked: Mutex<std::collections::HashMap<kr_protocol::ids::RequestId, String>>,
     /// What the host refuses this connection with, as an error with request identifier zero, when
@@ -2075,12 +2102,48 @@ impl Tapped {
         if let Some(receipted) = self.control.receipted_request(frame) {
             self.receipted.lock().expect("the record").push(receipted);
         }
+        if let Some(request) = self.control.admitted_request(frame) {
+            self.admitted.lock().expect("the record").push(request);
+        }
         self.inner.send(frame).await?;
         if lost {
             // The host has the request and acts on it; the caller never hears.
             return Err(kr_client::ClientError::ConnectionEnded);
         }
         Ok(())
+    }
+
+    /// `response` as an admission of the action it performed, when it answers a request a test
+    /// asked to have answered so: the host performed it, and the caller is handed the admission.
+    fn admitted_answer(
+        &self,
+        response: &kr_protocol::envelope::Response,
+    ) -> Option<kr_protocol::envelope::Response> {
+        let at = self
+            .admitted
+            .lock()
+            .expect("the record")
+            .iter()
+            .position(|request| *request == response.request_id)?;
+        let kr_protocol::envelope::Outcome::Ok(value) = &response.outcome else {
+            return None;
+        };
+        let mut result: kr_protocol::voice::VoiceDelegateResult = value.to_typed().ok()?;
+        let kr_protocol::voice::VoiceDelegationOutcome::Performed { action_id, .. } =
+            result.outcome
+        else {
+            return None;
+        };
+        result.outcome = kr_protocol::voice::VoiceDelegationOutcome::Admitted {
+            action_id,
+            note: kr_protocol::voice::VOICE_ADMISSION_NOTE.to_owned(),
+        };
+        let mut response = response.clone();
+        response.outcome = kr_protocol::envelope::Outcome::Ok(
+            kr_protocol::envelope::ParamsValue::from_typed(&result).ok()?,
+        );
+        self.admitted.lock().expect("the record").remove(at);
+        Some(response)
     }
 
     /// Carries `frame` to the host unless the time has run out or the caller no longer wants it.
@@ -2103,6 +2166,9 @@ impl Tapped {
         }
         if let Some(receipted) = self.control.receipted_request(frame) {
             self.receipted.lock().expect("the record").push(receipted);
+        }
+        if let Some(request) = self.control.admitted_request(frame) {
+            self.admitted.lock().expect("the record").push(request);
         }
         if !self.inner.send_before(frame, not_after, wanted).await? {
             return Ok(false);
@@ -2238,6 +2304,7 @@ impl kr_client::transport::ControlTransport for Tapped {
                             .control
                             .challenge_changed(&response)
                             .or_else(|| self.control.session_read_changed(&response))
+                            .or_else(|| self.admitted_answer(&response))
                         {
                             Some(changed) => ControlFrame::Response(changed),
                             None => ControlFrame::Response(response),
