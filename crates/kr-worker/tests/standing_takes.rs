@@ -745,6 +745,29 @@ fn a_new_method_over_the_boundarys_own_mutex_is_reported() {
 }
 
 #[test]
+fn a_take_of_the_boundarys_own_mutex_by_raw_identifiers_is_reported() {
+    // `r#lock` and `r#try_lock` are the names `lock` and `try_lock`: the plant reaches the private
+    // field and takes the mutex by them, in a method of the service.
+    let found = planted(
+        BOUNDARY,
+        SERVICE_METHODS_OF_THE_BOUNDARY,
+        "impl WorkerService {\n    pub(super) fn reach_by_raw_names(&self) -> std::sync::TryLockResult<std::sync::MutexGuard<'_, ()>> {\n        self.dispatch.r#lock.r#try_lock()\n    }\n\n    /// Takes the service's dispatch boundary, waiting for whoever holds it.",
+    );
+    assert_eq!(
+        finding_faults(
+            &found,
+            &[
+                rawtake_finding("reach_by_raw_names", "lock", 1, 0),
+                rawtake_finding("reach_by_raw_names", "try_lock", 1, 0),
+                taker_finding(BOUNDARY, "reach_by_raw_names"),
+            ]
+        ),
+        Vec::<String>::new(),
+        "{found:?}"
+    );
+}
+
+#[test]
 fn a_raw_take_in_a_function_with_a_rawtake_row_and_no_taker_row_is_reported() {
     let source = text_of(BOUNDARY);
     assert_eq!(
