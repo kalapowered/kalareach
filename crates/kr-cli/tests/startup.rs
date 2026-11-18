@@ -6512,9 +6512,9 @@ enum OnStop {
     /// that is ending: the greeting fails and nothing answers after it.
     EndAtTheGreeting,
     /// Answers the first request to stop, which asks only how the daemon was started, with no
-    /// launch, and closes the connection with no answer to the second, which is the stop, and
-    /// ends: the stop's outcome is not known.
-    AnswerTheLaunchThenCut,
+    /// launch and the process `pid`, and closes the connection with no answer to the second, which
+    /// is the stop, and ends: the stop's outcome is not known.
+    AnswerTheLaunchThenCut(u32),
     /// Answers the first request to stop, which asks only how the daemon was started, with no
     /// launch, and refuses the second, which is the stop, with `code`: the daemon did not take it.
     AnswerTheLaunchThenRefuse(kr_protocol::error::ErrorCode),
@@ -6749,17 +6749,17 @@ impl TestDaemon {
                                         over.store(true, std::sync::atomic::Ordering::SeqCst);
                                         break;
                                     }
-                                    OnStop::AnswerTheLaunchThenCut if stops_received > 1 => {
+                                    OnStop::AnswerTheLaunchThenCut(_) if stops_received > 1 => {
                                         over.store(true, std::sync::atomic::Ordering::SeqCst);
                                         break;
                                     }
-                                    OnStop::AnswerTheLaunchThenCut => ControlFrame::Response(Response {
+                                    OnStop::AnswerTheLaunchThenCut(pid) => ControlFrame::Response(Response {
                                         request_id: mutation.request_id,
                                         outcome: Outcome::Ok(
                                             ParamsValue::from_typed(
                                                 &kr_protocol::update::HostStopResult {
                                                     pid: kr_protocol::scalars::U64::new(
-                                                        u64::from(std::process::id()),
+                                                        u64::from(*pid),
                                                     ),
                                                     unsettled: kr_protocol::scalars::U64::new(0),
                                                     launch: Nullable::null(),
@@ -6925,6 +6925,28 @@ impl TestDaemon {
 
     fn received(&self) -> Vec<String> {
         self.received.lock().expect("the record").clone()
+    }
+
+    /// How many requests of `method` the daemon has received.
+    fn received_count(&self, method: &str) -> usize {
+        self.received
+            .lock()
+            .expect("the record")
+            .iter()
+            .filter(|got| *got == method)
+            .count()
+    }
+
+    /// Waits until the daemon has received `count` requests of `method`, within the deadline.
+    fn until_it_received_count(&self, method: &str, count: usize) {
+        let started = Instant::now();
+        while self.received_count(method) < count {
+            assert!(
+                started.elapsed() < LIVENESS_DEADLINE,
+                "the test daemon never received {count} requests of {method}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Whether the daemon's thread has ended, so that its listener is let go and the endpoint is
@@ -7216,6 +7238,121 @@ fn a_daemon_of_another_generation_that_answers_after_the_stop_is_a_successor() {
     assert!(said.contains("so something started it again"), "{said}");
     drop(held);
     again.end();
+}
+
+/// Waits until the daemon has answered `looks` more reads of `host.info` than it had when this was
+/// called, which only the command's own looks at the endpoint make, or until the command has ended,
+/// whichever comes first: a command that ends first has not waited for the daemon, and the case's
+/// own assertion then says what it said. A command that neither looks again nor ends within the
+/// deadline is a hang, and that is the failure here.
+fn until_the_daemon_is_looked_at_again_or_the_command_ends(
+    daemon: &TestDaemon,
+    running: &mut Running,
+    looks: usize,
+    events: &mut Events,
+) {
+    let before = daemon.received_count("host.info");
+    let waited = Instant::now();
+    loop {
+        if daemon.received_count("host.info") >= before + looks {
+            events.note(&format!("the daemon was looked at {looks} more times"));
+            return;
+        }
+        if running.has_ended() {
+            events.note("the command had ended before the daemon was looked at again");
+            return;
+        }
+        if waited.elapsed() >= LIVENESS_DEADLINE {
+            events.note("the wait for the command's looks reached its bound");
+            panic!(
+                "the command neither looked at the daemon {looks} more times nor ended within {LIVENESS_DEADLINE:?}\n{events}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A daemon that replaced the one that the lock file named, before the command connected, and whose
+/// reply to the request to stop is an unknown outcome while it goes on running: the process that
+/// the lock file named has gone and another holds the environment, and that is no end of the daemon
+/// that was asked, which is the one that still answers. `command` says which command is run, as
+/// the arguments after `kr`, and `requests` how many requests to stop it makes before the stop:
+/// the restart asks first how the daemon was started.
+fn a_daemon_that_replaced_the_one_the_lock_file_named_and_gives_no_outcome(
+    command: &[&str],
+    requests: usize,
+) {
+    let host = Standalone::create();
+    if command.contains(&"restart") {
+        host.run_the_daemon_as_the_started_process();
+        host.select_standalone();
+    }
+    let lock = host.tree.environment().singleton_lock();
+    let held = kr_controller::singleton::SingletonLock::hold(&lock, host.tree.environment_id())
+        .expect("takes the lock");
+    let mut old = a_process_named_kr_controller(&host, "old");
+    let mut successor = a_process_named_kr_controller(&host, "successor");
+    std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
+    let mut daemon = TestDaemon::serve(
+        &host,
+        "kr-controller/9.9.9",
+        OnStop::AnswerTheStopWithError {
+            code: an_error_code_of(kr_protocol::error::RetryCategory::OutcomeUnknown),
+            end: false,
+        },
+        true,
+    );
+    let mut events = Events::begin();
+    let mut running = start(host.kr(command));
+    daemon.until_it_received_count("host.stop", requests);
+    events.note("the daemon received the request to stop");
+    // The process that the lock file named ends, and the lock file names the process that holds the
+    // environment now. The daemon that answers is the one that was asked, and it runs on.
+    old.kill()
+        .expect("ends the process that the lock file named");
+    old.wait().expect("collects it");
+    std::fs::write(&lock, format!("{}\n", successor.id())).expect("names the successor");
+    events.note("the process that the lock file named ended; the successor was named");
+    until_the_daemon_is_looked_at_again_or_the_command_ends(&daemon, &mut running, 2, &mut events);
+    let ended = running.has_ended();
+    if !ended {
+        signal("INT", running.child.as_ref().expect("the child").id());
+    }
+    let output = running.finish(&command.join(" "));
+    let saw = what_the_case_saw(&events, &output);
+    let _ = successor.kill();
+    let _ = successor.wait();
+    drop(held);
+    daemon.end();
+    assert!(
+        !ended,
+        "the command ended while the daemon that was asked still answers and holds the environment\n{saw}"
+    );
+}
+
+/// KR-REQ-07.12 (the identity of the daemon that was asked): `kr host stop` does not end where the
+/// process that the lock file named before the connection has gone, another process holds the
+/// environment, and the daemon that was asked answers its stop with an outcome that is not known
+/// and runs on: the lock file named the daemon that was replaced, and the reply states no process
+/// that would show the asked daemon to be it.
+#[test]
+fn a_stop_of_a_daemon_that_replaced_the_one_the_lock_file_named_does_not_end_while_it_answers() {
+    a_daemon_that_replaced_the_one_the_lock_file_named_and_gives_no_outcome(
+        &["--json", "host", "stop"],
+        1,
+    );
+}
+
+/// KR-REQ-07.12 (the identity of the daemon that was asked): `kr host restart` does not end its
+/// stop where the process that the lock file named before the connection has gone, another process
+/// holds the environment, and the daemon that was asked answers its stop with an outcome that is
+/// not known and runs on, and it starts nothing beside that daemon.
+#[test]
+fn a_restart_of_a_daemon_that_replaced_the_one_the_lock_file_named_does_not_end_while_it_answers() {
+    a_daemon_that_replaced_the_one_the_lock_file_named_and_gives_no_outcome(
+        &["--json", "host", "restart"],
+        2,
+    );
 }
 
 /// KR-REQ-07.12 (a reader never removes): `kr new` with no start chosen says that no daemon runs and
@@ -8171,7 +8308,7 @@ fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
     let mut daemon = TestDaemon::serve_generation(
         &host,
         "kr-controller/9.9.9",
-        OnStop::AnswerTheLaunchThenCut,
+        OnStop::AnswerTheLaunchThenCut(std::process::id()),
         true,
         0,
     );
@@ -8691,7 +8828,7 @@ struct NeverAnswered {
 /// holds the environment and nothing ever answers. The command waits out its bound and fails with
 /// exit 1. The case reads its text, which opens with the stop's own words for what the stop came to
 /// and then says what was read of the successor as an earlier reading.
-fn a_successor_never_answers_after(on_stop: OnStop) -> NeverAnswered {
+fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> NeverAnswered {
     let host = Standalone::create();
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
@@ -8701,7 +8838,10 @@ fn a_successor_never_answers_after(on_stop: OnStop) -> NeverAnswered {
     let mut old = a_process_named_kr_controller(&host, "old");
     let mut successor = a_process_named_kr_controller(&host, "successor");
     std::fs::write(&lock, format!("{}\n", old.id())).expect("names the old daemon");
-    let mut daemon = TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop, true, 0);
+    // The daemon that answers states the process that the lock file named: the connection that
+    // carries the request is the old daemon's.
+    let mut daemon =
+        TestDaemon::serve_generation(&host, "kr-controller/9.9.9", on_stop(old.id()), true, 0);
     let mut events = Events::begin();
     let running = start(host.kr(&["--json", "host", "restart"]));
     events.note(&format!(
@@ -8748,7 +8888,7 @@ fn a_successor_never_answers_after(on_stop: OnStop) -> NeverAnswered {
 /// environment, where no request was made, and never says that the daemon was stopped.
 #[test]
 fn a_successor_that_never_answers_after_a_request_that_could_not_be_made_keeps_the_stops_words() {
-    let silent = a_successor_never_answers_after(OnStop::CloseAfterTheLookAndEnd);
+    let silent = a_successor_never_answers_after(|_| OnStop::CloseAfterTheLookAndEnd);
     let saw = what_the_case_saw(&silent.events, &silent.output);
     let said = document(&silent.output, "kr host restart");
     assert_eq!(silent.output.status.code(), Some(1), "{said}\n{saw}");
