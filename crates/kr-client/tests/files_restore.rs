@@ -16,8 +16,8 @@ use kr_client::error::HostWord;
 use kr_client::recovery::{
     BundleWrite, BundleWriter, BundleWritten, CandidateState, CheckpointRecorded, ExportSource,
     FilesRestore, MemberRefusal, MemberRole, MemberVerdict, OFFLINE_EXPORT_FORMAT, OfflineExport,
-    PublicationRefusal, RecoveryError, RestoreError, RestoreSource, SignInCause, SourceService,
-    SourceSignIn, fresh_locator,
+    PublicationRefusal, RecoveryError, RestoreError, RestoreSource, RetrievalPolicy, SignInCause,
+    SourceService, SourceSignIn, fresh_locator,
 };
 use kr_client::retry::RETRY_BACKOFF_MIN;
 use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition};
@@ -379,6 +379,7 @@ impl Scripted {
         Self {
             service: SourceService {
                 origin: ORIGIN.to_owned(),
+                managed_origin: ORIGIN.to_owned(),
                 sign_in: SourceSignIn::Usable,
             },
             bundle: Mutex::new(Some((world.locator.clone(), bundle))),
@@ -2009,6 +2010,97 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
         RestoreError::NotSignedIn { .. }
     ));
     assert!(signed_out.asked().is_empty());
+}
+
+/// KR-REQ-20.19: the retrieval policy is the configured service's, the managed service's origin as
+/// the host treats it being the managed account and any other a service the owner runs. A host with
+/// no usable sign-in is refused naming the sign-in of that policy, with what is wrong and what to
+/// do, before the kit's service is compared with the configured one and before anything is sent.
+#[tokio::test]
+async fn a_refusal_for_an_unusable_sign_in_names_the_sign_in_of_the_configured_services_policy() {
+    assert_eq!(
+        RetrievalPolicy::for_origin(ORIGIN, ORIGIN),
+        RetrievalPolicy::Account
+    );
+    assert_eq!(
+        RetrievalPolicy::for_origin(OTHER_ORIGIN, ORIGIN),
+        RetrievalPolicy::SelfHosted
+    );
+    let causes = [
+        SignInCause::SignedOut,
+        SignInCause::Ended,
+        SignInCause::Waiting,
+        SignInCause::WithoutScope,
+        SignInCause::NotRenewed,
+    ];
+    let account = [
+        "no account is signed in on this host. Sign this host in with `kr account sign-in`.",
+        "the service ended the sign-in on this host. Sign this host in with `kr account sign-in`.",
+        "a sign-in on this host is waiting to finish. Finish the sign-in at the address `kr \
+         account sign-in` printed.",
+        "the account signed in on this host lacks the backup.write scope. Sign this host in again \
+         with `kr account sign-in`, which asks for backup storage because storage.origin is set.",
+        "this host could not renew the token of the account signed in on this host. This host asks \
+         again by itself. Check that the account service is reachable, or sign this host in again \
+         with `kr account sign-in`.",
+    ];
+    let self_hosted = [
+        "no account is signed in on this host. Sign this host in with `kr account sign-in \
+         --storage`.",
+        "the service ended the sign-in on this host. Sign this host in with `kr account sign-in \
+         --storage`.",
+        "a sign-in on this host is waiting to finish. Finish the sign-in at the address `kr \
+         account sign-in --storage` printed.",
+        "the account signed in on this host lacks the backup.write scope. Sign this host in again \
+         with `kr account sign-in --storage`, which asks for backup storage.",
+        "this host could not renew the token of the account signed in on this host. This host asks \
+         again by itself. Check that the storage service is reachable, or sign this host in again \
+         with `kr account sign-in --storage`.",
+    ];
+    let world = World::new();
+    // The kit names a service the host is not configured for: the refusal for the sign-in comes
+    // first, and the control is that a usable sign-in then gets the refusal by name.
+    let kit = world
+        .seed
+        .to_kit(vec![OTHER_ORIGIN.to_owned()], world.locator.clone());
+    for (managed_origin, policy, sentences) in [
+        (ORIGIN, RetrievalPolicy::Account, account),
+        (
+            "https://managed.example",
+            RetrievalPolicy::SelfHosted,
+            self_hosted,
+        ),
+    ] {
+        for (cause, sentence) in causes.into_iter().zip(sentences) {
+            let mut source = Scripted::serving(&world, world.bundle(&Shape::default()));
+            source.service.managed_origin = managed_origin.to_owned();
+            source.service.sign_in = SourceSignIn::Unusable(cause);
+            let source = Arc::new(source);
+            let refused = FilesRestore::prepare(kit.clone(), Arc::clone(&source) as _, None, None)
+                .await
+                .expect_err("refused");
+            let RestoreError::NotSignedIn {
+                cause: named,
+                policy: named_policy,
+                ..
+            } = refused
+            else {
+                panic!("a sign-in that cannot be used is refused as one: {refused:?}");
+            };
+            assert_eq!(named, cause);
+            assert_eq!(named_policy, policy);
+            assert_eq!(
+                format!("{}. {}", named.why(), named.remedy(named_policy)),
+                sentence
+            );
+            assert!(source.asked().is_empty(), "nothing was sent");
+        }
+    }
+    let usable = Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())));
+    let refused = FilesRestore::prepare(kit, Arc::clone(&usable) as _, None, None)
+        .await
+        .expect_err("refused");
+    assert!(matches!(refused, RestoreError::OriginNotConfigured));
 }
 
 /// An explicit archive has to be one the bundle lists at the configured origin, and without one the

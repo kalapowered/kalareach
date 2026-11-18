@@ -14,7 +14,7 @@ use kr_protocol::ids::{ArchiveId, BackupObjectId};
 use kr_protocol::service::GatewayOrigin;
 
 use crate::recovery::{RestoreSource, SourceService, SourceSignIn, bundle_collection};
-use crate::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
+use crate::services::account::{ACCOUNT_ORIGIN, AccountTokenSource, BACKUP_WRITE_SCOPE};
 use crate::services::{
     BackupManifestService, ManagedBackupManifestService, ManagedStorageService, ManagedSyncService,
     ServiceFuture, ServiceHttp, ServiceSigner, StorageService, SyncBackupService, SyncFetched,
@@ -71,6 +71,7 @@ impl RestoreSource for AccountSource {
         Box::pin(async move {
             Ok(SourceService {
                 origin: self.origin.as_str().to_owned(),
+                managed_origin: ACCOUNT_ORIGIN.to_owned(),
                 sign_in: SourceSignIn::Usable,
             })
         })

@@ -6,7 +6,8 @@
 //! 1. **The kit, then the service.** The kit's checksum is checked before anything is derived. The
 //!    host's configured service must be one the kit names, and the kit's own spelling of that
 //!    origin is what the bundle key is derived from. A service the kit names and the host is not
-//!    configured for is refused by name: this restore reaches the managed account service only.
+//!    configured for is refused by name: this restore reaches the one storage service the host is
+//!    configured for, and no other.
 //! 2. **The bundle, authenticated by the seed.** Every writer, producer and checkpoint a restore
 //!    trusts comes out of a bundle that opens only under the key the seed, the origin and the
 //!    locator derive. Nothing is taken from an archive.
@@ -123,19 +124,39 @@ impl SignInCause {
         }
     }
 
-    /// What a person does about it.
+    /// What a person does about it: the sign-in of the account the retrieval policy reaches the
+    /// service through. A service the owner runs has an account of its own, signed in to with
+    /// `--storage`.
     #[must_use]
-    pub const fn remedy(self) -> &'static str {
-        match self {
-            Self::SignedOut | Self::Ended => "Sign this host in with `kr account sign-in`.",
-            Self::Waiting => "Finish the sign-in at the address `kr account sign-in` printed.",
-            Self::WithoutScope => {
+    pub const fn remedy(self, policy: RetrievalPolicy) -> &'static str {
+        match (policy, self) {
+            (RetrievalPolicy::Account, Self::SignedOut | Self::Ended) => {
+                "Sign this host in with `kr account sign-in`."
+            }
+            (RetrievalPolicy::Account, Self::Waiting) => {
+                "Finish the sign-in at the address `kr account sign-in` printed."
+            }
+            (RetrievalPolicy::Account, Self::WithoutScope) => {
                 "Sign this host in again with `kr account sign-in`, which asks for backup \
                  storage because storage.origin is set."
             }
-            Self::NotRenewed => {
+            (RetrievalPolicy::Account, Self::NotRenewed) => {
                 "This host asks again by itself. Check that the account service is reachable, or \
                  sign this host in again with `kr account sign-in`."
+            }
+            (RetrievalPolicy::SelfHosted, Self::SignedOut | Self::Ended) => {
+                "Sign this host in with `kr account sign-in --storage`."
+            }
+            (RetrievalPolicy::SelfHosted, Self::Waiting) => {
+                "Finish the sign-in at the address `kr account sign-in --storage` printed."
+            }
+            (RetrievalPolicy::SelfHosted, Self::WithoutScope) => {
+                "Sign this host in again with `kr account sign-in --storage`, which asks for \
+                 backup storage."
+            }
+            (RetrievalPolicy::SelfHosted, Self::NotRenewed) => {
+                "This host asks again by itself. Check that the storage service is reachable, or \
+                 sign this host in again with `kr account sign-in --storage`."
             }
         }
     }
@@ -155,6 +176,10 @@ pub enum SourceSignIn {
 pub struct SourceService {
     /// The configured storage origin.
     pub origin: String,
+    /// Where the managed account service is, as the host this source reaches treats it: the
+    /// configured origin is reached through the managed account when it is this, and through the
+    /// account the owner has at a service they run when it is not.
+    pub managed_origin: String,
     /// Whether a bundle read may be sent.
     pub sign_in: SourceSignIn,
 }
@@ -372,13 +397,17 @@ pub enum RestoreError {
     NotSignedIn {
         /// Why no token is usable, and so what mends it.
         cause: SignInCause,
+        /// The retrieval policy of the service the host is configured for, which says which
+        /// account to sign in to.
+        policy: RetrievalPolicy,
         /// The same, in words.
         why: Shown,
     },
     /// The kit names no service this host is configured for.
     ///
-    /// The host reaches the managed account service it is configured for and no other, so a kit
-    /// that names only a self-hosted service cannot be restored here.
+    /// The host reaches the one storage service it is configured for, the managed account service
+    /// or one its owner runs, and no other, so a kit that names only another service cannot be
+    /// restored here.
     #[error("the recovery kit names no service this host is configured for")]
     OriginNotConfigured,
     /// The kit, the bundle or the service refused at the recovery layer.
@@ -1517,9 +1546,13 @@ async fn open_bundle(
     let seed = RecoverySeed::from_kit(&kit)
         .map_err(|_| RestoreError::Recovery(Box::new(RecoveryError::MistypedKit)))?;
     let service = source.service().await?;
+    // The policy comes from the configured service before the sign-in is read, so that a refusal
+    // names the sign-in the service needs whatever the kit names.
+    let policy = RetrievalPolicy::for_origin(&service.origin, &service.managed_origin);
     if let SourceSignIn::Unusable(cause) = service.sign_in {
         return Err(RestoreError::NotSignedIn {
             cause,
+            policy,
             why: Shown::said(cause.why()),
         });
     }
@@ -1543,10 +1576,10 @@ async fn open_bundle(
         answered_absent: AtomicBool::new(false),
         first: std::sync::Mutex::new(None),
     });
-    let mut fresh = FreshRestore::new(kit, RetrievalPolicy::Account);
+    let mut fresh = FreshRestore::new(kit, policy);
     fresh
         .obtained_access(ServiceAccess::new(
-            RetrievalPolicy::Account,
+            policy,
             origin.clone(),
             Arc::clone(&reader) as Arc<dyn SyncBackupService>,
         ))

@@ -8938,6 +8938,8 @@ impl kr_client::recovery::RestoreSource for Relay {
                 BackupReadResult::Service { origin, sign_in } => {
                     assert_eq!(sign_in, BackupSignIn::Usable);
                     Ok(kr_client::recovery::SourceService {
+                        // The daemon of this suite treats its stand-in as the managed service.
+                        managed_origin: origin.clone(),
                         origin,
                         sign_in: kr_client::recovery::SourceSignIn::Usable,
                     })

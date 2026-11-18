@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ClientError;
 use crate::recovery::{RecoveryError, Result};
 use crate::recovery::{RestoreSource, SourceService, SourceSignIn};
+use crate::services::account::ACCOUNT_ORIGIN;
 use crate::services::{ServiceFuture, SyncFetched, SyncPosition, SyncRevision};
 use crate::shown::Shown;
 
@@ -155,6 +156,7 @@ impl RestoreSource for ExportSource {
         Box::pin(async move {
             Ok(SourceService {
                 origin: self.export.service_origin.clone(),
+                managed_origin: ACCOUNT_ORIGIN.to_owned(),
                 sign_in: SourceSignIn::Usable,
             })
         })

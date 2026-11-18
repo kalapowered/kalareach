@@ -3056,7 +3056,13 @@ async fn a_kit_that_names_only_another_service_than_the_configured_one_is_refuse
         .await;
     assert!(!refused.status.success());
     assert!(
-        text(&refused.stderr).contains("storage.origin"),
+        text(&refused.stderr).contains(
+            "the recovery kit names no storage service this host is configured for. This host \
+             reads backups only from the service its storage.origin names. If the kit names a \
+             service you run, write that service's origin into storage.origin, which the daemon \
+             reads when it starts; write it only for a service you run, because this host then \
+             signs in there. Otherwise check storage.origin"
+        ),
         "{}",
         text(&refused.stderr)
     );
@@ -3303,8 +3309,13 @@ async fn a_host_signed_in_to_no_account_at_the_service_its_owner_runs_is_told_to
             .await;
         assert_eq!(refused.status.code(), Some(8), "{}", text(&refused.stderr));
         let said = text(&refused.stderr);
-        assert!(said.contains("no account is signed in"), "{said}");
-        assert!(said.contains("kr account sign-in --storage"), "{said}");
+        assert!(
+            said.contains(
+                "no account is signed in on this host. Sign this host in with `kr account \
+                 sign-in --storage`."
+            ),
+            "{said}"
+        );
     }
     assert_eq!(rig.served.web().requests_to(SYNC), 0);
 }
@@ -3662,6 +3673,8 @@ async fn restore_through_the_library_pausing(
     let source = Arc::new(DaemonSource::new(
         Daemon::open(paths, &selector).await.expect("a connection"),
         pause,
+        // The daemon of this rig treats its stand-in as the managed service.
+        fixture.rig.origin(),
     ));
     let destination = Destination::check(&fixture.into).expect("the folder passes");
     let kit = kr_client::recovery::parse_kit(&fixture.world.kit_text(&[fixture.rig.origin()]))

@@ -158,6 +158,7 @@ async fn restore(
         None => Arc::new(DaemonSource::new(
             Daemon::open(paths, &selector).await?,
             real_pause(),
+            kr_client::services::account::ACCOUNT_ORIGIN,
         )),
     };
 
