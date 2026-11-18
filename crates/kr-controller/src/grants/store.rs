@@ -5131,6 +5131,31 @@ mod tests {
                 ],
             )
             .expect("the receipt is written");
+        let rows = || -> Vec<(i64, Option<Vec<u8>>, i64, Option<String>, Option<String>)> {
+            let connection =
+                Connection::open(&path).expect("the store opens beside the directory's own handle");
+            let mut statement = connection
+                .prepare(
+                    "SELECT claimed_at_ms, result, recorded_at_ms, refusal_code, refusal_detail
+                       FROM authority_receipts ORDER BY action_id",
+                )
+                .expect("the receipts are selected");
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })
+                .expect("the receipts are read")
+                .map(|row| row.expect("a receipt row"))
+                .collect()
+        };
+        let before = rows();
+        assert_eq!(before.len(), 1);
 
         let looked_up = store
             .recorded_action(&actor, action, &digest)
@@ -5146,6 +5171,8 @@ mod tests {
             matches!(claimed, ControllerError::Uncertain { .. }),
             "{claimed:?}"
         );
+        // The record stays, as it was kept, and no claim was made over it.
+        assert_eq!(rows(), before);
     }
 
     /// A policy and the answer to the action that changed it are written together or not at all:
