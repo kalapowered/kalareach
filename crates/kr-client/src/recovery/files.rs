@@ -411,7 +411,7 @@ pub enum RestoreError {
         /// The same, in words.
         why: Shown,
     },
-    /// The kit does not name the service the restore reads from.
+    /// The kit does not name the service that the restore needs.
     ///
     /// A restore through the daemon reads from the one storage service the host is configured for,
     /// the managed account service or one its owner runs, and no other. A restore from an export
