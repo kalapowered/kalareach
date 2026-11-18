@@ -1875,6 +1875,37 @@ mod tests {
         }
     }
 
+    /// KR-REQ-10.08: `kr pair confirm` and the host's answer to a repeat of `pair.confirm` agree on
+    /// the code of every ending that an invitation can sit in the host's open slot under: the host
+    /// answers a repeat with the code that the pairing crate gives the ending, and the command ends
+    /// with that code, so a person who learns of the ending either way reads the same one.
+    #[test]
+    fn confirming_an_invitation_that_ended_ends_with_the_code_the_host_gives_a_repeat() {
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        for reason in [
+            PairingConsumedReason::Denied,
+            PairingConsumedReason::Expired,
+            PairingConsumedReason::Cancelled,
+            PairingConsumedReason::AttemptsExhausted,
+            PairingConsumedReason::HostRestarted,
+            PairingConsumedReason::EndpointPaired,
+        ] {
+            let result = status_without_a_device(PairStatus::Consumed { reason }, false);
+            let Found::Nothing { then, .. } = found_in(invitation_id, &result) else {
+                panic!("an ended invitation has nothing to approve: {reason:?}");
+            };
+            let hosts = kr_pairing::PairingError::Consumed { reason }.code();
+            assert!(
+                then.machine_message()
+                    .as_str()
+                    .starts_with(&format!("{}: ", hosts.as_str())),
+                "{reason:?}: the host's code for a repeat is {}, the command said {}",
+                hosts.as_str(),
+                then.machine_message().as_str()
+            );
+        }
+    }
+
     /// KR-REQ-10.08: the same for an invitation that the host refused for a device it lists: the
     /// status view's second line comes with the first, the host's record of the device where the
     /// view has one and the ended-pairing sentence where it has not, and the command ends with the
