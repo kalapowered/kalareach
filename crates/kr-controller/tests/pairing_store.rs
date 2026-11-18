@@ -2246,6 +2246,25 @@ fn a_record_whose_end_the_host_cannot_prove_counts_as_live_until_it_is_revoked()
     );
     assert_eq!(rows.lifetimes().pending_expiry().owed(), 0);
 
+    // The owner's view reads the same record, and it names a record whose end this host cannot
+    // prove, as the binding counts it live: no view says that the pairing has ended while the
+    // binding still refuses the device.
+    assert!(
+        rows.existing_pairing(listed.device_id)
+            .expect("readable")
+            .is_some(),
+        "the view still names the record whose end the host cannot prove"
+    );
+    let record = directory
+        .record_for_device(listed.device_id)
+        .expect("readable")
+        .expect("the listed record");
+    assert!(
+        record.expired_at_ms.is_none() && record.revoked_at_ms.is_none(),
+        "the view writes no mark: {record:?}"
+    );
+    assert_eq!(rows.lifetimes().pending_expiry().owed(), 0);
+
     assert!(
         directory
             .revoke(listed.device_id, TimestampMs::new(30))
