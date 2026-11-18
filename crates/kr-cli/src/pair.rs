@@ -2016,8 +2016,13 @@ mod tests {
                     06060606-0606-0606-0606-060606060606.";
 
         let bare = status_without_a_device(committed.clone(), false);
-        let Found::Paired { document, line } = found_in(invitation_id, &bare) else {
-            panic!("an approved invitation is found paired");
+        let found = found_in(invitation_id, &bare);
+        assert!(
+            matches!(found, Found::Paired { .. }),
+            "an approved invitation is found paired, and the command ends with success"
+        );
+        let Found::Paired { document, line } = found else {
+            unreachable!("asserted above")
         };
         assert_eq!(
             document.json(),
@@ -2036,8 +2041,13 @@ mod tests {
                 .map_or_else(Nullable::null, Nullable::some)
         };
         let candidate = view.candidate.0.clone().expect("a candidate");
-        let Found::Paired { document, line } = found_in(invitation_id, &named) else {
-            panic!("an approved invitation is found paired");
+        let found = found_in(invitation_id, &named);
+        assert!(
+            matches!(found, Found::Paired { .. }),
+            "an approved invitation is found paired, and the command ends with success"
+        );
+        let Found::Paired { document, line } = found else {
+            unreachable!("asserted above")
         };
         let mut expected = recorded();
         expected["device_name"] = candidate.device_name.as_str().into();
