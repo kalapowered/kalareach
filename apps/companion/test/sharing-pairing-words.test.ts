@@ -81,24 +81,26 @@ describe('the scripted host refusing a share that would outlast a pairing', () =
   }
 
   it('says what the host says, the time left apart, and offers a second pairing only after the pairing has ended', async () => {
-    const { port } = fakeHost()
-    // The scripted host's own record of a short pairing: moving its end gives each time the host
-    // says. The pairing ends 40 minutes from the host's own clock until it is moved.
-    const listed = await port.deviceList({ include_revoked: true })
-    const tablet = listed.devices.find((each) => each.device_id === SHORT_TABLET)
-    if (tablet?.grant_expires_at_ms === null || tablet?.grant_expires_at_ms === undefined) {
-      throw new Error('the scripted host has no short pairing')
-    }
-    const hostNow = Number(tablet.grant_expires_at_ms) - 40 * 60_000
     const sentence = hostSentence()
+    // Each time is half a minute inside its form: the scripted host's clocks are read a few milliseconds
+    // apart, and a time on the edge of a minute would read as the one before it.
     for (const [left, said] of [
-      [40 * 60_000, '40 minutes'],
+      [40 * 60_000 + 30_000, '40 minutes'],
       [30_000, 'less than a minute'],
       [90_000, '1 minute'],
-      [3 * 3_600_000, '3 hours'],
+      [3 * 3_600_000 + 30_000, '3 hours'],
       [2 * 86_400_000 + 3_600_000, '2 days']
     ] as const) {
-      tablet.grant_expires_at_ms = String(hostNow + left)
+      // A host of its own for each time: it holds a refused attempt as under way. Its record of the
+      // short pairing is moved, which gives each time the host says; the pairing ends 40 minutes from
+      // the host's own clock until it is moved.
+      const { port } = fakeHost()
+      const listed = await port.deviceList({ include_revoked: true })
+      const tablet = listed.devices.find((each) => each.device_id === SHORT_TABLET)
+      if (tablet?.grant_expires_at_ms === null || tablet?.grant_expires_at_ms === undefined) {
+        throw new Error('the scripted host has no short pairing')
+      }
+      tablet.grant_expires_at_ms = String(Number(tablet.grant_expires_at_ms) - 40 * 60_000 + left)
       const invitation: GrantCreateParams = {
         session_id: SESSION_MAIN,
         recipient_device_id: SHORT_TABLET,
