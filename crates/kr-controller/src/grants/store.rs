@@ -4221,9 +4221,24 @@ fn subtree_within(connection: &Connection, grant_id: GrantId) -> Result<Vec<Gran
     Ok(found)
 }
 
+#[cfg(feature = "testing")]
+thread_local! {
+    /// How many grant rows this thread has decoded, for the cases that bound what one change of
+    /// the store reads. Compiled away in every shipped build.
+    static GRANT_ROWS_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many grant rows this thread has decoded so far ([`read_row`]).
+#[cfg(test)]
+pub(crate) fn grant_rows_read() -> u64 {
+    GRANT_ROWS_READ.with(std::cell::Cell::get)
+}
+
 /// Reads one grant row. A grant this build cannot read is refused with its table and the grant its
 /// key column names, read apart from the payload, so the row can be found and removed.
 fn read_row(row: &rusqlite::Row<'_>) -> Row {
+    #[cfg(feature = "testing")]
+    GRANT_ROWS_READ.with(|rows| rows.set(rows.get().saturating_add(1)));
     let encoded: Vec<u8> = row.get(0).map_err(ControllerError::registry)?;
     let grant: Grant =
         kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT).map_err(|error| {
@@ -5200,5 +5215,271 @@ mod a_previous_holder_that_is_letting_go {
         kr_flush::release::assert_an_open_succeeds_while_a_holder_maps_the_index(&path, || {
             GrantDirectory::open(&path).map(drop)
         });
+    }
+}
+
+/// What the revocation of one device's grants reads, for trees of every shape the device can hold.
+#[cfg(test)]
+mod a_devices_revocation {
+    use super::*;
+    use kr_protocol::grant::{EnvironmentSelector, HistoryScope, SessionSelector};
+    use kr_protocol::ids::{AuthorityRevision, EnvironmentId};
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::{CanonicalSet, Uuid};
+
+    /// The device a case revokes, and the one that holds what the first is not to lose.
+    const DEVICE: u8 = 1;
+    const OTHER_DEVICE: u8 = 2;
+
+    /// One grant of a case's forest. `number` names it and puts it in the order the store lists a
+    /// device's grants (the identifier's leading bytes, which the listing sorts by); the grants
+    /// are issued in the order of the forest's list, so a parent comes before its children.
+    struct Node {
+        number: u32,
+        parent: Option<u32>,
+        holder: u8,
+    }
+
+    fn id_of(number: u32) -> GrantId {
+        let mut bytes = [0_u8; 16];
+        bytes[..4].copy_from_slice(&number.to_be_bytes());
+        bytes[15] = 0x77;
+        GrantId::new(Uuid::from_bytes(bytes))
+    }
+
+    fn device_of(byte: u8) -> DeviceId {
+        DeviceId::new(Uuid::from_bytes([byte; 16]))
+    }
+
+    fn record_of(node: &Node) -> GrantRecord {
+        let session = SessionId::new(Uuid::from_bytes([0xa0; 16]));
+        GrantRecord {
+            grant: Grant {
+                grant_id: id_of(node.number),
+                parent_grant_id: Nullable(node.parent.map(id_of)),
+                issuer_device_id: device_of(0xf0),
+                recipient_device_id: device_of(node.holder),
+                authority_revision: AuthorityRevision::new(1),
+                environment_selector: EnvironmentSelector::These {
+                    environment_ids: [EnvironmentId::new(Uuid::from_bytes([0xe0; 16]))]
+                        .into_iter()
+                        .collect(),
+                },
+                session_selector: SessionSelector::These {
+                    session_ids: [session].into_iter().collect(),
+                },
+                actions: [ActionRight::SessionView, ActionRight::TerminalInput]
+                    .into_iter()
+                    .collect(),
+                history: HistoryScope {
+                    lower_bound_ms: Nullable::null(),
+                    include_live_screen: false,
+                    named_questions: CanonicalSet::from_iter([]),
+                    named_approvals: CanonicalSet::from_iter([]),
+                },
+                expiry: GrantExpiry::Never,
+                organisation: Nullable::null(),
+            },
+            session_id: Some(session),
+            issued_at_ms: 1_000,
+            activated_at_ms: Some(1_000),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        }
+    }
+
+    /// A forest of `size` grants, the k-th of them numbered `number_of(k)`, with the parent
+    /// `parent_of(k)` names (by k) and the holder `holder_of(k)` names.
+    fn forest(
+        size: u32,
+        number_of: impl Fn(u32) -> u32,
+        parent_of: impl Fn(u32) -> Option<u32>,
+        holder_of: impl Fn(u32) -> u8,
+    ) -> Vec<Node> {
+        (1..=size)
+            .map(|k| Node {
+                number: number_of(k),
+                parent: parent_of(k).map(&number_of),
+                holder: holder_of(k),
+            })
+            .collect()
+    }
+
+    /// One case's forest, and the grant whose subtree the case revokes before the device's
+    /// revocation, when it does.
+    struct Shape {
+        name: &'static str,
+        nodes: Vec<Node>,
+        beforehand: Option<u32>,
+    }
+
+    /// Every shape of grants one device can hold, `size` grants each: a tree or a chain the device
+    /// holds whole, with its ancestors listed first and last; many roots; a tree the device holds a
+    /// part of, whose root another device holds, so that the walk starts below a root that is not
+    /// the device's and one grant the device holds lies below another it holds; and a tree held
+    /// whole with a subtree of it, and with all of it, revoked beforehand.
+    fn shapes(size: u32) -> Vec<Shape> {
+        let ancestors_first = |k: u32| k;
+        let ancestors_last = move |k: u32| size + 1 - k;
+        let tree = |k: u32| (k > 1).then_some(k / 2);
+        let chain = |k: u32| (k > 1).then_some(k - 1);
+        let no_parent = |_: u32| None;
+        let the_device = |_: u32| DEVICE;
+        let shape = |name: &'static str, nodes: Vec<Node>, beforehand: Option<u32>| Shape {
+            name,
+            nodes,
+            beforehand,
+        };
+        vec![
+            shape(
+                "a tree held whole, ancestors listed first",
+                forest(size, ancestors_first, tree, the_device),
+                None,
+            ),
+            shape(
+                "a tree held whole, ancestors listed last",
+                forest(size, ancestors_last, tree, the_device),
+                None,
+            ),
+            shape(
+                "a chain held whole, ancestors listed first",
+                forest(size, ancestors_first, chain, the_device),
+                None,
+            ),
+            shape(
+                "a chain held whole, ancestors listed last",
+                forest(size, ancestors_last, chain, the_device),
+                None,
+            ),
+            shape(
+                "many roots",
+                forest(size, ancestors_first, no_parent, the_device),
+                None,
+            ),
+            shape(
+                "a tree held in part, below a root another device holds",
+                forest(size, ancestors_first, tree, |k| {
+                    if k % 2 == 0 { DEVICE } else { OTHER_DEVICE }
+                }),
+                None,
+            ),
+            shape(
+                "a tree held whole, a subtree of it revoked beforehand",
+                forest(size, ancestors_last, tree, the_device),
+                Some(size - 1),
+            ),
+            shape(
+                "a tree held whole, all of it revoked beforehand",
+                forest(size, ancestors_first, tree, the_device),
+                Some(1),
+            ),
+        ]
+    }
+
+    /// How many grants the device's revocation withdraws from `shape`, counted from the forest
+    /// alone: the grants not revoked beforehand that the device holds, or that lie below one it
+    /// holds.
+    fn withdrawn(shape: &Shape) -> usize {
+        let parents: BTreeMap<u32, Option<u32>> = shape
+            .nodes
+            .iter()
+            .map(|node| (node.number, node.parent))
+            .collect();
+        let holders: BTreeMap<u32, u8> = shape
+            .nodes
+            .iter()
+            .map(|node| (node.number, node.holder))
+            .collect();
+        let line = |number: u32| std::iter::successors(Some(number), |above| parents[above]);
+        shape
+            .nodes
+            .iter()
+            .filter(|node| {
+                let revoked_beforehand = shape
+                    .beforehand
+                    .is_some_and(|root| line(node.number).any(|number| number == root));
+                !revoked_beforehand && line(node.number).any(|number| holders[&number] == DEVICE)
+            })
+            .count()
+    }
+
+    /// How many of the shape's grants the device holds.
+    fn held(shape: &Shape) -> u64 {
+        let held = shape
+            .nodes
+            .iter()
+            .filter(|node| node.holder == DEVICE)
+            .count();
+        u64::try_from(held).expect("a count")
+    }
+
+    /// A store holding `shape`.
+    fn store_of(shape: &Shape) -> GrantDirectory {
+        let store = GrantDirectory::in_memory().expect("a grant store");
+        for node in &shape.nodes {
+            store
+                .issue(&record_of(node), || Ok(()))
+                .expect("the grant is issued");
+        }
+        if let Some(number) = shape.beforehand {
+            store
+                .revoke(id_of(number), 2_000, || Ok(()))
+                .expect("the subtree is revoked beforehand");
+        }
+        store
+    }
+
+    /// A device's revocation decodes each grant row of the store a bounded number of times, however
+    /// many grants the device holds and in whatever order the store lists them: a revocation that
+    /// reads the whole store again for every grant the device holds does work that grows with the
+    /// square of what the device holds, and a tree of the most grants a notice names takes minutes
+    /// to revoke that way. A device with nothing left to withdraw decodes its own rows and no
+    /// other.
+    #[test]
+    fn reads_each_grant_row_a_bounded_number_of_times_whatever_the_shape() {
+        const SMALL: u32 = 64;
+        let mut failures = Vec::new();
+        let small = shapes(SMALL);
+        let large = shapes(2 * SMALL);
+        for (small, large) in small.iter().zip(&large) {
+            let mut decoded = Vec::new();
+            for shape in [small, large] {
+                let store = store_of(shape);
+                let rows = u64::try_from(shape.nodes.len()).expect("a count");
+                let before = grant_rows_read();
+                let revocation = store
+                    .revoke_device(device_of(DEVICE), 5_000, || Ok(()), None)
+                    .expect("the device's grants are revoked");
+                let reads = grant_rows_read() - before;
+                let withdrawn = withdrawn(shape);
+                assert_eq!(
+                    revocation.revoked.len(),
+                    withdrawn,
+                    "{}, {rows} grants: what the revocation withdrew",
+                    shape.name
+                );
+                if reads > 3 * rows {
+                    failures.push(format!(
+                        "{}: {rows} grants held, {reads} rows decoded, more than three times the rows",
+                        shape.name
+                    ));
+                }
+                if withdrawn == 0 && reads != held(shape) {
+                    failures.push(format!(
+                        "{}: nothing left to withdraw, and {reads} rows decoded for {} held",
+                        shape.name,
+                        held(shape)
+                    ));
+                }
+                decoded.push(reads);
+            }
+            if decoded[1] > 2 * decoded[0] + 3 {
+                failures.push(format!(
+                    "{}: {} rows decoded at {SMALL} grants and {} at twice that, more than twice and a constant",
+                    small.name, decoded[0], decoded[1]
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }
