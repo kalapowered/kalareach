@@ -223,8 +223,12 @@ impl OnItsWay {
 
         gate.notify_one();
         admissions.before_dial(&relays, &host, key(0x22)).await;
+        // The dial's wait ends after 20 ms whether or not the request has, so the first answer is
+        // waited for itself before the clock moves.
+        service.answered_to(1).await;
         clock.advance(Duration::from_secs(started));
         admissions.before_dial(&relays, &host, key(0x22)).await;
+        service.asked_to(2).await;
         assert_eq!(service.asks(), 2, "the second request is on its way");
         Self {
             clock,
