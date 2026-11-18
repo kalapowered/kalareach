@@ -1742,6 +1742,226 @@ mod tests {
         assert_eq!(cells[2][4], '\u{2588}');
     }
 
+    /// The status of an invitation as its issuing owner reads it, with no device that waits for
+    /// approval, and the view that goes with it.
+    fn status_without_a_device(status: PairStatus, existing: bool) -> PairStatusResult {
+        use crate::output::planted::planted;
+
+        let mut view = planted::<PairStatusResult>()
+            .into_iter()
+            .find_map(|result| result.owner.0)
+            .expect("a result with an owner's view");
+        view.candidate = Nullable::null();
+        view.approval = Nullable::null();
+        view.existing = existing.then(|| kr_protocol::invitation::ExistingPairing {
+            device_name: kr_protocol::pairing::DeviceName::new("Ana phone").expect("a name"),
+            paired_at_ms: TimestampMs::new(1_767_225_600_000),
+        });
+        PairStatusResult {
+            status,
+            owner: Nullable::some(view),
+        }
+    }
+
+    fn found_in(invitation_id: InvitationId, result: &PairStatusResult) -> Found {
+        let view = result.owner.0.as_ref().expect("an owner's view");
+        found(invitation_id, result, view)
+    }
+
+    fn joined(lines: &[Line]) -> String {
+        lines
+            .iter()
+            .map(|line| line.text().to_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// KR-REQ-10.08: `kr pair confirm` says about an invitation that ended what `kr pair status`
+    /// says, letter for letter, and asks for no approval. It ends with the code that the host gives
+    /// a repeat of `pair.confirm` for that ending: the general rejection for a denial, a withdrawal,
+    /// a restart and the listed-device ending, and the codes of their own for an invitation that
+    /// ran out of time and one that ran out of guesses.
+    #[test]
+    fn confirming_an_invitation_that_ended_says_what_status_says_and_asks_for_no_approval() {
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        for (reason, code, ending) in [
+            (
+                PairingConsumedReason::Denied,
+                "PAIRING_REJECTED",
+                "the device was denied",
+            ),
+            (
+                PairingConsumedReason::Expired,
+                "PAIRING_EXPIRED",
+                "the invitation ran out of time",
+            ),
+            (
+                PairingConsumedReason::Cancelled,
+                "PAIRING_REJECTED",
+                "the invitation was withdrawn",
+            ),
+            (
+                PairingConsumedReason::AttemptsExhausted,
+                "PAIRING_ATTEMPTS_EXHAUSTED",
+                "too many wrong codes were tried",
+            ),
+            (
+                PairingConsumedReason::HostRestarted,
+                "PAIRING_REJECTED",
+                "the host restarted before it finished",
+            ),
+        ] {
+            let result = status_without_a_device(PairStatus::Consumed { reason }, false);
+            let Found::Nothing { said, then } = found_in(invitation_id, &result) else {
+                panic!("an ended invitation has nothing to approve: {reason:?}");
+            };
+            assert_eq!(
+                joined(&said),
+                format!("Invitation {invitation_id}: ended: {ending}."),
+                "{reason:?}: the command says what `kr pair status` says"
+            );
+            assert_eq!(
+                joined(&said),
+                joined(&describe_status(invitation_id, &result, 0)),
+                "{reason:?}: letter for letter"
+            );
+            assert_eq!(
+                then.machine_message().as_str(),
+                format!(
+                    "{code}: There is nothing to approve. To pair a device, issue a new invitation."
+                ),
+                "{reason:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-10.08: the same for an invitation that the host refused for a device it lists: the
+    /// status view's second line comes with the first, the host's record of the device where the
+    /// view has one and the ended-pairing sentence where it has not, and the command ends with the
+    /// general rejection, which is what the host gives a repeat of `pair.confirm`.
+    #[test]
+    fn confirming_an_invitation_refused_for_a_listed_device_says_what_status_says() {
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        let listed = PairStatus::Consumed {
+            reason: PairingConsumedReason::EndpointPaired,
+        };
+        for (existing, second) in [
+            (
+                true,
+                "The device that used this invitation is already paired with this host as Ana phone \
+                 since 2026-01-01 00:00:00 UTC. Remove that pairing, then issue a new invitation.",
+            ),
+            (
+                false,
+                "The device that used this invitation was paired with this host, and that pairing \
+                 has ended.",
+            ),
+        ] {
+            let result = status_without_a_device(listed.clone(), existing);
+            let Found::Nothing { said, then } = found_in(invitation_id, &result) else {
+                panic!("an ended invitation has nothing to approve");
+            };
+            assert_eq!(
+                joined(&said),
+                format!(
+                    "Invitation {invitation_id}: ended: the device was already paired with this \
+                     host.\n{second}"
+                ),
+                "existing: {existing}"
+            );
+            assert_eq!(
+                joined(&said),
+                joined(&describe_status(invitation_id, &result, 0)),
+                "existing: {existing}: letter for letter"
+            );
+            assert_eq!(
+                then.machine_message().as_str(),
+                "PAIRING_REJECTED: There is nothing to approve.",
+                "existing: {existing}"
+            );
+        }
+    }
+
+    /// KR-REQ-10.08: an invitation that is still open, with no device that waits for approval, says
+    /// that no device has answered it, and one whose device proved the code and is finishing says
+    /// that, so the owner knows to run the command again when the new device shows its value.
+    #[test]
+    fn confirming_an_invitation_no_device_waits_on_says_where_it_stands() {
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        let open = status_without_a_device(
+            PairStatus::Open {
+                remaining_confirmations: 3,
+                expires_at_ms: TimestampMs::new(1_764_000_300_000),
+            },
+            false,
+        );
+        let Found::Nothing { said, then } = found_in(invitation_id, &open) else {
+            panic!("no device waits");
+        };
+        assert!(said.is_empty(), "nothing is said first");
+        assert_eq!(
+            then.machine_message().as_str(),
+            "PERMISSION_DENIED: no device has answered this invitation yet: approve it once the \
+             new device shows its verification value"
+        );
+        let locked = status_without_a_device(
+            PairStatus::Locked {
+                attempt_id: kr_protocol::ids::AttemptId::new(Uuid::from_bytes([3; 16])),
+                expires_at_ms: TimestampMs::new(1_764_000_300_000),
+            },
+            false,
+        );
+        let Found::Nothing { said, then } = found_in(invitation_id, &locked) else {
+            panic!("no device waits yet");
+        };
+        assert!(said.is_empty(), "nothing is said first");
+        assert_eq!(
+            then.machine_message().as_str(),
+            "PERMISSION_DENIED: a device has proved the code and is finishing: approve it once the \
+             new device shows its verification value"
+        );
+    }
+
+    /// KR-REQ-10.08: an invitation that was approved already is the state a second run wants, so the
+    /// command ends with success and names what the host recorded: the device and the grant from the
+    /// status, and the device's name and platform where the view carries the candidate. Where the
+    /// view carries none, the command says the same and invents nothing.
+    #[test]
+    fn confirming_an_invitation_approved_already_finds_what_the_host_recorded() {
+        let invitation_id = InvitationId::new(Uuid::from_bytes([9; 16]));
+        let device_id = DeviceId::new(Uuid::from_bytes([5; 16]));
+        let grant_id = GrantId::new(Uuid::from_bytes([6; 16]));
+        let committed = PairStatus::Committed {
+            device_id,
+            grant_id,
+        };
+        let bare = status_without_a_device(committed.clone(), false);
+        let Found::Paired {
+            device_id: found_device,
+            grant_id: found_grant,
+            candidate,
+        } = found_in(invitation_id, &bare)
+        else {
+            panic!("an approved invitation is found paired");
+        };
+        assert_eq!(found_device, device_id);
+        assert_eq!(found_grant, grant_id);
+        assert!(candidate.is_none(), "the view carries no candidate");
+
+        let mut named = bare;
+        named.owner.0.as_mut().expect("a view").candidate = {
+            use crate::output::planted::planted;
+            planted::<PairStatusResult>()
+                .into_iter()
+                .find_map(|result| result.owner.0.and_then(|view| view.candidate.0))
+                .map_or_else(Nullable::null, Nullable::some)
+        };
+        let Found::Paired { candidate, .. } = found_in(invitation_id, &named) else {
+            panic!("an approved invitation is found paired");
+        };
+        assert!(candidate.is_some(), "the view's candidate is kept");
+    }
+
     /// KR-REQ-10.08: the issuing view of an invitation that ended because the device is already
     /// paired says which pairing stands, from the host's own record of it, and where the view
     /// carries no record, because the pairing was removed or ran out, says that it has ended and
