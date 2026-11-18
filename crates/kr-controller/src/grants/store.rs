@@ -5131,7 +5131,8 @@ mod tests {
                 ],
             )
             .expect("the receipt is written");
-        let rows = || -> Vec<(i64, Option<Vec<u8>>, i64, Option<String>, Option<String>)> {
+        type ReceiptRow = (i64, Option<Vec<u8>>, i64, Option<String>, Option<String>);
+        let rows = || -> Vec<ReceiptRow> {
             let connection =
                 Connection::open(&path).expect("the store opens beside the directory's own handle");
             let mut statement = connection

@@ -4177,7 +4177,8 @@ fn a_refusal_kept_under_a_code_this_build_lacks_is_an_unknown_outcome_on_every_p
             .state
     };
     let before = state();
-    let kept = || -> Vec<(String, Option<Vec<u8>>, Option<String>, Option<String>)> {
+    type KeptRow = (String, Option<Vec<u8>>, Option<String>, Option<String>);
+    let kept = || -> Vec<KeptRow> {
         let journal = rusqlite::Connection::open(kr_transfer::StagingArea::store_path(
             &harness.host.environment(),
         ))

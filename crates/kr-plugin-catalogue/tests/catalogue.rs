@@ -9004,33 +9004,31 @@ async fn a_receipt_kept_under_a_code_this_build_lacks_stops_the_lookup_and_the_c
         method_version: 1,
         deadline_ms: None,
     };
-    let rows =
-        |catalogue: &Catalogue| -> Vec<(String, String, i64, Option<Vec<u8>>, Option<String>)> {
-            let database = rusqlite::Connection::open(
-                catalogue
-                    .root()
-                    .join(kr_plugin_catalogue::db::DATABASE_FILE),
-            )
-            .expect("opens the database");
-            let mut statement = database
-                .prepare(
-                    "SELECT action, state, revision, result, error FROM receipts ORDER BY action",
-                )
-                .expect("selects the receipts");
-            statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                })
-                .expect("reads the receipts")
-                .map(|row| row.expect("a receipt row"))
-                .collect()
-        };
+    type ReceiptRow = (String, String, i64, Option<Vec<u8>>, Option<String>);
+    let rows = |catalogue: &Catalogue| -> Vec<ReceiptRow> {
+        let database = rusqlite::Connection::open(
+            catalogue
+                .root()
+                .join(kr_plugin_catalogue::db::DATABASE_FILE),
+        )
+        .expect("opens the database");
+        let mut statement = database
+            .prepare("SELECT action, state, revision, result, error FROM receipts ORDER BY action")
+            .expect("selects the receipts");
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .expect("reads the receipts")
+            .map(|row| row.expect("a receipt row"))
+            .collect()
+    };
 
     // The catalogue's own writer keeps the refusal.
     assert_eq!(

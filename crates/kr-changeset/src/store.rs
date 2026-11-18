@@ -2973,7 +2973,8 @@ mod tests {
             )
             .expect("the claim settles with a refusal");
 
-        let kept = |store: &Store| -> (i64, Option<Vec<u8>>, Option<String>, Option<String>) {
+        type KeptRow = (i64, Option<Vec<u8>>, Option<String>, Option<String>);
+        let kept = |store: &Store| -> KeptRow {
             store
                 .connection
                 .query_row(

@@ -1853,7 +1853,7 @@ mod tests {
     #[tokio::test]
     async fn a_plan_whose_step_holds_a_refusal_code_this_build_lacks_is_unreadable_and_stays_whole()
     {
-        use crate::error::Said as _;
+        use kr_client::shown::Said as _;
 
         fn replace(value: CanonicalValue, from: &str, to: &str) -> CanonicalValue {
             match value {

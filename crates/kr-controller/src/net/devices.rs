@@ -3125,7 +3125,8 @@ mod tests {
             message: "the declaration is not signed by the recorded key".to_owned(),
         })
         .expect("encodes");
-        let table = |directory: &DeviceDirectory| -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        type DeclarationRow = (Vec<u8>, Vec<u8>, Vec<u8>);
+        let table = |directory: &DeviceDirectory| -> Vec<DeclarationRow> {
             let connection = directory
                 .connection
                 .lock()
