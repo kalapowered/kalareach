@@ -39,20 +39,16 @@ use crate::scalars::{DurationMs, Nullable, to_base64url};
 #[derive(Clone, PartialEq, Eq)]
 pub struct ParamsValue(CanonicalValue);
 
-/// Prints how large the value is and a prefix of its digest, and nothing it holds.
+/// Prints that a value is there and nothing it holds, not even its size or a digest.
 ///
-/// Parameters can carry what a person said, and a log line or a panic message that formats a
-/// request must not carry it. The size and the digest are enough to tell two values apart.
+/// Parameters can carry what a person said or a credential, and a log line or a panic message that
+/// formats a request must not carry it. A length or a digest prefix would still correlate one
+/// secret request with another, and the client builds the value before it knows which method it
+/// belongs to, so one rule covers every value: the envelope's own form keeps the method, the action
+/// identifier and the payload digest for telling two requests apart.
 impl core::fmt::Debug for ParamsValue {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let encoded = kr_cbor::encode(&self.0);
-        let digest = kr_cbor::sha256(&encoded);
-        write!(
-            formatter,
-            "ParamsValue({} bytes, sha256 {}..)",
-            encoded.len(),
-            to_base64url(&digest[..6])
-        )
+        formatter.write_str("ParamsValue(redacted)")
     }
 }
 
