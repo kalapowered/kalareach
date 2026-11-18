@@ -107,6 +107,12 @@ impl Rig {
         Self::start_over(Arc::new(serve().await), |_| {}, true).await
     }
 
+    /// As [`Self::start_owner_run`], for a host that stands before its daemon starts as `prepare`
+    /// leaves it.
+    async fn start_owner_run_with(prepare: impl FnOnce(&kr_ipc::testing::TempHost)) -> Self {
+        Self::start_over(Arc::new(serve().await), prepare, true).await
+    }
+
     /// A host that stands before its daemon starts as `prepare` leaves it.
     async fn start_with(prepare: impl FnOnce(&kr_ipc::testing::TempHost)) -> Self {
         Self::start_at(Arc::new(serve().await), prepare).await
@@ -1769,6 +1775,88 @@ async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_
         serde_json::from_slice(&files["configuration.json"]).expect("the configuration is JSON");
     assert_eq!(restored_configuration, source);
     // The session's document carries the output it wrote.
+    let document: Value = serde_json::from_slice(&files["session-0001.json"]).expect("a document");
+    let mut carried = Vec::new();
+    for chunk in document["output"]["chunks"]
+        .as_array()
+        .expect("the document's chunks")
+    {
+        carried.extend(
+            kr_protocol::scalars::from_base64url(chunk["base64url"].as_str().expect("text"))
+                .expect("base64url"),
+        );
+    }
+    assert!(
+        text(&carried).contains("the output this session wrote"),
+        "{}",
+        text(&carried)
+    );
+}
+
+/// KR-REQ-20.19 and KR-ACC-033, end to end at a service the owner runs: a host whose storage is that
+/// service is set up through `kr` at a terminal, the kit it prints names that service and not the
+/// managed one, and a fresh host configured for that service, with nothing but the kit, restores the
+/// session that closed on the set up host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_host_at_the_service_its_owner_runs_restores_from_the_kit_a_set_up_host_printed() {
+    let output = b"the output this session wrote\r\n";
+    let rig = Rig::start_owner_run_with(|host| {
+        closed_session(host, output, 9_000);
+    })
+    .await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let kit = window.bring_up_the_kit();
+    window.confirm(&kit);
+    window.wait_for("kr ended 0");
+    assert_eq!(
+        parse_kit(&kit.text)
+            .expect("the kit shown is a recovery kit")
+            .service_origins,
+        [rig.origin().to_owned()],
+        "the kit names the service the owner runs and not the managed one"
+    );
+
+    let BackupSetupState::Committed { archive_id, .. } = rig.status().await.setup else {
+        panic!("the host is set up");
+    };
+    rig.until_published(archive_id, 1).await;
+
+    // A fresh host configured for the same service: its own state directory, and the kit as the
+    // only thing it is given.
+    let fresh = Rig::start_over(Arc::clone(&rig.served), |_| {}, true).await;
+    let kit_file = fresh.work.join("kit.txt");
+    std::fs::write(&kit_file, &kit.text).expect("the kit file");
+    let into = fresh.work.join("restored");
+    std::fs::create_dir(&into).expect("a folder to fill");
+    let kit_arg = kit_file.display().to_string();
+    let into_arg = into.display().to_string();
+    let preview = fresh.run(&[
+        "backup",
+        "restore",
+        "--into",
+        &into_arg,
+        "--kit-file",
+        &kit_arg,
+        "--preview",
+        "--json",
+    ]);
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
+    assert_eq!(plan["archive"], archive_id.get().to_string());
+    let digest = plan["digest"].as_str().expect("a digest").to_owned();
+    let restored = fresh.run(&[
+        "backup",
+        "restore",
+        "--into",
+        &into_arg,
+        "--kit-file",
+        &kit_arg,
+        "--confirm-plan",
+        &digest,
+        "--json",
+    ]);
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+    let files = tree(&into);
     let document: Value = serde_json::from_slice(&files["session-0001.json"]).expect("a document");
     let mut carried = Vec::new();
     for chunk in document["output"]["chunks"]
