@@ -88,6 +88,9 @@ pub struct Report {
     pub heartbeats: usize,
     /// Every text frame read from a device, whatever became of it.
     pub frames: Vec<String>,
+    /// Every request frame read from a device, in the order read, as soon as it is read: a request
+    /// that the route holds is here, and is in neither `frames` nor `sent` until it is taken up.
+    pub arrived: Vec<String>,
     /// The requests it sent on to the provider, each once.
     pub sent: Vec<Sent>,
     /// The reasons it refused requests for, in order.
@@ -515,6 +518,14 @@ where
                 }
                 let Some(text) = message.as_text() else { continue };
                 if text.contains(r#""type":"context""#) {
+                    shared
+                        .state
+                        .lock()
+                        .expect("the route's state")
+                        .report
+                        .arrived
+                        .push(text.to_owned());
+                    shared.changed.notify_waiters();
                     while_requests_are_held(&shared).await;
                 }
                 let (answers, drop_after) = answer(&shared, text);
