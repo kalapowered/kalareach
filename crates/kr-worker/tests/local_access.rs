@@ -1502,6 +1502,57 @@ fn a_statement_that_waits_for_a_hold_of_the_boundary_has_already_refused_what_a_
     on_a_runtime(the_requests_of_a_window_while_a_statement_waits());
 }
 
+/// What a statement that takes nothing away meets while a holder keeps the dispatch boundary:
+/// the worker owes no withdrawal for it, so nothing is left for the hold to end, and its
+/// acknowledgement does not wait for the hold.
+///
+/// With `repeat` the daemon first tells the worker `open(1)` and then tells it again, a statement
+/// the worker already holds, as the daemon does at the start of every link it opens and before
+/// each announcement of a revision. Without it the held statement is the worker's first: the host
+/// opens a worker that was born closed. Returns whether the daemon had its acknowledgement by the
+/// deadline while the holder was still in place.
+async fn a_statement_that_takes_nothing_away_while_the_boundary_is_held(repeat: bool) -> bool {
+    let world = Arc::new(world("exec cat", true).await);
+    let mut daemon = world.authority(1).await;
+    if repeat {
+        tell(&mut daemon, open(1)).await;
+    }
+    let deadline = std::time::Instant::now() + LIVENESS_DEADLINE;
+    let let_go = hold_the_boundary(&world, deadline)
+        .await
+        .expect("the boundary was never held");
+    let (acknowledged, told_end) = start_the_statement(daemon, open(1));
+    let seen = Arc::clone(&acknowledged);
+    let answered = holds_by(deadline, move || is_set(&seen)).await;
+    // The hold goes whatever came of the wait, so that the case ends and nothing outlives it.
+    let _ = let_go.send(());
+    let _ = received_by(deadline, told_end).await;
+    world.close();
+    answered
+}
+
+/// KR-REQ-17.54: a statement that opens a worker that was born closed is acknowledged while a
+/// holder keeps the dispatch boundary: it takes no access away, so no withdrawal waits on the hold.
+#[test]
+fn a_statement_that_opens_a_closed_worker_is_acknowledged_while_a_holder_keeps_the_boundary() {
+    assert!(
+        on_a_runtime(a_statement_that_takes_nothing_away_while_the_boundary_is_held(false)),
+        "the statement that opens the worker was not acknowledged while the boundary was held"
+    );
+}
+
+/// KR-REQ-17.54: a repeat of a statement the worker already holds is acknowledged while a holder
+/// keeps the dispatch boundary, so that the daemon's announcement of a revision, which a repeat
+/// precedes on the daemon's one link, reaches a worker whose boundary is held and is refused there
+/// at once.
+#[test]
+fn a_repeat_of_the_statement_the_worker_holds_is_acknowledged_while_a_holder_keeps_the_boundary() {
+    assert!(
+        on_a_runtime(a_statement_that_takes_nothing_away_while_the_boundary_is_held(true)),
+        "the repeat of the held statement was not acknowledged while the boundary was held"
+    );
+}
+
 /// A window whose connection a restriction withdrew, and that attaches again once the host is open.
 async fn the_attach_of_a_withdrawn_connection() {
     let world = Arc::new(world("exec cat", true).await);
