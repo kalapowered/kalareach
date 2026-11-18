@@ -101,6 +101,8 @@ function actions(): VoiceSurfaceActions {
     stopPlayback: vi.fn(),
     hangUp: vi.fn(),
     endSetup: vi.fn(),
+    startAfter: vi.fn(),
+    dismissStart: vi.fn(),
     cancelTask: vi.fn(),
     readSelection: vi.fn()
   }
@@ -863,5 +865,76 @@ describe('while a call is running', () => {
     for (const control of screen.getAllByRole('button')) {
       expect(control).toHaveAccessibleName()
     }
+  })
+})
+
+describe('a start the host never confirmed', () => {
+  // KR-REQ-23.24: a notice of an unconfirmed start is acted on without a new call being hidden
+  // behind a plain Start: "Start again" names the earlier start, "Dismiss" only hides the notice.
+  it('offers Start again and Dismiss beside the notice, each naming the earlier start', async () => {
+    const control = actions()
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        aftermath={[
+          { words: 'The host never said whether it created the call.', startAction: 'action-1' },
+          { words: 'Something else the last call left.', startAction: null }
+        ]}
+        actions={control}
+      />
+    )
+
+    expect(screen.getAllByRole('button', { name: 'Start again' })).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: 'Dismiss' })).toHaveLength(1)
+    expect(
+      screen.getByText(
+        'This asks for a new call. The earlier call may still be running, and you may be charged for both.'
+      )
+    ).toBeInTheDocument()
+    expect(
+      screen.getByText('This hides the notice on this device. It does not stop a call.')
+    ).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Start again' }))
+    expect(control.startAfter).toHaveBeenCalledWith('action-1')
+    expect(control.start).not.toHaveBeenCalled()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(control.dismissStart).toHaveBeenCalledWith('action-1')
+  })
+
+  // The host's refusal names an earlier start the device keeps: only then is Start again offered,
+  // and a refusal has nothing to dismiss.
+  it('offers Start again beside a refusal only when it names a start the device keeps', () => {
+    const { rerender } = render(
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice="Nothing was started."
+        noticeStartAgain={null}
+        actions={actions()}
+      />
+    )
+    expect(screen.queryByRole('button', { name: 'Start again' })).toBeNull()
+
+    rerender(
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice="Nothing was started."
+        noticeStartAgain="action-2"
+        actions={actions()}
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Start again' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull()
   })
 })

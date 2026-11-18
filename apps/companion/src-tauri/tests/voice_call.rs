@@ -2935,8 +2935,89 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
     scene.stand_in.release_creations();
     let prepared = scene.prepared().await;
     let _ = scene.call("voice_start", scene.start_request(&prepared));
+    // A later start that passed the host's hold shows that the host read this one's request, but
+    // not that it admitted it: the notice is hidden and the start is kept, so a later refusal
+    // that names it can still be matched.
     let later = scene.state();
-    assert_eq!(later["owed"][0]["action_id"], action_id.as_str(), "{later}");
+    assert!(
+        later["owed"]
+            .as_array()
+            .expect("the entries")
+            .iter()
+            .all(|owed| owed["action_id"] != action_id.as_str()),
+        "{later}"
+    );
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the kept file"),
+    )
+    .expect("a file");
+    let kept = file["owed"]
+        .as_array()
+        .expect("the entries")
+        .iter()
+        .find(|owed| owed["action_id"] == action_id.as_str())
+        .unwrap_or_else(|| panic!("the unanswered start is kept: {file}"));
+    assert_eq!(kept["kind"], "start_unanswered", "{file}");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A start that names an earlier start is sent only for a start this device keeps for that host.
+/// One it does not keep is refused before anything is sent, in words that say so; one it keeps
+/// is sent, and when the host passes it the earlier start stays, hidden, and the call runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_names_an_earlier_start_only_when_this_device_keeps_it() {
+    let timings = Timings {
+        host_within: Duration::from_millis(300),
+        ..asking_again()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.hold_creations();
+    let started = scene.start().await;
+    let earlier = started["action_id"]
+        .as_str()
+        .expect("the action")
+        .to_owned();
+    let prepared = scene.prepared().await;
+    let sent = scene.link.sent(HostMethod::VoiceStart);
+
+    let mut unkept = scene.start_request(&prepared);
+    unkept["afterActionId"] = json!("00000000-0000-4000-8000-000000000000");
+    let missing = scene
+        .call("voice_start", unkept)
+        .expect_err("a start cannot name a start this device does not keep");
+    assert_eq!(missing["code"], "INVALID_ARGUMENT", "{missing}");
+    assert!(
+        missing["message"]
+            .as_str()
+            .is_some_and(|words| words.starts_with("Nothing was sent.")),
+        "{missing}"
+    );
+    assert_eq!(
+        scene.link.sent(HostMethod::VoiceStart),
+        sent,
+        "nothing was sent for the start that named nothing this device keeps"
+    );
+
+    scene.stand_in.release_creations();
+    let mut named = scene.start_request(&prepared);
+    named["afterActionId"] = json!(earlier);
+    let answered = scene
+        .call("voice_start", named)
+        .expect("a start that names a kept start is sent");
+    assert!(
+        answered["value"]["outcome"]["started"].is_object(),
+        "{answered}"
+    );
+    let shown = scene.state();
+    assert!(
+        shown["owed"]
+            .as_array()
+            .expect("the entries")
+            .iter()
+            .all(|owed| owed["action_id"] != earlier.as_str()),
+        "{shown}"
+    );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }
@@ -3598,6 +3679,7 @@ fn request_of(scene: &Scene, prepared: &serde_json::Value) -> companion_tauri::v
             .as_str()
             .map(str::to_owned),
         subject: companion_tauri::target::Subject::default(),
+        after: None,
     }
 }
 
@@ -4538,13 +4620,17 @@ async fn a_start_the_host_has_not_answered_is_owed_to_the_phone_that_starts_afte
         .await
         .expect("the start ran")
         .expect("the host created the call");
+    // The host's answer closes the notice of the start as a notice: the start stays as a hidden
+    // entry, beside the revocation the running call owes, and the two are never one entry.
     let file = kept_file_where(scene.phone.data.path(), |file| {
-        file["owed"]
-            .as_array()
-            .is_some_and(|owed| owed.len() == 1 && owed[0]["kind"] == "revocation")
+        file["owed"].as_array().is_some_and(|owed| {
+            owed.len() == 2
+                && owed.iter().any(|each| each["kind"] == "revocation")
+                && owed.iter().any(|each| each["kind"] == "start_kept")
+        })
     })
     .await;
-    assert_eq!(file["owed"].as_array().map(Vec::len), Some(1), "{file}");
+    assert_eq!(file["owed"].as_array().map(Vec::len), Some(2), "{file}");
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }

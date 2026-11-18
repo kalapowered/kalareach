@@ -163,11 +163,96 @@ impl VoiceCallState {
     /// Nothing that has not lapsed is dropped to make room: a grant the host may still hold open is
     /// told to the person until it ends, however many there are. The list is bounded by time, as
     /// each entry ends by itself, and by the calls a device can make in that time.
+    ///
+    /// The entries of the starts this device sent are the one exception to "not dropped": none is
+    /// shown for ever. A hidden one is dropped, oldest first, when one host has more than
+    /// [`MAX_HIDDEN_STARTS`] of them, and no shown notice is ever dropped to make room.
     pub fn owe(&mut self, now_ms: u64, owed: OwedView) {
         self.owed.retain(|each| each.until_ms > now_ms);
+        let host = owed.host;
+        let hidden = owed.is_hidden_start();
         self.owed.push(owed);
+        if hidden {
+            self.cap_hidden_starts(host);
+        }
+    }
+
+    /// Keeps at most [`MAX_HIDDEN_STARTS`] hidden start entries for `host`, dropping the oldest.
+    pub fn cap_hidden_starts(&mut self, host: Option<(DeviceId, EnvironmentId)>) {
+        while self
+            .owed
+            .iter()
+            .filter(|each| each.host == host && each.is_hidden_start())
+            .count()
+            > MAX_HIDDEN_STARTS
+        {
+            let Some(oldest) = self
+                .owed
+                .iter()
+                .position(|each| each.host == host && each.is_hidden_start())
+            else {
+                return;
+            };
+            self.owed.remove(oldest);
+        }
+    }
+
+    /// A start to `host` passed the host's hold, so the host has read every start this device sent
+    /// before it. What the host answered is no longer needed: its entry goes. What it did not
+    /// answer may still be admitted later, on a connection that has not yet been heard, so its
+    /// notice is hidden and the entry is kept.
+    pub fn start_passed(&mut self, host: (DeviceId, EnvironmentId)) {
+        self.owed.retain(|each| {
+            each.host != Some(host) || !matches!(each.kind.as_str(), START_UNCONFIRMED | START_KEPT)
+        });
+        for each in &mut self.owed {
+            if each.host == Some(host) && each.kind == START_UNKNOWN {
+                each.become_hidden(START_UNANSWERED);
+            }
+        }
+        self.cap_hidden_starts(Some(host));
+    }
+
+    /// The person dismissed the notice of the start `action_id`: it stays as a hidden entry, so a
+    /// refusal that names it can still be matched. Says whether a shown notice was changed.
+    pub fn dismiss_start(&mut self, action_id: &str) -> bool {
+        let Some(entry) = self.owed.iter_mut().find(|each| {
+            each.action_id.as_deref() == Some(action_id)
+                && matches!(each.kind.as_str(), START_UNKNOWN | START_UNCONFIRMED)
+        }) else {
+            return false;
+        };
+        let host = entry.host;
+        let to = if entry.kind == START_UNKNOWN {
+            START_UNANSWERED
+        } else {
+            START_KEPT
+        };
+        entry.become_hidden(to);
+        self.cap_hidden_starts(host);
+        true
+    }
+
+    /// This device no longer pairs with the host `host`: every start entry for it goes.
+    pub fn forget_starts_of(&mut self, host: DeviceId) {
+        self.owed
+            .retain(|each| !(each.is_start() && each.host.is_some_and(|(id, _)| id == host)));
     }
 }
+
+/// An entry for a start this device sent whose answer was lost, or whose app ended first. Shown.
+pub const START_UNKNOWN: &str = "start_unknown";
+/// An entry for a start that the host answered with a typed `creation_unknown`. Shown.
+pub const START_UNCONFIRMED: &str = "start_unconfirmed";
+/// An entry for a start that the host answered, kept in case a refusal names it. Never shown.
+pub const START_KEPT: &str = "start_kept";
+/// An entry for a start that the host did not answer, and that the person was told of. Never
+/// shown, and kept until the host is forgotten or the cap drops it.
+pub const START_UNANSWERED: &str = "start_unanswered";
+/// How many hidden start entries this device keeps for one host.
+pub const MAX_HIDDEN_STARTS: usize = 8;
+/// The `until_ms` of an entry that no clock ends.
+pub const NO_LAPSE_MS: u64 = u64::MAX;
 
 /// What kind of problem a call met.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -223,6 +308,16 @@ pub struct OwedView {
     pub host: Option<(DeviceId, EnvironmentId)>,
 }
 
+/// What a person is told of a start whose answer never came.
+const START_UNKNOWN_WORDS: &str = "The host never said whether it created the call. If it did, \
+     its grant ends by itself when the call was to close.";
+/// What a person is told of a start whose answer was a typed `creation_unknown`.
+const START_UNCONFIRMED_WORDS: &str = "The host could not confirm whether the voice service \
+     created the call. If it did, you may be charged for it.";
+/// What an entry that is never shown says, for a build that does show it.
+const START_KEPT_WORDS: &str =
+    "This device keeps this voice start in case the host names it in a later refusal.";
+
 impl HostEnd {
     /// What a revocation owed to the host is owed for, in words, when this end leaves one owed: the
     /// host was not told, did not answer, or refused (which does not say the grant is gone).
@@ -263,20 +358,68 @@ impl OwedView {
         }
     }
 
-    /// A start `host` never said it answered, which may have made a call whose grant stands until
-    /// `until_ms`.
+    /// A start `host` never said it answered, which may have made a call.
     #[must_use]
-    pub fn start_unknown(action_id: ActionId, until_ms: u64, host: &CallHost) -> Self {
+    pub fn start_unknown(action_id: ActionId, host: &CallHost) -> Self {
         Self {
-            kind: "start_unknown".to_owned(),
-            words: "The host never said whether it created the call. If it did, its grant ends by \
-                    itself when the call was to close."
-                .to_owned(),
+            kind: START_UNKNOWN.to_owned(),
+            words: START_UNKNOWN_WORDS.to_owned(),
             action_id: Some(action_id.to_string()),
-            voice_session_id: None,
-            until_ms,
+            until_ms: NO_LAPSE_MS,
             ..Self::of(host)
         }
+    }
+
+    /// A start `host` answered with a typed `creation_unknown`: it could not confirm whether the
+    /// voice service created the call.
+    #[must_use]
+    pub fn start_unconfirmed(action_id: ActionId, host: &CallHost) -> Self {
+        Self {
+            kind: START_UNCONFIRMED.to_owned(),
+            words: START_UNCONFIRMED_WORDS.to_owned(),
+            action_id: Some(action_id.to_string()),
+            until_ms: NO_LAPSE_MS,
+            ..Self::of(host)
+        }
+    }
+
+    /// A start `host` answered, kept in case a later refusal names it. Never shown.
+    #[must_use]
+    pub fn start_kept(action_id: ActionId, host: &CallHost) -> Self {
+        Self {
+            kind: START_KEPT.to_owned(),
+            words: START_KEPT_WORDS.to_owned(),
+            action_id: Some(action_id.to_string()),
+            until_ms: NO_LAPSE_MS,
+            ..Self::of(host)
+        }
+    }
+
+    /// Whether this entry records a start this device sent.
+    #[must_use]
+    pub fn is_start(&self) -> bool {
+        matches!(
+            self.kind.as_str(),
+            START_UNKNOWN | START_UNCONFIRMED | START_KEPT | START_UNANSWERED
+        )
+    }
+
+    /// Whether this entry is a start that the page is never shown.
+    #[must_use]
+    pub fn is_hidden_start(&self) -> bool {
+        matches!(self.kind.as_str(), START_KEPT | START_UNANSWERED)
+    }
+
+    /// Hides this start's notice: the entry stays, as `kind`, with words that are true when a
+    /// person reads them.
+    fn become_hidden(&mut self, kind: &str) {
+        self.kind = kind.to_owned();
+        self.words = if kind == START_UNANSWERED {
+            START_UNKNOWN_WORDS
+        } else {
+            START_KEPT_WORDS
+        }
+        .to_owned();
     }
 
     /// A service `host` made a call for, that the voice service has not said it closed, though this
@@ -415,6 +558,141 @@ mod tests {
             host_name: "A host".to_owned(),
             host: None,
         }
+    }
+
+    fn host(n: u8) -> (DeviceId, EnvironmentId) {
+        (
+            DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([n; 16])),
+            EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+        )
+    }
+
+    fn start(kind: &str, action: &str, host: (DeviceId, EnvironmentId)) -> OwedView {
+        OwedView {
+            kind: kind.to_owned(),
+            action_id: Some(action.to_owned()),
+            until_ms: NO_LAPSE_MS,
+            host: Some(host),
+            ..owed(NO_LAPSE_MS)
+        }
+    }
+
+    fn kinds(state: &VoiceCallState) -> Vec<(String, String)> {
+        state
+            .owed
+            .iter()
+            .map(|each| {
+                (
+                    each.kind.clone(),
+                    each.action_id.clone().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// A start that passed the hold shows the host has read every start sent before it. What the
+    /// host answered goes; what it did not answer may still be admitted on a connection not yet
+    /// heard, so it stays, hidden. Another host's entries are not touched.
+    #[test]
+    fn a_start_that_passes_the_hold_changes_the_earlier_starts_of_its_host_only() {
+        let mut state = VoiceCallState::no_call();
+        for entry in [
+            start(START_UNKNOWN, "a", host(1)),
+            start(START_UNCONFIRMED, "b", host(1)),
+            start(START_KEPT, "c", host(1)),
+            start(START_UNANSWERED, "d", host(1)),
+            start(START_UNKNOWN, "e", host(2)),
+        ] {
+            state.owe(0, entry);
+        }
+
+        state.start_passed(host(1));
+
+        assert_eq!(
+            kinds(&state),
+            [
+                (START_UNANSWERED.to_owned(), "a".to_owned()),
+                (START_UNANSWERED.to_owned(), "d".to_owned()),
+                (START_UNKNOWN.to_owned(), "e".to_owned()),
+            ]
+        );
+    }
+
+    /// A host's hidden starts are bounded: the oldest hidden one goes, a shown notice never does
+    /// to make room, and another host's entries do not count.
+    #[test]
+    fn the_cap_drops_the_oldest_hidden_start_and_never_a_shown_notice() {
+        let mut state = VoiceCallState::no_call();
+        state.owe(0, start(START_UNKNOWN, "shown", host(1)));
+        state.owe(0, start(START_KEPT, "other-host", host(2)));
+        for number in 0..=MAX_HIDDEN_STARTS {
+            state.owe(0, start(START_KEPT, &format!("k{number}"), host(1)));
+        }
+
+        let ids: Vec<String> = kinds(&state).into_iter().map(|(_, id)| id).collect();
+        assert!(ids.contains(&"shown".to_owned()), "{ids:?}");
+        assert!(ids.contains(&"other-host".to_owned()), "{ids:?}");
+        assert!(
+            !ids.contains(&"k0".to_owned()),
+            "the oldest hidden start goes: {ids:?}"
+        );
+        assert!(ids.contains(&"k1".to_owned()), "{ids:?}");
+        assert_eq!(
+            state
+                .owed
+                .iter()
+                .filter(|each| each.host == Some(host(1)) && each.is_hidden_start())
+                .count(),
+            MAX_HIDDEN_STARTS
+        );
+    }
+
+    /// The person dismisses a notice: it becomes a hidden entry of the same start, and nothing
+    /// else changes. A revocation is not a notice of a start and is not dismissed.
+    #[test]
+    fn a_dismissed_notice_stays_as_a_hidden_entry_of_the_same_start() {
+        let mut state = VoiceCallState::no_call();
+        state.owe(0, start(START_UNKNOWN, "a", host(1)));
+        state.owe(0, start(START_UNCONFIRMED, "b", host(1)));
+        let mut revocation = owed(NO_LAPSE_MS);
+        revocation.action_id = Some("a".to_owned());
+        state.owe(0, revocation);
+
+        assert!(state.dismiss_start("a"));
+        assert!(state.dismiss_start("b"));
+        assert!(!state.dismiss_start("a"), "a hidden entry is no notice");
+
+        assert_eq!(
+            kinds(&state),
+            [
+                (START_UNANSWERED.to_owned(), "a".to_owned()),
+                (START_KEPT.to_owned(), "b".to_owned()),
+                ("revocation".to_owned(), "a".to_owned()),
+            ]
+        );
+        assert!(state.owed[0].is_hidden_start() && state.owed[1].is_hidden_start());
+    }
+
+    /// Forgetting a host removes its start entries, hidden or shown, and nothing else.
+    #[test]
+    fn forgetting_a_host_removes_its_start_entries_only() {
+        let mut state = VoiceCallState::no_call();
+        state.owe(0, start(START_UNKNOWN, "a", host(1)));
+        state.owe(0, start(START_KEPT, "b", host(1)));
+        state.owe(0, start(START_UNKNOWN, "c", host(2)));
+        let mut revocation = owed(NO_LAPSE_MS);
+        revocation.host = Some(host(1));
+        state.owe(0, revocation);
+
+        state.forget_starts_of(host(1).0);
+
+        assert_eq!(
+            kinds(&state),
+            [
+                (START_UNKNOWN.to_owned(), "c".to_owned()),
+                ("revocation".to_owned(), String::new()),
+            ]
+        );
     }
 
     /// Each problem a call met is kept: a later one of another kind is beside the first and does not

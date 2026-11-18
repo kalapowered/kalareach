@@ -223,6 +223,9 @@ pub struct StartRequest {
     pub expected_rate_version: Option<String>,
     /// What the start names.
     pub subject: Subject,
+    /// An earlier start of this device to this host that this start names, because the host holds
+    /// it: the host then admits this start in its place.
+    pub after: Option<ActionId>,
 }
 
 /// What a start came to.
@@ -231,6 +234,14 @@ pub enum Started {
     Result(VoiceStartResult),
     /// The host answered with a receipt.
     Receipt(Box<kr_protocol::receipt::Receipt>),
+    /// The host could not confirm whether the voice service created the call: its typed answer,
+    /// and the action the start was sent under.
+    Unconfirmed {
+        /// The host's answer.
+        result: VoiceStartResult,
+        /// The action the start was sent under.
+        action_id: ActionId,
+    },
     /// The host never said whether it made the call.
     Unknown {
         /// The action the start was sent under, which is what a later question about it names.
@@ -288,11 +299,21 @@ struct Emergency {
     voice_session_id: Option<VoiceSessionId>,
     /// The call at the voice service, and what is owed if the service does not confirm it closed.
     service_call: Option<ServiceCall>,
-    /// A start the host has not been heard to answer: the action it was sent under, and the
-    /// moment a call it made would end by itself.
-    pending_start: Option<(ActionId, u64)>,
+    /// A start the host has not been heard to answer: the action it was sent under.
+    pending_start: Option<ActionId>,
     reach: Arc<dyn HostReach>,
     tokens: Arc<SignedInAccount>,
+}
+
+/// Whether `words` holds `id` as a whole token: bounded by the ends of the words or by a character
+/// that is not a letter, a digit or a hyphen, so that a longer id that begins with it is not it.
+fn names_token(words: &str, id: &str) -> bool {
+    let is_id_char = |c: char| c.is_alphanumeric() || c == '-';
+    words.match_indices(id).any(|(at, _)| {
+        let before = words[..at].chars().next_back();
+        let after = words[at + id.len()..].chars().next();
+        !before.is_some_and(is_id_char) && !after.is_some_and(is_id_char)
+    })
 }
 
 /// The time now, in milliseconds since the epoch.
@@ -610,6 +631,178 @@ impl Shared {
         self.keep();
     }
 
+    /// Opens the entry for a start this device is about to send, and says whether it is on disk.
+    /// A start that the host may admit must leave a record that a crash does not lose, so a file
+    /// that cannot be read, a write that fails and a device with no place to keep anything each
+    /// say no, and the start is not sent.
+    pub(crate) fn stand_open_durably(&self, owner: u64, entry: OwedView) -> bool {
+        *self
+            .standing
+            .lock()
+            .expect("the standing lock is not poisoned") = Some((owner, entry));
+        let kept = {
+            let _ordered = self
+                .keeping
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.take_up_unread().is_some()
+                && self.kept.stores()
+                && self.write_kept_checked().is_ok()
+        };
+        if !kept {
+            let mut standing = self
+                .standing
+                .lock()
+                .expect("the standing lock is not poisoned");
+            if standing.as_ref().is_some_and(|(held, _)| *held == owner) {
+                *standing = None;
+            }
+        }
+        kept
+    }
+
+    /// Whether this device keeps the earlier start `action_id` for `host`, so that a start can
+    /// name it. The words say why not.
+    pub(crate) fn earlier_start(
+        &self,
+        action_id: &str,
+        host: (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId),
+    ) -> std::result::Result<(), &'static str> {
+        self.read_again();
+        let view = self.view.lock().expect("the view lock is not poisoned");
+        match view
+            .owed
+            .iter()
+            .find(|each| each.is_start() && each.action_id.as_deref() == Some(action_id))
+        {
+            None => Err(
+                "Nothing was sent. This device no longer keeps that earlier start, so \
+                         this start cannot name it.",
+            ),
+            Some(each) if each.host != Some(host) => Err("Nothing was sent. That earlier start \
+                         was made to another host, so this start cannot name it."),
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// The one earlier start of `host` that this device keeps and the host's words name: the
+    /// action id of exactly one kept start appears in `words` as a whole token. The start that was
+    /// refused and the one it named are not candidates. None, or two, is no candidate.
+    pub(crate) fn start_named_in(
+        &self,
+        host: (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId),
+        words: &str,
+        named: Option<String>,
+    ) -> Option<String> {
+        self.read_again();
+        let view = self.view.lock().expect("the view lock is not poisoned");
+        let mut found: Vec<&str> = Vec::new();
+        for id in view
+            .owed
+            .iter()
+            .filter(|each| each.is_start() && each.host == Some(host))
+            .filter_map(|each| each.action_id.as_deref())
+            .filter(|id| Some(*id) != named.as_deref())
+        {
+            if names_token(words, id) && !found.contains(&id) {
+                found.push(id);
+            }
+        }
+        match found.as_slice() {
+            [only] => Some((*only).to_owned()),
+            _ => None,
+        }
+    }
+
+    /// Records what the host's answer to the start `owner` sent comes to, in one write: when the
+    /// answer shows that the start passed the host's hold, the earlier starts to `passed` change as
+    /// a pass changes them; `entry` is the start's own entry, when it keeps one; and `then` is what
+    /// this process owes next, which replaces the entry opened for the send. A state that shows
+    /// the proof without the changes, or the changes without the entry, is never written.
+    pub(crate) fn settle_start(
+        &self,
+        owner: u64,
+        passed: Option<(kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId)>,
+        entry: Option<OwedView>,
+        then: Option<OwedView>,
+    ) {
+        let has_next = then.is_some();
+        let _ordered = self
+            .keeping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let took = self.take_up_unread();
+        {
+            let now = now_ms();
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            if let Some(host) = passed {
+                view.start_passed(host);
+            }
+            if let Some(entry) = entry {
+                view.owe(now, entry);
+            }
+        }
+        {
+            let mut standing = self
+                .standing
+                .lock()
+                .expect("the standing lock is not poisoned");
+            if standing.as_ref().is_some_and(|(held, _)| *held == owner) {
+                *standing = then.map(|entry| (owner, entry));
+            }
+        }
+        self.start_was_answered(owner);
+        if !has_next {
+            self.host_was_told(owner);
+        }
+        self.persist(took, true);
+    }
+
+    /// Changes what is owed and writes it, and says whether the change is saved: the change is
+    /// made on a copy and replaces what is owed only when the write has succeeded, so a person is
+    /// never shown a change that the next launch does not keep. `Ok(false)` when it changed
+    /// nothing.
+    pub(crate) fn change_owed_durably(
+        &self,
+        change: impl FnOnce(&mut VoiceCallState) -> bool,
+    ) -> std::result::Result<bool, ()> {
+        let _ordered = self
+            .keeping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.take_up_unread().is_none() {
+            return Err(());
+        }
+        let mut after = self
+            .view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .clone();
+        if !change(&mut after) {
+            return Ok(false);
+        }
+        let mut owed = after.owed.clone();
+        if let Some((_, standing)) = self
+            .standing
+            .lock()
+            .expect("the standing lock is not poisoned")
+            .clone()
+        {
+            owed.push(standing);
+        }
+        let note = self
+            .note
+            .lock()
+            .expect("the note lock is not poisoned")
+            .clone();
+        self.kept.write(&KeptVoice { owed, note }).map_err(|_| ())?;
+        self.view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .owed = after.owed;
+        Ok(true)
+    }
+
     /// Says that the host has answered the start `owner` sent in a way that makes no grant
     /// (a refusal, a decline, a receipt), so nothing is owed for it: the start is no longer
     /// pending, and the entry opened for it is closed before native code is asked to stop.
@@ -679,6 +872,14 @@ impl Shared {
 
     /// Writes the record as it is in memory. Called with `keeping` held and nothing unread.
     fn write_kept(&self) {
+        if let Err(error) = self.write_kept_checked() {
+            tracing::warn!(%error, "what a voice call left owed could not be kept");
+        }
+    }
+
+    /// Writes the record as it is in memory and says why it could not. Called with `keeping` held
+    /// and nothing unread.
+    fn write_kept_checked(&self) -> std::io::Result<()> {
         let mut owed = self
             .view
             .lock()
@@ -698,9 +899,7 @@ impl Shared {
             .lock()
             .expect("the note lock is not poisoned")
             .clone();
-        if let Err(error) = self.kept.write(&KeptVoice { owed, note }) {
-            tracing::warn!(%error, "what a voice call left owed could not be kept");
-        }
+        self.kept.write(&KeptVoice { owed, note })
     }
 
     /// Takes a revocation out of what is owed, because the host it is owed to has revoked the grant.
@@ -768,7 +967,7 @@ impl Shared {
 
     /// Says that the host has been sent a start under `action_id` and not been heard to answer
     /// it, so a supervisor that finishes the call after a failure keeps the start as owed.
-    pub(crate) fn keep_start_pending(&self, owner: u64, action_id: ActionId, until_ms: u64) {
+    pub(crate) fn keep_start_pending(&self, owner: u64, action_id: ActionId) {
         let mut kept = self
             .emergency
             .lock()
@@ -776,7 +975,7 @@ impl Shared {
         if let Some((held, kept)) = kept.as_mut()
             && *held == owner
         {
-            kept.pending_start = Some((action_id, until_ms));
+            kept.pending_start = Some(action_id);
         }
     }
 
@@ -970,8 +1169,8 @@ impl Shared {
         ) {
             owed.push(OwedView::revocation(words, id, service.until_ms, host));
         }
-        if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
-            owed.push(OwedView::start_unknown(action_id, until_ms, host));
+        if let (Some(action_id), Some(host)) = (kept.pending_start, &kept.host) {
+            owed.push(OwedView::start_unknown(action_id, host));
         }
         // The end and what it owes are shown in one update.
         let accepts = self.accepts_host_delegations();
@@ -1555,6 +1754,43 @@ impl Calls {
             .map_err(|_| CommandError::refused("this device is not holding a voice call"))?
     }
 
+    /// Hides the notice of the start `action_id`: the person has read it. The entry stays, hidden,
+    /// so a later refusal that names the start can still be matched; nothing is said to the host
+    /// and no call is stopped. The change is shown only when it is saved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the change could not be saved: the notice stays.
+    pub fn dismiss_start(&self, action_id: &str) -> Result<()> {
+        let Some(shared) = &self.shared else {
+            return Ok(());
+        };
+        shared
+            .change_owed_durably(|state| state.dismiss_start(action_id))
+            .map(|_| ())
+            .map_err(|()| {
+                CommandError::refused("This device could not save the dismissal. The notice stays.")
+            })
+    }
+
+    /// This device stops pairing with the host `host`: what it keeps of the starts it sent there
+    /// goes. The host's own state is not touched, and nothing is said about whether a call ended.
+    pub fn forget_starts_of(&self, host: kr_protocol::ids::DeviceId) {
+        let Some(shared) = &self.shared else {
+            return;
+        };
+        shared.read_again();
+        let removed = {
+            let mut view = shared.view.lock().expect("the view lock is not poisoned");
+            let before = view.owed.len();
+            view.forget_starts_of(host);
+            view.owed.len() != before
+        };
+        if removed {
+            shared.keep();
+        }
+    }
+
     /// What the call is doing, and, when `note` is the host, account and service of a call that
     /// found no such call, the problem a person is shown before starting another.
     #[must_use]
@@ -1580,7 +1816,9 @@ impl Calls {
         state.setting_up = busy && !state.running;
         state.ending = state.setting_up && state.ending;
         let now = now_ms();
-        state.owed.retain(|owed| owed.until_ms > now);
+        state
+            .owed
+            .retain(|owed| owed.until_ms > now && !owed.is_hidden_start());
         let remembered = shared
             .note
             .lock()
@@ -1716,5 +1954,24 @@ mod tests {
         shared.after_failed_owner(7).await;
 
         assert!(finalising_as_read(shared));
+    }
+}
+
+#[cfg(test)]
+mod named_in_words {
+    use super::names_token;
+
+    /// An action id in a host's words is found only as a whole token: a longer id that begins with
+    /// it, or one that ends with it, is not it.
+    #[test]
+    fn an_id_is_found_only_as_a_whole_token() {
+        let id = "0f3c-4a";
+        assert!(names_token("hold (action 0f3c-4a, begun", id));
+        assert!(names_token("under action 0f3c-4a.", id));
+        assert!(names_token("0f3c-4a", id));
+        assert!(!names_token("under action 0f3c-4a1, begun", id));
+        assert!(!names_token("under action x0f3c-4a, begun", id));
+        assert!(!names_token("under action 0f3c-4a-9, begun", id));
+        assert!(!names_token("no id here", id));
     }
 }

@@ -134,6 +134,7 @@ export function receivedFailure(native: {
   readonly message: string
   readonly user_action: string
   readonly retry: HostError['retry']
+  readonly start_again_for?: string
 }): HostError {
   const said = failureWords(native)
   const action = Object.hasOwn(ACTION_WORDS, native.user_action) ? ACTION_WORDS[native.user_action] : undefined
@@ -142,6 +143,7 @@ export function receivedFailure(native: {
     code: native.code,
     message: native.message,
     retry: native.retry,
+    ...(native.start_again_for === undefined ? {} : { startAgainFor: native.start_again_for }),
     line: action === undefined ? said : `${sentence}${/[.!?…]$/.test(sentence) ? '' : '.'} ${action}`
   }
 }
@@ -427,6 +429,7 @@ export function tauriPort(): HostPort {
         reasoningBudgetMinor: request.reasoningBudgetMinor,
         prepared: request.prepared,
         expectedRateVersion: request.expectedRateVersion,
+        afterActionId: request.afterActionId,
         subject
       }),
     voiceScope: () => call<VoiceScope>('voice_scope', {}),
@@ -452,6 +455,7 @@ export function tauriPort(): HostPort {
     voiceContext: (params) => read('voice_context', params),
     voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
+    voiceDismissStart: (actionId) => call<undefined>('voice_dismiss_start', { actionId }),
 
     hostsUse: (reference) => choose('hosts_use', reference),
     hostsForget: (reference) => choose('hosts_forget', reference),

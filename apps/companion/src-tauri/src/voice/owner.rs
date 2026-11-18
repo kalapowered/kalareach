@@ -410,6 +410,10 @@ fn declined_words(started: &Started) -> Option<String> {
             "This device holds no call: the host answered with a receipt and not with a call."
                 .to_owned(),
         ),
+        Started::Unconfirmed { result, .. } => match &result.outcome {
+            VoiceStartOutcome::CreationUnknown { message, .. } => Some(message.clone()),
+            _ => None,
+        },
         // The owner wrote what an unknown start left.
         Started::Unknown { .. } => None,
     }
@@ -938,19 +942,54 @@ impl Owner {
             }
         };
         let action_id = ActionId::new(kr_ipc::new_uuid());
-        let composed = match host
-            .session
-            .compose(
-                Method::VoiceStart,
-                action_id,
-                target,
-                None,
-                &NoPreconditions {},
-                &params,
-                MUTATION_TTL,
-            )
-            .await
-        {
+        let host_ids = (host.paired.host_device_id, host.environment_id);
+        // A start that names an earlier one carries that action in its one precondition. It names
+        // only a start this device keeps for this host.
+        let earlier = match request.after {
+            Some(earlier) => match self.shared.earlier_start(&earlier.to_string(), host_ids) {
+                Ok(()) => Some(earlier),
+                Err(words) => {
+                    return self
+                        .abandon_with(
+                            Cause::Step("the start named an earlier start".to_owned()),
+                            CommandError::invalid(words),
+                        )
+                        .await;
+                }
+            },
+            None => None,
+        };
+        let composing = match earlier {
+            Some(earlier) => {
+                host.session
+                    .compose(
+                        Method::VoiceStart,
+                        action_id,
+                        target,
+                        None,
+                        &Supersedes {
+                            supersedes_action_id: earlier,
+                        },
+                        &params,
+                        MUTATION_TTL,
+                    )
+                    .await
+            }
+            None => {
+                host.session
+                    .compose(
+                        Method::VoiceStart,
+                        action_id,
+                        target,
+                        None,
+                        &NoPreconditions {},
+                        &params,
+                        MUTATION_TTL,
+                    )
+                    .await
+            }
+        };
+        let composed = match composing {
             Ok(composed) => composed,
             Err(error) => {
                 return self
@@ -965,20 +1004,26 @@ impl Owner {
         // The send waits for the host for a bound of its own, after which its answer is taken as
         // lost and the host is asked what became of it. A stop that comes meanwhile waits in the
         // inbox and is read as soon as the answer is.
-        // A grant the host made for this start ends by itself, at the latest, a call's length after
-        // the last moment the host could still first admit the request: the end of the action
-        // window it carries, on the host's own clock. A repeat can only be answered from the
-        // host's record and is never an admission, so nothing later than that can create one.
-        let until_ms = composed
-            .window_issued_at_ms()
-            .saturating_add(composed.window_valid_for_ms())
-            .saturating_add(u64::from(self.requested) * 1000)
-            .saturating_add(MAX_CLOCK_SKEW_MS);
-        self.shared.keep_start_pending(self.id, action_id, until_ms);
         // From here the host may make a call, and a process that ends before the host answers
-        // leaves it owed: the start, under the action it was sent under.
-        self.shared
-            .stand_open(self.id, OwedView::start_unknown(action_id, until_ms, &host));
+        // leaves it owed: the start, under the action it was sent under. The record is on disk
+        // before the host is asked, or the host is not asked: a start that left no record cannot
+        // be named later.
+        self.shared.keep_start_pending(self.id, action_id);
+        if !self
+            .shared
+            .stand_open_durably(self.id, OwedView::start_unknown(action_id, &host))
+        {
+            self.shared.start_was_answered(self.id);
+            return self
+                .abandon_with(
+                    Cause::Step("the start could not be recorded".to_owned()),
+                    CommandError::refused(
+                        "Nothing was sent. This device could not save a record of this start, \
+                         so it did not ask the host.",
+                    ),
+                )
+                .await;
+        }
         let start_within = self.shared.timings.start_within;
         let sent = match self
             .wait_through(tokio::time::timeout(
@@ -1007,17 +1052,41 @@ impl Owner {
             }
             Err(error) => {
                 host.session.settle(action_id).await;
-                self.shared.answered(self.id);
+                let conflict = is_hold_refusal(&error);
+                if conflict || sent_nothing(&error) {
+                    // The start never reached the host's hold: it leaves no entry, and the
+                    // earlier starts stay as they were.
+                    self.shared.answered(self.id);
+                } else {
+                    // Any other answer proves nothing about the hold, so the start stays, hidden.
+                    self.shared.settle_start(
+                        self.id,
+                        None,
+                        Some(OwedView::start_kept(action_id, &host)),
+                        None,
+                    );
+                }
                 self.stop_native(HostEnd::NotNeeded).await;
-                return Err(CommandError::from(error));
+                return Err(self.refused_start(&host, error, earlier, conflict));
             }
         };
 
         let result = match created {
             Reached::Receipt(receipt) => {
-                self.shared.answered(self.id);
+                self.shared.settle_start(
+                    self.id,
+                    None,
+                    Some(OwedView::start_kept(action_id, &host)),
+                    None,
+                );
                 self.stop_native(HostEnd::NotNeeded).await;
                 return Ok(Outcome::Over(Started::Receipt(receipt)));
+            }
+            Reached::Refused(refusal) => {
+                // The host's record of the start is its own refusal: it never reached the hold.
+                self.shared.answered(self.id);
+                self.stop_native(HostEnd::NotNeeded).await;
+                return Err(self.refused_start(&host, refusal, earlier, true));
             }
             Reached::Unknown => {
                 let local = self
@@ -1053,7 +1122,7 @@ impl Owner {
                             broker: "unknown".to_owned(),
                         });
                     },
-                    vec![OwedView::start_unknown(action_id, until_ms, &host)],
+                    vec![OwedView::start_unknown(action_id, &host)],
                 );
                 self.shared.start_was_answered(self.id);
                 return Ok(Outcome::Over(Started::Unknown { action_id }));
@@ -1061,9 +1130,31 @@ impl Owner {
             Reached::Result(result) => result,
         };
         let VoiceStartOutcome::Started { session } = &result.outcome else {
-            self.shared.answered(self.id);
+            // What each answer proves about the host's hold: a typed `creation_unknown` and a
+            // changed rate come only after the start passed it; a refusal about the preparation
+            // came before it; the rest says nothing.
+            let (passed, entry) = match &result.outcome {
+                VoiceStartOutcome::CreationUnknown { .. } => (
+                    Some(host_ids),
+                    Some(OwedView::start_unconfirmed(action_id, &host)),
+                ),
+                VoiceStartOutcome::RateChanged { .. } => {
+                    (Some(host_ids), Some(OwedView::start_kept(action_id, &host)))
+                }
+                VoiceStartOutcome::Unavailable { .. } => {
+                    (None, Some(OwedView::start_kept(action_id, &host)))
+                }
+                VoiceStartOutcome::PreparationChanged { .. }
+                | VoiceStartOutcome::Started { .. } => (None, None),
+            };
+            let unconfirmed = matches!(&result.outcome, VoiceStartOutcome::CreationUnknown { .. });
+            self.shared.settle_start(self.id, passed, entry, None);
             self.stop_native(HostEnd::NotNeeded).await;
-            return Ok(Outcome::Over(Started::Result(result)));
+            return Ok(Outcome::Over(if unconfirmed {
+                Started::Unconfirmed { result, action_id }
+            } else {
+                Started::Result(result)
+            }));
         };
         let descriptor = (**session).clone();
         self.descriptor = Some(descriptor.clone());
@@ -1077,9 +1168,11 @@ impl Owner {
         );
         // The host has made the call and named it: what the process owes the host is now the
         // revocation of its grant, for as long as the call runs.
-        self.shared.stand_open(
+        self.shared.settle_start(
             self.id,
-            OwedView::revocation(
+            Some(host_ids),
+            Some(OwedView::start_kept(action_id, &host)),
+            Some(OwedView::revocation(
                 // A process that stops while a call that may act runs cannot know whether a request
                 // was written, so what it left says so.
                 if self.accepting {
@@ -1090,7 +1183,7 @@ impl Owner {
                 descriptor.voice_session_id,
                 owed_until(descriptor.closes_at_ms.get()),
                 &host,
-            ),
+            )),
         );
         // The call can be named from here on: a stop that names it reaches this owner.
         let mut shown = descriptor.clone();
@@ -1321,6 +1414,34 @@ impl Owner {
         Err(error)
     }
 
+    /// What a refused start tells the page. A refusal at the host's hold names the earlier start
+    /// that holds it, in the host's words: when this device keeps that start, the page can offer
+    /// to start again naming it, and when it does not, the person is told so.
+    fn refused_start(
+        &self,
+        host: &CallHost,
+        error: ClientError,
+        named: Option<ActionId>,
+        conflict: bool,
+    ) -> CommandError {
+        let mut failure = CommandError::from(error);
+        if conflict {
+            let host_ids = (host.paired.host_device_id, host.environment_id);
+            failure.start_again_for = self.shared.start_named_in(
+                host_ids,
+                &failure.message,
+                named.map(|id| id.to_string()),
+            );
+            if failure.start_again_for.is_none() {
+                failure.message.push_str(
+                    " This device cannot find the earlier start that the host names, so it \
+                     cannot offer \"Start again\".",
+                );
+            }
+        }
+        failure
+    }
+
     /// Stops the call's media before the end procedure has anything to revoke, and answers the
     /// stops waiting with `host` as what the host did. Says whether native code stopped the media:
     /// a stop it does not return from, or refuses, is not a stop. A call native code has already
@@ -1397,7 +1518,17 @@ impl Owner {
                         break 'asking;
                     }
                 }
-                // A receipt is a lost answer again, and a refusal says nothing of the original.
+                // The hold's refusal is the host's own record of this action: a repeat is only
+                // ever answered from it, so it is the answer to the start itself.
+                Ok(Err(ClientError::Host(refusal)))
+                    if refusal.code == kr_protocol::error::ErrorCode::DraftConflict =>
+                {
+                    session.settle(action_id).await;
+                    reached = Reached::Refused(ClientError::Host(refusal));
+                    break 'asking;
+                }
+                // A receipt is a lost answer again, and any other refusal says nothing of the
+                // original, which the host can still read until its window ends.
                 Ok(Ok(Settled::Receipt(_)) | Err(_)) | Err(_) => {}
             }
             session.settle(action_id).await;
@@ -2852,6 +2983,35 @@ enum Reached {
     Receipt(Box<kr_protocol::receipt::Receipt>),
     /// The host never said.
     Unknown,
+    /// The host's refusal of the start at its hold, read from the record of the action.
+    Refused(ClientError),
+}
+
+/// The one precondition of a start that names an earlier one.
+#[derive(serde::Serialize)]
+struct Supersedes {
+    supersedes_action_id: ActionId,
+}
+
+/// Whether the host refused the start at its hold on this device's earlier start.
+fn is_hold_refusal(error: &ClientError) -> bool {
+    matches!(error, ClientError::Host(refusal)
+        if refusal.code == kr_protocol::error::ErrorCode::DraftConflict)
+}
+
+/// Whether the client says that no byte of the start left this device. Any other failure leaves
+/// open that the host read it.
+const fn sent_nothing(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Withheld
+            | ClientError::Misdirected { .. }
+            | ClientError::OtherHost
+            | ClientError::StillAccounting
+            | ClientError::NoActionWindow
+            | ClientError::TooManyOutstandingMutations { .. }
+            | ClientError::TooManyUnresolvedActions { .. }
+    )
 }
 
 /// How far from the clock this device's idea of the moment a call closes may be, in milliseconds.

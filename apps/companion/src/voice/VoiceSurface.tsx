@@ -22,6 +22,7 @@ import {
   rateWords,
   requestedSeconds,
   speechCouldHaveBeenHeard,
+  type AftermathLine,
   type ContextRequest,
   type Delegation,
   type ProviderChoice,
@@ -71,6 +72,14 @@ export interface VoiceSurfaceActions {
    * after, as a hang-up is.
    */
   readonly endSetup: () => void
+  /**
+   * Starts a call again, naming the earlier start that the host holds, which this device keeps.
+   * It runs the same steps as `start`, with the same preparation and terms, and adds only that
+   * one name.
+   */
+  readonly startAfter: (actionId: string) => void
+  /** Hides the notice of an earlier start. Local: it stops no call and says nothing to the host. */
+  readonly dismissStart: (actionId: string) => void
   /** Cancels the current turn on a host. Typed, and it names the turn. */
   readonly cancelTask: (turn: CurrentTurn) => void
   /** Asks the host what it selected for the call. A read from the host; nothing is sent onward. */
@@ -106,12 +115,17 @@ export interface VoiceSurfaceProps {
    */
   readonly notice: string | null
   /**
+   * The earlier start that the host's refusal named and this device keeps, so that "Start again"
+   * can be offered beside the notice, or null when there is none.
+   */
+  readonly noticeStartAgain?: string | null
+  /**
    * What the last call left, in words: how it ended when no screen was looking, what this device
    * could not finish and the host may still hold open, and the problems it met, which a person is
    * given before the next start. Shown before a call and never in place of what the person is
    * deciding.
    */
-  readonly aftermath?: readonly string[]
+  readonly aftermath?: readonly AftermathLine[]
   /**
    * Whether the device is busy with a call that does not run: making one, which this screen is
    * asked to say instead of offering a second start, or ending one. There may be no call to name.
@@ -175,6 +189,7 @@ export function VoiceSurface({
   busy,
   waiting = false,
   notice,
+  noticeStartAgain = null,
   aftermath = [],
   settingUp = false,
   ending = false,
@@ -206,14 +221,55 @@ export function VoiceSurface({
         waiting={waiting}
         ending={ending}
         notice={notice}
+        noticeStartAgain={noticeStartAgain}
         aftermath={aftermath}
         focusOnShow={focusToken > 0}
         onStart={actions.start}
+        onStartAfter={actions.startAfter}
+        onDismissStart={actions.dismissStart}
         onEnd={actions.endSetup}
       />
     )
   }
   return <AskingScreen busy={busy} notice={notice} focusOnShow={focusHeadingOnShow} />
+}
+
+/**
+ * The two things a person can do about a start the host never confirmed: ask for a new call, which
+ * names the earlier start so the host admits it, or hide the notice. Each says what it does beside
+ * it, and hiding stops nothing.
+ */
+function StartNoticeControls({
+  startable,
+  onStartAgain,
+  onDismiss
+}: {
+  readonly startable: boolean
+  readonly onStartAgain: () => void
+  readonly onDismiss: (() => void) | null
+}): React.ReactElement {
+  return (
+    <span className="kr-voice__actions">
+      <button type="button" className="kr-voice__link" disabled={!startable} onClick={onStartAgain}>
+        Start again
+      </button>{' '}
+      <span className="kr-voice__hint">
+        This asks for a new call. The earlier call may still be running, and you may be charged for
+        both.
+      </span>
+      {onDismiss !== null && (
+        <>
+          {' '}
+          <button type="button" className="kr-voice__link" onClick={onDismiss}>
+            Dismiss
+          </button>{' '}
+          <span className="kr-voice__hint">
+            This hides the notice on this device. It does not stop a call.
+          </span>
+        </>
+      )}
+    </span>
+  )
 }
 
 /**
@@ -310,9 +366,12 @@ function ProviderChoiceScreen({
   waiting,
   ending,
   notice,
+  noticeStartAgain,
   aftermath,
   focusOnShow,
   onStart,
+  onStartAfter,
+  onDismissStart,
   onEnd
 }: {
   readonly choice: ProviderChoice
@@ -324,11 +383,17 @@ function ProviderChoiceScreen({
   readonly ending: boolean
   /** What the last answer said, when it was not a call. */
   readonly notice: string | null
+  /** The earlier start that the notice names and the device keeps, or null. */
+  readonly noticeStartAgain: string | null
   /** What the last call left. */
-  readonly aftermath: readonly string[]
+  readonly aftermath: readonly AftermathLine[]
   /** Whether a call has just left this screen, so that focus goes to its heading. */
   readonly focusOnShow: boolean
   readonly onStart: () => void
+  /** Starts again, naming an earlier start the host holds. */
+  readonly onStartAfter: (actionId: string) => void
+  /** Hides the notice of an earlier start. */
+  readonly onDismissStart: (actionId: string) => void
   /** Gives up the start in flight, without naming a call: there may be none to name yet. */
   readonly onEnd: () => void
 }): React.ReactElement {
@@ -414,7 +479,20 @@ function ProviderChoiceScreen({
         <div className="kr-voice__aftermath" role="status" aria-label="The last call">
           <ul className="kr-voice__list">
             {aftermath.map((line, index) => (
-              <li key={`${String(index)}-${line}`}>{line}</li>
+              <li key={`${String(index)}-${line.words}`}>
+                {line.words}
+                {line.startAction !== null && (
+                  <StartNoticeControls
+                    startable={startable && !busy}
+                    onStartAgain={() => {
+                      onStartAfter(line.startAction ?? '')
+                    }}
+                    onDismiss={() => {
+                      onDismissStart(line.startAction ?? '')
+                    }}
+                  />
+                )}
+              </li>
             ))}
           </ul>
         </div>
@@ -528,6 +606,15 @@ function ProviderChoiceScreen({
       {notice && (
         <p className="kr-voice__refusal" role="status">
           {notice}
+          {noticeStartAgain !== null && (
+            <StartNoticeControls
+              startable={startable && !busy}
+              onStartAgain={() => {
+                onStartAfter(noticeStartAgain)
+              }}
+              onDismiss={null}
+            />
+          )}
         </p>
       )}
 

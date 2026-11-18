@@ -139,6 +139,11 @@ export interface HostError {
    * and any other category is its definite word.
    */
   readonly retry: ProtocolError['retry']
+  /**
+   * The earlier voice start that a refusal of `voice.start` names, which this device keeps, so
+   * that a start can name it. Set only for that refusal, and only when the device keeps the start.
+   */
+  readonly startAgainFor?: string
 }
 
 /**
@@ -1070,6 +1075,13 @@ export interface VoiceStartRequest {
   /** Minor units to hold for reasoning and tools, or null to ask for none. */
   readonly reasoningBudgetMinor: string | null
   /**
+   * An earlier start of this device to this host that this start names, because the host holds it:
+   * the host then admits this start in its place. Only a "Start again" press sets it, and only to
+   * a start the device keeps, which a notice or a refusal of the host named. A plain start sets
+   * none.
+   */
+  readonly afterActionId?: string
+  /**
    * The version of the managed rate the person was shown, as the host's preparation answered it.
    *
    * A start names it so the call runs under the terms the person saw. The service refuses a
@@ -1276,13 +1288,15 @@ export interface VoiceDelegationRow {
 /** Something this device could not finish, which the host may still hold open. */
 export interface VoiceOwed {
   /**
-   * `revocation` when a call's grant may still be live; `start_unknown` for a start never answered;
-   * `service_close` when the voice service has not confirmed that it closed a call.
+   * `revocation` when a call's grant may still be live; `start_unknown` for a start never answered
+   * and `start_unconfirmed` for a start whose creation the host could not confirm, which are the
+   * only start entries the device shows; `service_close` when the voice service has not confirmed
+   * that it closed a call.
    */
   readonly kind: string
   /** What a person is told. */
   readonly words: string
-  /** The action a start was sent under, for `start_unknown`. */
+  /** The action a start was sent under, for the start entries. */
   readonly action_id: string | null
   /** The call whose grant may be live, for `revocation`. */
   readonly voice_session_id: string | null
@@ -2167,6 +2181,11 @@ export interface HostPort {
 
   /** What the native call is doing right now. */
   voiceCallState(): Promise<VoiceCallState>
+  /**
+   * Hides the notice of an earlier start this device keeps. Local: it reaches no host, stops no
+   * call and says nothing about one. The device keeps the start, so a later refusal can name it.
+   */
+  voiceDismissStart(actionId: string): Promise<void>
 
   /**
    * Takes a host this computer is paired with, named by its pairing-screen reference, as the one
@@ -2964,6 +2983,11 @@ export function failureWords(value: unknown): string {
 /** The protocol code of a failure, or null when it did not carry one. */
 export function failureCode(value: unknown): string | null {
   return isHostError(value) ? value.code : null
+}
+
+/** The earlier start that a failure names for "Start again", or null when it names none. */
+export function failureStartAgainFor(value: unknown): string | null {
+  return isHostError(value) && typeof value.startAgainFor === 'string' ? value.startAgainFor : null
 }
 
 /** The retry category of a failure, or null when the value is not a host's failure. */

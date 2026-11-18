@@ -208,6 +208,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // holds no call, so the silences are refused and the state is a device holding none.
     ("voice_set_muted", None),
     ("voice_call_state", None),
+    ("voice_dismiss_start", None),
     // The application's own boundary.
     ("open_external", None),
     ("import_remote_image", None),
@@ -720,6 +721,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         voice_context,
         voice_set_muted,
         voice_call_state,
+        voice_dismiss_start,
         open_external,
         import_remote_image,
         choose_export_destination,
@@ -2065,6 +2067,7 @@ pub async fn voice_start<R: tauri::Runtime>(
     reasoning_budget_minor: Option<String>,
     prepared: kr_protocol::scalars::Digest256,
     expected_rate_version: Option<String>,
+    after_action_id: Option<String>,
 ) -> Result<VoiceStarted> {
     let session_ids = session_ids
         .iter()
@@ -2080,6 +2083,12 @@ pub async fn voice_start<R: tauri::Runtime>(
                 .map_err(|_| CommandError::invalid("a reasoning budget is a whole number"))
         })
         .transpose()?;
+    let after = after_action_id
+        .map(|id| {
+            id.parse::<kr_protocol::ids::ActionId>()
+                .map_err(|_| CommandError::invalid("that is not an action identifier"))
+        })
+        .transpose()?;
     let tokens = account.get().await?.tokens();
     let started = calls
         .start(
@@ -2090,6 +2099,7 @@ pub async fn voice_start<R: tauri::Runtime>(
                 prepared,
                 expected_rate_version,
                 subject,
+                after,
             },
             std::sync::Arc::new(crate::voice::AppReach::new(app)),
             tokens,
@@ -2100,6 +2110,11 @@ pub async fn voice_start<R: tauri::Runtime>(
             receipt: None,
             value: Some(value),
             action_id: None,
+        },
+        crate::voice::Started::Unconfirmed { result, action_id } => VoiceStarted {
+            receipt: None,
+            value: Some(result),
+            action_id: Some(action_id.to_string()),
         },
         crate::voice::Started::Receipt(receipt) => VoiceStarted {
             action_id: Some(receipt.action_id.to_string()),
@@ -2322,6 +2337,13 @@ pub enum VoiceMute {
     Microphone,
     /// The model's voice coming out of this device.
     Playback,
+}
+
+/// Hides the notice of an earlier voice start that this device keeps. Local: it reaches no host,
+/// stops no call and says nothing about one.
+#[tauri::command]
+pub fn voice_dismiss_start(calls: State<'_, crate::voice::Calls>, action_id: String) -> Result<()> {
+    calls.dismiss_start(&action_id)
 }
 
 /// Silences the microphone or the model's voice on this device, or ends the silence.
@@ -2873,6 +2895,7 @@ pub async fn inbox_hosts(state: State<'_, AppState>) -> Result<Vec<crate::inbox:
 pub fn hosts_forget<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppState>,
+    calls: State<'_, crate::voice::Calls>,
     reference: String,
 ) -> Result<crate::connection::ConnectionState> {
     let host = state
@@ -2880,6 +2903,8 @@ pub fn hosts_forget<R: tauri::Runtime>(
         .host_by_reference(&reference)
         .ok_or_else(crate::hosts::unknown_host)?;
     let forgotten = crate::hosts::forget_host(&app, &host)?;
+    // The starts this device sent to the host are no longer kept, and no later answer names them.
+    calls.forget_starts_of(host.host_device_id);
     // What is kept of a host's notifications goes with the host. The host's own destination stays
     // until its owner removes this device: only the host revokes an authorisation it holds.
     if let Some(desk) = state.push() {
@@ -3956,6 +3981,7 @@ mod tests {
         "voice_context",
         "voice_set_muted",
         "voice_call_state",
+        "voice_dismiss_start",
         "open_external",
         "import_remote_image",
         "choose_export_destination",
@@ -4130,6 +4156,7 @@ mod tests {
                 // be granted by a service is one that would fail at exactly the moment a person
                 // needs it.
                 "voice_call_state",
+                "voice_dismiss_start",
                 "voice_set_muted",
                 // The account's. Each reaches the account service or this device's secure store,
                 // or only says which services the application holds a client of, and none reaches

@@ -632,6 +632,30 @@ export function owedWords(owed: VoiceOwed): string {
   return `${owed.host_name} may still hold a grant for this call open. It ends by itself by ${until}. ${owed.words}`
 }
 
+/** A line of what the last call left, with the start it is about when the person can act on it. */
+export interface AftermathLine {
+  readonly words: string
+  /** The action of a start this device could not confirm: "Start again" and "Dismiss" name it. */
+  readonly startAction: string | null
+}
+
+/** The action of the start that an owed entry is a notice of, or null when it is not one. */
+export function startNoticeOf(owed: VoiceOwed): string | null {
+  return (owed.kind === 'start_unknown' || owed.kind === 'start_unconfirmed') &&
+    owed.action_id !== null
+    ? owed.action_id
+    : null
+}
+
+/**
+ * The moment the screen reads the device's state again because an entry lapses by itself, or null
+ * when none does: a notice of a start has no lapse, and is not waited for.
+ */
+export function nextLapseOf(owed: readonly VoiceOwed[]): number | null {
+  const ends = owed.filter((each) => startNoticeOf(each) === null).map((each) => each.until_ms)
+  return ends.length === 0 ? null : Math.min(...ends)
+}
+
 /** Every capture state the surface can draw, by its wire name. */
 const CAPTURE_STATES: readonly CaptureState[] = [
   'capturing',

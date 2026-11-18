@@ -20,6 +20,10 @@ pub struct CommandError {
     /// for now (`transient`: nothing took effect, and the same send may be tried again) and from an
     /// outcome the host could not establish (`outcome_unknown`).
     pub retry: RetryCategory,
+    /// The earlier voice start that a refusal of `voice.start` names, which this device keeps, so
+    /// that a start can name it. Only for that refusal, and only when this device keeps the start.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_again_for: Option<String>,
 }
 
 impl CommandError {
@@ -36,6 +40,7 @@ impl CommandError {
             message: message.into(),
             user_action: kr_client::retry::user_action(code).as_str().into(),
             retry: code.retry_category(),
+            start_again_for: None,
         }
     }
 
@@ -53,6 +58,7 @@ impl CommandError {
             message: message.into(),
             user_action: kr_client::retry::UserAction::Nothing.as_str().into(),
             retry: code.retry_category(),
+            start_again_for: None,
         }
     }
 
@@ -147,6 +153,7 @@ impl From<kr_client::ClientError> for CommandError {
             message,
             user_action: action.as_str().into(),
             retry: code.retry_category(),
+            start_again_for: None,
         }
     }
 }

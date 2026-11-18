@@ -2874,6 +2874,15 @@ export function fakeHost(
 
     voiceCallState: () => Promise.resolve(voiceCallState(voice)),
 
+    voiceDismissStart: (actionId) => {
+      voice.owed = voice.owed.filter(
+        (owed) =>
+          owed.action_id !== actionId ||
+          (owed.kind !== 'start_unknown' && owed.kind !== 'start_unconfirmed')
+      )
+      return Promise.resolve()
+    },
+
     accountStatus: () => reading('accountStatus', () => accountView),
     accountSignIn: () => {
       signIns += 1

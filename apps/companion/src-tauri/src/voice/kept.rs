@@ -86,6 +86,12 @@ impl Kept {
         }
     }
 
+    /// Whether this has a place to keep anything.
+    #[must_use]
+    pub const fn stores(&self) -> bool {
+        self.directory.is_some()
+    }
+
     /// What is kept, without what has lapsed by `now_ms`. A file that is missing, or is not this
     /// layout, is nothing kept, and a file that is not this layout says so in the log: a record that
     /// is not there must not stop a call from starting.
