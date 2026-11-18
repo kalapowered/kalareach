@@ -7,15 +7,17 @@
 //! revocation or by the end of its grant, or it did not end at all: what the phone is shown and
 //! what the host keeps are read at each step.
 //!
-//! Every wait of a case is a condition with a bound and a message of its own, and every result of
-//! a step is asserted before its value is taken: a failing case ends at an assertion that names
-//! what did not happen.
+//! Every wait of a case is a condition with a bound and a message of its own, every command the
+//! page calls is called through one helper that gives up on an answer that does not come, and
+//! every result of a step is asserted before its value is taken: a failing case ends at an
+//! assertion that names what did not happen.
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
 mod support;
 
 use std::future::Future;
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +42,7 @@ use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, Moved, proposal};
 use serde_json::{Value, json};
 use support::{Phone, WATCHDOG, phone_paired_with};
+use tauri::Manager;
 
 /// What happened to a phone's attempt to pair again.
 #[derive(Debug)]
@@ -86,6 +89,72 @@ async fn until(what: &str, check: impl Fn() -> bool) {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Where the bundle's pages are served from, which is where the page's calls come from.
+#[cfg(windows)]
+const BUNDLE: &str = "http://tauri.localhost";
+#[cfg(not(windows))]
+const BUNDLE: &str = "tauri://localhost";
+
+/// Calls `command` with `body` as the page does, through the invoke path, and returns what the
+/// page receives: the command's answer or its refusal, both kept with what the page was sent.
+///
+/// The test runtime's own call waits for the answer on a channel with no time-out, which no
+/// enclosing time-out can interrupt, so the call is made on a thread of its own and its result is
+/// received for at most [`WATCHDOG`]. A command that does not answer ends the case with `what`,
+/// the operation that was waiting; the thread is left behind, as the process ends with the case.
+fn invoke(phone: &Phone, what: &str, command: &str, body: Value) -> Result<Value, Value> {
+    assert!(
+        companion_tauri::commands::NAMED_COMMANDS
+            .iter()
+            .any(|(name, _)| *name == command),
+        "{what}: {command} is a command the application registers"
+    );
+    let window = phone
+        .companion
+        .app
+        .get_webview_window("main")
+        .unwrap_or_else(|| panic!("{what}: the application has its window"));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let request = tauri::webview::InvokeRequest {
+        cmd: command.into(),
+        callback: tauri::ipc::CallbackFn(0),
+        error: tauri::ipc::CallbackFn(1),
+        url: BUNDLE.parse().expect("the bundle's address"),
+        body: tauri::ipc::InvokeBody::Json(body),
+        headers: Default::default(),
+        invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+    };
+    let spawned = std::thread::Builder::new()
+        .name(format!("command {command}"))
+        .spawn(move || {
+            let answered = tauri::test::get_ipc_response(&window, request);
+            let _ = sender.send(answered.map(|answer| {
+                answer
+                    .deserialize::<Value>()
+                    .expect("an answer the page can read")
+            }));
+        });
+    assert!(
+        spawned.is_ok(),
+        "{what}: the call of {command} got a thread: {spawned:?}"
+    );
+    let received = tokio::task::block_in_place(|| receiver.recv_timeout(WATCHDOG));
+    let answered = match received {
+        Ok(answered) => answered,
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("{what}: the command {command} gave no answer within {WATCHDOG:?}")
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("{what}: the call of {command} ended with no answer")
+        }
+    };
+    match &answered {
+        Ok(answer) => phone.companion.answered.keep(answer),
+        Err(refusal) => phone.companion.answered.keep(refusal),
+    }
+    answered
 }
 
 /// The result of a step, or the end of the case with the step's name and what refused it.
@@ -166,7 +235,7 @@ fn record_of(host: &Host, device_id: DeviceId) -> DeviceRecord {
 fn the_listed_host(phone: &Phone) -> String {
     let view = took(
         "the pairing screen",
-        phone.companion.call("pairing_view", json!({})),
+        invoke(phone, "reading the listed host", "pairing_view", json!({})),
     );
     let hosts = view["hosts"].as_array().cloned().unwrap_or_default();
     assert_eq!(hosts.len(), 1, "the phone lists one host: {view}");
@@ -181,7 +250,12 @@ fn the_listed_host(phone: &Phone) -> String {
 fn listed_host_count(phone: &Phone) -> usize {
     let view = took(
         "the pairing screen",
-        phone.companion.call("pairing_view", json!({})),
+        invoke(
+            phone,
+            "counting the listed hosts",
+            "pairing_view",
+            json!({}),
+        ),
     );
     view["hosts"].as_array().map_or(usize::MAX, Vec::len)
 }
@@ -194,9 +268,7 @@ async fn connection(phone: &Phone, connected: bool) {
         "the phone's connection to its host ending"
     };
     until(what, || {
-        phone
-            .companion
-            .call("connection_state", json!({}))
+        invoke(phone, what, "connection_state", json!({}))
             .is_ok_and(|state| state["connected"] == connected)
     })
     .await;
@@ -206,7 +278,12 @@ async fn connection(phone: &Phone, connected: bool) {
 async fn attempt_in(phone: &Phone, states: &[&str]) -> Value {
     let end = Instant::now() + WATCHDOG;
     loop {
-        let view = phone.companion.call("pairing_view", json!({}));
+        let view = invoke(
+            phone,
+            "waiting for the attempt's state",
+            "pairing_view",
+            json!({}),
+        );
         if let Ok(view) = &view
             && states
                 .iter()
@@ -253,7 +330,7 @@ async fn attempt(
     owner: &DeviceKeys,
     grant: ProposedGrant,
 ) -> (Outcome, InvitationId) {
-    let mut client = host.client().await;
+    let mut client = within("the connection to the host", host.client()).await;
     let signer = Signer::OwnerDevice(owner);
     let invited = took(
         "the owner issuing an invitation",
@@ -276,23 +353,34 @@ async fn attempt(
     // as the page's "Done" does: the new attempt is read from a screen that holds nothing.
     took(
         "returning the pairing screen to its start",
-        phone.companion.call("pairing_stop", json!({})),
+        invoke(
+            phone,
+            "returning the pairing screen to its start",
+            "pairing_stop",
+            json!({}),
+        ),
     );
     until("the pairing screen holding no attempt", || {
-        phone
-            .companion
-            .call("pairing_view", json!({}))
-            .is_ok_and(|view| {
-                view["state"]["state"] != "paired" && view["state"]["state"] != "ended"
-            })
+        invoke(
+            phone,
+            "the pairing screen holding no attempt",
+            "pairing_view",
+            json!({}),
+        )
+        .is_ok_and(|view| view["state"]["state"] != "paired" && view["state"]["state"] != "ended")
     })
     .await;
     phone.paste.copy(qr_text.as_str(), false);
     let id = invited.invitation_id;
-    if let Err(error) = phone.companion.call("pairing_paste", json!({})) {
+    if let Err(error) = invoke(phone, "pasting the invitation", "pairing_paste", json!({})) {
         return (Outcome::Refused(error), id);
     }
-    if let Err(error) = phone.companion.call("pairing_start_read", json!({})) {
+    if let Err(error) = invoke(
+        phone,
+        "starting to read the invitation",
+        "pairing_start_read",
+        json!({}),
+    ) {
         return (Outcome::Refused(error), id);
     }
     let reached = attempt_in(phone, &["awaiting_approval", "paired", "ended"]).await;
@@ -318,32 +406,25 @@ async fn attempt(
     )
 }
 
-/// The phone forgets the one host it lists, as the page's forget question does.
+/// The phone forgets the one host it lists, as the page's forget question does. The command is
+/// the application's own, so a phone whose notifications were opened (see [`open_push`]) has them
+/// told of the forget by the command, as in the application.
 fn forget(phone: &Phone) {
     let reference = the_listed_host(phone);
     took(
         "forgetting the host",
-        phone
-            .companion
-            .call("hosts_forget", json!({ "reference": reference })),
+        invoke(
+            phone,
+            "forgetting the host",
+            "hosts_forget",
+            json!({ "reference": reference }),
+        ),
     );
     assert_eq!(
         listed_host_count(phone),
         0,
         "the phone lists no host once it forgot it"
     );
-}
-
-/// As [`forget`], with the notifications told that the host is forgotten, as the application
-/// tells them.
-fn forget_notifying(phone: &Phone, push: &Push) {
-    let paired = took(
-        "reading the paired hosts",
-        phone.companion.device().pairing().hosts.list(),
-    );
-    assert_eq!(paired.len(), 1, "the phone is paired with one host");
-    forget(phone);
-    push.desk.forgotten(paired[0].host_device_id);
 }
 
 /// What the notifications must show once the phone paired again and the person turned them on
@@ -426,7 +507,7 @@ async fn paired_phone(host: &Host, owner: &DeviceKeys) -> (Phone, DeviceId) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_phone_that_forgot_a_host_that_still_lists_it_is_told_so() {
     let owner = DeviceKeys::generate().expect("keys");
-    let host = Host::start(&owner).await;
+    let host = within("the host starting", Host::start(&owner)).await;
     let (phone, first) = paired_phone(&host, &owner).await;
     let listed = row_of(&host, first);
 
@@ -452,7 +533,7 @@ async fn a_phone_that_forgot_a_host_that_still_lists_it_is_told_so() {
         "the phone still lists the host"
     );
     // The phone never used that invitation: the owner withdraws it before issuing the next.
-    let mut client = host.client().await;
+    let mut client = within("the connection to the host", host.client()).await;
     took(
         "the owner withdrawing the unused invitation",
         within(
@@ -492,7 +573,7 @@ async fn a_phone_that_forgot_a_host_that_still_lists_it_is_told_so() {
         0,
         "the phone still lists no host"
     );
-    host.stop().await;
+    within("the host stopping", host.stop()).await;
 }
 
 /// The host revokes the phone's record; the phone forgets the host and pairs again with a new
@@ -500,7 +581,7 @@ async fn a_phone_that_forgot_a_host_that_still_lists_it_is_told_so() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_phone_its_host_revoked_forgets_the_host_and_pairs_again() {
     let owner = DeviceKeys::generate().expect("keys");
-    let host = Host::start(&owner).await;
+    let host = within("the host starting", Host::start(&owner)).await;
     let (phone, first) = paired_phone(&host, &owner).await;
     connection(&phone, true).await;
     let push = open_push(&phone);
@@ -523,7 +604,7 @@ async fn a_phone_its_host_revoked_forgets_the_host_and_pairs_again() {
     connection(&phone, false).await;
     let revoked = row_of(&host, first);
 
-    forget_notifying(&phone, &push);
+    forget(&phone);
     let outcome = pair_again(&phone, &host, &owner, viewer()).await;
     assert!(
         matches!(outcome, Outcome::Paired),
@@ -531,7 +612,7 @@ async fn a_phone_its_host_revoked_forgets_the_host_and_pairs_again() {
     );
     assert_paired_again(&phone, &host, first, &revoked).await;
     assert_new_authorisation(&push, &host, first, &old_sender, &asked_before).await;
-    host.stop().await;
+    within("the host stopping", host.stop()).await;
 }
 
 /// As the case above, for a record whose grant ran out and is on record.
@@ -539,7 +620,7 @@ async fn a_phone_its_host_revoked_forgets_the_host_and_pairs_again() {
 async fn a_phone_whose_grant_ran_out_forgets_the_host_and_pairs_again() {
     let (moved, clocks) = Moved::new();
     let owner = DeviceKeys::generate().expect("keys");
-    let host = Host::start_on_clocks(&owner, clocks).await;
+    let host = within("the host starting", Host::start_on_clocks(&owner, clocks)).await;
     let (phone, first) = paired_phone(&host, &owner).await;
     // The phone is connected, which anchors its grant in this boot; the grant runs out and the
     // host's watch over the connection records the end.
@@ -554,7 +635,7 @@ async fn a_phone_whose_grant_ran_out_forgets_the_host_and_pairs_again() {
     .await;
     let ran_out = row_of(&host, first);
 
-    forget_notifying(&phone, &push);
+    forget(&phone);
     let outcome = pair_again(&phone, &host, &owner, grant_past_the_moved_clocks()).await;
     assert!(
         matches!(outcome, Outcome::Paired),
@@ -562,7 +643,7 @@ async fn a_phone_whose_grant_ran_out_forgets_the_host_and_pairs_again() {
     );
     assert_paired_again(&phone, &host, first, &ran_out).await;
     assert_new_authorisation(&push, &host, first, &old_sender, &asked_before).await;
-    host.stop().await;
+    within("the host stopping", host.stop()).await;
 }
 
 /// As the case above, for a grant that is due and whose end nobody read or recorded: the host
@@ -571,7 +652,7 @@ async fn a_phone_whose_grant_ran_out_forgets_the_host_and_pairs_again() {
 async fn a_grant_that_ran_out_unread_is_recorded_when_the_phone_pairs_again() {
     let (moved, clocks) = Moved::new();
     let owner = DeviceKeys::generate().expect("keys");
-    let host = Host::start_on_clocks(&owner, clocks).await;
+    let host = within("the host starting", Host::start_on_clocks(&owner, clocks)).await;
     let (phone, first) = paired_phone(&host, &owner).await;
     connection(&phone, true).await;
     let push = open_push(&phone);
@@ -580,7 +661,7 @@ async fn a_grant_that_ran_out_unread_is_recorded_when_the_phone_pairs_again() {
     // The phone forgets the host while it is connected, which ends the connection, and the host
     // counts no connection of the record before the clocks move: nothing reads the end of the
     // grant.
-    forget_notifying(&phone, &push);
+    forget(&phone);
     let record = record_of(&host, first);
     until("the host counting no connection of the record", || {
         host.connections_of(&record) == 0
@@ -611,7 +692,7 @@ async fn a_grant_that_ran_out_unread_is_recorded_when_the_phone_pairs_again() {
     .await;
     connection(&phone, true).await;
     assert_new_authorisation(&push, &host, first, &old_sender, &asked_before).await;
-    host.stop().await;
+    within("the host stopping", host.stop()).await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -865,6 +946,13 @@ fn open_push(phone: &Phone) -> Push {
         },
         |_view| {},
     );
+    // The application records its notifications in its state once they are opened, and its forget
+    // command tells them from there.
+    phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .push_opened(Arc::clone(&desk));
     Push {
         desk,
         gateway,
