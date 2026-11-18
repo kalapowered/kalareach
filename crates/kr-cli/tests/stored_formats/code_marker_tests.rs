@@ -349,8 +349,8 @@ fn the_schema_librarys_rename_of_the_code_on_a_clash_is_the_code() {
     definitions_of(&mut clash)["ErrorCode2"] = definition;
     clash["properties"]["code"]["$ref"] = json!("#/$defs/ErrorCode2");
     assert_eq!(
-        before,
-        input(&clash, &own),
+        normalise_with_code(&clash, &own, None).as_ref(),
+        Ok(&before),
         "the code under the schema library's rename on a clash is not the code"
     );
 }
