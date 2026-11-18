@@ -238,6 +238,15 @@ pub(super) enum Disk {
 }
 
 pub(super) fn disk(path: &Path) -> Disk {
+    // A name under something that is not a directory is not there either.
+    if let Err(error) = std::fs::symlink_metadata(path)
+        && matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    {
+        return Disk::Missing;
+    }
     match kr_ipc::paths::read_owner_only_file(path, READ_LIMIT) {
         Ok(None) => Disk::Missing,
         Ok(Some(bytes)) => Disk::Bytes(bytes),
@@ -482,15 +491,6 @@ fn leftover(run: &mut Run, record: &Record, which: Leftover) -> Result<()> {
         Leftover::Staging => run.paths.staging.clone(),
         Leftover::Aside => run.paths.aside.clone(),
     };
-    // A name under something that is not a directory is not there either.
-    if let Err(error) = std::fs::symlink_metadata(&path)
-        && matches!(
-            error.kind(),
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-        )
-    {
-        return Ok(());
-    }
     let bytes = match disk(&path) {
         Disk::Missing => return Ok(()),
         Disk::Untrusted => {
