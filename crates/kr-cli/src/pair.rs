@@ -1321,7 +1321,7 @@ fn describe_status(
                 ),
                 None => stdout_line!(
                     "The device that used this invitation was paired with this host, and that \
-                     pairing has ended. Issue a new invitation to pair it again."
+                     pairing has ended."
                 ),
             },
         );
@@ -1438,21 +1438,61 @@ enum Found {
 
 /// Decides what `kr pair confirm` does with the status of an invitation that its issuing owner
 /// reads.
+///
+/// An invitation is told what `kr pair status` says of it, and the command ends with the code that
+/// the host gives a repeat of `pair.confirm` for that ending, so the two ways to learn of it agree.
 fn found(invitation_id: InvitationId, status: &PairStatusResult, view: &PairOwnerView) -> Found {
-    let _ = (invitation_id, status);
-    match (view.candidate.0.clone(), view.approval.0) {
-        (Some(candidate), Some(approval)) => Found::Waiting {
-            candidate,
-            approval,
+    let nothing = |said: Vec<Line>, then: CliError| Found::Nothing { said, then };
+    match &status.status {
+        PairStatus::Committed {
+            device_id,
+            grant_id,
+        } => Found::Paired {
+            device_id: *device_id,
+            grant_id: *grant_id,
+            candidate: view.candidate.0.clone(),
         },
-        _ => Found::Nothing {
-            said: Vec::new(),
-            then: refused(
+        PairStatus::Consumed { reason } => {
+            let code = match reason {
+                PairingConsumedReason::Expired => ErrorCode::PairingExpired,
+                PairingConsumedReason::AttemptsExhausted => ErrorCode::PairingAttemptsExhausted,
+                _ => ErrorCode::PairingRejected,
+            };
+            let said = describe_status(invitation_id, status, kr_ipc::now_ms().get());
+            let then = if matches!(reason, PairingConsumedReason::EndpointPaired) {
+                refused(code, "There is nothing to approve.")
+            } else {
+                refused(
+                    code,
+                    "There is nothing to approve. To pair a device, issue a new invitation.",
+                )
+            };
+            nothing(said, then)
+        }
+        PairStatus::Locked { .. } => nothing(
+            Vec::new(),
+            refused(
                 ErrorCode::PermissionDenied,
-                "no device has answered this invitation yet: approve it once the new device shows \
-                 its verification value",
+                "a device has proved the code and is finishing: approve it once the new device \
+                 shows its verification value",
             ),
-        },
+        ),
+        PairStatus::Open { .. } | PairStatus::AwaitingApproval { .. } => {
+            match (view.candidate.0.clone(), view.approval.0) {
+                (Some(candidate), Some(approval)) => Found::Waiting {
+                    candidate,
+                    approval,
+                },
+                _ => nothing(
+                    Vec::new(),
+                    refused(
+                        ErrorCode::PermissionDenied,
+                        "no device has answered this invitation yet: approve it once the new \
+                         device shows its verification value",
+                    ),
+                ),
+            }
+        }
     }
 }
 
@@ -1993,9 +2033,14 @@ mod tests {
         assert!(
             shown.contains(
                 "The device that used this invitation was paired with this host, and that pairing \
-                 has ended. Issue a new invitation to pair it again."
+                 has ended."
             ),
             "{shown}"
+        );
+        assert!(
+            !shown.contains("pair it again"),
+            "after the device paired again under a new record, the host would refuse that \
+             pairing: {shown}"
         );
         assert!(
             !shown.contains("Remove that pairing"),
