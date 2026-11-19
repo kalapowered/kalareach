@@ -2046,6 +2046,27 @@ read_command!(
     kr_protocol::voice::VoicePrepareParams => kr_protocol::voice::VoicePrepareResult
 );
 
+/// What the page asks of `voice_start`: the call it was shown, in the one map every command reads
+/// its parameters from.
+///
+/// The method's own offer is not here: native code makes it when it opens the call.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceStart {
+    /// The provider the person was shown, as the preparation named it.
+    provider: crate::voice::CallProvider,
+    /// The sessions the call may reach.
+    session_ids: Vec<String>,
+    /// Seconds of call to ask the service to authorise.
+    duration_seconds: u32,
+    /// Minor units to hold for reasoning and tools, as a whole number, or none.
+    reasoning_budget_minor: Option<String>,
+    /// The preparation the person was shown.
+    prepared: kr_protocol::scalars::Digest256,
+    /// The version of the managed rate the person was shown; none for a call on the owner's key.
+    expected_rate_version: Option<String>,
+}
+
 /// Starts a voice call on this device.
 ///
 /// The call is this application's own: native code holds its media, and the task that owns it
@@ -2056,19 +2077,21 @@ read_command!(
 /// call on the host owner's own key is controlled through the host, so the provider the person was
 /// shown is named in the request and no account is asked for before the host answers.
 #[tauri::command]
-#[allow(clippy::too_many_arguments)]
 pub async fn voice_start<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     calls: State<'_, crate::voice::Calls>,
     account: State<'_, crate::account::AccountSlot>,
     subject: Subject,
-    provider: crate::voice::CallProvider,
-    session_ids: Vec<String>,
-    duration_seconds: u32,
-    reasoning_budget_minor: Option<String>,
-    prepared: kr_protocol::scalars::Digest256,
-    expected_rate_version: Option<String>,
+    params: Value,
 ) -> Result<VoiceStarted> {
+    let VoiceStart {
+        provider,
+        session_ids,
+        duration_seconds,
+        reasoning_budget_minor,
+        prepared,
+        expected_rate_version,
+    } = decode(params)?;
     let session_ids = session_ids
         .iter()
         .map(|id| {
@@ -4437,8 +4460,8 @@ mod tests {
     /// reads that take nothing from the page go straight to that question, and the upload, which
     /// takes a path rather than a map, refuses one that nobody dropped. A voice stop takes its
     /// values one by one rather than as a map, and refuses values that are not what they claim to
-    /// be in the same way, and so does a voice start, which parses its sessions before it asks
-    /// for an account or a host.
+    /// be in the same way. A voice start takes a map like the rest, and a map of the right shape
+    /// whose sessions are not identifiers is refused before it asks for an account or a host.
     #[test]
     fn parameters_that_are_not_the_methods_shape_are_refused_before_anything_is_sent() {
         let refusal: Result<kr_protocol::session::SessionReadParams> =
@@ -4504,19 +4527,14 @@ mod tests {
             voice_context,
         ]);
         // One body for every command: each reads the arguments it takes and nothing else. The
-        // voice stop and the voice start read their own one by one. The identifiers they parse
-        // themselves are not identifiers, and the values the invoke layer types are of their types,
-        // so the refusal is the command's own rather than the invoke layer's.
-        let prepared = serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([0; 32]))
-            .expect("a digest");
+        // voice stop reads its own one by one. The identifier it parses itself is not an
+        // identifier, and the values the invoke layer types are of their types, so the refusal is
+        // the command's own rather than the invoke layer's.
         let foreign = serde_json::json!({
             "subject": {},
             "params": { "a_field_no_method_takes": true },
             "path": "/a/file/nobody/dropped",
             "sessionId": null,
-            "sessionIds": ["the session I was looking at"],
-            "durationSeconds": 60,
-            "prepared": prepared,
             "voiceSessionId": "the call I was on",
         });
         for (command, method) in NAMED_COMMANDS {
@@ -4537,6 +4555,27 @@ mod tests {
                 "{command} answers a shape its method does not take"
             );
         }
+
+        // A start whose map is the right shape but whose session is not an identifier is refused
+        // by its own parse, before an account or a host is asked for.
+        let prepared = serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([0; 32]))
+            .expect("a digest");
+        let start = serde_json::json!({
+            "subject": {},
+            "params": {
+                "provider": "managed",
+                "session_ids": ["the session I was looking at"],
+                "duration_seconds": 60,
+                "reasoning_budget_minor": null,
+                "prepared": prepared,
+                "expected_rate_version": null,
+            },
+        });
+        assert_eq!(
+            refusal_of(&window, "voice_start", start).as_deref(),
+            Some("INVALID_ARGUMENT"),
+            "voice_start answers a session that is not an identifier"
+        );
     }
 
     /// KR-REQ-13.16: a file the page hands over as bytes is read from the call's raw body with its

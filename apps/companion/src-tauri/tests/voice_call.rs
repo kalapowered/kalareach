@@ -397,12 +397,14 @@ impl Scene {
     fn own_start_request(&self, prepared: &serde_json::Value) -> serde_json::Value {
         json!({
             "subject": {},
-            "provider": "own_key",
-            "sessionIds": [self.session],
-            "durationSeconds": 1800,
-            "reasoningBudgetMinor": null,
-            "prepared": prepared["prepared"],
-            "expectedRateVersion": null,
+            "params": {
+                "provider": "own_key",
+                "session_ids": [self.session],
+                "duration_seconds": 1800,
+                "reasoning_budget_minor": null,
+                "prepared": prepared["prepared"],
+                "expected_rate_version": null,
+            },
         })
     }
 
@@ -410,12 +412,14 @@ impl Scene {
     fn start_request(&self, prepared: &serde_json::Value) -> serde_json::Value {
         json!({
             "subject": {},
-            "provider": "managed",
-            "sessionIds": [self.session],
-            "durationSeconds": 600,
-            "reasoningBudgetMinor": null,
-            "prepared": prepared["prepared"],
-            "expectedRateVersion": prepared["provider"]["managed"]["terms"]["rate"]["version"],
+            "params": {
+                "provider": "managed",
+                "session_ids": [self.session],
+                "duration_seconds": 600,
+                "reasoning_budget_minor": null,
+                "prepared": prepared["prepared"],
+                "expected_rate_version": prepared["provider"]["managed"]["terms"]["rate"]["version"],
+            },
         })
     }
 
@@ -3967,7 +3971,7 @@ async fn a_start_the_host_refuses_is_recorded_in_its_words_and_without_its_code(
     let mut scene = scene().await;
     let prepared = scene.prepared().await;
     let mut request = scene.start_request(&prepared);
-    request["sessionIds"] =
+    request["params"]["session_ids"] =
         json!([kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string()]);
 
     let answer = scene.call("voice_start", request);
@@ -4661,7 +4665,7 @@ async fn a_start_the_host_refuses_is_not_owed_while_the_media_stops() {
     let _holding = scene.platform.release_when_done("stop");
     let prepared = scene.prepared().await;
     let mut request = scene.start_request(&prepared);
-    request["sessionIds"] =
+    request["params"]["session_ids"] =
         json!([kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string()]);
 
     let starting = scene.phone.companion.start_call("voice_start", request);
@@ -4701,7 +4705,7 @@ async fn a_start_the_host_declines_is_not_owed_while_the_media_stops() {
     let mut request = scene.start_request(&prepared);
     // A digest of a call that is not the one the host would make now: the host declines the start
     // before it asks the service for anything.
-    request["prepared"] =
+    request["params"]["prepared"] =
         serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([9; 32]))
             .expect("a digest");
 
@@ -8760,8 +8764,8 @@ async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_throu
             own_scene_signed_in(own_timings(), Some(phone_grant(PHONE_TOKEN, 3600))).await;
         let prepared = scene.prepared().await;
         let mut request = scene.own_start_request(&prepared);
-        request["provider"] = json!("managed");
-        request["durationSeconds"] = json!(600);
+        request["params"]["provider"] = json!("managed");
+        request["params"]["duration_seconds"] = json!(600);
         if !stop_answered {
             scene.link.lose_the_answer_to(Some(HostMethod::VoiceStop));
         }
@@ -8893,7 +8897,7 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
         let prepared = scene.prepared().await;
         let mut request = scene.own_start_request(&prepared);
         if cause == "deadline" {
-            request["durationSeconds"] = json!(8);
+            request["params"]["duration_seconds"] = json!(8);
         }
         let answer = scene.call("voice_start", request);
         assert!(
@@ -9816,7 +9820,7 @@ async fn the_hosts_news_of_its_deadline_ends_an_own_key_call_before_the_phones_o
     let mut scene = own_scene(own_timings()).await;
     let prepared = scene.prepared().await;
     let mut request = scene.own_start_request(&prepared);
-    request["durationSeconds"] = json!(100);
+    request["params"]["duration_seconds"] = json!(100);
     let answer = scene.call("voice_start", request);
     assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
     scene

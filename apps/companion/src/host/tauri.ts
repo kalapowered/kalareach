@@ -421,15 +421,18 @@ export function tauriPort(): HostPort {
     // from the call the application holds, and reach no service.
     voicePrepare: (params) => read('voice_prepare', params),
     voiceStart: (request, subject) =>
-      call('voice_start', {
-        provider: request.provider,
-        sessionIds: request.sessionIds,
-        durationSeconds: request.durationSeconds,
-        reasoningBudgetMinor: request.reasoningBudgetMinor,
-        prepared: request.prepared,
-        expectedRateVersion: request.expectedRateVersion,
+      mutate(
+        'voice_start',
+        {
+          provider: request.provider,
+          session_ids: request.sessionIds,
+          duration_seconds: request.durationSeconds,
+          reasoning_budget_minor: request.reasoningBudgetMinor,
+          prepared: request.prepared,
+          expected_rate_version: request.expectedRateVersion
+        },
         subject
-      }),
+      ),
     voiceScope: () => call<VoiceScope>('voice_scope', {}),
     voiceAllow: (request, subject) =>
       mutate(

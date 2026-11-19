@@ -193,6 +193,37 @@ describe('the desktop port and the published methods', () => {
     ])
   })
 
+  it('sends a voice start as one map of what the person was shown, with the subject beside it', async () => {
+    const port = tauriPort()
+    await port.voiceStart(
+      {
+        provider: 'own_key',
+        sessionIds: [SESSION],
+        prepared: 'scope-1',
+        durationSeconds: 1800,
+        reasoningBudgetMinor: null,
+        expectedRateVersion: null
+      },
+      { sessionId: SESSION }
+    )
+    expect(shell.invoked).toEqual([
+      {
+        command: 'voice_start',
+        args: {
+          params: {
+            provider: 'own_key',
+            session_ids: [SESSION],
+            duration_seconds: 1800,
+            reasoning_budget_minor: null,
+            prepared: 'scope-1',
+            expected_rate_version: null
+          },
+          subject: { sessionId: SESSION }
+        }
+      }
+    ])
+  })
+
   it('hands a pasted or picked file over as raw bytes, with its name and subject in headers', async () => {
     const bytes = new Uint8Array([1, 2, 3])
     await tauriPort().attachmentUploadBytes(
