@@ -2391,9 +2391,15 @@ mod tests {
         );
         let mut far = ends.recv().await.expect("the tunnel's far end");
 
+        // The closing task reads the steps itself, the moment the end is published: the case's
+        // body runs only after the whole chain on this runtime, so it could not see an end that
+        // was published before the front was gone.
         let closing = tokio::spawn({
             let closer = closer.clone();
-            async move { closer.close().await }
+            async move {
+                closer.close().await;
+                closer.steps()
+            }
         });
         entered.notified().await;
         assert!(!closer.closed() && !endpoint.is_closed());
@@ -2415,7 +2421,11 @@ mod tests {
         );
 
         gate.notify_one();
-        closing.await.expect("the close");
+        assert_eq!(
+            closing.await.expect("the close"),
+            ["gate", "close", "front"],
+            "the end is published only once the front is gone"
+        );
         assert!(closer.closed() && endpoint.is_closed());
         let mut rest = [0_u8; 1];
         assert!(
