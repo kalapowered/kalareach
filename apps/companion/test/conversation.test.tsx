@@ -607,6 +607,36 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
     expect(screen.getByTestId('composer-send')).toBeDisabled()
     expect(screen.queryByText('No agent is running in this session.')).toBeNull()
   })
+
+  it('says the tie before the empty draft’s own words (KR-REQ-12.23)', async () => {
+    const { port } = fakeHost()
+    const tie =
+      'it was not launched through the integration, and acme.codex and openai.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+    openConversation({
+      ...port,
+      sessionAgents: async (...args) => {
+        const read = await port.sessionAgents(...args)
+        const instances = read.instances.instances.map((each) => ({
+          ...each,
+          plugin_id: null,
+          refusal: tie
+        }))
+        return { ...read, instances: { ...read.instances, instances } }
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    expect(screen.getByTestId('composer-input')).toHaveValue('')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(
+        `No package is bound to this agent. The host says ${tie}.`
+      )
+    })
+    // The empty draft's own words follow the notice.
+    expect(screen.getByTestId('composer-reason')).toHaveTextContent(`${tie}. Write something to send.`)
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+  })
 })
 
 describe('what packages show arrives on the stream (KR-REQ-11.48)', () => {

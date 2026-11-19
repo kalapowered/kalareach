@@ -939,27 +939,34 @@ export function MobileSession({
   // A submission whose outcome nobody knows is the one case where sending again could run the
   // same thing twice. Until a receipt settles it, this session sends nothing more.
   const waiting = unresolved(mine)
-  const blocked = over
-    ? 'Nothing more can be sent to this session from here.'
-    : waiting.length > 0
-      ? unconfirmedWords(waiting.length)
-      : (notSubmittableBecause(draft) ?? (submitOffer.offered ? null : submitOffer.reason))
   // The composer is its line, the field with Send beside it, while the terminal shows and on a
   // session too short for the whole composer under the conversation's floor.
   const asLine = pane === 'terminal' || short
-  // While the composer is its line, an empty draft's own words are left out: Send stands disabled
-  // beside the field. Every other reason stays, whatever the draft holds, a tied agent's notice
-  // with it, except while the field is the program's keyboard, when the draft waits for control to
-  // end.
   const emptyDraft = draft.state === 'bound' && draft.text.trim().length === 0 && draft.attachments.length === 0
-  const withoutEmptyWords = asLine && waiting.length === 0 && emptyDraft
-  const offerReason = submitOffer.offered ? null : submitOffer.reason
-  const hint = typingToProgram ? null : withoutEmptyWords ? offerReason : blocked
-  const reason = hint ? (
-    <p className="m-hint" id={`composer-why-${sessionId}`}>
-      {hint}
-    </p>
-  ) : null
+  // Why the agent cannot take a message at all comes first, for every draft, an empty one included:
+  // a tied agent's notice is the reason Send cannot work. The draft's own words follow it, except
+  // an empty draft's while the composer is its line, where Send stands disabled beside the field.
+  // While the field is the program's keyboard the draft waits for control to end: nothing is said.
+  const hints: readonly string[] = typingToProgram
+    ? []
+    : over
+      ? ['Nothing more can be sent to this session from here.']
+      : waiting.length > 0
+        ? [unconfirmedWords(waiting.length)]
+        : [submitOffer.offered ? null : submitOffer.reason, asLine && emptyDraft ? null : notSubmittableBecause(draft)].filter(
+            (each): each is string => each !== null
+          )
+  const whyIds = hints.map((_, index) => (index === 0 ? `composer-why-${sessionId}` : `composer-why-draft-${sessionId}`))
+  const describedBy = whyIds.length > 0 ? whyIds.join(' ') : undefined
+  const reason = (
+    <>
+      {hints.map((words, index) => (
+        <p className="m-hint" id={whyIds[index]} key={whyIds[index]}>
+          {words}
+        </p>
+      ))}
+    </>
+  )
   // When every action that holds the session is one nobody knows the end of, a person who checked
   // can send anyway: that is a new action, and the earlier ones stay listed as they are.
   const release =
@@ -967,7 +974,7 @@ export function MobileSession({
       <Button
         data-testid="composer-send-anyway"
         data-wraps
-        aria-describedby={hint ? `composer-why-${sessionId}` : undefined}
+        aria-describedby={describedBy}
         disabled={!submittable(draft) || !submitOffer.offered || busy}
         style={{ minBlockSize: target }}
         onClick={() => {
@@ -1002,7 +1009,7 @@ export function MobileSession({
       rows={pane === 'terminal' ? 1 : undefined}
       value={draft.text}
       placeholder="Message this session"
-      aria-describedby={hint ? `composer-why-${sessionId}` : undefined}
+      aria-describedby={describedBy}
       onChange={(event) => {
         typeInto(event.target.value)
       }}

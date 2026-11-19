@@ -521,6 +521,24 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
     expect(screen.queryByText('Write something to send.')).toBeNull()
   })
+
+  it('says the tie before the empty draft’s own words in the whole composer (KR-REQ-12.23)', async () => {
+    const { port } = fakeHost()
+    render(
+      <AppProvider port={tiedAgent(port)}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    const field = await screen.findByLabelText('Message this session')
+    expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'whole')
+    expect(field).toHaveValue('')
+    const notice = await screen.findByText(TIE_NOTICE)
+    // The empty draft's own words follow the notice, each in its own line, and both describe the field.
+    const own = screen.getByText('Write something to send.')
+    expect(notice.compareDocumentPosition(own) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(field).toHaveAttribute('aria-describedby', `${notice.id} ${own.id}`)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
 })
 
 describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
