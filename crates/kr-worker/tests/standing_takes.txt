@@ -60,7 +60,8 @@ scope crates/kr-worker/src/input_domain.rs lock
 outside crates/kr-worker/src/service.rs decidable
 
 # The takes. Each is a lock of one domain, or the session's guard.
-# The time contract's state lock: the proven reading's mark is read under it, and nothing else.
+# The time contract's state lock: the proven reading's mark is read under it, and the pure wall
+# reader takes the readings' lock under it (the next entry).
 site crates/kr-worker/src/action/time.rs pure_proven_ms lock 1
 # The readings' lock, for the note of the wall reading that the pure wall reader takes: taken under
 # the state's in the contract's order (the state's, then the readings'), held for the two clocks
