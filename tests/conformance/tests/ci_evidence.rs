@@ -1172,6 +1172,169 @@ fn the_wsl2_acceptance_has_a_workflow_that_runs_its_script_on_windows() {
     );
 }
 
+/// The title of every case of a test file that is skipped off Windows (`it.skipIf(!windows)(...)`),
+/// each as the file writes its literal, quotes included.
+fn windows_only_titles(source: &str) -> Vec<String> {
+    const CALL: &str = ".skipIf(!windows)(";
+    let titles: Vec<String> = source
+        .match_indices(CALL)
+        .map(|(at, _)| {
+            let word: String = source[..at]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            assert!(
+                word == "it" || word == "test",
+                "a skipIf(!windows) on {word}, which this reads no title of"
+            );
+            let after = &source[at + CALL.len()..];
+            let quote = after
+                .chars()
+                .next()
+                .filter(|c| matches!(c, '\'' | '"' | '`'))
+                .expect("a skipIf(!windows) case whose title is a string literal");
+            let end = 1 + after[1..].find(quote).expect("the title's closing quote");
+            let literal = &after[..=end];
+            assert!(
+                !literal.contains('\\'),
+                "a title with an escape cannot be compared as text: {literal}"
+            );
+            literal.to_owned()
+        })
+        .collect();
+    assert_eq!(
+        titles.len(),
+        source.matches("skipIf(!windows)").count(),
+        "a skipIf(!windows) that is not a call on a case with a literal title"
+    );
+    titles
+}
+
+/// KR-REQ-27.03, the TypeScript reader on Windows: `artefacts-dir.test.ts` has cases that run only
+/// on Windows and are skipped on every other platform, and a skipped case does not fail a run. The
+/// landing workflow's Windows job runs the file in its `first` leg, after the step that installs
+/// the packages, with Vitest's report written to a file, and a check reads that report and refuses
+/// a run in which one of those cases is missing, skipped or failed. The check names every case the
+/// file skips off Windows, by its title as the file writes it, so a case added to the file and not
+/// to the check fails here. Unlike the cases above, this one reads what the step's command does:
+/// that the check runs after Vitest whatever Vitest's exit was, and that the step then exits with
+/// Vitest's own code if it was not zero.
+#[test]
+fn the_windows_job_runs_the_evidence_readers_windows_only_cases_and_checks_they_passed() {
+    const TEST: &str = "pnpm -C apps/companion exec vitest run test/artefacts-dir.test.ts";
+    const CHECK: &str = "node apps/companion/scripts/artefacts-dir-windows-cases.mjs";
+
+    // The check names each of the file's Windows-only cases, on a line of its own.
+    let source = fs::read_to_string(repository().join("apps/companion/test/artefacts-dir.test.ts"))
+        .expect("the evidence directory reader's test file");
+    let titles = windows_only_titles(&source);
+    assert!(
+        !titles.is_empty(),
+        "the test file has no case that runs only on Windows"
+    );
+    let script = fs::read_to_string(
+        repository().join("apps/companion/scripts/artefacts-dir-windows-cases.mjs"),
+    )
+    .expect("the check of the Windows-only cases");
+    for title in &titles {
+        assert!(
+            script
+                .lines()
+                .any(|line| line.trim().trim_end_matches(',') == title),
+            "the check does not name the Windows-only case {title}"
+        );
+    }
+
+    // The Windows job's first leg runs the file once, after the packages are installed.
+    let workflow = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let windows = job(&workflow, "windows");
+    assert!(
+        legs(&windows).iter().any(|leg| leg == "first"),
+        "the Windows job has no first leg"
+    );
+    let running: Vec<String> = steps_of(&windows)
+        .into_iter()
+        .filter(|step| step.lines().any(|line| starts(line, TEST)))
+        .collect();
+    assert_eq!(
+        running.len(),
+        1,
+        "the number of steps of the Windows job that run the evidence reader's test file"
+    );
+    let step = &running[0];
+    assert!(
+        !is_disabled(step),
+        "the step that runs the evidence reader's test file is disabled"
+    );
+    let condition = step_condition(step).expect("the step runs under a condition");
+    assert_eq!(
+        leg_named(&condition).as_deref(),
+        Some("first"),
+        "the step does not run in the first leg"
+    );
+    assert!(
+        condition.contains("!cancelled()"),
+        "the step does not run after an earlier step failed"
+    );
+    assert!(
+        steps_named(&condition)
+            .iter()
+            .any(|id| id == "install-packages"),
+        "the step does not wait for the packages' installation"
+    );
+    let install = position_of_id(&windows, "install-packages")
+        .expect("the Windows job has a step with the id install-packages");
+    let steps = steps_of(&windows);
+    assert!(
+        steps[install]
+            .lines()
+            .any(|line| starts(line, "pnpm install --frozen-lockfile")),
+        "the step with the id install-packages does not install the packages"
+    );
+    assert!(
+        !is_disabled(&steps[install])
+            && step_condition(&steps[install])
+                .and_then(|when| leg_named(&when))
+                .as_deref()
+                == Some("first"),
+        "the installation is disabled or does not run in the first leg"
+    );
+    assert!(
+        position_of_tool(&windows, TEST).is_some_and(|at| install < at),
+        "the installation does not come before the step that runs the file"
+    );
+
+    // Vitest's report goes to a file, the check reads it, and Vitest's own exit is kept.
+    let lines: Vec<&str> = step.lines().map(str::trim).collect();
+    let at = |wanted: &dyn Fn(&str) -> bool| lines.iter().position(|line| wanted(line));
+    let vitest = lines
+        .iter()
+        .position(|line| starts(line, TEST))
+        .expect("the line that runs Vitest");
+    assert!(
+        lines[vitest].contains("--reporter=json")
+            && lines[vitest].contains("\"--outputFile.json=$report\""),
+        "Vitest does not write its JSON report to a file"
+    );
+    let kept = at(&|line| line == "$vitest = $LASTEXITCODE").expect("Vitest's exit is kept");
+    let check = at(&|line| line.starts_with(CHECK) && line.ends_with("$report"))
+        .expect("the check reads Vitest's report");
+    let exits = at(&|line| line == "if ($vitest -ne 0) { exit $vitest }")
+        .expect("the step exits with Vitest's exit when it is not zero");
+    let cases = at(&|line| line == "$cases = $LASTEXITCODE").expect("the check's exit is kept");
+    let last = at(&|line| line == "exit $cases").expect("the step exits with the check's exit");
+    assert!(
+        vitest < kept && kept < check && check < cases && cases < exits && exits < last,
+        "Vitest's exit is kept right after it, the check runs next, and the step exits with Vitest's \
+         exit if it is not zero and with the check's otherwise"
+    );
+}
+
 /// The tests that start a daemon through the user's service manager stand down, and pass, on a
 /// machine that has none. The Linux runs that report on the workspace's tests set
 /// `KR_REQUIRE_SERVICE_MANAGER`, which turns that standing down into a failure, so that a runner
