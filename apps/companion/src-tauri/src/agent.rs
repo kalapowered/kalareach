@@ -261,6 +261,25 @@ impl WorkerLinks {
         self.settle(state, session_id, link.link(), answer)
     }
 
+    /// Lets the link `session_id`'s call used stop counting `action_id` as unresolved.
+    ///
+    /// The link is found as every agent call finds it, by the opening the call used.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the link could not be reached.
+    pub async fn settle_action(
+        &self,
+        state: &AppState,
+        session_id: SessionId,
+        opening: Option<&str>,
+        action_id: ActionId,
+    ) -> Result<()> {
+        let link = self.link(state, session_id, opening).await?;
+        link.session.settle(action_id).await;
+        Ok(())
+    }
+
     /// Submits one agent mutation to the worker of the session `about` names, about its instance at
     /// the binding revision it names, and waits for the worker to settle it. `expected` is the
     /// request's subject preconditions.
