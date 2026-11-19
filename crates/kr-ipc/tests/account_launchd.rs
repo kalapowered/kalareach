@@ -163,14 +163,16 @@ fn holds(path: &str, needle: &str) -> bool {
         .any(|window| window == needle.as_bytes())
 }
 
-/// A program a release ships holds neither the sentence of the refusal nor the name of the variable
-/// that asks, and the programs built for the suites hold both.
+/// KR-REQ-03.02: a program a release ships holds neither the sentence of the refusal nor the name of
+/// the variable that asks, and the programs built for the suites hold both. A shipped program that
+/// held the test-only launchd refusal would refuse the person's own per-user service.
 ///
 /// The second half is what makes the first one a search that can find: a program with the
 /// `testing` features carries the bytes, so a shipped program that does not is not one that was
-/// searched for the wrong thing. `scripts/shipped-hold-gate.sh` builds the programs, each alone as
-/// a release tree builds it and the suites' own with the feature, and names them in
-/// `KR_SHIPPED_HELD` and `KR_SHIPPED_PROGRAMS`, one path to a line.
+/// searched for the wrong thing. `scripts/shipped-hold-gate.sh` builds the programs in the release
+/// profile, each alone as a release tree builds it and in the build of the whole workspace, and the
+/// suites' own with the feature, and names them in `KR_SHIPPED_HELD` and `KR_SHIPPED_PROGRAMS`, one
+/// path to a line.
 #[test]
 #[ignore = "reads the programs that KR_SHIPPED_HELD and KR_SHIPPED_PROGRAMS name; scripts/shipped-hold-gate.sh builds them and runs this"]
 fn a_shipped_program_holds_none_of_the_launchd_refusal() {

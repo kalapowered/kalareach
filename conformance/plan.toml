@@ -2421,6 +2421,15 @@ file = 'scripts/shipped-controller-gate.sh'
 line = 'KR_SHIPPED_CONTROLLER="$target/debug/kr-controller" cargo test --locked -p kr-controller --test storage_account -- --ignored --exact a_shipped_controller_refuses_a_plain_http_storage_origin_before_it_sends_anything --nocapture'
 
 [[ignored_run]]
+package = 'kr-ipc'
+target = '--test account_launchd'
+cases = ['a_shipped_program_holds_none_of_the_launchd_refusal']
+[ignored_run.runs]
+kind = 'command'
+file = 'scripts/shipped-hold-gate.sh'
+line = 'KR_SHIPPED_HELD="$held" KR_SHIPPED_PROGRAMS="$shipped" cargo test --locked -p kr-ipc --test account_launchd -- --ignored --exact a_shipped_program_holds_none_of_the_launchd_refusal --nocapture'
+
+[[ignored_run]]
 package = 'kr-controller'
 target = '--test descriptions'
 [ignored_run.runs]
