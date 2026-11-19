@@ -6048,7 +6048,8 @@ fn signal(name: &str, pid: u32) {
 
 /// The line that is typed into a session's shell to run `kr host stop` with both session variables
 /// taken out, as a workflow's shell node would run it: it names the daemon's two folders and the
-/// program, and writes what the command said to the file `said`.
+/// program, and writes what the command said to the file `said`. Each path is quoted for the shell
+/// that reads the line.
 fn the_stop_line_typed_into_a_session(
     runtime: &Path,
     state: &Path,
@@ -6059,11 +6060,11 @@ fn the_stop_line_typed_into_a_session(
         "env -u KR_SESSION -u KR_ATTACHMENT {runtime_variable}={runtime} {state_variable}={state} \
          {kr} host stop > {said} 2>&1; echo done-$?",
         runtime_variable = kr_ipc::paths::RUNTIME_DIR_VARIABLE,
-        runtime = runtime.display(),
+        runtime = kr_worker::testing::shell_quoted(runtime),
         state_variable = kr_ipc::paths::STATE_DIR_VARIABLE,
-        state = state.display(),
-        kr = kr.display(),
-        said = said.display(),
+        state = kr_worker::testing::shell_quoted(state),
+        kr = kr_worker::testing::shell_quoted(kr),
+        said = kr_worker::testing::shell_quoted(said),
     )
 }
 

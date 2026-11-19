@@ -5880,9 +5880,10 @@ const COMMAND_RIGHTS: [ActionRight; 4] = [
     ActionRight::WorkspaceManage,
 ];
 
-/// The command of a node that makes the file `marker`, so that a case can tell the node ran.
+/// The command of a node that makes the file `marker`, so that a case can tell the node ran. The
+/// path is quoted for the shell that reads the command.
 fn the_command_that_touches(marker: &Path) -> String {
-    format!("touch {}", marker.display())
+    format!("touch {}", kr_worker::testing::shell_quoted(marker))
 }
 
 /// A `shell_command` node that runs `command` in this host's own environment.
