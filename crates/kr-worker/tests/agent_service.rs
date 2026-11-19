@@ -3282,7 +3282,7 @@ async fn kr_req_25_22_an_ending_binding_stays_while_the_thread_of_a_cancellation
     mutation.params = ParamsValue::from_typed(&params).expect("encodes");
 
     let (arrived, release) = host.service.broker().pause_before_submit();
-    let mut sending = tokio::spawn(async move {
+    let sending = tokio::spawn(async move {
         let outcome = send(&mut client, mutation).await;
         (outcome, client)
     });
