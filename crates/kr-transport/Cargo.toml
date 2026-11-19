@@ -54,6 +54,8 @@ kr-transport = { path = ".", features = ["testing"] }
 kr-test-artifacts.workspace = true
 iroh = { workspace = true, features = ["test-utils"] }
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
+# The interface list the network library reads before it keeps a relay connection through a change.
+netwatch.workspace = true
 # Certificates from an authority a test makes, for the relay front and the intercepting proxy.
 rcgen.workspace = true
 serde_json.workspace = true
