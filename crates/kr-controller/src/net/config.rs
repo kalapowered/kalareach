@@ -392,7 +392,7 @@ mod tests {
             assert!(said.contains("network.proxy_url"), "{value}: {said}");
             assert!(!said.contains(secret), "{value}: {said}");
             assert_eq!(
-                said.ends_with("--proxy-credential-file <file>`"),
+                said.ends_with("a proxy is named by its address alone, with no user name or password"),
                 credential,
                 "{value}: {said}"
             );
