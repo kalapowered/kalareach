@@ -354,7 +354,7 @@ enum Way {
 
 /// The funnels of the programs that are built without the hold: file, function (`Type::name` inside
 /// an `impl`), the way its guard stands, and why it is a funnel.
-const FUNNELS: [(&str, &str, Way, &str); 7] = [
+const FUNNELS: [(&str, &str, Way, &str); 8] = [
     (
         "tests/e2e/m1b/src/host.rs",
         "Host::start_prepared",
@@ -392,10 +392,31 @@ const FUNNELS: [(&str, &str, Way, &str); 7] = [
         "spawns a second daemon over a host's tree",
     ),
     (
+        "crates/kr-cli/tests/upgrade.rs",
+        "Previous::built",
+        Way::First,
+        "builds an earlier release's plain daemon and `kr`, which the suite then starts",
+    ),
+    (
         "tests/e2e/m1b/tests/checkpoint.rs",
         "a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_attach_draws",
         Way::Before,
         "a case that runs `kr new` on a terminal of its own",
+    ),
+];
+
+/// The functions of a gated file that hold a launch form and start nothing themselves: file,
+/// function, and the call (`Type::name`) that reaches the funnel, which holds the guard.
+const THROUGH_A_FUNNEL: [(&str, &str, &str); 2] = [
+    (
+        "crates/kr-cli/tests/upgrade.rs",
+        "a_stored_apply_node_is_admitted_across_an_update_and_a_rollback",
+        "Updated::prepare",
+    ),
+    (
+        "crates/kr-cli/tests/upgrade.rs",
+        "a_report_store_the_release_before_ignores_is_kept_across_a_rollback_and_an_update",
+        "Updated::prepare",
     ),
 ];
 
@@ -686,6 +707,17 @@ fn read(relative: &str) -> String {
         .unwrap_or_else(|error| panic!("{relative} is read: {error}"))
 }
 
+/// Whether the body holds a call of `Type::name`: the two identifiers with `::` between.
+fn calls(tokens: &[Token], body: &std::ops::Range<usize>, path: &str) -> bool {
+    let (owner, name) = path.split_once("::").expect("a path of two names");
+    tokens[body.clone()].windows(4).any(|window| {
+        window[0].ident() == Some(owner)
+            && window[1].is_punct(':')
+            && window[2].is_punct(':')
+            && window[3].ident() == Some(name)
+    })
+}
+
 /// Every funnel holds its guard statement first, or before its first launch.
 #[test]
 fn every_launch_function_holds_its_guard_statement_first_or_before_its_first_form() {
@@ -775,6 +807,12 @@ fn every_launch_form_of_a_gated_file_stands_by_a_listed_way() {
             .iter()
             .filter(|funnel| funnel.0 == file)
             .map(|funnel| funnel.1)
+            .chain(
+                THROUGH_A_FUNNEL
+                    .iter()
+                    .filter(|through| through.0 == file)
+                    .map(|through| through.1),
+            )
             .collect();
         sites.extend(
             unlisted_launches(&read(file), &listed)
@@ -786,6 +824,38 @@ fn every_launch_form_of_a_gated_file_stands_by_a_listed_way() {
         sites.is_empty(),
         "these launch sites stand by no listed way: {sites:?}"
     );
+
+    // A function that starts nothing itself still calls the funnel that does.
+    for (file, function, call) in THROUGH_A_FUNNEL {
+        let tokens = code_tokens(&read(file));
+        let found: Vec<Function> = functions(&tokens)
+            .into_iter()
+            .filter(|candidate| candidate.name == function)
+            .collect();
+        assert!(
+            !found.is_empty(),
+            "{file}: {function} is no longer in the source"
+        );
+        for definition in found {
+            assert!(
+                calls(&tokens, &definition.body, call),
+                "{file}: {function} no longer calls {call}, which holds its guard"
+            );
+        }
+    }
+    let holds = |source: &str, call: &str| {
+        let tokens = code_tokens(source);
+        calls(&tokens, &(0..tokens.len()), call)
+    };
+    assert!(holds(
+        "fn a() { Updated::prepare(x).await; }",
+        "Updated::prepare"
+    ));
+    assert!(!holds("fn a() { prepare(x); }", "Updated::prepare"));
+    assert!(!holds(
+        "fn a() { // Updated::prepare(x)\n }",
+        "Updated::prepare"
+    ));
 
     // What the reading finds and does not find, on sources of its own.
     let daemon = plain_daemon();
