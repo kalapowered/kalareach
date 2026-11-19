@@ -5301,9 +5301,10 @@ async fn an_uncertain_action_of_a_replaced_package_does_not_hold_the_same_named_
         refresh_invocation_with(&host, request_id, window.clone(), plugin, Nullable::null())
     };
 
-    // The first package's action runs, and the case writes its receipt as uncertain. A
-    // presentation action never becomes uncertain in production; the hold reads only that state
-    // and the subject, so this is all the control and the retry below need.
+    // The first package's action runs, and the case writes its receipt as uncertain. In production
+    // a presentation action is uncertain only when the worker stops between its dispatch marker
+    // and its outcome. The hold reads only that state and the subject, so this is all the control
+    // and the retry below need.
     let uncertain = call(150, "kalareach/example-declarative");
     let uncertain_id = uncertain.action_id;
     assert!(

@@ -1373,6 +1373,12 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
                 .expect("the action's parameters"),
         ),
     };
+    // The envelope names the application instance and the binding revision the parameters name.
+    let envelope = |device: &kr_e2e_m1b::device::Remote| kr_protocol::envelope::ActionTarget {
+        application_instance_id: Nullable::some(invoke.target.subject.application_instance_id),
+        agent_binding_revision: Nullable::some(invoke.target.binding_revision),
+        ..session_target(device, session_id)
+    };
 
     // The control first: a device that holds a share of the session, whose grant does not carry the
     // action's rights.
@@ -1432,7 +1438,7 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
         .unwrap_or_else(|why| panic!("grant.redeem: {why}"));
     let refused = runtime.block_on(watching.mutate::<_, PluginActionInvokeResult>(
         Method::PluginActionInvoke,
-        session_target(&watching, session_id),
+        envelope(&watching),
         &invoke,
     ));
     match refused {
@@ -1443,11 +1449,7 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
         ),
     }
     let applied: PluginActionInvokeResult = runtime
-        .block_on(remote.mutate(
-            Method::PluginActionInvoke,
-            session_target(&remote, session_id),
-            &invoke,
-        ))
+        .block_on(remote.mutate(Method::PluginActionInvoke, envelope(&remote), &invoke))
         .unwrap_or_else(|error| panic!("plugin.action.invoke: {error}"));
     assert_eq!(applied.action.as_str(), ACTION);
 
