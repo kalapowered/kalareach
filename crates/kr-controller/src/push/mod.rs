@@ -1544,7 +1544,8 @@ impl DeliveryModule {
             }
             mailbox::Placement::Later { detail, after, .. } => Detail::Later { detail, after },
             // The pending detail stays: nothing was sent, and nothing schedules another attempt
-            // for it before the host restarts.
+            // for it before the host restarts. A later attempt of the push asks the placer
+            // again, and the stop refuses that request before it is sent.
             mailbox::Placement::Held { detail } => Detail::Held(detail),
         };
         Ok(Placing {
