@@ -4666,7 +4666,12 @@ mod tests {
                 .map_err(|error| error.to_string())
         };
         assert_eq!(project_of(true, "json_command_args"), Ok(()));
-        let sharing = project_of(false, "json_command_args").expect_err("not shared");
+        let not_shared = project_of(false, "json_command_args");
+        assert!(
+            not_shared.is_err(),
+            "a document that is not shared is refused"
+        );
+        let sharing = not_shared.err().unwrap_or_default();
         assert!(
             sharing.contains("is named by amp and by claude-code at project scope"),
             "{sharing}"
@@ -4675,7 +4680,9 @@ mod tests {
             sharing.contains("do not both declare it shared"),
             "{sharing}"
         );
-        let formats = project_of(true, "json_local_command_list").expect_err("another format");
+        let another = project_of(true, "json_local_command_list");
+        assert!(another.is_err(), "another format is refused");
+        let formats = another.err().unwrap_or_default();
         assert!(formats.contains("in different formats"), "{formats}");
     }
 
@@ -5750,6 +5757,8 @@ mod tests {
             )
             .install(&params(amp(), InstallScope::User))
             .expect("the first installs");
+        let first_document = tree.home().join(".shared").join("mcp.json");
+        let before = std::fs::read(&first_document).expect("the first entry");
         let mut other = declared(
             Some(document(
                 [".Shared", "MCP.json"],
@@ -5766,9 +5775,26 @@ mod tests {
                 InstallScope::User,
             ))
             .expect_err("the same document under another spelling");
+        // The refusal is the claim the first record holds on the document, whatever the file system
+        // does with the spelling: no other refusal stands for it.
+        match refused {
+            ControllerError::PermissionDenied { detail } => assert_eq!(
+                detail,
+                CLAIMED_DIFFERENTLY.replace(
+                    "{path}",
+                    &display(&tree.home().join(".Shared").join("MCP.json"))
+                )
+            ),
+            other => panic!("the claim on the document refuses: {other}"),
+        }
         assert!(
-            matches!(refused, ControllerError::PermissionDenied { .. }),
-            "{refused}"
+            !tree.home().join(".bmp").exists(),
+            "nothing was written for the refused word"
+        );
+        assert_eq!(
+            std::fs::read(&first_document).expect("the first entry"),
+            before,
+            "the first entry is as it was"
         );
     }
 
