@@ -3820,8 +3820,10 @@ mod proxy_login_gate {
 
     /// KR-REQ-10.02: a request of the catalogue on a tunnel that is already open, and kept in the
     /// pool, is stopped once another client has set the verdict: the origin reads no request after
-    /// it and the proxy sees no further connection.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// it and the proxy sees no further connection. The case runs on one thread and reads each
+    /// answer whole, so the first connection is back in the pool before the next request asks
+    /// for one.
+    #[tokio::test]
     async fn the_catalogues_egress_stops_a_request_on_a_tunnel_that_is_already_open() {
         use super::connect_proxy::Login;
 
@@ -3859,6 +3861,7 @@ mod proxy_login_gate {
                 panic!("the origin answers");
             };
             assert_eq!(answered.status().as_u16(), 200);
+            answered.bytes().await.expect("the complete answer");
         }
         assert_eq!(origin.requests(), 2);
         assert_eq!(

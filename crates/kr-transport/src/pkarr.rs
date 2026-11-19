@@ -610,10 +610,12 @@ mod tests {
 
     /// A request on a tunnel that is already open, and kept in the pool, is stopped once another
     /// client has set the verdict: the origin counts no request after it, the proxy no further
-    /// connection, and a publication is stopped as a resolution is.
+    /// connection, and a publication is stopped as a resolution is. The case runs on one thread,
+    /// its origin answers with no body and it reads each answer whole, so the first connection is
+    /// back in the pool before the next request asks for one.
     ///
     /// Covers KR-REQ-10.02.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn a_refused_login_stops_a_request_on_a_tunnel_that_is_already_open() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -647,7 +649,7 @@ mod tests {
                         }
                         counted.fetch_add(1, Ordering::SeqCst);
                         if stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
                             .await
                             .is_err()
                         {
@@ -681,6 +683,7 @@ mod tests {
             .await
             .expect("the origin answers");
         assert_eq!(resolved.status().as_u16(), 200);
+        resolved.bytes().await.expect("the complete answer");
         let published = send(
             &client,
             Some(&url),
@@ -689,6 +692,7 @@ mod tests {
         .await
         .expect("the origin answers");
         assert_eq!(published.status().as_u16(), 200);
+        published.bytes().await.expect("the complete answer");
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert_eq!(
             proxy.logins(),
