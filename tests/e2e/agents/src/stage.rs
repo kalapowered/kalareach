@@ -489,6 +489,9 @@ pub fn session_path(run: &Run) -> String {
 #[derive(Clone, Debug)]
 pub struct Installation {
     current: PathBuf,
+    /// The directory `agent` as the run made it: an upgrade acts only through the handle of this
+    /// object, found again by the walk from the pin that follows no link.
+    agent: PlacedDirectory,
 }
 
 impl Installation {
@@ -510,7 +513,10 @@ impl Installation {
             std::os::unix::fs::symlink(executable, runtimes.join(name))
                 .unwrap_or_else(|error| panic!("links {}: {error}", executable.display()));
         }
-        Self { current }
+        let agent =
+            PlacedDirectory::record(run.root(), run.pin(), Path::new(INSTALLATION_DIRECTORY))
+                .expect("the installation directory is a directory of the run");
+        Self { current, agent }
     }
 
     /// The directory the command is found in.
@@ -520,15 +526,20 @@ impl Installation {
     }
 
     /// Points `current` at the build installed at `prefix` in one step: a new link renamed over
-    /// the old one, as an installer that switches versions does.
+    /// the old one, as an installer that switches versions does. Both steps go through the held
+    /// handle of the directory `agent` as the run made it: where the agent put a link or another
+    /// directory in its place the upgrade is refused, a `current.next` that is already there stops
+    /// it (the harness unlinks nothing by name), and nothing is written outside the run.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when the link cannot be replaced.
-    pub fn upgrade(&self, prefix: &Path) {
-        let next = self.current.with_file_name("current.next");
-        std::os::unix::fs::symlink(prefix, &next).expect("links the newer build");
-        std::fs::rename(&next, &self.current).expect("replaces the link");
+    /// Returns why `agent` is not the directory the run made, or a step was refused.
+    pub fn upgrade(&self, run: &Run, prefix: &Path) -> Result<(), String> {
+        let handle = self.agent.open(run.root(), run.pin())?;
+        rustix::fs::symlinkat(prefix, &handle, "current.next")
+            .map_err(|error| format!("the newer build is not linked: {error}"))?;
+        rustix::fs::renameat(&handle, "current.next", &handle, CURRENT_LINK)
+            .map_err(|error| format!("the link is not replaced: {error}"))
     }
 }
 
