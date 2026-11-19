@@ -411,6 +411,35 @@ pub const COMMAND_INTEGRATION_NOTICE: &str = "This package changes how a command
 pub const INTEGRATION_STATEMENT_LABEL: &str =
     "The host's exact reading of the command integration:";
 
+/// What the host writes before its own exact reading of a placement in an installation's
+/// statement, for a package whose table declares where its bridge's files are placed. The
+/// publisher's words never hold it (the package check refuses them, and the host refuses a manifest
+/// that has it), so the first place it stands is where the host's reading starts and the
+/// publisher's words end.
+pub const PLACEMENT_STATEMENT_LABEL: &str = "The host's exact reading of the placement:";
+
+/// The capability a host states in its hello when it writes [`PLACEMENT_STATEMENT_LABEL`] and
+/// refuses it in the publisher's words. A device takes the label for the host's only on a link
+/// whose host states it: a host built before the label lets a publisher write it, and the device
+/// cannot tell that text from the host's reading any other way.
+pub const PLACEMENT_READING_CAPABILITY: &str = "statement.placement_reading/1";
+
+/// The longest statement an installation's confirmation carries, and so the longest shown whole:
+/// the publisher's statement of a native bridge, the host's label, and the host's reading of a
+/// command integration, each at the longest the package contract allows. The host's reading of a
+/// placement shares the room: a release whose whole statement is longer is refused by the host.
+pub const STATEMENT_CHARS: usize = 5054;
+
+/// Whether a link's hello states that its host writes the placement reading.
+#[must_use]
+pub fn states_placement_reading(
+    capabilities: &crate::scalars::CanonicalSet<crate::ids::CapabilityId>,
+) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == PLACEMENT_READING_CAPABILITY)
+}
+
 /// The host's notices for an installation with this grant, in the order they are shown: one for
 /// each capability in it that the host describes in its own words.
 #[must_use]
@@ -429,64 +458,91 @@ pub fn install_notices(grant: &[String]) -> Vec<&'static str> {
 }
 
 /// The statement an installation's confirmation carries, from the words the release's manifest
-/// gives for a native bridge it installs and the host's reading of a command integration it
-/// declares, each present only where the grant holds the capability that applies it.
+/// gives for a native bridge it installs, the host's reading of the placement the package
+/// declares and the host's reading of a command integration it declares, each present only where
+/// the grant holds the capability that applies it.
 ///
-/// A bridge's words are the publisher's and come first; the integration's follow after
-/// [`INTEGRATION_STATEMENT_LABEL`], which is the host's, so a reader can tell where the publisher's
-/// words end.
+/// A bridge's words are the publisher's and come first; the placement reading follows after
+/// [`PLACEMENT_STATEMENT_LABEL`] and the integration's after [`INTEGRATION_STATEMENT_LABEL`], both
+/// the host's, so a reader can tell where the publisher's words end.
 #[must_use]
-pub fn install_statement(bridge: Option<&str>, integration: Option<&str>) -> Option<String> {
-    let integration = integration.map(|text| format!("{INTEGRATION_STATEMENT_LABEL} {text}"));
-    match (bridge, integration) {
-        (None, None) => None,
-        (Some(bridge), None) => Some(bridge.to_owned()),
-        (None, Some(integration)) => Some(integration),
-        (Some(bridge), Some(integration)) => Some(format!("{bridge} {integration}")),
-    }
+pub fn install_statement(
+    bridge: Option<&str>,
+    placement: Option<&str>,
+    integration: Option<&str>,
+) -> Option<String> {
+    let parts: Vec<String> = [
+        bridge.map(str::to_owned),
+        placement.map(|text| format!("{PLACEMENT_STATEMENT_LABEL} {text}")),
+        integration.map(|text| format!("{INTEGRATION_STATEMENT_LABEL} {text}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// The parts of an installation's statement: the publisher's words about a native bridge, and the
-/// host's reading of a command integration, each where the statement has it.
+/// host's readings of a placement and of a command integration, each where the statement has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatementParts<'a> {
-    /// The publisher's own words, before the host's label.
+    /// The publisher's own words, before the host's labels.
     pub publisher: Option<&'a str>,
-    /// The host's reading, after its label.
+    /// The host's reading of the placement, after its label.
+    pub placement: Option<&'a str>,
+    /// The host's reading of the integration, after its label.
     pub reading: Option<&'a str>,
 }
 
-/// Splits an installation's statement at the host's label, so that a device captions each part by
+/// Splits an installation's statement at the host's labels, so that a device captions each part by
 /// who wrote it. A statement with no label is all the publisher's, and so is every statement of a
-/// grant that does not hold `command_integration.launch`: a host writes the label only for a grant
-/// that holds it, so for any other grant a device never takes words in the publisher's bridge
-/// statement for the host's reading, even from a host that does not refuse the label in them.
+/// grant that does not hold the capability a label belongs to: a host writes the integration label
+/// only for a grant that holds `command_integration.launch`, and the placement label only for one
+/// that holds `native_bridge.install`, so for any other grant a device never takes words in the
+/// publisher's bridge statement for the host's reading, even from a host that does not refuse the
+/// label in them. The placement label is the host's only where `host_states_placement` says the
+/// link's host writes it ([`states_placement_reading`]): a host built before the label does not
+/// refuse it in a publisher's words.
 ///
-/// A grant that holds both capabilities has one case the device cannot settle. A host that does not
-/// refuse the label in a bridge's words and writes no reading sends the bridge's words alone, and
-/// when they hold the label the device cannot tell them from a statement that a host which does
-/// write the reading sent. It splits at the first label, so the publisher's words after it show as
-/// the host's reading.
+/// The integration label is split first, then the part before it at the placement label, so a
+/// flag of the integration that holds the placement label stays in the integration's reading.
+///
+/// A grant that holds both integration and bridge capabilities has one case the device cannot
+/// settle. A host that does not refuse the integration label in a bridge's words and writes no
+/// reading sends the bridge's words alone, and when they hold the label the device cannot tell
+/// them from a statement that a host which does write the reading sent. It splits at the first
+/// label, so the publisher's words after it show as the host's reading.
 #[must_use]
-pub fn split_install_statement<'a>(grant: &[String], statement: &'a str) -> StatementParts<'a> {
+pub fn split_install_statement<'a>(
+    grant: &[String],
+    statement: &'a str,
+    host_states_placement: bool,
+) -> StatementParts<'a> {
     fn part(text: &str) -> Option<&str> {
         let text = text.trim();
         (!text.is_empty()).then_some(text)
     }
-    let integration = grant
-        .iter()
-        .any(|name| name == "command_integration.launch");
-    let split = integration
+    let holds = |name: &str| grant.iter().any(|held| held == name);
+    let (before, reading) = match holds("command_integration.launch")
         .then(|| statement.split_once(INTEGRATION_STATEMENT_LABEL))
-        .flatten();
-    match split {
-        Some((before, after)) => StatementParts {
-            publisher: part(before),
-            reading: part(after),
+        .flatten()
+    {
+        Some((before, after)) => (before, part(after)),
+        None => (statement, None),
+    };
+    match (host_states_placement && holds("native_bridge.install"))
+        .then(|| before.split_once(PLACEMENT_STATEMENT_LABEL))
+        .flatten()
+    {
+        Some((publisher, placement)) => StatementParts {
+            publisher: part(publisher),
+            placement: part(placement),
+            reading,
         },
         None => StatementParts {
-            publisher: part(statement),
-            reading: None,
+            publisher: part(before),
+            placement: None,
+            reading,
         },
     }
 }
@@ -1136,23 +1192,23 @@ mod tests {
         let both = grant(&["command_integration.launch", "native_bridge.install"]);
         let reading = format!(r#"Runs "x" with "{INTEGRATION_STATEMENT_LABEL} fake"."#);
         let composed =
-            install_statement(Some("Changes one setting."), Some(&reading)).expect("a statement");
-        let parts = split_install_statement(&both, &composed);
+            install_statement(Some("Changes one setting."), None, Some(&reading)).expect("a statement");
+        let parts = split_install_statement(&both, &composed, false);
         assert_eq!(parts.publisher, Some("Changes one setting."));
         assert_eq!(parts.reading, Some(reading.as_str()));
 
-        let alone = install_statement(None, Some("Runs x.")).expect("a statement");
-        let parts = split_install_statement(&grant(&["command_integration.launch"]), &alone);
+        let alone = install_statement(None, None, Some("Runs x.")).expect("a statement");
+        let parts = split_install_statement(&grant(&["command_integration.launch"]), &alone, false);
         assert_eq!((parts.publisher, parts.reading), (None, Some("Runs x.")));
 
         // No label, or a grant without the integration: all of it is the publisher's.
-        let plain = split_install_statement(&both, "Changes one setting.");
+        let plain = split_install_statement(&both, "Changes one setting.", false);
         assert_eq!(
             (plain.publisher, plain.reading),
             (Some("Changes one setting."), None)
         );
         let forged = format!("Harmless. {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
-        let bridge = split_install_statement(&grant(&["native_bridge.install"]), &forged);
+        let bridge = split_install_statement(&grant(&["native_bridge.install"]), &forged, false);
         assert_eq!(
             (bridge.publisher, bridge.reading),
             (Some(forged.as_str()), None)

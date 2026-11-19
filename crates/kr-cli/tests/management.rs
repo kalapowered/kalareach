@@ -1273,6 +1273,7 @@ impl OwnerDevice {
                         .iter()
                         .any(|name| name == "native_bridge.install")
                         .then_some(STATEMENT),
+                    None,
                     params
                         .grant
                         .iter()

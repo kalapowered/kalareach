@@ -2511,7 +2511,7 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         .await
         .expect("the manifest the index pins is read")
         .expect("a statement");
-    let parts = split_install_statement(&grant, &shown);
+    let parts = split_install_statement(&grant, &shown, false);
     assert_eq!(parts.publisher, Some(words));
     assert!(
         parts
@@ -2536,7 +2536,7 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         .expect("the manifest the index pins is read")
         .expect("a statement");
     assert!(
-        split_install_statement(&grant, &none)
+        split_install_statement(&grant, &none, false)
             .reading
             .is_some_and(|reading| reading.contains("declares no command integration")),
         "{none}"
