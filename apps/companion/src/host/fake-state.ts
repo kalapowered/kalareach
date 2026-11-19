@@ -128,6 +128,12 @@ interface ScriptedAgent {
   /** The last entry the host let go, or nought while it has kept them all. */
   forgotten: number
   turns: number
+  /**
+   * How the instance's answers end, when it takes them over a channel that confirms nothing: every
+   * answer is written and ends as an outcome nobody can establish, and the request is held as
+   * uncertain. `lost` is how many of the next answers are then also lost on the way back.
+   */
+  channel?: { lost: number }
 }
 
 /** How many entries one part of a snapshot carries here, so a longer history continues. */
@@ -327,6 +333,8 @@ export class ScriptedRecords {
   readonly #reach = new Map<string, bigint>()
   #attention: AttentionItem[]
   #revision = 10
+  /** How many answers a channel instance has taken, for the identity of each. */
+  #answers = 0
   #reviews: ReviewState[]
   readonly #devices: DeviceSummary[]
   #actions = 0
@@ -922,6 +930,22 @@ export class ScriptedRecords {
     if (!decoding.projection.decisions.some((decision) => decision.option_id === read.option_id)) {
       refuse('DRAFT_CONFLICT', `${read.option_id} is not one of the decisions this request offered`)
     }
+    if (agent.channel !== undefined) {
+      // The channel took the verdict and confirms nothing: what the desktop host tells the page is
+      // the action and nothing else, and the request stays listed as uncertain.
+      const lost = agent.channel.lost > 0
+      if (lost) agent.channel = { lost: agent.channel.lost - 1 }
+      agent.resources = agent.resources.map((each) =>
+        each.resource_id === read.resource_id ? { ...each, state: 'uncertain' } : each
+      )
+      this.#attention = this.#attention.filter((item) => item.rule !== 'attention.pending_approval')
+      return {
+        receipt: null,
+        value: null,
+        action_id: idOf('c4c4c4c4', ++this.#answers),
+        answer_lost: lost
+      }
+    }
     const mutation = this.#performed(agent).value
     if (mutation === null) refuse('RESOURCE_UNAVAILABLE', 'the answer was not recorded')
     agent.resources = agent.resources.map((each) =>
@@ -1507,6 +1531,18 @@ export class ScriptedRecords {
     const item = this.#attention.find((each) => each.rule === rule)
     if (item === undefined) throw new Error(`the host holds no item raised by ${rule}`)
     return item
+  }
+
+  /**
+   * Makes the session's instance one of Claude Code, whose channel confirms nothing: its answers
+   * end as an outcome nobody can establish, as the desktop host tells them, and the answered
+   * request stays listed as uncertain. `lostAnswers` of the first answers are also lost on the way
+   * back, so the page is told the host's own word is missing.
+   */
+  useChannel(sessionId: string, lostAnswers = 0): void {
+    const agent = this.#agentOf(sessionId)
+    agent.instances = agent.instances.map((each) => ({ ...each, plugin_id: 'kalareach/claude-code' }))
+    agent.channel = { lost: lostAnswers }
   }
 
   /** The capability records and resources a test reads back. */

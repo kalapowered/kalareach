@@ -331,6 +331,8 @@ export interface Answer {
   readonly receipt: Receipt | null
   readonly value: unknown
   readonly action_id: string | null
+  /** Whether the answer was lost; false is the worker's own word. See `Settled`. */
+  readonly answer_lost?: boolean
 }
 
 /**
@@ -369,6 +371,23 @@ export function outcomeMessage(done: string, answer: Answer): string {
     case 'sent':
       return 'Sent. Waiting for the host to confirm.'
   }
+}
+
+/** What an answer says when a channel took it and the host's own word is that nothing confirms it. */
+export const CHANNEL_ANSWER_WORDS =
+  'The host cannot tell whether Claude Code took this answer. Claude Code does not confirm answers. If the request still waits in its terminal, answer it there.'
+
+/** What stays beside a request whose answer a channel took, for as long as the host lists it. */
+export const CHANNEL_ANSWER_LINE =
+  'The host cannot tell whether Claude Code took the answer to this request. If it still waits in its terminal, answer it there.'
+
+/**
+ * Whether an answer ended as a channel end: the host's own word, not a lost answer, says the
+ * outcome is unknown, and the request's package takes answers over a channel that confirms nothing
+ * (`viaChannel`). A lost answer, and every unknown outcome of another package, are not.
+ */
+export function endsAsChannelAnswer(answer: Answer, viaChannel: boolean): boolean {
+  return answeredState(answer) === 'unknown' && answer.answer_lost === false && viaChannel
 }
 
 /**
