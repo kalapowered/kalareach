@@ -356,7 +356,7 @@ crates/kr-worker/src/broker/attach.rs | Attached::deliver_to_views | tokio::spaw
 crates/kr-worker/src/broker/attach.rs | NativeGateway::serve | tokio::spawn | async{tokio::time::timeout} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/attach.rs | NativeGateway::serve | tokio::spawn | writes | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/channel_fixture.rs | Channel::open_with | tokio::spawn | serve | 1 | test | - | compiled in only with the testing feature or a test module
-crates/kr-worker/src/broker/channels.rs | ChannelDispatch::submit | detached | async{.refused} | 1 | other_crate | - | worker program: linked; the worker runs it
+crates/kr-worker/src/broker/channels.rs | ChannelDispatch::submit_gated | detached | async{.refused} | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/channels.rs | serve | tokio::spawn | crate::broker::attach::deliver_to_views | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/channels.rs | serve | tokio::spawn | write_answers | 1 | other_crate | - | worker program: linked; the worker runs it
 crates/kr-worker/src/broker/commands.rs | CommandBackends::create | .spawn | serve | 1 | other_crate | - | worker program: linked; the worker runs it
