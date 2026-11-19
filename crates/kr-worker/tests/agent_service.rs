@@ -3243,7 +3243,11 @@ impl Installed {
 /// action has reached the upstream, and the binding closes at a snapshot after it.
 ///
 /// The case waits for the thread's pause through a blocking thread of its own and never through a
-/// timer of the runtime, which is what the deadline runs on.
+/// timer of the runtime, which is what the deadline runs on. The deadline starts before the thread
+/// is made, so a short one could pass before the thread reaches its pause on a loaded runner. The
+/// service's deadline is therefore the longest wait this suite allows, and the case ends the wait
+/// itself, as the deadline ends it, once the signal of the pause has come: the caller is told only
+/// after the thread stands at its pause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_22_an_ending_binding_stays_while_the_thread_of_a_cancellation_whose_deadline_passed_still_stands()
  {
@@ -3260,7 +3264,7 @@ async fn kr_req_25_22_an_ending_binding_stays_while_the_thread_of_a_cancellation
     );
     let transport = real_transport_with(&host, upstream_rich_cancelling()).await;
     host.service
-        .set_upstream_deadline_for_tests(std::time::Duration::from_millis(50));
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     host.service
         .broker()
         .set_turn(
@@ -3282,21 +3286,26 @@ async fn kr_req_25_22_an_ending_binding_stays_while_the_thread_of_a_cancellation
         let outcome = send(&mut client, mutation).await;
         (outcome, client)
     });
-    // Whichever comes first: the thread's arrival at its pause, or an answer to the caller, which
-    // before the pause is a refusal the case did not mean to make.
-    tokio::select! {
-        arrived = tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE)) => {
-            arrived
-                .expect("the wait ends")
-                .expect("the call reaches the thread that makes the transport's call");
-        }
-        answered = &mut sending => {
-            panic!("the caller was answered before the call reached its thread: {:?}",
-                answered.expect("the mutation is answered").0);
-        }
+    // The thread's arrival at its pause comes first; the wait for the upstream cannot end before
+    // it, since nothing but the case ends it.
+    let reached = tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends");
+    if reached.is_err() {
+        // A refusal before the call is one the case did not mean to make: say what it was.
+        assert!(
+            sending.is_finished(),
+            "the call never reached the thread that makes the transport's call"
+        );
+        panic!(
+            "the caller was answered before the call reached its thread: {:?}",
+            sending.await.expect("the mutation is answered").0
+        );
     }
-    // The service's deadline passes while the thread stands at its pause: the caller is told that
-    // the outcome cannot be established, and the future that waited for the thread is gone.
+    // The service's wait ends now, as its deadline ends it, while the thread stands at its pause:
+    // the caller is told that the outcome cannot be established, and the future that waited for
+    // the thread is gone.
+    host.service.end_upstream_waits_for_tests();
     let (outcome, _client) = sending.await.expect("the mutation is answered");
     let Outcome::Error(error) = outcome else {
         panic!("a cancellation whose call has not been made is not an applied one: {outcome:?}");
