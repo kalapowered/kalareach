@@ -185,6 +185,75 @@ async fn the_server_runs_a_turn_and_ends_its_commands_with_its_input() {
     ending.0 = None;
 }
 
+/// The server ends its commands when its input ends even where nothing reads its error stream any
+/// more: a reader that has gone does not stop it before it has ended them.
+#[tokio::test]
+async fn the_server_ends_its_commands_when_nothing_reads_its_error_stream() {
+    let mut child = server("", Some(COMMAND));
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout")).lines();
+    let mut errors = BufReader::new(child.stderr.take().expect("stderr")).lines();
+    write(&mut stdin, &initialize()).await;
+    assert_eq!(next(&mut lines).await["id"], "initialize");
+    assert_eq!(
+        next(&mut lines).await["method"],
+        "remoteControl/status/changed"
+    );
+    write(&mut stdin, &json!({"method":"initialized"})).await;
+    write(
+        &mut stdin,
+        &json!({"id":2,"method":"thread/start","params":{}}),
+    )
+    .await;
+    assert!(next(&mut lines).await["result"]["thread"]["id"].is_string());
+    assert_eq!(next(&mut lines).await["method"], "thread/started");
+    write(&mut stdin, &turn_request("thread-1")).await;
+    assert!(next(&mut lines).await["result"]["turn"].is_object());
+    assert_eq!(next(&mut lines).await["method"], "turn/started");
+    // The turn waits for an approval nobody gives, with its command started.
+    assert_eq!(
+        next(&mut lines).await["method"],
+        "item/commandExecution/requestApproval"
+    );
+    let started = loop {
+        let line = tokio::time::timeout(WAIT, errors.next_line())
+            .await
+            .expect("the server says it started the command")
+            .expect("readable")
+            .expect("not ended");
+        if let Some(pid) = line.strip_prefix("stand-in: started command ") {
+            break pid.trim().to_owned();
+        }
+    };
+    // The command's group is ended by this guard if the server does not end it.
+    let mut ending = EndsGroup(Some(started.clone()));
+    tokio::time::timeout(WAIT, async {
+        while status_of("/usr/bin/pgrep", &["-g", &started])
+            .is_none_or(|members| members.lines().count() < 2)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the command's group holds the command and a process of its own");
+    // Nothing reads the error stream now; then the input ends.
+    drop(errors);
+    drop(stdin);
+    let status = tokio::time::timeout(WAIT, child.wait())
+        .await
+        .expect("the server ends with its input")
+        .expect("waited");
+    assert!(status.success(), "{status}");
+    tokio::time::timeout(WAIT, async {
+        while status_of("/usr/bin/pgrep", &["-g", &started]).is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("nothing of the command's group is left");
+    ending.0 = None;
+}
+
 /// The server steers and interrupts the turn it runs only when the request names it, clears the
 /// approval the turn waits on when it interrupts it, resumes, forks and unsubscribes from threads
 /// under identifiers of its own, and runs a later turn to its end at once. Every frame it writes is
