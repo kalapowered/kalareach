@@ -890,3 +890,64 @@ fn kr_req_11_30_a_channel_s_table_is_not_compiled() {
         refusal.detail
     );
 }
+
+/// The hook events a package declares, written the way a table states them.
+fn declared_events() -> serde_json::Value {
+    let place = |names: &[&str]| {
+        serde_json::json!({"segments": names.iter()
+            .map(|name| serde_json::json!({"type": "member", "name": name}))
+            .collect::<Vec<_>>()})
+    };
+    serde_json::json!({
+        "event": place(&["event", "name"]),
+        "thread": place(&["thread", "id"]),
+        "events": [{"name": "session_open", "report": "session_started"}],
+    })
+}
+
+/// KR-REQ-11.44: a package that declares hook events has them held by the connector the worker
+/// assembles, and one that declares none holds none.
+#[test]
+fn an_installed_connector_holds_the_hook_events_its_package_declares() {
+    let store = Store::new("events-held");
+    let declared = declared_events();
+    let source = store.shaped(&fixture::Shape {
+        hook_events: Some(declared.clone()),
+        ..fixture::Shape::claude_code()
+    });
+    let connector = InstalledConnector::read(source).expect("the package is read");
+    assert_eq!(
+        serde_json::to_value(connector.hook_events().expect("declared events")).expect("writes"),
+        declared
+    );
+    let plain = InstalledConnector::read(Store::new("events-none").package()).expect("read");
+    assert!(plain.hook_events().is_none());
+}
+
+/// KR-REQ-11.44: the worker checks the hook events again when it assembles a connector, with the
+/// function the package check uses, so a package value that the check would refuse is refused.
+#[test]
+fn an_installed_connector_refuses_a_map_the_package_check_would_refuse() {
+    let store = Store::new("events-refused");
+    let source = store.shaped(&fixture::Shape {
+        hook_events: Some(declared_events()),
+        ..fixture::Shape::claude_code()
+    });
+    let mut package = kr_plugin_sdk::validate::validate_package_directory(&source.package_dir)
+        .package
+        .expect("the package passes the check");
+    package
+        .connector
+        .as_mut()
+        .and_then(|table| table.hook_events.as_mut())
+        .expect("declared events")
+        .events
+        .clear();
+    let refusal = InstalledConnector::assemble(source, package).expect_err("refused");
+    assert!(
+        refusal.detail.contains("hook_events.no_events"),
+        "{}",
+        refusal.detail
+    );
+}
+
