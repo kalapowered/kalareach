@@ -96,6 +96,21 @@ pub fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> Result<
     Ok(state.connection_state())
 }
 
+/// What the voice calls ask of the pairings: whether this computer is still paired with `host`,
+/// and nothing while the records cannot be read. The pairing record is written before an
+/// unpairing is reported, so it outlives a launch whatever happened to what the calls kept.
+pub fn pairing_known<R: Runtime>(
+    app: AppHandle<R>,
+) -> impl Fn(kr_protocol::ids::DeviceId) -> Option<bool> + Send + Sync + 'static {
+    move |host| {
+        app.try_state::<AppState>()?
+            .device()
+            .ok()?
+            .is_paired_with(host)
+            .ok()
+    }
+}
+
 /// Takes up the host this application's commands went to the last time, when there was one and
 /// this computer is still paired with it. Nothing is waited for.
 pub fn resume<R: Runtime>(app: &AppHandle<R>) {
