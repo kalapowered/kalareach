@@ -505,12 +505,18 @@ fn the_decode_class_keeps_the_decoders_sentence() {
     let decoder = kr_cbor::from_canonical_slice::<Grant>(&[0], &kr_cbor::Limits::DEFAULT)
         .expect_err("one byte is no grant")
         .to_string();
+    let sentence = format!(
+        "the grants row of grant {} cannot be read: {decoder}",
+        id_of(1)
+    );
     let refusal = store.record(id_of(1)).expect_err("the row is refused");
+    assert_eq!(refusal.to_string(), sentence);
+    let revoking = store
+        .revoke_claimed(id_of(1), Scope::Subtree, 5_000, || Ok(()), None)
+        .expect_err("a device's revocation of a row that cannot be read is refused");
     assert_eq!(
-        refusal.to_string(),
-        format!(
-            "the grants row of grant {} cannot be read: {decoder}",
-            id_of(1)
-        )
+        revoking.to_string(),
+        sentence,
+        "a revocation says it in the decoder's words as well"
     );
 }
