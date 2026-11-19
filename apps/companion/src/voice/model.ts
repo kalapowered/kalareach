@@ -184,7 +184,12 @@ export interface ProviderChoice {
    * show it. A managed call is never offered without it: a start names the rate it shows.
    */
   readonly managed: VoiceManagedTerms | null
-  /** Why no managed call can start from here, in the host's words, when `managed` is null. */
+  /**
+   * What a call on the host owner's own account would be, in the host's words, when the host's
+   * provider is that account. Null for the managed service.
+   */
+  readonly ownKey: { readonly model: string; readonly disclosure: readonly string[]; readonly held: boolean } | null
+  /** Why no call can start from here, in the host's words, when neither `managed` nor `ownKey` is set. */
   readonly unavailable: string | null
   /**
    * The rate the person was shown before the one `managed` now carries, when a start was refused
@@ -231,14 +236,13 @@ function classSummary(kind: string): string {
  * to a provider name, a disclosure or a scope.
  */
 export function choiceFromPreparation(preparation: VoicePrepareResult): ProviderChoice {
+  const provider = preparation.provider
   return {
-    brokerOrigin: preparation.broker_origin,
+    brokerOrigin: 'managed' in provider ? provider.managed.broker_origin : '',
     prepared: preparation.prepared,
-    managed: preparation.managed,
-    unavailable: preparation.managed
-      ? null
-      : (preparation.managed_unavailable ??
-        'This host did not say what a managed call would cost, so one cannot start from here.'),
+    managed: 'managed' in provider ? provider.managed.terms : null,
+    ownKey: 'own_key' in provider ? provider.own_key : null,
+    unavailable: 'unavailable' in provider ? provider.unavailable.message : null,
     previousRate: null,
     context: [
       {

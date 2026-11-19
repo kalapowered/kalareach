@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::services::ServiceFuture;
 use kr_client::services::voice::{
-    VoiceClosure, VoiceHold, VoiceMetadata, VoiceProviderService, VoiceRateQuote, VoiceSession,
-    VoiceSessionRequest, VoiceStart, VoiceStartLatency,
+    VoiceClosure, VoiceHold, VoiceMetadata, VoiceProviderService, VoiceProviderTerms,
+    VoiceRateQuote, VoiceSession, VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 use kr_client::services::voice_confirm::sign_voice_confirmation;
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -972,7 +972,11 @@ impl VoiceProviderService for ManagedFake {
         })
     }
 
-    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+    fn account_bound(&self) -> bool {
+        true
+    }
+
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
         let unreachable = *self.terms_unreachable.lock().expect("the switch");
         Box::pin(async move {
             if unreachable {
@@ -983,7 +987,7 @@ impl VoiceProviderService for ManagedFake {
                     ),
                 ));
             }
-            Ok(Some(published_terms()))
+            Ok(VoiceProviderTerms::Managed(published_terms()))
         })
     }
 
@@ -1129,9 +1133,13 @@ struct OwnBackend {
 }
 
 impl VoiceProviderService for OwnBackend {
-    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
         // Not the managed service: it quotes no managed rate and publishes no managed terms.
-        Box::pin(async move { Ok(None) })
+        Box::pin(async move { Ok(VoiceProviderTerms::Unquoted) })
+    }
+
+    fn account_bound(&self) -> bool {
+        true
     }
 
     fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {
@@ -1177,6 +1185,293 @@ impl VoiceProviderService for OwnBackend {
             })
         })
     }
+}
+
+/// A provider on the host owner's own account, as the coordinator sees one: it quotes its own
+/// terms, spends the owner's key, and records the halves of every start it is asked for.
+#[derive(Debug)]
+struct OwnKeyFake {
+    halves: Mutex<Vec<&'static str>>,
+    closed: Mutex<Vec<String>>,
+    /// What `dispatch` answers.
+    answer: Mutex<Option<VoiceStart>>,
+}
+
+impl OwnKeyFake {
+    fn new() -> Self {
+        Self {
+            halves: Mutex::new(Vec::new()),
+            closed: Mutex::new(Vec::new()),
+            answer: Mutex::new(None),
+        }
+    }
+
+    fn halves(&self) -> Vec<&'static str> {
+        self.halves.lock().expect("the halves").clone()
+    }
+}
+
+impl VoiceProviderService for OwnKeyFake {
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
+        Box::pin(async move {
+            Ok(VoiceProviderTerms::OwnKey(
+                kr_client::services::voice::VoiceOwnKeyTerms {
+                    model: "gpt-live-1".to_owned(),
+                    disclosure: vec![
+                        "This call runs on the OpenAI key set on this host.".to_owned(),
+                    ],
+                    held: true,
+                },
+            ))
+        })
+    }
+
+    fn account_bound(&self) -> bool {
+        false
+    }
+
+    fn spends_the_owners_key(&self) -> bool {
+        true
+    }
+
+    fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {
+        Box::pin(async move { Ok(true) })
+    }
+
+    fn provider(&self) -> String {
+        "openai_live".to_owned()
+    }
+
+    fn begin<'a>(
+        &'a self,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, kr_client::services::StartAttempt> {
+        self.halves.lock().expect("the halves").push("begin");
+        Box::pin(async { Ok(kr_client::services::StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(&'a self, _attempt: kr_client::services::StartAttempt) -> ServiceFuture<'a, ()> {
+        self.halves.lock().expect("the halves").push("abandon");
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart> {
+        self.halves.lock().expect("the halves").push("dispatch");
+        let answer = self.answer.lock().expect("the answer").take();
+        Box::pin(async move {
+            Ok(answer.unwrap_or_else(|| {
+                VoiceStart::Refused(Box::new(kr_client::services::voice::VoiceRefusal {
+                    reason: kr_client::services::voice::VoiceRefusalReason::ServiceCapacity,
+                    message: "the stand-in refuses".to_owned(),
+                    alternatives: Vec::new(),
+                    attempt_id: None,
+                    call_id: None,
+                }))
+            }))
+        })
+    }
+
+    fn close<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, VoiceClosure> {
+        self.closed
+            .lock()
+            .expect("what was closed")
+            .push(call_id.to_owned());
+        let call_id = call_id.to_owned();
+        Box::pin(async move {
+            Ok(VoiceClosure {
+                call_id,
+                state: "finalised".to_owned(),
+                usage_seconds: 0,
+                usage_provisional: true,
+            })
+        })
+    }
+}
+
+/// A coordinator whose provider is on the owner's own account, with the phone holding every right a
+/// call needs and not yet an owner device.
+fn own_key_fixture() -> (Coordinator, Arc<Authority>, Arc<OwnKeyFake>) {
+    let key = AuthorisationKeyPair::generate().expect("a device identity key");
+    let authority = Arc::new(Authority::new(
+        device_grant(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+        *key.public(),
+    ));
+    let provider = Arc::new(OwnKeyFake::new());
+    let coordinator = Coordinator::new(
+        Arc::new(Context::new(gathered())) as Arc<dyn ContextSource>,
+        Arc::clone(&authority) as Arc<dyn VoiceAuthority>,
+        Arc::new(Submitter::new()) as Arc<dyn ActionSubmitter>,
+        Some(Arc::clone(&provider) as Arc<dyn VoiceProviderService>),
+        device(HOST),
+        environment(),
+        "https://reach.example",
+    );
+    (coordinator, authority, provider)
+}
+
+const NOT_A_MANAGER: &str = "This host's OpenAI key can be used only from a device that has \
+     host-management authority on this host.";
+
+/// A phone is offered a call on the owner's key only when the host's own owner rule says it holds
+/// host management, and is otherwise told why none can start, in the one sentence.
+#[tokio::test]
+async fn a_call_on_the_owners_key_is_offered_only_to_a_device_with_host_management() {
+    let (coordinator, authority, _provider) = own_key_fixture();
+    let params = VoicePrepareParams {
+        session_ids: [session(SESSION_A)].into_iter().collect(),
+        selected: CanonicalSet::from_iter([]),
+    };
+    coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+
+    let refused = coordinator
+        .prepare(device(PHONE), &params)
+        .await
+        .expect("a preparation");
+    assert_eq!(refused.unavailable(), Some(NOT_A_MANAGER), "{refused:?}");
+
+    authority
+        .owners
+        .lock()
+        .expect("the owners")
+        .push(device(PHONE));
+    let offered = coordinator
+        .prepare(device(PHONE), &params)
+        .await
+        .expect("a preparation");
+    assert_eq!(
+        offered.provider,
+        kr_protocol::voice::VoicePrepareProvider::OwnKey {
+            model: "gpt-live-1".to_owned(),
+            disclosure: vec!["This call runs on the OpenAI key set on this host.".to_owned()],
+            held: true,
+        }
+    );
+    assert!(offered.managed().is_none());
+}
+
+/// A start on the owner's key from a device without host management is refused before the provider
+/// is asked for its first half, and the same start from an owner device reaches it.
+#[tokio::test]
+async fn a_start_on_the_owners_key_from_a_device_without_host_management_writes_and_asks_nothing() {
+    let (coordinator, authority, provider) = own_key_fixture();
+    coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    authority
+        .owners
+        .lock()
+        .expect("the owners")
+        .push(device(PHONE));
+    let params = start_params_for(&coordinator).await;
+    // The phone stops being an owner device between what it was shown and its start.
+    authority.owners.lock().expect("the owners").clear();
+
+    let refused = coordinator
+        .start(
+            device(PHONE),
+            action(0x41),
+            &params,
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("an answer");
+    let VoiceStartOutcome::Unavailable {
+        reason, message, ..
+    } = refused.outcome
+    else {
+        panic!("a refusal: {:?}", refused.outcome)
+    };
+    assert_eq!(reason, "host_management_required");
+    assert_eq!(message, NOT_A_MANAGER);
+    assert!(provider.halves().is_empty(), "{:?}", provider.halves());
+    assert_eq!(coordinator.live_sessions(), 0);
+
+    // The control: the same device, an owner again, reaches the provider.
+    authority
+        .owners
+        .lock()
+        .expect("the owners")
+        .push(device(PHONE));
+    let _ = coordinator
+        .start(
+            device(PHONE),
+            action(0x42),
+            &params,
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await;
+    assert_eq!(provider.halves(), ["begin", "dispatch"]);
+}
+
+/// A call on the owner's account that this coordinator holds no record for is closed, and the start
+/// is refused: a call nobody holds is a call the owner pays for.
+#[tokio::test]
+async fn an_own_call_the_coordinator_has_no_record_for_is_closed_and_the_start_refused() {
+    let (coordinator, authority, provider) = own_key_fixture();
+    coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    authority
+        .owners
+        .lock()
+        .expect("the owners")
+        .push(device(PHONE));
+    let params = start_params_for(&coordinator).await;
+    *provider.answer.lock().expect("the answer") = Some(VoiceStart::StartedOwn(Box::new(
+        kr_client::services::voice::OwnSession {
+            call_id: "own_call_1".to_owned(),
+            provider_session_id: "sess_1".to_owned(),
+            answer_sdp: "v=0\r\n".to_owned(),
+            model: "gpt-live-1".to_owned(),
+            closes_at_ms: 610_000,
+            disclosure: Vec::new(),
+        },
+    )));
+
+    let refused = coordinator
+        .start(
+            device(PHONE),
+            action(0x43),
+            &params,
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await;
+    assert!(refused.is_err(), "{refused:?}");
+    assert_eq!(
+        provider.closed.lock().expect("what was closed").as_slice(),
+        ["own_call_1"]
+    );
+    assert_eq!(coordinator.live_sessions(), 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4413,7 +4708,7 @@ async fn the_terms_a_person_reads_before_a_call_are_the_services_own() {
         .expect("a preparation");
 
     let published = published_terms();
-    let terms = prepared.managed.0.expect("the managed service's terms");
+    let terms = prepared.managed().expect("the managed service's terms");
     assert_eq!(terms.disclosure, published.disclosure, "carried verbatim");
     assert_eq!(terms.admission_note, published.admission_note);
     assert_eq!(terms.delegation_note, published.delegation_note);
@@ -4422,13 +4717,17 @@ async fn the_terms_a_person_reads_before_a_call_are_the_services_own() {
     assert_eq!(terms.rate.version, "2026-09");
     assert_eq!(terms.rate.minor_units_per_second.get(), 1);
     assert_eq!(terms.maximum_session_seconds, 1_800);
-    assert!(prepared.managed_unavailable.0.is_none());
+    assert!(prepared.unavailable().is_none());
 
     assert_eq!(
         prepared.session_ids,
         [session(SESSION_A)].into_iter().collect()
     );
-    assert_eq!(prepared.broker_origin, "https://reach.example");
+    assert!(
+        matches!(&prepared.provider, kr_protocol::voice::VoicePrepareProvider::Managed { broker_origin, .. } if broker_origin == "https://reach.example"),
+        "{:?}",
+        prepared.provider
+    );
     // Both classes the person selected would be carried.
     assert_eq!(
         prepared.selected,
@@ -4485,23 +4784,23 @@ async fn a_host_without_the_services_terms_says_why() {
     }
 
     let none = prepared(None).await;
-    assert!(none.managed.0.is_none());
-    let said = none.managed_unavailable.0.clone().expect("a reason");
+    assert!(none.managed().is_none());
+    let said = none.unavailable().expect("a reason").to_owned();
     assert!(said.starts_with("This host has no voice service"), "{said}");
 
     let own = prepared(Some(
         Arc::new(OwnBackend::default()) as Arc<dyn VoiceProviderService>
     ))
     .await;
-    assert!(own.managed.0.is_none());
-    let said = own.managed_unavailable.0.clone().expect("a reason");
+    assert!(own.managed().is_none());
+    let said = own.unavailable().expect("a reason").to_owned();
     assert!(said.contains("not the managed service"), "{said}");
 
     let silent = Arc::new(ManagedFake::new(Answer::Started));
     *silent.terms_unreachable.lock().expect("the switch") = true;
     let unread = prepared(Some(silent as Arc<dyn VoiceProviderService>)).await;
-    assert!(unread.managed.0.is_none());
-    let said = unread.managed_unavailable.0.clone().expect("a reason");
+    assert!(unread.managed().is_none());
+    let said = unread.unavailable().expect("a reason").to_owned();
     assert!(
         said.contains("could not read the managed service's terms"),
         "{said}"

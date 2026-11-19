@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use kr_client::services::ServiceFuture;
 use kr_client::services::voice::{
-    VoiceClosure, VoiceHold, VoiceMetadata, VoiceProviderService, VoiceRateQuote, VoiceSession,
-    VoiceSessionRequest, VoiceStart, VoiceStartLatency,
+    VoiceClosure, VoiceHold, VoiceProviderService, VoiceProviderTerms, VoiceRateQuote,
+    VoiceSession, VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
 use kr_protocol::error::ErrorCode;
@@ -266,8 +266,12 @@ pub(super) async fn held_before_its_claim(
 struct OfflineProvider;
 
 impl VoiceProviderService for OfflineProvider {
-    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
-        Box::pin(async move { Ok(None) })
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
+        Box::pin(async move { Ok(VoiceProviderTerms::Unquoted) })
+    }
+
+    fn account_bound(&self) -> bool {
+        true
     }
 
     fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {

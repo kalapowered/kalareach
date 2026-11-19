@@ -9,8 +9,8 @@
 
 use kr_client::services::ServiceFuture;
 use kr_client::services::voice::{
-    VoiceClosure, VoiceHold, VoiceMetadata, VoiceProviderService, VoiceRateQuote, VoiceSession,
-    VoiceSessionRequest, VoiceStart, VoiceStartLatency,
+    VoiceClosure, VoiceHold, VoiceProviderService, VoiceProviderTerms, VoiceRateQuote,
+    VoiceSession, VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 
 /// A provider that answers without a network call.
@@ -71,10 +71,14 @@ impl OfflineProvider {
 }
 
 impl VoiceProviderService for OfflineProvider {
-    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
         // This stand-in quotes nothing. The test that needs the service's terms scripts the
         // service's own wire instead, so what it proves is what a real answer does.
-        Box::pin(async move { Ok(None) })
+        Box::pin(async move { Ok(VoiceProviderTerms::Unquoted) })
+    }
+
+    fn account_bound(&self) -> bool {
+        true
     }
 
     fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {

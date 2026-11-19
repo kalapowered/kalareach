@@ -3281,7 +3281,7 @@ async fn a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate
         )
         .await
         .expect("the host answers what a call would be");
-    let terms = prepared.managed.0.expect("the service's terms");
+    let terms = prepared.managed().expect("the service's terms");
     assert_eq!(
         terms.disclosure, disclosure,
         "the service's words, verbatim"

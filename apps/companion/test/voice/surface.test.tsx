@@ -47,6 +47,7 @@ const TERMS: NonNullable<ProviderChoice['managed']> = {
 function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
   return {
     brokerOrigin: 'https://reach.kala.to',
+    ownKey: null,
     prepared: 'scope-1',
     managed: TERMS,
     unavailable: null,

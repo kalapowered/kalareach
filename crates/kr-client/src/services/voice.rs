@@ -362,6 +362,39 @@ pub struct VoiceStartLatency {
     pub sideband_ready_ms: u64,
 }
 
+/// A call on the owner's own provider account that is running, and what the caller needs to use it.
+///
+/// There is no reservation, hold or rate: the call is not metered here, and the owner's own account
+/// at the provider is charged. The call identifier is minted by this host and means something only
+/// to it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OwnSession {
+    /// This host's identifier for the call.
+    pub call_id: String,
+    /// The provider's own session identifier. Opaque; never parsed or constructed.
+    pub provider_session_id: String,
+    /// The provider's SDP answer, to be applied to the caller's own connection.
+    pub answer_sdp: String,
+    /// The model the call is running on.
+    pub model: String,
+    /// When this host closes the call, whatever else happens, in milliseconds since the epoch.
+    pub closes_at_ms: u64,
+    /// What the provider can see, stated where the caller reads it.
+    pub disclosure: Vec<String>,
+}
+
+impl fmt::Debug for OwnSession {
+    /// Which call is running and until when, and not the answer: a session description carries the
+    /// connection's ICE credentials.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnSession")
+            .field("answer_sdp_bytes", &self.answer_sdp.len())
+            .field("closes_at_ms", &self.closes_at_ms)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A managed call that is running, and everything the caller needs to use it.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -501,8 +534,13 @@ crate::debug_fields!(VoiceRefusal { reason });
 /// What a creation request was answered with.
 #[derive(Clone, PartialEq, Eq)]
 pub enum VoiceStart {
-    /// A call is running.
+    /// A managed call is running.
     Started(Box<VoiceSession>),
+    /// A call on the owner's own provider account is running.
+    ///
+    /// It carries no hold, rate or reservation, because nothing here meters it: the owner's own
+    /// account pays.
+    StartedOwn(Box<OwnSession>),
     /// The provider may or may not hold a session for this attempt.
     ///
     /// A typed state rather than an error code. **Never retried automatically**: the provider
@@ -538,6 +576,9 @@ impl fmt::Debug for VoiceStart {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Started(session) => formatter.debug_tuple("Started").field(session).finish(),
+            Self::StartedOwn(session) => {
+                formatter.debug_tuple("StartedOwn").field(session).finish()
+            }
             Self::CreationUnknown { .. } => formatter
                 .debug_struct("CreationUnknown")
                 .finish_non_exhaustive(),
@@ -551,12 +592,15 @@ impl fmt::Debug for VoiceStart {
 }
 
 impl VoiceStart {
-    /// The running call, when there is one.
+    /// The running managed call, when there is one.
     #[must_use]
     pub fn session(&self) -> Option<&VoiceSession> {
         match self {
             Self::Started(session) => Some(session),
-            Self::CreationUnknown { .. } | Self::RateChanged { .. } | Self::Refused(_) => None,
+            Self::StartedOwn(_)
+            | Self::CreationUnknown { .. }
+            | Self::RateChanged { .. }
+            | Self::Refused(_) => None,
         }
     }
 
@@ -569,7 +613,10 @@ impl VoiceStart {
     #[must_use]
     pub fn may_ask_again(&self) -> bool {
         match self {
-            Self::Started(_) | Self::CreationUnknown { .. } | Self::RateChanged { .. } => false,
+            Self::Started(_)
+            | Self::StartedOwn(_)
+            | Self::CreationUnknown { .. }
+            | Self::RateChanged { .. } => false,
             Self::Refused(refusal) => matches!(
                 refusal.reason,
                 VoiceRefusalReason::AttemptReconciled
@@ -949,6 +996,40 @@ pub fn read_control_event(value: &serde_json::Value) -> Option<VoiceControlEvent
 /* The service                                                                 */
 /* -------------------------------------------------------------------------- */
 
+/// What a provider is, as a person is quoted it before a call.
+#[derive(Clone, PartialEq)]
+pub enum VoiceProviderTerms {
+    /// A provider that publishes no terms: it is neither the managed service nor the owner's own
+    /// account, and a person is quoted nothing for it.
+    Unquoted,
+    /// The managed service, with the terms it published.
+    Managed(VoiceMetadata),
+    /// The owner's own account at the provider.
+    OwnKey(VoiceOwnKeyTerms),
+}
+
+impl fmt::Debug for VoiceProviderTerms {
+    /// Which kind of provider it is, and none of the terms.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unquoted => formatter.write_str("Unquoted"),
+            Self::Managed(_) => formatter.write_str("Managed(..)"),
+            Self::OwnKey(terms) => formatter.debug_tuple("OwnKey").field(terms).finish(),
+        }
+    }
+}
+
+/// What a call on the owner's own provider account would be, in this host's own words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VoiceOwnKeyTerms {
+    /// The model the call runs on.
+    pub model: String,
+    /// What a person is told before such a call.
+    pub disclosure: Vec<String>,
+    /// Whether this host holds the key a call needs. A call is not offered without it.
+    pub held: bool,
+}
+
 /// What a provider holds between the two halves of a start.
 ///
 /// [`VoiceProviderService::begin`] returns one and [`VoiceProviderService::dispatch`] or
@@ -1000,16 +1081,32 @@ impl fmt::Debug for StartAttempt {
 /// The interface is deliberately this small, because it is the seam every provider sits behind.
 /// Nothing above it knows which one answered.
 pub trait VoiceProviderService: Send + Sync + fmt::Debug {
-    /// What a call started now would be: the model, the disclosure, the rate and the limits.
+    /// What a call started now would be: the model, the disclosure and, for the managed service,
+    /// the rate and the limits.
     ///
-    /// Reading it creates nothing and holds nothing. `None` is a provider that is not the managed
-    /// service: it publishes no managed terms, and a person is quoted no managed rate for it.
+    /// Reading it creates nothing and holds nothing. [`VoiceProviderTerms::Unquoted`] is a provider
+    /// that publishes no terms: a person is quoted nothing for it.
     ///
     /// # Errors
     ///
     /// Returns a transport or protocol error, or the service's refusal, and an answer whose rate
     /// this client could not show a person.
-    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>>;
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms>;
+
+    /// Whether this provider's calls belong to the signed-in account.
+    ///
+    /// True for the managed service: its calls are made under the account, so an account change
+    /// waits for them and ends them. False for a provider on the owner's own account, whose calls
+    /// a sign-out neither waits for nor ends.
+    fn account_bound(&self) -> bool;
+
+    /// Whether a call on this provider is paid for with the host owner's own key.
+    ///
+    /// True only for the owner's own account: such a call is started only for a device the owner
+    /// has given host-management authority. Nothing else answers true.
+    fn spends_the_owners_key(&self) -> bool {
+        false
+    }
 
     /// The first half of a start: everything a provider writes down before it asks for a call.
     ///
@@ -1335,13 +1432,17 @@ impl ManagedVoiceBroker {
 }
 
 impl VoiceProviderService for ManagedVoiceBroker {
-    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
         Box::pin(async move {
             // An empty object. The service refuses any member, because a member it ignored would
             // leave a caller believing it had asked for something.
             let data = self.call(VOICE_METADATA_PATH, b"{}".to_vec()).await?;
-            read_metadata(data).map(Some)
+            read_metadata(data).map(VoiceProviderTerms::Managed)
         })
+    }
+
+    fn account_bound(&self) -> bool {
+        true
     }
 
     fn provider(&self) -> String {
@@ -2597,10 +2698,12 @@ mod tests {
     async fn the_terms_a_person_is_shown_are_the_ones_the_service_publishes() {
         let service = Scripted::answering([(200, published_terms())]);
         let terms = broker(&service)
-            .metadata()
+            .terms()
             .await
-            .expect("the service answered")
-            .expect("the managed service publishes terms");
+            .expect("the service answered");
+        let VoiceProviderTerms::Managed(terms) = terms else {
+            panic!("the managed service publishes terms")
+        };
         assert_eq!(terms.model, "gpt-live-1");
         assert_eq!(terms.rate.version, "2026-09-a");
         assert_eq!(terms.rate.amount_per_second(), Some(2));
@@ -2635,14 +2738,14 @@ mod tests {
             terms["data"]["rate"]["minorUnitsPerSecond"] = amount.clone();
             let service = Scripted::answering([(200, terms)]);
             assert!(
-                broker(&service).metadata().await.is_err(),
+                broker(&service).terms().await.is_err(),
                 "{amount} was read as an amount"
             );
         }
         let mut unversioned = published_terms();
         unversioned["data"]["rate"]["version"] = serde_json::json!("");
         let service = Scripted::answering([(200, unversioned)]);
-        assert!(broker(&service).metadata().await.is_err());
+        assert!(broker(&service).terms().await.is_err());
     }
 
     /// A start names the rate version the person was shown, and a start naming none is refused

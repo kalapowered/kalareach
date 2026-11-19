@@ -9,6 +9,7 @@
 use serde_json::Value;
 
 use super::{Levelled, Newer, Release, THIS_RELEASE};
+use crate::hostinfo::configuration::OwnVoiceProvider;
 use crate::hostinfo::configuration::{
     BASE_LEVEL, Change, ConfigurationDocument, DocumentState, EditRefused, TestSuite, VERSION,
     contents_in, edit_in, is_known_term, load_in, still_current,
@@ -164,6 +165,42 @@ const BEFORE_PUSH: Release = Release {
         Levelled {
             member: "push",
             level: 7,
+        },
+    ],
+};
+
+/// A release that reads level 7 and predates the own voice section: it takes the section for a
+/// member of a newer release.
+const BEFORE_OWN_VOICE: Release = Release {
+    level: 7,
+    levelled: &[
+        Levelled {
+            member: "authority",
+            level: 2,
+        },
+        Levelled {
+            member: "mailbox",
+            level: 3,
+        },
+        Levelled {
+            member: "relay",
+            level: 4,
+        },
+        Levelled {
+            member: "automation",
+            level: 5,
+        },
+        Levelled {
+            member: "shell",
+            level: 6,
+        },
+        Levelled {
+            member: "push",
+            level: 7,
+        },
+        Levelled {
+            member: "own_voice",
+            level: 8,
         },
     ],
 };
@@ -1591,4 +1628,163 @@ fn the_report_lists_the_gateways_in_force_and_says_they_apply_at_once() {
     let emptied = push_row(&[], Some(&cleared), "/state/configuration.json");
     assert_eq!(emptied.source, ValueSource::HostConfiguration);
     assert_eq!(emptied.value(), "none");
+}
+
+/// A document that names the own voice provider and a ceiling, as this build writes it.
+fn with_an_own_voice_provider() -> ConfigurationDocument {
+    let mut document = ConfigurationDocument::empty();
+    document.own_voice.provider = Nullable::some(OwnVoiceProvider::OpenaiLive);
+    document.ceilings.session_limit = Nullable::some(4);
+    document
+}
+
+/// The own voice section is a section of level 8, and a writer stamps the highest level among the
+/// sections the document holds. A document that names no provider is written without the section.
+#[test]
+fn a_document_that_names_no_own_voice_provider_is_stamped_below_the_sections_level() {
+    let mut shell_only = ConfigurationDocument::empty();
+    shell_only.shell.mode = Nullable::some(ShellMode::Managed);
+    let written = contents_in(&shell_only, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 6, "{written}");
+    assert!(json(&written).get("own_voice").is_none(), "{written}");
+
+    let mut both = shell_only;
+    both.own_voice.provider = Nullable::some(OwnVoiceProvider::OpenaiLive);
+    let written = contents_in(&both, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 8, "{written}");
+    assert_eq!(
+        json(&written)["own_voice"]["provider"],
+        "openai_live",
+        "{written}"
+    );
+    assert_eq!(json(&written)["shell"]["mode"], "managed", "{written}");
+}
+
+/// A release that reads level 7 takes the own voice section for a section of a newer release: it
+/// applies every member it knows, leaves the section out, counts and names it, does not fail
+/// closed, and does not edit the document.
+#[test]
+fn a_release_at_level_7_ignores_the_own_voice_section_and_applies_the_rest() {
+    let written = contents_in(&with_an_own_voice_provider(), &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 8, "{written}");
+
+    let loaded = load_in(Some(written.as_bytes()), &BEFORE_OWN_VOICE);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
+    assert!(!loaded.fails_closed());
+    assert_eq!(
+        loaded.newer,
+        Some(Newer {
+            declared: 8,
+            count: 1,
+            names: vec!["own_voice".to_owned()]
+        })
+    );
+    let used = loaded.document.as_ref().expect("the document is used");
+    assert_eq!(used.ceilings.session_limit.0, Some(4));
+    assert_eq!(used.own_voice.provider(), None, "the section is left out");
+    assert!(matches!(
+        edit_in(&loaded, &Change::SessionLimit(Some(2)), &BEFORE_OWN_VOICE),
+        Err(EditRefused::NotOurs(_))
+    ));
+}
+
+/// The round trip of an active value: the provider survives the file, the typed document and the
+/// registry's copy, and the section is as strict as any other.
+#[test]
+fn a_named_own_voice_provider_survives_the_file_and_the_registrys_copy() {
+    let written = contents_in(&with_an_own_voice_provider(), &THIS_RELEASE);
+    let read = load_in(Some(written.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        read.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        read.status
+    );
+    let typed = read.document.expect("used");
+    assert_eq!(
+        typed.own_voice.provider(),
+        Some(OwnVoiceProvider::OpenaiLive)
+    );
+    assert_eq!(typed.level, 8);
+    let copy = contents_in(&typed, &THIS_RELEASE);
+    assert_eq!(
+        copy, written,
+        "the copy is the file's reading written again"
+    );
+
+    for stray in [
+        r#"{"version": 3, "level": 8, "own_voice": {"provider": "openai_live", "fallback": true}}"#,
+        r#"{"version": 3, "level": 8, "own_voice": {"provider": "somewhere_else"}}"#,
+        r#"{"version": 3, "level": 8, "own_voice": {"provider": 5}}"#,
+        // The level is stated below the section's, which the release that reads it refuses.
+        r#"{"version": 3, "level": 7, "own_voice": {"provider": "openai_live"}}"#,
+    ] {
+        assert_eq!(
+            load_in(Some(stray.as_bytes()), &THIS_RELEASE).status.state,
+            DocumentState::Invalid,
+            "{stray}"
+        );
+    }
+}
+
+/// A document that names both providers is refused once, at load, with the one fixed sentence, by a
+/// release that reads level 8; a release that reads level 7 ignores the section it does not know
+/// and reads the broker's origin, so it builds the broker. The control: either alone is read.
+#[test]
+fn a_document_naming_both_voice_providers_is_refused_at_load_and_an_older_release_reads_the_broker()
+{
+    const SENTENCE: &str = "voice: name either broker_origin or own_voice.provider, not both.";
+    let text = r#"{"version": 3, "level": 8, "voice": {"broker_origin": "https://broker.example.com"}, "own_voice": {"provider": "openai_live"}}"#;
+    let loaded = load_in(Some(text.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Invalid,
+        "{:?}",
+        loaded.status
+    );
+    assert!(
+        loaded.status.detail.to_string().contains(SENTENCE),
+        "{:?}",
+        loaded.status
+    );
+    assert!(loaded.fails_closed());
+
+    // A write that would make the document refuses it by the same sentence and writes nothing.
+    let mut document = with_a_broker();
+    document.own_voice.provider = Nullable::some(OwnVoiceProvider::OpenaiLive);
+    let written = serde_json::to_string(&document).expect("serialises");
+    assert_eq!(
+        load_in(Some(written.as_bytes()), &THIS_RELEASE)
+            .status
+            .state,
+        DocumentState::Invalid
+    );
+
+    // The older reading: the section is ignored and the broker is read.
+    let older = load_in(Some(text.as_bytes()), &BEFORE_OWN_VOICE);
+    assert_eq!(
+        older.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        older.status
+    );
+    let used = older.document.as_ref().expect("used");
+    assert_eq!(used.voice.broker_origin(), Some(BROKER));
+    assert_eq!(used.own_voice.provider(), None);
+
+    for alone in [
+        r#"{"version": 3, "level": 8, "own_voice": {"provider": "openai_live"}}"#,
+        r#"{"version": 3, "voice": {"broker_origin": "https://broker.example.com"}}"#,
+    ] {
+        assert_eq!(
+            load_in(Some(alone.as_bytes()), &THIS_RELEASE).status.state,
+            DocumentState::Loaded,
+            "{alone}"
+        );
+    }
 }

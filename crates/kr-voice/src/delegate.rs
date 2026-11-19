@@ -44,7 +44,9 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use kr_client::services::voice::{VoiceMetadata, VoiceProviderService, VoiceRateQuote, VoiceStart};
+use kr_client::services::voice::{
+    VoiceMetadata, VoiceProviderService, VoiceProviderTerms, VoiceRateQuote, VoiceStart,
+};
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{
     ActionId, AuthorityRevision, DeviceId, EnvironmentId, GrantId, SessionId, VoiceSessionId,
@@ -56,9 +58,9 @@ use kr_protocol::voice::{
     VOICE_DELEGATION_NOTE, VoiceAction, VoiceActionPlan, VoiceConfirmationRequest,
     VoiceContextClass, VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationId,
     VoiceDelegationOutcome, VoiceGrantParams, VoiceGrantResult, VoiceGrantStatement,
-    VoiceManagedTerms, VoicePrepareParams, VoicePrepareResult, VoiceRate, VoiceRefusal,
-    VoiceSessionDescriptor, VoiceStartOutcome, VoiceStartParams, VoiceStartResult, VoiceStopParams,
-    VoiceStopResult,
+    VoiceManagedTerms, VoicePrepareParams, VoicePrepareProvider, VoicePrepareResult, VoiceRate,
+    VoiceRefusal, VoiceSessionControl, VoiceSessionDescriptor, VoiceStartOutcome, VoiceStartParams,
+    VoiceStartResult, VoiceStopParams, VoiceStopResult,
 };
 
 use crate::confirm::{ConfirmationLedger, issue_confirmation, verify_confirmation};
@@ -75,6 +77,11 @@ use crate::interpret::{
 ///
 /// One sentence for the start that is refused and the preparation that explains why no start is
 /// offered, so the two never describe the same host differently.
+/// What a device is told when it would spend the owner's own key and is not one the owner gave
+/// host-management authority.
+const NOT_A_HOST_MANAGER: &str = "This host's OpenAI key can be used only from a device that has \
+     host-management authority on this host.";
+
 const NO_VOICE_SERVICE: &str = "this host has no voice service configured. A provider credential \
                                 of your own, or the agent already running in the session, both \
                                 still work.";
@@ -781,35 +788,48 @@ impl Coordinator {
         // the history bound each item is held to applies when the call gathers it.
         let selected = params.selected.clone();
 
-        let (managed, managed_unavailable) = match provider {
-            None => (None, Some(capitalised(NO_VOICE_SERVICE))),
-            Some(provider) => match provider.metadata().await {
-                Ok(Some(terms)) => match managed_terms(terms) {
-                    Some(terms) => (Some(terms), None),
-                    None => (
-                        None,
-                        Some(
-                            "The managed service quoted a rate this host cannot show, so a managed \
-                             call cannot start from here."
-                                .to_owned(),
-                        ),
-                    ),
-                },
-                Ok(None) => (
-                    None,
-                    Some(
-                        "This host's voice provider is not the managed service and quotes no \
-                         managed terms."
+        let provider = match provider {
+            None => VoicePrepareProvider::Unavailable {
+                message: capitalised(NO_VOICE_SERVICE),
+            },
+            Some(provider) => match provider.terms().await {
+                Ok(VoiceProviderTerms::Managed(terms)) => match managed_terms(terms) {
+                    Some(terms) => VoicePrepareProvider::Managed {
+                        broker_origin: self.broker_origin.clone(),
+                        terms: Box::new(terms),
+                    },
+                    None => VoicePrepareProvider::Unavailable {
+                        message: "The managed service quoted a rate this host cannot show, so a \
+                                  managed call cannot start from here."
                             .to_owned(),
-                    ),
-                ),
-                Err(error) => (
-                    None,
-                    Some(format!(
+                    },
+                },
+                Ok(VoiceProviderTerms::OwnKey(terms)) => {
+                    // A phone never offers a call it would be refused, so the gate that decides
+                    // whose key pays is asked here as well as at the start.
+                    if self.holds_host_management(device_id)? {
+                        VoicePrepareProvider::OwnKey {
+                            model: terms.model,
+                            disclosure: terms.disclosure,
+                            held: terms.held,
+                        }
+                    } else {
+                        VoicePrepareProvider::Unavailable {
+                            message: NOT_A_HOST_MANAGER.to_owned(),
+                        }
+                    }
+                }
+                Ok(VoiceProviderTerms::Unquoted) => VoicePrepareProvider::Unavailable {
+                    message: "This host's voice provider is not the managed service and quotes \
+                              no managed terms."
+                        .to_owned(),
+                },
+                Err(error) => VoicePrepareProvider::Unavailable {
+                    message: format!(
                         "This host could not read the managed service's terms, so a managed call \
                          cannot start from here: {error}"
-                    )),
-                ),
+                    ),
+                },
             },
         };
 
@@ -820,10 +840,8 @@ impl Coordinator {
             selected,
             token_cap: VOICE_CONTEXT_TOKEN_CAP,
             message_count: VOICE_CONTEXT_MESSAGE_COUNT,
-            broker_origin: self.broker_origin.clone(),
             prepared,
-            managed: Nullable(managed),
-            managed_unavailable: Nullable(managed_unavailable),
+            provider,
         })
     }
 
@@ -1000,6 +1018,19 @@ impl Coordinator {
             ..
         } = call;
 
+        // Whose key pays is decided before anything is written or asked of the provider.
+        if provider.spends_the_owners_key() && !self.holds_host_management(device_id)? {
+            return Ok(VoiceStartResult {
+                outcome: VoiceStartOutcome::Unavailable {
+                    reason: "host_management_required".to_owned(),
+                    message: NOT_A_HOST_MANAGER.to_owned(),
+                    alternatives: vec![
+                        "The agent already running in the session, reached by typing.".to_owned(),
+                    ],
+                },
+            });
+        }
+
         let request = kr_client::services::voice::VoiceSessionRequest {
             offer_sdp: params.offer_sdp.clone(),
             host_id: self.environment_id.to_string(),
@@ -1074,6 +1105,13 @@ impl Coordinator {
                 });
             }
             VoiceStart::Started(session) => session,
+            VoiceStart::StartedOwn(own) => {
+                // This coordinator holds no record of a call on the owner's own account yet, and
+                // a call nobody holds is a call somebody is paying for: it is closed, and the
+                // start is answered as a host with no voice service is.
+                let _ = provider.close(&own.call_id).await;
+                return Err(VoiceError::NotConfigured(NO_VOICE_SERVICE.to_owned()));
+            }
         };
 
         if session.replayed {
@@ -1208,9 +1246,11 @@ impl Coordinator {
                     provider_session_id: session.provider_session_id.clone(),
                     answer_sdp: session.answer_sdp.clone(),
                     model: session.model.clone(),
-                    control_path: session.control_path.clone(),
-                    broker_origin: self.broker_origin.clone(),
-                    heartbeat_seconds: session.heartbeat_seconds,
+                    control: VoiceSessionControl::Broker {
+                        origin: self.broker_origin.clone(),
+                        control_path: session.control_path.clone(),
+                        heartbeat_seconds: session.heartbeat_seconds,
+                    },
                     closes_at_ms: TimestampMs::new(closes_at_ms),
                     // The service's own words for this call, carried as they came. A host copy put
                     // in their place would be a second statement of what the operator can see.
@@ -1244,6 +1284,15 @@ impl Coordinator {
     /// happens after it is an effect nobody is holding a window for any more. What stops one is
     /// the host's to say: a fence it owes, a registration it has replaced or a deadline that has
     /// passed on its own clock, each under its own code and in its own words.
+    /// Whether this device may spend the host owner's own key: the owner rule, from the pairing
+    /// grant as this host lets it be used.
+    ///
+    /// A refusal the host could not decide is an error and never a "no", so a device the host
+    /// could not read is not told it is not a manager.
+    fn holds_host_management(&self, device_id: DeviceId) -> Result<bool> {
+        self.authority.holds_host_management(device_id)
+    }
+
     fn still_admitted(admission: &dyn Admission) -> Result<()> {
         admission.still_admitted().map_err(VoiceError::Host)
     }

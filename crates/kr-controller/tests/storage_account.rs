@@ -362,7 +362,7 @@ async fn each_client_presents_the_account_of_its_role_and_reaches_the_service_of
         .managed_inference
         .clone()
         .expect("the voice client");
-    let _ = voice.metadata().await;
+    let _ = voice.terms().await;
     // The storage client, through the doctor's read of the storage status, and the bundle client,
     // through a restore's read.
     let _ = doctor(&host).await;
@@ -482,7 +482,7 @@ async fn the_voice_client_and_the_lease_keeper_never_ask_the_storage_account() {
         .managed_inference
         .clone()
         .expect("the voice client");
-    let _ = voice.metadata().await;
+    let _ = voice.terms().await;
 
     // The carrier asks the storage account for the one scope it is for. The voice client and the
     // lease keeper ask it for no scope at all, though its grant holds the scopes they would ask.

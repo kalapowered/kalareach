@@ -77,10 +77,8 @@ function preparation(over: Partial<VoicePrepareResult> = {}): VoicePrepareResult
     selected: ['environment_variables'],
     token_cap: 8000,
     message_count: 20,
-    broker_origin: 'https://reach.kala.to',
     prepared: 'AAAA',
-    managed: terms(),
-    managed_unavailable: null,
+    provider: { managed: { broker_origin: 'https://reach.kala.to', terms: terms() } },
     ...over
   }
 }
@@ -139,6 +137,7 @@ function choice(over: Partial<ProviderChoice> = {}): ProviderChoice {
     brokerOrigin: 'https://reach.kala.to',
     prepared: 'scope-1',
     managed: terms(),
+    ownKey: null,
     unavailable: null,
     previousRate: null,
     context: [{ kind: 'the session', summary: 'its description and the last 20 messages' }],
@@ -186,7 +185,9 @@ describe('the provider choice', () => {
         'The provider and this service can process the speech and the context the host selects.'
       ]
     })
-    const made = choiceFromPreparation(preparation({ managed: published }))
+    const made = choiceFromPreparation(
+      preparation({ provider: { managed: { broker_origin: 'https://reach.kala.to', terms: published } } })
+    )
     expect(made.managed).toEqual(published)
     expect(made.unavailable).toBeNull()
   })
@@ -206,13 +207,31 @@ describe('the provider choice', () => {
   // what the person reads.
   it('carries the host’s reason when it has no terms to show', () => {
     const made = choiceFromPreparation(
-      preparation({ managed: null, managed_unavailable: 'The managed service did not answer.' })
+      preparation({ provider: { unavailable: { message: 'The managed service did not answer.' } } })
     )
     expect(made.managed).toBeNull()
+    expect(made.ownKey).toBeNull()
     expect(made.unavailable).toBe('The managed service did not answer.')
+  })
 
-    const silent = choiceFromPreparation(preparation({ managed: null, managed_unavailable: null }))
-    expect(silent.unavailable).toBeTruthy()
+  // The owner's own account is carried as the host described it, with no managed terms and no
+  // broker.
+  it('carries a call on the owner’s own key as the host described it', () => {
+    const made = choiceFromPreparation(
+      preparation({
+        provider: {
+          own_key: { model: 'gpt-live-1', disclosure: ['This call runs on the OpenAI key.'], held: true }
+        }
+      })
+    )
+    expect(made.managed).toBeNull()
+    expect(made.unavailable).toBeNull()
+    expect(made.brokerOrigin).toBe('')
+    expect(made.ownKey).toEqual({
+      model: 'gpt-live-1',
+      disclosure: ['This call runs on the OpenAI key.'],
+      held: true
+    })
   })
 
   // A refused start moves only the rate, and the rate the person read before stays beside it.
@@ -257,9 +276,13 @@ describe('what the native layer reports about capture', () => {
         provider_session_id: 'sess_9',
         answer_sdp: 'v=0\r\n',
         model: 'gpt-live-1',
-        control_path: '/api/voice/sessions/call-9/control',
-        broker_origin: 'https://reach.kala.to',
-        heartbeat_seconds: 20,
+        control: {
+          broker: {
+            origin: 'https://reach.kala.to',
+            control_path: '/api/voice/sessions/call-9/control',
+            heartbeat_seconds: 20
+          }
+        },
         closes_at_ms: '1763000000000',
         disclosure: []
       },

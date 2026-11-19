@@ -74,7 +74,7 @@ use kr_client::services::account::{
     StoredGrant,
 };
 use kr_client::services::voice::{
-    VoiceClosure, VoiceMetadata, VoiceProviderService, VoiceSessionRequest, VoiceStart,
+    VoiceClosure, VoiceProviderService, VoiceProviderTerms, VoiceSessionRequest, VoiceStart,
 };
 use kr_client::services::voice_control::ControlConnector;
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
@@ -478,8 +478,12 @@ struct ForkBroker {
 }
 
 impl VoiceProviderService for ForkBroker {
-    fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
-        self.managed.metadata()
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
+        self.managed.terms()
+    }
+
+    fn account_bound(&self) -> bool {
+        self.managed.account_bound()
     }
 
     fn begin<'a>(

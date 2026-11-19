@@ -10026,7 +10026,7 @@ async fn storage_that_moves_between_the_managed_service_and_one_the_owner_runs_l
         .clone()
         .expect("the managed voice client");
     let before_voice = managed.web().arrived().len();
-    let _ = voice.metadata().await;
+    let _ = voice.terms().await;
     let presented: Vec<_> = managed
         .web()
         .arrived()

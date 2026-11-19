@@ -4301,11 +4301,15 @@ impl kr_client::services::BackupManifestService for ForkServices {
 }
 
 impl kr_client::services::VoiceProviderService for ForkServices {
-    fn metadata(
+    fn terms(
         &self,
-    ) -> kr_client::services::ServiceFuture<'_, Option<kr_client::services::voice::VoiceMetadata>>
+    ) -> kr_client::services::ServiceFuture<'_, kr_client::services::voice::VoiceProviderTerms>
     {
         self.refuses("voice.metadata")
+    }
+
+    fn account_bound(&self) -> bool {
+        true
     }
 
     fn call_is_open<'a>(
@@ -4468,7 +4472,7 @@ async fn a_fork_replaces_every_service_client_and_availability_only_explains_it(
             .managed_inference
             .as_ref()
             .expect("the fork's inference client")
-            .metadata()
+            .terms()
             .await
             .err(),
     ];

@@ -2698,14 +2698,24 @@ export function fakeHost(
               : [...voiceStandingSessions],
           prepared: preparedFor(voice),
           selected: VOICE_EXCLUDED_CLASSES.filter((each) => selected.includes(each)),
-          managed:
+          provider:
             voice.terms === 'unread'
-              ? null
-              : { ...VOICE_TERMS, enabled: voice.terms === 'published', rate: { ...voice.rate } },
-          managed_unavailable:
-            voice.terms === 'unread'
-              ? "This host could not read the managed service's terms, so a managed call cannot start from here: the managed service did not answer"
-              : null
+              ? {
+                  unavailable: {
+                    message:
+                      "This host could not read the managed service's terms, so a managed call cannot start from here: the managed service did not answer"
+                  }
+                }
+              : {
+                  managed: {
+                    broker_origin: VOICE_BROKER_ORIGIN,
+                    terms: {
+                      ...VOICE_TERMS,
+                      enabled: voice.terms === 'published',
+                      rate: { ...voice.rate }
+                    }
+                  }
+                }
         }
       }),
 
@@ -4033,7 +4043,10 @@ const VOICE_EXCLUDED_CLASSES = ['environment_variables', 'terminal_scrollback'] 
  *
  * The scope is the host's own: its grants, its selection and its cap.
  */
-const VOICE_SCOPE: Omit<VoicePrepareResult, 'managed' | 'managed_unavailable' | 'prepared'> = {
+/** The managed broker the fake host's voice calls are brokered through. */
+const VOICE_BROKER_ORIGIN = 'https://reach.kala.to'
+
+const VOICE_SCOPE: Omit<VoicePrepareResult, 'provider' | 'prepared'> = {
   session_ids: [SESSION_MAIN],
   statement: {
     actions: ['brief', 'compose_prompt', 'navigate', 'status'],
@@ -4048,8 +4061,7 @@ const VOICE_SCOPE: Omit<VoicePrepareResult, 'managed' | 'managed_unavailable' | 
   excluded: [...VOICE_EXCLUDED_CLASSES],
   selected: [],
   token_cap: 8000,
-  message_count: 20,
-  broker_origin: 'https://reach.kala.to'
+  message_count: 20
 }
 
 /** The action a person may add to the default grant, in the protocol's own sentence. */
@@ -4143,9 +4155,13 @@ function fakeVoiceSession(
     provider_session_id: 'sess_7f3a',
     answer_sdp: 'v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n',
     model: VOICE_TERMS.model,
-    control_path: '/api/voice/sessions/call-7f3a/control',
-    broker_origin: VOICE_SCOPE.broker_origin,
-    heartbeat_seconds: 20,
+    control: {
+      broker: {
+        origin: VOICE_BROKER_ORIGIN,
+        control_path: '/api/voice/sessions/call-7f3a/control',
+        heartbeat_seconds: 20
+      }
+    },
     closes_at_ms: String(closesAtMs),
     disclosure: VOICE_TERMS.disclosure
   }

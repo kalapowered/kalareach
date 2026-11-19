@@ -54,8 +54,8 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::voice::{
     FragmentText, TranscriptFragment, VoiceContextParams, VoiceDelegateParams, VoiceDelegateResult,
-    VoiceDelegationId, VoiceDelegationOutcome, VoiceSessionDescriptor, VoiceStartOutcome,
-    VoiceStartParams, VoiceStartResult,
+    VoiceDelegationId, VoiceDelegationOutcome, VoiceSessionControl, VoiceSessionDescriptor,
+    VoiceStartOutcome, VoiceStartParams, VoiceStartResult,
 };
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -1111,16 +1111,32 @@ impl Owner {
         let call = self.call.clone().expect("a call is held");
         let service = self.shared.service.clone();
 
+        // A call the host controls has no socket for this device to open here: the device's half of
+        // that control arrives with the host control, and until it does the call is not followed.
+        let VoiceSessionControl::Broker {
+            origin: broker_origin,
+            control_path,
+            ..
+        } = &descriptor.control
+        else {
+            return self
+                .abandon(Cause::Step(
+                    "the host controls this call itself, and this version of the app cannot \
+                     follow such a call yet, so the call was ended"
+                        .to_owned(),
+                ))
+                .await;
+        };
         // The service the control is opened at is the one the account is signed in at, whatever
         // the host said.
         let target = match ControlTarget::at(
             &service.origin,
-            &descriptor.broker_origin,
-            &descriptor.control_path,
+            broker_origin,
+            control_path,
             &descriptor.call_id,
         ) {
             Ok(target) => target,
-            Err(_) if !same_origin(&service.origin, &descriptor.broker_origin) => {
+            Err(_) if !same_origin(&service.origin, broker_origin) => {
                 return self.abandon(Cause::ForeignService).await;
             }
             Err(_) => {

@@ -1683,8 +1683,12 @@ impl BackupManifestService for NullService {
 }
 
 impl VoiceProviderService for NullService {
-    fn metadata(&self) -> ServiceFuture<'_, Option<voice::VoiceMetadata>> {
+    fn terms(&self) -> ServiceFuture<'_, voice::VoiceProviderTerms> {
         unconfigured(ManagedService::ManagedInference.as_str())
+    }
+
+    fn account_bound(&self) -> bool {
+        true
     }
 
     fn provider(&self) -> String {

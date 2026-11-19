@@ -699,8 +699,6 @@ pub struct VoicePrepareResult {
     pub token_cap: u32,
     /// How many semantic messages the default context carries.
     pub message_count: u32,
-    /// The origin of the managed service a call would be brokered through.
-    pub broker_origin: String,
     /// A digest of what a call started now would be bound to: the sessions it would reach, what
     /// it would be permitted to do, and the provider that would carry it.
     ///
@@ -709,17 +707,64 @@ pub struct VoicePrepareResult {
     /// as [`VoiceStartOutcome::PreparationChanged`] before anything is created, so a call never
     /// reaches further than what the person was shown.
     pub prepared: Digest256,
-    /// What the managed service answered about a call started now.
+    /// Which provider would carry a call started now, and what it would be.
     ///
-    /// Null for a provider that is not the managed service, and when this host could not read the
-    /// service's terms; [`Self::managed_unavailable`] then says which. A managed call is not
-    /// offered without these terms, because a start names the rate version a person was shown
-    /// and a person shown no rate has accepted none.
-    pub managed: Nullable<VoiceManagedTerms>,
-    /// Why a managed call cannot start from here, in words a person can act on.
-    ///
-    /// Present exactly when [`Self::managed`] is null.
-    pub managed_unavailable: Nullable<String>,
+    /// One of three states and no other: the managed service with the terms it published, the
+    /// owner's own account with what a person is told about it, or neither, with the reason.
+    pub provider: VoicePrepareProvider,
+}
+
+impl VoicePrepareResult {
+    /// The managed service's terms, when the managed service would carry a call.
+    #[must_use]
+    pub fn managed(&self) -> Option<&VoiceManagedTerms> {
+        match &self.provider {
+            VoicePrepareProvider::Managed { terms, .. } => Some(terms),
+            VoicePrepareProvider::OwnKey { .. } | VoicePrepareProvider::Unavailable { .. } => None,
+        }
+    }
+
+    /// Why no call can start from here, when none can.
+    #[must_use]
+    pub fn unavailable(&self) -> Option<&str> {
+        match &self.provider {
+            VoicePrepareProvider::Unavailable { message } => Some(message),
+            VoicePrepareProvider::Managed { .. } | VoicePrepareProvider::OwnKey { .. } => None,
+        }
+    }
+}
+
+/// Which provider would carry a call, as a preparation says it.
+///
+/// A union and not three fields with a rule about which of them is present together: a state the
+/// rule forbids cannot be written. The managed state is read from the service for this answer; the
+/// own-key state is this host's own, and carries no rate, balance or sign-in because the owner's
+/// own account pays.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum VoicePrepareProvider {
+    /// The managed service would carry the call.
+    Managed {
+        /// The origin of the managed service a call would be brokered through.
+        broker_origin: String,
+        /// What the managed service answered about a call started now: a start names the rate
+        /// version in it, and a person shown no rate has accepted none.
+        terms: Box<VoiceManagedTerms>,
+    },
+    /// The owner's own account at the provider would carry the call.
+    OwnKey {
+        /// The model the call runs on.
+        model: String,
+        /// What a person is told before such a call, in this host's words.
+        disclosure: Vec<String>,
+        /// Whether this host holds the key a call needs. A call is not offered without it.
+        held: bool,
+    },
+    /// No call can start from here.
+    Unavailable {
+        /// Why, in words a person can act on.
+        message: String,
+    },
 }
 
 /// What the managed service publishes about a call started now, carried in its own words.
@@ -897,17 +942,37 @@ pub struct VoiceSessionDescriptor {
     pub answer_sdp: String,
     /// The model the call is running on.
     pub model: String,
-    /// Path on the broker's origin the control socket is opened on.
-    pub control_path: String,
-    /// The broker's origin, so the device does not have to be configured with it separately.
-    pub broker_origin: String,
-    /// Seconds between heartbeats the device is expected to send.
-    pub heartbeat_seconds: u32,
+    /// How the device reaches the call's control: the managed broker's socket, or the host.
+    pub control: VoiceSessionControl,
     /// When the broker closes the call, whatever else happens, in UTC milliseconds.
     pub closes_at_ms: TimestampMs,
     /// What the provider and the managed service can see, in the words the service's answer to
     /// this start gave.
     pub disclosure: Vec<String>,
+}
+
+/// Where a call's control is reached, as the host tells the device when it starts a call.
+///
+/// A union and not fields that apply to one provider and sit empty for another: a managed call is
+/// controlled at the broker's origin over a socket the device opens, and a call on the host
+/// owner's own account is controlled through the host, which holds the provider's side of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum VoiceSessionControl {
+    /// The managed broker's control socket.
+    Broker {
+        /// The broker's origin, so the device does not have to be configured with it separately.
+        origin: String,
+        /// Path on the broker's origin the control socket is opened on.
+        control_path: String,
+        /// Seconds between heartbeats the device is expected to send.
+        heartbeat_seconds: u32,
+    },
+    /// The host holds the control; the device sends its writes and heartbeats to the host.
+    Host {
+        /// Seconds between heartbeats the device is expected to send.
+        heartbeat_seconds: u32,
+    },
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1571,15 +1636,29 @@ mod tests {
             provider_session_id: "sess_1".to_owned(),
             answer_sdp: "v=0\r\n".to_owned(),
             model: "gpt-live-1".to_owned(),
-            control_path: "/api/voice/sessions/call-1/control".to_owned(),
-            broker_origin: "https://reach.example".to_owned(),
-            heartbeat_seconds: 20,
+            control: VoiceSessionControl::Broker {
+                origin: "https://reach.example".to_owned(),
+                control_path: "/api/voice/sessions/call-1/control".to_owned(),
+                heartbeat_seconds: 20,
+            },
             closes_at_ms: TimestampMs::new(1_700_000_000_000),
             disclosure: disclosure.clone(),
         };
         round_trip(&VoiceStartResult {
             outcome: VoiceStartOutcome::Started {
-                session: Box::new(descriptor),
+                session: Box::new(descriptor.clone()),
+            },
+        });
+        // A call the host controls names no broker, no path and no socket.
+        let hosted = VoiceSessionDescriptor {
+            control: VoiceSessionControl::Host {
+                heartbeat_seconds: 20,
+            },
+            ..descriptor
+        };
+        round_trip(&VoiceStartResult {
+            outcome: VoiceStartOutcome::Started {
+                session: Box::new(hosted),
             },
         });
         round_trip(&VoiceStartResult {
@@ -1638,22 +1717,23 @@ mod tests {
                 .collect(),
             token_cap: VOICE_CONTEXT_TOKEN_CAP,
             message_count: VOICE_CONTEXT_MESSAGE_COUNT,
-            broker_origin: "https://reach.example".to_owned(),
             prepared: Digest256::from_bytes([4; 32]),
-            managed: Nullable::some(VoiceManagedTerms {
-                enabled: true,
-                model: "gpt-live-1".to_owned(),
-                disclosure,
-                admission_note: "The model received this context.".to_owned(),
-                delegation_note: "A delegation identifier is correlation data.".to_owned(),
-                alternatives: vec!["Type to the agent instead.".to_owned()],
-                rate,
-                maximum_session_seconds: 1_800,
-                minimum_request_seconds: 60,
-                heartbeat_seconds: 20,
-                context_bytes: 500,
-            }),
-            managed_unavailable: Nullable::null(),
+            provider: VoicePrepareProvider::Managed {
+                broker_origin: "https://reach.example".to_owned(),
+                terms: Box::new(VoiceManagedTerms {
+                    enabled: true,
+                    model: "gpt-live-1".to_owned(),
+                    disclosure,
+                    admission_note: "The model received this context.".to_owned(),
+                    delegation_note: "A delegation identifier is correlation data.".to_owned(),
+                    alternatives: vec!["Type to the agent instead.".to_owned()],
+                    rate,
+                    maximum_session_seconds: 1_800,
+                    minimum_request_seconds: 60,
+                    heartbeat_seconds: 20,
+                    context_bytes: 500,
+                }),
+            },
         });
         round_trip(&VoicePrepareResult {
             session_ids: CanonicalSet::from_iter([]),
@@ -1662,10 +1742,24 @@ mod tests {
             selected: CanonicalSet::from_iter([]),
             token_cap: VOICE_CONTEXT_TOKEN_CAP,
             message_count: VOICE_CONTEXT_MESSAGE_COUNT,
-            broker_origin: String::new(),
             prepared: Digest256::from_bytes([5; 32]),
-            managed: Nullable::null(),
-            managed_unavailable: Nullable::some("This host has no voice service.".to_owned()),
+            provider: VoicePrepareProvider::Unavailable {
+                message: "This host has no voice service.".to_owned(),
+            },
+        });
+        round_trip(&VoicePrepareResult {
+            session_ids: CanonicalSet::from_iter([]),
+            statement: VoiceGrantStatement::of(&VoiceAction::default_scope()),
+            excluded: VoiceContextClass::ALL.iter().copied().collect(),
+            selected: CanonicalSet::from_iter([]),
+            token_cap: VOICE_CONTEXT_TOKEN_CAP,
+            message_count: VOICE_CONTEXT_MESSAGE_COUNT,
+            prepared: Digest256::from_bytes([6; 32]),
+            provider: VoicePrepareProvider::OwnKey {
+                model: "gpt-live-1".to_owned(),
+                disclosure: vec!["This call runs on the OpenAI key set on this host.".to_owned()],
+                held: true,
+            },
         });
     }
 

@@ -30,8 +30,8 @@ use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
 use kr_protocol::voice::{
-    VoiceGrantParams, VoicePrepareParams, VoicePrepareResult, VoiceStartOutcome, VoiceStartParams,
-    VoiceStartResult, VoiceStopParams,
+    VoiceGrantParams, VoicePrepareParams, VoicePrepareProvider, VoicePrepareResult,
+    VoiceStartOutcome, VoiceStartParams, VoiceStartResult, VoiceStopParams,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
@@ -840,9 +840,8 @@ async fn sign_out(host: &net_support::Host) -> AccountSignedOut {
 /// What a device asks to start a call with, from what it was shown.
 fn start_params(session_id: SessionId, prepared: &VoicePrepareResult) -> VoiceStartParams {
     let terms = prepared
-        .managed
-        .as_ref()
-        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
+        .managed()
+        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.unavailable()));
     VoiceStartParams {
         session_ids: [session_id].into_iter().collect(),
         offer_sdp: "v=0\r\n".to_owned(),
@@ -946,11 +945,14 @@ async fn a_host_whose_document_names_a_broker_brokers_a_call_through_it() {
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
 
     let terms = prepared
-        .managed
-        .as_ref()
-        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
+        .managed()
+        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.unavailable()));
     assert_eq!(terms.rate.version, "2026-09");
-    assert_eq!(prepared.broker_origin, broker.origin);
+    assert!(
+        matches!(&prepared.provider, VoicePrepareProvider::Managed { broker_origin, .. } if *broker_origin == broker.origin),
+        "{:?}",
+        prepared.provider
+    );
 
     let offer = "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\na=the-devices-own-offer\r\n";
     let started: VoiceStartResult = mutate(
@@ -1030,7 +1032,7 @@ async fn a_host_whose_document_names_no_broker_starts_no_call() {
         net_support::Host::start_with_document(&owner, &ConfigurationDocument::empty()).await;
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     assert!(
-        prepared.managed.as_ref().is_none(),
+        prepared.managed().is_none(),
         "no service is named, so no terms are offered"
     );
 
@@ -1076,7 +1078,7 @@ async fn a_host_reaches_the_broker_through_the_proxy_its_document_selects() {
     let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
 
     assert!(
-        prepared.managed.as_ref().is_none(),
+        prepared.managed().is_none(),
         "the proxy refused the tunnel, so the service's terms were not read"
     );
     assert!(
@@ -1191,9 +1193,8 @@ async fn an_operator_signs_the_host_in_and_a_call_presents_the_account_it_signed
 
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     let terms = prepared
-        .managed
-        .as_ref()
-        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
+        .managed()
+        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.unavailable()));
     let started: VoiceStartResult = mutate(
         &session,
         host.environment_id,
@@ -1485,7 +1486,7 @@ async fn signing_the_host_out_ends_the_grant_and_a_call_presents_no_account_afte
     assert_eq!(report.last_attempt.as_ref(), None);
     let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
     assert!(
-        prepared.managed.as_ref().is_none(),
+        prepared.managed().is_none(),
         "no terms were read without an account"
     );
     assert!(
@@ -2921,7 +2922,7 @@ async fn a_host_moved_off_the_managed_broker_can_still_end_the_sign_in_it_keeps(
     );
     let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
     assert!(
-        prepared.managed.as_ref().is_none(),
+        prepared.managed().is_none(),
         "no account is presented to the other broker"
     );
     let refused = host
@@ -2974,7 +2975,7 @@ async fn an_account_the_store_could_not_settle_is_not_presented_until_it_is_sett
 
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     assert!(
-        prepared.managed.as_ref().is_none(),
+        prepared.managed().is_none(),
         "no account is presented while the store cannot be settled"
     );
     assert!(
@@ -2998,9 +2999,9 @@ async fn an_account_the_store_could_not_settle_is_not_presented_until_it_is_sett
         .await
         .expect("the host answers what a call would be");
     assert!(
-        prepared.managed.as_ref().is_some(),
+        prepared.managed().is_some(),
         "the account is presented once it is settled: {:?}",
-        prepared.managed_unavailable
+        prepared.unavailable()
     );
     assert_eq!(broker.revoked(), [broker.refresh(1)]);
     host.stop().await;
@@ -3047,9 +3048,8 @@ async fn each_refresh_presents_the_token_the_last_one_issued() {
     sign_in_with(&host, broker.issue_grant(20)).await;
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     let terms = prepared
-        .managed
-        .as_ref()
-        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
+        .managed()
+        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.unavailable()));
     let _: VoiceStartResult = mutate(
         &session,
         host.environment_id,
@@ -3098,9 +3098,8 @@ async fn a_stop_after_the_service_ended_the_sign_in_still_revokes_the_calls_gran
     sign_in_with(&host, broker.issue_grant(20)).await;
     let (_device, session, session_id, prepared) = ready(&host, &owner).await;
     let terms = prepared
-        .managed
-        .as_ref()
-        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.managed_unavailable));
+        .managed()
+        .unwrap_or_else(|| panic!("the service's terms: {:?}", prepared.unavailable()));
     let started: VoiceStartResult = mutate(
         &session,
         host.environment_id,
@@ -3402,7 +3401,7 @@ async fn an_account_signed_in_at_one_service_is_reached_only_through_that_servic
     assert_eq!(account_report(&host).await.state, AccountState::SignedOut);
     let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
     assert!(
-        prepared.managed.as_ref().is_none(),
+        prepared.managed().is_none(),
         "no terms were read with an account that belongs to another service"
     );
     assert!(
@@ -3504,7 +3503,7 @@ async fn a_host_whose_broker_is_not_the_account_service_signs_in_nowhere() {
     // Signing out needs no broker: with no account kept there is nothing to end, and it says so.
     assert!(!sign_out(&host).await.was_signed_in);
     let (_device, _session, _session_id, prepared) = ready(&host, &owner).await;
-    assert!(prepared.managed.as_ref().is_none(), "no terms were read");
+    assert!(prepared.managed().is_none(), "no terms were read");
     assert!(broker.seen().is_empty(), "the broker was sent nothing");
     host.stop().await;
 }

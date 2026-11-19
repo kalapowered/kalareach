@@ -1225,6 +1225,10 @@ export type ChangeSetVersion = string
  */
 export type RevocationPolicy = 'warn_only' | 'disable_at_next_admission' | 'disable_at_once'
 /**
+ * A voice provider a host can run its own calls on.
+ */
+export type OwnVoiceProvider = 'openai_live'
+/**
  * The owner's sleep-inhibition choice.
  *
  * Off by default. Setup offers the mains-only choice and never enables it; using battery power as
@@ -2625,6 +2629,80 @@ export type VoiceAction =
   | 'apply_diff'
   | 'deliver_externally'
 /**
+ * Which provider would carry a call, as a preparation says it.
+ *
+ * A union and not three fields with a rule about which of them is present together: a state the
+ * rule forbids cannot be written. The managed state is read from the service for this answer; the
+ * own-key state is this host's own, and carries no rate, balance or sign-in because the owner's
+ * own account pays.
+ */
+export type VoicePrepareProvider =
+  | {
+      managed: {
+        /**
+         * The origin of the managed service a call would be brokered through.
+         */
+        broker_origin: string
+        terms: VoiceManagedTerms1
+      }
+    }
+  | {
+      own_key: {
+        /**
+         * What a person is told before such a call, in this host's words.
+         */
+        disclosure: string[]
+        /**
+         * Whether this host holds the key a call needs. A call is not offered without it.
+         */
+        held: boolean
+        /**
+         * The model the call runs on.
+         */
+        model: string
+      }
+    }
+  | {
+      unavailable: {
+        /**
+         * Why, in words a person can act on.
+         */
+        message: string
+      }
+    }
+/**
+ * Where a call's control is reached, as the host tells the device when it starts a call.
+ *
+ * A union and not fields that apply to one provider and sit empty for another: a managed call is
+ * controlled at the broker's origin over a socket the device opens, and a call on the host
+ * owner's own account is controlled through the host, which holds the provider's side of it.
+ */
+export type VoiceSessionControl =
+  | {
+      broker: {
+        /**
+         * Path on the broker's origin the control socket is opened on.
+         */
+        control_path: string
+        /**
+         * Seconds between heartbeats the device is expected to send.
+         */
+        heartbeat_seconds: number
+        /**
+         * The broker's origin, so the device does not have to be configured with it separately.
+         */
+        origin: string
+      }
+    }
+  | {
+      host: {
+        /**
+         * Seconds between heartbeats the device is expected to send.
+         */
+        heartbeat_seconds: number
+      }
+    }
+/**
  * The action kinds a workflow node can name.
  *
  * Each kind takes one parameter type, needs the rights the method that performs the same
@@ -3342,8 +3420,10 @@ export interface KalaReachProtocol {
   voice_instructions?: VoiceInstructions
   voice_managed_terms?: VoiceManagedTerms
   voice_prepare_params?: VoicePrepareParams
+  voice_prepare_provider?: VoicePrepareProvider
   voice_prepare_result?: VoicePrepareResult
   voice_rate?: VoiceRate1
+  voice_session_control?: VoiceSessionControl
   voice_session_descriptor?: VoiceSessionDescriptor
   voice_start_params?: VoiceStartParams
   voice_start_result?: VoiceStartResult
@@ -12484,6 +12564,7 @@ export interface ConfigurationDocument {
   level?: number
   mailbox?: MailboxSelection
   network?: NetworkSelection
+  own_voice?: OwnVoiceSelection
   preferences?: PreferenceSet
   /**
    * Named profiles, each a set of the same preferences.
@@ -12763,6 +12844,23 @@ export interface NetworkSelection {
    * relay.
    */
   relay_urls?: string[] | null
+}
+/**
+ * The voice provider account this host's own calls run on, chosen by the owner.
+ *
+ * A section of level 8: written when its `provider` member is not null. A release that
+ * reads level 7 does not know it: it applies the rest of the document, counts the section
+ * among the members it ignores, and builds no voice provider for it. A document that
+ * names this section and `voice.broker_origin` is refused by a release that reads level 8,
+ * and by an older one it is read with the section ignored and the broker built, so a host
+ * rolled back below level 8 with both named runs the managed broker. The daemon reads the
+ * section when it starts its voice service, so a change applies at the next start.
+ */
+export interface OwnVoiceSelection {
+  /**
+   * The provider. Null or absent leaves the section unused.
+   */
+  provider?: OwnVoiceProvider | null
 }
 /**
  * The ordinary preferences that apply when no profile is selected.
@@ -32363,6 +32461,56 @@ export interface VoicePrepareParams {
   session_ids: SessionId[]
 }
 /**
+ * What the managed service answered about a call started now: a start names the rate
+ * version in it, and a person shown no rate has accepted none.
+ */
+export interface VoiceManagedTerms1 {
+  /**
+   * What an append acknowledgement establishes, and what it does not (section 15 ¶10).
+   */
+  admission_note: string
+  /**
+   * Paths that cost no managed credit.
+   */
+  alternatives: string[]
+  /**
+   * The largest context append the service carries, in UTF-8 bytes.
+   */
+  context_bytes: number
+  /**
+   * What a provider delegation identifier is, and what it is not.
+   */
+  delegation_note: string
+  /**
+   * What the provider and the managed service can see, stated where the choice is made.
+   */
+  disclosure: string[]
+  /**
+   * Whether an operator has managed voice open.
+   *
+   * False is the operator's circuit breaker: a call started now would be refused, and
+   * [`Self::alternatives`] is what still works.
+   */
+  enabled: boolean
+  /**
+   * Seconds between heartbeats on the control socket.
+   */
+  heartbeat_seconds: number
+  /**
+   * The longest call the service authorises, in seconds.
+   */
+  maximum_session_seconds: number
+  /**
+   * The shortest call a start may ask for, in seconds.
+   */
+  minimum_request_seconds: number
+  /**
+   * The model a call started now would be asked for.
+   */
+  model: string
+  rate: VoiceRate
+}
+/**
  * What `voice.prepare` answered: what a call started now would be, before one exists.
  *
  * Section 15 ¶12 asks for the provider and the selected context scope to be shown **before**
@@ -32379,28 +32527,9 @@ export interface VoicePrepareParams {
  */
 export interface VoicePrepareResult {
   /**
-   * The origin of the managed service a call would be brokered through.
-   */
-  broker_origin: string
-  /**
    * Classes the default context leaves out unless the person selects them (section 15 ¶12).
    */
   excluded: VoiceContextClass[]
-  /**
-   * What the managed service answered about a call started now.
-   *
-   * Null for a provider that is not the managed service, and when this host could not read the
-   * service's terms; [`Self::managed_unavailable`] then says which. A managed call is not
-   * offered without these terms, because a start names the rate version a person was shown
-   * and a person shown no rate has accepted none.
-   */
-  managed: VoiceManagedTerms | null
-  /**
-   * Why a managed call cannot start from here, in words a person can act on.
-   *
-   * Present exactly when [`Self::managed`] is null.
-   */
-  managed_unavailable: string | null
   /**
    * How many semantic messages the default context carries.
    */
@@ -32409,6 +32538,46 @@ export interface VoicePrepareResult {
    * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   prepared: string
+  /**
+   * Which provider would carry a call started now, and what it would be.
+   *
+   * One of three states and no other: the managed service with the terms it published, the
+   * owner's own account with what a person is told about it, or neither, with the reason.
+   */
+  provider:
+    | {
+        managed: {
+          /**
+           * The origin of the managed service a call would be brokered through.
+           */
+          broker_origin: string
+          terms: VoiceManagedTerms1
+        }
+      }
+    | {
+        own_key: {
+          /**
+           * What a person is told before such a call, in this host's words.
+           */
+          disclosure: string[]
+          /**
+           * Whether this host holds the key a call needs. A call is not offered without it.
+           */
+          held: boolean
+          /**
+           * The model the call runs on.
+           */
+          model: string
+        }
+      }
+    | {
+        unavailable: {
+          /**
+           * Why, in words a person can act on.
+           */
+          message: string
+        }
+      }
   /**
    * Classes from the request that would actually be carried.
    */
@@ -32481,10 +32650,6 @@ export interface VoiceSessionDescriptor {
    */
   answer_sdp: string
   /**
-   * The broker's origin, so the device does not have to be configured with it separately.
-   */
-  broker_origin: string
-  /**
    * The broker's identifier for the call. The control socket is addressed by it.
    */
   call_id: string
@@ -32493,9 +32658,33 @@ export interface VoiceSessionDescriptor {
    */
   closes_at_ms: string
   /**
-   * Path on the broker's origin the control socket is opened on.
+   * How the device reaches the call's control: the managed broker's socket, or the host.
    */
-  control_path: string
+  control:
+    | {
+        broker: {
+          /**
+           * Path on the broker's origin the control socket is opened on.
+           */
+          control_path: string
+          /**
+           * Seconds between heartbeats the device is expected to send.
+           */
+          heartbeat_seconds: number
+          /**
+           * The broker's origin, so the device does not have to be configured with it separately.
+           */
+          origin: string
+        }
+      }
+    | {
+        host: {
+          /**
+           * Seconds between heartbeats the device is expected to send.
+           */
+          heartbeat_seconds: number
+        }
+      }
   /**
    * What the provider and the managed service can see, in the words the service's answer to
    * this start gave.
@@ -32505,10 +32694,6 @@ export interface VoiceSessionDescriptor {
    * One host-issued authority object.
    */
   grant_id: string
-  /**
-   * Seconds between heartbeats the device is expected to send.
-   */
-  heartbeat_seconds: number
   /**
    * The model the call is running on.
    */
@@ -32652,10 +32837,6 @@ export interface VoiceSessionDescriptor1 {
    */
   answer_sdp: string
   /**
-   * The broker's origin, so the device does not have to be configured with it separately.
-   */
-  broker_origin: string
-  /**
    * The broker's identifier for the call. The control socket is addressed by it.
    */
   call_id: string
@@ -32664,9 +32845,33 @@ export interface VoiceSessionDescriptor1 {
    */
   closes_at_ms: string
   /**
-   * Path on the broker's origin the control socket is opened on.
+   * How the device reaches the call's control: the managed broker's socket, or the host.
    */
-  control_path: string
+  control:
+    | {
+        broker: {
+          /**
+           * Path on the broker's origin the control socket is opened on.
+           */
+          control_path: string
+          /**
+           * Seconds between heartbeats the device is expected to send.
+           */
+          heartbeat_seconds: number
+          /**
+           * The broker's origin, so the device does not have to be configured with it separately.
+           */
+          origin: string
+        }
+      }
+    | {
+        host: {
+          /**
+           * Seconds between heartbeats the device is expected to send.
+           */
+          heartbeat_seconds: number
+        }
+      }
   /**
    * What the provider and the managed service can see, in the words the service's answer to
    * this start gave.
@@ -32676,10 +32881,6 @@ export interface VoiceSessionDescriptor1 {
    * One host-issued authority object.
    */
   grant_id: string
-  /**
-   * Seconds between heartbeats the device is expected to send.
-   */
-  heartbeat_seconds: number
   /**
    * The model the call is running on.
    */

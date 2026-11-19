@@ -5175,11 +5175,15 @@ async fn the_startup_exchange_binds_a_worker_to_its_own_reservation() {
 struct OfflineProvider;
 
 impl kr_client::services::voice::VoiceProviderService for OfflineProvider {
-    fn metadata(
+    fn terms(
         &self,
-    ) -> kr_client::services::ServiceFuture<'_, Option<kr_client::services::voice::VoiceMetadata>>
+    ) -> kr_client::services::ServiceFuture<'_, kr_client::services::voice::VoiceProviderTerms>
     {
-        Box::pin(async move { Ok(None) })
+        Box::pin(async move { Ok(kr_client::services::voice::VoiceProviderTerms::Unquoted) })
+    }
+
+    fn account_bound(&self) -> bool {
+        true
     }
 
     fn call_is_open<'a>(

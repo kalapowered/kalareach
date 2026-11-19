@@ -1440,6 +1440,9 @@ impl ComposedBundle {
 /// [`VoiceSelection`], [`StorageSelection`], [`AuthoritySelection`], [`MailboxSelection`],
 /// [`RelaySelection`]). No environment variable reaches any of them.
 ///
+/// The `own_voice` section names the provider whose account this host's own voice calls run on
+/// ([`OwnVoiceSelection`]); a document that names it and a broker origin is refused.
+///
 /// The `push` section lists the push gateways, besides the official one, that a paired device's
 /// credential may name ([`PushSelection`]). It is not read once at start: the host takes the list
 /// whenever the document is put into force, and a gateway taken out of it loses its credentials.
@@ -1496,6 +1499,7 @@ impl ComposedBundle {
 /// [`MailboxSelection`]: configuration::MailboxSelection
 /// [`RelaySelection`]: configuration::RelaySelection
 /// [`PushSelection`]: configuration::PushSelection
+/// [`OwnVoiceSelection`]: configuration::OwnVoiceSelection
 /// [`resolve`]: configuration::resolve
 /// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
@@ -2150,6 +2154,17 @@ pub mod configuration {
         /// gateway to revoke each. No profile, request or environment variable can set it.
         #[serde(default, skip_serializing_if = "levels::is_unused")]
         pub push: PushSelection,
+        /// The voice provider account this host's own calls run on, chosen by the owner.
+        ///
+        /// A section of level 8: written when its `provider` member is not null. A release that
+        /// reads level 7 does not know it: it applies the rest of the document, counts the section
+        /// among the members it ignores, and builds no voice provider for it. A document that
+        /// names this section and `voice.broker_origin` is refused by a release that reads level 8,
+        /// and by an older one it is read with the section ignored and the broker built, so a host
+        /// rolled back below level 8 with both named runs the managed broker. The daemon reads the
+        /// section when it starts its voice service, so a change applies at the next start.
+        #[serde(default, skip_serializing_if = "levels::is_unused")]
+        pub own_voice: OwnVoiceSelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -2209,6 +2224,7 @@ pub mod configuration {
                 automation: AutomationSelection::default(),
                 shell: ShellSelection::default(),
                 push: PushSelection::default(),
+                own_voice: OwnVoiceSelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2703,6 +2719,52 @@ pub mod configuration {
         pub fn broker_origin(&self) -> Option<&str> {
             self.broker_origin.as_ref().map(String::as_str)
         }
+    }
+
+    /// The voice provider whose account this host's own voice calls run on.
+    ///
+    /// The owner's choice, never a paired device's: it decides whose money pays for a call. A call
+    /// on this provider uses the credential the owner stored on this host with `kr voice
+    /// credential set`, and is started only by a device that holds host-management authority.
+    /// Absent means this host runs no call on its own account. A document that names a provider
+    /// here and a `voice.broker_origin` is refused, so one host has one voice provider and no
+    /// choice that could fall back in either direction.
+    ///
+    /// The section arrived with level 8. A release that reads level 7 does not know it: it applies
+    /// the rest of the document, counts the section among the members it ignores, and does not
+    /// edit the document. A document that names both a provider here and a broker origin is
+    /// refused by a release at level 8 and read by an older release with the section ignored, so
+    /// that older release builds the broker the document also names.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct OwnVoiceSelection {
+        /// The provider. Null or absent leaves the section unused.
+        pub provider: Nullable<OwnVoiceProvider>,
+    }
+
+    impl Default for OwnVoiceSelection {
+        /// Nothing chosen, which is what an absent section reads as.
+        fn default() -> Self {
+            Self {
+                provider: Nullable::null(),
+            }
+        }
+    }
+
+    impl OwnVoiceSelection {
+        /// The provider the document chooses, when it chooses one.
+        #[must_use]
+        pub fn provider(&self) -> Option<OwnVoiceProvider> {
+            self.provider.0
+        }
+    }
+
+    /// A voice provider a host can run its own calls on.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(rename_all = "snake_case")]
+    pub enum OwnVoiceProvider {
+        /// OpenAI's `gpt-live-1` realtime model, on the host owner's OpenAI key.
+        OpenaiLive,
     }
 
     /// The managed storage service this host uploads its backups to.
@@ -3962,6 +4024,12 @@ pub mod configuration {
             );
         }
         problems.extend(push_gateway_problems(&document.push));
+        if document.voice.broker_origin().is_some() && document.own_voice.provider().is_some() {
+            problems.push(
+                Sentence::new()
+                    .stated("voice: name either broker_origin or own_voice.provider, not both."),
+            );
+        }
         if problems.is_empty() {
             Ok(())
         } else {

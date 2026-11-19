@@ -9641,6 +9641,10 @@
           },
           "description": "Whether this host joins the network, and every service it selects there.\n\nRead when the daemon starts, so a change applies at the next start. No environment\nvariable reaches any of it."
         },
+        "own_voice": {
+          "$ref": "#/$defs/OwnVoiceSelection",
+          "description": "The voice provider account this host's own calls run on, chosen by the owner.\n\nA section of level 8: written when its `provider` member is not null. A release that\nreads level 7 does not know it: it applies the rest of the document, counts the section\namong the members it ignores, and builds no voice provider for it. A document that\nnames this section and `voice.broker_origin` is refused by a release that reads level 8,\nand by an older one it is read with the section ignored and the broker built, so a host\nrolled back below level 8 with both named runs the managed broker. The daemon reads the\nsection when it starts its voice service, so a change applies at the next start."
+        },
         "preferences": {
           "$ref": "#/$defs/PreferenceSet",
           "default": {
@@ -25753,6 +25757,35 @@
       ],
       "type": "object"
     },
+    "OwnVoiceProvider": {
+      "description": "A voice provider a host can run its own calls on.",
+      "oneOf": [
+        {
+          "const": "openai_live",
+          "description": "OpenAI's `gpt-live-1` realtime model, on the host owner's OpenAI key.",
+          "type": "string"
+        }
+      ]
+    },
+    "OwnVoiceSelection": {
+      "additionalProperties": false,
+      "description": "The voice provider whose account this host's own voice calls run on.\n\nThe owner's choice, never a paired device's: it decides whose money pays for a call. A call\non this provider uses the credential the owner stored on this host with `kr voice\ncredential set`, and is started only by a device that holds host-management authority.\nAbsent means this host runs no call on its own account. A document that names a provider\nhere and a `voice.broker_origin` is refused, so one host has one voice provider and no\nchoice that could fall back in either direction.\n\nThe section arrived with level 8. A release that reads level 7 does not know it: it applies\nthe rest of the document, counts the section among the members it ignores, and does not\nedit the document. A document that names both a provider here and a broker origin is\nrefused by a release at level 8 and read by an older release with the section ignored, so\nthat older release builds the broker the document also names.",
+      "properties": {
+        "provider": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OwnVoiceProvider"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The provider. Null or absent leaves the section unused."
+        }
+      },
+      "type": "object"
+    },
     "OwnerConfirmationCompleteParams": {
       "additionalProperties": false,
       "description": "The parameters of `owner.confirmation.complete`.",
@@ -41768,14 +41801,102 @@
       ],
       "type": "object"
     },
+    "VoicePrepareProvider": {
+      "description": "Which provider would carry a call, as a preparation says it.\n\nA union and not three fields with a rule about which of them is present together: a state the\nrule forbids cannot be written. The managed state is read from the service for this answer; the\nown-key state is this host's own, and carries no rate, balance or sign-in because the owner's\nown account pays.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The managed service would carry the call.",
+          "properties": {
+            "managed": {
+              "additionalProperties": false,
+              "properties": {
+                "broker_origin": {
+                  "description": "The origin of the managed service a call would be brokered through.",
+                  "type": "string"
+                },
+                "terms": {
+                  "$ref": "#/$defs/VoiceManagedTerms",
+                  "description": "What the managed service answered about a call started now: a start names the rate\nversion in it, and a person shown no rate has accepted none."
+                }
+              },
+              "required": [
+                "broker_origin",
+                "terms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "managed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The owner's own account at the provider would carry the call.",
+          "properties": {
+            "own_key": {
+              "additionalProperties": false,
+              "properties": {
+                "disclosure": {
+                  "description": "What a person is told before such a call, in this host's words.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "held": {
+                  "description": "Whether this host holds the key a call needs. A call is not offered without it.",
+                  "type": "boolean"
+                },
+                "model": {
+                  "description": "The model the call runs on.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "model",
+                "disclosure",
+                "held"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "own_key"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "No call can start from here.",
+          "properties": {
+            "unavailable": {
+              "additionalProperties": false,
+              "properties": {
+                "message": {
+                  "description": "Why, in words a person can act on.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "message"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "unavailable"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "VoicePrepareResult": {
       "additionalProperties": false,
       "description": "What `voice.prepare` answered: what a call started now would be, before one exists.\n\nSection 15 ¶12 asks for the provider and the selected context scope to be shown **before**\nvoice starts. The only other read of the voice surface, [`VoiceContextParams`], names a voice\nsession, and `voice.start` has already created the metered provider session by the time its\ndescriptor carries this. So the answer a person reads before deciding has to come from\nsomewhere that creates nothing, and this is it: no provider session, no reservation, no grant\nand no context leaves the host for this read.\n\nTwo sources, kept apart. The scope is this host's: its grants, its selection and its cap. What\nthe managed service would do with a call is the service's, read from it for this answer and\ncarried in [`Self::managed`] in its own words, so a person is shown the model, the disclosure,\nthe rate and the limits the deployment publishes rather than a copy this host keeps.",
       "properties": {
-        "broker_origin": {
-          "description": "The origin of the managed service a call would be brokered through.",
-          "type": "string"
-        },
         "excluded": {
           "description": "Classes the default context leaves out unless the person selects them (section 15 ¶12).",
           "items": {
@@ -41783,28 +41904,6 @@
           },
           "type": "array",
           "uniqueItems": true
-        },
-        "managed": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/VoiceManagedTerms"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "What the managed service answered about a call started now.\n\nNull for a provider that is not the managed service, and when this host could not read the\nservice's terms; [`Self::managed_unavailable`] then says which. A managed call is not\noffered without these terms, because a start names the rate version a person was shown\nand a person shown no rate has accepted none."
-        },
-        "managed_unavailable": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Why a managed call cannot start from here, in words a person can act on.\n\nPresent exactly when [`Self::managed`] is null."
         },
         "message_count": {
           "description": "How many semantic messages the default context carries.",
@@ -41815,6 +41914,10 @@
         "prepared": {
           "$ref": "#/$defs/Digest256",
           "description": "A digest of what a call started now would be bound to: the sessions it would reach, what\nit would be permitted to do, and the provider that would carry it.\n\nA start names it. When what a start would be bound to is no longer what this digest\ndescribes, because a grant changed or another provider was attached, the start is refused\nas [`VoiceStartOutcome::PreparationChanged`] before anything is created, so a call never\nreaches further than what the person was shown."
+        },
+        "provider": {
+          "$ref": "#/$defs/VoicePrepareProvider",
+          "description": "Which provider would carry a call started now, and what it would be.\n\nOne of three states and no other: the managed service with the terms it published, the\nowner's own account with what a person is told about it, or neither, with the reason."
         },
         "selected": {
           "description": "Classes from the request that would actually be carried.",
@@ -41850,10 +41953,8 @@
         "selected",
         "token_cap",
         "message_count",
-        "broker_origin",
         "prepared",
-        "managed",
-        "managed_unavailable"
+        "provider"
       ],
       "type": "object"
     },
@@ -42001,16 +42102,77 @@
       },
       "type": "object"
     },
+    "VoiceSessionControl": {
+      "description": "Where a call's control is reached, as the host tells the device when it starts a call.\n\nA union and not fields that apply to one provider and sit empty for another: a managed call is\ncontrolled at the broker's origin over a socket the device opens, and a call on the host\nowner's own account is controlled through the host, which holds the provider's side of it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The managed broker's control socket.",
+          "properties": {
+            "broker": {
+              "additionalProperties": false,
+              "properties": {
+                "control_path": {
+                  "description": "Path on the broker's origin the control socket is opened on.",
+                  "type": "string"
+                },
+                "heartbeat_seconds": {
+                  "description": "Seconds between heartbeats the device is expected to send.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "origin": {
+                  "description": "The broker's origin, so the device does not have to be configured with it separately.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "origin",
+                "control_path",
+                "heartbeat_seconds"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "broker"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host holds the control; the device sends its writes and heartbeats to the host.",
+          "properties": {
+            "host": {
+              "additionalProperties": false,
+              "properties": {
+                "heartbeat_seconds": {
+                  "description": "Seconds between heartbeats the device is expected to send.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "heartbeat_seconds"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "host"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "VoiceSessionDescriptor": {
       "additionalProperties": false,
       "description": "A running voice session, as the paired device needs to see it.",
       "properties": {
         "answer_sdp": {
           "description": "The provider's SDP answer, to be applied to the caller's own connection.",
-          "type": "string"
-        },
-        "broker_origin": {
-          "description": "The broker's origin, so the device does not have to be configured with it separately.",
           "type": "string"
         },
         "call_id": {
@@ -42021,9 +42183,9 @@
           "$ref": "#/$defs/TimestampMs",
           "description": "When the broker closes the call, whatever else happens, in UTC milliseconds."
         },
-        "control_path": {
-          "description": "Path on the broker's origin the control socket is opened on.",
-          "type": "string"
+        "control": {
+          "$ref": "#/$defs/VoiceSessionControl",
+          "description": "How the device reaches the call's control: the managed broker's socket, or the host."
         },
         "disclosure": {
           "description": "What the provider and the managed service can see, in the words the service's answer to\nthis start gave.",
@@ -42035,12 +42197,6 @@
         "grant_id": {
           "$ref": "#/$defs/GrantId",
           "description": "The session-bound voice grant this session runs under. Stopping revokes it."
-        },
-        "heartbeat_seconds": {
-          "description": "Seconds between heartbeats the device is expected to send.",
-          "format": "uint32",
-          "minimum": 0,
-          "type": "integer"
         },
         "model": {
           "description": "The model the call is running on.",
@@ -42076,9 +42232,7 @@
         "provider_session_id",
         "answer_sdp",
         "model",
-        "control_path",
-        "broker_origin",
-        "heartbeat_seconds",
+        "control",
         "closes_at_ms",
         "disclosure"
       ],
@@ -46375,11 +46529,17 @@
     "voice_prepare_params": {
       "$ref": "#/$defs/VoicePrepareParams"
     },
+    "voice_prepare_provider": {
+      "$ref": "#/$defs/VoicePrepareProvider"
+    },
     "voice_prepare_result": {
       "$ref": "#/$defs/VoicePrepareResult"
     },
     "voice_rate": {
       "$ref": "#/$defs/VoiceRate"
+    },
+    "voice_session_control": {
+      "$ref": "#/$defs/VoiceSessionControl"
     },
     "voice_session_descriptor": {
       "$ref": "#/$defs/VoiceSessionDescriptor"
