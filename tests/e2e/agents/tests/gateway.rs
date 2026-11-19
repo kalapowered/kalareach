@@ -126,9 +126,10 @@ use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::matching::{Architecture, OperatingSystem};
 use kr_plugin_sdk::text::Label;
 use kr_protocol::agent::{
-    AgentApprovalRespondParams, AgentApprovalRespondResult, AgentBindingState, AgentCancelParams,
-    AgentCapabilitiesParams, AgentCapabilitiesResult, AgentMutationResult, AgentMutationTarget,
-    AgentPromptParams, AgentSubject, PromptText,
+    AgentApprovalInspectParams, AgentApprovalInspectResult, AgentApprovalRespondParams,
+    AgentApprovalRespondResult, AgentBindingState, AgentCancelParams, AgentCapabilitiesParams,
+    AgentCapabilitiesResult, AgentMutationResult, AgentMutationTarget, AgentPromptParams,
+    AgentSubject, PromptText,
 };
 use kr_protocol::broker::{InstanceCapabilityIdentity, InstanceCapabilityState};
 use kr_protocol::envelope::ActionTarget;
@@ -1489,6 +1490,24 @@ impl Context {
                 target: mutation_target,
                 draft_id: Nullable::null(),
                 text: Nullable::some(PromptText::new(text).expect("a prompt")),
+            },
+        ))
+    }
+
+    /// Reads the host's record of the approval `resource` of an instance: what the decoder read,
+    /// with the source bytes the upstream sent.
+    fn inspects(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        resource: PendingResourceId,
+    ) -> Result<AgentApprovalInspectResult, RequestError> {
+        self.runtime.block_on(remote.read(
+            Method::AgentApprovalInspect,
+            &AgentApprovalInspectParams {
+                subject: subject(session_id, instance),
+                resource_id: resource,
             },
         ))
     }
@@ -3370,12 +3389,6 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
         TEST,
         "leave-unanswered,two-approvals,stay",
         |ctx, session| {
-            assert!(
-                matches!(ctx.route, Route::StandIn),
-                "the real arm of this part runs once its charged turn after the upgrade is built \
-                 (the newer build's probes, configuration directory and recorded file are); the \
-                 stand-in route is the one this build runs"
-            );
             let second = session.second.as_ref().expect("two sessions");
             let first_session = session.session_id();
             let second_session = second.person.session_id;
@@ -3392,7 +3405,9 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
 
             // Step 5: the first agent starts on the pinned build, and its identity is recorded.
             let instance = session.starts_the_agent(&[], None, &[]);
-            let held = session.interpreted_approval();
+            // On the stand-in route the first process holds an approval that the device answers
+            // after the upgrade; the real build holds none before its one charged turn.
+            let held = matches!(ctx.route, Route::StandIn).then(|| session.interpreted_approval());
             let first_process = process_mapping_within(
                 workers[0],
                 pinned_inode,
@@ -3421,26 +3436,120 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
             // is seen running as typed, and once more after.
             ctx.checks_the_placed_files();
             let _ = servers_seen(&workers, &mut servers);
-            second.person.types("codex");
+            let (typed, shows) = match &ctx.route {
+                Route::StandIn => ("codex".to_owned(), RAN_AS_TYPED.to_owned()),
+                Route::Real(real) => (
+                    real.typed(&[]),
+                    real.build
+                        .newer
+                        .as_ref()
+                        .expect("the entry names a newer build")
+                        .ready
+                        .clone(),
+                ),
+            };
+            second.person.types(&typed);
             let second_process =
                 process_mapping_within(workers[1], newer_inode, None, &workers, &mut servers);
-            let as_typed = shows_within(&second.person, RAN_AS_TYPED);
+            let as_typed = shows_within(&second.person, &shows);
             let _ = servers_seen(&workers, &mut servers);
 
             // Step 8: fresh traffic through the pinned adapter, made after the upgrade: the device
             // answers the held approval, and the pinned server asks a second one that did not exist
             // before the upgrade.
-            let binding = ctx.binding(&session.remote, first_session, instance);
-            let answered = ctx.answers(
-                &session.remote,
-                first_session,
-                instance,
-                &binding,
-                held.resource_id,
-                ACCEPT,
-            );
-            let fresh =
-                fresh_approval_within(ctx, &session.remote, first_session, &[held.resource_id]);
+            let mut inspected = None;
+            let (answered, fresh, typed_command) = match (&ctx.route, held.as_ref()) {
+                (Route::StandIn, Some(held)) => {
+                    let binding = ctx.binding(&session.remote, first_session, instance);
+                    let answered = ctx.answers(
+                        &session.remote,
+                        first_session,
+                        instance,
+                        &binding,
+                        held.resource_id,
+                        ACCEPT,
+                    );
+                    let fresh = fresh_approval_within(
+                        ctx,
+                        &session.remote,
+                        first_session,
+                        &[held.resource_id],
+                    );
+                    (answered, fresh, None)
+                }
+                (Route::Real(real), _) => {
+                    // One charged turn, typed in the first session after the upgrade, so that the
+                    // approval it asks is traffic that did not exist before: a command that makes
+                    // no pipe and is declined, so the case shows the declined resource and the
+                    // closed dialog and never that a command did not run.
+                    let mark = mark();
+                    let command = format!("echo {mark}");
+                    assert!(
+                        real.account
+                            .approval
+                            .command_line
+                            .as_deref()
+                            .unwrap_or("")
+                            .len()
+                            + command.len()
+                            + 8
+                            <= usize::from(kr_e2e_m1b::window::COLUMNS),
+                        "the case's command, {} characters, would not fit on one line of the \
+                         agent's dialog",
+                        command.len()
+                    );
+                    real.charge(&ctx.run, "6b", "an approval-gated command");
+                    session.person.composes(
+                        &format!(
+                            "({mark}) Use your shell tool to run exactly this command and nothing \
+                             else: {command}"
+                        ),
+                        &mark,
+                    );
+                    let _ = session.person.dialog_names(&real.account, &command);
+                    let binding = session.binding_until(
+                        instance,
+                        "the stream names the thread and the running turn",
+                        |binding| {
+                            binding.thread_id.0.is_some()
+                                && binding.turn_id.0.is_some()
+                                && unsuspended(binding)
+                        },
+                    );
+                    let fresh = fresh_approval_within(ctx, &session.remote, first_session, &[]);
+                    let pending = fresh
+                        .as_ref()
+                        .unwrap_or_else(|why| panic!("the approval the turn asks: {why}"));
+                    inspected = Some(ctx.inspects(
+                        &session.remote,
+                        first_session,
+                        instance,
+                        pending.resource_id,
+                    ));
+                    let answered = ctx.answers(
+                        &session.remote,
+                        first_session,
+                        instance,
+                        &binding,
+                        pending.resource_id,
+                        DECLINE,
+                    );
+                    let started = Instant::now();
+                    loop {
+                        let binding = ctx.binding(&session.remote, first_session, instance);
+                        if binding.turn_id.0.is_none() && unsuspended(&binding) {
+                            break;
+                        }
+                        assert!(
+                            started.elapsed() < LIVENESS,
+                            "the turn does not end after {LIVENESS:?}: the binding is {binding:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    (answered, fresh, Some(command))
+                }
+                (Route::StandIn, None) => panic!("the stand-in route holds the first approval"),
+            };
 
             // Reads for the assertions.
             let after = capability_identity(ctx, &session.remote, first_session, instance);
@@ -3541,7 +3650,23 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
             let fresh = fresh
                 .as_ref()
                 .expect("a fresh approval, interpreted by the pinned table");
-            assert_ne!(fresh.resource_id, held.resource_id);
+            if let Some(held) = &held {
+                assert_ne!(fresh.resource_id, held.resource_id);
+            }
+            // The real arm: the interpreted command is the typed command, read from the source
+            // bytes the host recorded for the approval.
+            if let Some(command) = &typed_command {
+                let inspected = inspected
+                    .as_ref()
+                    .expect("the approval was inspected")
+                    .as_ref()
+                    .unwrap_or_else(|why| panic!("the host's record of the approval: {why:?}"));
+                assert!(
+                    String::from_utf8_lossy(inspected.decoding.source_bytes.as_slice())
+                        .contains(command.as_str()),
+                    "the approval's source bytes do not name the typed command"
+                );
+            }
             // 9d: the second process runs the newer image.
             let second_identity = second_process.as_ref().expect("the second program runs");
             let second_image = text_image(u32::try_from(second_identity.pid.get()).expect("a pid"))
