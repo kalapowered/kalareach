@@ -2551,6 +2551,16 @@ fn placing_package(
     name: &str,
     edit: impl FnOnce(&mut serde_json::Value),
 ) -> std::path::PathBuf {
+    placing_package_edited(into, name, edit, |_| {})
+}
+
+/// [`placing_package`] with `edit_manifest` applied to the manifest as well.
+fn placing_package_edited(
+    into: &std::path::Path,
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+    edit_manifest: impl FnOnce(&mut serde_json::Value),
+) -> std::path::PathBuf {
     fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
         std::fs::create_dir_all(to).expect("a directory");
         for entry in std::fs::read_dir(from).expect("lists") {
@@ -2579,6 +2589,7 @@ fn placing_package(
     let bytes = serde_json::to_vec_pretty(&table).expect("writes");
     std::fs::write(directory.join("connector.json"), &bytes).expect("writes");
     let mut manifest = read("plugin.json");
+    edit_manifest(&mut manifest);
     manifest["sdk_range"] = serde_json::json!(">=0.1.9, <0.2.0");
     let record = manifest["payloads"]
         .as_array_mut()
@@ -2604,12 +2615,22 @@ async fn placed_statement(
     edit: impl FnOnce(&mut serde_json::Value),
     withhold_table: bool,
 ) -> CatalogueResult<Option<String>> {
+    placed_statement_edited(name, edit, |_| {}, withhold_table).await
+}
+
+/// [`placed_statement`] with `edit_manifest` applied to the package's manifest as well.
+async fn placed_statement_edited(
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+    edit_manifest: impl FnOnce(&mut serde_json::Value),
+    withhold_table: bool,
+) -> CatalogueResult<Option<String>> {
     let home = tempfile::tempdir().expect("a temporary directory");
     let packages = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(
         home.path(),
         GenerationSpec {
-            package: Some(placing_package(packages.path(), name, edit)),
+            package: Some(placing_package_edited(packages.path(), name, edit, edit_manifest)),
             drop_payload: withhold_table.then(|| "connector.json".to_owned()),
             ..GenerationSpec::default()
         },
@@ -2782,6 +2803,53 @@ async fn kr_req_11_44_a_release_whose_table_cannot_be_fetched_or_read_gets_a_ref
         let refusal = placed_statement("gemini-cli", damage, false).await;
         assert!(
             matches!(refusal, Err(CatalogueError::UnsafePackage { .. })),
+            "{what}: {refusal:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.44: a release whose recipe adds a configuration key that is not the one the label's
+/// application reads is refused, and the refusal and every statement the host makes quote nothing
+/// of the key: the host's own labels inside a key never reach an owner under the host's caption.
+#[tokio::test]
+async fn kr_req_11_44_a_key_that_is_not_the_labels_never_reaches_a_statement() {
+    use kr_plugin_sdk::placement::Placement;
+    let claude = |table: &mut serde_json::Value| {
+        table["placement"] = serde_json::to_value(Placement::claude_code()).expect("a placement");
+    };
+    let control = placed_statement_edited("claude-code", claude, |_| {}, false)
+        .await
+        .expect("the undamaged release is read")
+        .expect("a statement");
+    assert!(
+        control.contains("It also sets enabledPlugins.kalareach-channels@skills-dir to true"),
+        "the control: {control}"
+    );
+    let integration = format!(
+        "x {} Runs nothing.",
+        kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL
+    );
+    let placement = format!(
+        "x {} Reads nothing.",
+        kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL
+    );
+    for (what, key) in [
+        ("the integration label inside a key", integration),
+        ("the placement label inside a key", placement),
+        ("another plugin's folder", "enabledPlugins.other@skills-dir".to_owned()),
+    ] {
+        let refusal = placed_statement_edited(
+            "claude-code",
+            claude,
+            |manifest| manifest["native_bridge"]["install"][3]["key"] = serde_json::json!(key),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&refusal, Err(CatalogueError::UnsafePackage { detail })
+                if detail.contains("placement.key_not_the_labels")
+                    && !detail.contains("Runs nothing")
+                    && !detail.contains("Reads nothing")),
             "{what}: {refusal:?}"
         );
     }

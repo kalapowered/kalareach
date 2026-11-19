@@ -931,8 +931,11 @@ fn the_statement_bound_is_the_sum_of_the_contract_limits() {
     assert_eq!(STATEMENT_CHARS, 5054);
 }
 
+/// The longest reading `statement` can return is the bound: the one label whose reading holds a
+/// key sentence, with every field at its largest, equals it, and the longest reading of any other
+/// label is shorter.
 #[test]
-fn the_longest_reading_of_a_placement_is_the_bound_and_one_more_is_refused() {
+fn the_longest_reading_of_a_placement_is_the_bound() {
     let component = "n".repeat(64);
     let mut table = claude();
     table["directory"] = json!([component, component, component]);
@@ -942,7 +945,8 @@ fn the_longest_reading_of_a_placement_is_the_bound_and_one_more_is_refused() {
         .map(|number| {
             let tail = format!("{}/{}/{number:0>64}", "t".repeat(64), "u".repeat(64));
             let shape = if number == 0 {
-                json!({ "kind": "record_path" })
+                json!({ "kind": "object", "members": [
+                    { "name": "source", "required": true, "shape": { "kind": "record_path" } }] })
             } else {
                 shape.clone()
             };
@@ -953,23 +957,205 @@ fn the_longest_reading_of_a_placement_is_the_bound_and_one_more_is_refused() {
     table.as_object_mut().unwrap().remove("one_per_name");
     let placement = placement(&table);
     let folder = "f".repeat(128);
-    let mut bridge = serde_json::to_value(quill_bridge(&"A".repeat(64))).expect("a value");
-    bridge["install"] = json!([
-        {
-            "type": "install_file", "source": "bridge/x.json", "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb",
+    let recipe = |label: &str, key: bool| {
+        let mut bridge = serde_json::to_value(quill_bridge(label)).expect("a value");
+        let mut steps = vec![json!({
+            "type": "install_file", "source": "bridge/x.json",
+            "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb",
             "destination": format!("{component}/{folder}/{}", tails[0]["tail"].as_str().unwrap()),
-        },
-        { "type": "add_configuration_key", "file": "settings.json", "key": format!("enabledPlugins.{folder}@skills-dir"), "value": "true" },
-    ]);
-    let bridge: kr_plugin_sdk::plugin::NativeBridge =
-        serde_json::from_value(bridge).expect("a recipe");
-    let found = placement.statement(&bridge);
-    let text = found.expect("the longest reading is within the bound");
+        })];
+        if key {
+            steps.push(json!({
+                "type": "add_configuration_key", "file": "settings.json",
+                "key": format!("enabledPlugins.{folder}@skills-dir"), "value": "true"
+            }));
+        }
+        bridge["install"] = json!(steps);
+        serde_json::from_value::<kr_plugin_sdk::plugin::NativeBridge>(bridge).expect("a recipe")
+    };
+    let longest = placement
+        .statement(&recipe("Claude Code", true))
+        .expect("the longest reading is within the bound");
+    assert!(longest.contains("It also sets enabledPlugins."), "the key sentence is in it");
     assert_eq!(
-        text.chars().count(),
+        longest.chars().count(),
         kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS,
         "the bound is the longest reading"
     );
+    let other = placement
+        .statement(&recipe(&"A".repeat(64), false))
+        .expect("a reading with no key sentence");
+    assert!(
+        other.chars().count() < kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS,
+        "a label with no key sentence reads shorter: {}",
+        other.chars().count()
+    );
+}
+
+/// A Claude Code recipe that installs the hooks file of the plugin folder `kalareach-channels` and
+/// adds `step`, where one is given.
+fn claude_recipe(label: &str, step: Option<Value>) -> kr_plugin_sdk::plugin::NativeBridge {
+    let mut bridge = serde_json::to_value(quill_bridge(label)).expect("a value");
+    let mut steps = vec![json!({
+        "type": "install_file", "source": "bridge/x.json",
+        "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb",
+        "destination": "skills/kalareach-channels/hooks/hooks.json",
+    })];
+    steps.extend(step);
+    bridge["install"] = json!(steps);
+    serde_json::from_value(bridge).expect("a recipe")
+}
+
+fn key_step(file: &str, key: &str, value: &str) -> Value {
+    json!({ "type": "add_configuration_key", "file": file, "key": key, "value": value })
+}
+
+/// The host's reading quotes one key, the one the label's application reads for the plugin's
+/// folder, in words the host writes; a recipe with no key step has no key sentence.
+#[test]
+fn the_host_writes_the_labels_one_enabling_key_and_nothing_a_recipe_says() {
+    let placement = Placement::claude_code();
+    let with = placement
+        .statement(&claude_recipe(
+            "Claude Code",
+            Some(key_step(
+                "settings.json",
+                "enabledPlugins.kalareach-channels@skills-dir",
+                "true",
+            )),
+        ))
+        .expect("a reading");
+    assert!(
+        with.contains(
+            "It also sets enabledPlugins.kalareach-channels@skills-dir to true in \
+             .claude/settings.json, and keeps your other settings in that file. "
+        ),
+        "{with}"
+    );
+    assert!(with.contains("takes out only what this host placed and the key it set;"));
+    let without = placement
+        .statement(&claude_recipe("Claude Code", None))
+        .expect("a reading");
+    assert!(!without.contains("It also sets"), "{without}");
+}
+
+/// Every configuration key step but the label's one enabling key is refused by name before a
+/// statement is made, and the refusal quotes nothing the recipe says: a free sentence, the host's
+/// own labels and a value, a file or a folder that is not the label's.
+#[test]
+fn a_key_that_is_not_the_labels_one_is_refused_before_a_statement_is_made() {
+    use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, PLACEMENT_STATEMENT_LABEL};
+    let exact = "enabledPlugins.kalareach-channels@skills-dir";
+    let integration = format!("x {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
+    let placement_label = format!("x {PLACEMENT_STATEMENT_LABEL} Reads nothing.");
+    let cases: Vec<(&str, &str, Option<Value>)> = vec![
+        ("a free sentence", "Claude Code", Some(key_step("settings.json", "Runs nothing.", "true"))),
+        ("the integration label", "Claude Code", Some(key_step("settings.json", &integration, "true"))),
+        ("the placement label", "Claude Code", Some(key_step("settings.json", &placement_label, "true"))),
+        ("another plugin's folder", "Claude Code", Some(key_step("settings.json", "enabledPlugins.other@skills-dir", "true"))),
+        ("another file", "Claude Code", Some(key_step("other.json", exact, "true"))),
+        ("another value", "Claude Code", Some(key_step("settings.json", exact, "false"))),
+        ("a value with a space", "Claude Code", Some(key_step("settings.json", exact, "true "))),
+        ("another label", "Gemini CLI", Some(key_step("settings.json", exact, "true"))),
+    ];
+    for (what, label, step) in cases {
+        let found = Placement::claude_code().statement(&claude_recipe(label, step));
+        let error = found.expect_err(what);
+        assert_eq!(error.refusal, PlacementRefusal::KeyNotTheLabels, "{what}");
+        assert!(
+            !error.to_string().contains("Runs nothing") && !error.to_string().contains("Reads nothing"),
+            "{what}: the refusal quotes the recipe: {error}"
+        );
+    }
+    // A key with no file of the plugin's folder beside it has no folder to enable.
+    let mut bridge = serde_json::to_value(claude_recipe("Claude Code", None)).expect("a value");
+    bridge["install"] = json!([key_step("settings.json", exact, "true")]);
+    let bridge: kr_plugin_sdk::plugin::NativeBridge = serde_json::from_value(bridge).expect("a recipe");
+    let error = Placement::claude_code().statement(&bridge).expect_err("no folder");
+    assert_eq!(error.refusal, PlacementRefusal::KeyNotTheLabels);
+}
+
+/// The bundled package `name` under a fresh directory with an SDK range that holds the arrival of
+/// a placement, `manifest` applied to its manifest and `table` to its connector table, the table's
+/// payload record brought up to the changed file.
+fn package_edited(
+    name: &str,
+    manifest: impl FnOnce(&mut Value),
+    table: impl FnOnce(&mut Value),
+) -> Validated {
+    let home = tempfile::tempdir().expect("a directory");
+    let directory = home.path().join("package");
+    copy_tree(&bundled(name), &directory);
+    let manifest_path = directory.join("plugin.json");
+    let mut plugin: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("reads")).expect("JSON");
+    plugin["sdk_range"] = json!(">=0.1.9, <0.2.0");
+    manifest(&mut plugin);
+    let path = directory.join("connector.json");
+    let mut connector: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("reads")).expect("JSON");
+    table(&mut connector);
+    let bytes = serde_json::to_vec_pretty(&connector).expect("writes");
+    std::fs::write(&path, &bytes).expect("writes");
+    let record = plugin["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .iter_mut()
+        .find(|payload| payload["path"] == "connector.json")
+        .expect("the connector payload");
+    record["digest"] = json!(PayloadDigest::of(&bytes).to_string());
+    record["size_bytes"] = json!(bytes.len().to_string());
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&plugin).expect("writes"))
+        .expect("writes");
+    validate_package_directory(&directory)
+}
+
+/// The package check refuses a key the label's application does not read, for a package that
+/// declares its layout and for one that does not, once and by name; the unedited packages are
+/// accepted.
+#[test]
+fn the_package_check_refuses_every_key_but_the_labels_one() {
+    use kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL;
+    let named = |validated: &Validated| {
+        validated
+            .report
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.code == FindingCode::BridgeRecipeInvalid
+                    && finding.detail.contains(PlacementRefusal::KeyNotTheLabels.name())
+            })
+            .count()
+    };
+    let control = package_edited("claude-code", |_| {}, |_| {});
+    assert_eq!(named(&control), 0, "{:?}", control.report.findings);
+    let claude_table = |table: &mut Value| table["placement"] = claude();
+    let words = format!("x {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
+    for (what, key) in [
+        ("another folder", "enabledPlugins.other@skills-dir".to_owned()),
+        ("a free sentence", "Runs nothing.".to_owned()),
+        ("the integration label", words),
+    ] {
+        let edit = |manifest: &mut Value| {
+            manifest["native_bridge"]["install"][3]["key"] = json!(key);
+        };
+        let undeclared = package_edited("claude-code", edit, |_| {});
+        assert_eq!(named(&undeclared), 1, "{what}, no declaration: {:?}", undeclared.report.findings);
+        assert!(!undeclared.report.is_valid(), "{what}");
+        let declared = package_edited("claude-code", edit, claude_table);
+        assert_eq!(named(&declared), 1, "{what}, declared: {:?}", declared.report.findings);
+        assert!(!declared.report.is_valid(), "{what}");
+    }
+    // A label with no key of its own adds none.
+    let gemini = package_edited(
+        "gemini-cli",
+        |manifest| {
+            let install = manifest["native_bridge"]["install"].as_array_mut().expect("steps");
+            install.push(key_step("settings.json", "enabledPlugins.kalareach@skills-dir", "true"));
+        },
+        |_| {},
+    );
+    assert_eq!(named(&gemini), 1, "{:?}", gemini.report.findings);
 }
 
 /// The plugin documentation names the placement declaration, each floor the host holds before it

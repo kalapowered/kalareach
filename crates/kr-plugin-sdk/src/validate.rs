@@ -1080,6 +1080,22 @@ fn check_placement(
 ) {
     let declared = connector.and_then(|table| table.placement.as_ref());
     let bridge = manifest.native_bridge.0.as_ref();
+    // A configuration key a recipe adds is the label's one enabling key or it is refused, whatever
+    // layout the package declares: the host's own reading quotes only that key.
+    if let Some(bridge) = bridge {
+        let area = declared
+            .cloned()
+            .or_else(|| crate::placement::Placement::for_label(bridge.application.as_str()))
+            .map(|placement| placement.area)
+            .unwrap_or_default();
+        for refusal in crate::placement::key_refusals(bridge, &area) {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                MANIFEST_FILE,
+                refusal.to_string(),
+            ));
+        }
+    }
     if let Some(placement) = declared {
         for refusal in placement.refusals() {
             report.push(Finding::at(
@@ -1099,7 +1115,9 @@ fn check_placement(
                 }
                 // What an owner is shown of the placement is written from this table, so a label
                 // that cannot be quoted or a reading too long to show whole is refused here.
-                if let Err(refusal) = placement.statement(bridge) {
+                if let Err(refusal) = placement.statement(bridge)
+                    && refusal.refusal != crate::placement::PlacementRefusal::KeyNotTheLabels
+                {
                     report.push(Finding::at(
                         FindingCode::ConnectorTableInvalid,
                         CONNECTOR_FILE,
