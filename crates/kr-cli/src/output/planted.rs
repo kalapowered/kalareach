@@ -332,6 +332,7 @@ fn pattern_example(pattern: &str) -> Value {
         "^[1-9A-HJ-NP-Za-km-z]{4}-[1-9A-HJ-NP-Za-km-z]{3}-[1-9A-HJ-NP-Za-km-z]{3}$" => {
             "4XkP-Qm7-Zr2"
         }
+        "^(?!.*-(user|project)$)(?!.*-[0-9a-f]{16}$)[a-z][a-z0-9]*(-[a-z0-9]+)*$" => "example-agent",
         other => panic!("the planted values have no example of the pattern {other}"),
     };
     Value::from(example)

@@ -11,10 +11,10 @@
           "member": "version",
           "absent": 0
         },
-        "version": 1,
+        "version": 2,
         "migrates_from": 0
       },
-      "digest": "229a74397c636e7453e591bc3c9bd0df702823e8e6d8b67f7e8b27363cbfe672",
+      "digest": "73bb2797fece825bdc6c01ab7cb33f84a71a35e7a15ee81ad609273db1e7ffe6",
       "kept": [
         "AgentToolsInstallResult",
         "AgentToolsRemoveResult",
@@ -31,10 +31,10 @@
           "member": "version",
           "absent": 0
         },
-        "version": 1,
+        "version": 2,
         "migrates_from": 0
       },
-      "digest": "e196baec5f87a0b899ccfce6eec82b6681aaf86ea7ea220176b22943c2b320be",
+      "digest": "10451969b3b3c9f12e7873bd8892b0c56b5ba284a8a37e088306451c47372a71",
       "kept": [
         "ChangeManifest",
         "InstallationRecord (crates/kr-controller/src/agent_tools.rs)"
