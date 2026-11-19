@@ -804,6 +804,8 @@ impl Controller {
         }
         // Recorded before the hold goes, so a retry finds the answer rather than a claim with
         // neither an answer nor an attempt behind it.
+        #[cfg(test)]
+        self.before_a_voice_claim_settles.wait().await;
         self.settle_claim(&hold, &outcome)?;
         // Whatever the claim recorded, and only now: the hold's row ends when its start's effect is
         // known and its claim is settled, in either order.
@@ -1336,6 +1338,8 @@ impl kr_voice::Admission for VoiceAdmission {
         };
         let controller = &self.controller;
         let first = controller.clock.now();
+        #[cfg(test)]
+        controller.after_a_start_reads_its_first_moment.run();
         let wall = controller.settled_now_ms();
         let at_the_lock = std::cell::Cell::new(first);
         let moments = || {
@@ -1424,14 +1428,10 @@ impl kr_voice::Admission for VoiceAdmission {
     }
 
     fn after_the_broker(&self, effect: kr_voice::BrokerEffect) {
-        use kr_voice::BrokerEffect::{
-            Bound, Closed, Deferred, Handed, NotAsked, Open, Refused, Unknown,
-        };
-        if let Some(start) = &self.start {
-            match effect {
-                NotAsked | Refused | Bound | Handed | Closed => start.row.ended(),
-                Unknown | Open | Deferred => {}
-            }
+        if let Some(start) = &self.start
+            && ends_the_row(effect)
+        {
+            start.row.ended();
         }
     }
 
@@ -1445,13 +1445,24 @@ impl kr_voice::Admission for VoiceAdmission {
     }
 
     fn deferred(&self) -> Option<kr_voice::AfterDeferred> {
-        use kr_voice::BrokerEffect::{Closed, Handed};
         let row = Arc::clone(&self.start.as_ref()?.row);
         Some(Box::new(move |effect| {
-            if matches!(effect, Handed | Closed) {
+            if ends_the_row(effect) {
                 row.ended();
             }
         }))
+    }
+}
+
+/// Whether a start's effect says that no call of the start can still be running unreconciled, so
+/// that the row it wrote may end once its claim has settled.
+fn ends_the_row(effect: kr_voice::BrokerEffect) -> bool {
+    use kr_voice::BrokerEffect::{
+        Bound, Closed, Deferred, Handed, NotAsked, Open, Refused, Unknown,
+    };
+    match effect {
+        NotAsked | Refused | Bound | Handed | Closed => true,
+        Unknown | Open | Deferred => false,
     }
 }
 
@@ -1563,5 +1574,164 @@ mod attempt_row {
             Some(action(2)),
             "the later row stands"
         );
+    }
+}
+
+/// The hold a voice start writes before the managed service is asked, on clocks the test moves.
+#[cfg(test)]
+mod a_start_hold_on_clocks_moved_by_hand {
+    use super::*;
+    use crate::service::net::tests::{daemon_on_clocks_to_move, manual_clocks};
+    use kr_protocol::error::ErrorCode;
+    use kr_voice::Admission as _;
+    use kr_voice::BrokerEffect;
+
+    fn actor() -> ActorId {
+        ActorId::new("local:1").expect("an actor")
+    }
+
+    fn action(n: u8) -> ActionId {
+        ActionId::new(kr_protocol::scalars::Uuid::from_bytes([n; 16]))
+    }
+
+    /// The admission of the start of `action` by the actor, with a deadline `deadline_in` out.
+    async fn start_of(
+        controller: &Arc<Controller>,
+        action: ActionId,
+        deadline_in: std::time::Duration,
+    ) -> (VoiceAdmission, kr_transport::clock::ContinuousInstant) {
+        let deadline = controller
+            .clock
+            .now()
+            .checked_add(deadline_in)
+            .expect("a deadline");
+        let carried = crate::service::a_close_a_worker_never_answers::admission(
+            controller,
+            kr_transport::window::AcceptedDeadline {
+                deadline,
+                bound: kr_transport::window::DeadlineBound::RequestedTtl,
+            },
+        )
+        .await;
+        let admission =
+            VoiceAdmission::new(Arc::clone(controller), carried).for_a_start(StartHold {
+                row: Arc::new(AttemptRow::new(
+                    Arc::clone(&controller.voice_start_holds),
+                    actor(),
+                    action,
+                )),
+                supersedes: None,
+                send_by: std::sync::Mutex::new(None),
+            });
+        (admission, deadline)
+    }
+
+    fn standing(controller: &Controller) -> crate::voice_start_holds::Row {
+        controller
+            .voice_start_holds
+            .standing(actor())
+            .expect("the record reads")
+            .expect("a hold stands")
+    }
+
+    /// The host ends a start's row only for the effects that say no call of the start can still be
+    /// running unreconciled.
+    #[test]
+    fn a_start_ends_its_row_only_for_the_effects_that_leave_no_call_unreconciled() {
+        for (effect, ends) in [
+            (BrokerEffect::NotAsked, true),
+            (BrokerEffect::Refused, true),
+            (BrokerEffect::Bound, true),
+            (BrokerEffect::Handed, true),
+            (BrokerEffect::Closed, true),
+            (BrokerEffect::Unknown, false),
+            (BrokerEffect::Open, false),
+            (BrokerEffect::Deferred, false),
+        ] {
+            assert_eq!(ends_the_row(effect), ends, "{effect:?}");
+        }
+    }
+
+    /// The time a start has to send is bounded by its own deadline when that comes first, and is
+    /// the send limit from the moment the hold is written when the deadline is farther.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_send_limit_is_cut_short_by_the_deadline_of_the_start() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, _wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+
+        let (near, deadline) =
+            start_of(&controller, action(1), std::time::Duration::from_secs(10)).await;
+        near.before_the_broker(600).expect("admitted");
+        assert_eq!(
+            near.send_by(),
+            Some(deadline),
+            "the deadline is nearer than the limit"
+        );
+
+        // The second start names the first, so that it is admitted over the standing row.
+        let (mut far, _) =
+            start_of(&controller, action(2), std::time::Duration::from_secs(600)).await;
+        if let Some(start) = far.start.as_mut() {
+            start.supersedes = Some(action(1));
+        }
+        far.before_the_broker(600).expect("admitted");
+        let limit = std::time::Duration::from_millis(crate::voice_start_holds::SEND_LIMIT_MS);
+        assert_eq!(
+            far.send_by(),
+            Some(controller.clock.now().checked_add(limit).expect("a limit")),
+            "the limit counts from the moment the hold is written"
+        );
+    }
+
+    /// Every wait before the write lock counts toward the start's moment: the time the continuous
+    /// clock counts between the start's first reading and the write adds to the wall reading, and
+    /// the wall clock itself is read once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_moment_of_a_start_counts_what_the_continuous_clock_counted_before_the_lock() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, _wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let wall = controller.settled_now_ms();
+        let (start, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        // Only the continuous clock moves, four seconds, after the first reading.
+        controller
+            .after_a_start_reads_its_first_moment
+            .set(move || continuous.advance(std::time::Duration::from_secs(4)));
+        start.before_the_broker(600).expect("admitted");
+        let row = standing(&controller);
+        assert_eq!(row.asked_ms, wall + 4_000);
+        assert_eq!(
+            row.ends_ms,
+            crate::voice_start_holds::hold_ends_ms(wall + 4_000, 600)
+        );
+    }
+
+    /// A hold ends at its end and not before, to the millisecond, on the clocks the host keeps: a
+    /// start read one millisecond before the end is held, and one read at the end is admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_stands_until_the_millisecond_it_ends() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let (first, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        first.before_the_broker(600).expect("admitted");
+        let ends = standing(&controller).ends_ms;
+
+        wall.store(ends - 1, std::sync::atomic::Ordering::SeqCst);
+        let (early, _) = start_of(&controller, action(2), std::time::Duration::from_secs(60)).await;
+        let held = early
+            .before_the_broker(600)
+            .expect_err("a start one millisecond before the end is held");
+        assert_eq!(held.code, ErrorCode::DraftConflict, "{held}");
+        assert_eq!(standing(&controller).action, action(1));
+
+        wall.store(ends, std::sync::atomic::Ordering::SeqCst);
+        let (at_the_end, _) =
+            start_of(&controller, action(3), std::time::Duration::from_secs(60)).await;
+        at_the_end
+            .before_the_broker(600)
+            .expect("a start read at the end is admitted");
+        assert_eq!(standing(&controller).action, action(3));
     }
 }

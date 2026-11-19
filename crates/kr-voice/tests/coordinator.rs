@@ -4800,6 +4800,9 @@ async fn a_start_is_bound_to_the_preparation_the_person_was_shown() {
 /// the effect the start came to, and the effect each deferred closure was run with. It can refuse
 /// the Nth check made after `before_the_broker`, which is how each exit that follows the broker is
 /// reached.
+/// A step a test runs at one place in a start.
+type Step = Box<dyn Fn() + Send>;
+
 struct Recording {
     before: std::sync::atomic::AtomicUsize,
     checks: std::sync::atomic::AtomicUsize,
@@ -4811,6 +4814,8 @@ struct Recording {
     coordinator: Mutex<Option<Arc<Coordinator>>>,
     /// Whether each closure's read of the coordinator was answered.
     probes: Arc<Mutex<Vec<bool>>>,
+    /// A step to run when the check with this number is asked, which passes after it.
+    at_check: Mutex<Option<(usize, Step)>>,
 }
 
 impl std::fmt::Debug for Recording {
@@ -4829,7 +4834,13 @@ impl Recording {
             resolved: Arc::new(Mutex::new(Vec::new())),
             coordinator: Mutex::new(None),
             probes: Arc::new(Mutex::new(Vec::new())),
+            at_check: Mutex::new(None),
         })
+    }
+
+    /// Runs `step` when the check with number `number` is asked, and lets that check pass.
+    fn acts_at(&self, number: usize, step: impl Fn() + Send + 'static) {
+        *self.at_check.lock().expect("the step") = Some((number, Box::new(step)));
     }
 
     fn probes(&self) -> Vec<bool> {
@@ -4858,6 +4869,11 @@ impl kr_voice::Admission for Recording {
             .checks
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
+        if let Some((at, step)) = self.at_check.lock().expect("the step").as_ref()
+            && *at == number
+        {
+            step();
+        }
         if self.refuse_at == Some(number) {
             Err(host_refusal())
         } else {
@@ -5092,6 +5108,93 @@ async fn every_exit_of_a_start_reports_its_effect() {
             .await;
         assert_eq!(admission.before_calls(), 1, "{label}: asked once");
         assert_eq!(admission.effects(), vec![expected], "{label}");
+    }
+}
+
+/// KR-REQ-23.24: a call the host created and then could not keep, because the standing voice grant
+/// could not be read or the grant for the call could not be written, is closed on the way out, and
+/// the start's effect says whether the service confirmed the close.
+#[tokio::test]
+async fn a_call_the_host_could_not_keep_is_closed_and_its_effect_says_whether_the_close_stood() {
+    use kr_voice::BrokerEffect::{Closed, Open};
+    for (label, check, cannot_close, expected) in [
+        (
+            "the standing grant cannot be read, close confirmed",
+            2,
+            false,
+            Closed,
+        ),
+        (
+            "the standing grant cannot be read, close not confirmed",
+            2,
+            true,
+            Open,
+        ),
+        (
+            "the grant cannot be written, close confirmed",
+            3,
+            false,
+            Closed,
+        ),
+        (
+            "the grant cannot be written, close not confirmed",
+            3,
+            true,
+            Open,
+        ),
+    ] {
+        let fixture = fixture();
+        fixture
+            .coordinator
+            .grant(
+                &grant_params(None),
+                AuthorityRevision::new(1),
+                10_000,
+                &kr_voice::Unbounded,
+            )
+            .await
+            .expect("a standing voice grant");
+        if cannot_close {
+            fixture.broker.cannot_close();
+        }
+        let admission = Recording::new(None);
+        // The first check after the broker answers is asked just before the standing grant is read
+        // a second time, and the next one just before the grant is written.
+        let authority = Arc::clone(&fixture.authority);
+        if check == 2 {
+            admission.acts_at(2, move || {
+                authority.refuse(Some((Seam::StandingVoiceGrant, floor_unrecorded())));
+            });
+        } else {
+            admission.acts_at(3, move || authority.fail_the_next_write());
+        }
+        let refused = fixture
+            .coordinator
+            .start(
+                device(PHONE),
+                &start_params_for(&fixture.coordinator).await,
+                AuthorityRevision::new(1),
+                10_100,
+                admission.as_ref(),
+            )
+            .await
+            .expect_err(label);
+        assert_eq!(
+            refused.to_protocol_error().code,
+            if check == 2 {
+                floor_unrecorded().code
+            } else {
+                kr_protocol::error::ErrorCode::StorageUnavailable
+            },
+            "{label}"
+        );
+        assert_eq!(admission.before_calls(), 1, "{label}: asked once");
+        assert_eq!(admission.effects(), vec![expected], "{label}");
+        assert_eq!(
+            fixture.broker.closed().len(),
+            1,
+            "{label}: the call is closed once"
+        );
     }
 }
 

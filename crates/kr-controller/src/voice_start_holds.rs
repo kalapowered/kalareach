@@ -540,6 +540,42 @@ mod tests {
         assert_eq!(later, Decision::Admitted);
     }
 
+    /// The start's moment is read once the write lock is held, so that every wait for the lock
+    /// counts toward it: a second connection that asks for the write lock at that moment, and
+    /// waits no time for it, is refused as busy.
+    #[test]
+    fn the_moment_of_a_start_is_read_with_the_write_lock_held() {
+        let (directory, record) = open();
+        let other = rusqlite::Connection::open(directory.path().join(VOICE_START_HOLDS_RECORD))
+            .expect("a second connection");
+        other
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("no wait for the lock");
+        let tried = std::cell::RefCell::new(None);
+        let decided = record
+            .begin(
+                actor(1),
+                action(1),
+                None,
+                &|| {
+                    let asked = other.execute_batch("BEGIN IMMEDIATE");
+                    if asked.is_ok() {
+                        other.execute_batch("ROLLBACK").expect("the lock is let go");
+                    }
+                    *tried.borrow_mut() = Some(asked);
+                    (10, 100)
+                },
+                &never,
+                &|_| false,
+            )
+            .expect("begin");
+        assert_eq!(decided, Decision::Admitted);
+        let Some(Err(rusqlite::Error::SqliteFailure(refused, _))) = tried.into_inner() else {
+            panic!("the moment was read while the lock was free, or never");
+        };
+        assert_eq!(refused.code, rusqlite::ErrorCode::DatabaseBusy);
+    }
+
     /// A row whose action cannot be read still holds the device: the start is refused as a store
     /// failure and is never admitted over it, and the row goes at its end like any other.
     #[test]
