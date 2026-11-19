@@ -211,7 +211,7 @@ mod tests {
         beside(&temp)
             .execute_batch(&format!(
                 "{}{}{}{}{}DELETE FROM grants WHERE grant_id = {};",
-                damage(0x41, "grant_id = 'not a blob'"),
+                damage(0x41, "grant = 7"),
                 damage(0x43, "grant = X'00'"),
                 damage(0x44, "grant_id = X'0102'"),
                 damage(

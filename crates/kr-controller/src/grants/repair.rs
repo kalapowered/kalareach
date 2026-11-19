@@ -488,9 +488,6 @@ mod tests {
         let temp = kr_ipc::testing::TempHost::create();
         let path = temp.environment().registry_database();
         drop(Registry::open(&path, temp.environment_id()).expect("the registry"));
-        drop(
-            crate::service::net::devices::DeviceDirectory::open(&path).expect("the devices tables"),
-        );
         let directory = GrantDirectory::open(&path).expect("the grants tables");
         let store = Fixture {
             temp,
@@ -509,6 +506,12 @@ mod tests {
         INSERT INTO authority_receipts (actor_id, action_id, payload_digest, claimed_at_ms, result,
                                         recorded_at_ms, refusal_code, refusal_detail, withdrawn)
             VALUES ('owner', X'0c0c', X'0d0d', 12, X'0e0e', 13, 'a_code', 'a detail', X'0f0f');
+        CREATE TABLE IF NOT EXISTS network_devices (
+            device_id BLOB PRIMARY KEY NOT NULL, endpoint_id BLOB NOT NULL,
+            device_key_revision INTEGER NOT NULL, authorisation_key BLOB NOT NULL,
+            device_name TEXT NOT NULL, platform TEXT NOT NULL, grant_id BLOB NOT NULL,
+            grant BLOB NOT NULL, paired_at_ms INTEGER NOT NULL, revoked_at_ms INTEGER,
+            expired_at_ms INTEGER);
         INSERT INTO network_devices (device_id, endpoint_id, device_key_revision, authorisation_key,
                                      device_name, platform, grant_id, grant, paired_at_ms)
             VALUES (X'e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1', X'1111', 1, X'2222', 'a phone', 'ios',
@@ -801,10 +804,14 @@ mod tests {
         // The grants: the two damaged rows are removed; each other row keeps every column but the
         // two marks, and the withdrawn ones differ in those alone.
         let marks = ["revoked_at_ms", "revoked_by_parent"];
-        let gone = [key(0x41), key(0x45)];
+        let gone = [key(0x41).to_lowercase(), "x'0102'".to_owned()];
         let kept_before: Vec<String> = dump_at(&repaired.copy, "grants", &marks)
             .into_iter()
-            .filter(|row| !gone.iter().any(|name| row.to_lowercase().starts_with(name)))
+            .filter(|row| {
+                !gone
+                    .iter()
+                    .any(|name| row.to_lowercase().starts_with(name.as_str()))
+            })
             .collect();
         assert_eq!(kept_before.len(), 4, "the rows that stay");
         assert_eq!(
@@ -1116,11 +1123,10 @@ mod tests {
     fn the_undo_leaves_the_registry_usable_when_the_replacement_cannot_be_made() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let mut store = damaged();
+        let store = damaged();
         let repaired = apply(&store.path, 5_000, 87)
             .expect("ok")
             .expect("repaired");
-        store.close();
         let environment_id = store.temp.environment_id();
         let after_the_repair = store.rows();
         let folder = store.path.parent().expect("a folder").to_owned();
@@ -1301,7 +1307,7 @@ mod tests {
             ("a voice grant", ActionRight::VoiceUse, true),
         ] {
             let store = fixture();
-            store.issue(0x41, None);
+            store.issue_with(0x41, None, action, true);
             store.issue_with(0x42, Some(0x41), action, active);
             store.sql(&format!(
                 "DELETE FROM grants WHERE grant_id = {};",
