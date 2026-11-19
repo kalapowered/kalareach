@@ -406,6 +406,15 @@ fn refused(settled: &Settled) -> &str {
     }
 }
 
+/// Why a run was refused, and `None` for any other end. A case of a declared placement asserts on
+/// this in its own body, so a run that applies fails the case's own assertion.
+fn refusal_of(settled: &Settled) -> Option<&str> {
+    match settled {
+        Settled::Refused(reason) => Some(reason),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Installing and removing
 // ---------------------------------------------------------------------------------------------
@@ -6218,7 +6227,7 @@ fn a_declared_placement_places_a_registration_for_an_application_the_host_does_n
         .reconcile(&quill_id(), Some(&undeclared))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("does not know where Quill CLI keeps its plugins"),
+        refusal_of(&settled).is_some_and(|reason| reason.contains("does not know where Quill CLI keeps its plugins")),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -6270,7 +6279,7 @@ fn a_declared_placement_registers_the_forwarder_by_the_placeholder_only() {
         .reconcile(&quill_id(), Some(&site.declared()))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("starts the forwarder with arguments it does not accept"),
+        refusal_of(&settled).is_some_and(|reason| reason.contains("starts the forwarder with arguments it does not accept")),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -6290,9 +6299,11 @@ fn a_declared_directory_that_is_a_link_at_any_component_is_refused() {
         for (index, component) in components.iter().enumerate() {
             path.push(component);
             if index == linked {
-                // What the link leads to holds a directory the placement could be written in.
-                std::fs::create_dir_all(outside.join("plugins"))
-                    .expect("a place the link leads to");
+                // What the link leads to holds the rest of the directory and a folder the placement
+                // could be written in: a link followed would be placed through.
+                let mut led = outside.clone();
+                led.extend(&components[index + 1..]);
+                std::fs::create_dir_all(led.join("plugins")).expect("a place the link leads to");
                 std::os::unix::fs::symlink(&outside, &path).expect("a link");
                 break;
             }
@@ -6310,7 +6321,7 @@ fn a_declared_directory_that_is_a_link_at_any_component_is_refused() {
             .reconcile(&quill_id(), Some(&release))
             .expect("reconciles");
         assert!(
-            refused(&settled).contains("follows no link there"),
+            refusal_of(&settled).is_some_and(|reason| reason.contains("follows no link there")),
             "component {linked}: {settled:?}"
         );
         assert_eq!(site.tree(), before, "component {linked}: nothing written");
@@ -6332,7 +6343,7 @@ fn a_declared_directory_that_is_a_link_at_any_component_is_refused() {
         .bridges()
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
-    assert!(refused(&settled).contains("it is not there"), "{settled:?}");
+    assert!(refusal_of(&settled).is_some_and(|reason| reason.contains("it is not there")), "{settled:?}");
     assert_eq!(site.tree(), before, "the directory is not made");
 }
 
@@ -6363,7 +6374,7 @@ fn a_declared_copy_of_a_compiled_default_refuses_the_link() {
         .reconcile(&plugin(), Some(&copy))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("follows no link there"),
+        refusal_of(&settled).is_some_and(|reason| reason.contains("follows no link there")),
         "{settled:?}"
     );
     assert_eq!(
@@ -6388,7 +6399,7 @@ fn a_declared_copy_of_a_compiled_default_refuses_the_link() {
         .reconcile(&gemini(), Some(&copy))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("follows no link there"),
+        refusal_of(&settled).is_some_and(|reason| reason.contains("follows no link there")),
         "{settled:?}"
     );
     assert_eq!(
@@ -6425,7 +6436,7 @@ fn a_declared_placement_adds_only_the_labels_own_key() {
         .bridges()
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
-    assert!(refused(&settled).contains(UNPERMITTED_KEY), "{settled:?}");
+    assert!(refusal_of(&settled).is_some_and(|reason| reason.contains(UNPERMITTED_KEY)), "{settled:?}");
     assert_eq!(site.tree(), before, "nothing was written");
 
     let site = Site::new();
@@ -6466,7 +6477,7 @@ fn a_declared_placement_installs_only_into_a_folder_this_host_made() {
         .bridges()
         .reconcile(&quill_id(), Some(&site.declared()))
         .expect("reconciles");
-    assert!(refused(&settled).contains("did not make it"), "{settled:?}");
+    assert!(refusal_of(&settled).is_some_and(|reason| reason.contains("did not make it")), "{settled:?}");
     assert_eq!(site.tree(), before, "nothing was written");
 
     let site = QuillSite::new();
@@ -6489,7 +6500,7 @@ fn a_declared_placement_installs_only_into_a_folder_this_host_made() {
             Some(&second),
         )
         .expect("reconciles");
-    assert!(refused(&settled).contains("did not make it"), "{settled:?}");
+    assert!(refusal_of(&settled).is_some_and(|reason| reason.contains("did not make it")), "{settled:?}");
     assert_eq!(
         site.tree(),
         placed,
@@ -6497,29 +6508,82 @@ fn a_declared_placement_installs_only_into_a_folder_this_host_made() {
     );
 }
 
+/// KR-REQ-11.44: a declared placement that says its application keeps one plugin for each name
+/// refuses a folder beside the plugin's own whose manifest names the same plugin, and places the
+/// plugin beside one that names another.
+#[cfg(unix)]
+#[test]
+fn a_declared_name_check_refuses_another_folder_of_the_same_name() {
+    let beside = |site: &QuillSite, name: &str| {
+        let folder = site.application().join("plugins/other");
+        std::fs::create_dir_all(&folder).expect("a folder");
+        std::fs::write(folder.join("plugin.json"), format!("{{\"name\": \"{name}\"}}\n"))
+            .expect("a manifest");
+    };
+    let site = QuillSite::new();
+    beside(&site, "quill-bridge");
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&site.declared()))
+        .expect("reconciles");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains("keeps one of two")),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    let site = QuillSite::new();
+    beside(&site, "another-name");
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&site.declared()))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "the control: {settled:?}");
+}
+
 /// KR-REQ-11.44: a declared placement whose directory is the directory this host keeps another
 /// label's plugins in is refused, compared by what was opened and not by the spelling.
 #[cfg(unix)]
 #[test]
 fn a_declared_placement_in_another_labels_directory_is_refused() {
+    // The same spelling as Claude Code's directory, in an area of the placement's own.
     let site = QuillSite::new();
-    std::fs::create_dir_all(site.home().join(".claude/skills")).expect("Claude Code's directory");
+    std::fs::create_dir_all(site.home().join(".claude/plugins")).expect("Claude Code's directory");
     let before = site.tree();
     let release = site.release(
         "kalareach/quill",
         "quill-bridge",
-        Declared::Placement(Box::new({
-            let mut placement = quill_placement(&[".claude"]);
-            placement.area = "skills".to_owned();
-            placement
-        })),
+        Declared::Placement(Box::new(quill_placement(&[".claude"]))),
     );
     let settled = site
         .bridges()
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("keeps Claude Code's plugins in"),
+        refusal_of(&settled).is_some_and(|reason| reason.contains("keeps Claude Code's plugins in")),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    // Another spelling of it: the person keeps `.claude` as a link to `dotfiles/claude`, and the
+    // placement names `dotfiles/claude`. What was opened is the same directory.
+    let site = QuillSite::new();
+    std::fs::create_dir_all(site.home().join("dotfiles/claude/plugins")).expect("the real one");
+    std::os::unix::fs::symlink(site.home().join("dotfiles/claude"), site.home().join(".claude"))
+        .expect("the person's link");
+    let before = site.tree();
+    let release = site.release(
+        "kalareach/quill",
+        "quill-bridge",
+        Declared::Placement(Box::new(quill_placement(&["dotfiles", "claude"]))),
+    );
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&release))
+        .expect("reconciles");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains("keeps Claude Code's plugins in")),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -6590,7 +6654,7 @@ fn a_file_that_is_not_json_is_refused_before_anything_is_written_under_a_declare
         .reconcile(&quill_id(), Some(&site.declared()))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("cannot be read as JSON"),
+        refusal_of(&settled).is_some_and(|reason| reason.contains("cannot be read as JSON")),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -6625,7 +6689,7 @@ fn a_declared_shape_cannot_hide_a_command_from_the_walker() {
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
     assert!(
-        refused(&settled).contains("starts something other than the forwarder"),
+        refusal_of(&settled).is_some_and(|reason| reason.contains("starts something other than the forwarder")),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
