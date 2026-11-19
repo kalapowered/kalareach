@@ -1624,7 +1624,7 @@ Granting a capability is `plugin.grant`, confirmed the same way and bound to the
 the capabilities it is about. An install carries the owner's confirmation of that exact installation
 when what it may do exceeds what the installation it replaces could do, read under the ceiling that
 installation was installed under, or, with nothing to replace, exceeds what its repository's ceiling
-permits by itself. So does every release that installs a native bridge, declares a command
+permits by itself. So does every release that asks for `skill_target.install`, installs a native bridge, declares a command
 integration or asks for `launch.probe`. An install that needs the confirmation and lacks it is
 refused. `docs/plugins/catalogue.md` states the rule in full.
 
