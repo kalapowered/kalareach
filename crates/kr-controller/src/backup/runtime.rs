@@ -318,6 +318,15 @@ impl Observed {
     }
 }
 
+/// Whether a pass met a refusal only a person can mend, and the host's token has stopped being
+/// usable, so that the token is what to wait for. A hold that the proxy's login stopped lasts until
+/// the host restarts, and no look at the token mends it, so it sets no check.
+fn token_is_what_refused(hold: Option<Hold>, token_usable: bool, account_moved: bool) -> bool {
+    hold.is_some_and(|hold| hold.needs_a_person() && !hold.waits_for_restart())
+        && !token_usable
+        && !account_moved
+}
+
 /// What one pass did, in the words `kr doctor` uses.
 #[derive(Clone, Copy, Debug)]
 struct LastPass {
@@ -743,7 +752,7 @@ impl Shared {
                 let by_a_person = report.hold.is_some_and(|hold| hold.needs_a_person());
                 let usable = !by_a_person || self.token_usable().await;
                 let account_moved = self.sign_in.grant_mark() != grant;
-                let token_refused = by_a_person && !usable && !account_moved;
+                let token_refused = token_is_what_refused(report.hold, usable, account_moved);
                 let wait = self.absorb(&report, account_moved, token_refused, backoff);
                 // Under a fence the wait the fence asked for stands.
                 if token_refused && !fenced {
@@ -1513,5 +1522,32 @@ mod proxy_login_readers {
             "{}",
             check.detail()
         );
+    }
+
+    /// KR-REQ-10.02: a hold that the proxy's login stopped and that a person would also have to
+    /// mend is not the token to wait for: no token check is asked for, and the hold stands until
+    /// the host restarts. A hold that only a person can mend is still the token's, as before.
+    #[test]
+    fn kr_req_10_02_a_login_stop_that_needs_a_person_too_asks_for_no_token_check() {
+        let person = Hold {
+            code: ErrorCode::QuotaExceeded,
+            ..ordinary()
+        };
+        let combined = person.and(stopped());
+        assert!(combined.needs_a_person() && combined.waits_for_restart());
+        assert!(
+            !token_is_what_refused(Some(combined), false, false),
+            "a stop that lasts until the restart is not the token's"
+        );
+        assert!(token_is_what_refused(Some(person), false, false));
+        assert!(!token_is_what_refused(Some(person), true, false));
+        assert!(!token_is_what_refused(Some(person), false, true));
+        assert!(!token_is_what_refused(None, false, false));
+
+        let mut observed = Observed::default();
+        observed.note_pass(&held_work(combined), false, false);
+        assert_eq!(observed.pass_hold, Some(combined));
+        assert!(observed.waits_for_restart());
+        assert!(!observed.token_blocked);
     }
 }
