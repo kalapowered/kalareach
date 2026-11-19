@@ -69,10 +69,11 @@ pub fn run(paths: &HostPaths, command: &LoginItemCommand, json: bool) -> Result<
             LoginItemCommand::Remove => writer::remove(paths, json),
         };
         match ended {
+            Ok(()) => Ok(Completion::Done),
             // The document already says what failed, beside what the settling did: a second
             // document for the same failure would give a reader two to reconcile.
-            Err(error) if writer::reported() => Ok(Completion::Reported(error)),
-            other => other.map(|()| Completion::Done),
+            Err(writer::Stopped::Reported(error)) => Ok(Completion::Reported(error)),
+            Err(writer::Stopped::Plain(error)) => Err(error),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -102,6 +103,22 @@ mod writer {
     const LABEL_PREFIX: &str = "kr-desktop-host-";
     const LOCK_WAIT: Duration = Duration::from_secs(60);
     const LOCK_HOLDS: &str = "sets up or removes this environment's login item";
+
+    /// How a command stopped: whether its document already says what failed.
+    pub(super) enum Stopped {
+        /// The failure is for the caller to report.
+        Plain(CliError),
+        /// The command wrote its failure into its document, which stands as its one result.
+        Reported(CliError),
+    }
+
+    impl<E: Into<CliError>> From<E> for Stopped {
+        fn from(error: E) -> Self {
+            Self::Plain(error.into())
+        }
+    }
+
+    type Outcome = std::result::Result<(), Stopped>;
 
     #[cfg(target_os = "macos")]
     const HOME_VARIABLE: &str = "HOME";
@@ -218,6 +235,8 @@ mod writer {
         label: String,
         file: PathBuf,
         expected: Option<String>,
+        /// Whether `install` goes past the control daemon check and the words check here.
+        installs: bool,
     }
 
     fn derived_for(environment: &EnvironmentPaths, kind: Kind, strict: bool) -> Result<Derived> {
@@ -233,10 +252,12 @@ mod writer {
             Some(program) => contents(environment, &program, &label, kind).ok(),
             None => None,
         };
+        let installs = strict || (expected.is_some() && controller().is_ok());
         Ok(Derived {
             label,
             file,
             expected,
+            installs,
         })
     }
 
@@ -293,7 +314,14 @@ mod writer {
         }
     }
 
-    fn pending_clause(pending: Option<Operation>, state: State) -> Option<&'static str> {
+    /// What the next command does about what an earlier one left. `installs` is whether `install`
+    /// gets past its checks here: it refuses before it settles anything where the control daemon
+    /// is gone.
+    fn pending_clause(
+        pending: Option<Operation>,
+        state: State,
+        installs: bool,
+    ) -> Option<&'static str> {
         Some(match (pending?, state) {
             (Operation::Remove, _) => {
                 "an earlier kr host login-item remove did not finish: kr host login-item remove \
@@ -307,6 +335,10 @@ mod writer {
                 "an earlier kr host login-item install did not finish: kr host login-item remove \
                  takes out what it left"
             }
+            _ if !installs => {
+                "an earlier kr host login-item install did not finish: kr host login-item remove \
+                 takes out what it left"
+            }
             _ => {
                 "an earlier kr host login-item install did not finish: kr host login-item install \
                  finishes it, or kr host login-item remove takes out what it left"
@@ -314,7 +346,13 @@ mod writer {
         })
     }
 
-    fn status_said(state: State, file: &Path, record: &Shown, pending: Option<Operation>) -> Shown {
+    fn status_said(
+        state: State,
+        file: &Path,
+        record: &Shown,
+        pending: Option<Operation>,
+        installs: bool,
+    ) -> Shown {
         let file = Shown::root(file);
         let line = match state {
             State::None => shown!(
@@ -378,7 +416,7 @@ mod writer {
                 file
             ),
         };
-        match pending_clause(pending, state) {
+        match pending_clause(pending, state, installs) {
             Some(clause) => shown!("{}; {}", line, clause),
             None => line,
         }
@@ -422,7 +460,13 @@ mod writer {
         emit(json, lines, state, derived, record);
         if !json {
             let pending = record.and_then(|record| record.pending.as_ref().map(|p| p.operation));
-            output::say(&status_said(state, &derived.file, record_said, pending));
+            output::say(&status_said(
+                state,
+                &derived.file,
+                record_said,
+                pending,
+                derived.installs,
+            ));
         }
     }
 
@@ -465,14 +509,6 @@ mod writer {
         }
     }
 
-    /// Whether this command wrote its failure into its document, which then stands as its one
-    /// result.
-    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-    pub(super) fn reported() -> bool {
-        REPORTED.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Hands `error` back after telling what the settling before it did, which the record no
     /// longer says: a leftover it took out or left would otherwise be named nowhere.
     fn carried(
@@ -481,19 +517,27 @@ mod writer {
         derived: &Derived,
         read: &dyn Fn() -> Result<Option<Record>>,
         error: CliError,
-    ) -> CliError {
+    ) -> Stopped {
         if !lines.is_empty() {
             let record = read().ok().flatten();
             let state = state_of(record.as_ref(), &derived.file, derived.expected.as_deref());
             if json {
                 let document = document_of(lines, state, derived, record.as_ref());
                 output::document(&report::with_failure(document, &error));
-                REPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                emit(false, lines, state, derived, record.as_ref());
+                return Stopped::Reported(error);
             }
+            emit(false, lines, state, derived, record.as_ref());
         }
-        error
+        Stopped::Plain(error)
+    }
+
+    /// What is at `path`, as a sentence names it: a path that is gone was a file.
+    fn thing_at(path: &Path) -> &'static str {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_dir() => "a directory",
+            Ok(metadata) if metadata.file_type().is_symlink() => "a link",
+            _ => "a file",
+        }
     }
 
     /// A path as a sentence says it: whole where it is beside the file kr derives, and by the
@@ -507,13 +551,15 @@ mod writer {
             Shown::root(path)
         } else if name.ends_with(".kr-moving") {
             shown!(
-                "a file beside the file the record {} names, under a name that ends in .kr-moving",
+                "{} beside the file the record {} names, under a name that ends in .kr-moving",
+                thing_at(path),
                 *record
             )
         } else if name.ends_with(".kr-staging") {
             shown!(
-                "a file beside the file the record {} names, under a name that ends in \
+                "{} beside the file the record {} names, under a name that ends in \
                  .kr-staging",
+                thing_at(path),
                 *record
             )
         } else {
@@ -521,7 +567,7 @@ mod writer {
         }
     }
 
-    fn event_lines(
+    pub(super) fn event_lines(
         events: &[Event],
         derived: &Path,
         recorded: &Path,
@@ -534,6 +580,12 @@ mod writer {
                 Event::Removed(path) => {
                     let word = if path == recorded {
                         "removed_file"
+                    } else if path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.ends_with(".kr-staging"))
+                    {
+                        "removed_staging"
                     } else {
                         "removed_aside"
                     };
@@ -547,8 +599,7 @@ mod writer {
                     "left_file",
                     shown!(
                         "left {}: it was changed after kr wrote it, so it is no longer kr's to \
-                         remove; kr dropped its record, and the file may still start a daemon \
-                         when you log in",
+                         remove, and it may still start a daemon when you log in",
                         said(recorded)
                     ),
                 ),
@@ -556,7 +607,7 @@ mod writer {
                     "aside_stays",
                     shown!(
                         "left {}: {} holds another file now, so the file kr moved aside could not \
-                         go back; kr dropped its record",
+                         go back",
                         said(aside),
                         said(recorded)
                     ),
@@ -623,7 +674,7 @@ mod writer {
             Some(record.clone()),
         );
         let settled = steps::settle(&mut run, &record, mode);
-        let mut lines = event_lines(&run.events, &derived.file, &record.path, said);
+        let lines = event_lines(&run.events, &derived.file, &record.path, said);
         let settled = match settled {
             Ok(settled) => settled,
             Err(error) => {
@@ -639,30 +690,39 @@ mod writer {
                 return Err(Box::new((error, lines)));
             }
         };
-        if settled == Settled::Done {
-            let operation = record.pending.as_ref().map(|pending| pending.operation);
-            lines.push((
-                "settled",
-                match (mode, operation) {
-                    (Mode::Remove, Some(Operation::Remove)) => {
-                        shown!("finished what an earlier kr host login-item remove began")
-                    }
-                    (Mode::Install, Some(Operation::Remove)) => {
-                        shown!("took back what an earlier kr host login-item remove began")
-                    }
-                    (Mode::Remove, _) => {
-                        shown!("took out what an earlier kr host login-item install began")
-                    }
-                    (Mode::Install, _) => {
-                        shown!("finished what an earlier kr host login-item install began")
-                    }
-                },
-            ));
-        }
         Ok((settled, lines))
     }
 
-    pub(super) fn status(paths: &HostPaths, json: bool) -> Result<()> {
+    /// What an earlier run's settling came to, said from the steps that completed and the state
+    /// they left: `file_in_place` is whether the recorded file is on disk once they are done. A
+    /// removal says it only after its own removal has run.
+    fn settled_said(mode: Mode, earlier: Operation, file_in_place: bool) -> (&'static str, Shown) {
+        let line = match (mode, earlier, file_in_place) {
+            (Mode::Remove, Operation::Remove, _) => {
+                shown!("finished what an earlier kr host login-item remove began")
+            }
+            (Mode::Remove, _, _) => {
+                shown!("took out what an earlier kr host login-item install began")
+            }
+            (Mode::Install, Operation::Remove, true) => {
+                shown!("took back what an earlier kr host login-item remove began")
+            }
+            (Mode::Install, Operation::Remove, false) => shown!(
+                "an earlier kr host login-item remove had already taken out the file, so kr had \
+                 nothing to take back"
+            ),
+            (Mode::Install, _, true) => {
+                shown!("finished what an earlier kr host login-item install began")
+            }
+            (Mode::Install, _, false) => shown!(
+                "an earlier kr host login-item install stopped before it put the file in place, \
+                 so kr had no file to finish"
+            ),
+        };
+        ("settled", line)
+    }
+
+    pub(super) fn status(paths: &HostPaths, json: bool) -> Outcome {
         let kind = Kind::current();
         let Some(id) = paths.recorded_environment_id().map_err(CliError::Ipc)? else {
             if json {
@@ -682,10 +742,10 @@ mod writer {
         Ok(())
     }
 
-    pub(super) fn install(paths: &HostPaths, json: bool) -> Result<()> {
+    pub(super) fn install(paths: &HostPaths, json: bool) -> Outcome {
         let kind = Kind::current();
         // Everything that can refuse comes before the identity, the state directory or any file.
-        text_of(&directory(kind)?, kind)?;
+        directory_text(&directory(kind)?)?;
         let program = controller()?;
         let probe = Parts {
             label: "kr-desktop-host-x",
@@ -712,24 +772,33 @@ mod writer {
         };
         let mut record = read()?;
         let mut lines = Lines::new();
+        let refused = |lines: &Lines, error: CliError| carried(json, lines, &derived, &read, error);
         if let Some(pending) = record.clone().filter(|record| record.pending.is_some()) {
             let recorded = pending.path.clone();
+            let earlier = pending.pending.as_ref().map(|pending| pending.operation);
             let (settled, more) =
                 settle(&environment, &derived, kind, pending, Mode::Install, &said).map_err(
                     |stopped| {
                         let (error, more) = *stopped;
-                        carried(json, &more, &derived, &read, error)
+                        refused(&more, error)
                     },
                 )?;
             lines.extend(more);
             if settled == Settled::Changed {
-                let error = refusal_changed(&recorded);
-                return Err(carried(json, &lines, &derived, &read, error));
+                let error = if recorded == derived.file {
+                    refusal_changed(&derived.file)
+                } else {
+                    refusal_changed_recorded(&said)
+                };
+                return Err(refused(&lines, error));
             }
-            record = read()?;
+            if let Some(earlier) = earlier {
+                let in_place = !matches!(steps::disk(&recorded), steps::Disk::Missing);
+                lines.push(settled_said(Mode::Install, earlier, in_place));
+            }
+            record = read().map_err(|error| refused(&lines, error))?;
         }
         let state = state_of(record.as_ref(), &derived.file, Some(&expected));
-        let refused = |lines: &Lines, error: CliError| carried(json, lines, &derived, &read, error);
         match state {
             State::Foreign => {
                 return Err(refused(
@@ -822,7 +891,7 @@ mod writer {
                 lines.push(("installed", installed_said(&derived.file)));
             }
         }
-        let record = read()?;
+        let record = read().map_err(|error| refused(&lines, error))?;
         let state = state_of(record.as_ref(), &derived.file, Some(&expected));
         if json {
             finish(json, &lines, state, &derived, record.as_ref(), &said);
@@ -832,6 +901,18 @@ mod writer {
             }
         }
         Ok(())
+    }
+
+    /// The directory the item goes in, which only the record holds: its text, or why the record
+    /// cannot hold it.
+    fn directory_text(path: &Path) -> Result<&str> {
+        render::text(path).ok_or_else(|| {
+            CliError::Usage(shown!(
+                "the directory {} is not text, so the login item's record cannot hold it \
+                 exactly; nothing was written",
+                Shown::root(path)
+            ))
+        })
     }
 
     fn text_of(path: &Path, kind: Kind) -> Result<&str> {
@@ -844,6 +925,17 @@ mod writer {
              run kr host login-item remove, which leaves it, then move it aside and run kr host \
              login-item install again",
             Shown::root(file)
+        ))
+    }
+
+    /// The refusal when the file a pending record names is not the one this command derives, and
+    /// it was changed: the record names it, and its path is not this command's to say.
+    fn refusal_changed_recorded(record: &Shown) -> CliError {
+        CliError::Usage(shown!(
+            "the file the record {} names was changed after kr wrote it, so kr does not replace \
+             it; run kr host login-item remove, which leaves it, then run kr host login-item \
+             install again",
+            *record
         ))
     }
 
@@ -883,7 +975,7 @@ mod writer {
         )
     }
 
-    pub(super) fn remove(paths: &HostPaths, json: bool) -> Result<()> {
+    pub(super) fn remove(paths: &HostPaths, json: bool) -> Outcome {
         let kind = Kind::current();
         directory(kind)?;
         let Some(id) = paths.recorded_environment_id().map_err(CliError::Ipc)? else {
@@ -939,24 +1031,27 @@ mod writer {
             return Ok(());
         };
         let mut lines = Lines::new();
-        if record.pending.is_some() {
+        let earlier = record.pending.as_ref().map(|pending| pending.operation);
+        if earlier.is_some() {
             let (_, more) = settle(&environment, &derived, kind, record, Mode::Remove, &said)
                 .map_err(|stopped| {
                     let (error, more) = *stopped;
                     carried(json, &more, &derived, &read, error)
                 })?;
             lines.extend(more);
-            record = read()?.ok_or_else(|| {
-                carried(
-                    json,
-                    &lines,
-                    &derived,
-                    &read,
-                    CliError::Other(Shown::said(
-                        "the record was taken away while kr was removing",
-                    )),
-                )
-            })?;
+            record = read()
+                .map_err(|error| carried(json, &lines, &derived, &read, error))?
+                .ok_or_else(|| {
+                    carried(
+                        json,
+                        &lines,
+                        &derived,
+                        &read,
+                        CliError::Other(Shown::said(
+                            "the record was taken away while kr was removing",
+                        )),
+                    )
+                })?;
         }
         let recorded = record.path.clone();
         let mut run = Run::new(
@@ -972,6 +1067,9 @@ mod writer {
             let mut lines = lines;
             lines.extend(event_lines(&run.events, &derived.file, &recorded, &said));
             return Err(carried(json, &lines, &derived, &read, error));
+        }
+        if let Some(earlier) = earlier {
+            lines.push(settled_said(Mode::Remove, earlier, false));
         }
         lines.extend(event_lines(&run.events, &derived.file, &recorded, &said));
         lines.push((
