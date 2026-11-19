@@ -582,8 +582,17 @@ async fn kr_req_11_44_a_package_with_no_native_bridge_is_admitted_under_its_plug
     assert_eq!(bridge.application, "amp-cli");
     assert_eq!(bridge.surfaces, [BridgeSurface::Hook].into_iter().collect());
 
-    // The arguments the package registers are read from its own flag.
-    let registered: serde_json::Value = serde_json::from_str(&settings).expect("the flag is JSON");
+    // The arguments the package registers are read from the flag of the connector the worker
+    // assembled.
+    let Some(integration) = connector.integration() else {
+        panic!("the package's command integration is granted");
+    };
+    assert_eq!(
+        integration.flags.first().map(String::as_str),
+        Some("--settings")
+    );
+    let registered: serde_json::Value =
+        serde_json::from_str(&integration.flags[1]).expect("the flag is JSON");
     let args: Vec<&str> = registered["hooks"]["SessionStart"][0]["hooks"][0]["args"]
         .as_array()
         .expect("an argument list")
