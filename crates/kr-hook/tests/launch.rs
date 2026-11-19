@@ -1597,9 +1597,12 @@ fn kr_req_12_20_a_declared_variable_reaches_the_program_through_a_committed_laun
         "a package that declares its variable is installed"
     );
     for (own, name) in [(None, "declared-absent"), (Some("0"), "declared-zero")] {
-        let answer = shell
-            .try_establish_gemini()
-            .unwrap_or_else(|why| panic!("{name}: a backend is established: {why}"));
+        let result = shell.try_establish_gemini();
+        assert!(
+            result.is_ok(),
+            "{name}: a backend is established: {result:?}"
+        );
+        let answer = result.expect("a backend is established");
         let exported: Vec<&str> = answer
             .environment
             .iter()
@@ -1645,9 +1648,12 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_varia
         (None, "declared-refused-absent", "unset"),
     ] {
         // Another credential: the backend refuses the launch.
-        let answer = shell
-            .try_establish_gemini()
-            .unwrap_or_else(|why| panic!("{name}: a backend is established: {why}"));
+        let result = shell.try_establish_gemini();
+        assert!(
+            result.is_ok(),
+            "{name}: a backend is established: {result:?}"
+        );
+        let answer = result.expect("a backend is established");
         std::fs::write(
             Shell::directory(&answer).join("credential"),
             "05".repeat(32),
