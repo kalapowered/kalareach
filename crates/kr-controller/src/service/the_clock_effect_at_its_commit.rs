@@ -124,7 +124,10 @@ async fn authority_that_lapses_while_the_establishment_waits_stops_it() {
         (At::BeforeTheClock, Lapse::TheRegistrationIsWithdrawn),
         (At::BeforeTheRegistrationHold, Lapse::TheDeadlinePasses),
         (At::BeforeTheRegistrationHold, Lapse::AFenceIsOwed),
-        (At::BeforeTheRegistrationHold, Lapse::TheRegistrationIsWithdrawn),
+        (
+            At::BeforeTheRegistrationHold,
+            Lapse::TheRegistrationIsWithdrawn,
+        ),
     ] {
         an_establishment_that_lapses_while_it_waits(at, lapse).await;
     }
@@ -560,6 +563,11 @@ async fn a_deadline_that_passes_after_the_guard_asked_stops_the_establishment_at
         .expect("the directory's connection is held");
 
     let refused = attempt.await.expect("the effect ends");
+    assert!(
+        refused.is_err(),
+        "the establishment is refused: the deadline passed after the guard asked and before the \
+         directory's connection was held"
+    );
     assert_eq!(
         code(refused.map_err(|error| error.to_protocol_error())),
         ErrorCode::PermissionDenied

@@ -421,6 +421,167 @@ async fn within<T>(what: &str, work: impl std::future::Future<Output = T>) -> T 
         .unwrap_or_else(|_| panic!("gave up waiting for {what}"))
 }
 
+/// The line a watchdog's report of the threads' state begins with.
+const WATCHDOG_MARKER: &str = "kr-controller authority_feed watchdog: thread state";
+
+/// The line a watchdog writes where this platform gives no list of a process's threads.
+const WATCHDOG_FALLBACK: &str = "thread state unavailable on this platform";
+
+/// Ends a test that does not end. A thread of its own waits for the guard to be dropped; if the
+/// bound passes first, it writes the state of the process's threads to the standard error stream
+/// and aborts the process, so a hang in a lock shows where each thread stands instead of
+/// stalling a run until a machine-wide limit cuts it.
+///
+/// A test declares the guard before its runtime: a panic then drops the runtime first, and the
+/// watchdog's thread outlives a drop that waits for a task which never ends. `within`'s timers
+/// start one after another and each has its own limit, so the bound is the whole case's and no
+/// order between it and an inner timer is promised.
+struct Watchdog {
+    ended: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn arm(bound: Duration) -> Self {
+        let (ended, waiting) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("watchdog".to_owned())
+            .spawn(move || {
+                if waiting.recv_timeout(bound) == Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    report_the_threads();
+                    std::process::abort();
+                }
+            })
+            .expect("the watchdog's thread starts");
+        Self {
+            ended: Some(ended),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.ended.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Writes the state of every thread of this process to the standard error stream, which the test
+/// harness's capture does not cover: the marker, then on Linux each thread's name, the kernel
+/// function it waits in and its state line, and elsewhere only the line that says there is none.
+fn report_the_threads() {
+    use std::io::Write as _;
+
+    let mut out = std::io::stderr().lock();
+    let _ = writeln!(out, "{WATCHDOG_MARKER}");
+    #[cfg(target_os = "linux")]
+    {
+        let read = |tid: &std::ffi::OsStr, file: &str| {
+            std::fs::read_to_string(std::path::Path::new("/proc/self/task").join(tid).join(file))
+                .map_or_else(|error| format!("<{error}>"), |text| text.trim().to_owned())
+        };
+        if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
+            for task in tasks.flatten() {
+                let tid = task.file_name();
+                let _ = writeln!(
+                    out,
+                    "tid={} comm={} wchan={} stat={}",
+                    tid.to_string_lossy(),
+                    read(&tid, "comm"),
+                    read(&tid, "wchan"),
+                    read(&tid, "stat"),
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = writeln!(out, "{WATCHDOG_FALLBACK}");
+    }
+    let _ = out.flush();
+}
+
+/// What the self-check's child blocks on: a bound in seconds, which makes the case below this
+/// one's test wait for ever under a watchdog of that bound.
+const WATCHDOG_CHILD: &str = "KR_AUTHORITY_FEED_WATCHDOG_CHILD_BOUND";
+
+/// The child of the watchdog's self-check. Without the variable it ends at once. With it, it arms
+/// a watchdog of that bound and then blocks for ever, so that only the watchdog ends it.
+#[test]
+fn the_watchdog_child_blocks_until_its_watchdog_ends_it() {
+    let Ok(bound) = std::env::var(WATCHDOG_CHILD) else {
+        return;
+    };
+    let bound = Duration::from_secs(bound.parse().expect("a bound in seconds"));
+    let _watchdog = Watchdog::arm(bound);
+    loop {
+        std::thread::park();
+    }
+}
+
+/// A watchdog that is not dropped inside its bound writes the threads' state and aborts the
+/// process. The case starts its own test binary on the child above, with a bound of a few seconds,
+/// waits for it under a deadline of its own that kills it, and asserts that it ended by the abort
+/// signal and that its standard error holds the report: on Linux with each thread's `comm` and
+/// `wchan`, elsewhere with the line that says there is none.
+#[cfg(unix)]
+#[test]
+fn the_watchdog_aborts_a_run_that_does_not_end() {
+    use std::io::Read as _;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    // `SIGABRT`, which `std::process::abort` ends a process with, on every Unix platform.
+    const SIGABRT: i32 = 6;
+    let mut child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args([
+            "--exact",
+            "the_watchdog_child_blocks_until_its_watchdog_ends_it",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .env(WATCHDOG_CHILD, "3")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the child starts");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the child can be waited for") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().expect("the child is killed at the deadline");
+            break child.wait().expect("the killed child is reaped");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let mut report = String::new();
+    child
+        .stderr
+        .take()
+        .expect("the child's standard error")
+        .read_to_string(&mut report)
+        .expect("the child's standard error is read");
+    assert_eq!(
+        status.signal(),
+        Some(SIGABRT),
+        "the watchdog ended the child by an abort: {status:?}"
+    );
+    assert!(report.contains(WATCHDOG_MARKER), "{report}");
+    if cfg!(target_os = "linux") {
+        assert!(
+            report.contains("comm=") && report.contains("wchan="),
+            "each thread's name and wait are reported: {report}"
+        );
+    } else {
+        assert!(report.contains(WATCHDOG_FALLBACK), "{report}");
+    }
+}
+
 /// The deadlines the rig gives the feed's client of every daemon it starts, in place of the
 /// product's, and the clients its cases make for a publisher or a device (`client_for`): longer
 /// than `within`, so that a machine that stalls a case while a request is in flight, or while the
@@ -2809,55 +2970,70 @@ async fn a_change_to_the_feeds_list_answered_by_its_removal_refuses_the_grants_t
 /// ends the pass as the read's own answer does: the grants that rest on the feed are refused when
 /// the answer is read, and not when the next read finds the removal. The feed stores a revision
 /// for a host it removed and answers `removed`, where its acknowledgements find no record.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_revision_answered_by_the_feeds_removal_refuses_the_grants_that_rest_on_it_at_once() {
-    let rig = Rig::start().await;
-    rig.the_owner_bounds_offline_validity();
-    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
-    let session = connect(&rig.host, &phone, &record).await;
-    let (_target, target_record) = rig.pairs(&[ActionRight::SessionView]).await;
-    rig.until_the_carrier_is_idle().await;
-    rig.doctor_as(&session)
-        .await
-        .expect("inside the bound, with the feed standing");
+#[test]
+fn a_revision_answered_by_the_feeds_removal_refuses_the_grants_that_rest_on_it_at_once() {
+    // Declared before the runtime, so that a panic drops the runtime first and the watchdog's
+    // thread outlives a drop that waits for a task which never ends. The case reaches seven of
+    // `within`'s timers, one after another (the daemon's start, two pairings, the carrier going
+    // idle, the owner's publication, the request reaching the feed, and the pass ending), each of
+    // 180 seconds: the worst case of them all together is 1,260 seconds, far beyond this bound,
+    // which therefore decides alone that a case that does not end is ended.
+    let _watchdog = Watchdog::arm(Duration::from_secs(240));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    runtime.block_on(async {
+        let rig = Rig::start().await;
+        rig.the_owner_bounds_offline_validity();
+        let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+        let session = connect(&rig.host, &phone, &record).await;
+        let (_target, target_record) = rig.pairs(&[ActionRight::SessionView]).await;
+        rig.until_the_carrier_is_idle().await;
+        rig.doctor_as(&session)
+            .await
+            .expect("inside the bound, with the feed standing");
 
-    // The feed holds the host's revision of a request it carries out until a key the host named has
-    // removed the feed.
-    rig.served
-        .web()
-        .fail_with_member(AUTHORITY, "revise", 1, Moment::Gate);
-    let revised = rig.arrivals("revise");
-    let mut passes = rig.runtime().passes();
-    let seen = *passes.borrow_and_update();
-    rig.owner_publishes(0xb7, devices(target_record.device_id))
+        // The feed holds the host's revision of a request it carries out until a key the host named has
+        // removed the feed.
+        rig.served
+            .web()
+            .fail_with_member(AUTHORITY, "revise", 1, Moment::Gate);
+        let revised = rig.arrivals("revise");
+        let mut passes = rig.runtime().passes();
+        let seen = *passes.borrow_and_update();
+        rig.owner_publishes(0xb7, devices(target_record.device_id))
+            .await;
+        rig.runtime().wake();
+        rig.until_arrivals("revise", revised + 1).await;
+        rig.remote
+            .remove(rig.feed())
+            .await
+            .expect("a key the host named removes the feed");
+        rig.served.web().release_held();
+        within("the pass the revision was sent in ends", async {
+            while *passes.borrow_and_update() <= seen {
+                passes.changed().await.expect("the carrier is running");
+            }
+        })
         .await;
-    rig.runtime().wake();
-    rig.until_arrivals("revise", revised + 1).await;
-    rig.remote
-        .remove(rig.feed())
-        .await
-        .expect("a key the host named removes the feed");
-    rig.served.web().release_held();
-    within("the pass the revision was sent in ends", async {
-        while *passes.borrow_and_update() <= seen {
-            passes.changed().await.expect("the carrier is running");
-        }
-    })
-    .await;
 
-    assert!(
-        rig.shown().await.list.feed_removed,
-        "the host shows that the feed removed it"
-    );
-    let refused = rig
-        .doctor_as(&session)
-        .await
-        .expect_err("the grant rests on a feed that removed the host");
-    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
-    assert!(
-        refused.to_string().contains("was removed"),
-        "refused for the feed's removal and not for something else: {refused}"
-    );
+        assert!(
+            rig.shown().await.list.feed_removed,
+            "the host shows that the feed removed it"
+        );
+        let refused = rig
+            .doctor_as(&session)
+            .await
+            .expect_err("the grant rests on a feed that removed the host");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+        assert!(
+            refused.to_string().contains("was removed"),
+            "refused for the feed's removal and not for something else: {refused}"
+        );
+    });
+    drop(runtime);
 }
 
 /// KR-REQ-24.15: a refusal that rises waits for every write to the pairing records that was under

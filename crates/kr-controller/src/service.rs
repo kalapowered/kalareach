@@ -1912,6 +1912,9 @@ mod a_connection_that_ends_behind_a_withdrawal;
 mod a_refusal_the_feed_raises_after_admission;
 
 #[cfg(test)]
+mod a_policy_commit_and_an_owner_answer;
+
+#[cfg(test)]
 mod a_revocation_without_an_admission_that_meets_a_registration;
 
 #[cfg(test)]
