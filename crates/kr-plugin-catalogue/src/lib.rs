@@ -2397,6 +2397,32 @@ impl Catalogue {
                 ),
             });
         }
+        // The words the host writes before its reading of a placement are the host's too.
+        if bridge.is_some_and(|words| {
+            words.contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL)
+        }) {
+            return Err(CatalogueError::UnsafePackage {
+                detail: format!(
+                    "{subject} is not a package this host will install: the bridge's statement \
+                     holds the words the host writes before its own reading of a placement"
+                ),
+            });
+        }
+        // A package that declares where its bridge is placed gets the host's reading of it, written
+        // from the table the verified manifest pins, which is read only after the range test and
+        // by the one function the controller reads it with. A table that cannot be fetched, read
+        // or used is a refusal, never a statement without the reading.
+        let placement = match manifest.native_bridge.0.as_ref().filter(|_| {
+            grant.holds(PluginCapability::NativeBridgeInstall)
+        }) {
+            Some(recipe) => {
+                self.placement_reading(
+                    &enrolled, &store, &entry, &manifest, recipe, &subject,
+                )
+                .await?
+            }
+            None => None,
+        };
         // A release that asks for the integration and declares none is told so in the reading.
         let integration = grant
             .holds(PluginCapability::CommandIntegrationLaunch)
@@ -2416,10 +2442,81 @@ impl Catalogue {
                 ),
             });
         }
-        Ok(kr_protocol::confirmation::install_statement(
+        let statement = kr_protocol::confirmation::install_statement(
             bridge,
+            placement.as_deref(),
             integration.as_deref(),
-        ))
+        );
+        if statement
+            .as_ref()
+            .is_some_and(|text| text.chars().count() > kr_protocol::confirmation::STATEMENT_CHARS)
+        {
+            return Err(CatalogueError::UnsafePackage {
+                detail: format!(
+                    "{subject} is not a package this host will install: its whole statement is \
+                     longer than an owner is shown whole"
+                ),
+            });
+        }
+        Ok(statement)
+    }
+
+    /// The host's reading of the placement a release's connector table declares for its bridge,
+    /// or `None` for a release that declares none.
+    async fn placement_reading(
+        &mut self,
+        enrolled: &Enrolled,
+        store: &Store,
+        entry: &IndexEntry,
+        manifest: &kr_plugin_sdk::plugin::PluginManifest,
+        recipe: &kr_plugin_sdk::plugin::NativeBridge,
+        subject: &str,
+    ) -> CatalogueResult<Option<String>> {
+        use kr_plugin_sdk::plugin::PayloadRole;
+        let unsafe_package = |why: String| CatalogueError::UnsafePackage {
+            detail: format!(
+                "{subject} is not a package this host will install: the placement its table \
+                 declares cannot be read to describe it: {why}"
+            ),
+        };
+        // The range test comes first: a table written for another SDK is not read.
+        extract::check_sdk_range(entry)?;
+        let Some(payload) = manifest
+            .payloads
+            .iter()
+            .find(|payload| payload.role == PayloadRole::Connector)
+        else {
+            return Ok(None);
+        };
+        let length = payload.size_bytes.get();
+        let bytes = match store.read_payload(payload.digest, length) {
+            Ok(bytes) => bytes,
+            Err(CatalogueError::UnavailableOffline { .. } | CatalogueError::Integrity { .. }) => {
+                let prefix = format!(
+                    "{PACKAGE_PREFIX}{}/{}/{}",
+                    entry.publisher_id, entry.plugin_name, entry.version
+                );
+                let package: BTreeSet<PayloadDigest> =
+                    std::iter::once(payload.digest).collect();
+                self.fetch(
+                    enrolled,
+                    store,
+                    &format!("{prefix}/{}", payload.path),
+                    payload.digest,
+                    length,
+                    &package,
+                    Why::Reason(FetchReason::ExplicitInstall),
+                    &Owner::acting(),
+                )
+                .await?
+            }
+            Err(other) => return Err(other),
+        };
+        let declared = kr_plugin_sdk::placement::declared_in(&bytes, recipe.application.as_str())
+            .map_err(unsafe_package)?;
+        declared
+            .map(|placement| placement.statement(recipe).map_err(|why| unsafe_package(why.to_string())))
+            .transpose()
     }
 
     /// Installs one verified package into one environment, as the owner acting directly.
