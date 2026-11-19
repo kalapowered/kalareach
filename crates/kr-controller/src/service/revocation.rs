@@ -735,16 +735,17 @@ impl Controller {
             eprintln!("kr-controller: could not forget stale offline bound records: {error}");
         }
         // The time bounds the written policy states, published under its lock before it is put in
-        // force, so a reader that loads a cell sees what the policy it could read says.
-        candidate.publish_leases(&held);
-        net::publish_offline_bound(
-            candidate.offline_cell(),
-            candidate.offline_validity(),
-            next,
-            self.clock.now(),
-            self.settled_utc_now(),
-        );
-        *held = candidate;
+        // force, so a reader that loads a cell sees what the policy it could read says: its
+        // leases, then the offline bound.
+        self.put_in_force(&mut held, candidate, |candidate| {
+            net::publish_offline_bound(
+                candidate.offline_cell(),
+                candidate.offline_validity(),
+                next,
+                self.clock.now(),
+                self.settled_utc_now(),
+            );
+        });
         self.mirror_the_feed_standing_of(&held);
         self.lifetimes.hold_offline_anchor(next, &held);
         // Published with the policy, under its lock, so a decision that reads this epoch reads the

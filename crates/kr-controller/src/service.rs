@@ -537,7 +537,8 @@ pub struct Controller {
     ///
     /// A check that runs inside a transaction on the device directory's connection or the grant
     /// store's reads published words and takes no lock of levels 1 to 4 (`feed_refusal`, the
-    /// bound cells and the atomics). Those are read at any level and never locked.
+    /// local owner's standing, the bound cells and the atomics). Those are read at any level and
+    /// never locked.
     commit_hold: std::sync::RwLock<()>,
     /// The connections that ended while the registrations were held, whose registrations go when
     /// whoever holds them lets go ([`Self::deregister`]).
@@ -1098,6 +1099,15 @@ pub struct Controller {
     ///
     /// Its place among the crate's locks is in the lock order on `commit_hold`.
     policy: Arc<std::sync::Mutex<crate::grants::HostPolicy>>,
+    /// What the host's local owner may do, as the policy in force states it: whether the host is
+    /// exclusively organisation-managed and the two ends of each lease of its own key.
+    ///
+    /// One value, published whole by the function that puts a policy in force
+    /// ([`Self::put_in_force`]), under the policy's lock and after the policy's leases are
+    /// published. It is read with no lock, by the checks that run inside a transaction on the
+    /// device directory's connection and may not take the policy's: whether the local owner is
+    /// shut out to the recovery set ([`Self::local_owner_is_closed`]).
+    local_owner_standing: arc_swap::ArcSwap<crate::grants::policy::LocalOwnerStanding>,
     /// Moves whenever something a paired device's authority is decided from changes: this host's
     /// policy, or the rights ceiling in force.
     ///

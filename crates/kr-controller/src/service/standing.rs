@@ -120,6 +120,31 @@ impl Controller {
         presented
     }
 
+    /// Puts `candidate` in force in place of the policy `held` holds. It is the one place a
+    /// written policy becomes the policy in force, for a change of the policy and for the
+    /// presentation of a lease alike, and runs under the policy's lock, once the policy is
+    /// written down.
+    ///
+    /// In this order: the policy's leases in their cells, which a reader that loads a cell must
+    /// find saying what the policy it could read says; `between`, with the policy about to be put
+    /// in force, for whatever else is published before it; the local owner's standing, one value
+    /// that holds the ends of the leases; and last the policy itself. A change whose write was
+    /// refused never gets here, so it publishes nothing.
+    pub(super) fn put_in_force(
+        &self,
+        held: &mut std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
+        candidate: crate::grants::HostPolicy,
+        between: impl FnOnce(&crate::grants::HostPolicy),
+    ) {
+        candidate.publish_leases(held);
+        between(&candidate);
+        self.local_owner_standing
+            .store(std::sync::Arc::new(
+                candidate.local_owner_standing(self.local_owner_device()),
+            ));
+        **held = candidate;
+    }
+
     /// [`Self::present_membership_lease`], handing back in `own_barrier` the barrier of the debt
     /// that the presentation owes the whole host, when it owes one, instead of leaving it to the debt
     /// pass: the caller raises it, or drops it to leave the debt to the pass.
@@ -293,10 +318,9 @@ impl Controller {
             });
         if written.is_ok() {
             self.utc_floor.wrote(snapshot.utc_floor_ms.get());
-            // The lease's snapshot in its cell, under the policy's lock, before the policy holding
-            // it is put in force.
-            candidate.publish_leases(&held);
-            *held = candidate;
+            // The lease's snapshot in its cell and the local owner's standing, under the policy's
+            // lock, as the policy holding the lease is put in force.
+            self.put_in_force(&mut held, candidate, |_| {});
             // Published with the policy, under its lock, as every change of the policy is.
             self.advance_authority_epoch();
         }
