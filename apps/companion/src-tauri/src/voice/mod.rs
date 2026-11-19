@@ -1054,6 +1054,10 @@ impl Shared {
                 }
             }
             // A start the host may have answered made a call this device cannot name.
+            // The voice service has no part in a call on the host's own key.
+            (None, _) if kept.pending_start.is_some() && kept.provider == CallProvider::OwnKey => {
+                "host_unknown"
+            }
             (None, _) if kept.pending_start.is_some() => "unknown",
             (None, _) => "not_needed",
         };

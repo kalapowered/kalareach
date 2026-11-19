@@ -1066,7 +1066,12 @@ impl Owner {
                                     .to_owned(),
                             },
                             // The service may hold a call this device cannot name.
-                            broker: "unknown".to_owned(),
+                            broker: if self.provider == CallProvider::OwnKey {
+                                "host_unknown"
+                            } else {
+                                "unknown"
+                            }
+                            .to_owned(),
                         });
                     },
                     vec![OwedView::start_unknown(
@@ -1100,7 +1105,7 @@ impl Owner {
             Some(call.clone()),
             self.host.as_ref(),
             Some(&descriptor),
-            self.provider,
+            provider_of(&descriptor),
             &self.reach,
             &self.tokens,
         );
@@ -1731,19 +1736,17 @@ impl Owner {
     /// What the host's heartbeat told.
     fn on_host_news(&mut self, news: HostNews) -> Option<Cause> {
         match news {
-            HostNews::Attached { reattached } => {
-                if reattached {
-                    // The notice of two beats unanswered is over with the answer.
-                    self.view(|state| state.pass(ProblemKind::HostPath));
-                }
+            HostNews::Attached { .. } => {
+                // The notice of two beats unanswered is over with any answer: the first answer
+                // after the misses may not say the call was attached before.
+                self.view(|state| state.pass(ProblemKind::HostPath));
                 self.attached(Vec::new());
                 None
             }
+            // The host is the thing that does not answer, and the voice service has no part in the
+            // call: the notice says so, and nothing says the service is not answering.
             HostNews::Detached => {
-                self.view(|state| {
-                    state.control = "unreachable".to_owned();
-                    state.meet(ProblemKind::HostPath, HOST_NOT_REACHED.to_owned());
-                });
+                self.view(|state| state.meet(ProblemKind::HostPath, HOST_NOT_REACHED.to_owned()));
                 None
             }
             HostNews::Delegation {
@@ -1824,7 +1827,12 @@ impl Owner {
         let Some(send) = self.context.as_mut() else {
             return;
         };
-        match send.news(action_id, appended, of, unconfirmed, state) {
+        let changed = send.news(action_id, appended, of, unconfirmed, state);
+        if let Some(progress) = changed {
+            let shown = progress.view();
+            self.view(|state| state.context = Some(shown));
+        }
+        match changed {
             None | Some(ContextProgress::Sending { .. }) => {}
             // The host took the request whatever its reply said.
             Some(ContextProgress::Done) => {
@@ -1918,7 +1926,10 @@ impl Owner {
         // about it applies whether or not its reply comes, and whichever of the two comes first.
         let action_id = ActionId::new(kr_ipc::new_uuid());
         if matches!(control, CallControl::Host(_)) {
-            self.context = Some(ContextSend::begun(action_id));
+            let send = ContextSend::begun(action_id);
+            let shown = send.progress().view();
+            self.context = Some(send);
+            self.view(|state| state.context = Some(shown));
         }
         self.opening = Some(match control {
             CallControl::Managed(control) => tokio::spawn(async move {
@@ -1969,12 +1980,17 @@ impl Owner {
                     .context
                     .as_mut()
                     .filter(|send| send.action_id() == queued.action_id)
+                    && send.queued(queued.appends)
                 {
-                    send.queued(queued.appends);
+                    let shown = send.progress().view();
+                    self.view(|state| state.context = Some(shown));
                 }
             }
             // A host that took none of it has nothing to tell of it.
-            Opened::HostRefused => self.context = None,
+            Opened::HostRefused => {
+                self.context = None;
+                self.view(|state| state.context = None);
+            }
             _ => {}
         }
         if let Some((why, words)) = opened.problem() {
@@ -2279,9 +2295,14 @@ impl Owner {
         });
     }
 
+    /// Whether the host controls this call.
+    fn host_controls(&self) -> bool {
+        matches!(self.control, Some(CallControl::Host(_)))
+    }
+
     /// This device would not hand the delegation `id` to the host, for `why`.
     fn refuse(&self, id: &str, why: Why) {
-        self.set_row(id, "refused", Some(why.word()));
+        self.set_row(id, "refused", Some(cause_word(&why, self.host_controls())));
         self.tell_delegation(
             id,
             if why.taints() {
@@ -2294,7 +2315,7 @@ impl Owner {
 
     /// Nothing of the delegation `id` was written to the host, for `why`.
     fn not_sent(&self, id: &str, why: Why) {
-        self.set_row(id, "not_sent", Some(why.word()));
+        self.set_row(id, "not_sent", Some(cause_word(&why, self.host_controls())));
         self.tell_delegation(
             id,
             if why.taints() {
@@ -2741,11 +2762,6 @@ impl Owner {
         self.cancel_confirmations(Why::LateFragment);
     }
 
-    /// Whether a request was written to the host and has no answer: it may have been carried out.
-    fn requests_unsettled(&self) -> bool {
-        !self.unsettled.is_empty() || self.outcomes_uncertain
-    }
-
     /* ------------------------------------------------------------------------------------- */
     /* The end                                                                               */
     /* ------------------------------------------------------------------------------------- */
@@ -2781,11 +2797,9 @@ impl Owner {
         // so that a person who reads the end reads it too.
         self.settle_the_opening().await;
         // A context send the host had not finished when the call ended was cut short by the end.
-        if self
-            .context
-            .take()
-            .is_some_and(|send| !send.is_over())
-        {
+        if self.context.take().is_some_and(|send| !send.is_over()) {
+            // The call is over, and the send does not go on.
+            self.view(|state| state.context = None);
             self.note_the_opening(&Opened::Cut);
         }
         self.view(|state| {
@@ -2852,15 +2866,22 @@ impl Owner {
 
         // The voice service finalises only a call it controls. A call the host controls is closed
         // by the host when the grant is revoked, and a host that did not confirm it is left to.
-        let own_key_call = self.provider == CallProvider::OwnKey && self.descriptor.is_some();
+        // By the control the host's descriptor names, not the provider the person was shown: a
+        // call the host controls is closed through the host whichever was asked for.
+        let own_key_call = self.descriptor.as_ref().is_some_and(is_host_controlled);
         let needs_broker = self.descriptor.is_some() && !own_key_call;
         // The host that ended the call itself closed it, and a call the host lost is left to it.
         let host_ended = matches!(cause, Cause::Host(HostEnding::Reason(_)));
         let host_lost = matches!(cause, Cause::Host(HostEnding::NotKnown(_)));
-        let left_to_host = own_key_call && !host_ended && (host_lost || !host_end.closes_the_call());
+        let left_to_host =
+            own_key_call && !host_ended && (host_lost || !host_end.closes_the_call());
         // A request written to the host and not answered may have been carried out, and the aftermath
         // never says nothing was done.
-        let unsettled = self.accepting && self.requests_unsettled();
+        let unsettled = shows_requests_unsettled(
+            self.accepting,
+            !self.unsettled.is_empty(),
+            self.outcomes_uncertain,
+        );
         // What the end owes is recorded with the end and with the host being told, in one step.
         // The grant may be live at the host until the moment the call was to close, by the host's
         // reading of the clock.
@@ -3075,6 +3096,41 @@ fn answered_as(outcome: &VoiceDelegationOutcome) -> (&'static str, Option<&'stat
 /// down to what was asked for, and one that is long past (further than the clock may differ) is
 /// not a call to carry. A host whose clock is a little behind gives a time that is a little past,
 /// which native code ends the call at.
+/// The word the screen branches on for `why`: on a call the host controls, the announcement that was
+/// not confirmed is the host's to confirm, not the voice service's.
+fn cause_word(why: &Why, host_controls: bool) -> &'static str {
+    match why {
+        Why::BrokerDisagrees if host_controls => "host_disagrees",
+        _ => why.word(),
+    }
+}
+
+/// Whether the host controls the call the descriptor describes: a call on its owner's own key, which
+/// no voice service holds.
+fn is_host_controlled(descriptor: &VoiceSessionDescriptor) -> bool {
+    provider_for(&descriptor.control) == CallProvider::OwnKey
+}
+
+/// The provider a call runs on, by the control its descriptor names.
+fn provider_of(descriptor: &VoiceSessionDescriptor) -> CallProvider {
+    provider_for(&descriptor.control)
+}
+
+/// The provider a control belongs to.
+fn provider_for(control: &VoiceSessionControl) -> CallProvider {
+    match control {
+        VoiceSessionControl::Host { .. } => CallProvider::OwnKey,
+        VoiceSessionControl::Broker { .. } => CallProvider::Managed,
+    }
+}
+
+/// Whether the end says that a request that was spoken may or may not have been carried out: a
+/// request written to the host that has no answer, on a call that acts on speech, or news of the
+/// host that overflowed, on any call, because what the call did is then not all known.
+fn shows_requests_unsettled(accepting: bool, unanswered: bool, news_lost: bool) -> bool {
+    (accepting && unanswered) || news_lost
+}
+
 fn hold_until(host_closes_ms: u64, requested_seconds: u32, now_ms: u64) -> Option<u64> {
     if host_closes_ms.saturating_add(MAX_CLOCK_SKEW_MS) <= now_ms {
         return None;
@@ -3532,6 +3588,46 @@ mod tests {
     }
 
     use super::*;
+
+    /// A call is closed as the control its descriptor names, whichever provider was asked for.
+    #[test]
+    fn a_call_is_cleaned_up_as_the_control_its_descriptor_names_whichever_provider_was_asked_for() {
+        assert_eq!(
+            provider_for(&VoiceSessionControl::Host {
+                heartbeat_seconds: 20
+            }),
+            CallProvider::OwnKey
+        );
+        assert_eq!(
+            provider_for(&VoiceSessionControl::Broker {
+                origin: "https://voice.example".to_owned(),
+                control_path: "/control".to_owned(),
+                heartbeat_seconds: 20,
+            }),
+            CallProvider::Managed
+        );
+    }
+
+    /// News of the host that overflowed is told whatever the call acts on, and a request with no
+    /// answer only on a call that acts on speech.
+    #[test]
+    fn overflowed_news_is_told_on_a_call_that_does_not_act_on_speech_and_an_unanswered_request_is_not()
+     {
+        assert!(
+            shows_requests_unsettled(false, false, true),
+            "news overflowed"
+        );
+        assert!(shows_requests_unsettled(true, false, true));
+        assert!(
+            shows_requests_unsettled(true, true, false),
+            "a request with no answer"
+        );
+        assert!(
+            !shows_requests_unsettled(false, true, false),
+            "no request can be spoken"
+        );
+        assert!(!shows_requests_unsettled(true, false, false));
+    }
 
     /// The closing time this device holds a call to is the host's, held down to what was asked
     /// for with room for a clock that is not its own, and a call that closed long ago is not

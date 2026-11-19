@@ -46,6 +46,9 @@ pub struct VoiceCallState {
     pub ended: Option<EndedView>,
     /// The delegations the provider announced, and what this version did with each.
     pub delegations: Vec<DelegationRow>,
+    /// How the host's sender is getting on with the call's opening context, once the call has
+    /// asked it, in words for a person.
+    pub context: Option<ContextView>,
     /// What the call met that a person is told, each problem once, from the moment it was met until
     /// another call begins: on the running call, and after it for the person who starts the next.
     pub problems: Vec<CallProblem>,
@@ -89,6 +92,7 @@ impl VoiceCallState {
             session: None,
             ended: None,
             delegations: Vec::new(),
+            context: None,
             problems: Vec::new(),
             owed: Vec::new(),
             owner: 0,
@@ -197,6 +201,23 @@ pub struct CallProblem {
     /// Whether what it says no longer holds: the host that would not vouch for the call has
     /// answered since.
     pub over: bool,
+}
+
+/// Where the host's sender stands with the call's opening context, as a person reads it.
+#[derive(Clone, Debug, Serialize)]
+pub struct ContextView {
+    /// `sending`, `done` or `stopped`, which the screen branches on.
+    pub state: String,
+    /// How many parts the host has sent.
+    pub appended: u32,
+    /// How many parts it has to send, or none while it has not said.
+    pub of: u32,
+    /// How many parts the host sent and did not learn whether the provider took.
+    pub unconfirmed: u32,
+    /// What stopped it, for `stopped`.
+    pub stopped_by: Option<String>,
+    /// What a person is told.
+    pub words: String,
 }
 
 /// Something this device could not finish, which the host may still hold open.

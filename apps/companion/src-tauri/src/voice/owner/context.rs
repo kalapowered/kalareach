@@ -6,6 +6,8 @@
 use kr_protocol::ids::ActionId;
 use kr_protocol::voice_host::{VoiceContextState, VoiceContextStop};
 
+use super::super::view::ContextView;
+
 /// How far the host's sender has got.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContextProgress {
@@ -22,6 +24,85 @@ pub(super) enum ContextProgress {
         of: u32,
         unconfirmed: u32,
     },
+}
+
+impl ContextProgress {
+    /// What the screen shows of the send, in words for a person.
+    pub(super) fn view(&self) -> ContextView {
+        match *self {
+            Self::Sending { appended, of } => ContextView {
+                state: "sending".to_owned(),
+                appended,
+                of,
+                unconfirmed: 0,
+                stopped_by: None,
+                words: if of == 0 {
+                    "The host is giving this call the context of its session.".to_owned()
+                } else {
+                    format!(
+                        "The host is giving this call the context of its session: {appended} of {of} parts so far."
+                    )
+                },
+            },
+            Self::Done => ContextView {
+                state: "done".to_owned(),
+                appended: 0,
+                of: 0,
+                unconfirmed: 0,
+                stopped_by: None,
+                words: "The host gave this call the context of its session.".to_owned(),
+            },
+            Self::Stopped {
+                stopped_by,
+                appended,
+                of,
+                unconfirmed,
+            } => ContextView {
+                state: "stopped".to_owned(),
+                appended,
+                of,
+                unconfirmed,
+                stopped_by: Some(stop_word(stopped_by).to_owned()),
+                words: format!(
+                    "The host stopped giving this call the context of its session after {appended} of {of} parts, {}.{}",
+                    stopped_because(stopped_by),
+                    if unconfirmed > 0 {
+                        " It did not learn whether OpenAI took the next part."
+                    } else {
+                        ""
+                    }
+                ),
+            },
+        }
+    }
+}
+
+/// What stopped the send, as the word the screen branches on.
+const fn stop_word(stopped_by: VoiceContextStop) -> &'static str {
+    match stopped_by {
+        VoiceContextStop::Stop => "stop",
+        VoiceContextStop::Revocation => "revocation",
+        VoiceContextStop::Grant => "grant",
+        VoiceContextStop::History => "history",
+        VoiceContextStop::Privacy => "privacy",
+        VoiceContextStop::Deadline => "deadline",
+        VoiceContextStop::SidebandLost => "sideband_lost",
+        VoiceContextStop::ProviderRefused => "provider_refused",
+    }
+}
+
+/// Why the host stopped sending the context, as a clause that follows the counts.
+const fn stopped_because(stopped_by: VoiceContextStop) -> &'static str {
+    match stopped_by {
+        VoiceContextStop::Stop => "because the call was stopped",
+        VoiceContextStop::Revocation => "because this device's grant for the call was revoked",
+        VoiceContextStop::Grant => "because a grant this call needs for the session ended",
+        VoiceContextStop::History => "because the history the host may share was narrowed",
+        VoiceContextStop::Privacy => "because privacy mode changed",
+        VoiceContextStop::Deadline => "because the call reached its time limit",
+        VoiceContextStop::SidebandLost => "because the host lost its connection to OpenAI",
+        VoiceContextStop::ProviderRefused => "because OpenAI refused part of it",
+    }
 }
 
 /// The context send a host's sender is running for a call.
@@ -55,11 +136,16 @@ impl ContextSend {
     }
 
     /// The host's reply to the request: its sender will write `appends` appends. A state the news
-    /// already gave stays, and so does a count the news already gave.
-    pub(super) fn queued(&mut self, appends: u32) {
-        if let ContextProgress::Sending { of, .. } = &mut self.progress {
-            *of = (*of).max(appends);
+    /// already gave stays, and so does a count the news already gave. Says whether it changed
+    /// what the send shows.
+    pub(super) fn queued(&mut self, appends: u32) -> bool {
+        if let ContextProgress::Sending { of, .. } = &mut self.progress
+            && appends > *of
+        {
+            *of = appends;
+            return true;
         }
+        false
     }
 
     /// The host's news about a send. News about another send is not about this one, and news about
@@ -118,8 +204,78 @@ mod tests {
             Some(ContextProgress::Done)
         );
         send.queued(5);
-        assert!(send.is_over(), "a late reply does not make a finished send run again");
+        assert!(
+            send.is_over(),
+            "a late reply does not make a finished send run again"
+        );
         assert_eq!(send.progress(), ContextProgress::Done);
+    }
+
+    /// The words shown are one for each state and one for each cause, with the counts.
+    #[test]
+    fn the_shown_words_are_one_for_each_state_and_one_for_each_cause() {
+        let words = |progress: ContextProgress| progress.view().words;
+        assert_eq!(
+            words(ContextProgress::Sending { appended: 0, of: 0 }),
+            "The host is giving this call the context of its session."
+        );
+        assert_eq!(
+            words(ContextProgress::Sending { appended: 2, of: 5 }),
+            "The host is giving this call the context of its session: 2 of 5 parts so far."
+        );
+        assert_eq!(
+            words(ContextProgress::Done),
+            "The host gave this call the context of its session."
+        );
+        for (stopped_by, because) in [
+            (VoiceContextStop::Stop, "because the call was stopped"),
+            (
+                VoiceContextStop::Revocation,
+                "because this device's grant for the call was revoked",
+            ),
+            (
+                VoiceContextStop::Grant,
+                "because a grant this call needs for the session ended",
+            ),
+            (
+                VoiceContextStop::History,
+                "because the history the host may share was narrowed",
+            ),
+            (VoiceContextStop::Privacy, "because privacy mode changed"),
+            (
+                VoiceContextStop::Deadline,
+                "because the call reached its time limit",
+            ),
+            (
+                VoiceContextStop::SidebandLost,
+                "because the host lost its connection to OpenAI",
+            ),
+            (
+                VoiceContextStop::ProviderRefused,
+                "because OpenAI refused part of it",
+            ),
+        ] {
+            assert_eq!(
+                words(ContextProgress::Stopped {
+                    stopped_by,
+                    appended: 2,
+                    of: 5,
+                    unconfirmed: 0
+                }),
+                format!(
+                    "The host stopped giving this call the context of its session after 2 of 5 parts, {because}."
+                )
+            );
+        }
+        assert_eq!(
+            words(ContextProgress::Stopped {
+                stopped_by: VoiceContextStop::SidebandLost,
+                appended: 1,
+                of: 3,
+                unconfirmed: 1
+            }),
+            "The host stopped giving this call the context of its session after 1 of 3 parts, because the host lost its connection to OpenAI. It did not learn whether OpenAI took the next part."
+        );
     }
 
     /// A send is over once it stopped: later news for it, and a late reply, change nothing, and the

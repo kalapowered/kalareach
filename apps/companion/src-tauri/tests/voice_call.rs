@@ -8286,9 +8286,9 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
             .lose_the_answer_to(Some(HostMethod::VoiceControl));
         let told = scene
             .state_where("the notice of two beats unanswered", |state| {
-                state["problems"].as_array().is_some_and(|problems| {
-                    problems.iter().any(|each| each["kind"] == "host_path")
-                })
+                state["problems"]
+                    .as_array()
+                    .is_some_and(|problems| problems.iter().any(|each| each["kind"] == "host_path"))
             })
             .await;
         let notice = told["problems"]
@@ -8301,6 +8301,10 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
             "The host could not be reached. So it is not known whether the host still has the call."
         );
         assert_eq!(told["running"], true, "the call is not ended by two misses");
+        assert_ne!(
+            told["control"], "unreachable",
+            "the host that does not answer is not the voice service: {told}"
+        );
 
         // The host stays silent: the phone ends the call at the host's absent bound.
         let ended = scene
@@ -8349,9 +8353,9 @@ async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leav
         let mut scene = own_scene(own_timings()).await;
         let openai = scene.openai.clone().expect("an own-key scene");
         let prepared = scene.prepared().await;
-        openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Answer(
-            500, None,
-        ));
+        openai.script_hangup(
+            kr_client::services::own_voice::stand_in::HangupScript::Answer(500, None),
+        );
         let cause = if by_the_person {
             let answer = scene.call("voice_start", scene.own_start_request(&prepared));
             assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
@@ -8394,7 +8398,10 @@ async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leav
             ended["ended"]["host"]["broker_notified"], false,
             "the host did not confirm the provider's closure ({cause}): {ended}"
         );
-        assert_eq!(ended["ended"]["broker"], "left_to_host", "({cause}) {ended}");
+        assert_eq!(
+            ended["ended"]["broker"], "left_to_host",
+            "({cause}) {ended}"
+        );
         assert!(
             ended["ended"]["words"]
                 .as_str()
@@ -8403,7 +8410,11 @@ async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leav
         );
         let owed_kinds: Vec<&str> = ended["owed"]
             .as_array()
-            .map(|owed| owed.iter().filter_map(|entry| entry["kind"].as_str()).collect())
+            .map(|owed| {
+                owed.iter()
+                    .filter_map(|entry| entry["kind"].as_str())
+                    .collect()
+            })
             .unwrap_or_default();
         assert!(
             owed_kinds.contains(&"host_close") && !owed_kinds.contains(&"service_close"),
@@ -8470,16 +8481,17 @@ async fn a_call_left_to_the_host_stays_owed_past_its_grant_until_the_host_says_i
     let this_host = (host.host_device_id, connection.environment_id());
     let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
     let long_past = now_ms().saturating_sub(3_600_000);
-    let owed = |kind: &str, id: kr_protocol::ids::VoiceSessionId| companion_tauri::voice::OwedView {
-        kind: kind.to_owned(),
-        words: "The host's rule.".to_owned(),
-        action_id: None,
-        voice_session_id: Some(id.to_string()),
-        until_ms: long_past,
-        host_reference: "a-host".to_owned(),
-        host_name: "A host".to_owned(),
-        host: Some(this_host),
-    };
+    let owed =
+        |kind: &str, id: kr_protocol::ids::VoiceSessionId| companion_tauri::voice::OwedView {
+            kind: kind.to_owned(),
+            words: "The host's rule.".to_owned(),
+            action_id: None,
+            voice_session_id: Some(id.to_string()),
+            until_ms: long_past,
+            host_reference: "a-host".to_owned(),
+            host_name: "A host".to_owned(),
+            host: Some(this_host),
+        };
     let lapsed_revocation = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
     let directory = scene.phone.data.path().join("relaunch-left-to-host");
     Kept::at(&directory)
@@ -8517,9 +8529,7 @@ async fn a_call_left_to_the_host_stays_owed_past_its_grant_until_the_host_says_i
 
     // The host revokes the live call's grant and the provider does not confirm the closure: that is
     // no word that the call is closed. The host holds no call by the other name, which is.
-    openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Answer(
-        500, None,
-    ));
+    openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Answer(500, None));
     relaunched.host_reached(this_host.0, this_host.1, connection.session());
     tokio::time::timeout(WATCHDOG, async {
         while ids(&relaunched).len() != 1 || scene.link.sent(HostMethod::VoiceStop) < 2 {
@@ -8618,10 +8628,13 @@ async fn the_hosts_news_of_a_context_send_applies_when_its_reply_was_lost() {
             .unwrap_or_default()
     };
     let done = scene
-        .state_where("the notice taken back by the news that the send is done", |state| {
-            let problems = opening(state);
-            !problems.is_empty() && problems.iter().all(|(_, over)| *over)
-        })
+        .state_where(
+            "the notice taken back by the news that the send is done",
+            |state| {
+                let problems = opening(state);
+                !problems.is_empty() && problems.iter().all(|(_, over)| *over)
+            },
+        )
         .await;
     assert_eq!(
         opening(&done),
@@ -8642,6 +8655,144 @@ async fn the_hosts_news_of_a_context_send_applies_when_its_reply_was_lost() {
         "the end adds no notice of a send that finished: {ended}"
     );
     scene.stop_host().await;
+}
+
+/// The host's first answer comes after two beats that got none, before any answer attached the
+/// control: the notice of the two misses is taken back all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_after_two_misses_before_any_attachment_takes_back_the_notice() {
+    let timings = Timings {
+        host_miss: Duration::from_millis(150),
+        host_silent: Duration::from_secs(30),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    let prepared = scene.prepared().await;
+    scene
+        .link
+        .lose_the_answer_to(Some(HostMethod::VoiceControl));
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("the notice of two beats unanswered", |state| {
+            state["problems"]
+                .as_array()
+                .is_some_and(|problems| problems.iter().any(|each| each["kind"] == "host_path"))
+        })
+        .await;
+    scene.link.lose_the_answer_to(None);
+    let back = scene
+        .state_where("the notice taken back", |state| {
+            state["control"] == "connected"
+                && state["problems"].as_array().is_some_and(|problems| {
+                    problems
+                        .iter()
+                        .filter(|each| each["kind"] == "host_path")
+                        .all(|each| each["over"] == true)
+                })
+        })
+        .await;
+    assert_eq!(back["running"], true, "{back}");
+    scene.stop_host().await;
+}
+
+/// A write the phone gave up on before the host answered leaves nothing unresolved on the
+/// connection: the next writes still go, however many were given up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_the_phone_gave_up_on_is_settled_in_the_connections_book() {
+    let timings = Timings {
+        host_miss: Duration::from_millis(200),
+        host_silent: Duration::from_secs(30),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let session = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected")
+        .session();
+    // The next heartbeat is held, and the phone gives up on it after its bound.
+    scene.link.hold_next_request(HostMethod::VoiceControl);
+    scene.link.until_request_held().await;
+    assert!(
+        !session.submitted_actions().await.is_empty(),
+        "the held write is on the connection's book"
+    );
+    // The book is clear between the beats once the held write has been given up: a write the phone
+    // gave up on is not left on it.
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            if session.submitted_actions().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the write the phone gave up on was settled");
+    scene.link.release_request();
+    assert!(
+        until_more_heartbeats(&scene, 2).await,
+        "the phone goes on writing to the host"
+    );
+    scene.stop_host().await;
+}
+
+/// A start the person asked as managed that the host answers with a call on its owner's own key is
+/// ended, whatever the host's answer to the stop: the call is cleaned up as the host-controlled call
+/// it is, so nothing is asked of the voice service or the account, and the words say the host ran
+/// the call on another provider than the one shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_through_the_host() {
+    for stop_answered in [true, false] {
+        let mut scene =
+            own_scene_signed_in(own_timings(), Some(phone_grant(PHONE_TOKEN, 3600))).await;
+        let prepared = scene.prepared().await;
+        let mut request = scene.own_start_request(&prepared);
+        request["provider"] = json!("managed");
+        request["durationSeconds"] = json!(600);
+        if !stop_answered {
+            scene.link.lose_the_answer_to(Some(HostMethod::VoiceStop));
+        }
+        let _ = scene.call("voice_start", request);
+        let ended = scene
+            .state_where("the end the mismatch brings", |state| {
+                state["ended"]["cause"] == "step_failed" && state["setting_up"] == false
+            })
+            .await;
+        assert_eq!(
+            ended["ended"]["words"],
+            "The call could not be set up on this device: the host started the call on another provider than the one this device showed, so the call was ended",
+            "{ended}"
+        );
+        assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+        let kinds = owed_kinds_of(&ended);
+        assert!(!kinds.contains(&"service_close".to_owned()), "{kinds:?}");
+        if stop_answered {
+            assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+            assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+        } else {
+            assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+            assert!(kinds.contains(&"host_close".to_owned()), "{kinds:?}");
+        }
+        assert_eq!(
+            what_reached_kalareach(&scene),
+            (0, 0, 0),
+            "the voice service and the account were asked for nothing (stop answered: {stop_answered})"
+        );
+        scene.stop_host().await;
+    }
 }
 
 /// A call the host ended and swept out of its list before this phone's stop reached it was closed by
@@ -8683,11 +8834,18 @@ async fn a_call_the_host_swept_before_the_phones_stop_reached_it_is_not_left_to_
         })
         .await;
     assert_eq!(ended["ended"]["host"]["kind"], "not_held", "{ended}");
-    assert_eq!(ended["ended"]["words"], "OpenAI closed the call.", "{ended}");
+    assert_eq!(
+        ended["ended"]["words"], "OpenAI closed the call.",
+        "{ended}"
+    );
     assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
     let owed_kinds: Vec<&str> = ended["owed"]
         .as_array()
-        .map(|owed| owed.iter().filter_map(|entry| entry["kind"].as_str()).collect())
+        .map(|owed| {
+            owed.iter()
+                .filter_map(|entry| entry["kind"].as_str())
+                .collect()
+        })
         .unwrap_or_default();
     assert!(
         !owed_kinds.contains(&"host_close") && !owed_kinds.contains(&"revocation"),
@@ -8817,11 +8975,10 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
     }
 }
 
-/// The unknown-start notice of a call on the host's key names the charge, and the notice for a call
-/// left to the host states the host's own rule and not a closing time of the voice service.
+/// The unknown-start notice of a call on the host's key names the charge, and the call's end says
+/// nothing of a voice service: it holds no call of this kind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_unresolved_notice_for_an_own_key_call_does_not_use_closes_at_ms_as_a_closure_boundary_and_the_unknown_start_notice_names_the_charge()
- {
+async fn the_unknown_start_notice_of_an_own_key_call_names_the_charge_and_no_voice_service() {
     let mut scene = own_scene(Timings {
         start_within: Duration::from_millis(400),
         repeat_delays: [Duration::from_millis(50); 3],
@@ -8840,6 +8997,10 @@ async fn the_unresolved_notice_for_an_own_key_call_does_not_use_closes_at_ms_as_
                 .is_some_and(|owed| owed.iter().any(|each| each["kind"] == "start_unknown"))
         })
         .await;
+    assert_eq!(
+        state["ended"]["broker"], "host_unknown",
+        "the voice service is not what may hold the call: {state}"
+    );
     let owed = state["owed"]
         .as_array()
         .and_then(|owed| owed.iter().find(|each| each["kind"] == "start_unknown"))

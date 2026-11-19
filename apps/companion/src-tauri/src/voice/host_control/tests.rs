@@ -151,17 +151,9 @@ async fn a_heartbeat_goes_at_once_under_a_fresh_action_and_acknowledges_the_news
             offset_ms: 900
         }
     );
-    // The second beat repeats an item the device already holds: it is told once.
-    for _ in 0..2 {
-        tokio::time::advance(BEAT).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-    }
-    assert!(
-        events.news.try_recv().is_err(),
-        "news already held is told again"
-    );
+    // The second beat repeats an item the device already holds: it is told once. The wait ends just
+    // after the third beat went.
+    tokio::time::sleep_until(Instant::now() + 2 * BEAT + Duration::from_millis(1)).await;
     control.stop();
     let seen = script.seen();
     assert!(seen.len() >= 3, "{} heartbeats were sent", seen.len());
@@ -184,6 +176,10 @@ async fn a_heartbeat_goes_at_once_under_a_fresh_action_and_acknowledges_the_news
         seen.len(),
         "a heartbeat reused an action identifier"
     );
+    assert!(
+        events.news.try_recv().is_err(),
+        "news already held is told again"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -200,25 +196,24 @@ async fn two_heartbeats_in_a_row_that_get_no_answer_are_told_once_and_an_answer_
         next(&mut events).await,
         HostNews::Attached { reattached: false }
     );
-    // The second beat, at 20 s, is not answered: its miss is counted at 30 s and tells nothing.
-    tokio::time::advance(Duration::from_secs(35)).await;
-    tokio::task::yield_now().await;
+    let attached_at = Instant::now();
+    // The second beat is not answered: its miss tells nothing. The clock is taken through the beat
+    // and the miss, to just after the miss.
+    tokio::time::sleep_until(attached_at + BEAT + MISS + Duration::from_secs(1)).await;
     assert!(
         events.news.try_recv().is_err(),
         "a single miss was told to the person"
     );
-    // The third beat, at 40 s, comes back as an error: the second miss is told, once.
-    tokio::time::advance(Duration::from_secs(10)).await;
+    // The third beat comes back as an error: the second miss is told, once.
     assert_eq!(next(&mut events).await, HostNews::Detached);
-    // The fourth, at 60 s, is not answered either: the same outage is not told twice.
-    tokio::time::advance(Duration::from_secs(25)).await;
-    tokio::task::yield_now().await;
+    // The fourth is not answered either: the same outage is not told twice. The clock is taken
+    // through its miss.
+    tokio::time::sleep_until(attached_at + 3 * BEAT + MISS + Duration::from_secs(1)).await;
     assert!(
         events.news.try_recv().is_err(),
         "the same outage was told twice"
     );
-    // The fifth, at 80 s, is answered: the notice is taken back.
-    tokio::time::advance(Duration::from_secs(10)).await;
+    // The fifth is answered: the notice is taken back.
     assert_eq!(
         next(&mut events).await,
         HostNews::Attached { reattached: true }
@@ -237,15 +232,16 @@ async fn a_host_not_heard_for_two_minutes_ends_the_control_at_that_moment_and_no
     let heard_at = Instant::now();
     // Two misses are told; nothing ends the call before the bound.
     assert_eq!(next(&mut events).await, HostNews::Detached);
+    tokio::time::sleep_until(heard_at + SILENT - Duration::from_millis(1)).await;
     assert!(
-        Instant::now() - heard_at < SILENT,
+        events.news.try_recv().is_err(),
         "the control ended before the bound"
     );
-    assert_eq!(next(&mut events).await, HostNews::Ended(HostEnding::Silent));
+    tokio::time::sleep_until(heard_at + SILENT + Duration::from_millis(1)).await;
     assert_eq!(
-        Instant::now() - heard_at,
-        SILENT,
-        "the control ended at another moment than the bound"
+        events.news.try_recv(),
+        Ok(HostNews::Ended(HostEnding::Silent)),
+        "the control did not end at the bound"
     );
     assert!(events.next().await.is_none(), "news followed the end");
 }
@@ -376,7 +372,10 @@ async fn a_context_send_is_queued_with_its_identity_or_refused_with_the_hosts_re
         .await
         .expect("the host queued it");
     assert_eq!(queued.appends, 3);
-    assert_eq!(queued.action_id, ours, "the news about the send names the caller's identity");
+    assert_eq!(
+        queued.action_id, ours,
+        "the news about the send names the caller's identity"
+    );
     assert_eq!(
         control
             .send_context(ActionId::new(kr_ipc::new_uuid()), session, None)
