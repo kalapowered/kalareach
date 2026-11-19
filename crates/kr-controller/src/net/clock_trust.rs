@@ -33,9 +33,10 @@
 //!
 //! # Lock order
 //!
-//! The owner challenges where an owner's confirmation is spent, the attention store where one is
-//! read, then this state, then the device directory, then a registration table held through a
-//! commit. No policy or grant callback runs under this state.
+//! The owner challenges where an owner's confirmation is spent and the attention store where one
+//! is read, then the registration hold where a commit stands on a registration, then this state,
+//! then the device directory. No policy or grant callback runs under this state. The crate's
+//! whole order is on `Controller::commit_hold`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
