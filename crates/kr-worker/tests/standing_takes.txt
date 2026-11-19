@@ -62,6 +62,10 @@ outside crates/kr-worker/src/service.rs decidable
 # The takes. Each is a lock of one domain, or the session's guard.
 # The time contract's state lock: the proven reading's mark is read under it, and nothing else.
 site crates/kr-worker/src/action/time.rs pure_proven_ms lock 1
+# The readings' lock, for the note of the wall reading that the pure wall reader takes: taken under
+# the state's in the contract's order (the state's, then the readings'), held for the two clocks
+# and the note, and let go with the call.
+site crates/kr-worker/src/action/time.rs read_unbracketed lock 1
 # The gate's own lock: the bound is copied out and the lock is let go before any clock is read.
 site crates/kr-worker/src/local_gate.rs check_bound lock 1
 # The authority state.
@@ -132,6 +136,8 @@ caller decidable crates/kr-worker/src/service/standing.rs dispatch 1
 caller utc_deadline_standing crates/kr-worker/src/local_gate.rs check_bound 1
 caller pure_proven_ms crates/kr-worker/src/action/time.rs utc_deadline_standing 1
 caller pure_wall_ms crates/kr-worker/src/action/time.rs pure_proven_ms 1
+caller read_unbracketed crates/kr-worker/src/action/time.rs pure_wall_ms 1
+caller read_unbracketed crates/kr-worker/src/action/time.rs wall_reading 1
 caller utc_end_reached crates/kr-worker/src/action/time.rs utc_deadline_standing 1
 # The broker's checks, and the expiry sweep inside the subject's check.
 caller check_responsible crates/kr-worker/src/broker/methods.rs checks 1
@@ -269,7 +275,9 @@ caller admitted_open crates/kr-worker/src/broker/binder.rs close_ended 1
 allow crates/kr-worker/src/action/dedup.rs holds_back identity_of
 allow crates/kr-worker/src/action/dedup.rs revision clone get
 allow crates/kr-worker/src/action/time.rs now_ms load new now_ms
-allow crates/kr-worker/src/action/time.rs pure_wall_ms get
+allow crates/kr-worker/src/action/time.rs read_unbracketed get
+allow crates/kr-worker/src/action/time.rs level_of from
+allow crates/kr-worker/src/action/time.rs peak len push
 allow crates/kr-worker/src/action/time.rs utc_deadline_standing load named recorded
 allow crates/kr-worker/src/attachments.rs geometry new
 allow crates/kr-worker/src/attachments.rs get get
@@ -358,7 +366,7 @@ allow crates/kr-worker/src/service.rs validate any as_str contains iter
 # call through a field, a guard or a parameter names the definition of that type and never the
 # body's own file by default. A name has an `allow` row or a `calls` row for a body, not both.
 calls crates/kr-worker/src/action/time.rs pure_proven_ms projected crates/kr-worker/src/action/time.rs
-calls crates/kr-worker/src/action/time.rs pure_wall_ms now_ms crates/kr-worker/src/action/time.rs
+calls crates/kr-worker/src/action/time.rs read_unbracketed now_ms crates/kr-worker/src/action/time.rs
 calls crates/kr-worker/src/broker/agents.rs attested attested_thread crates/kr-worker/src/broker/bridge.rs
 calls crates/kr-worker/src/broker/binder.rs admitted_open iter crates/kr-worker/src/broker/arbitration.rs
 calls crates/kr-worker/src/broker/bridge.rs attested_thread attested_thread crates/kr-worker/src/broker/bridge.rs

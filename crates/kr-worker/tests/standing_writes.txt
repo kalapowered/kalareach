@@ -58,6 +58,9 @@ outside crates/kr-worker/src/service.rs decidable
 # own, made by its wrapper from what the limits hand back, and stands outside the scope.
 # The expiry sweep of the questions that are due: run only for `Sweep::Run`, which is `Mode::First`.
 site crates/kr-worker/src/service.rs sweep_questions sweep 1
+# The note of the wall reading that the pure wall reader takes: the readings' lock is taken under
+# the state's, in the contract's order, and nothing else of the contract is changed.
+site crates/kr-worker/src/action/time.rs pure_wall_ms read_unbracketed 1
 # The slot that holds the session's guard when this check takes it itself (no pass holds one): a
 # local `Option`, not a state that others read.
 site crates/kr-worker/src/service.rs check_admission_limits insert 1
@@ -77,7 +80,10 @@ site crates/kr-worker/src/session.rs journal_mut &mut 1
 # contract takes its readings in `take`, a function that the contract's module alone can call
 # and that several other functions of this crate share the name of: its callers are `caller` rows,
 # which read the file of the contract only, where the other makers of the reading are `only`
-# rows, which read the whole crate.
+# rows, which read the whole crate. The one write that a pure reader makes is the note of the
+# reading that `pure_wall_ms` takes, through `read_unbracketed`, the contract's second place that
+# reads the wall clock: the readings are evidence of how far the wall clock had got, whichever
+# check reads it, and the pass raises no floor and moves no mark or checkpoint.
 only check_utc_deadline crates/kr-worker/src/local_gate.rs check 1
 only check_utc_deadline crates/kr-worker/src/runtime.rs start_and_say_if_the_shell_ended 1
 only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
@@ -90,6 +96,7 @@ caller take crates/kr-worker/src/action/time.rs wall_reading 1
 only wall_reading crates/kr-worker/src/action/time.rs proven_wall_ms 1
 only wall_reading crates/kr-worker/src/action/time.rs retrust 1
 only wall_reading crates/kr-worker/src/action/time.rs tombstone 1
+only read_unbracketed crates/kr-worker/src/action/time.rs wall_reading 1
 only proven_wall_ms crates/kr-worker/src/action/time.rs settled_utc_ms 1
 only proven_wall_ms crates/kr-worker/src/action/time.rs check_utc_deadline 1
 only proven_wall_ms crates/kr-worker/src/action/time.rs validity 1
@@ -117,8 +124,6 @@ site crates/kr-worker/src/persistence/fault.rs observe note_fault 1
 allow crates/kr-worker/src/action/dedup.rs holds_back identity_of
 allow crates/kr-worker/src/action/dedup.rs revision clone get
 allow crates/kr-worker/src/action/time.rs lock lock
-allow crates/kr-worker/src/action/time.rs now_ms load new now_ms
-allow crates/kr-worker/src/action/time.rs pure_wall_ms get
 allow crates/kr-worker/src/action/time.rs utc_deadline_standing load named recorded
 allow crates/kr-worker/src/attachments.rs geometry new
 allow crates/kr-worker/src/attachments.rs get get
@@ -201,7 +206,6 @@ allow crates/kr-worker/src/service.rs validate any as_str contains iter
 # body's own file by default. A name has an `allow` row or a `calls` row for a body, not both.
 calls crates/kr-worker/src/action/time.rs pure_proven_ms lock crates/kr-worker/src/action/time.rs
 calls crates/kr-worker/src/action/time.rs pure_proven_ms projected crates/kr-worker/src/action/time.rs
-calls crates/kr-worker/src/action/time.rs pure_wall_ms now_ms crates/kr-worker/src/action/time.rs
 calls crates/kr-worker/src/broker/ledger.rs fault of crates/kr-worker/src/broker/ledger.rs
 calls crates/kr-worker/src/broker/ledger.rs of observe crates/kr-worker/src/persistence/fault.rs
 calls crates/kr-worker/src/broker/ledger.rs pending decode crates/kr-worker/src/broker/ledger.rs

@@ -576,9 +576,9 @@ enum Refusal {
 /// a staircase enters the same reading at its second, and because a mark or checkpoint that this
 /// boot's record put back is in no staircase.
 ///
-/// Every reading comes here through [`TimeContract::take`] and the unbracketed read of
-/// [`TimeContract::wall_reading`], the two places that read the wall clock, each reading its clocks
-/// and noting what it read in one hold of the lock that guards this. The readings are noted in the
+/// Every reading comes here through [`TimeContract::take`] and
+/// [`TimeContract::read_unbracketed`], the two places that read the wall clock, each reading its
+/// clocks and noting what it read in one hold of the lock that guards this. The readings are noted in the
 /// order they were taken, and no reading is in flight when a confirmation is decided. Nothing here
 /// belongs to a confirmation: a decision uses up nothing and applies its own act. The readings
 /// are never written down.
@@ -1314,20 +1314,22 @@ impl TimeContract {
         })
     }
 
-    /// The wall clock's reading as it stands, with no lock and no side effect: the reading is not
-    /// kept and the floor is not raised.
+    /// The wall clock's reading as it stands, with no bracket: the reading is noted in the readings
+    /// as every wall reading is, and no floor is raised and no mark or checkpoint is moved.
     ///
-    /// A check that asks again whether a UTC end has been reached reads this where it may take no
-    /// lock; what it leaves out against `Self::proven_wall_ms` is the kept reading and the
-    /// high-water projection, so it can read earlier than the proven reading and never later.
+    /// A check that asks again whether a UTC end has been reached reads this where it may change
+    /// nothing else; what it leaves out against `Self::proven_wall_ms` is the bracket, the floor's
+    /// raise for the tries that were held up and the high-water projection, so it can read earlier
+    /// than the proven reading and never later. The readings' lock is taken after the state's, as
+    /// the order of the contract's locks has it.
     #[must_use]
     pub fn pure_wall_ms(&self) -> u64 {
-        self.wall.now_ms().get()
+        self.read_unbracketed()
     }
 
     /// The earliest the wall clock can honestly read now, as `Self::proven_wall_ms` reads it, with
-    /// no side effect: the mark is read under the contract's lock, the reading is not kept and the
-    /// floor is not raised.
+    /// no change of the floor, a mark or a checkpoint: the mark is read under the contract's lock
+    /// and the reading is noted in the readings as every wall reading is.
     #[must_use]
     pub fn pure_proven_ms(&self) -> u64 {
         let state = self.lock();
@@ -1338,7 +1340,8 @@ impl TimeContract {
     }
 
     /// Decides one copy of authority against its UTC deadline as [`Self::check_utc_deadline`]
-    /// decides it, reading the clocks and the floor and changing none of them.
+    /// decides it, reading the clocks and the floor and changing none of them; the wall reading is
+    /// noted in the readings, as every wall reading is.
     ///
     /// Where the full check raises the floor to the reading and owes the daemon's record the value
     /// it loaded, this reads the floor as it stands against the pure reading
@@ -1903,7 +1906,7 @@ impl TimeContract {
 
     /// Reads the clocks together, between two readings of the continuous clock, and notes every
     /// wall reading in the readings: every reading this contract takes of the wall clock comes
-    /// through here or through [`Self::wall_reading`] ([`Readings`]).
+    /// through here or through [`Self::read_unbracketed`] ([`Readings`]).
     ///
     /// A try is used for a comparison only where the two readings of the continuous clock are no
     /// further apart than [`DISCONTINUITY_TOLERANCE`], and the clocks are read again, at most three
@@ -1957,12 +1960,21 @@ impl TimeContract {
     /// deadline, a comparison with another host's reading. No narrow reading here raises a mark,
     /// so the walls of the tries held up before it are only published and noted, as
     /// [`Self::take`] does. Where no narrow bracket could be taken, the clock is read once more
-    /// with no bracket, in one hold of the readings' lock, and that reading is stamped after it and
-    /// noted the same way.
+    /// with no bracket ([`Self::read_unbracketed`]).
     fn wall_reading(&self) -> u64 {
         if let Some(taken) = self.take().narrow {
             return taken.wall_ms;
         }
+        self.read_unbracketed()
+    }
+
+    /// Reads the wall clock once with no bracket, in one hold of the readings' lock, and notes the
+    /// reading in the staircase of the highest readings, stamped at the continuous clock's reading
+    /// after it. It is the second of the two places that read the wall clock: a reading that no
+    /// narrow bracket could be taken for, and a reading that may change nothing else, is evidence
+    /// of how far the wall clock had got all the same. It takes no other lock of the contract, so
+    /// a caller that holds the state's lock may call it.
+    fn read_unbracketed(&self) -> u64 {
         let mut readings = self
             .readings
             .lock()
@@ -4783,6 +4795,51 @@ mod tests {
             contract.trust(),
             WallClockTrust::Unresolved,
             "the clock went back ten minutes from a reading that no bracket was taken for"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: a reading of the wall clock that a check which changes nothing
+    /// else takes is held against the pending confirmation too. The pure reader reads a peak ten
+    /// minutes ahead of the owner's clock, and the clock is back at the owner's level for the next
+    /// look.
+    #[test]
+    fn a_reading_that_moves_no_mark_is_held_against_the_pending_confirmation() {
+        let (_floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let start = held.wall.now_ms().get();
+        held.wall.set(start + 600_000);
+        assert_eq!(
+            contract.pure_wall_ms(),
+            start + 600_000,
+            "the pure reading is the peak"
+        );
+        held.wall.set(start + 30_000);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading that moved no mark"
+        );
+    }
+
+    /// KR-REQ-09.18, KR-REQ-09.19: the comparison of a UTC end that a pass asking again makes reads
+    /// the wall clock through the same rule: the peak it read, ten minutes ahead of the owner's
+    /// clock and short of the end, refuses the pending confirmation at the next look.
+    #[test]
+    fn the_standing_comparison_of_a_utc_end_is_held_against_the_pending_confirmation() {
+        let (_floor, held, contract) = found_a_rollback_and_was_confirmed();
+        let start = held.wall.now_ms().get();
+        held.wall.set(start + 600_000);
+        assert_eq!(
+            contract.utc_deadline_standing(start + 3_600_000),
+            UtcDeadline::Ahead,
+            "the end is far ahead of the peak"
+        );
+        held.wall.set(start + 30_000);
+        contract.observe();
+        assert_eq!(
+            contract.trust(),
+            WallClockTrust::Unresolved,
+            "the clock went back ten minutes from a reading of the standing comparison"
         );
     }
 

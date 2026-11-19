@@ -111,8 +111,8 @@ const OVERTAKE: &str = "crates/kr-worker/src/service/overtake.rs";
 fn a_take_planted_in_the_pure_wall_reader_is_reported() {
     let found = planted(
         TIME,
-        "        self.wall.now_ms().get()\n    }",
-        "        let _held = self.readings.lock();\n        self.wall.now_ms().get()\n    }",
+        "    pub fn pure_wall_ms(&self) -> u64 {\n        self.read_unbracketed()",
+        "    pub fn pure_wall_ms(&self) -> u64 {\n        let _held = self.readings.lock();\n        self.read_unbracketed()",
     );
     only_finding(&found, "action/time.rs pure_wall_ms calls lock 1 time(s)");
 }
@@ -152,10 +152,11 @@ fn the_proven_reading_planted_in_the_pure_proven_reader_is_reported() {
         "        let now = self.pure_wall_ms();\n        state.high_water",
         "        let now = self.pure_wall_ms();\n        let _kept = self.proven_wall_ms(&state);\n        state.high_water",
     );
-    // The reading is kept under the readings' own lock, in a function that the pass now calls.
+    // The reading is kept by the contract's `take`, which takes the readings' lock, in a function that
+    // the pass now calls: the scan reaches that function and reports its call of `take`.
     finding_among(
         &found,
-        "action/time.rs wall_reading calls lock 1 time(s) and no row lists it",
+        "action/time.rs wall_reading calls take, which several functions of the crate declare",
     );
 }
 
@@ -163,12 +164,12 @@ fn the_proven_reading_planted_in_the_pure_proven_reader_is_reported() {
 fn the_kept_reading_planted_in_the_pure_wall_reader_is_reported() {
     let found = planted(
         TIME,
-        "        self.wall.now_ms().get()\n    }",
-        "        let _kept = self.wall_reading();\n        self.wall.now_ms().get()\n    }",
+        "    pub fn pure_wall_ms(&self) -> u64 {\n        self.read_unbracketed()",
+        "    pub fn pure_wall_ms(&self) -> u64 {\n        let _kept = self.wall_reading();\n        self.read_unbracketed()",
     );
     finding_among(
         &found,
-        "action/time.rs wall_reading calls lock 1 time(s) and no row lists it",
+        "action/time.rs wall_reading calls take, which several functions of the crate declare",
     );
 }
 
@@ -182,7 +183,7 @@ fn the_second_raise_planted_in_the_gates_standing_comparison_is_reported() {
     // The second raise is read where it stands: it takes the contract's lock and keeps a reading.
     for names in [
         "action/time.rs settled_utc_ms calls lock 1 time(s) and no row lists it",
-        "action/time.rs wall_reading calls lock 1 time(s) and no row lists it",
+        "action/time.rs wall_reading calls take, which several functions of the crate declare",
         "local_gate.rs check_bound calls settled_utc_ms 1 time(s) and no row lists the caller",
     ] {
         finding_among(&found, names);
