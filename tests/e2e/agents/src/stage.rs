@@ -544,6 +544,30 @@ impl Installation {
         rustix::fs::renameat(&handle, "current.next", &handle, CURRENT_LINK)
             .map_err(|error| format!("the link is not replaced: {error}"))
     }
+
+    /// Fails unless `current` names the build installed at `prefix`, read through the held handle of
+    /// the directory `agent` as the run made it: an agent that ran since the link was set may have
+    /// pointed it elsewhere, and the next start would run what it names.
+    ///
+    /// # Errors
+    ///
+    /// Returns why `agent` is not the directory the run made, the link cannot be read, or it names
+    /// another place.
+    pub fn names(&self, run: &Run, prefix: &Path) -> Result<(), String> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let handle = self.agent.open(run.root(), run.pin())?;
+        let target = rustix::fs::readlinkat(&handle, CURRENT_LINK, Vec::new())
+            .map_err(|error| format!("the installation's link cannot be read: {error}"))?;
+        if target.to_bytes() == prefix.as_os_str().as_bytes() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the installation's link names {:?} and not {}",
+                target,
+                prefix.display()
+            ))
+        }
+    }
 }
 
 /// The largest program [`PlacedProgram`] reads whole.
