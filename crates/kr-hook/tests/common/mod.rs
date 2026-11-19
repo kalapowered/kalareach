@@ -426,6 +426,9 @@ pub struct Ran {
     pub stderr: String,
     /// How long it took from start to exit.
     pub took: Duration,
+    /// Whether the whole of the input was written to it and flushed: the write of an input nobody
+    /// reads to its end fails, or never completes.
+    pub written: std::io::Result<()>,
 }
 
 /// Runs a command to its end with `input` on standard input, which is then closed.
@@ -461,13 +464,13 @@ fn run(mut command: Command, input: &[u8], hold: bool, within: Duration) -> Ran 
     let input = input.to_vec();
     let (release, released) = std::sync::mpsc::channel::<()>();
     let writing = std::thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        let _ = stdin.flush();
+        let written = stdin.write_all(&input).and_then(|()| stdin.flush());
         if hold {
             // Held until the process has ended, then closed.
             let _ = released.recv();
         }
         drop(stdin);
+        written
     });
     let mut stdout = child.stdout.take().expect("its output");
     let mut stderr = child.stderr.take().expect("its diagnostics");
@@ -494,12 +497,13 @@ fn run(mut command: Command, input: &[u8], hold: bool, within: Duration) -> Ran 
     };
     let took = started.elapsed();
     drop(release);
-    let _ = writing.join();
+    let written = writing.join().expect("the input is written");
     Ran {
         code: status.code(),
         stdout: reading.join().expect("the output is read"),
         stderr: diagnosing.join().expect("the diagnostics are read"),
         took,
+        written,
     }
 }
 

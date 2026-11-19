@@ -18,7 +18,7 @@ use std::io::Read as _;
 use std::time::{Duration, Instant};
 
 use common::{
-    ATTEMPTS, LIVENESS, Placed, Reached, hook_reaching, read_line, run_holding_input,
+    ATTEMPTS, LIVENESS, Placed, Reached, StandIn, hook_reaching, read_line, run_holding_input,
     run_with_input,
 };
 
@@ -227,13 +227,14 @@ fn kr_req_12_27_input_a_hook_cannot_read_is_answered_neutrally() {
 
 /// KR-REQ-12.27: outside a launch a hook reads its input to the end without parsing it, so an
 /// application's write of a large input completes and a malformed one is not a diagnostic: the
-/// answer is the neutral one, standard error is empty, and it comes inside the shortest timeout.
+/// answer is the neutral one and standard error is empty. A hook that ran out of its deadline always
+/// says so on standard error, so an empty one is a hook that answered before it.
 #[test]
 fn outside_a_launch_the_input_is_drained_without_a_parse_and_without_a_diagnostic() {
     let placed = Placed::new();
     let large = format!(
         r#"{{"session_id":"s","hook_event_name":"PostToolUse","tool_response":"{}"}}"#,
-        "x".repeat(4 * 1024 * 1024)
+        "x".repeat(LARGE)
     );
     for hooks in every_application() {
         for input in [
@@ -250,7 +251,179 @@ fn outside_a_launch_the_input_is_drained_without_a_parse_and_without_a_diagnosti
                 ran.stderr, "",
                 "{case}: nothing is said about an input nobody reads"
             );
-            common::assert_answered_in_time(&ran.stderr, SHORTEST_TIMEOUT, &case);
+            assert!(ran.written.is_ok(), "{case}: {:?}", ran.written);
+        }
+    }
+}
+
+/// The length of the tail that a hook's input carries in the cases that read it to its end: more
+/// than a pipe holds, so a hook that stops reading leaves the application's write unfinished.
+const LARGE: usize = 4 * 1024 * 1024;
+
+/// What a hook of a launch is asked to read: where its registration is, and the hook events file
+/// the registration names, if any.
+enum Registered {
+    /// No registration is there at all.
+    Absent,
+    /// A registration that names no hook events file, so Claude Code's value is the one read.
+    Default,
+    /// A registration that names a hook events file holding these bytes.
+    Events(Vec<u8>),
+}
+
+/// What a hook says on standard error.
+enum Says {
+    /// Nothing.
+    Nothing,
+    /// One line that starts as a hook's diagnostics do and holds this text.
+    Line(String),
+}
+
+/// KR-REQ-12.27: inside a launch a hook reads its input to the end however its run ends, and says
+/// nothing and reports nothing about an event its registration's map does not name. The run ends
+/// at a registration that is not there, at a hook events file that cannot be read or that holds
+/// events the check refuses, at input that is not JSON, at an event named twice, and at an event the
+/// map names with a member of the wrong type; none of them reaches the worker, and an application's
+/// write of an input over a pipe's size completes in each. An event the map does not name is read
+/// the same, whatever else the input holds and whatever type its members have, and is no
+/// diagnostic. The cases that say something say one line and the answer is the neutral one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inside_a_launch_a_hook_reads_its_input_to_the_end_however_its_run_ends() {
+    let placed = Placed::new();
+    let files = placed.host.root().join("files");
+    kr_ipc::paths::create_private_directory(&files).expect("a private directory");
+    let credential_file = files.join("credential");
+    kr_ipc::paths::create_new_owner_only_file(&credential_file, "5e".repeat(32).as_bytes())
+        .expect("the credential is written");
+    let tail = "x".repeat(LARGE);
+    let refused = {
+        let mut events = kr_plugin_sdk::hook_events::HookEvents::claude_code();
+        events.events.clear();
+        serde_json::to_vec(&events).expect("the events are JSON")
+    };
+    let wrong = |event: &str, members: &str| {
+        format!(
+            r#"{{"session_id":"s","hook_event_name":"{event}",{members},"tool_response":"{tail}"}}"#
+        )
+    };
+    let cases: Vec<(&str, Registered, Vec<u8>, bool)> = vec![
+        (
+            "no registration",
+            Registered::Absent,
+            wrong("SessionStart", r#""source":"a""#).into_bytes(),
+            true,
+        ),
+        (
+            "an events file that is not JSON",
+            Registered::Events(b"not json".to_vec()),
+            wrong("SessionStart", r#""source":"a""#).into_bytes(),
+            true,
+        ),
+        (
+            "an events file the check refuses",
+            Registered::Events(refused),
+            wrong("SessionStart", r#""source":"a""#).into_bytes(),
+            true,
+        ),
+        (
+            "input that is not JSON",
+            Registered::Default,
+            [&b"not json"[..], tail.as_bytes()].concat(),
+            true,
+        ),
+        (
+            "an event named twice",
+            Registered::Default,
+            wrong("SessionStart", r#""hook_event_name":"SessionEnd""#).into_bytes(),
+            true,
+        ),
+        (
+            "an event with a member of the wrong type",
+            Registered::Default,
+            wrong("SessionStart", r#""source":3"#).into_bytes(),
+            true,
+        ),
+        (
+            "an event the map does not name",
+            Registered::Default,
+            wrong("Elsewhere", r#""source":"a""#).into_bytes(),
+            false,
+        ),
+        (
+            "an event the map does not name, with a member of the wrong type",
+            Registered::Default,
+            wrong("Elsewhere", r#""source":3,"session_id":["s"]"#).into_bytes(),
+            false,
+        ),
+        (
+            "an event the map does not name, with a member held twice",
+            Registered::Default,
+            wrong("Elsewhere", r#""source":"a","source":"b""#).into_bytes(),
+            false,
+        ),
+    ];
+    for hooks in every_application() {
+        for (number, (name, registered, input, says)) in cases.iter().enumerate() {
+            let case = format!("{} {name}", hooks.application);
+            let stand_in = StandIn::bind(&files, hooks.application);
+            let registration = files.join(format!("registration.{}.{number}", hooks.application));
+            let events_file = files.join(format!("events.{}.{number}", hooks.application));
+            let mut said = String::new();
+            let mut command = placed.command(&[hooks.application, "hook"]);
+            match registered {
+                Registered::Absent => {
+                    command.env("KR_REGISTRATION", files.join("absent").join("registration"));
+                    said = files.join("absent").display().to_string();
+                }
+                Registered::Default | Registered::Events(_) => {
+                    let mut text = format!(
+                        "endpoint={}\nprofile=lp-1\n\
+                         instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+                         credential={}\nframing=json_lines\n",
+                        stand_in.address,
+                        credential_file.display()
+                    );
+                    if let Registered::Events(bytes) = registered {
+                        kr_ipc::paths::create_new_owner_only_file(&events_file, bytes)
+                            .expect("the events are written");
+                        text.push_str(&format!("events={}\n", events_file.display()));
+                        said = events_file.display().to_string();
+                    }
+                    std::fs::write(&registration, text).expect("the registration is written");
+                    command.env("KR_REGISTRATION", &registration);
+                }
+            }
+            let says = if *says {
+                Says::Line(said)
+            } else {
+                Says::Nothing
+            };
+            let input = input.clone();
+            let ran = tokio::task::spawn_blocking(move || run_with_input(command, &input))
+                .await
+                .expect("the hook ran");
+            assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
+            assert_eq!(ran.stdout, b"{}\n", "{case}");
+            assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
+            assert!(ran.written.is_ok(), "{case}: {:?}", ran.written);
+            match says {
+                Says::Nothing => assert_eq!(ran.stderr, "", "{case}"),
+                Says::Line(text) => assert!(
+                    ran.stderr.starts_with("kr-hook: ")
+                        && ran.stderr.ends_with('\n')
+                        && ran.stderr.lines().count() == 1
+                        && ran.stderr.contains(&text),
+                    "{case}: one diagnostic line that names {text:?}: {:?}",
+                    ran.stderr
+                ),
+            }
+            // A connection the hook made is waiting for an accept by now.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), stand_in.listener.accept())
+                    .await
+                    .is_err(),
+                "{case}: the hook reached the worker"
+            );
         }
     }
 }
@@ -421,12 +594,15 @@ fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
             if full {
                 fill(&writer);
             }
-            // Input the hook cannot read, which it says so about on standard error.
-            let held = run_beside(
-                placed.command(&[hooks.application, "hook"]),
-                b"not json",
-                writer,
+            // A launch whose registration is not there: the hook reads its input to the end, and
+            // says so about the registration on standard error. Outside a launch it would say
+            // nothing, so the control would have no line to read.
+            let mut command = placed.command(&[hooks.application, "hook"]);
+            command.env(
+                "KR_REGISTRATION",
+                placed.host.root().join("absent").join("registration"),
             );
+            let held = run_beside(command, b"not json", writer);
             assert_eq!(held.answer, b"{}\n", "{case}");
             assert_eq!(held.code, Some(0), "{case}");
             let mut said = String::new();
