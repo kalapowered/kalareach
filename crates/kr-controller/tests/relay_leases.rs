@@ -21,6 +21,10 @@ mod local_relay;
 #[path = "../../kr-transport/tests/support/pkarr.rs"]
 mod pkarr;
 
+// A stand-in proxy that opens every tunnel, for the endpoint of the case that holds a login.
+#[path = "../../kr-client/tests/support/connect_proxy.rs"]
+mod connect_proxy;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1820,6 +1824,58 @@ async fn an_endpoint_that_uses_no_relay_is_left_alone() {
         .endpoint_for_tests()
         .expect("the host is on the network");
     assert!(endpoint.remove_relay(&chosen).await.is_none());
+}
+
+/// KR-REQ-10.02: once the proxy has refused the login that the host's endpoint reaches its relays
+/// through, the keeper asks the lease service for nothing: a lease that falls due for a refill while
+/// the login stands is refilled, and the same fall of time after the verdict costs no request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_keeper_asks_the_lease_service_for_nothing_once_the_proxy_has_refused_the_login() {
+    let proxy = connect_proxy::ConnectProxy::tunnelling().await;
+    let login = kr_transport::proxy::ProxyCredential::new(
+        kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+        kr_crypto::secret::SecretVec::new(b"password".to_vec()),
+    )
+    .expect("a login");
+    let through = proxy
+        .url
+        .parse::<kr_transport::config::ProxyUrl>()
+        .expect("a proxy address")
+        .with_login(login.clone());
+    let tls = kr_controller::service::net::proxy_login::proxy_tls(&[]).expect("verification");
+    let mut config = net_support::loopback();
+    config.login_front = Some(kr_transport::front::FrontOpener(Arc::new(
+        kr_client::tunnel::ProxyTunnels::new(through.clone(), tls),
+    )));
+    config.proxy_url = Some(through);
+    let rig = Rig::start_over(true, 8 * 1024 * 1024, config, None).await;
+    let owner = rig.owner_device();
+    rig.until("the owner's device holds a lease", || rig.holds(&owner))
+        .await;
+    rig.pass().await;
+    let issued = rig.requests(ISSUE);
+
+    // The lease falls due for a refill while the login stands: the keeper asks.
+    let due =
+        Duration::from_secs(u64::from(LEASE_SECONDS)) - REFILL_WHEN_LEFT + Duration::from_secs(1);
+    rig.time_passes(due);
+    rig.pass().await;
+    assert_eq!(
+        rig.requests(ISSUE),
+        issued + 1,
+        "the refill is asked for while the login stands"
+    );
+
+    // The same fall of time after the verdict: the keeper asks for nothing.
+    login.refuse(kr_transport::proxy::StopKind::Refused);
+    rig.time_passes(due);
+    rig.pass().await;
+    rig.pass().await;
+    assert_eq!(
+        rig.requests(ISSUE),
+        issued + 1,
+        "no lease was asked for after the verdict"
+    );
 }
 
 /// KR-REQ-17.35: a host that is not signed in has no account to bill, so it asks the service for
