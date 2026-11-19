@@ -9645,12 +9645,38 @@ fn a_channel_end_stores_the_provenance_its_answer_went_by() {
     );
 }
 
+/// KR-REQ-12.09: the provenance stored with a channel end is kept when the same receipt is settled
+/// again by a word that names none, as the upstream's late word does for an unknown outcome.
+#[test]
+fn a_later_settlement_of_a_channel_end_keeps_the_provenance_it_stored() {
+    let mut journal = Journal::in_memory().expect("a journal");
+    settled_unknown(&mut journal, 1, 7, true, 2_000);
+    let settled = journal
+        .settle(
+            actor("device:phone"),
+            action(1),
+            ReceiptState::Applied,
+            None,
+            None,
+            TimestampMs::new(3_000),
+        )
+        .expect("the late word settles the unknown outcome");
+    assert_eq!(settled.state, ReceiptState::Applied);
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(1))
+            .expect("reads"),
+        Some(kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse),
+        "settling the receipt again does not erase how the answer went"
+    );
+}
+
 /// KR-REQ-12.18: a journal an earlier build of this schema version wrote has no column for the
 /// mark. Opening it adds the column, keeps every unknown outcome it holds as one that stands in the
 /// way and as one that records no provenance, and lets the next channel end be recorded with its
 /// provenance.
 #[test]
-fn a_journal_without_the_channel_end_column_gets_it_when_opened() {
+fn a_journal_without_the_channel_provenance_column_gets_it_when_opened() {
     let temp = kr_ipc::testing::TempHost::create();
     let path = temp
         .environment()

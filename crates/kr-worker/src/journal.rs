@@ -1806,7 +1806,8 @@ impl Journal {
         transaction
             .execute(
                 "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
-                     error_message = ?7, updated_at_ms = ?8, channel_provenance = ?9
+                     error_message = ?7, updated_at_ms = ?8,
+                     channel_provenance = COALESCE(?9, channel_provenance)
                  WHERE actor_id = ?1 AND action_id = ?2",
                 params![
                     receipt.actor_id.as_str(),
