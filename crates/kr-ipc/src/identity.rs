@@ -3634,6 +3634,308 @@ mod tests {
         assert_eq!(process_state(&first), ProcessState::Running);
     }
 
+    /// The process that a case reads when the reading is of a process whose threads come and go.
+    /// It is not the test's own: the other cases run in other threads of that process at the same
+    /// time, and every thread they start or end while a reading is made makes the reading again,
+    /// however often that is. This process has the threads and the child that the case that
+    /// started it tells it to have, and no others.
+    ///
+    /// It is this test binary, started again to run [`the_process_a_case_reads`], which does
+    /// nothing in a run of the suite. It takes one command a line on its input and ends, with what
+    /// it holds, when the input ends.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    mod held {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+        use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
+        use std::thread::JoinHandle;
+
+        /// Set in the process that serves.
+        pub(super) const SERVES: &str = "KR_IDENTITY_TEST_SERVES";
+        /// What marks each line that the process that serves says. The harness's own text can
+        /// come before it on the same line.
+        const SAYS: &str = "held: ";
+
+        /// Threads wait for it, and [`Signal::give`] lets them all go.
+        #[derive(Clone, Default)]
+        struct Signal(Arc<(Mutex<bool>, Condvar)>);
+
+        impl Signal {
+            fn wait(&self) {
+                let (given, heard) = &*self.0;
+                drop(
+                    heard
+                        .wait_while(given.lock().expect("the signal"), |given| !*given)
+                        .expect("the signal"),
+                );
+            }
+
+            fn give(&self) {
+                let (given, heard) = &*self.0;
+                *given.lock().expect("the signal") = true;
+                heard.notify_all();
+            }
+        }
+
+        /// What the process that serves holds from `begin` to `finish`.
+        struct Round {
+            gate: Signal,
+            over: Signal,
+            /// Threads older than the owner, each of which makes a thread when the gate opens and
+            /// ends.
+            holders: Vec<JoinHandle<JoinHandle<()>>>,
+            /// The thread that has the child, which ends when it is told to leave, with the child
+            /// running.
+            owner: JoinHandle<Child>,
+            leave: mpsc::Sender<()>,
+            /// A thread younger than the owner.
+            younger: Option<(Signal, JoinHandle<()>)>,
+        }
+
+        fn a_child() -> Child {
+            Command::new("sleep")
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("a child")
+        }
+
+        /// Starts the holders, then the owner and its child, and gives the child's identifier and the
+        /// owner's thread identifier.
+        fn begin(holders: usize) -> (Round, u32, u32) {
+            let (gate, over) = (Signal::default(), Signal::default());
+            let holders = (0..holders)
+                .map(|_| {
+                    let (gate, over) = (gate.clone(), over.clone());
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        std::thread::spawn(move || over.wait())
+                    })
+                })
+                .collect();
+            let (started, started_child) = mpsc::channel();
+            let (leave, leaving) = mpsc::channel::<()>();
+            let owner = std::thread::spawn(move || {
+                let own = std::fs::read_link("/proc/thread-self").expect("this thread");
+                let tid: u32 = own
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.parse().ok())
+                    .expect("a thread identifier");
+                let child = a_child();
+                started
+                    .send((child.id(), tid))
+                    .expect("the process is waiting");
+                let _ = leaving.recv();
+                // The thread ends with the child running, and another thread has it from there.
+                child
+            });
+            let (child, owner_tid) = started_child.recv().expect("the owner started a child");
+            let round = Round {
+                gate,
+                over,
+                holders,
+                owner,
+                leave,
+                younger: None,
+            };
+            (round, child, owner_tid)
+        }
+
+        /// Ends the owner if it has not left, the child, and every thread.
+        fn finish(round: Round) {
+            // An owner that has left has dropped its end: there is nobody to tell.
+            let _ = round.leave.send(());
+            let mut child = round.owner.join().expect("the owner ends");
+            let _ = child.kill();
+            let _ = child.wait();
+            round.gate.give();
+            round.over.give();
+            for holder in round.holders {
+                holder
+                    .join()
+                    .expect("a holder ends")
+                    .join()
+                    .expect("its replacement ends");
+            }
+            if let Some((parked, thread)) = round.younger {
+                parked.give();
+                thread.join().expect("the younger thread ends");
+            }
+        }
+
+        /// The program: one command a line.
+        ///
+        /// - `begin <n>`: `n` holders, then the owner with a child; says `held <child> <owner's
+        ///   thread>`.
+        /// - `younger`: a thread younger than the owner; says `younger` once it has begun.
+        /// - `open`: the gate the holders wait at opens, and each makes a thread and ends.
+        /// - `leave`: the owner ends, with its child running.
+        /// - `finish`: the round ends; says `done`.
+        pub(super) fn serve() {
+            let mut round: Option<Round> = None;
+            for line in std::io::stdin().lock().lines() {
+                let line = line.expect("a command");
+                let mut words = line.split_whitespace();
+                match (words.next(), &mut round) {
+                    (Some("begin"), None) => {
+                        let holders = words
+                            .next()
+                            .and_then(|count| count.parse().ok())
+                            .expect("a count of holders");
+                        let (begun, child, owner_tid) = begin(holders);
+                        round = Some(begun);
+                        println!("{SAYS}held {child} {owner_tid}");
+                    }
+                    (Some("younger"), Some(round)) => {
+                        let parked = Signal::default();
+                        let waits = parked.clone();
+                        let thread = std::thread::spawn(move || waits.wait());
+                        round.younger = Some((parked, thread));
+                        println!("{SAYS}younger");
+                    }
+                    (Some("open"), Some(round)) => round.gate.give(),
+                    (Some("leave"), Some(round)) => {
+                        let _ = round.leave.send(());
+                    }
+                    (Some("finish"), Some(_)) => {
+                        finish(round.take().expect("a round"));
+                        println!("{SAYS}done");
+                    }
+                    _ => panic!("the command {line:?} is not one to serve now"),
+                }
+            }
+            if let Some(round) = round {
+                finish(round);
+            }
+        }
+
+        /// The end of the process's input, which a hook that runs during a reading can hold.
+        #[derive(Clone)]
+        pub(super) struct Commands(Arc<Mutex<Option<ChildStdin>>>);
+
+        impl Commands {
+            pub(super) fn send(&self, command: &str) {
+                let mut input = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+                let input = input.as_mut().expect("the process still takes commands");
+                writeln!(input, "{command}").expect("the process takes its command");
+            }
+
+            fn close(&self) {
+                *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            }
+        }
+
+        /// The process, started.
+        pub(super) struct Held {
+            process: Child,
+            commands: Commands,
+            said: BufReader<ChildStdout>,
+        }
+
+        impl Held {
+            pub(super) fn start() -> Self {
+                let mut process = Command::new(std::env::current_exe().expect("this test binary"))
+                    .args([
+                        "--exact",
+                        "identity::tests::the_process_a_case_reads",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(SERVES, "1")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .expect("the process starts");
+                let input = process.stdin.take().expect("its input");
+                let output = process.stdout.take().expect("its output");
+                Self {
+                    process,
+                    commands: Commands(Arc::new(Mutex::new(Some(input)))),
+                    said: BufReader::new(output),
+                }
+            }
+
+            pub(super) fn pid(&self) -> u32 {
+                self.process.id()
+            }
+
+            pub(super) fn commands(&self) -> Commands {
+                self.commands.clone()
+            }
+
+            /// The next thing the process says, which is a line of it among the harness's own.
+            fn hear(&mut self) -> String {
+                loop {
+                    let mut line = String::new();
+                    let read = self.said.read_line(&mut line).expect("the process speaks");
+                    assert!(read > 0, "the process ended without saying what was asked");
+                    if let Some(at) = line.find(SAYS) {
+                        return line[at + SAYS.len()..].trim_end().to_owned();
+                    }
+                }
+            }
+
+            /// Begins a round with `holders` holders: the child's identifier and the owner's thread
+            /// identifier.
+            pub(super) fn begin(&mut self, holders: usize) -> (u32, u32) {
+                self.commands.send(&format!("begin {holders}"));
+                let said = self.hear();
+                let mut words = said
+                    .strip_prefix("held ")
+                    .expect("the process says what it holds")
+                    .split_whitespace()
+                    .map(|word| word.parse::<u32>().expect("an identifier"));
+                (
+                    words.next().expect("a child"),
+                    words.next().expect("a thread"),
+                )
+            }
+
+            pub(super) fn younger(&mut self) {
+                self.commands.send("younger");
+                assert_eq!(self.hear(), "younger");
+            }
+
+            /// Lets the holders go on: each makes a thread and ends. Nothing is waited for.
+            pub(super) fn open(&self) {
+                self.commands.send("open");
+            }
+
+            pub(super) fn finish(&mut self) {
+                self.commands.send("finish");
+                assert_eq!(self.hear(), "done");
+            }
+
+            /// Ends the process by ending its input, and says whether it ended well.
+            pub(super) fn end(mut self) {
+                self.commands.close();
+                let status = self.process.wait().expect("the process ends");
+                assert!(status.success(), "the process ended well: {status}");
+            }
+        }
+
+        impl Drop for Held {
+            /// A case that fails still ends the process and what it holds.
+            fn drop(&mut self) {
+                self.commands.close();
+                let _ = self.process.wait();
+            }
+        }
+    }
+
+    /// The program of the process that [`held`] starts. In a run of the suite it is not told to
+    /// serve and passes.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn the_process_a_case_reads() {
+        if std::env::var_os(held::SERVES).is_some() {
+            held::serve();
+        }
+    }
+
     /// A process that has no children lists none, whatever failed earlier on the thread asking: a
     /// listing that returns nothing is not read as failed because of a call before it.
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -3655,27 +3957,25 @@ mod tests {
     }
 
     /// A process's children are read from that process alone: what it costs follows the one
-    /// process, however many others the host is running.
+    /// process, however many others the host is running. The process is one that only this case
+    /// changes, which is also what lets the reading's answer be waited for.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_process_s_children_are_read_from_that_process_alone() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("a child");
-        let me = std::process::id();
-        let (children, read) = super::processes_read_during(|| super::children_of(me));
-        let _ = child.kill();
-        let _ = child.wait();
-        let children = children.expect("the kernel lists this process's children");
+        let mut held = held::Held::start();
+        let (child, _) = held.begin(0);
+        let pid = held.pid();
+        let (children, read) = super::processes_read_during(|| super::children_of(pid));
+        held.end();
+        let children = children.expect("the kernel lists the process's children");
         assert!(
-            children.contains(&child.id()),
+            children.contains(&child),
             "the child is listed: {children:?}"
         );
         assert!(!read.is_empty(), "the reading is counted");
         assert!(
-            read.iter().all(|pid| *pid == me),
-            "nothing but this process was read: {read:?}"
+            read.iter().all(|read| *read == pid),
+            "nothing but that process was read: {read:?}"
         );
     }
 
@@ -3683,81 +3983,31 @@ mod tests {
     /// that left while it was made: the threads after it, and the children they hold, are not in
     /// it, and a listing taken up again after it finds its place by counting threads, which lands
     /// after a thread that stayed when the ones ahead of it have gone and takes in the threads made
-    /// since. A child that is alive is listed whatever the process's other threads do.
+    /// since. A child that is alive is listed whatever the process's other threads do. The threads
+    /// are those of a process that only this case changes: in this test's own process the other
+    /// cases' threads come and go as well, and a reading that never meets two passes alike is
+    /// refused.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_live_child_is_listed_while_the_process_s_other_threads_come_and_go() {
-        use std::sync::{Arc, Condvar, Mutex, mpsc};
-
         const ROUNDS: usize = 300;
-        let me = std::process::id();
+        let mut held = held::Held::start();
+        let pid = held.pid();
         let mut unlisted = Vec::new();
         for round in 0..ROUNDS {
             // Threads made before the one that holds the child, which each make a thread and leave
             // as the child is read: the kernel's listing meets each of them ahead of the thread
             // with the child, and new threads follow it.
-            let gate = Arc::new((Mutex::new(false), Condvar::new()));
-            let over = Arc::new((Mutex::new(false), Condvar::new()));
-            let leaving: Vec<_> = (0..16)
-                .map(|_| {
-                    let gate = Arc::clone(&gate);
-                    let over = Arc::clone(&over);
-                    std::thread::spawn(move || {
-                        let (open, opened) = &*gate;
-                        drop(
-                            opened
-                                .wait_while(open.lock().expect("the gate"), |open| !*open)
-                                .expect("the gate"),
-                        );
-                        std::thread::spawn(move || {
-                            let (done, ended) = &*over;
-                            drop(
-                                ended
-                                    .wait_while(done.lock().expect("the end"), |done| !*done)
-                                    .expect("the end"),
-                            );
-                        })
-                    })
-                })
-                .collect();
-            let (started, child) = mpsc::channel();
-            let (finished, release) = mpsc::channel::<()>();
-            let owner = std::thread::spawn(move || {
-                let mut child = std::process::Command::new("sleep")
-                    .arg("30")
-                    .spawn()
-                    .expect("a child");
-                started.send(child.id()).expect("the round is read");
-                let _ = release.recv();
-                let _ = child.kill();
-                let _ = child.wait();
-            });
-            let child = child.recv().expect("the owner started a child");
-            {
-                let (open, opened) = &*gate;
-                *open.lock().expect("the gate") = true;
-                opened.notify_all();
-            }
+            let (child, _) = held.begin(16);
+            held.open();
             let children =
-                super::children_of(me).expect("the kernel lists this process's children");
+                super::children_of(pid).expect("the kernel lists the process's children");
             if !children.contains(&child) {
                 unlisted.push(round);
             }
-            finished.send(()).expect("the owner is waiting");
-            owner.join().expect("the owner ends");
-            {
-                let (done, ended) = &*over;
-                *done.lock().expect("the end") = true;
-                ended.notify_all();
-            }
-            for thread in leaving {
-                thread
-                    .join()
-                    .expect("a thread ends")
-                    .join()
-                    .expect("its replacement ends");
-            }
+            held.finish();
         }
+        held.end();
         assert!(
             unlisted.is_empty(),
             "a child that was alive went unlisted in {} of {ROUNDS} readings, the first in round {:?}",
@@ -3769,51 +4019,28 @@ mod tests {
     /// A thread that ends hands its children to another thread of the process, and its own list is
     /// gone with it. A thread younger than the one that holds the child is read first, and when the
     /// holder ends after that, its list is gone when it is read and the pass is made again: the
-    /// child is in the list of the thread that took it, which the next pass reads.
+    /// child is in the list of the thread that took it, which the next pass reads. The threads are
+    /// those of a process that only this case changes, so no thread but the holder's changes the
+    /// pass that is made again.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn a_child_whose_thread_ends_while_its_list_is_unread_is_still_listed() {
-        use std::sync::mpsc;
-
-        let me = std::process::id();
-        let (started, started_child) = mpsc::channel();
-        let (leave, leaving) = mpsc::channel::<()>();
-        let owner = std::thread::spawn(move || {
-            let own = std::fs::read_link("/proc/thread-self").expect("this thread");
-            let tid: u32 = own
-                .file_name()
-                .and_then(|name| name.to_str())
-                .and_then(|name| name.parse().ok())
-                .expect("a thread identifier");
-            let child = std::process::Command::new("sleep")
-                .arg("30")
-                .spawn()
-                .expect("a child");
-            started
-                .send((child.id(), tid))
-                .expect("the test is waiting");
-            let _ = leaving.recv();
-            // The thread ends with the child running, and another thread has it from there.
-            child
-        });
-        let (child_id, owner_tid) = started_child.recv().expect("the owner started a child");
+        let mut held = held::Held::start();
+        let (child_id, owner_tid) = held.begin(0);
         // A thread younger than the owner, which a reading reads before the owner's list.
-        let (release, parked) = mpsc::channel::<()>();
-        let younger = std::thread::spawn(move || {
-            let _ = parked.recv();
-        });
-        let owners_task = format!("/proc/{me}/task/{owner_tid}");
+        held.younger();
+        let pid = held.pid();
+        let commands = held.commands();
+        let owners_task = format!("/proc/{pid}/task/{owner_tid}");
         let owners_list = format!("task/{owner_tid}/children");
-        let mut leave = Some(leave);
+        let mut left = false;
         let children = super::after_each_read(
-            move |_, file| {
+            move |read, file| {
                 // Once the list of a thread other than the owner's has been read, the owner ends,
                 // with its own list still to read.
-                if file.ends_with("/children")
-                    && file != owners_list
-                    && let Some(leave) = leave.take()
-                {
-                    leave.send(()).expect("the owner is waiting");
+                if read == pid && file.ends_with("/children") && file != owners_list && !left {
+                    left = true;
+                    commands.send("leave");
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
                     while std::path::Path::new(&owners_task).exists() {
                         assert!(
@@ -3824,14 +4051,11 @@ mod tests {
                     }
                 }
             },
-            || super::children_of(me),
+            || super::children_of(pid),
         );
-        release.send(()).expect("the younger thread is waiting");
-        younger.join().expect("it ends");
-        let mut child = owner.join().expect("the owner ended");
-        let _ = child.kill();
-        let _ = child.wait();
-        let children = children.expect("the kernel lists this process's children");
+        held.finish();
+        held.end();
+        let children = children.expect("the kernel lists the process's children");
         assert!(
             children.contains(&child_id),
             "the child is listed after its thread ended: {children:?}"
