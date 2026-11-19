@@ -8397,6 +8397,14 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
                 given_in_part || cut_by_the_end,
                 "the unfinished context send is shown ({cause}): {ended}"
             );
+        } else if cause == "provider_closure" {
+            // The provider closed the session: the host reports that it stopped before it sent any
+            // of the context, and counts no part as unconfirmed.
+            assert_eq!(
+                shown,
+                "This call was not given the host's context for its session: the host stopped before it sent any of it.",
+                "({cause}) {ended}"
+            );
         } else {
             assert!(
                 given_in_part,
