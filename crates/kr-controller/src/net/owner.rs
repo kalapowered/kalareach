@@ -759,7 +759,8 @@ impl OwnerAuthority {
     /// action asked for is recorded with the action before it is issued, so a retry of that
     /// mutation gets the same challenge, outstanding or not and across a restart, and the same
     /// identifier with another payload is `ID_CONFLICT`, whichever pairing method it was spent on.
-    /// `admission` is asked immediately before anything is written.
+    /// `admission` is asked inside the record, and then the lease the door found, immediately before
+    /// anything is written.
     ///
     /// # Errors
     ///
@@ -820,14 +821,15 @@ impl OwnerAuthority {
             return Err(now.refusal_to_confirm());
         }
         // The admission is asked inside the transaction that records the request, after every wait
-        // before it; nothing is issued unless that record is written. The lease the door found is
-        // asked again there, last, with no lock: it can end in the wait for the record's lock.
+        // before it; nothing is issued unless that record is written. It waits for the connection
+        // table, so the lease the door found is asked again after it, last, with no lock: it can
+        // end in the wait for the record's lock and in the wait for the table.
         let display = &resolved.display;
         let in_the_record = || {
             #[cfg(feature = "testing")]
             self.inside_the_record.wait();
-            caller.lease_serves(display)?;
-            admission()
+            admission()?;
+            caller.lease_serves(display)
         };
         let recorded = self.rows.record_requested(
             &PairingAction {
@@ -1322,14 +1324,15 @@ impl OwnerAuthority {
             return Err(now.refusal_to_confirm());
         }
         // The admission is asked inside the transaction that records the answer, after every wait
-        // before it. The lease the door found is asked again there, last, with no lock: it can end
-        // in the wait for the record's lock.
+        // before it. It waits for the connection table, so the lease the door found is asked again
+        // after it, last, with no lock: it can end in the wait for the record's lock and in the
+        // wait for the table.
         let display = &entry.display;
         let in_the_record = || {
             #[cfg(feature = "testing")]
             self.inside_the_record.wait();
-            caller.lease_serves(display)?;
-            admission()
+            admission()?;
+            caller.lease_serves(display)
         };
         let answered_at_ms = self.rows.record_answered(
             proof,
