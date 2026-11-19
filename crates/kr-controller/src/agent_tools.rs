@@ -4097,6 +4097,46 @@ mod tests {
         assert_eq!(declared::admissions_held(7, None), Err(refusal));
     }
 
+    /// KR-REQ-11.01: the host reads the table of an admitted package for a declared word only where
+    /// the package's current grants hold the capability: a package admitted without it, or with
+    /// other capabilities only, is not read.
+    #[test]
+    fn a_package_whose_admission_does_not_hold_the_capability_declares_no_target_the_host_resolves()
+    {
+        let package = |name: &str, grants: &[&str]| -> kr_protocol::admission::AdmittedPackage {
+            serde_json::from_value(serde_json::json!({
+                "plugin_id": format!("kalareach/{name}"),
+                "publisher_id": "kalareach",
+                "version": "0.1.0",
+                "package_digest": "A".repeat(43),
+                "origin": { "repository_id": "official", "enrolment_key": "key" },
+                "repository_generation": 1,
+                "package_dir": format!("/packages/{name}"),
+                "grants": grants,
+                "bridge": null,
+                "builds": [],
+                "component": null
+            }))
+            .expect("an admitted package")
+        };
+        let packages = [
+            package("holds", &["approval.respond", "skill_target.install"]),
+            package("other", &["approval.respond", "native_bridge.install"]),
+            package("none", &[]),
+            package("also", &["skill_target.install"]),
+        ];
+        let held = declared::holding_the_capability(&packages);
+        assert_eq!(
+            held.iter().map(|(dir, _)| dir.as_str()).collect::<Vec<_>>(),
+            ["/packages/holds", "/packages/also"]
+        );
+        assert!(
+            held.iter()
+                .all(|(_, digest)| *digest == packages[0].package_digest)
+        );
+        assert!(declared::holding_the_capability(&packages[1..3]).is_empty());
+    }
+
     /// KR-REQ-11.01: a package that now declares another entry key or another entry for the same
     /// place moves the place, so the installation is refused by name and nothing is written.
     #[cfg(unix)]

@@ -230,7 +230,7 @@ impl Controller {
         method: Method,
     ) -> Result<crate::agent_tools::Installer> {
         use crate::agent_tools::declared::{
-            Declaration, admissions_held, platform_refusal, served,
+            Declaration, admissions_held, holding_the_capability, platform_refusal, served,
         };
         if params.agent.compiled().is_some() {
             return Ok(installer);
@@ -251,17 +251,7 @@ impl Controller {
         let Some(snapshot) = self.current_snapshot(tokio::time::Instant::now()).await else {
             return Err(unread());
         };
-        let held: Vec<_> = snapshot
-            .packages
-            .iter()
-            .filter(|package| {
-                package
-                    .grants
-                    .iter()
-                    .any(|name| name == "skill_target.install")
-            })
-            .map(|package| (package.package_dir.clone(), package.package_digest))
-            .collect();
+        let held = holding_the_capability(&snapshot.packages);
         let read = tokio::task::spawn_blocking(move || {
             held.into_iter()
                 .filter_map(|(directory, digest)| {

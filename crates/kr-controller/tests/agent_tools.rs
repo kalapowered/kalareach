@@ -156,6 +156,172 @@ async fn a_removal_the_daemon_will_not_do_leaves_no_dispatch_marker() {
     assert_eq!(again.code, ErrorCode::InvalidArgument, "{again:?}");
 }
 
+/// The marker directory of a host holds nothing: a refusal before the change writes no marker.
+fn no_marker_was_written(host: &Host) -> bool {
+    let actions = host.state_dir.join("agent-tools/actions");
+    !actions.exists()
+        || std::fs::read_dir(&actions)
+            .expect("reads the directory")
+            .next()
+            .is_none()
+}
+
+/// A request to install the contact skill for the word `amp` at project scope, in a project folder
+/// of the test's own host, so that a refusal is decided before any other folder is read.
+fn install_for_amp(host: &Host) -> AgentToolsParams {
+    let project = host._temp.root().join("project");
+    std::fs::create_dir_all(&project).expect("a project folder");
+    AgentToolsParams {
+        agent: AgentTarget::parse("amp").expect("a word in the grammar"),
+        scope: InstallScope::Project,
+        project_dir: Nullable::some(project.to_string_lossy().into_owned()),
+    }
+}
+
+/// KR-REQ-11.01: through the daemon, a word in the grammar that no admitted package declares is
+/// refused by name, with the words the host knows, before any marker is written; the same request
+/// again is refused the same way, never answered as an outcome nobody knows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_word_no_admitted_package_declares_is_refused_by_the_daemon_before_any_marker() {
+    let host = host().await;
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let target = ActionTarget::environment(host.environment_id);
+    let params = install_for_amp(&host);
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    for attempt in ["first", "again"] {
+        let refused = client
+            .mutate(
+                Method::AgentToolsInstall,
+                action_id,
+                target.clone(),
+                &params,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect_err("and is refused");
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidArgument,
+            "{attempt}: {refused:?}"
+        );
+        assert_eq!(
+            refused.message,
+            "amp is not an agent this host knows; it knows codex, claude-code, opencode, \
+             gemini-cli, kimi-code-cli and qoder-cli",
+            "{attempt}"
+        );
+        assert!(no_marker_was_written(&host), "{attempt}");
+    }
+    let status = client
+        .request(Method::AgentToolsStatus, &params)
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a status of a word nobody declares and no record names is refused too");
+    assert_eq!(status.code, ErrorCode::InvalidArgument, "{status:?}");
+}
+
+/// Raises the admission revision of the host's catalogue by one: a change of the revocation policy
+/// it holds, whichever it holds now.
+async fn raise_the_admission_revision(host: &Host) {
+    use kr_protocol::admission::RevocationPolicy;
+    for policy in [RevocationPolicy::WarnOnly, RevocationPolicy::DisableAtOnce] {
+        if host
+            ._controller
+            .catalogue()
+            .put_disable_policy_in_force(policy)
+            .await
+            .expect("the policy is recorded")
+        {
+            return;
+        }
+    }
+    panic!("neither policy was a change");
+}
+
+/// KR-REQ-11.01: a grant or a package that changes while the host reads the admitted packages for
+/// a declared word refuses the request before the dispatch marker, so nothing was changed and an
+/// exact retry is asked again, not answered as an unknown outcome; the same request once the
+/// admissions stand still goes on to be answered by the word's own refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_of_the_admissions_while_the_packages_are_read_refuses_before_the_marker() {
+    use kr_controller::catalogue::TestingPoint;
+    let host = host().await;
+    // A snapshot computed before is reused at an unchanged revision, and the packages are read
+    // again only when the revision has moved: so the revision moves first.
+    raise_the_admission_revision(&host).await;
+    let (reached, reached_at) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let armed = std::sync::atomic::AtomicBool::new(true);
+    host._controller.catalogue().at_testing_point(move |point| {
+        if point == TestingPoint::PackageChecks
+            && armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = reached.send(());
+            let _ = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(30));
+        }
+    });
+
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let target = ActionTarget::environment(host.environment_id);
+    let params = install_for_amp(&host);
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let asked = tokio::spawn({
+        let (target, params) = (target.clone(), params.clone());
+        async move {
+            client
+                .mutate(Method::AgentToolsInstall, action_id, target, &params)
+                .await
+                .expect("the call reaches the daemon")
+                .expect_err("and is refused")
+        }
+    });
+    let held = tokio::task::spawn_blocking(move || {
+        reached_at
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok()
+    })
+    .await
+    .expect("the wait ends");
+    assert!(held, "the read of the packages was reached");
+    raise_the_admission_revision(&host).await;
+    release.send(()).expect("the read is released");
+
+    let refused = asked.await.expect("the request ends");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert_eq!(
+        refused.message,
+        "the packages this host admits changed while this request was read; ask again"
+    );
+    assert!(no_marker_was_written(&host));
+
+    // The admissions stand still now: the same request reads them once and gets the word's own
+    // refusal.
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let again = client
+        .mutate(Method::AgentToolsInstall, action_id, target, &params)
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("and is refused");
+    assert_eq!(again.code, ErrorCode::InvalidArgument, "{again:?}");
+    assert!(
+        again
+            .message
+            .starts_with("amp is not an agent this host knows;"),
+        "{again:?}"
+    );
+    assert!(no_marker_was_written(&host));
+}
+
 mod fence_support;
 
 /// KR-REQ-09.09, 09.12 and 26.16: a withdrawal whose fence could not be raised stops an

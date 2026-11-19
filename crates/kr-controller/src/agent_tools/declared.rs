@@ -59,6 +59,22 @@ pub(crate) fn served(
     }
 }
 
+/// The capability a package holds in its admission to declare an agent word.
+const CAPABILITY: &str = "skill_target.install";
+
+/// The directory and hash of each admitted package whose current grants hold the capability: the
+/// only packages whose tables are read for a declared word. A package admitted without the
+/// capability, or whose grant was taken back, is not read, whatever its table says.
+pub(crate) fn holding_the_capability(
+    packages: &[kr_protocol::admission::AdmittedPackage],
+) -> Vec<(String, kr_protocol::scalars::Digest256)> {
+    packages
+        .iter()
+        .filter(|package| package.grants.iter().any(|name| name == CAPABILITY))
+        .map(|package| (package.package_dir.clone(), package.package_digest))
+        .collect()
+}
+
 /// The refusal when the admissions changed while the packages were read.
 const ADMISSIONS_MOVED: &str =
     "the packages this host admits changed while this request was read; ask again";
