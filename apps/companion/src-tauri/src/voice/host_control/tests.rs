@@ -152,9 +152,12 @@ async fn a_heartbeat_goes_at_once_under_a_fresh_action_and_acknowledges_the_news
         }
     );
     // The second beat repeats an item the device already holds: it is told once.
-    tokio::time::advance(BEAT).await;
-    tokio::time::advance(BEAT).await;
-    tokio::task::yield_now().await;
+    for _ in 0..2 {
+        tokio::time::advance(BEAT).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
     assert!(
         events.news.try_recv().is_err(),
         "news already held is told again"
@@ -332,7 +335,13 @@ async fn a_note_a_mute_and_a_question_about_a_delegation_are_written_as_the_arms
 #[tokio::test(start_paused = true)]
 async fn a_write_the_host_does_not_answer_is_unanswered_after_its_bound_and_one_never_sent_is_not()
 {
-    let script = Script::new([Step::Hang, Step::Hang, Step::Fail(LinkError::NotSent)]);
+    // The first step is the heartbeat that goes at once; the case's own writes follow it.
+    let script = Script::new([
+        Step::Hang,
+        Step::Hang,
+        Step::Hang,
+        Step::Fail(LinkError::NotSent),
+    ]);
     let (control, _events) = HostControl::open(script, voice_session(), quiet());
     tokio::task::yield_now().await;
     assert_eq!(control.mute(true).await, Err(HostSendError::Unanswered));
