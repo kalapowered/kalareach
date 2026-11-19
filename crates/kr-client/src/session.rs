@@ -526,7 +526,8 @@ impl Outcomes {
 /// An unresolved action is one whose outcome nobody knows, and section 9 forbids forgetting one.
 /// The bound is what stops "never forget" becoming "grow for ever". A client reaches it through
 /// accepted actions whose receipts have not settled as much as through a host it cannot reach, and
-/// either way submitting more would only add to the pile. The actions the host refused for now
+/// either way submitting more would only add to the pile. A caller that knows an outcome is final
+/// frees its place with [`Session::settle`]. The actions the host refused for now
 /// ([`SubmittedAction::refused_for_now`]) are not among those, and have a bound of their own.
 pub const MAX_UNRESOLVED_ACTIONS: usize = 1024;
 
@@ -1414,6 +1415,12 @@ impl Session {
     ///
     /// Only an action sent through [`Session::send`] or [`Session::repeat`] needs this: the
     /// library settles every other action itself, as the host answers it.
+    ///
+    /// A caller may also release an action whose outcome the host could not establish, when it
+    /// knows that outcome is final: the transport the host used confirms nothing and will say
+    /// nothing later, so no receipt will ever settle it. The release frees the place the action
+    /// holds under [`MAX_UNRESOLVED_ACTIONS`]. The host's journal keeps the receipt as it was and
+    /// still answers a repeat of the identifier with it; only this client's book lets go.
     pub async fn settle(&self, action_id: ActionId) {
         self.state.outcomes.lock().await.settle_action(action_id);
     }
