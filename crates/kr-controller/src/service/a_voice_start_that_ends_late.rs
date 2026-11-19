@@ -689,6 +689,13 @@ async fn a_start_the_hold_refused_is_told_the_same_refusal_when_it_is_sent_again
         vec![
             Answer::Fails(ErrorCode::OutcomeUnknown),
             Answer::Refuses { gate: None },
+            // A host that runs the repeat after the row ended as a new start gets this call and
+            // fails the case at the refusal it expects, not at an empty script.
+            Answer::Call {
+                call: "call-3",
+                replayed: false,
+                gate: None,
+            },
         ],
         true,
     );
