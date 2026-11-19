@@ -755,3 +755,54 @@ async fn a_forget_calls_the_record_refuses_leaves_the_record_as_it_was_and_says_
     let _ = &daemon.placed;
     daemon.host.stop().await;
 }
+
+/// A key is not replaced while a start waits on its creation or while the call it made runs, and
+/// the replacement goes through once the calls are forgotten, with every later request made under
+/// the new key. (A guard for the held write: the race itself is the registry's case
+/// `a_change_runs_only_while_idle_and_a_start_cannot_pass_it`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_is_not_replaced_while_a_creation_is_held_or_a_call_runs_and_is_after_the_calls_are_forgotten()
+ {
+    let mut daemon = daemon().await;
+    let phone = Arc::new(phone(&daemon, &MANAGER).await);
+    let release = Arc::new(tokio::sync::Notify::new());
+    daemon.stand_in.script_create(CreateScript::Held(
+        Arc::clone(&release),
+        Box::new(CreateScript::Answer(201, Some(created_body("live_held")))),
+    ));
+    let starting = {
+        let phone = Arc::clone(&phone);
+        tokio::spawn(async move { phone.start().await })
+    };
+    until("the creation reached the stand-in", || {
+        daemon.stand_in.recorded().creates.len() == 1
+    })
+    .await;
+    let refusal = |result: Result<ParamsValue, ProtocolError>| {
+        result
+            .expect_err("a key is not replaced now")
+            .message
+            .contains("A call is using this key; replace it after the call has ended")
+    };
+    assert!(refusal(
+        set_key(&mut daemon.control, &daemon.host, OTHER_KEY).await
+    ));
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+
+    release.notify_one();
+    let _call = started(starting.await.expect("the task ends"));
+    assert!(refusal(
+        set_key(&mut daemon.control, &daemon.host, OTHER_KEY).await
+    ));
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+
+    forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect("the calls are forgotten");
+    set_key(&mut daemon.control, &daemon.host, OTHER_KEY)
+        .await
+        .expect("the key is replaced once nothing uses it");
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(OTHER_KEY));
+    let _ = &daemon.placed;
+    daemon.host.stop().await;
+}
