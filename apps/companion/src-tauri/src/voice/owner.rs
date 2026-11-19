@@ -62,10 +62,12 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 mod ceremony;
+mod context;
 pub(super) mod control;
 #[cfg(test)]
 mod note_tests;
 
+use self::context::{ContextProgress, ContextSend};
 use self::control::{CallControl, CallNews, ControlFeed, Said};
 use super::advice::MuteAdvice;
 use super::cause::Cause;
@@ -522,12 +524,6 @@ pub(super) struct Owner {
     sent_under: HashMap<String, Arc<AtomicBool>>,
     /// Whether the person and the model were told the call is tainted.
     taint_told: bool,
-}
-
-/// The context send a host's sender is running for this call.
-struct ContextSend {
-    /// The `voice.context.send` that began it, which the host's news about it names.
-    action_id: kr_protocol::ids::ActionId,
 }
 
 /// A delegation waiting for what was said before it to be read.
@@ -1825,18 +1821,21 @@ impl Owner {
         unconfirmed: u32,
         state: VoiceContextState,
     ) {
-        if self
-            .context
-            .as_ref()
-            .is_none_or(|send| send.action_id != action_id)
-        {
+        let Some(send) = self.context.as_mut() else {
             return;
-        }
-        match state {
-            VoiceContextState::Sending => {}
-            VoiceContextState::Done => self.context = None,
-            VoiceContextState::Stopped { stopped_by } => {
-                self.context = None;
+        };
+        match send.news(action_id, appended, of, unconfirmed, state) {
+            None | Some(ContextProgress::Sending { .. }) => {}
+            // The host took the request whatever its reply said.
+            Some(ContextProgress::Done) => {
+                self.view(|state| state.pass(ProblemKind::OpeningContext));
+            }
+            Some(ContextProgress::Stopped {
+                stopped_by,
+                appended,
+                of,
+                unconfirmed,
+            }) => {
                 tracing::warn!(
                     stopped_by = ?stopped_by,
                     "the host stopped sending the call's opening context"
@@ -1915,6 +1914,12 @@ impl Owner {
             return;
         };
         let (internal, within) = (self.internal_tx.clone(), self.shared.timings.host_within);
+        // The send's identity is made here, before anything is written, so that the host's news
+        // about it applies whether or not its reply comes, and whichever of the two comes first.
+        let action_id = ActionId::new(kr_ipc::new_uuid());
+        if matches!(control, CallControl::Host(_)) {
+            self.context = Some(ContextSend::begun(action_id));
+        }
         self.opening = Some(match control {
             CallControl::Managed(control) => tokio::spawn(async move {
                 let params = VoiceContextParams {
@@ -1943,7 +1948,7 @@ impl Owner {
             // The host selects the context and writes it to the provider at its own pace: this
             // device asks, and the host's news says how far it got.
             CallControl::Host(control) => tokio::spawn(async move {
-                let opened = match control.send_context(session_id, None).await {
+                let opened = match control.send_context(action_id, session_id, None).await {
                     Ok(queued) => Opened::Queued(queued),
                     Err(HostSendError::Unanswered) => Opened::HostUnanswered,
                     Err(HostSendError::NotSent | HostSendError::Refused(_)) => Opened::HostRefused,
@@ -1958,10 +1963,19 @@ impl Owner {
     /// after it.
     fn note_the_opening(&mut self, opened: &Opened) {
         self.opening = None;
-        if let Opened::Queued(queued) = opened {
-            self.context = Some(ContextSend {
-                action_id: queued.action_id,
-            });
+        match opened {
+            Opened::Queued(queued) => {
+                if let Some(send) = self
+                    .context
+                    .as_mut()
+                    .filter(|send| send.action_id() == queued.action_id)
+                {
+                    send.queued(queued.appends);
+                }
+            }
+            // A host that took none of it has nothing to tell of it.
+            Opened::HostRefused => self.context = None,
+            _ => {}
         }
         if let Some((why, words)) = opened.problem() {
             tracing::warn!("the call was not given its opening context: {why}");
@@ -2767,7 +2781,11 @@ impl Owner {
         // so that a person who reads the end reads it too.
         self.settle_the_opening().await;
         // A context send the host had not finished when the call ended was cut short by the end.
-        if self.context.take().is_some() {
+        if self
+            .context
+            .take()
+            .is_some_and(|send| !send.is_over())
+        {
             self.note_the_opening(&Opened::Cut);
         }
         self.view(|state| {
