@@ -2694,3 +2694,89 @@ async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_
         fixture.host.stop().await;
     }
 }
+
+/// A request for an owner confirmation records its challenge in a transaction that holds the
+/// record's lock, and a policy commit holds the policy's lock across its writes to the same
+/// record. A commit that takes the policy's lock while a request is inside the record neither
+/// waits for the request nor holds it up: both are answered. A watchdog ends the process where one
+/// waits for the other, so that a host that orders the two locks against each other fails this
+/// case within a bound and does not hang it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_commit_that_takes_its_lock_while_a_confirmation_request_is_in_the_record_neither_waits_for_the_other()
+ {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const BOUND: Duration = Duration::from_secs(20);
+
+    let fixture = Fixture::start().await;
+    let environment = fixture.host.environment_id;
+    let controller = Arc::clone(fixture.host.controller());
+    let finished = Arc::new(AtomicBool::new(false));
+    {
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            std::thread::sleep(BOUND * 3);
+            if !finished.load(Ordering::SeqCst) {
+                eprintln!(
+                    "a confirmation request that holds the record and a policy commit that holds \
+                     the policy wait for each other"
+                );
+                std::process::exit(1);
+            }
+        });
+    }
+
+    // The request stops inside the record, which it holds.
+    let (in_the_record, let_the_request_go) =
+        controller.pause_inside_the_record_of_a_confirmation();
+    let mut client = fixture.host.client().await;
+    let asking =
+        tokio::spawn(
+            async move { calls::request(environment, &mut client, an_invitation()).await },
+        );
+    tokio::task::spawn_blocking(move || in_the_record.recv_timeout(BOUND))
+        .await
+        .expect("the wait for the request ends")
+        .expect("the request reaches the record");
+
+    // The commit takes the policy's lock and stops there, then goes on to the record.
+    let (policy_is_held, held_rx) = std::sync::mpsc::channel();
+    let (let_the_commit_go, go_rx) = std::sync::mpsc::channel::<()>();
+    let committing = tokio::task::spawn_blocking({
+        let controller = Arc::clone(&controller);
+        move || {
+            controller.update_policy(|policy| {
+                policy_is_held
+                    .send(())
+                    .expect("the case waits for the commit");
+                go_rx.recv().expect("the case lets the commit go");
+                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
+                    last_synchronised_at_ms: Nullable::some(
+                        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                    ),
+                }));
+            })
+        }
+    });
+    tokio::task::spawn_blocking(move || held_rx.recv_timeout(BOUND))
+        .await
+        .expect("the wait for the commit ends")
+        .expect("the commit takes the policy's lock");
+    let_the_commit_go.send(()).expect("the commit goes on");
+    let_the_request_go.send(()).expect("the request goes on");
+
+    tokio::time::timeout(BOUND, asking)
+        .await
+        .expect("the request is answered while the commit holds the policy's lock")
+        .expect("the request ends")
+        .expect("the challenge is recorded");
+    tokio::time::timeout(BOUND, committing)
+        .await
+        .expect("the commit is made once the request has left the record")
+        .expect("the commit ends")
+        .expect("the policy is written");
+    finished.store(true, Ordering::SeqCst);
+    fixture.host.stop().await;
+}

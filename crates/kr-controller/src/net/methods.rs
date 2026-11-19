@@ -359,7 +359,11 @@ impl Controller {
                 let admission: Admission = {
                     let caller = caller.clone();
                     let subject = params.subject.clone();
+                    #[cfg(feature = "testing")]
+                    let controller = Arc::clone(self);
                     Arc::new(move || {
+                        #[cfg(feature = "testing")]
+                        controller.inside_the_record_of_a_confirmation.wait();
                         let now = caller.decided_now();
                         if !now.may_confirm(&subject) {
                             return Err(now.refusal_to_confirm());
