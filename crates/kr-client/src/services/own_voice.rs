@@ -82,6 +82,10 @@ pub const HANGUP_BOUND: Duration = Duration::from_secs(15);
 /// How long a close waits for the provider to say the session closed before it hangs up.
 pub const DRAIN_BOUND: Duration = Duration::from_secs(5);
 
+/// How many messages are read from a channel that is about to be let go, looking for the
+/// provider's closure among them.
+const QUEUED_READS: usize = 256;
+
 /// How much longer than a transport's own bound the provider waits before it counts the answer
 /// lost, for a transport that does not keep to its bound itself.
 const WATCHDOG_MARGIN: Duration = Duration::from_millis(500);
@@ -1155,6 +1159,7 @@ impl OwnVoiceProvider {
             closed_seen: false,
             counter: 0,
             muted: false,
+            mute_asked: None,
             _token: core.registry.track(),
         };
         let readiness = task.establish(1, readiness_ends).await;
@@ -1591,6 +1596,11 @@ struct CallTask {
     counter: u64,
     /// Whether the model's input audio is muted, as the provider last said.
     muted: bool,
+    /// The last mute or unmute this task wrote, by its identifier and the state it asked for,
+    /// until the provider's acknowledgement of that write is read. A write the provider took
+    /// before the channel failed has taken effect whether or not its acknowledgement came, so
+    /// the recovery restates this state and never undoes it.
+    mute_asked: Option<(String, bool)>,
     /// Held while this task runs, so that a removal waits for it before the key goes.
     _token: TaskToken,
 }
@@ -1624,6 +1634,17 @@ impl CallTask {
         // the one that started it.
         if self.core.registry.epoch() != self.epoch {
             return Err(NotReady::Unavailable);
+        }
+        // The probe is a write like every other and keeps the call's one pace: nothing else
+        // writes while this runs, so a reattachment after a burst waits for its turn before it
+        // attaches, within the time the attachment has.
+        loop {
+            let next = self.shared.pacer().next_at(Instant::now());
+            let Some(at) = next else { break };
+            if at >= ends {
+                return Err(NotReady::Unavailable);
+            }
+            tokio::time::sleep_until(at).await;
         }
         let key = match self.core.keys.key() {
             Ok(Some(key)) => key,
@@ -1673,7 +1694,11 @@ impl CallTask {
         // The probe restates the mute state rather than changing it, and is answered under its
         // own identifier.
         let probe_id = self.event_id("probe");
-        let kind = if self.muted {
+        let muted = self
+            .mute_asked
+            .as_ref()
+            .map_or(self.muted, |(_, asked)| *asked);
+        let kind = if muted {
             "session.input_audio.mute"
         } else {
             "session.input_audio.unmute"
@@ -1795,6 +1820,13 @@ impl CallTask {
                 }
                 let acknowledged = acknowledged();
                 if let Some(id) = &acknowledged {
+                    if self
+                        .mute_asked
+                        .as_ref()
+                        .is_some_and(|(asked, _)| asked == id)
+                    {
+                        self.mute_asked = None;
+                    }
                     self.shared.pacer().acknowledged(id, Instant::now());
                     self.shared.emit(HostCallEvent::WriteAcknowledged {
                         write_id: id.clone(),
@@ -1911,7 +1943,16 @@ impl CallTask {
             return Err(WriteRefusal::Rate);
         }
         let bound = DRAIN_BOUND.min(self.deadline.saturating_duration_since(Instant::now()));
-        if self.send_within(text, bound).await {
+        let sent = self.send_within(text, bound).await;
+        // A mute that was written has taken effect once the provider read it, and a write that
+        // did not finish may have been read: a mute is kept either way. An unmute is kept only
+        // when it was written, so that a lost channel never turns a microphone on.
+        match frame.command {
+            VoiceCommand::Mute => self.mute_asked = Some((frame.id.clone(), true)),
+            VoiceCommand::Unmute if sent => self.mute_asked = Some((frame.id.clone(), false)),
+            _ => {}
+        }
+        if sent {
             if counted {
                 self.shared.pacer().record(&frame.id, Instant::now());
             }
@@ -1921,11 +1962,36 @@ impl CallTask {
         }
     }
 
+    /// Reads what the channel already holds, without waiting for more, and says whether a
+    /// recognised closure was among it. A channel is not let go before this: the provider's
+    /// closure may have come while a write waited, and a host that did not read it would hang the
+    /// call up and learn nothing from the answer.
+    async fn read_queued(&mut self) -> bool {
+        for _ in 0..QUEUED_READS {
+            let Some(socket) = self.socket.as_mut() else {
+                return false;
+            };
+            match tokio::time::timeout(Duration::ZERO, socket.next()).await {
+                Ok(SocketRead::Text(text)) => {
+                    if self.read(&text).closed {
+                        self.closed_seen = true;
+                        return true;
+                    }
+                }
+                Ok(SocketRead::Closed) | Err(_) => return false,
+            }
+        }
+        false
+    }
+
     /// The side channel was lost. It is attached again at once under a higher revision, for as
     /// long as [`RECOVERY_BOUND`] after the loss; after that the call is hung up. `None` means the
     /// channel is back.
     async fn recover(&mut self) -> Option<Outcome> {
         if self.closed_seen {
+            return Some(Outcome::ProviderClosed);
+        }
+        if self.read_queued().await {
             return Some(Outcome::ProviderClosed);
         }
         self.socket = None;
@@ -1939,10 +2005,18 @@ impl CallTask {
                     return None;
                 }
                 Err(NotReady::Closed) => return Some(Outcome::ProviderClosed),
-                // A fence ends the recovery: the call is hung up with the key that is still held.
-                Err(_) if self.core.registry.epoch() != self.epoch => break,
-                Err(_) if Instant::now() >= ends => break,
-                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+                Err(_) => {
+                    // The channel that failed to carry the probe may hold the closure.
+                    if self.read_queued().await {
+                        return Some(Outcome::ProviderClosed);
+                    }
+                    // A fence ends the recovery: the call is hung up with the key that is still
+                    // held.
+                    if self.core.registry.epoch() != self.epoch || Instant::now() >= ends {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
             }
         }
         self.socket = None;
@@ -1968,8 +2042,11 @@ impl CallTask {
             let id = self.event_id("close");
             let command = json!({ "type": "session.close", "event_id": id });
             let sent = self.send_within(command.to_string(), DRAIN_BOUND).await;
-            if sent {
-                let drained = tokio::time::timeout(DRAIN_BOUND, async {
+            // What the channel holds is read whether or not the close was written: the provider's
+            // closure may have come while the write waited. Only a close that was written is
+            // waited on for the answer.
+            let drained = if sent {
+                tokio::time::timeout(DRAIN_BOUND, async {
                     loop {
                         match self.socket_next().await {
                             SocketRead::Closed => return false,
@@ -1982,11 +2059,13 @@ impl CallTask {
                     }
                 })
                 .await
-                .unwrap_or(false);
-                if drained {
-                    self.closed_seen = true;
-                    return Outcome::ProviderClosed;
-                }
+                .unwrap_or(false)
+            } else {
+                self.read_queued().await
+            };
+            if drained {
+                self.closed_seen = true;
+                return Outcome::ProviderClosed;
             }
         }
         self.hang_up().await

@@ -1034,7 +1034,9 @@ fn a_status_kept_across_a_failed_body_decides_the_class_of_the_creation_and_of_t
     );
 }
 
-/// The elapsed time of a bound read off the paused clock.
+/// The elapsed time of a bound read off the paused clock. Every bound a case reads is written
+/// out in seconds beside it, as the requirement states it, and is not read from the constant that
+/// implements it.
 fn within(took: Duration, bound: Duration, margin: Duration) -> bool {
     took >= bound && took <= bound + margin
 }
@@ -1052,7 +1054,7 @@ async fn a_creation_that_is_never_answered_is_given_up_when_the_dispatch_bound_a
     assert!(matches!(outcome, VoiceStart::CreationUnknown { .. }));
     let took = begun.elapsed();
     assert!(
-        within(took, DISPATCH_BOUND, WATCHDOG_MARGIN),
+        within(took, Duration::from_secs(15), Duration::from_millis(500)),
         "the dispatch bound decides: {took:?}"
     );
     assert_eq!(states(&world), [CallState::Creating]);
@@ -1068,7 +1070,7 @@ async fn a_readiness_that_gets_no_acknowledgement_gives_up_at_its_own_bound_and_
     assert!(matches!(outcome, VoiceStart::Refused(_)));
     let took = begun.elapsed();
     assert!(
-        within(took, READINESS_BOUND, Duration::from_millis(100)),
+        within(took, Duration::from_secs(10), Duration::from_millis(100)),
         "readiness has its own ten seconds: {took:?}"
     );
     assert_eq!(world.stand_in.recorded().hangups.len(), 1);
@@ -1091,7 +1093,7 @@ async fn readiness_has_only_what_is_left_of_the_creation_window_when_the_creatio
     assert!(matches!(outcome, VoiceStart::Refused(_)));
     let took = begun.elapsed();
     assert!(
-        within(took, CREATION_WINDOW, Duration::from_millis(100)),
+        within(took, Duration::from_secs(30), Duration::from_millis(100)),
         "the whole start ends with the window, not ten seconds after the answer: {took:?}"
     );
     assert_eq!(world.stand_in.recorded().hangups.len(), 1);
@@ -1108,7 +1110,7 @@ async fn a_hangup_that_is_never_answered_is_given_up_after_the_hangup_bound() {
     assert!(!world.provider.cleanup_hangup("live_never").await);
     let took = begun.elapsed();
     assert!(
-        within(took, HANGUP_BOUND, WATCHDOG_MARGIN),
+        within(took, Duration::from_secs(15), Duration::from_millis(500)),
         "the hangup bound decides: {took:?}"
     );
 }
@@ -1165,7 +1167,7 @@ async fn a_probe_write_that_never_completes_is_given_up_with_the_readiness_bound
     assert!(matches!(outcome, VoiceStart::Refused(_)));
     let took = begun.elapsed();
     assert!(
-        within(took, READINESS_BOUND, Duration::from_millis(100)),
+        within(took, Duration::from_secs(10), Duration::from_millis(100)),
         "a held write is bounded by readiness: {took:?}"
     );
     assert_eq!(world.stand_in.recorded().hangups.len(), 1);
@@ -1194,7 +1196,7 @@ async fn a_write_that_never_completes_is_given_up_after_the_drain_bound_and_the_
     );
     let took = begun.elapsed();
     assert!(
-        within(took, DRAIN_BOUND, Duration::from_millis(100)),
+        within(took, Duration::from_secs(5), Duration::from_millis(100)),
         "a held write is bounded by the drain bound: {took:?}"
     );
     for _ in 0..8 {
@@ -1217,7 +1219,7 @@ async fn a_close_whose_write_never_completes_is_given_up_after_the_drain_bound_a
     assert!(world.provider.close(&own.call_id).await.is_ok());
     let took = begun.elapsed();
     assert!(
-        within(took, DRAIN_BOUND, Duration::from_millis(100)),
+        within(took, Duration::from_secs(5), Duration::from_millis(100)),
         "a held close is bounded by the drain bound: {took:?}"
     );
     assert_eq!(world.stand_in.recorded().hangups.len(), 1);
@@ -1248,5 +1250,181 @@ async fn a_mark_that_cannot_be_written_keeps_the_open_row_and_an_empty_404_on_re
         states(&world),
         [CallState::Unresolved],
         "an empty 404 is not a recognised closure"
+    );
+}
+
+/// A mute the provider took is not undone by a recovery: the acknowledgement may never be read,
+/// and the channel is attached again and probed with the state the owner asked for.
+#[tokio::test(start_paused = true)]
+async fn a_mute_the_provider_took_is_restated_by_the_recovery_though_its_acknowledgement_was_never_read()
+ {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world.stand_in.acknowledge(false);
+    let mute = VoiceContextFrame::new("m-1", VoiceCommand::Mute, None, None).expect("a frame");
+    assert_eq!(control.write(control.revision(), mute).await, Ok(()));
+    world.stand_in.acknowledge(true);
+    world.stand_in.drop_socket();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Ready);
+    assert_eq!(control.revision(), 2);
+    let commands = world.stand_in.recorded().commands;
+    let probe = commands.last().expect("the probe of the reattachment");
+    assert_eq!(
+        probe["type"],
+        json!("session.input_audio.mute"),
+        "the recovery keeps the mute the provider took"
+    );
+}
+
+/// An unmute whose write did not complete is not asked for by the recovery: a lost channel never
+/// turns a microphone on.
+#[tokio::test(start_paused = true)]
+async fn a_recovery_never_restates_an_unmute_whose_write_did_not_complete() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    let frame = |id: &str, command| VoiceContextFrame::new(id, command, None, None).expect("frame");
+    assert_eq!(
+        control
+            .write(control.revision(), frame("m-1", VoiceCommand::Mute))
+            .await,
+        Ok(())
+    );
+    // The unmute never completes: the call is muted as far as the host can tell.
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    assert_eq!(
+        control
+            .write(control.revision(), frame("u-1", VoiceCommand::Unmute))
+            .await,
+        Err(WriteRefusal::Lost)
+    );
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Ready);
+    let commands = world.stand_in.recorded().commands;
+    let probe = commands.last().expect("the probe of the reattachment");
+    assert_eq!(
+        probe["type"],
+        json!("session.input_audio.mute"),
+        "a write that did not complete never turns a microphone on"
+    );
+}
+
+/// A closure that came while a write waited is read before the channel is let go, so the call is
+/// closed by the provider's word, no hangup is sent and the row is deleted, though the hangup
+/// would have been answered by an empty 404.
+#[tokio::test(start_paused = true)]
+async fn a_closure_that_came_while_a_write_waited_is_read_before_the_channel_is_let_go() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    for _ in 0..80 {
+        world.stand_in.fail_attach(AttachFault::Unavailable);
+    }
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    world.stand_in.event(&closed_event("expired", None));
+    let frame = VoiceContextFrame::new("w-1", VoiceCommand::Thinking, None, Some("x".to_owned()))
+        .expect("frame");
+    assert_eq!(
+        control.write(control.revision(), frame).await,
+        Err(WriteRefusal::Lost)
+    );
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed)
+    );
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+    assert_eq!(world.provider.registry().state(), RegistryState::Idle);
+}
+
+/// A close whose write waits out its bound still reads what the channel holds: a closure that
+/// came meanwhile ends the call with no hangup.
+#[tokio::test(start_paused = true)]
+async fn a_close_whose_write_waits_out_its_bound_still_reads_a_closure_the_channel_holds() {
+    let world = fresh();
+    let own = started(&world).await;
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    world.stand_in.event(&closed_event("expired", None));
+    let begun = Instant::now();
+    assert!(world.provider.close(&own.call_id).await.is_ok());
+    let took = begun.elapsed();
+    assert!(
+        within(took, Duration::from_secs(5), Duration::from_millis(100)),
+        "the close write was given up at five seconds: {took:?}"
+    );
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+/// A reattachment writes its probe under the call's one pace: after a burst it waits for its
+/// turn, and writes nothing until then.
+#[tokio::test(start_paused = true)]
+async fn a_reattachment_after_a_burst_waits_for_the_pace_before_it_attaches_and_probes() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    // The readiness probe is the first entry of the burst window; the burst is filled later.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let thinking = |id: &str| {
+        VoiceContextFrame::new(id, VoiceCommand::Thinking, None, Some("x".to_owned()))
+            .expect("a frame")
+    };
+    let mut written = 0;
+    while control
+        .write(1, thinking(&format!("w-{written}")))
+        .await
+        .is_ok()
+    {
+        written += 1;
+    }
+    assert!(control.next_write_at().is_some(), "the burst is full");
+    let commands_before = world.stand_in.recorded().commands.len();
+    world.stand_in.drop_socket();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Recovering);
+    assert_eq!(
+        world.stand_in.recorded().commands.len(),
+        commands_before,
+        "no probe is written while the burst window is full"
+    );
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Ready);
+    assert_eq!(control.revision(), 2);
+    assert_eq!(
+        world.stand_in.recorded().commands.len(),
+        commands_before + 1
     );
 }
