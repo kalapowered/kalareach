@@ -1374,7 +1374,9 @@ impl VoiceProviderService for OwnVoiceProvider {
             let confirmed = if let Some(shared) = self.live_call(call_id) {
                 let (reply, answer) = oneshot::channel();
                 if shared.tx.send(Task::Close { reply }).is_ok() {
-                    // The task's own bounds are a drain, a hangup and a margin.
+                    // The wait is a drain, a hangup and a margin. The task's close can outlast
+                    // it: a write, a drain, a hangup with its watchdog and up to two queue
+                    // reads each take a bound of their own.
                     tokio::time::timeout(
                         DRAIN_BOUND + HANGUP_BOUND + Duration::from_secs(5),
                         answer,
@@ -1382,8 +1384,9 @@ impl VoiceProviderService for OwnVoiceProvider {
                     .await
                     .ok()
                     .and_then(std::result::Result::ok)
-                    // The task may have ended with this close still queued: its reply sender
-                    // is gone, and the record's state is the answer.
+                    // A close that the task did not answer (its sender went with the task, or the
+                    // wait ran out) is answered by the call's state: closed only when the task
+                    // ended the call cleanly.
                     .unwrap_or_else(|| shared.state_is_closed_cleanly())
                 } else {
                     shared.state_is_closed_cleanly()
