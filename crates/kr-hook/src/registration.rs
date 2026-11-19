@@ -920,12 +920,10 @@ mod tests {
 
     /// What a registration beside a credential and, where `events` is `Some`, a file of hook
     /// events holds.
-    #[cfg(unix)]
     struct Launch {
         folder: kr_ipc::testing::PrivateTempDir,
     }
 
-    #[cfg(unix)]
     impl Launch {
         /// A launch whose registration names `events` on its `events` line, as written, or none.
         fn new(events: Option<&dyn Fn(&Path) -> String>) -> Self {
@@ -938,7 +936,8 @@ mod tests {
             )
             .expect("the credential is written");
             let mut text = format!(
-                "endpoint=/run/kr/a-1.sock\nprofile=lp-1\ninstance=i-1\npid=1\nstart=2\ncredential={}\n",
+                "endpoint={}\nprofile=lp-1\ninstance=i-1\npid=1\nstart=2\ncredential={}\n",
+                r"\\.\pipe\kr-a-1",
                 directory.join("credential").display()
             );
             if let Some(line) = events {
@@ -969,7 +968,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn vendor_events() -> String {
         serde_json::json!({
             "event": {"segments": [{"type": "member", "name": "kind"}]},
@@ -980,7 +978,6 @@ mod tests {
     }
 
     /// A registration that names no file of hook events is read with Claude Code's.
-    #[cfg(unix)]
     #[test]
     fn a_registration_that_names_no_events_gets_the_claude_code_events() {
         let read = Launch::new(None).read().expect("a registration");
@@ -988,7 +985,6 @@ mod tests {
     }
 
     /// A registration that names a file of hook events beside it is read by what the file holds.
-    #[cfg(unix)]
     #[test]
     fn a_registration_that_names_its_events_is_read_by_them() {
         let launch = Launch::new(Some(&|directory| {
@@ -1003,7 +999,6 @@ mod tests {
     /// The file of hook events is read from the registration's own directory and from nowhere
     /// else, and a file that cannot be read, is too large, or holds events the check refuses is an
     /// error: Claude Code's events are never read in its place.
-    #[cfg(unix)]
     #[test]
     fn the_events_file_is_read_only_beside_the_registration() {
         let elsewhere = kr_ipc::testing::PrivateTempDir::create();
@@ -1036,16 +1031,6 @@ mod tests {
                 "{what}: {error}"
             );
         }
-        // A link in the file's place is not followed.
-        let launch = Launch::new(Some(&|directory| {
-            directory.join("hook-events.json").display().to_string()
-        }));
-        std::os::unix::fs::symlink(
-            elsewhere.path().join("hook-events.json"),
-            launch.directory().join("hook-events.json"),
-        )
-        .expect("a link");
-        launch.read().expect_err("a link is not followed");
         // Too large, not events, events the check refuses, and no file at all.
         let too_large = vec![b' '; usize::try_from(MAX_EVENTS_BYTES).expect("small") + 1];
         for (what, bytes) in [
@@ -1072,5 +1057,22 @@ mod tests {
             }
             assert!(launch.read().is_err(), "{what}");
         }
+    }
+
+    /// A link in the file of hook events' place is not followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_events_files_place_is_not_followed() {
+        let elsewhere = kr_ipc::testing::PrivateTempDir::create();
+        std::fs::write(elsewhere.path().join("hook-events.json"), vendor_events()).expect("writes");
+        let launch = Launch::new(Some(&|directory| {
+            directory.join("hook-events.json").display().to_string()
+        }));
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("hook-events.json"),
+            launch.directory().join("hook-events.json"),
+        )
+        .expect("a link");
+        launch.read().expect_err("a link is not followed");
     }
 }

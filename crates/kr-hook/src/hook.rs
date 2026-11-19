@@ -777,7 +777,9 @@ pub fn read_input(
     parsed.map_err(|error| refused(&error.to_string()))?;
     drained?;
     let Some(event) = reading.found.remove(&Slot::Event) else {
-        return Err(refused(reading.fault.as_deref().unwrap_or("it names no event")));
+        return Err(refused(
+            reading.fault.as_deref().unwrap_or("it names no event"),
+        ));
     };
     if !events.events.iter().any(|named| named.name == event) {
         return Ok(None);
@@ -2188,7 +2190,8 @@ mod tests {
             None
         );
         assert_eq!(
-            read(r#"{"session_id":"s","hook_event_name":"SessionStart","other":1,"other":2}"#).thread,
+            read(r#"{"session_id":"s","hook_event_name":"SessionStart","other":1,"other":2}"#)
+                .thread,
             "s"
         );
         for text in [
@@ -2361,6 +2364,8 @@ mod tests {
     /// input does not complete until it is.
     #[test]
     fn a_read_ends_only_at_the_end_of_the_input_however_it_goes() {
+        use std::io::Read as _;
+
         let events = HookEvents::claude_code();
         let tail = 1024 * 1024;
         for (name, prefix, suffix, shape) in [
