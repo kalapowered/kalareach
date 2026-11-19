@@ -23,8 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_controller::catalogue::native_bridge::{
-    BridgeHost, BridgeSurface, Declared, BridgeTarget, NativeBridges,
-    QualifiedExecutable, Settled,
+    BridgeHost, BridgeSurface, BridgeTarget, Declared, NativeBridges, QualifiedExecutable, Settled,
 };
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::matching::MatchRule;
@@ -773,7 +772,11 @@ fn a_registration_string_that_names_a_place_is_refused_whatever_the_shape() {
         let in_a_key = format!(
             r#"{{"hooks": {{"Event{mark}": [{{"hooks": [{{"type": "command", "command": "{{kr_hook}}", "args": ["claude-code", "hook"], "timeout": 5}}]}}]}}}}"#
         );
-        for (what, hooks) in [("a value", in_a_value), ("a name", in_a_name), ("a key", in_a_key)] {
+        for (what, hooks) in [
+            ("a value", in_a_value),
+            ("a name", in_a_name),
+            ("a key", in_a_key),
+        ] {
             let site = Site::new();
             let before = site.tree();
             let settled = site
@@ -1519,7 +1522,7 @@ fn target_named(site: &Site, directory: &str, with_key: bool) -> BridgeTarget {
     }
     target.recipe = serde_json::from_value(recipe).expect("a recipe");
     target
-    }
+}
 
 /// What the refusal of a file outside the shape this host names says.
 #[cfg(unix)]
@@ -4987,7 +4990,10 @@ fn a_compiled_labels_directory_is_reached_through_the_persons_own_link_when_no_p
             .expect("applies"),
         Settled::Applied
     );
-    assert!(real.join(HOOKS_PATH).exists(), "written where the link leads");
+    assert!(
+        real.join(HOOKS_PATH).exists(),
+        "written where the link leads"
+    );
     assert!(is_link(&site.application()), "the link is the link it was");
     assert_eq!(
         bridges.reconcile(&plugin(), None).expect("removes"),
@@ -5296,7 +5302,10 @@ fn kr_req_11_42_a_home_without_the_applications_directory_places_nothing() {
         .expect("reconciles");
 
     assert!(refused(&settled).contains("Gemini CLI"), "{settled:?}");
-    assert!(refused(&settled).contains("cannot be opened"), "{settled:?}");
+    assert!(
+        refused(&settled).contains("cannot be opened"),
+        "{settled:?}"
+    );
     assert_eq!(site.tree(), before, "nothing was written");
     assert!(
         !bare.join(".gemini").exists() && !bare.join(".claude").exists(),

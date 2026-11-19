@@ -3593,9 +3593,7 @@ mod native_bridges {
     #[cfg(unix)]
     use super::generations;
 
-    use kr_controller::catalogue::native_bridge::{
-        BridgeHost, BridgeSurface, QualifiedExecutable,
-    };
+    use kr_controller::catalogue::native_bridge::{BridgeHost, BridgeSurface, QualifiedExecutable};
 
     use super::*;
 

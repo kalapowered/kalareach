@@ -631,7 +631,9 @@ impl Placement {
         if !is_plain_component(application) {
             return Err(PlacementError::new(
                 PlacementRefusal::ApplicationNotPlain,
-                format!("{application:?} is not one plain component, so the reading cannot quote it"),
+                format!(
+                    "{application:?} is not one plain component, so the reading cannot quote it"
+                ),
             ));
         }
         let folder = bridge
@@ -648,14 +650,16 @@ impl Placement {
             })
             .unwrap_or_default();
         let directory = self.directory_path();
-        let tails: Vec<&str> = self.files.iter().map(|placed| placed.tail.as_str()).collect();
+        let tails: Vec<&str> = self
+            .files
+            .iter()
+            .map(|placed| placed.tail.as_str())
+            .collect();
         let key = bridge.install.iter().find_map(|step| match step {
-            crate::plugin::BridgeStep::AddConfigurationKey { file, key, .. } => {
-                Some(format!(
-                    "It also sets {key} to true in {directory}/{file}, and keeps your other \
+            crate::plugin::BridgeStep::AddConfigurationKey { file, key, .. } => Some(format!(
+                "It also sets {key} to true in {directory}/{file}, and keeps your other \
                      settings in that file. "
-                ))
-            }
+            )),
             crate::plugin::BridgeStep::InstallFile { .. } => None,
         });
         let record = self

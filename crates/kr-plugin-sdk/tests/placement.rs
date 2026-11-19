@@ -619,8 +619,14 @@ fn quill_placement() -> Placement {
 #[test]
 fn the_host_states_what_it_reads_of_a_placement_in_its_own_words() {
     let placement = quill_placement();
-    assert!(placement.refusals().is_empty(), "{:?}", placement.refusals());
-    let text = placement.statement(&quill_bridge("Quill CLI")).expect("a reading");
+    assert!(
+        placement.refusals().is_empty(),
+        "{:?}",
+        placement.refusals()
+    );
+    let text = placement
+        .statement(&quill_bridge("Quill CLI"))
+        .expect("a reading");
     assert_eq!(
         text,
         "This package places files for \"Quill CLI\" in a folder it chose: \
@@ -652,7 +658,11 @@ fn an_application_label_that_is_not_plain_is_refused_for_the_statement() {
 #[test]
 fn a_publishers_words_holding_the_placement_label_are_refused() {
     let validated = gemini_package(">=0.1.9, <0.2.0", |_| {});
-    assert!(validated.report.is_valid(), "{:?}", validated.report.findings);
+    assert!(
+        validated.report.is_valid(),
+        "{:?}",
+        validated.report.findings
+    );
     let home = tempfile::tempdir().expect("a directory");
     let directory = home.path().join("package");
     copy_tree(&bundled("gemini-cli"), &directory);
@@ -663,12 +673,18 @@ fn a_publishers_words_holding_the_placement_label_are_refused() {
         "Harmless. {} Reads nothing.",
         kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL
     ));
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
     let refused = validate_package_directory(&directory);
     assert!(
         refused.report.findings.iter().any(|finding| {
             finding.code == FindingCode::BridgeRecipeInvalid
-                && finding.detail.contains("before its own reading of a placement")
+                && finding
+                    .detail
+                    .contains("before its own reading of a placement")
         }),
         "{:?}",
         refused.report.findings
@@ -720,7 +736,8 @@ fn the_longest_reading_of_a_placement_is_the_bound_and_one_more_is_refused() {
         },
         { "type": "add_configuration_key", "file": "settings.json", "key": format!("enabledPlugins.{folder}@skills-dir"), "value": "true" },
     ]);
-    let bridge: kr_plugin_sdk::plugin::NativeBridge = serde_json::from_value(bridge).expect("a recipe");
+    let bridge: kr_plugin_sdk::plugin::NativeBridge =
+        serde_json::from_value(bridge).expect("a recipe");
     let found = placement.statement(&bridge);
     let text = found.expect("the longest reading is within the bound");
     assert_eq!(

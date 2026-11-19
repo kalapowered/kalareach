@@ -98,7 +98,10 @@ fn a_table_that_does_not_validate_is_refused_and_never_defaulted() {
         "{declared:?}"
     );
     let declared = read(">=0.1.9, <0.2.0", b"not json at all", None);
-    assert!(refusal(&declared).contains("cannot be read"), "{declared:?}");
+    assert!(
+        refusal(&declared).contains("cannot be read"),
+        "{declared:?}"
+    );
     let table = gemini_table(Some(gemini_placement()));
     let declared = read(">=0.1.9, <0.2.0", &table, Some(b"other bytes"));
     assert!(
@@ -122,7 +125,11 @@ fn a_package_with_no_connector_table_takes_the_labels_default() {
     );
     let declared = read(">=0.1.3, <0.2.0", &gemini_table(None), None);
     assert_eq!(declared, Declared::Nothing, "a table that declares none");
-    let declared = read(">=0.1.9, <0.2.0", &gemini_table(Some(gemini_placement())), None);
+    let declared = read(
+        ">=0.1.9, <0.2.0",
+        &gemini_table(Some(gemini_placement())),
+        None,
+    );
     assert!(
         matches!(&declared, Declared::Placement(placement) if **placement == kr_plugin_sdk::placement::Placement::gemini_cli()),
         "{declared:?}"
