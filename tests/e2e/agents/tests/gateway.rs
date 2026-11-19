@@ -1757,6 +1757,44 @@ impl Context {
         (device, paired, remote)
     }
 
+    /// Reads what a session holds of its agents, with the error as the device got it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the request failed: the host's refusal, or a failure of the connection.
+    fn requests_instances(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+    ) -> Result<AgentInstancesResult, RequestError> {
+        self.runtime.block_on(remote.read(
+            Method::AgentInstances,
+            &AgentInstancesParams {
+                session_id,
+                agent_resources_from: Nullable::null(),
+            },
+        ))
+    }
+
+    /// Reads what an instance's capabilities and binding are, with the error as the device got it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the request failed: the host's refusal, or a failure of the connection.
+    fn requests_capabilities(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+    ) -> Result<AgentCapabilitiesResult, RequestError> {
+        self.runtime.block_on(remote.read(
+            Method::AgentCapabilities,
+            &AgentCapabilitiesParams {
+                subject: subject(session_id, instance),
+            },
+        ))
+    }
+
     /// Reads what a session holds of its agents, and keeps what it listed with the polls.
     ///
     /// # Errors
@@ -1768,14 +1806,7 @@ impl Context {
         session_id: SessionId,
     ) -> Result<AgentInstancesResult, String> {
         let read: Result<AgentInstancesResult, String> = self
-            .runtime
-            .block_on(remote.read(
-                Method::AgentInstances,
-                &AgentInstancesParams {
-                    session_id,
-                    agent_resources_from: Nullable::null(),
-                },
-            ))
+            .requests_instances(remote, session_id)
             .map_err(|why| format!("agent.instances: {why}"));
         match &read {
             Ok(result) => self.polls.record(&format!("{:?}", result.agent_instances)),
@@ -1841,14 +1872,8 @@ impl Context {
         session_id: SessionId,
         instance: ApplicationInstanceId,
     ) -> Result<AgentBindingState, String> {
-        let read: AgentCapabilitiesResult = self
-            .runtime
-            .block_on(remote.read(
-                Method::AgentCapabilities,
-                &AgentCapabilitiesParams {
-                    subject: subject(session_id, instance),
-                },
-            ))
+        let read = self
+            .requests_capabilities(remote, session_id, instance)
             .map_err(|why| format!("agent.capabilities: {why}"))?;
         Ok(read.binding)
     }
@@ -4942,11 +4967,13 @@ fn gateway_a_release_or_a_pipe_is_made_only_through_the_recorded_directory_and_n
 // ---------------------------------------------------------------------------------------------
 
 /// What the device reads of an agent and one pending request of it: the instances and resources
-/// the host lists, the instance's binding and the host's record of what the decoder read.
+/// the host lists, the instance's binding, the identity of its capabilities and the host's record
+/// of what the decoder read.
 #[derive(Debug)]
 struct Observed {
     listed: AgentInstancesResult,
     binding: AgentBindingState,
+    identity: Option<InstanceCapabilityIdentity>,
     inspected: AgentApprovalInspectResult,
 }
 
@@ -4965,6 +4992,9 @@ fn observes(
     Ok(Observed {
         listed: ctx.read_instances(remote, session_id)?,
         binding: ctx.read_binding(remote, session_id, instance)?,
+        identity: capability_identity(ctx, remote, session_id, instance)
+            .map_err(|why| format!("agent.capabilities: {why}"))?
+            .0,
         inspected: ctx
             .inspects(remote, session_id, instance, resource)
             .map_err(|why| format!("agent.approval.inspect: {why}"))?,
@@ -5037,30 +5067,73 @@ fn releases_tick(ctx: &Context, number: u64) {
         .unwrap_or_else(|why| panic!("the tick's release: {why}"));
 }
 
-/// How many times the terminal wrote that the server asked for an approval, as its screen shows.
-fn asked_by_the_screen(person: &Person) -> usize {
-    person
-        .window
-        .screen()
-        .iter()
-        .filter(|row| row.trim() == ASKED)
-        .count()
+/// How many times the terminal wrote that the server asked for an approval, in `bytes` of its
+/// stream.
+fn asked_in(bytes: &[u8]) -> usize {
+    String::from_utf8_lossy(bytes).matches(ASKED).count()
+}
+
+/// How many times the terminal's byte stream carries that line since `mark`: a request that
+/// scrolled off the screen is counted as well as one that is still on it.
+fn asked_since(person: &Person, mark: usize) -> usize {
+    asked_in(&person.window.collected().since(mark))
+}
+
+/// Waits until the person's screen shows `needle`, within [`LIVENESS`].
+///
+/// # Errors
+///
+/// Returns the screen that showed no such text when the bound passed.
+fn shows_within(person: &Person, needle: &str) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let rows = person.window.screen();
+        if rows.iter().any(|row| row.contains(needle)) {
+            return Ok(());
+        }
+        if started.elapsed() >= LIVENESS {
+            return Err(format!(
+                "the screen shows no {needle:?} after {LIVENESS:?}:\n{}",
+                rows.join("\n")
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Runs `exchange` on the runtime for at most `bound`, so that what the host allows a step of its
+/// start is what the step takes.
+///
+/// # Errors
+///
+/// Returns why `exchange` failed, or that it did not finish within `bound`.
+fn within<T, E: std::fmt::Display>(
+    runtime: &tokio::runtime::Runtime,
+    bound: Duration,
+    what: &str,
+    exchange: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, String> {
+    match runtime.block_on(async { tokio::time::timeout(bound, exchange).await }) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(why)) => Err(format!("{what}: {why}")),
+        Err(_) => Err(format!("{what} did not finish within {bound:?}")),
+    }
 }
 
 /// Starts the daemon again over the host's tree and returns the device's connection to it: the
-/// daemon is ready when the device connects, and no `kr` is run, as none may be after the agent
-/// started.
+/// daemon is ready when the device connects within the bound the start gives the step, and no `kr`
+/// is run, as none may be after the agent started.
 fn restarts_the_daemon(ctx: &Context, session: &Session<'_>) -> Remote {
     let connection = std::cell::RefCell::new(None);
-    session.host.start_daemon_ready_by(&|_| match ctx
-        .runtime
-        .block_on(session.device.connect(&session.paired))
-    {
-        Ok(remote) => {
-            *connection.borrow_mut() = Some(remote);
-            Ok(())
-        }
-        Err(why) => Err(format!("the device's connection: {why}")),
+    session.host.start_daemon_ready_by(&|bound| {
+        let remote = within(
+            &ctx.runtime,
+            bound,
+            "the device's connection",
+            session.device.connect(&session.paired),
+        )?;
+        *connection.borrow_mut() = Some(remote);
+        Ok(())
     });
     let connected = connection.into_inner();
     assert!(
@@ -5090,14 +5163,114 @@ fn sessions_within(
         .map_err(|why| format!("session.list: {why}"))
 }
 
+/// What the daemon started again says of a session whose worker ended while no daemon ran.
+#[derive(Debug)]
+struct Closed {
+    /// The state the host's list of sessions, closed ones included, gives the session, read until
+    /// it says the session is closed or the bound passed.
+    state: Result<Option<kr_protocol::session::SessionState>, String>,
+    /// The reads of the session's agent, each as the device got it.
+    instances: Result<AgentInstancesResult, RequestError>,
+    capabilities: Result<AgentCapabilitiesResult, RequestError>,
+    inspected: Result<AgentApprovalInspectResult, RequestError>,
+}
+
+impl Closed {
+    /// The code the host refused a read with, where it was the host that refused it.
+    fn refusals(&self) -> [Option<ErrorCode>; 3] {
+        [
+            self.instances
+                .as_ref()
+                .err()
+                .and_then(RequestError::refusal),
+            self.capabilities
+                .as_ref()
+                .err()
+                .and_then(RequestError::refusal),
+            self.inspected
+                .as_ref()
+                .err()
+                .and_then(RequestError::refusal),
+        ]
+    }
+}
+
+/// The control of 5b: the daemon is killed first, so that no cleanup of its own runs, then the
+/// worker is ended by its recorded identity and waited for, and the daemon is started again; the
+/// host's list of sessions is read until it shows the session closed, and the agent is read through
+/// the daemon started again, the pending `resource` included.
+fn ends_the_worker_beside_a_dead_daemon(
+    ctx: &Context,
+    session: &Session<'_>,
+    agent: &Agent,
+    instance: ApplicationInstanceId,
+    resource: PendingResourceId,
+) -> Closed {
+    session.host.kill_daemon();
+    kr_e2e_m1b::run::signal(&agent.worker, rustix::process::Signal::KILL);
+    let started = Instant::now();
+    while kr_e2e_m1b::run::running(&agent.worker) {
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the worker did not end within {LIVENESS:?} of being killed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let remote = restarts_the_daemon(ctx, session);
+    let session_id = session.session_id();
+    let started = Instant::now();
+    let state = loop {
+        let read = sessions_within(ctx, &remote).map(|listed| {
+            listed
+                .sessions
+                .iter()
+                .find(|entry| entry.session_id == session_id)
+                .map(|entry| entry.state)
+        });
+        let closed = matches!(read, Ok(Some(kr_protocol::session::SessionState::Closed)));
+        if closed || read.is_err() || started.elapsed() >= LIVENESS {
+            break read;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Closed {
+        state,
+        instances: ctx.requests_instances(&remote, session_id),
+        capabilities: ctx.requests_capabilities(&remote, session_id, instance),
+        inspected: ctx.inspects(&remote, session_id, instance, resource),
+    }
+}
+
+/// Waits until the terminal's stream carries the line of a request at least `count` times since
+/// `mark`, within [`LIVENESS`].
+///
+/// # Errors
+///
+/// Returns how many times it was there when the bound passed.
+fn asked_up_to(person: &Person, mark: usize, count: usize) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let asked = asked_since(person, mark);
+        if asked >= count {
+            return Ok(());
+        }
+        if started.elapsed() >= LIVENESS {
+            return Err(format!("the terminal was asked {asked} times, not {count}"));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The gateway's state of a request survives a crash of the control daemon: with a request pending
 /// at the gateway, killing only the daemon leaves the worker, the terminal and the server running
 /// and the terminal writing; a daemon started again, with no `kr` and no client that takes anything
-/// from the run, serves the same instance, the same binding and the same pending resource, field for
-/// field; the request then resolves once, through that daemon, and the terminal that was asked once
-/// is not asked again. The control kills the daemon, then ends the worker, and reads `session.list`
-/// of the daemon started again: the session's service is gone with its worker, so the comparison
-/// above is not one that anything passes.
+/// from the run, serves the same instance, the same binding, the same capability identity and the
+/// same pending resource, field for field, at the same positions of the session's and the broker's
+/// streams; the request then resolves once, through that daemon, and the terminal that was asked
+/// once is not asked again, as the terminal's byte stream shows. The control kills the daemon, then
+/// ends the worker, and reads the daemon started again: the session is recorded closed, and the
+/// reads of its instance, its binding and the request are refused as a closed session's, so the
+/// comparison above is not one that anything passes.
 ///
 /// KR-REQ-12.10, KR-REQ-11.27 (the daemon-reconnect leg). Stand-in route only. Not claimed: a
 /// kill made during a write (KR-ACC-006), keyboard input to a real terminal while the daemon is
@@ -5117,6 +5290,9 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
                 "the restart case runs on the stand-in route only"
             );
             let session_id = session.session_id();
+            // What the terminal is asked is counted in its byte stream from here, before the agent
+            // starts, and not from the screen, which scrolls.
+            let mark = session.person.window.collected().mark();
             let instance = session.starts_the_agent(&[], None, &[]);
             let pending = session.interpreted_approval_within();
             assert!(
@@ -5125,9 +5301,11 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
             );
             let pending = pending.expect("asserted above");
             assert_eq!(pending.state, PendingState::Pending);
-            let _ = session
-                .person
-                .sees(ASKED, "the terminal is asked for the approval");
+            let asked = shows_within(&session.person, ASKED);
+            assert!(
+                asked.is_ok(),
+                "the terminal is asked for the approval: {asked:?}"
+            );
 
             // The state before, read by the device and the process table.
             let before = observes(
@@ -5139,6 +5317,10 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
             );
             assert!(before.is_ok(), "the state before the kill: {before:?}");
             let before = before.expect("asserted above");
+            assert!(
+                before.identity.is_some(),
+                "the instance's capability identity is read: {before:?}"
+            );
             assert_eq!(before.listed.agent_resources.resources.len(), 1);
             assert_eq!(before.listed.agent_instances.instances.len(), 1);
             let agent = Agent::below(ctx.run.worker_of(&session_id.to_string()));
@@ -5147,7 +5329,11 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
                 "the worker, the terminal and the server: {agent:?}"
             );
             let agent = agent.expect("asserted above");
-            assert_eq!(asked_by_the_screen(&session.person), 1);
+            assert_eq!(
+                asked_since(&session.person, mark),
+                1,
+                "the terminal was asked once"
+            );
 
             // Only the daemon is killed. The agent goes on, and the terminal writes with no daemon
             // to carry what it writes.
@@ -5157,11 +5343,17 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
                 "the worker, the terminal and the server go on without the daemon"
             );
             releases_tick(ctx, 1);
-            let _ = session
-                .person
-                .sees("TUI: tick 1", "the terminal writes while no daemon runs");
+            let ticked = shows_within(&session.person, "TUI: tick 1");
+            assert!(
+                ticked.is_ok(),
+                "the terminal writes while no daemon runs: {ticked:?}"
+            );
             assert!(agent.run(), "all three still run after the tick");
-            assert_eq!(asked_by_the_screen(&session.person), 1);
+            assert_eq!(
+                asked_since(&session.person, mark),
+                1,
+                "the terminal was not asked again while no daemon ran"
+            );
 
             // A daemon is started again, and the device connects to it: nothing is asked of `kr`.
             let remote = restarts_the_daemon(ctx, session);
@@ -5183,20 +5375,58 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
                 "the same instance"
             );
             assert_eq!(
+                after.listed.agent_instances.sequence, before.listed.agent_instances.sequence,
+                "the same position in the session's announcements"
+            );
+            assert_eq!(
                 after.listed.agent_resources.resources, before.listed.agent_resources.resources,
                 "the same pending resource, field for field"
             );
+            assert_eq!(
+                after.listed.agent_resources.stream_generation,
+                before.listed.agent_resources.stream_generation,
+                "the same generation of the broker's stream"
+            );
+            assert_eq!(
+                after.listed.agent_resources.cursor, before.listed.agent_resources.cursor,
+                "the same position in the broker's stream"
+            );
             assert_eq!(after.binding, before.binding, "the same binding");
             assert_eq!(
-                after.inspected.decoding.source_bytes.as_slice(),
-                before.inspected.decoding.source_bytes.as_slice(),
-                "the same decoder record of the request"
+                after.identity, before.identity,
+                "the same capability identity"
+            );
+            assert_eq!(
+                after
+                    .identity
+                    .as_ref()
+                    .map(|identity| &identity.binary_digest),
+                before
+                    .identity
+                    .as_ref()
+                    .map(|identity| &identity.binary_digest),
+                "the same digest of the program"
+            );
+            assert_eq!(
+                after
+                    .identity
+                    .as_ref()
+                    .map(|identity| &identity.package_digest),
+                before
+                    .identity
+                    .as_ref()
+                    .map(|identity| &identity.package_digest),
+                "the same digest of the package"
+            );
+            assert_eq!(
+                after.inspected, before.inspected,
+                "the same record of the request, with the decoder's whole record of it"
             );
             assert!(
                 agent.run(),
                 "the processes of the restarted daemon's session are the ones that ran before"
             );
-            assert_eq!(asked_by_the_screen(&session.person), 1, "not asked again");
+            assert_eq!(asked_since(&session.person, mark), 1, "not asked again");
 
             // The request resolves once, through the restarted daemon, and the terminal's own
             // reads of the server go on after it.
@@ -5216,9 +5446,10 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
                 answered.expect("asserted above").state,
                 PendingState::Resolved
             );
-            let _ = session.person.sees(
-                "TUI: serverRequest/resolved",
-                "the terminal reads the server's word that the request was answered",
+            let told = shows_within(&session.person, "TUI: serverRequest/resolved");
+            assert!(
+                told.is_ok(),
+                "the terminal reads the server's word that the request was answered: {told:?}"
             );
             let resolved =
                 ctx.instances_within(&remote, session_id, "the request resolves", |read| {
@@ -5232,72 +5463,253 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
                 "the same resource resolved"
             );
             releases(ctx);
-            let _ = session.person.sees(
-                "TUI: the server answered after the turn",
-                "the terminal's reply to its own question after the turn",
+            let replied = shows_within(&session.person, "TUI: the server answered after the turn");
+            assert!(
+                replied.is_ok(),
+                "the terminal's reply to its own question after the turn: {replied:?}"
             );
             let answers = received_lines(ctx)
                 .iter()
                 .filter(|line| line.starts_with("response "))
                 .count();
             assert_eq!(answers, 1, "the server received one answer");
-            assert_eq!(asked_by_the_screen(&session.person), 1, "asked once");
+            assert_eq!(
+                asked_since(&session.person, mark),
+                1,
+                "asked once, through the turn's end"
+            );
             assert!(
                 agent.run(),
                 "the server goes on: it was sent no second answer"
             );
 
             // The control: the daemon is killed first, so no cleanup runs, then the worker ends;
-            // a daemon started again lists the sessions with no worker for this one, and the
-            // instance cannot be read through it.
+            // a daemon started again records the session closed and refuses each read of it as a
+            // closed session's.
             let kept = observes(ctx, &remote, session_id, instance, pending.resource_id);
             assert!(kept.is_ok(), "the state before the control: {kept:?}");
-            session.host.kill_daemon();
-            kr_e2e_m1b::run::signal(&agent.worker, rustix::process::Signal::KILL);
-            let started = Instant::now();
-            while kr_e2e_m1b::run::running(&agent.worker) {
-                assert!(
-                    started.elapsed() < LIVENESS,
-                    "the worker did not end within {LIVENESS:?} of being killed"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            let remote = restarts_the_daemon(ctx, session);
-            let listed = sessions_within(ctx, &remote);
-            assert!(listed.is_ok(), "the host lists its sessions: {listed:?}");
-            let listed = listed.expect("asserted above");
-            let entry = listed
-                .sessions
-                .iter()
-                .find(|entry| entry.session_id == session_id);
-            assert!(
-                entry.is_none_or(|entry| {
-                    !matches!(
-                        entry.state,
-                        kr_protocol::session::SessionState::Live
-                            | kr_protocol::session::SessionState::Creating
-                    )
-                }),
-                "a session whose worker ended is not live: {entry:?}"
+            let closed = ends_the_worker_beside_a_dead_daemon(
+                ctx,
+                session,
+                &agent,
+                instance,
+                pending.resource_id,
             );
-            let read = ctx.read_instances(&remote, session_id);
             assert!(
-                read.is_err(),
-                "the instance of a session whose worker ended is not served: {read:?}"
+                closed.state.is_ok(),
+                "the host lists its sessions: {:?}",
+                closed.state
+            );
+            assert_eq!(
+                closed.state.as_ref().ok().copied().flatten(),
+                Some(kr_protocol::session::SessionState::Closed),
+                "a session whose worker ended is recorded closed"
+            );
+            assert_eq!(
+                closed.refusals(),
+                [Some(ErrorCode::SessionClosed); 3],
+                "the instance, the binding and the request of a session whose worker ended are \
+                 refused as a closed session's, not lost to the transport: {closed:?}"
             );
             // What is left of the agent is ended by identity: the terminal and the server go with
             // their session's shell, and anything that does not is ended here.
             for identity in [&agent.terminal, &agent.server] {
                 kr_e2e_m1b::run::signal(identity, rustix::process::Signal::KILL);
             }
+            assert!(
+                session
+                    .host
+                    .kr_after_the_agent_started()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "no `kr` ran after the agent started"
+            );
             serde_json::json!({
                 "pending_resource_compared_field_for_field": true,
                 "answers_the_server_received": answers,
-                "session_after_the_worker_ended": entry.map(|entry| format!("{:?}", entry.state)),
-                "instance_read_after_the_worker_ended": format!("{read:?}"),
+                "session_after_the_worker_ended": format!("{:?}", closed.state),
+                "refusals_after_the_worker_ended": format!("{:?}", closed.refusals()),
             })
         },
     );
+}
+
+/// The control with a second request pending: the first approval is answered through the device and
+/// the server asks a second one, which is pending under a new identifier and is asked of the
+/// terminal too. The daemon is killed, then the worker; the daemon started again records the
+/// session closed, and the instance, the binding and the second request, which was pending, are
+/// refused as a closed session's: a pending request is lost with its worker, so the comparison of
+/// one that the restart case makes is not one that anything passes.
+///
+/// KR-REQ-12.10, KR-REQ-11.27. Stand-in route only, at no charge.
+#[test]
+fn gateway_a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed_is_refused_as_a_closed_sessions()
+ {
+    const TEST: &str = "gateway_a_second_request_pending_when_the_daemon_and_then_the_worker_are_killed_is_refused_as_a_closed_sessions";
+    run_case(
+        "gateway-restart-pending",
+        "5b",
+        TEST,
+        "leave-unanswered,tick,two-approvals,stay",
+        |ctx, session| {
+            assert!(
+                matches!(ctx.route, Route::StandIn),
+                "the control runs on the stand-in route only"
+            );
+            let session_id = session.session_id();
+            let mark = session.person.window.collected().mark();
+            let instance = session.starts_the_agent(&[], None, &[]);
+            let first = session.interpreted_approval_within();
+            assert!(first.is_ok(), "the first request is pending: {first:?}");
+            let first = first.expect("asserted above");
+            assert_eq!(first.state, PendingState::Pending);
+            let binding = ctx.read_binding(&session.remote, session_id, instance);
+            assert!(binding.is_ok(), "the binding: {binding:?}");
+            let answered = ctx.answers(
+                &session.remote,
+                session_id,
+                instance,
+                &binding.expect("asserted above"),
+                first.resource_id,
+                ACCEPT,
+            );
+            assert!(
+                answered.is_ok(),
+                "the device's answer to the first request: {answered:?}"
+            );
+            assert_eq!(
+                answered.expect("asserted above").state,
+                PendingState::Resolved
+            );
+            // The server asks again once the first is answered: a request under a new identifier.
+            let second =
+                fresh_approval_within(ctx, &session.remote, session_id, &[first.resource_id]);
+            assert!(second.is_ok(), "a second request is pending: {second:?}");
+            let second = second.expect("asserted above");
+            assert_ne!(
+                second.resource_id, first.resource_id,
+                "the second request has an identifier of its own"
+            );
+            assert_eq!(second.state, PendingState::Pending);
+            let again = ctx.inspects(&session.remote, session_id, instance, second.resource_id);
+            assert!(
+                again.is_ok(),
+                "the host's record of the second request: {again:?}"
+            );
+            assert_eq!(
+                again.expect("asserted above").state,
+                PendingState::Pending,
+                "the second request is still pending"
+            );
+            let asked = asked_up_to(&session.person, mark, 2);
+            assert!(
+                asked.is_ok(),
+                "the terminal is asked for each request: {asked:?}"
+            );
+            assert_eq!(
+                asked_since(&session.person, mark),
+                2,
+                "a request the terminal was asked for again is counted again"
+            );
+            let agent = Agent::below(ctx.run.worker_of(&session_id.to_string()));
+            assert!(
+                agent.is_ok(),
+                "the worker, the terminal and the server: {agent:?}"
+            );
+            let agent = agent.expect("asserted above");
+
+            // The daemon is killed first, then the worker.
+            let closed = ends_the_worker_beside_a_dead_daemon(
+                ctx,
+                session,
+                &agent,
+                instance,
+                second.resource_id,
+            );
+            assert!(
+                closed.state.is_ok(),
+                "the host lists its sessions: {:?}",
+                closed.state
+            );
+            assert_eq!(
+                closed.state.as_ref().ok().copied().flatten(),
+                Some(kr_protocol::session::SessionState::Closed),
+                "a session whose worker ended is recorded closed"
+            );
+            assert_eq!(
+                closed.refusals(),
+                [Some(ErrorCode::SessionClosed); 3],
+                "the instance, the binding and the pending request of a session whose worker \
+                 ended are refused as a closed session's, not lost to the transport: {closed:?}"
+            );
+            for identity in [&agent.terminal, &agent.server] {
+                kr_e2e_m1b::run::signal(identity, rustix::process::Signal::KILL);
+            }
+            assert!(
+                session
+                    .host
+                    .kr_after_the_agent_started()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "no `kr` ran after the agent started"
+            );
+            serde_json::json!({
+                "second_request_pending_when_the_worker_ended": true,
+                "session_after_the_worker_ended": format!("{:?}", closed.state),
+                "refusals_after_the_worker_ended": format!("{:?}", closed.refusals()),
+            })
+        },
+    );
+}
+
+/// The terminal's byte stream is counted for what it was asked, and a request asked for twice is
+/// two, whatever the screen has scrolled off.
+#[test]
+fn a_request_the_terminal_was_asked_for_twice_is_counted_twice_though_the_screen_shows_one() {
+    let first = format!("\x1b[2J{ASKED}\r\n");
+    assert_eq!(asked_in(first.as_bytes()), 1);
+    let again = format!("{first}TUI: tick 1\r\n{ASKED}\r\n");
+    assert_eq!(asked_in(again.as_bytes()), 2);
+    assert_eq!(asked_in(b"TUI: tick 1\r\n"), 0);
+    assert_eq!(asked_in(b""), 0);
+}
+
+/// A step of the daemon's restart is given the bound the host allows it: a connection that does not
+/// finish within it fails then, though it would finish later, and one that finishes or fails within
+/// it is returned or says why.
+#[test]
+fn a_connection_that_would_finish_late_fails_within_the_bound_the_restart_gave_it() {
+    let runtime = runtime();
+    let started = Instant::now();
+    let late = within(
+        &runtime,
+        Duration::from_millis(200),
+        "the connection",
+        async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok::<_, String>(1)
+        },
+    );
+    let said = late.expect_err("a connection that finishes after the bound fails");
+    assert!(said.contains("did not finish within"), "{said}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the failure came at the bound, not when the connection would have finished: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        within(&runtime, Duration::from_secs(5), "the connection", async {
+            Ok::<_, String>(7)
+        }),
+        Ok(7)
+    );
+    let said = within(&runtime, Duration::from_secs(5), "the connection", async {
+        Err::<u8, _>("refused".to_owned())
+    })
+    .expect_err("a failure is returned");
+    assert_eq!(said, "the connection: refused");
 }
 
 // ---------------------------------------------------------------------------------------------
