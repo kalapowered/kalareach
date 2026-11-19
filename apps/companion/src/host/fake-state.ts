@@ -1457,6 +1457,35 @@ export class ScriptedRecords {
     agent.capabilities.set(capability, this.#record(instance, capability, state, reason))
   }
 
+  /** Puts one capability into a state that gives no reason of its own, as a record of an older host can. */
+  setCapabilityWithoutReason(
+    sessionId: string,
+    capability: string,
+    state: InstanceCapabilityRecord['state']
+  ): void {
+    const agent = this.#agents.get(sessionId)
+    const instance = agent?.instances[0]?.application_instance_id
+    if (agent === undefined || instance === undefined) return
+    agent.capabilities.set(capability, {
+      ...this.#record(instance, capability, state),
+      disabled_reason: null
+    })
+  }
+
+  /** Takes one capability's record away from a session's live instance, as a host with no evidence of it has none. */
+  withoutCapability(sessionId: string, capability: string): void {
+    this.#agents.get(sessionId)?.capabilities.delete(capability)
+  }
+
+  /** Gives a session's live instance the reason its bridges are refused. */
+  refuseInstance(sessionId: string, reason: string): void {
+    const agent = this.#agents.get(sessionId)
+    if (agent === undefined) return
+    agent.instances = agent.instances.map((each, index) =>
+      index === 0 ? { ...each, refusal: reason } : each
+    )
+  }
+
   /** Suspends a session's rich mutations for `reason`, or lifts the suspension with null. */
   suspend(sessionId: string, reason: string | null): void {
     const agent = this.#agentOf(sessionId)
