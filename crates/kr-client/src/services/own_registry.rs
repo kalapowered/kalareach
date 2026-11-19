@@ -172,6 +172,9 @@ struct Inner {
     /// could not wait for them leaves the key and the record as they are, and no start runs
     /// meanwhile.
     draining: bool,
+    /// Whether the daemon is stopping: no start is admitted for the rest of this registry's life,
+    /// and no fence that ends, nor any lapse of a fence kept for tasks, takes that away.
+    stopped: bool,
 }
 
 #[derive(Default)]
@@ -232,6 +235,7 @@ impl CallRegistry {
                 slot: None,
                 reconciling: false,
                 draining: false,
+                stopped: false,
             }),
             ledger,
             tasks: Arc::new(Tasks::default()),
@@ -256,6 +260,7 @@ impl CallRegistry {
     /// held fence after the last task has ended, and none sees it end before.
     fn lapse_drained(&self, inner: &mut Inner) {
         if inner.draining
+            && !inner.stopped
             && inner.state == RegistryState::Settling
             && *self
                 .tasks
@@ -515,16 +520,34 @@ impl CallRegistry {
         self.lapse_drained(&mut inner);
     }
 
-    /// Ends a fence: the registry is idle and starts are taken again.
+    /// Ends a fence: the registry is idle and starts are taken again, unless the daemon is
+    /// stopping ([`fence_for_stop`](Self::fence_for_stop)), which no fence's end undoes.
     pub fn unfence(&self) {
         let mut inner = self.inner();
         if inner.state == RegistryState::Settling {
-            inner.state = RegistryState::Idle;
+            if !inner.stopped {
+                inner.state = RegistryState::Idle;
+            }
             inner.reconciling = false;
             inner.draining = false;
         }
         drop(inner);
         self.unfenced.notify_waiters();
+    }
+
+    /// Prohibits every start for the rest of this registry's life: the daemon is stopping, and
+    /// its serving tasks still run. The prohibition is permanent for this registry. Whatever
+    /// fence is held when it comes (a removal's, the start-time reconcile's, or one kept for
+    /// tasks that still run) and whichever ends later, neither [`unfence`](Self::unfence) nor the
+    /// end of the last task makes the registry idle again.
+    pub fn fence_for_stop(&self) {
+        let mut inner = self.inner();
+        inner.stopped = true;
+        inner.draining = false;
+        if inner.state != RegistryState::Settling {
+            inner.state = RegistryState::Settling;
+            inner.epoch += 1;
+        }
     }
 }
 
@@ -834,6 +857,70 @@ mod tests {
         assert_eq!(registry.state(), RegistryState::Idle);
         assert_eq!(registry.while_idle(|| 7), Ok(7));
         assert!(registry.begin_start().is_ok());
+    }
+
+    /// A stop's prohibition is permanent: whichever fence stands when it comes, and whichever ends
+    /// after it, the registry admits no start again.
+    #[tokio::test(start_paused = true)]
+    async fn a_stops_prohibition_outlasts_every_fence_that_ends_after_it() {
+        // No fence stands.
+        let registry = CallRegistry::new(Rows::with(CallState::Closed, 1));
+        registry.fence_for_stop();
+        registry.unfence();
+        assert_eq!(registry.state(), RegistryState::Settling);
+        assert!(matches!(
+            registry.begin_start(),
+            Err(StartRefusal::Settling)
+        ));
+
+        // A removal's fence stands, and the removal ends.
+        let registry = CallRegistry::new(Rows::with(CallState::Closed, 1));
+        let _removal = registry.fence().expect("the removal's fence");
+        registry.fence_for_stop();
+        registry.unfence();
+        assert_eq!(registry.state(), RegistryState::Settling);
+        assert_eq!(registry.while_idle(|| 7), Err(StartRefusal::Settling));
+
+        // The start-time reconcile's fence stands, and the reconcile ends: a removal that waited
+        // for it is not made to wait out its bound, and is refused.
+        let registry = CallRegistry::new(Rows::with(CallState::Closed, 1));
+        let _reconcile = registry
+            .fence_for_reconcile()
+            .expect("the reconcile's fence");
+        registry.fence_for_stop();
+        registry.unfence();
+        assert_eq!(registry.state(), RegistryState::Settling);
+        assert!(
+            registry
+                .fence_after_reconcile(Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+
+        // A fence kept for a task that still runs stands, and the task ends.
+        let registry = CallRegistry::new(Rows::with(CallState::Closed, 1));
+        let token = registry.track();
+        let _kept = registry.fence().expect("a fence");
+        registry.unfence_when_quiet();
+        registry.fence_for_stop();
+        drop(token);
+        assert_eq!(registry.state(), RegistryState::Settling);
+        assert!(matches!(
+            registry.begin_start(),
+            Err(StartRefusal::Settling)
+        ));
+
+        // A fence is kept for a task after the stop took its prohibition.
+        let registry = CallRegistry::new(Rows::with(CallState::Closed, 1));
+        let token = registry.track();
+        registry.fence_for_stop();
+        registry.unfence_when_quiet();
+        drop(token);
+        assert_eq!(registry.state(), RegistryState::Settling);
+        assert!(matches!(
+            registry.begin_start(),
+            Err(StartRefusal::Settling)
+        ));
     }
 
     #[tokio::test(start_paused = true)]

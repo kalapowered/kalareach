@@ -151,10 +151,11 @@ impl Controller {
     pub async fn close_host_calls_for_stop(&self) {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(25), async {
             // The serving tasks still run while the daemon stops, so no start is admitted from
-            // here on: the fence is taken first and is not let go. A removal that holds it
-            // already settles the same calls.
+            // here on: the prohibition is taken first and is permanent for this registry,
+            // whatever fence a removal, the start-time reconcile or a drain holds, and whichever
+            // of them ends.
             let registry = self.own_voice.registry();
-            let _fenced = registry.fence();
+            registry.fence_for_stop();
             // A start in flight is waited for, so the call it gives out is one this ends.
             self.own_voice.settle().await;
             self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::Stop)

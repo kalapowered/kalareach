@@ -1268,24 +1268,186 @@ async fn a_forget_calls_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_
     daemon.host.stop().await;
 }
 
-/// A clean stop takes the fence first and keeps it: the serving tasks still run while the daemon
-/// stops, so no start is admitted from then on, and the calls the host controls are ended.
+/// A clean stop takes the prohibition first and keeps it: the serving tasks still run while the
+/// daemon stops, so no start is admitted from the moment the stop begins, while the call it ends
+/// is still closing, and none after.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_clean_stop_fences_the_registry_before_it_ends_the_calls_and_admits_no_start_after() {
     let daemon = daemon().await;
     let phone = phone(&daemon, &MANAGER).await;
     let _ = started(phone.start().await);
-    daemon.host.controller().close_host_calls_for_stop().await;
+    // The call's close is held at the stand-in: the stop is part way through ending the call.
+    let release = Arc::new(tokio::sync::Notify::new());
+    daemon.stand_in.hold_send(Arc::clone(&release));
+    let stopping = {
+        let controller = Arc::clone(daemon.host.controller());
+        tokio::spawn(async move { controller.close_host_calls_for_stop().await })
+    };
+    until("the stop has fenced the registry", || {
+        the_registry_is(&daemon, RegistryState::Settling)
+    })
+    .await;
     assert!(
-        the_registry_is(&daemon, RegistryState::Settling),
-        "the fence taken by the stop is kept"
+        rows_of(&daemon).len() == 1 && !stopping.is_finished(),
+        "the call is still closing"
     );
     let refused = phone
         .start()
         .await
-        .expect_err("no start is admitted while the daemon stops");
+        .expect_err("no start is admitted while the stop ends the calls");
+    assert!(refused.message.contains(words::SETTLING));
+    release.notify_one();
+    stopping.await.expect("the stop ends");
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the prohibition the stop took is kept"
+    );
+    let refused = phone
+        .start()
+        .await
+        .expect_err("no start is admitted after the stop");
     assert!(refused.message.contains(words::SETTLING));
     assert!(rows_of(&daemon).is_empty(), "the call was closed");
+    daemon.host.stop().await;
+}
+
+/// A removal's fence that stands when a clean stop comes, and ends after it, does not make the
+/// registry take a start again: the stop's prohibition is permanent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_stop_that_meets_a_removals_fence_leaves_starts_prohibited_when_the_removal_ends() {
+    let daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    // The removal ends the call without a closing event, so the call leaves an unresolved row,
+    // and the removal's own hangup of that row is held while it holds the fence.
+    daemon.stand_in.answer_close(false);
+    daemon
+        .stand_in
+        .script_hangup(HangupScript::Answer(500, None));
+    let release = Arc::new(tokio::sync::Notify::new());
+    daemon.stand_in.script_hangup(HangupScript::Held(
+        Arc::clone(&release),
+        Box::new(HangupScript::Answer(200, Some(Vec::new()))),
+    ));
+    let removing = removing_in_background(&daemon).await;
+    until("the removal's hangup of the stored call is held", || {
+        daemon.stand_in.recorded().hangups.len() == 2
+    })
+    .await;
+
+    daemon.host.controller().close_host_calls_for_stop().await;
+    release.notify_one();
+    let removed = removing
+        .await
+        .expect("the task ends")
+        .expect("the removal is answered");
+    assert!(removed.removed);
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the removal's end does not undo the stop's prohibition"
+    );
+    let refused = phone
+        .start()
+        .await
+        .expect_err("no start is admitted after the stop");
+    assert!(refused.message.contains(words::SETTLING));
+    daemon.host.stop().await;
+}
+
+/// The same for the start-time reconcile's fence: a stop that comes while it stands keeps the
+/// prohibition when it ends, and a removal that waited for the reconcile is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_stop_that_meets_the_start_time_reconciles_fence_leaves_starts_prohibited_when_it_ends()
+ {
+    let daemon = daemon().await;
+    let Daemon {
+        host,
+        stand_in,
+        placed,
+        control,
+        owner,
+    } = daemon;
+    drop(control);
+    let stopped = host.shut_down().await;
+    let state_dir = stopped.tree().environment().state_dir().to_path_buf();
+    {
+        use kr_client::services::NewCall;
+        let calls = OwnKeyCalls::open(&state_dir).expect("the record opens");
+        let call = NewCall {
+            call_id: "call-1".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            device_id: "device-1".to_owned(),
+            asked_ms: 1_700_000_000_000,
+            closes_at_ms: 1_700_000_300_000,
+        };
+        calls.begin(&call).expect("a row is written");
+        calls
+            .record_id(&call.call_id, "live_open", None)
+            .expect("its id is written");
+    }
+    let release = Arc::new(tokio::sync::Notify::new());
+    stand_in.script_hangup(HangupScript::Held(
+        Arc::clone(&release),
+        Box::new(HangupScript::Answer(200, Some(Vec::new()))),
+    ));
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    until("the reconcile's hangup reached the stand-in", || {
+        stand_in.recorded().hangups.len() == 1
+    })
+    .await;
+
+    host.controller().close_host_calls_for_stop().await;
+    // A forget-calls waits for the reconcile, and learns when it has ended.
+    let forgetting = {
+        let mut client = host.client().await;
+        let environment = host.environment_id;
+        tokio::spawn(async move { forget_calls_of(&mut client, environment).await })
+    };
+    release.notify_one();
+    let refused = forgetting
+        .await
+        .expect("the task ends")
+        .expect_err("the stop's prohibition outlasts the reconcile, so no fence is taken");
+    assert_eq!(refused.message, words::STILL_CLOSING);
+    assert_eq!(
+        host.controller().own_key_registry_state(),
+        RegistryState::Settling,
+        "the reconcile's end does not undo the stop's prohibition"
+    );
+    let _ = owner;
+    host.stop().await;
+    drop(placed);
+}
+
+/// The same for a fence that a failed settle keeps until a task has ended: the task ends after
+/// the stop, and the registry still admits no start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_stop_that_meets_a_fence_kept_for_a_task_leaves_starts_prohibited_when_the_task_ends()
+ {
+    let mut daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    let task = daemon.host.controller().own_key_task_token();
+    let refused = forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("forgetting could not wait out the task");
+    assert_eq!(refused.message, words::STILL_CLOSING);
+    assert!(the_registry_is(&daemon, RegistryState::Settling));
+
+    // The stop waits out its own bound for the task, which ends after the stop has.
+    daemon.host.controller().close_host_calls_for_stop().await;
+    drop(task);
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the end of the task does not undo the stop's prohibition"
+    );
+    let refused = phone
+        .start()
+        .await
+        .expect_err("no start is admitted after the stop");
+    assert!(refused.message.contains(words::SETTLING));
     daemon.host.stop().await;
 }
 
