@@ -10,9 +10,11 @@ mod net_support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_client::services::own_voice::stand_in::{CreateScript, StandIn, created_body};
+use kr_client::services::own_voice::stand_in::{
+    CreateScript, HangupScript, StandIn, TESTING_REFUSALS, closed_event, created_body,
+};
 use kr_client::services::own_voice::words;
-use kr_client::services::{OwnCallLedger, RegistryState};
+use kr_client::services::{CallState, OwnCallLedger, RegistryState};
 use kr_controller::voice::own_key_calls::OwnKeyCalls;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::open_store_in;
@@ -51,6 +53,7 @@ struct Daemon {
 /// bound to.
 struct Phone {
     device_id: kr_protocol::ids::DeviceId,
+    record: kr_controller::service::net::devices::DeviceRecord,
     raw: net_support::RawDevice,
     target: ActionTarget,
     prepared: VoicePrepareResult,
@@ -143,18 +146,16 @@ fn held_key(host: &net_support::Host) -> Option<String> {
 }
 
 async fn phone(daemon: &Daemon, rights: &[ActionRight]) -> Phone {
+    phone_on(&daemon.host, &daemon.owner, rights).await
+}
+
+async fn phone_on(host: &net_support::Host, owner: &DeviceKeys, rights: &[ActionRight]) -> Phone {
     let device = net_support::Device::create().await;
-    let record = net_support::pair_with(
-        &daemon.host,
-        &device,
-        &daemon.owner,
-        net_support::proposal(rights),
-    )
-    .await;
-    let raw = net_support::RawDevice::connect(&daemon.host, &device, &record).await;
+    let record = net_support::pair_with(host, &device, owner, net_support::proposal(rights)).await;
+    let raw = net_support::RawDevice::connect(host, &device, &record).await;
     raw.claim();
     let session_id = SessionId::new(kr_ipc::new_uuid());
-    let target = ActionTarget::environment(daemon.host.environment_id);
+    let target = ActionTarget::environment(host.environment_id);
     raw.mutate(
         Method::VoiceGrant,
         ActionId::new(kr_ipc::new_uuid()),
@@ -181,6 +182,7 @@ async fn phone(daemon: &Daemon, rights: &[ActionRight]) -> Phone {
         .expect("a preparation");
     Phone {
         device_id: record.device_id,
+        record,
         raw,
         target,
         prepared,
@@ -805,4 +807,596 @@ async fn a_key_is_not_replaced_while_a_creation_is_held_or_a_call_runs_and_is_af
     assert_eq!(held_key(&daemon.host).as_deref(), Some(OTHER_KEY));
     let _ = &daemon.placed;
     daemon.host.stop().await;
+}
+
+type Forgetting = tokio::task::JoinHandle<Result<VoiceCredentialForgetCallsResult, ProtocolError>>;
+type Removing = tokio::task::JoinHandle<Result<VoiceCredentialRemoveResult, ProtocolError>>;
+
+async fn forgetting_in_background(daemon: &Daemon) -> Forgetting {
+    let mut client = daemon.host.client().await;
+    let environment = daemon.host.environment_id;
+    tokio::spawn(async move { forget_calls_of(&mut client, environment).await })
+}
+
+async fn removing_in_background(daemon: &Daemon) -> Removing {
+    let mut client = daemon.host.client().await;
+    let environment = daemon.host.environment_id;
+    tokio::spawn(async move {
+        client
+            .mutate(
+                Method::VoiceCredentialRemove,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(environment),
+                &VoiceCredentialRemoveParams {
+                    kind: VoiceCredentialKind::OpenaiLive,
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .map(|answer| answer.to_typed().expect("the result decodes"))
+    })
+}
+
+fn starting_in_background(
+    phone: &Arc<Phone>,
+) -> tokio::task::JoinHandle<Result<VoiceStartResult, ProtocolError>> {
+    let phone = Arc::clone(phone);
+    tokio::spawn(async move { phone.start().await })
+}
+
+fn creates_seen(daemon: &Daemon) -> usize {
+    daemon.stand_in.recorded().creates.len()
+}
+
+fn the_registry_is(daemon: &Daemon, state: RegistryState) -> bool {
+    daemon.host.controller().own_key_registry_state() == state
+}
+
+/// The live voice grants a device holds in the host's own store.
+fn live_voice_grants(daemon: &Daemon, phone: &Phone) -> usize {
+    daemon
+        .host
+        .controller()
+        .sharing()
+        .grants()
+        .records_for_device(phone.device_id)
+        .expect("the store answers")
+        .into_iter()
+        .filter(|record| record.is_active() && record.revoked_at_ms.is_none())
+        .filter(|record| record.grant.permits(ActionRight::VoiceUse))
+        .count()
+}
+
+/// A start whose caller goes away while OpenAI has not yet answered is not dropped with it: the
+/// start runs on a task of its own, so the answer that comes later is adopted, found no longer
+/// admitted because its link is gone, and the call it created is closed: no row stays, the
+/// registry is idle and the coordinator holds nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_whose_caller_goes_away_during_the_creation_is_carried_to_its_end_and_the_call_it_created_is_closed()
+ {
+    let daemon = daemon().await;
+    let phone = Arc::new(phone(&daemon, &MANAGER).await);
+    let release = Arc::new(tokio::sync::Notify::new());
+    daemon.stand_in.script_create(CreateScript::Held(
+        Arc::clone(&release),
+        Box::new(CreateScript::Answer(
+            201,
+            Some(created_body("live_carried")),
+        )),
+    ));
+    let starting = starting_in_background(&phone);
+    until("the creation reached the stand-in", || {
+        creates_seen(&daemon) == 1
+    })
+    .await;
+    assert!(the_registry_is(&daemon, RegistryState::Starting));
+
+    phone.raw.close();
+    until("the daemon has let the link go", || {
+        daemon.host.connections_of(&phone.record) == 0
+    })
+    .await;
+    release.notify_one();
+    until(
+        "the start ran to its end though its caller was gone",
+        || the_registry_is(&daemon, RegistryState::Idle) && rows_of(&daemon).is_empty(),
+    )
+    .await;
+
+    let seen = daemon.stand_in.recorded();
+    assert_eq!(seen.creates.len(), 1);
+    let closed_by_command = seen
+        .commands
+        .iter()
+        .any(|command| command["type"] == "session.close");
+    let hung_up = seen
+        .hangups
+        .iter()
+        .any(|(key, session)| key == HELD_KEY && session == "live_carried");
+    assert!(
+        closed_by_command || hung_up,
+        "the session the creation gave is closed at the provider: {:?} {:?}",
+        seen.commands,
+        seen.hangups
+    );
+    assert_eq!(
+        daemon
+            .host
+            .controller()
+            .voice()
+            .coordinator()
+            .live_sessions(),
+        0,
+        "the coordinator holds no call its caller never saw"
+    );
+    let _ = starting.await;
+    daemon.host.stop().await;
+}
+
+/// A reattachment that a fence overtakes while its attach is awaited writes nothing to the channel
+/// it was given: the call is hung up with the key still held and no probe goes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reattachment_that_a_fence_overtakes_sends_no_probe_and_the_call_is_hung_up_with_the_held_key()
+ {
+    let daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    let asked_before = daemon.stand_in.recorded().attaches_asked;
+    let release = Arc::new(tokio::sync::Notify::new());
+    daemon.stand_in.hold_attach(Arc::clone(&release));
+    daemon.stand_in.drop_socket();
+    until("the reattachment reached the stand-in", || {
+        daemon.stand_in.recorded().attaches_asked == asked_before + 1
+    })
+    .await;
+    let commands_before = daemon.stand_in.recorded().commands.len();
+
+    let forgetting = forgetting_in_background(&daemon).await;
+    until("the registry is settling", || {
+        the_registry_is(&daemon, RegistryState::Settling)
+    })
+    .await;
+    release.notify_one();
+    forgetting
+        .await
+        .expect("the task ends")
+        .expect("forgetting is answered");
+
+    let seen = daemon.stand_in.recorded();
+    assert_eq!(
+        seen.commands.len(),
+        commands_before,
+        "no probe and no close was written to the channel an older epoch attached: {:?}",
+        &seen.commands[commands_before..]
+    );
+    assert!(
+        !seen.hangups.is_empty() && seen.hangups.iter().all(|(key, _)| key == HELD_KEY),
+        "the call is hung up with the key that is still held: {:?}",
+        seen.hangups
+    );
+    assert!(rows_of(&daemon).is_empty());
+    assert!(the_registry_is(&daemon, RegistryState::Idle));
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+    daemon.host.stop().await;
+}
+
+/// A call that OpenAI closes leaves nothing of the host's authority behind: the host call is gone
+/// at once, and the coordinator's own pass then ends the voice session and revokes the call's
+/// grant, though no host call is left to prompt it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_the_provider_closes_is_ended_in_the_coordinator_with_its_grant_revoked_though_no_host_call_is_left()
+ {
+    let daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let before = live_voice_grants(&daemon, &phone);
+    let _ = started(phone.start().await);
+    let coordinator = daemon.host.controller().voice().coordinator();
+    assert_eq!(coordinator.live_sessions(), 1);
+    assert!(
+        live_voice_grants(&daemon, &phone) > before,
+        "the call has a grant of its own"
+    );
+
+    daemon.stand_in.event(&closed_event("expired", None));
+    until("the host call left with the closed session", || {
+        daemon.host.controller().voice().host_calls().is_empty()
+    })
+    .await;
+    until("the coordinator ended the call it still held", || {
+        coordinator.live_sessions() == 0
+    })
+    .await;
+    assert_eq!(
+        live_voice_grants(&daemon, &phone),
+        before,
+        "the call's grant is revoked"
+    );
+    assert!(
+        rows_of(&daemon).is_empty(),
+        "the closure was marked and the row deleted"
+    );
+    assert!(the_registry_is(&daemon, RegistryState::Idle));
+    assert!(
+        daemon.stand_in.recorded().hangups.is_empty(),
+        "a closure OpenAI told is not hung up again"
+    );
+    daemon.host.stop().await;
+}
+
+/// A `session.closed` that comes while the call is not yet ready is a recognised closure: the row
+/// is marked and deleted, nothing is hung up, and the registry is free for the next start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_closed_during_readiness_marks_the_row_closed_sends_no_hangup_and_frees_the_next_start()
+ {
+    let daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    daemon.stand_in.close_at_attach(true);
+    let outcome = phone.start().await.expect("the start is answered").outcome;
+    assert!(
+        !matches!(outcome, VoiceStartOutcome::Started { .. }),
+        "a call that closed before it was ready does not run: {outcome:?}"
+    );
+    let seen = daemon.stand_in.recorded();
+    assert_eq!(seen.creates.len(), 1);
+    assert!(
+        seen.hangups.is_empty(),
+        "a closure the provider told is not hung up again: {:?}",
+        seen.hangups
+    );
+    assert!(
+        rows_of(&daemon).is_empty(),
+        "the row was marked and deleted"
+    );
+    assert!(the_registry_is(&daemon, RegistryState::Idle));
+
+    daemon.stand_in.close_at_attach(false);
+    let _ = started(phone.start().await);
+    daemon.host.stop().await;
+}
+
+/// A removal that fences after the session id is written and before the call is ready hangs that
+/// session up with the key still held, and deletes the key after the closure is recognised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_after_the_id_is_written_and_before_the_call_is_ready_hangs_that_session_up_with_the_held_key_and_deletes_the_item_after_the_recognised_closure()
+ {
+    let daemon = daemon().await;
+    let phone = Arc::new(phone(&daemon, &MANAGER).await);
+    daemon.stand_in.script_create(CreateScript::Answer(
+        201,
+        Some(created_body("live_not_ready")),
+    ));
+    let release = Arc::new(tokio::sync::Notify::new());
+    daemon.stand_in.hold_attach(Arc::clone(&release));
+    let starting = starting_in_background(&phone);
+    until("the session id is written and the attach is asked", || {
+        daemon.stand_in.recorded().attaches_asked == 1
+            && rows_of(&daemon)
+                .first()
+                .is_some_and(|row| row.provider_session_id.as_deref() == Some("live_not_ready"))
+    })
+    .await;
+
+    let removing = removing_in_background(&daemon).await;
+    until("the registry is settling", || {
+        the_registry_is(&daemon, RegistryState::Settling)
+    })
+    .await;
+    release.notify_one();
+    let removed = removing
+        .await
+        .expect("the task ends")
+        .expect("the removal is answered");
+    assert!(removed.removed);
+    assert_eq!(removed.late_start, VoiceLateStart::Closed);
+    assert_eq!(
+        held_key(&daemon.host),
+        None,
+        "the item goes after the closure"
+    );
+    assert_eq!(
+        daemon.stand_in.recorded().hangups,
+        vec![(HELD_KEY.to_owned(), "live_not_ready".to_owned())],
+        "the session was hung up with the key that was held then"
+    );
+    assert!(rows_of(&daemon).is_empty());
+    let _ = starting.await;
+    daemon.host.stop().await;
+}
+
+/// A removal that finds only a row with no id keeps the key and says the creation was not learned;
+/// forget-calls then deletes the record and keeps the key, and the key can be removed after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_with_only_a_creating_row_keeps_the_item_and_forget_calls_deletes_it() {
+    let mut daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    daemon.stand_in.script_create(CreateScript::Lost);
+    let outcome = phone.start().await.expect("the start is answered").outcome;
+    assert!(
+        matches!(outcome, VoiceStartOutcome::CreationUnknown { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(rows_of(&daemon).len(), 1);
+    assert_eq!(rows_of(&daemon)[0].state, CallState::Creating);
+
+    let refused = remove_key(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("a creating row keeps the key");
+    assert_eq!(refused.message, words::CREATION_NOT_LEARNED);
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+    assert_eq!(rows_of(&daemon).len(), 1, "the record is as it was");
+
+    let forgotten = forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect("forgetting is answered");
+    assert_eq!(forgotten.calls_forgotten, 1);
+    assert!(rows_of(&daemon).is_empty());
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+    let removed = remove_key(&mut daemon.control, &daemon.host)
+        .await
+        .expect("the removal is answered");
+    assert!(removed.removed);
+    assert_eq!(held_key(&daemon.host), None);
+    let _ = &daemon.placed;
+    daemon.host.stop().await;
+}
+
+/// A plain removal that meets a late creation whose hangup is not confirmed keeps the key and the
+/// row with the late session's id, and says the call could not be confirmed closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plain_removal_that_cannot_confirm_the_late_session_closed_keeps_the_key_and_the_row_with_its_id()
+ {
+    let daemon = daemon().await;
+    let phone = Arc::new(phone(&daemon, &MANAGER).await);
+    let release = Arc::new(tokio::sync::Notify::new());
+    daemon.stand_in.script_create(CreateScript::Held(
+        Arc::clone(&release),
+        Box::new(CreateScript::Answer(
+            201,
+            Some(created_body("live_late_session")),
+        )),
+    ));
+    // The late hangup and the removal's own hangup of the stored row are both lost.
+    daemon.stand_in.script_hangup(HangupScript::Lost);
+    daemon.stand_in.script_hangup(HangupScript::Lost);
+    let starting = starting_in_background(&phone);
+    until("the creation reached the stand-in", || {
+        creates_seen(&daemon) == 1
+    })
+    .await;
+    let removing = removing_in_background(&daemon).await;
+    until("the registry is settling", || {
+        the_registry_is(&daemon, RegistryState::Settling)
+    })
+    .await;
+    release.notify_one();
+    let refused = removing
+        .await
+        .expect("the task ends")
+        .expect_err("the removal could not confirm the call closed");
+    assert_eq!(refused.message, words::NOT_CONFIRMED_CLOSED);
+    assert_eq!(
+        held_key(&daemon.host).as_deref(),
+        Some(HELD_KEY),
+        "the key stays so that the host can try again"
+    );
+    let rows = rows_of(&daemon);
+    assert_eq!(rows.len(), 1, "the late session keeps its row");
+    assert_eq!(rows[0].state, CallState::Unresolved);
+    assert_eq!(
+        rows[0].provider_session_id.as_deref(),
+        Some("live_late_session")
+    );
+    assert!(
+        daemon
+            .stand_in
+            .recorded()
+            .hangups
+            .iter()
+            .all(|(key, session)| key == HELD_KEY && session == "live_late_session")
+    );
+    let _ = starting.await;
+    daemon.host.stop().await;
+}
+
+/// A forget-calls hangs a live call up once, and only when its close did not hear `session.closed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forget_calls_hangs_a_live_call_up_once_and_only_when_its_close_heard_no_closing_event() {
+    for answer_close in [true, false] {
+        let mut daemon = daemon().await;
+        daemon.stand_in.answer_close(answer_close);
+        let phone = phone(&daemon, &MANAGER).await;
+        let _ = started(phone.start().await);
+
+        let forgotten = forget_calls(&mut daemon.control, &daemon.host)
+            .await
+            .expect("forgetting is answered");
+        assert_eq!(forgotten.late_start, VoiceLateStart::None);
+        let seen = daemon.stand_in.recorded();
+        let closes = seen
+            .commands
+            .iter()
+            .filter(|command| command["type"] == "session.close")
+            .count();
+        assert_eq!(closes, 1, "the close protocol ran once");
+        if answer_close {
+            assert!(
+                seen.hangups.is_empty(),
+                "the close heard session.closed, so nothing is hung up: {:?}",
+                seen.hangups
+            );
+        } else {
+            assert_eq!(
+                seen.hangups,
+                vec![(HELD_KEY.to_owned(), "live_u1_stand_in".to_owned())],
+                "one hangup with the held key, and no second one from the forget"
+            );
+        }
+        assert!(rows_of(&daemon).is_empty());
+        assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+        daemon.host.stop().await;
+    }
+}
+
+/// A forget-calls that comes while the start-time reconcile hangs a stored call up waits for it:
+/// it is not refused, it hangs nothing up a second time, and it finds the record as the reconcile
+/// left it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forget_calls_fences_a_running_reconcile_and_waits_for_its_hangup() {
+    let daemon = daemon().await;
+    let Daemon {
+        host,
+        stand_in,
+        placed,
+        control,
+        owner,
+    } = daemon;
+    drop(control);
+    let stopped = host.shut_down().await;
+    let state_dir = stopped.tree().environment().state_dir().to_path_buf();
+    {
+        use kr_client::services::NewCall;
+        let calls = OwnKeyCalls::open(&state_dir).expect("the record opens");
+        let call = NewCall {
+            call_id: "call-1".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            device_id: "device-1".to_owned(),
+            asked_ms: 1_700_000_000_000,
+            closes_at_ms: 1_700_000_300_000,
+        };
+        calls.begin(&call).expect("a row is written");
+        calls
+            .record_id(&call.call_id, "live_open", None)
+            .expect("its id is written");
+    }
+    let release = Arc::new(tokio::sync::Notify::new());
+    stand_in.script_hangup(HangupScript::Held(
+        Arc::clone(&release),
+        Box::new(HangupScript::Answer(200, Some(Vec::new()))),
+    ));
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    until("the reconcile's hangup reached the stand-in", || {
+        stand_in.recorded().hangups.len() == 1
+    })
+    .await;
+
+    let mut client = host.client().await;
+    let environment = host.environment_id;
+    let mut forgetting =
+        tokio::spawn(async move { forget_calls_of(&mut client, environment).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), &mut forgetting)
+            .await
+            .is_err(),
+        "the forget waits for the reconcile and is not refused"
+    );
+    release.notify_one();
+    let forgotten = forgetting
+        .await
+        .expect("the task ends")
+        .expect("forgetting is answered after the reconcile");
+    assert_eq!(forgotten.late_start, VoiceLateStart::None);
+    assert_eq!(
+        stand_in.recorded().hangups,
+        vec![(HELD_KEY.to_owned(), "live_open".to_owned())],
+        "the stored call is hung up once, by the reconcile"
+    );
+    assert!(
+        OwnKeyCalls::open(&state_dir)
+            .expect("the record opens")
+            .rows()
+            .expect("rows")
+            .is_empty()
+    );
+    assert_eq!(held_key(&host).as_deref(), Some(HELD_KEY));
+    let _ = owner;
+    host.stop().await;
+    drop(placed);
+}
+
+/// A host that holds the owner's key and no account is a host that needs no account, and it does
+/// not report the managed inference service as configured, before a call and while one runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_own_voice_host_passes_assert_it_needs_no_account_and_does_not_report_managed_inference()
+{
+    let daemon = daemon().await;
+    daemon.host.assert_it_needs_no_account().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    daemon.host.assert_it_needs_no_account().await;
+    daemon.host.stop().await;
+}
+
+/// A daemon of the testing build that has no stand-in under it asks the production connector once
+/// at startup and is refused by it, and an own-key start on it never becomes a call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_testing_daemon_refuses_an_own_key_start_without_a_stand_in_transport_and_makes_no_connection()
+ {
+    use std::sync::atomic::Ordering;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let before = TESTING_REFUSALS.load(Ordering::Relaxed);
+    let host = net_support::Host::start_with_own_voice_unplaced(&owner).await;
+    assert_eq!(
+        TESTING_REFUSALS.load(Ordering::Relaxed),
+        before + 1,
+        "the daemon asked the production connector once and the testing build refused it"
+    );
+    let mut control = host.client().await;
+    set_key(&mut control, &host, HELD_KEY)
+        .await
+        .expect("the key is held");
+    let phone = phone_on(&host, &owner, &MANAGER).await;
+    let outcome = phone.start().await.expect("the start is answered").outcome;
+    assert!(
+        !matches!(outcome, VoiceStartOutcome::Started { .. }),
+        "no call runs on a daemon that reaches nothing: {outcome:?}"
+    );
+    assert_eq!(
+        TESTING_REFUSALS.load(Ordering::Relaxed),
+        before + 1,
+        "no second connection was asked for"
+    );
+    host.stop().await;
+}
+
+/// A document edited by hand to name both voice providers is refused at load with its sentence,
+/// which the diagnostics show, and the daemon starts neither provider: a device is offered no call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hand_edited_document_naming_both_providers_is_refused_at_load_with_its_sentence_and_starts_no_provider()
+ {
+    const SENTENCE: &str = "voice: name either broker_origin or own_voice.provider, not both.";
+    let daemon = daemon().await;
+    let Daemon {
+        host,
+        placed,
+        control,
+        owner,
+        ..
+    } = daemon;
+    drop(control);
+    let stopped = host.shut_down().await;
+    net_support::write_document_text(
+        stopped.tree(),
+        r#"{"version": 3, "level": 8, "voice": {"broker_origin": "https://broker.example.com"}, "own_voice": {"provider": "openai_live"}}"#,
+    );
+    let settings = stopped.settings().clone();
+    let host = stopped.start(settings).await;
+    let doctor = host.doctor().await;
+    let shown = format!("{:?}", doctor.configuration);
+    assert!(
+        shown.contains(SENTENCE),
+        "the diagnostics carry the refusal: {shown}"
+    );
+    let phone = phone_on(&host, &owner, &MANAGER).await;
+    assert!(
+        matches!(
+            phone.prepared.provider,
+            VoicePrepareProvider::Unavailable { .. }
+        ),
+        "neither provider is started: {:?}",
+        phone.prepared.provider
+    );
+    host.stop().await;
+    drop(placed);
 }

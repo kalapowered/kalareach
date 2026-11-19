@@ -1664,6 +1664,12 @@ impl CallTask {
                 return Err(NotReady::Different);
             }
         }
+        // A fence can come while the attach or the first events are awaited: a task of an older
+        // epoch writes nothing to the channel it just opened.
+        if self.core.registry.epoch() != self.epoch {
+            self.socket = None;
+            return Err(NotReady::Unavailable);
+        }
         // The probe restates the mute state rather than changing it, and is answered under its
         // own identifier.
         let probe_id = self.event_id("probe");

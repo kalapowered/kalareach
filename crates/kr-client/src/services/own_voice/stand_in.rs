@@ -54,6 +54,8 @@ pub enum HangupScript {
     Answer(u16, Option<Vec<u8>>),
     /// No answer.
     Lost,
+    /// The same answer once the test lets it go.
+    Held(Arc<tokio::sync::Notify>, Box<HangupScript>),
 }
 
 crate::debug_as_name!(HangupScript);
@@ -67,6 +69,8 @@ pub struct Recorded {
     pub hangups: Vec<(String, String)>,
     /// How many times the side channel was attached.
     pub attaches: u32,
+    /// How many times the side channel was asked for, whether or not it was given.
+    pub attaches_asked: u32,
     /// Each command written on the side channel.
     pub commands: Vec<Value>,
 }
@@ -77,9 +81,12 @@ struct Script {
     create: VecDeque<CreateScript>,
     hangup: VecDeque<HangupScript>,
     attach: VecDeque<AttachFault>,
+    attach_hold: VecDeque<Arc<tokio::sync::Notify>>,
+    send_hold: VecDeque<Arc<tokio::sync::Notify>>,
     ack: bool,
     answer_close: bool,
     send_started: bool,
+    closed_at_attach: bool,
 }
 
 struct State {
@@ -158,9 +165,12 @@ impl StandIn {
                     create: VecDeque::new(),
                     hangup: VecDeque::new(),
                     attach: VecDeque::new(),
+                    attach_hold: VecDeque::new(),
+                    send_hold: VecDeque::new(),
                     ack: true,
                     answer_close: true,
                     send_started: true,
+                    closed_at_attach: false,
                 }),
                 recorded: Mutex::new(Recorded::default()),
                 socket: Mutex::new(None),
@@ -189,6 +199,22 @@ impl StandIn {
     /// The next attach fails like this.
     pub fn fail_attach(&self, fault: AttachFault) {
         self.script().attach.push_back(fault);
+    }
+
+    /// The next attach is answered once the test lets it go.
+    pub fn hold_attach(&self, release: Arc<tokio::sync::Notify>) {
+        self.script().attach_hold.push_back(release);
+    }
+
+    /// The next write on a side channel takes no effect until the test lets it go.
+    pub fn hold_send(&self, release: Arc<tokio::sync::Notify>) {
+        self.script().send_hold.push_back(release);
+    }
+
+    /// Whether an attach is answered at once with a valid `session.closed`, in the place of
+    /// `session.started`.
+    pub fn close_at_attach(&self, on: bool) {
+        self.script().closed_at_attach = on;
     }
 
     /// Whether commands are acknowledged.
@@ -258,6 +284,10 @@ struct StandSocket {
 impl SidebandSocket for StandSocket {
     fn send(&mut self, text: String) -> TransportFuture<'_, bool> {
         Box::pin(async move {
+            let held = self.stand_in.script().send_hold.pop_front();
+            if let Some(release) = held {
+                release.notified().await;
+            }
             let Ok(command) = crate::services::json::read::<Value>(text.as_bytes()) else {
                 return false;
             };
@@ -348,13 +378,22 @@ impl OwnVoiceTransport for StandIn {
                     .hangups
                     .push((key.expose().to_owned(), session_id.to_owned()));
             });
-            match self.script().hangup.pop_front() {
-                Some(HangupScript::Lost) => Err(Lost),
-                Some(HangupScript::Answer(status, body)) => Ok(Reply { status, body }),
-                None => Ok(Reply {
-                    status: 200,
-                    body: Some(Vec::new()),
-                }),
+            let mut script = self.script().hangup.pop_front();
+            loop {
+                match script {
+                    Some(HangupScript::Held(release, next)) => {
+                        release.notified().await;
+                        script = Some(*next);
+                    }
+                    Some(HangupScript::Lost) => return Err(Lost),
+                    Some(HangupScript::Answer(status, body)) => return Ok(Reply { status, body }),
+                    None => {
+                        return Ok(Reply {
+                            status: 200,
+                            body: Some(Vec::new()),
+                        });
+                    }
+                }
             }
         })
     }
@@ -365,6 +404,11 @@ impl OwnVoiceTransport for StandIn {
         _session_id: &'a str,
     ) -> TransportFuture<'a, Result<Box<dyn SidebandSocket>, AttachFault>> {
         Box::pin(async move {
+            self.record(|recorded| recorded.attaches_asked += 1);
+            let held = self.script().attach_hold.pop_front();
+            if let Some(release) = held {
+                release.notified().await;
+            }
             if let Some(fault) = self.script().attach.pop_front() {
                 return Err(fault);
             }
@@ -375,7 +419,11 @@ impl OwnVoiceTransport for StandIn {
                 .socket
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(inject.clone());
-            if self.script().send_started {
+            if self.script().closed_at_attach {
+                let _ = inject.send(SocketRead::Text(
+                    closed_event("close_requested", None).to_string(),
+                ));
+            } else if self.script().send_started {
                 let asked = self
                     .state
                     .last_body

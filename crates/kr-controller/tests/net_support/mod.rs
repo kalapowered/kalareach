@@ -73,6 +73,11 @@ pub fn write_document(
     );
 }
 
+/// Writes `text` as the configuration document, where the document is kept.
+pub fn write_document_text(temp: &kr_ipc::testing::TempHost, text: &str) {
+    write_document_bytes(temp, text.as_bytes());
+}
+
 /// Writes a configuration document this host cannot use, where the document is kept.
 pub fn write_unusable_document(temp: &kr_ipc::testing::TempHost) {
     write_document_bytes(temp, b"{ this is not a configuration document");
@@ -562,6 +567,20 @@ impl Host {
         owner: &DeviceKeys,
         transport: Arc<dyn kr_client::services::own_voice::OwnVoiceTransport>,
     ) -> (Self, kr_controller::voice::own_key_hooks::Placed) {
+        let (host, placed) = Self::start_own_voice_document(owner, Some(transport)).await;
+        (host, placed.expect("a transport was placed"))
+    }
+
+    /// Starts a daemon whose configuration document selects the owner's own OpenAI key and that
+    /// has no transport placed under it, so its provider asks the connector a daemon asks.
+    pub async fn start_with_own_voice_unplaced(owner: &DeviceKeys) -> Self {
+        Self::start_own_voice_document(owner, None).await.0
+    }
+
+    async fn start_own_voice_document(
+        owner: &DeviceKeys,
+        transport: Option<Arc<dyn kr_client::services::own_voice::OwnVoiceTransport>>,
+    ) -> (Self, Option<kr_controller::voice::own_key_hooks::Placed>) {
         let temp = kr_ipc::testing::TempHost::create();
         let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
         document.own_voice = kr_protocol::hostinfo::configuration::OwnVoiceSelection {
@@ -570,8 +589,9 @@ impl Host {
             ),
         };
         write_document(&temp, &document);
-        let placed =
-            kr_controller::voice::own_key_hooks::place(temp.environment().state_dir(), transport);
+        let placed = transport.map(|transport| {
+            kr_controller::voice::own_key_hooks::place(temp.environment().state_dir(), transport)
+        });
         let mut host = Self::start_on(
             temp,
             room::TestRoom::new(),
@@ -1381,6 +1401,14 @@ impl Host {
         LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())
             .await
             .expect("connects to the control endpoint")
+    }
+
+    /// The diagnostics the daemon answers.
+    pub async fn doctor(&self) -> kr_protocol::hostinfo::HostDoctorResult {
+        let mut local = self.client().await;
+        pairing::read(&mut local, Method::HostDoctor, &())
+            .await
+            .expect("the host's diagnostics")
     }
 
     /// What the daemon says of the managed services it holds, in the `managed-services` check of
