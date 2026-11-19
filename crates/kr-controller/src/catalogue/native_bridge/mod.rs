@@ -68,7 +68,7 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::PluginId;
 use kr_protocol::scalars::Digest256;
 pub use kr_worker::broker::bridge::BridgeSurface;
-use kr_worker::broker::bridge::{forwarder_application, forwarder_serves};
+use kr_worker::broker::bridge::forwarder_serves;
 pub use kr_worker::broker::connectors::{BridgeFacts, QualifiedExecutable};
 
 pub use self::check::{check, unread_check};
@@ -885,20 +885,6 @@ impl NativeBridges {
                 && let Some((_, bytes)) = written.iter().find(|(named, _)| named == path)
             {
                 *digest = PayloadDigest::of(bytes).to_string();
-            }
-        }
-        // The forwarder a registration starts reports for the application it names, and a
-        // launch of this package admits only the application the package declares, under any
-        // publisher and any package name: a registration for another application would be a
-        // bridge no launch of this package could use.
-        if let Some(facts) = facts.as_ref() {
-            let declared = forwarder_application(recipe.application.as_str());
-            if declared != Some(facts.application.as_str()) {
-                return Err(format!(
-                    "the registration starts the forwarder for {}, which is not the application \
-                     {} declares ({application})",
-                    facts.application, target.plugin_id
-                ));
             }
         }
         let versions = self.versions(target)?;
