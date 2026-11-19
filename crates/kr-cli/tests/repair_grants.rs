@@ -260,3 +260,139 @@ fn the_repair_refuses_a_registry_of_another_schema() {
     );
     assert_eq!(grants_rows(&path), 2);
 }
+
+/// The one document of a run that succeeded.
+fn document_of(output: &Output) -> serde_json::Value {
+    assert!(output.status.success(), "{}", said(output));
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("one document, not {error}: {}", said(output)))
+}
+
+/// `--json` states what the lines state, in one document for each run: the rows by place, cause
+/// and key, the grants, the copy, the fence, and the undo's grants.
+#[test]
+fn the_json_form_states_what_the_lines_state() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = damaged_registry(&temp);
+    let preview = document_of(&run_kr(&temp, &["--json", "host", "repair-grants"]));
+    assert_eq!(
+        preview,
+        serde_json::json!({
+            "ok": true,
+            "applied": false,
+            "nothing_to_repair": false,
+            "unreadable_rows": [
+                {"place": 1, "cause": "its record does not decode", "key": id(0x41).to_string()}
+            ],
+            "grants_to_withdraw": [id(0x42).to_string()],
+        })
+    );
+    assert_eq!(grants_rows(&path), 2, "the preview changes nothing");
+
+    let applied = document_of(&run_kr(
+        &temp,
+        &["host", "repair-grants", "--apply", "--json"],
+    ));
+    let copy = applied["copy"]
+        .as_str()
+        .expect("the copy is named")
+        .to_owned();
+    let folder = std::path::Path::new(&copy)
+        .parent()
+        .expect("a folder")
+        .display()
+        .to_string();
+    assert_eq!(
+        applied,
+        serde_json::json!({
+            "ok": true,
+            "applied": true,
+            "nothing_to_repair": false,
+            "copy": copy,
+            "folder": folder,
+            "removed_rows": [
+                {"place": 1, "cause": "its record does not decode", "key": id(0x41).to_string()}
+            ],
+            "withdrawn_grants": [id(0x42).to_string()],
+            "fence_owed": true,
+        })
+    );
+    assert_eq!(grants_rows(&path), 1, "the damaged row is removed");
+
+    let undo = document_of(&run_kr(
+        &temp,
+        &["--json", "host", "repair-grants", "--undo", &copy],
+    ));
+    assert_eq!(
+        undo,
+        serde_json::json!({
+            "ok": true,
+            "applied": false,
+            "grants_live_again": [id(0x42).to_string()],
+        })
+    );
+    let undone = document_of(&run_kr(
+        &temp,
+        &[
+            "--json",
+            "host",
+            "repair-grants",
+            "--undo",
+            &copy,
+            "--apply",
+        ],
+    ));
+    assert_eq!(undone, serde_json::json!({"ok": true, "applied": true}));
+    assert_eq!(grants_rows(&path), 2, "the registry is what the copy held");
+}
+
+/// A registry with nothing to repair gives the document that says so, with and without `--apply`.
+#[test]
+fn the_json_form_of_a_sound_registry_says_there_is_nothing_to_repair() {
+    let temp = kr_ipc::testing::TempHost::create();
+    drop(
+        kr_controller::registry::Registry::open(
+            temp.environment().registry_database(),
+            temp.environment_id(),
+        )
+        .expect("the registry"),
+    );
+    drop(GrantDirectory::open(temp.environment().registry_database()).expect("tables"));
+    for line in [
+        &["--json", "host", "repair-grants"][..],
+        &["--json", "host", "repair-grants", "--apply"],
+    ] {
+        assert_eq!(
+            document_of(&run_kr(&temp, line)),
+            serde_json::json!({
+                "ok": true,
+                "applied": false,
+                "nothing_to_repair": true,
+                "unreadable_rows": [],
+                "grants_to_withdraw": [],
+            })
+        );
+    }
+}
+
+/// A refusal under `--json` is the one failure document the command line gives, and nothing is
+/// changed.
+#[test]
+fn the_json_form_of_a_refusal_is_one_failure_document() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = damaged_registry(&temp);
+    rusqlite::Connection::open(&path)
+        .expect("opens")
+        .execute_batch("UPDATE schema_version SET version = 14;")
+        .expect("another schema");
+    let output = run_kr(&temp, &["--json", "host", "repair-grants", "--apply"]);
+    assert!(!output.status.success());
+    let failure: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("one document, not {error}: {}", said(&output)));
+    assert_eq!(failure["ok"], serde_json::json!(false), "{failure}");
+    assert!(
+        failure.to_string().contains("Nothing is changed."),
+        "the document says nothing was changed: {failure}"
+    );
+    assert_eq!(grants_rows(&path), 2);
+}

@@ -3,7 +3,8 @@
 //! It runs against the environment's own files with no daemon: it holds the environment's
 //! singleton lock, which a running daemon, an update, an import and another repair all hold, and
 //! it never opens the registry through the daemon's own open, which migrates. Without `--apply` it
-//! lists what it would do and changes nothing, in either mode.
+//! lists what it would do and changes nothing, in either mode. With `--json` it writes one document
+//! for the run, with the facts the lines state.
 
 use kr_client::shown;
 use kr_client::shown::Shown;
@@ -15,7 +16,7 @@ use kr_ipc::paths::HostPaths;
 
 use crate::cli::RepairGrantsArguments;
 use crate::error::{CliError, Result};
-use crate::output;
+use crate::output::{self, Document};
 use crate::report::Completion;
 
 /// The sentence a refusal is told in. Every one says that nothing was changed.
@@ -109,6 +110,30 @@ fn lines_of(found: &Found, done: bool) -> Vec<Shown> {
     lines
 }
 
+/// The damaged rows of `found` as the document states them: place, cause and key (null for a key
+/// that is not a grant identifier), and no payload value.
+fn rows_document(found: &Found) -> Vec<Document> {
+    found
+        .damaged
+        .iter()
+        .map(|row| {
+            Document::new()
+                .with("place", row.place)
+                .with("cause", row.class.phrase())
+                .with("key", row.key.map(|key| output::said(&key)))
+        })
+        .collect()
+}
+
+/// The grants of `found` that the repair withdraws, as identifiers.
+fn grants_document(found: &Found) -> Vec<Shown> {
+    found
+        .withdraw
+        .iter()
+        .map(|grant| output::said(grant))
+        .collect()
+}
+
 /// `kr host repair-grants [--apply] [--undo <copy>]`.
 ///
 /// # Errors
@@ -116,7 +141,7 @@ fn lines_of(found: &Found, done: bool) -> Vec<Shown> {
 /// Returns an error, and changes nothing, when the environment cannot be resolved, another process
 /// holds it, the registry is not one this build reads, or a step of the copy or the replacement
 /// fails.
-pub fn run(paths: &HostPaths, arguments: &RepairGrantsArguments) -> Result<Completion> {
+pub fn run(paths: &HostPaths, arguments: &RepairGrantsArguments, json: bool) -> Result<Completion> {
     let environment = crate::resolve::select(paths, None)?;
     // Held until this function returns, and released by the operating system if it never does. It
     // is taken without advancing the controller generation or naming a holder.
@@ -135,23 +160,52 @@ pub fn run(paths: &HostPaths, arguments: &RepairGrantsArguments) -> Result<Compl
     })?;
     let registry = environment.paths.registry_database();
     match &arguments.undo {
-        Some(copy) => undo(&registry, copy, environment.environment_id, arguments.apply),
-        None => repair_grants(&registry, arguments.apply),
+        Some(copy) => undo(
+            &registry,
+            copy,
+            environment.environment_id,
+            arguments.apply,
+            json,
+        ),
+        None => repair_grants(&registry, arguments.apply, json),
     }
 }
 
-fn nothing_to_repair() {
-    output::say(&Shown::said(
-        "Every grants row can be read and every live grant traces to a root. There is nothing to \
-         repair.",
-    ));
+/// What a run that finds nothing to repair says: the sentence, or the document with nothing in it.
+fn nothing_to_repair(json: bool) {
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("applied", false)
+                .with("nothing_to_repair", true)
+                .with("unreadable_rows", Vec::<Document>::new())
+                .with("grants_to_withdraw", Vec::<Shown>::new()),
+        );
+    } else {
+        output::say(&Shown::said(
+            "Every grants row can be read and every live grant traces to a root. There is nothing \
+             to repair.",
+        ));
+    }
 }
 
-fn repair_grants(registry: &std::path::Path, apply: bool) -> Result<Completion> {
+fn repair_grants(registry: &std::path::Path, apply: bool, json: bool) -> Result<Completion> {
     if !apply {
         let found = repair::preview(registry).map_err(refused)?;
         if found.is_empty() {
-            nothing_to_repair();
+            nothing_to_repair(json);
+            return Ok(Completion::Done);
+        }
+        if json {
+            output::document(
+                &Document::new()
+                    .with("ok", true)
+                    .with("applied", false)
+                    .with("nothing_to_repair", false)
+                    .with("unreadable_rows", rows_document(&found))
+                    .with("grants_to_withdraw", grants_document(&found)),
+            );
             return Ok(Completion::Done);
         }
         for line in lines_of(&found, false) {
@@ -168,9 +222,23 @@ fn repair_grants(registry: &std::path::Path, apply: bool) -> Result<Completion> 
     let Some(repaired) =
         repair::apply(registry, kr_ipc::now_ms().get(), unix_seconds).map_err(refused)?
     else {
-        nothing_to_repair();
+        nothing_to_repair(json);
         return Ok(Completion::Done);
     };
+    if json {
+        output::document(
+            &Document::new()
+                .with("ok", true)
+                .with("applied", true)
+                .with("nothing_to_repair", false)
+                .with("copy", Shown::root(&repaired.copy))
+                .with("folder", Shown::root(&repaired.folder))
+                .with("removed_rows", rows_document(&repaired.found))
+                .with("withdrawn_grants", grants_document(&repaired.found))
+                .with("fence_owed", repaired.fence_owed),
+        );
+        return Ok(Completion::Done);
+    }
     output::say(&shown!(
         "Copy of the registry before the repair: {}.",
         Shown::root(&repaired.copy)
@@ -201,9 +269,26 @@ fn undo(
     copy: &std::path::Path,
     environment_id: kr_protocol::ids::EnvironmentId,
     apply: bool,
+    json: bool,
 ) -> Result<Completion> {
     if !apply {
         let preview = repair::undo_preview(registry, copy, environment_id).map_err(refused)?;
+        if json {
+            output::document(
+                &Document::new()
+                    .with("ok", true)
+                    .with("applied", false)
+                    .with(
+                        "grants_live_again",
+                        preview
+                            .live_again
+                            .iter()
+                            .map(|grant| output::said(grant))
+                            .collect::<Vec<_>>(),
+                    ),
+            );
+            return Ok(Completion::Done);
+        }
         output::say(&Shown::said(
             "Putting this copy back withdraws nothing and revokes nothing: it makes the registry \
              what the copy held.",
@@ -222,6 +307,10 @@ fn undo(
         return Ok(Completion::Done);
     }
     repair::undo_apply(registry, copy, environment_id).map_err(refused)?;
+    if json {
+        output::document(&Document::new().with("ok", true).with("applied", true));
+        return Ok(Completion::Done);
+    }
     output::say(&Shown::said(
         "The registry is back to what the copy held. Every change made after the copy is gone \
          with it, and the grants the repair withdrew are live again.",
