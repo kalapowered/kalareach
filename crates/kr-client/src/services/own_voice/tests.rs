@@ -1033,3 +1033,220 @@ fn a_status_kept_across_a_failed_body_decides_the_class_of_the_creation_and_of_t
         "a 404 with no body is not a recognised closure"
     );
 }
+
+/// The elapsed time of a bound read off the paused clock.
+fn within(took: Duration, bound: Duration, margin: Duration) -> bool {
+    took >= bound && took <= bound + margin
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_creation_that_is_never_answered_is_given_up_when_the_dispatch_bound_and_its_margin_have_passed()
+ {
+    let world = fresh();
+    world.stand_in.script_create(CreateScript::Held(
+        Arc::new(tokio::sync::Notify::new()),
+        Box::new(CreateScript::Lost),
+    ));
+    let begun = Instant::now();
+    let outcome = start(&world, 1).await.expect("an answer");
+    assert!(matches!(outcome, VoiceStart::CreationUnknown { .. }));
+    let took = begun.elapsed();
+    assert!(
+        within(took, DISPATCH_BOUND, WATCHDOG_MARGIN),
+        "the dispatch bound decides: {took:?}"
+    );
+    assert_eq!(states(&world), [CallState::Creating]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_readiness_that_gets_no_acknowledgement_gives_up_at_its_own_bound_and_hangs_the_call_up()
+{
+    let world = fresh();
+    world.stand_in.acknowledge(false);
+    let begun = Instant::now();
+    let outcome = start(&world, 1).await.expect("an answer");
+    assert!(matches!(outcome, VoiceStart::Refused(_)));
+    let took = begun.elapsed();
+    assert!(
+        within(took, READINESS_BOUND, Duration::from_millis(100)),
+        "readiness has its own ten seconds: {took:?}"
+    );
+    assert_eq!(world.stand_in.recorded().hangups.len(), 1);
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_has_only_what_is_left_of_the_creation_window_when_the_creation_took_long() {
+    let world = fresh();
+    world.stand_in.acknowledge(false);
+    let request = request(1);
+    let begun = Instant::now();
+    let attempt = world.provider.begin(&request).await.expect("begin");
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    let outcome = world
+        .provider
+        .dispatch(attempt, &request)
+        .await
+        .expect("an answer");
+    assert!(matches!(outcome, VoiceStart::Refused(_)));
+    let took = begun.elapsed();
+    assert!(
+        within(took, CREATION_WINDOW, Duration::from_millis(100)),
+        "the whole start ends with the window, not ten seconds after the answer: {took:?}"
+    );
+    assert_eq!(world.stand_in.recorded().hangups.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hangup_that_is_never_answered_is_given_up_after_the_hangup_bound() {
+    let world = fresh();
+    world.stand_in.script_hangup(HangupScript::Held(
+        Arc::new(tokio::sync::Notify::new()),
+        Box::new(HangupScript::Lost),
+    ));
+    let begun = Instant::now();
+    assert!(!world.provider.cleanup_hangup("live_never").await);
+    let took = begun.elapsed();
+    assert!(
+        within(took, HANGUP_BOUND, WATCHDOG_MARGIN),
+        "the hangup bound decides: {took:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_session_closed_while_the_call_awaits_readiness_ends_the_creation_at_once_with_nothing_hung_up()
+ {
+    let world = fresh();
+    world.stand_in.close_at_attach(true);
+    let begun = Instant::now();
+    let outcome = start(&world, 1).await.expect("an answer");
+    assert!(matches!(outcome, VoiceStart::Refused(_)));
+    assert!(begun.elapsed() < Duration::from_secs(1), "no wait");
+    assert!(world.stand_in.recorded().hangups.is_empty());
+    assert!(world.ledger.rows().expect("rows").is_empty());
+    assert_eq!(world.provider.registry().state(), RegistryState::Idle);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_offer_not_starting_v0_or_over_the_size_limit_is_refused_before_anything_is_written_or_sent()
+ {
+    let world = fresh();
+    for offer in [
+        "o=nothing".to_owned(),
+        format!("v=0{}", "a".repeat(VOICE_OFFER_BYTES - 2)),
+    ] {
+        let mut bad = request(1);
+        bad.offer_sdp = offer;
+        assert!(world.provider.begin(&bad).await.is_err());
+        assert!(world.ledger.rows().expect("rows").is_empty());
+        assert_eq!(world.provider.registry().state(), RegistryState::Idle);
+    }
+    let mut edge = request(1);
+    edge.offer_sdp = format!("v=0{}", "a".repeat(VOICE_OFFER_BYTES - 3));
+    assert_eq!(edge.offer_sdp.len(), VOICE_OFFER_BYTES);
+    let attempt = world
+        .provider
+        .begin(&edge)
+        .await
+        .expect("an offer of exactly the limit is taken");
+    world.provider.abandon(attempt).await.ok();
+    assert!(world.stand_in.recorded().creates.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_probe_write_that_never_completes_is_given_up_with_the_readiness_bound_and_the_call_hung_up()
+ {
+    let world = fresh();
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    let begun = Instant::now();
+    let outcome = start(&world, 1).await.expect("an answer");
+    assert!(matches!(outcome, VoiceStart::Refused(_)));
+    let took = begun.elapsed();
+    assert!(
+        within(took, READINESS_BOUND, Duration::from_millis(100)),
+        "a held write is bounded by readiness: {took:?}"
+    );
+    assert_eq!(world.stand_in.recorded().hangups.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_that_never_completes_is_given_up_after_the_drain_bound_and_the_channel_is_attached_again()
+ {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    let frame = VoiceContextFrame::new(
+        "w-1",
+        VoiceCommand::Thinking,
+        None,
+        Some("hello".to_owned()),
+    )
+    .expect("frame");
+    let begun = Instant::now();
+    assert_eq!(
+        control.write(control.revision(), frame).await,
+        Err(WriteRefusal::Lost)
+    );
+    let took = begun.elapsed();
+    assert!(
+        within(took, DRAIN_BOUND, Duration::from_millis(100)),
+        "a held write is bounded by the drain bound: {took:?}"
+    );
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Ready);
+    assert_eq!(control.revision(), 2);
+    assert_eq!(world.stand_in.recorded().attaches, 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_close_whose_write_never_completes_is_given_up_after_the_drain_bound_and_the_call_is_hung_up()
+ {
+    let world = fresh();
+    let own = started(&world).await;
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    let begun = Instant::now();
+    assert!(world.provider.close(&own.call_id).await.is_ok());
+    let took = begun.elapsed();
+    assert!(
+        within(took, DRAIN_BOUND, Duration::from_millis(100)),
+        "a held close is bounded by the drain bound: {took:?}"
+    );
+    assert_eq!(world.stand_in.recorded().hangups.len(), 1);
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_mark_that_cannot_be_written_keeps_the_open_row_and_an_empty_404_on_reconcile_makes_it_unresolved()
+ {
+    let world = fresh();
+    let own = started(&world).await;
+    world.ledger.failing("record_closed", true);
+    world.stand_in.answer_close(false);
+    assert!(world.provider.close(&own.call_id).await.is_ok());
+    assert_eq!(
+        states(&world),
+        [CallState::Open],
+        "a closure whose mark cannot be written leaves the row as it was"
+    );
+    assert_eq!(world.stand_in.recorded().hangups.len(), 1);
+
+    world.ledger.failing("record_closed", false);
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    world.provider.reconcile().await;
+    assert_eq!(
+        states(&world),
+        [CallState::Unresolved],
+        "an empty 404 is not a recognised closure"
+    );
+}

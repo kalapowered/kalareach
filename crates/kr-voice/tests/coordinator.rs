@@ -5607,3 +5607,87 @@ async fn a_start_is_bound_to_the_preparation_the_person_was_shown() {
         started.outcome
     );
 }
+
+/// An admission that stands until the provider has written its first half, and has lapsed from
+/// then on.
+#[derive(Debug)]
+struct LapsesAfter {
+    provider: Arc<OwnKeyFake>,
+    half: &'static str,
+}
+
+impl kr_voice::Admission for LapsesAfter {
+    fn still_admitted(&self) -> Result<(), kr_protocol::error::ProtocolError> {
+        if self.provider.halves().contains(&self.half) {
+            Err(host_refusal())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// An admission that lapses between the first half and the request sends the provider nothing:
+/// the row is written and given up, and the admission's own sentence is told.
+#[tokio::test]
+async fn an_admission_withdrawn_between_begin_and_dispatch_sends_no_provider_request_and_deletes_the_row()
+ {
+    let (coordinator, _authority, provider, params) = own_call_ready().await;
+    let admission = LapsesAfter {
+        provider: Arc::clone(&provider),
+        half: "begin",
+    };
+    let refused = coordinator
+        .start(
+            device(PHONE),
+            action(0x44),
+            &params,
+            AuthorityRevision::new(1),
+            10_000,
+            &admission,
+        )
+        .await
+        .expect_err("the start is refused");
+    assert_eq!(
+        refused.to_protocol_error().message,
+        "this host owes a fence it could not raise",
+        "the admission's own sentence"
+    );
+    assert_eq!(
+        provider.halves(),
+        ["begin", "abandon"],
+        "the first half was written and given up, and no request was made"
+    );
+    assert_eq!(coordinator.live_sessions(), 0);
+}
+
+/// An admission that lapses after the provider answered closes the call that was created and
+/// tells the admission's sentence; no session is recorded.
+#[tokio::test]
+async fn an_admission_withdrawn_after_the_creation_answer_closes_the_call_and_records_no_session() {
+    let (coordinator, _authority, provider, params) = own_call_ready().await;
+    let admission = LapsesAfter {
+        provider: Arc::clone(&provider),
+        half: "dispatch",
+    };
+    let refused = coordinator
+        .start(
+            device(PHONE),
+            action(0x45),
+            &params,
+            AuthorityRevision::new(1),
+            10_000,
+            &admission,
+        )
+        .await
+        .expect_err("the start is refused");
+    assert_eq!(
+        refused.to_protocol_error().message,
+        "this host owes a fence it could not raise"
+    );
+    assert_eq!(
+        *provider.closed.lock().expect("what was closed"),
+        ["own_call_1".to_owned()],
+        "the call the provider created is closed"
+    );
+    assert_eq!(coordinator.live_sessions(), 0);
+}
