@@ -1900,6 +1900,8 @@ async fn kr_req_25_22_disable_at_once_ends_a_revoked_binding_once_its_admitted_r
     let caller = Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     };
     let answer = kr_protocol::agent::AgentApprovalRespondParams {
         target: kr_protocol::agent::AgentMutationTarget {
@@ -2019,6 +2021,8 @@ async fn kr_req_18_06_a_binding_ended_by_the_allowlist_admits_nothing_and_says_w
     let caller = Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     };
     let answer = kr_protocol::agent::AgentApprovalRespondParams {
         target: kr_protocol::agent::AgentMutationTarget {
@@ -2437,6 +2441,8 @@ fn kr_req_23_30_a_component_action_is_waited_for_until_its_component_is_register
         let caller = Caller {
             actor_id: ActorId::new("device-1").expect("valid"),
             grant_id: None,
+            ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+            device_id: None,
         };
         let params = PluginActionInvokeParams {
             target: AgentMutationTarget {
