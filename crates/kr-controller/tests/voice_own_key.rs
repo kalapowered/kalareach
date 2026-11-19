@@ -897,11 +897,14 @@ async fn a_start_whose_caller_goes_away_during_the_creation_is_carried_to_its_en
     })
     .await;
     release.notify_one();
-    until(
-        "the start ran to its end though its caller was gone",
-        || the_registry_is(&daemon, RegistryState::Idle) && rows_of(&daemon).is_empty(),
-    )
+    until("the start ended though its caller was gone", || {
+        the_registry_is(&daemon, RegistryState::Idle)
+    })
     .await;
+    assert!(
+        rows_of(&daemon).is_empty(),
+        "the start ran to its end: the row of the call it created is closed and deleted"
+    );
 
     let seen = daemon.stand_in.recorded();
     assert_eq!(seen.creates.len(), 1);
@@ -1413,10 +1416,26 @@ async fn forget_calls_fences_a_running_reconcile_and_waits_for_its_hangup() {
 async fn an_own_voice_host_passes_assert_it_needs_no_account_and_does_not_report_managed_inference()
 {
     let daemon = daemon().await;
+    let not_configured = format!(
+        "{}: not configured",
+        kr_client::services::ManagedService::ManagedInference.as_str()
+    );
     daemon.host.assert_it_needs_no_account().await;
+    let before = daemon.host.managed_services().await;
+    assert!(
+        before.detail().contains(&not_configured),
+        "managed inference is not configured before a call: {}",
+        before.detail()
+    );
     let phone = phone(&daemon, &MANAGER).await;
     let _ = started(phone.start().await);
     daemon.host.assert_it_needs_no_account().await;
+    let during = daemon.host.managed_services().await;
+    assert!(
+        during.detail().contains(&not_configured),
+        "managed inference is not configured while an own-key call runs: {}",
+        during.detail()
+    );
     daemon.host.stop().await;
 }
 
