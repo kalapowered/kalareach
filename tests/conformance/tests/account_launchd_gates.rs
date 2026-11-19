@@ -630,9 +630,11 @@ fn is_read_for_the_daemon(file: &str, text: &str) -> bool {
 }
 
 /// Whether the function `selecting` of the update harness takes the name a program is looked for by
-/// from `mapping`: it holds `let name = mapping(name);` and, after it, a string that is built from
-/// that `name`, which is the file's name. A call whose result is dropped, or a `name` that stays the
-/// argument, is no selection.
+/// from `mapping`: it holds `let name = mapping(name);` and, in the block that holds it, after it, a
+/// string that is built from that `name`, which is the file's name, with no later binding or
+/// assignment of `name` in that block. A call whose result is dropped, a `name` that stays the
+/// argument, a map in a block that ends before the path, and a `name` that is changed after the map
+/// are no selection.
 fn selects_through(tokens: &[Token], selecting: &Function, mapping: &str) -> bool {
     let body = &tokens[selecting.body.clone()];
     let Some(at) = body.windows(8).position(|window| {
@@ -647,9 +649,34 @@ fn selects_through(tokens: &[Token], selecting: &Function, mapping: &str) -> boo
     }) else {
         return false;
     };
-    body[at + 8..]
+    // What follows the map up to the `}` that closes the block that holds it.
+    let rest = &body[at + 8..];
+    let mut depth = 0_i32;
+    let end = rest
         .iter()
-        .any(|token| matches!(&token.tok, Tok::Str(value, _) if value.contains("{name}")))
+        .position(|token| match token.tok {
+            Tok::Punct('{') => {
+                depth += 1;
+                false
+            }
+            Tok::Punct('}') => {
+                depth -= 1;
+                depth < 0
+            }
+            _ => false,
+        })
+        .unwrap_or(rest.len());
+    let scope = &rest[..end];
+    let changed = scope.iter().enumerate().any(|(index, token)| {
+        token.ident() == Some("name")
+            && (matches!(index.checked_sub(1).map(|before| &scope[before]), Some(before) if matches!(before.ident(), Some("let" | "mut" | "for")))
+                || (scope.get(index + 1).is_some_and(|next| next.is_punct('='))
+                    && !scope.get(index + 2).is_some_and(|next| next.is_punct('='))))
+    });
+    !changed
+        && scope
+            .iter()
+            .any(|token| matches!(&token.tok, Tok::Str(value, _) if value.contains("{name}")))
 }
 
 /// Whether the harness source maps the plain name to the held build in `mapping`, and selects every
@@ -740,7 +767,8 @@ fn the_daemon_the_suites_start_is_the_one_built_with_the_hold() {
 }
 
 /// The reading of the harness's selection finds a call that selects through the map, and refuses a
-/// map that is not called, a call whose result is dropped, and a name that stays the argument.
+/// map that is not called, a call whose result is dropped, a name that stays the argument, a name
+/// that is changed after the map, and a map that is in another block than the path.
 #[test]
 fn the_harness_selection_reading_finds_a_selection_through_the_map_and_only_that() {
     // NAME stands for the daemon's plain name, which a source of this file does not spell out.
@@ -768,6 +796,18 @@ fn the_harness_selection_reading_finds_a_selection_through_the_map_and_only_that
         (
             "a path built from no name",
             r#"let name = built_as(name); let c = profile.join("kr-controller");"#,
+        ),
+        (
+            "a name that is changed after the map",
+            r#"let name = built_as(name); let name = name.strip_suffix("-held").unwrap_or(name); let c = profile.join(format!("{name}{}", S));"#,
+        ),
+        (
+            "a name that is assigned again after the map",
+            r#"let name = built_as(name); name = other; let c = profile.join(format!("{name}{}", S));"#,
+        ),
+        (
+            "a map in a block that ends before the path is built",
+            r#"{ let name = built_as(name); } let c = profile.join(format!("{name}{}", S));"#,
         ),
     ] {
         assert!(!selected(&format!("{map}\n{}", programs(body))), "{what}");
@@ -1032,16 +1072,12 @@ fn statements(tokens: &[Token], body: &std::ops::Range<usize>) -> Vec<std::ops::
     found
 }
 
-/// The functions of the helper that refuse a launch where the run did not ask: each with the number
-/// of arguments it takes and whether its call is followed by `?`, since it returns the refusal
-/// rather than panicking.
-const GUARDS: [(&str, usize, bool); 5] = [
-    ("require", 1, false),
-    ("require_for_command", 3, false),
-    ("require_for_arguments", 2, false),
-    ("require_for_text", 2, false),
-    ("require_given", 3, true),
-];
+/// The functions of the helper that refuse a launch in every run that did not ask, each with the
+/// number of arguments it takes: only the unconditional `require`. The wrappers that refuse for the
+/// arguments or the text they are given (`require_for_command`, `require_for_arguments`,
+/// `require_for_text`) and `require_given` refuse nothing when their arguments are empty or their
+/// value is none, so a call of one of them is no guard of a daemon's start.
+const GUARDS: [(&str, usize); 1] = [("require", 1)];
 
 /// The tokens of each argument of the call whose `(` is `tokens[open]`, split at the commas of its
 /// own level, with what follows its `)`.
@@ -1072,10 +1108,9 @@ fn call_arguments(tokens: &[Token], open: usize) -> Option<(Vec<&[Token]>, &[Tok
 }
 
 /// Whether a statement is a call of one of the helper's guard functions, by the path that names the
-/// module, with the arguments the function takes and the end it has: a string for what would load a
-/// job, and for `require_given` a value that is not none, `true` or the platform's own test for the
-/// Mac, and a `?` that returns its refusal. A statement that is not one call, a call in a closure, a
-/// `let ... else` and a call with another end (`.unwrap()`, `.ok()`) are no guard.
+/// module, with the arguments the function takes, each a string for what would load a job, and the
+/// end `;`. A statement that is not one call, a call in a closure, a `let ... else`, a call with
+/// another end (`.unwrap()`, `.ok()`, `?`) and a call of a conditional wrapper are no guard.
 fn is_guard(tokens: &[Token], statement: &std::ops::Range<usize>) -> bool {
     let statement = &tokens[statement.clone()];
     let mut path = Vec::new();
@@ -1093,7 +1128,7 @@ fn is_guard(tokens: &[Token], statement: &std::ops::Range<usize>) -> bool {
         ["account_launchd", name] | ["kr_ipc", "testing", "account_launchd", name] => *name,
         _ => return false,
     };
-    let Some(&(_, arity, question)) = GUARDS.iter().find(|guard| guard.0 == named) else {
+    let Some(&(_, arity)) = GUARDS.iter().find(|guard| guard.0 == named) else {
         return false;
     };
     if !statement.get(at).is_some_and(|open| open.is_punct('(')) {
@@ -1102,49 +1137,12 @@ fn is_guard(tokens: &[Token], statement: &std::ops::Range<usize>) -> bool {
     let Some((arguments, after)) = call_arguments(statement, at) else {
         return false;
     };
-    let ending = if question { "?;" } else { ";" };
-    let ends: String = after
-        .iter()
-        .filter_map(|token| match token.tok {
-            Tok::Punct(c) => Some(c),
-            _ => None,
-        })
-        .collect();
-    if arguments.len() != arity || ends != ending || after.len() != ending.len() {
+    if arguments.len() != arity || !matches!(after, [end] if end.is_punct(';')) {
         return false;
     }
-    let is_str =
-        |argument: &[Token]| matches!(argument, [token] if matches!(token.tok, Tok::Str(..)));
-    if named == "require_given" {
-        let value_given = !matches!(arguments[0], [first, ..] if first.ident() == Some("None") || first.ident() == Some("Some"));
-        let on_a_mac = match arguments[1] {
-            [only] => only.ident() == Some("true"),
-            [
-                cfg,
-                bang,
-                open,
-                target,
-                equals,
-                Token {
-                    tok: Tok::Str(system, _),
-                    ..
-                },
-                close,
-            ] => {
-                cfg.ident() == Some("cfg")
-                    && bang.is_punct('!')
-                    && open.is_punct('(')
-                    && target.ident() == Some("target_os")
-                    && equals.is_punct('=')
-                    && system == "macos"
-                    && close.is_punct(')')
-            }
-            _ => false,
-        };
-        value_given && on_a_mac && is_str(arguments[2])
-    } else {
-        is_str(arguments[0])
-    }
+    arguments
+        .iter()
+        .all(|argument| matches!(argument, [token] if matches!(token.tok, Tok::Str(..))))
 }
 
 /// The token where each launch form of a body stands: the string `new`, `n` or `workflow` in a body
@@ -1305,20 +1303,9 @@ fn every_launch_function_holds_its_guard_statement_first_or_before_its_first_for
     let guard = "kr_ipc::testing::account_launchd::require(\"x\");";
     let first = |body: &str| format!("pub fn start() {{\n{body}\n}}");
     assert!(guard_problems(&first(&format!("{guard}\n{launch}")), "start", Way::First).is_empty());
-    // The other exact forms the helper has.
-    for exact in [
-        "account_launchd::require(\"x\");",
-        "account_launchd::require_for_command(\"x\", program, &arguments);",
-        "kr_ipc::testing::account_launchd::require_for_arguments(\"x\", &arguments);",
-        "account_launchd::require_for_text(\"x\", command);",
-        "account_launchd::require_given(asked, true, \"x\")?;",
-        "account_launchd::require_given(asked.as_deref(), cfg!(target_os = \"macos\"), \"x\")?;",
-    ] {
-        assert!(
-            guard_problems(&first(&format!("{exact}\n{launch}")), "start", Way::First).is_empty(),
-            "{exact}"
-        );
-    }
+    // The same call by the module's short path.
+    let short = "account_launchd::require(\"x\");";
+    assert!(guard_problems(&first(&format!("{short}\n{launch}")), "start", Way::First).is_empty());
     for (what, body) in [
         ("a guard after the launch", format!("{launch}\n{guard}")),
         ("a guard in a comment", format!("// {guard}\n{launch}")),
@@ -1337,6 +1324,40 @@ fn every_launch_function_holds_its_guard_statement_first_or_before_its_first_for
         (
             "a guard that is not a call of the rule",
             format!("account_launchd::asked();\n{launch}"),
+        ),
+        (
+            "a wrapper that refuses only for a command that makes a session",
+            format!("account_launchd::require_for_command(\"x\", program, &arguments);\n{launch}"),
+        ),
+        (
+            "a wrapper given no arguments, which never refuses",
+            format!(
+                "kr_ipc::testing::account_launchd::require_for_arguments(\"x\", &[]);\n{launch}"
+            ),
+        ),
+        (
+            "a wrapper given arguments",
+            format!(
+                "kr_ipc::testing::account_launchd::require_for_arguments(\"x\", &arguments);\n{launch}"
+            ),
+        ),
+        (
+            "a wrapper given no text, which never refuses",
+            format!("account_launchd::require_for_text(\"x\", \"\");\n{launch}"),
+        ),
+        (
+            "a wrapper given a text",
+            format!("account_launchd::require_for_text(\"x\", command);\n{launch}"),
+        ),
+        (
+            "a conditional refusal given a value that is not none",
+            format!("account_launchd::require_given(asked, true, \"x\")?;\n{launch}"),
+        ),
+        (
+            "a conditional refusal ended with a question mark",
+            format!(
+                "account_launchd::require_given(asked.as_deref(), cfg!(target_os = \"macos\"), \"x\")?;\n{launch}"
+            ),
         ),
         (
             "a refusal that never refuses, ended with unwrap",
@@ -1528,7 +1549,9 @@ fn shell_launches(line: &str) -> bool {
     words
         .windows(2)
         .any(|pair| pair[0] == "cargo" && matches!(pair[1], "build" | "run" | "test"))
-        || words.iter().any(|word| matches!(*word, "mktemp" | "nohup"))
+        || words
+            .iter()
+            .any(|word| word.contains("mktemp") || *word == "nohup")
         || line.contains(&plain_daemon())
         || (line.contains("\"$kr\"") && words.contains(&"new"))
 }
@@ -1592,6 +1615,11 @@ fn the_scripts_that_start_a_daemon_and_sessions_ask_before_they_launch() {
     };
     assert!(order(before));
     assert!(!order(after));
+    // A temporary folder made in a command substitution is a launch too.
+    let temp_before = "require_account_launchd \"$(uname -s)\"\nwork=\"$(mktemp -d x)\"\n";
+    let temp_after = "work=\"$(mktemp -d x)\"\nrequire_account_launchd \"$(uname -s)\"\n";
+    assert!(order(temp_before));
+    assert!(!order(temp_after));
     assert!(!order("cargo build -p x\n"));
     assert!(!order(
         "# require_account_launchd \"$(uname -s)\"\ncargo build -p x\n"
