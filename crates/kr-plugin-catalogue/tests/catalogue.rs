@@ -3396,6 +3396,7 @@ impl Authority for StopsTheSync {
             (StopsAt::TheIndexWrite, Effect::Index(_)) => Err(withdrawn()),
             (StopsAt::AfterTheIndexWrite, Effect::Index(_)) => {
                 commit()?;
+                self.indexed.store(true, SeqCst);
                 Err(CatalogueError::StorageUnavailable {
                     detail: "the order the change ran under could not be released".to_owned(),
                 })
