@@ -6894,7 +6894,7 @@ async fn a_grant_withdrawn_at_the_door_starts_nothing(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_grant_withdrawn_before_the_worker_claims_its_launch_runs_no_command() {
     a_grant_withdrawn_at_the_door_starts_nothing(32, &COMMAND_RIGHTS, |host, marker| {
-        command_node(host, "command", &the_command_that_touches(&marker))
+        command_node(host, "command", &the_command_that_touches(marker))
     })
     .await;
 }
@@ -7019,7 +7019,7 @@ async fn a_wait_that_ends_at_the_door_cancels_a_command_that_never_runs() {
     a_wait_that_ends_at_the_door_makes_no_session(
         40,
         &COMMAND_RIGHTS,
-        |host, marker| command_node(host, "command", &the_command_that_touches(&marker)),
+        |host, marker| command_node(host, "command", &the_command_that_touches(marker)),
         NodeStatus::Cancelled,
     )
     .await;
@@ -8434,7 +8434,7 @@ async fn a_run_cancelled_at_the_door_starts_nothing(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_run_cancelled_before_the_worker_claims_its_launch_runs_no_command() {
     a_run_cancelled_at_the_door_starts_nothing(52, &COMMAND_RIGHTS, |host, marker| {
-        command_node(host, "command", &the_command_that_touches(&marker))
+        command_node(host, "command", &the_command_that_touches(marker))
     })
     .await;
 }
