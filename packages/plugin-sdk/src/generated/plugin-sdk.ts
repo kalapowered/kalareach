@@ -1487,15 +1487,17 @@ export interface ConnectorManifest {
   hook_events?: HookEvents | null
   /**
    * The environment variables the package's command integration sets, each by exact name and
-   * value with the reason a reviewer reads. The rules of [`crate::launch_variables`] hold every
-   * entry.
+   * value with the reason a reviewer reads, under the rules the package contract publishes as
+   * `command_integration.launch_variable_rules`.
    *
-   * A table that does not state it leaves the member out, and the integration may then set only
-   * a pair of [`crate::integration::PERMITTED_VARIABLES`], for a release whose `sdk_range`
-   * admits an SDK that predates the member, so a connector written before the member existed
-   * reads and hashes exactly as it did. A package that states it declares an `sdk_range` that
-   * admits no SDK version before [`crate::launch_variables::ARRIVAL`], and the statement the
-   * owner confirms says that every program the command starts gets the variables too.
+   * A table that does not state it leaves the member out, so a connector written before the
+   * member existed reads and hashes exactly as it did; its integration may then set a pair of
+   * the contract's `command_integration.permitted_variables` without declaring it, only where
+   * its `sdk_range` is written in release versions only and admits an SDK version before the
+   * member arrived. A package that states it declares an `sdk_range` written in release
+   * versions only that admits no SDK version before the one the contract's `arrivals` table
+   * lists for this member, and the statement the owner confirms says that every program the
+   * command starts gets the variables too, unless the command removes them.
    */
   launch_variables?: LaunchVariable[] | null
   /**
