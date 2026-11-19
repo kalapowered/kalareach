@@ -5230,6 +5230,38 @@ async fn kr_req_12_18_a_plugin_answer_to_a_second_request_is_admitted_after_the_
     );
 }
 
+/// KR-REQ-12.18: after one answer ended unknown on a channel, the package's refresh is admitted and
+/// applied. The refresh is the first and only thing sent after the answer, so what it is refused
+/// with, if it is, is the answer's hold on the subject and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_the_packages_refresh_is_applied_after_an_answer_ended_unknown_on_a_channel() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let resource_id = channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+
+    // The package's own answer action is the same method as its refresh, which is the method a
+    // held answer would hold.
+    let mutation = channel_answer(&client, &host, &channel.connector, 60, resource_id, "allow");
+    let Outcome::Error(error) = send(&mut client, mutation).await else {
+        panic!("the answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    channel.next().await;
+
+    let refresh = channel_refresh(&client, &host, &channel.connector, 61);
+    let refresh_id = refresh.action_id;
+    let outcome = send(&mut client, refresh).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the refresh is not held back by the answer: {outcome:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, refresh_id).await.state,
+        ReceiptState::Applied
+    );
+}
+
 /// KR-REQ-12.18: an answer the channel's writer has not written when the worker's own bound passes
 /// is still a channel's end. The receipt says unknown and records that nothing will say more, so
 /// the next answer on the channel and the package's refresh are admitted, as they are after an
