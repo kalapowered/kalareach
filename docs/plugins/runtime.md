@@ -953,13 +953,13 @@ action to the daemon, regardless of how the action ends. If the upstream acknowl
 the worker reports `accepted_by_agent`, with the upstream request and turn as evidence. If the
 upstream refuses the request, or the action is rejected after the claim, it reports `failed`. If the
 action reaches the dispatch marker without ever being answered, it reports `unknown`, and a later
-offer of the same attachment names the earlier action it supersedes, as any action on a subject with
-an uncertain outcome does. A claim that the daemon was asked for and did not answer is settled by a
-report that the offer failed, made once the claim's deadline has passed, because until then the
-daemon may still commit it. The worker keeps these reports in memory until it can deliver them, and
-uses a task to keep asking the daemon until it either records the report or refuses it. A worker
-that ends first is a closed session, and the closure fails every offer in flight, so nothing needs
-to survive the worker.
+offer of the same attachment from the same draft names the earlier action it supersedes, as any
+action on a subject with an uncertain outcome does. A claim that the daemon was asked for and did
+not answer is settled by a report that the offer failed, made once the claim's deadline has passed,
+because until then the daemon may still commit it. The worker keeps these reports in memory until it
+can deliver them, and uses a task to keep asking the daemon until it either records the report or
+refuses it. A worker that ends first is a closed session, and the closure fails every offer in
+flight, so nothing needs to survive the worker.
 
 An attachment to an upstream is referenced by a worker both via its identifiers and the grant which
 gives access to the attachment file. It is never referenced by its name. The grant's path ends in
