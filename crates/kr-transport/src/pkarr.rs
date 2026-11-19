@@ -583,7 +583,9 @@ mod tests {
             .with_login(login.clone());
         let builder = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
-            .tls_backend_preconfigured((*tls::client_config(&[authority.der.clone()])).clone());
+            .tls_backend_preconfigured(
+                (*tls::client_config(std::slice::from_ref(&authority.der))).clone(),
+            );
         let client = proxy::proxied(builder, &url)
             .expect("a proxy the library takes")
             .build()

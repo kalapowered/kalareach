@@ -2393,8 +2393,7 @@ mod tests {
         };
         let refused = bind_listener(&config, &identity)
             .await
-            .err()
-            .expect("a listener takes no proxy that holds a login");
+            .expect_err("a listener takes no proxy that holds a login");
         let (endpoint, closer) = bind_network(&config, &identity)
             .await
             .expect("a network endpoint");
