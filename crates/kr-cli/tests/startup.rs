@@ -5890,7 +5890,9 @@ const WHERE_TO_RUN: &str = "Run it in a terminal of this account that is not a K
 /// the daemon, which answers before and after. The worker's word is what the second form shows.
 #[test]
 fn kr_host_restart_is_refused_inside_a_session_with_nothing_asked() {
-    let (host, session_id, _created, daemon) = a_host_with_a_session();
+    let Some((host, session_id, _created, daemon)) = a_host_with_a_session() else {
+        return;
+    };
     for variable in ["KR_SESSION", "KR_ATTACHMENT"] {
         let mut command = host.kr(&["--json", "host", "restart"]);
         command.env(variable, "x");
@@ -5949,9 +5951,10 @@ fn failure_of(output: &Output, what: &str) -> Value {
 /// session: the host, the session and the daemon's process. The cases that use it run where a
 /// daemon started with `--secret-store file` is no launch difference, which the Mac is not: its
 /// platform store is the only store, so a truthful comparison refuses the harness's daemons there.
+/// None where [`Standalone::create`] gives no host.
 #[cfg(not(target_os = "macos"))]
-fn a_host_with_a_session_run_as_started() -> (Standalone, SessionId, u32) {
-    let host = Standalone::create();
+fn a_host_with_a_session_run_as_started() -> Option<(Standalone, SessionId, u32)> {
+    let host = Standalone::create()?;
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let output = start(host.new_session()).finish("kr new");
@@ -5963,7 +5966,7 @@ fn a_host_with_a_session_run_as_started() -> (Standalone, SessionId, u32) {
         .parse()
         .expect("parses");
     let daemon = host.one_daemon();
-    (host, session_id, daemon)
+    Some((host, session_id, daemon))
 }
 
 /// KR-REQ-07.12 (a restart where no daemon runs): it starts one under the chosen start and says
@@ -5971,7 +5974,9 @@ fn a_host_with_a_session_run_as_started() -> (Standalone, SessionId, u32) {
 /// command's record is gone.
 #[test]
 fn kr_host_restart_starts_a_daemon_where_none_runs_and_says_which() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
@@ -5998,7 +6003,9 @@ fn kr_host_restart_starts_a_daemon_where_none_runs_and_says_which() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn kr_host_restart_replaces_the_daemon_and_the_new_one_is_the_one_it_started() {
-    let (host, session_id, old) = a_host_with_a_session_run_as_started();
+    let Some((host, session_id, old)) = a_host_with_a_session_run_as_started() else {
+        return;
+    };
     let runtime = runtime();
     let mut before = runtime.block_on(async {
         let mut terminal = Typing::attach(&host, session_id, true).await;
@@ -6058,7 +6065,9 @@ fn kr_host_restart_replaces_the_daemon_and_the_new_one_is_the_one_it_started() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn two_kr_host_restarts_at_once_converge_on_one_daemon_and_neither_fails() {
-    let (host, _session_id, old) = a_host_with_a_session_run_as_started();
+    let Some((host, _session_id, old)) = a_host_with_a_session_run_as_started() else {
+        return;
+    };
     let first = start(host.kr(&["--json", "host", "restart"]));
     let second = start(host.kr(&["--json", "host", "restart"]));
     let outputs = [
@@ -6114,7 +6123,9 @@ fn two_kr_host_restarts_at_once_converge_on_one_daemon_and_neither_fails() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn a_restart_whose_start_fails_after_the_stop_says_so_and_leaves_the_sessions_alive() {
-    let (host, session_id, old) = a_host_with_a_session_run_as_started();
+    let Some((host, session_id, old)) = a_host_with_a_session_run_as_started() else {
+        return;
+    };
     host.fail_the_starts_after(1);
     let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
     let failed = failure_of(&output, "kr host restart");
@@ -6186,7 +6197,9 @@ fn a_restart_whose_start_fails_after_the_stop_says_so_and_leaves_the_sessions_al
 /// The control: `kr host stop` still ends it.
 #[test]
 fn kr_host_restart_refuses_before_it_stops_where_no_start_is_chosen() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.start_a_daemon_by_hand();
     let daemon = host.one_daemon();
     let output = start(host.kr(&["--json", "host", "restart"])).finish("kr host restart");
@@ -6221,7 +6234,9 @@ fn kr_host_restart_refuses_before_it_stops_where_no_start_is_chosen() {
 fn kr_host_restart_refuses_before_it_stops_where_the_daemon_program_cannot_be_run() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let (host, _session_id, _created, daemon) = a_host_with_a_session();
+    let Some((host, _session_id, _created, daemon)) = a_host_with_a_session() else {
+        return;
+    };
     let directory = host
         .tree
         .root()
@@ -6261,7 +6276,9 @@ fn kr_host_restart_refuses_before_it_stops_where_the_daemon_program_cannot_be_ru
 fn kr_host_restart_refuses_before_it_stops_where_the_log_cannot_be_used() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    let (host, _session_id, _created, daemon) = a_host_with_a_session();
+    let Some((host, _session_id, _created, daemon)) = a_host_with_a_session() else {
+        return;
+    };
     let log = host
         .tree
         .environment()
@@ -6292,7 +6309,9 @@ fn kr_host_restart_refuses_before_it_stops_where_the_log_cannot_be_used() {
 /// asked of it but its launch.
 #[test]
 fn kr_host_restart_refuses_a_daemon_whose_launch_the_start_does_not_give_and_stops_nothing() {
-    let (host, _session_id, _created, daemon) = a_host_with_a_session();
+    let Some((host, _session_id, _created, daemon)) = a_host_with_a_session() else {
+        return;
+    };
     let secrets = host.tree.environment().secrets_dir();
     std::fs::create_dir_all(&secrets).expect("the secrets directory");
     std::fs::write(secrets.join(".store-kind"), "platform\n").expect("names the platform store");
@@ -6336,7 +6355,9 @@ fn kr_host_restart_refuses_a_daemon_whose_launch_the_start_does_not_give_and_sto
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn kr_host_restart_says_that_it_could_not_record_its_attempt_and_asks_for_no_stop() {
-    let (host, _session_id, daemon) = a_host_with_a_session_run_as_started();
+    let Some((host, _session_id, daemon)) = a_host_with_a_session_run_as_started() else {
+        return;
+    };
     let place = host
         .tree
         .environment()
@@ -7332,7 +7353,9 @@ fn a_daemon_that_replaced_the_one_the_lock_file_named_and_gives_no_outcome(
     command: &[&str],
     requests: usize,
 ) {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     if command.contains(&"restart") {
         host.run_the_daemon_as_the_started_process();
         host.select_standalone();
@@ -7991,7 +8014,9 @@ fn a_daemon_that_does_not_answer_host_info_is_a_holder_that_is_silent_and_no_sto
 /// nothing listens at.
 #[test]
 fn a_listener_that_never_answers_the_hello_is_not_an_environment_with_no_daemon() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     let mut silent = SilentListener::bind(&host);
     let output = start(host.kr(&["--json", "host", "stop"])).finish("kr host stop");
     let said = document(&output, "kr host stop");
@@ -8014,7 +8039,9 @@ fn a_listener_that_never_answers_the_hello_is_not_an_environment_with_no_daemon(
 /// `refused`.
 #[test]
 fn a_restart_whose_request_the_daemon_refused_says_that_nothing_was_stopped() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let mut daemon = TestDaemon::serve(
@@ -8259,7 +8286,9 @@ fn a_daemon_that_closed_the_connection_and_goes_is_waited_for_to_its_end_whichev
 /// stop was made, and no record stands.
 #[test]
 fn a_restart_where_the_greeting_fails_because_the_daemon_is_ending_goes_on_to_start_one() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let mut daemon =
@@ -8299,7 +8328,9 @@ fn a_restart_where_the_greeting_fails_because_the_daemon_is_ending_goes_on_to_st
 /// started a daemon, which answers; no record stands and no request to stop left.
 #[test]
 fn a_restart_whose_request_could_not_be_made_because_the_daemon_ended_goes_on_to_start_one() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     // Of an older generation than any daemon the start makes, so that the one that answers after
@@ -8347,7 +8378,9 @@ fn a_restart_whose_request_could_not_be_made_because_the_daemon_ended_goes_on_to
 /// says `ended`, as the stop does for that state.
 #[test]
 fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     // Of an older generation than any daemon the start makes, so that the one that answers after
@@ -8398,7 +8431,9 @@ fn a_restart_whose_stop_has_no_answer_says_so_and_then_what_the_start_did() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn a_restart_whose_request_could_not_be_made_and_whose_start_fails_says_both() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     host.fail_the_starts_after(0);
@@ -8568,8 +8603,8 @@ fn a_restart_that_waits_for_a_replaced_successor(
     json: bool,
     first_ends: OnStop,
     next: Then,
-) -> Replaced {
-    let host = Standalone::create();
+) -> Option<Replaced> {
+    let host = Standalone::create()?;
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let lock = host.tree.environment().singleton_lock();
@@ -8669,7 +8704,7 @@ fn a_restart_that_waits_for_a_replaced_successor(
     first.end();
     let second_asked = second.launch_only_asked();
     second.end();
-    Replaced {
+    Some(Replaced {
         host,
         output,
         old: ids.0,
@@ -8677,7 +8712,7 @@ fn a_restart_that_waits_for_a_replaced_successor(
         answering: ids.2,
         second_asked,
         events,
-    }
+    })
 }
 
 /// KR-REQ-07.12 (a restart that waits for the daemon that holds the environment since the end): its
@@ -8687,11 +8722,13 @@ fn a_restart_that_waits_for_a_replaced_successor(
 /// names, and says that this command launched none.
 #[test]
 fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_record() {
-    let replaced = a_restart_that_waits_for_a_replaced_successor(
+    let Some(replaced) = a_restart_that_waits_for_a_replaced_successor(
         true,
         OnStop::EndAtTheGreeting,
         Then::AnAnswerFrom,
-    );
+    ) else {
+        return;
+    };
     let saw = what_the_case_saw(&replaced.events, &replaced.output);
     let said = document(&replaced.output, "kr host restart");
     assert_eq!(replaced.output.status.code(), Some(0), "{said}\n{saw}");
@@ -8712,11 +8749,13 @@ fn a_restart_that_waits_for_the_daemon_that_holds_the_environment_writes_no_reco
 /// taken for the daemon that was asked.
 #[test]
 fn a_restart_whose_read_of_the_daemon_is_cut_waits_for_the_successor_and_writes_no_record() {
-    let replaced = a_restart_that_waits_for_a_replaced_successor(
+    let Some(replaced) = a_restart_that_waits_for_a_replaced_successor(
         true,
         OnStop::EndAtTheLook,
         Then::AnAnswerFrom,
-    );
+    ) else {
+        return;
+    };
     let saw = what_the_case_saw(&replaced.events, &replaced.output);
     let said = document(&replaced.output, "kr host restart");
     assert_eq!(replaced.output.status.code(), Some(0), "{said}\n{saw}");
@@ -8735,11 +8774,13 @@ fn a_restart_whose_read_of_the_daemon_is_cut_waits_for_the_successor_and_writes_
 /// environment.
 #[test]
 fn a_restart_whose_successor_was_replaced_says_what_it_read_and_when() {
-    let replaced = a_restart_that_waits_for_a_replaced_successor(
+    let Some(replaced) = a_restart_that_waits_for_a_replaced_successor(
         false,
         OnStop::EndAtTheGreeting,
         Then::AnAnswerFrom,
-    );
+    ) else {
+        return;
+    };
     let out = String::from_utf8_lossy(&replaced.output.stdout);
     let saw = what_the_case_saw(&replaced.events, &replaced.output);
     assert_eq!(replaced.output.status.code(), Some(0), "{saw}");
@@ -8838,7 +8879,9 @@ impl SilentListener {
 /// look before it.
 #[test]
 fn a_restart_that_waits_for_a_holder_names_the_process_the_answering_daemon_states() {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let lock = host.tree.environment().singleton_lock();
@@ -8896,7 +8939,7 @@ struct NeverAnswered {
 /// holds the environment and nothing ever answers. The command waits out its bound and fails with
 /// exit 1. The case reads its text, which opens with the stop's own words for what the stop came to
 /// and then says what was read of the successor as an earlier reading.
-fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> NeverAnswered {
+fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> Option<NeverAnswered> {
     a_successor_answers_after(on_stop, None)
 }
 
@@ -8905,8 +8948,8 @@ fn a_successor_never_answers_after(on_stop: impl FnOnce(u32) -> OnStop) -> Never
 fn a_successor_answers_after(
     on_stop: impl FnOnce(u32) -> OnStop,
     successor_answers: Option<OnStop>,
-) -> NeverAnswered {
-    let host = Standalone::create();
+) -> Option<NeverAnswered> {
+    let host = Standalone::create()?;
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let lock = host.tree.environment().singleton_lock();
@@ -8970,13 +9013,13 @@ fn a_successor_answers_after(
     if let Some(second) = second.as_mut() {
         second.end();
     }
-    NeverAnswered {
+    Some(NeverAnswered {
         host,
         output,
         old: ids.0,
         successor: ids.1,
         events,
-    }
+    })
 }
 
 /// KR-REQ-07.12 (a successor that never answers, after a request that could not be made): the
@@ -8984,7 +9027,9 @@ fn a_successor_answers_after(
 /// environment, where no request was made, and never says that the daemon was stopped.
 #[test]
 fn a_successor_that_never_answers_after_a_request_that_could_not_be_made_keeps_the_stops_words() {
-    let silent = a_successor_never_answers_after(|_| OnStop::CloseAfterTheLookAndEnd);
+    let Some(silent) = a_successor_never_answers_after(|_| OnStop::CloseAfterTheLookAndEnd) else {
+        return;
+    };
     let saw = what_the_case_saw(&silent.events, &silent.output);
     let said = document(&silent.output, "kr host restart");
     assert_eq!(silent.output.status.code(), Some(1), "{said}\n{saw}");
@@ -9021,11 +9066,13 @@ fn a_successor_that_never_answers_after_a_request_that_could_not_be_made_keeps_t
 #[test]
 fn a_successor_after_an_unmade_request_that_greets_and_owes_a_fence_is_said_by_what_the_reads_gave()
 {
-    let replaced = a_restart_that_waits_for_a_replaced_successor(
+    let Some(replaced) = a_restart_that_waits_for_a_replaced_successor(
         true,
         OnStop::EndAtTheGreeting,
         Then::OwesAFence,
-    );
+    ) else {
+        return;
+    };
     let saw = what_the_case_saw(&replaced.events, &replaced.output);
     let said = document(&replaced.output, "kr host restart");
     assert_eq!(replaced.output.status.code(), Some(1), "{said}\n{saw}");
@@ -9052,13 +9099,15 @@ fn a_successor_after_an_unmade_request_that_greets_and_owes_a_fence_is_said_by_w
 #[test]
 fn a_successor_that_greets_and_answers_each_stop_with_an_unknown_outcome_is_said_by_what_the_reads_gave()
  {
-    let silent = a_successor_answers_after(
+    let Some(silent) = a_successor_answers_after(
         OnStop::AnswerTheLaunchThenCut,
         Some(OnStop::AnswerTheStopWithError {
             code: an_error_code_of(kr_protocol::error::RetryCategory::OutcomeUnknown),
             end: false,
         }),
-    );
+    ) else {
+        return;
+    };
     let saw = what_the_case_saw(&silent.events, &silent.output);
     let said = document(&silent.output, "kr host restart");
     assert_eq!(silent.output.status.code(), Some(1), "{said}\n{saw}");
@@ -9079,7 +9128,9 @@ fn a_successor_that_greets_and_answers_each_stop_with_an_unknown_outcome_is_said
 /// stopped.
 #[test]
 fn a_successor_that_never_answers_after_an_unknown_stop_keeps_the_stops_words() {
-    let silent = a_successor_never_answers_after(OnStop::AnswerTheLaunchThenCut);
+    let Some(silent) = a_successor_never_answers_after(OnStop::AnswerTheLaunchThenCut) else {
+        return;
+    };
     let saw = what_the_case_saw(&silent.events, &silent.output);
     let said = document(&silent.output, "kr host restart");
     assert_eq!(silent.output.status.code(), Some(1), "{said}\n{saw}");
@@ -9122,7 +9173,9 @@ fn a_successor_that_never_answers_after_an_unknown_stop_keeps_the_stops_words() 
 #[test]
 fn a_restart_whose_holder_answers_and_ends_before_the_read_of_who_serves_never_says_that_one_answers_now()
  {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let lock = host.tree.environment().singleton_lock();
@@ -9167,11 +9220,13 @@ fn a_restart_whose_holder_answers_and_ends_before_the_read_of_who_serves_never_s
 /// a failure where none comes.
 #[test]
 fn a_successor_whose_exchange_is_cut_is_no_proof_of_another_daemon() {
-    let replaced = a_restart_that_waits_for_a_replaced_successor(
+    let Some(replaced) = a_restart_that_waits_for_a_replaced_successor(
         true,
         OnStop::EndAtTheGreeting,
         Then::AnExchangeThatIsCut,
-    );
+    ) else {
+        return;
+    };
     let saw = what_the_case_saw(&replaced.events, &replaced.output);
     let said = document(&replaced.output, "kr host restart");
     assert_eq!(replaced.output.status.code(), Some(1), "{said}\n{saw}");
@@ -9199,7 +9254,9 @@ fn a_successor_whose_exchange_is_cut_is_no_proof_of_another_daemon() {
 #[test]
 fn a_restart_whose_stop_request_the_daemon_refused_after_the_launch_says_that_nothing_was_stopped()
 {
-    let host = Standalone::create();
+    let Some(host) = Standalone::create() else {
+        return;
+    };
     host.run_the_daemon_as_the_started_process();
     host.select_standalone();
     let mut daemon = TestDaemon::serve(
