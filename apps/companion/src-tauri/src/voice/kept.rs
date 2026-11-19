@@ -67,6 +67,10 @@ pub struct Kept {
     directory: Option<PathBuf>,
     /// One writer at a time within this process.
     gate: Mutex<()>,
+    /// How many times a file was asked to be written, for the cases that count the writes of one
+    /// change.
+    #[cfg(test)]
+    writes: AtomicU64,
 }
 
 impl Kept {
@@ -76,6 +80,8 @@ impl Kept {
         Self {
             directory: Some(directory.into()),
             gate: Mutex::new(()),
+            #[cfg(test)]
+            writes: AtomicU64::new(0),
         }
     }
 
@@ -86,7 +92,15 @@ impl Kept {
         Self {
             directory: None,
             gate: Mutex::new(()),
+            #[cfg(test)]
+            writes: AtomicU64::new(0),
         }
+    }
+
+    /// How many writes were asked of this place.
+    #[cfg(test)]
+    pub(crate) fn writes(&self) -> u64 {
+        self.writes.load(Ordering::SeqCst)
     }
 
     /// Whether this has a place to keep anything.
@@ -169,6 +183,8 @@ impl Kept {
     /// place, whose survival of a crash is then not known.
     pub fn write(&self, kept: &KeptVoice) -> std::io::Result<()> {
         static STAGED: AtomicU64 = AtomicU64::new(0);
+        #[cfg(test)]
+        self.writes.fetch_add(1, Ordering::SeqCst);
         let Some(directory) = &self.directory else {
             return Ok(());
         };
