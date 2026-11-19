@@ -575,6 +575,7 @@ pub fn default_keychain_of_a_session(
     shell: &ManagedShell,
     home: &Path,
 ) -> OwnHome {
+    kr_ipc::testing::account_launchd::require("a session create");
     let run = host.run();
     let mut variables: Vec<(String, String)> = host
         .variables()
@@ -679,6 +680,7 @@ pub fn names_a_session_exports(
     shell: &ManagedShell,
     variables: &[(String, String)],
 ) -> String {
+    kr_ipc::testing::account_launchd::require("a session create");
     let run = host.run();
     let file = run.home().join(EXPORTED_FILE);
     crate::provenance::forget_names(&file).unwrap_or_else(|why| panic!("{why}"));
@@ -799,6 +801,7 @@ pub fn open_session(
     what: &str,
     context: Context,
 ) -> Session {
+    kr_ipc::testing::account_launchd::require("a session create");
     let run = host.run();
     let before: Vec<String> = host
         .live_sessions()
@@ -1258,6 +1261,7 @@ impl Replacement {
     /// Panics when it does not answer within [`LIVENESS`].
     #[must_use]
     pub fn start(host: &Host<'_>, port: u16) -> Self {
+        kr_ipc::testing::account_launchd::require("the host start");
         let run = host.run();
         let path = kr_worker::config::document_path(host.environment());
         let mut configuration: serde_json::Value =

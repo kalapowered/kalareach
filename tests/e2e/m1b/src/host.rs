@@ -247,6 +247,7 @@ impl<'r> Host<'r> {
         preparation: &Preparation,
         seed: impl FnOnce(&EnvironmentPaths),
     ) -> Self {
+        kr_ipc::testing::account_launchd::require("the host start");
         let paths = HostPaths::new(run.root().join("r"), run.root().join("s"))
             .expect("absolute host roots");
         // The same identity the daemon opens when it starts: it reads the one that is there.
@@ -342,6 +343,7 @@ impl<'r> Host<'r> {
     ///
     /// Panics when it does not answer within [`LIVENESS`].
     fn start_daemon_once(&self) -> Result<(), String> {
+        kr_ipc::testing::account_launchd::require("the host start");
         // What the log holds before this start is an earlier start's, and is not this one's to say.
         let earlier = std::fs::metadata(self.daemon_log()).map_or(0, |log| log.len());
         let log = std::fs::OpenOptions::new()

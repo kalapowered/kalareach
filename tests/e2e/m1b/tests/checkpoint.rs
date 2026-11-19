@@ -597,6 +597,10 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
     use kr_protocol::method::Method;
     use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
     use kr_protocol::scalars::Nullable;
+    if kr_ipc::testing::account_launchd::stands_down("a session create") {
+        return;
+    }
+    kr_ipc::testing::account_launchd::require("a session create");
 
     const LEG: &str = "terminal";
     let Some(checkpoint) = Checkpoint::from_environment(LEG) else {
