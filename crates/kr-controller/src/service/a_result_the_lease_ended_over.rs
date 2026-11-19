@@ -602,6 +602,105 @@ async fn a_lease_asked_again_in_a_record_reads_its_clocks_after_the_bound_is_cop
     }
 }
 
+/// KR-REQ-17.54: the end that a caller found its lease to have is compared with the continuous
+/// clock after the bound's published snapshot is copied. The same rights presented again after the
+/// caller found the lease move the bound's end on, so where the end the caller found comes right
+/// after the copy, only that comparison can refuse, and the question refuses. The control: where
+/// no clock moves after the copy, it serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_end_a_caller_found_is_compared_with_a_clock_read_after_the_bound_is_copied() {
+    use kr_protocol::confirmation::ConfirmationDisplay;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    for ends in [false, true] {
+        let (_temp, controller, continuous, presenter, _writer, _reader) =
+            connected_under_a_lease_that_can_be_presented_again().await;
+        let actor = kr_protocol::ids::ActorId::new("local:501").expect("an actor");
+        let outside_the_recovery_set = ConfirmationDisplay::ExclusiveManagement {
+            exclusive: true,
+            organisation_ids: Vec::new(),
+        };
+        // Found under the lease as it is now: its end is fifteen minutes away.
+        let caller = controller.local_caller(&actor);
+        continuous.advance(std::time::Duration::from_secs(5 * 60));
+        presenter.wall.fetch_add(5 * 60 * 1000, SeqCst);
+        // The same rights again keep the bound's run and move its end to about twenty minutes.
+        presenter.present(&[kr_protocol::rights::ActionRight::SessionView]);
+        if ends {
+            let later = continuous.clone();
+            crate::grants::policy::publishing::stop_after_a_copy(move || {
+                later.advance(std::time::Duration::from_secs(11 * 60));
+            });
+        }
+        let served = caller.lease_serves(&outside_the_recovery_set);
+        assert_eq!(
+            served.is_err(),
+            ends,
+            "the end the caller found came right after the copy: {ends}: {served:?}"
+        );
+        if ends {
+            // Only the end the caller found had passed: the lease as presented again still serves.
+            controller
+                .local_caller(&actor)
+                .lease_serves(&outside_the_recovery_set)
+                .expect("a caller that finds the lease presented again is served");
+        }
+    }
+}
+
+/// KR-REQ-17.54: the wall clock is read after the bound's published snapshot is copied. A lease
+/// whose UTC end comes right after the copy, with the continuous clock still inside the end the
+/// caller found, is read as ended at the host's reading of UTC, and the question refuses. The
+/// control: where the wall clock does not move after the copy, it serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_asked_again_in_a_record_reads_the_wall_clock_after_the_bound_is_copied() {
+    use crate::grants::policy::Stands;
+    use kr_protocol::confirmation::ConfirmationDisplay;
+    use std::sync::atomic::Ordering::SeqCst;
+
+    for ends in [false, true] {
+        let (_temp, controller, _continuous, presenter, _writer, _reader) =
+            connected_under_a_lease_that_can_be_presented_again().await;
+        let actor = kr_protocol::ids::ActorId::new("local:501").expect("an actor");
+        let outside_the_recovery_set = ConfirmationDisplay::ExclusiveManagement {
+            exclusive: true,
+            organisation_ids: Vec::new(),
+        };
+        let caller = controller.local_caller(&actor);
+        let held = controller
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .local_owner_hold(
+                controller.local_owner_device(),
+                controller.clock.now(),
+                controller.settled_utc_now(),
+            )
+            .1
+            .expect("the lease's held bound");
+        if ends {
+            let wall = Arc::clone(&presenter.wall);
+            crate::grants::policy::publishing::stop_after_a_copy(move || {
+                wall.fetch_add(16 * 60 * 1000, SeqCst);
+            });
+        }
+        let served = caller.lease_serves(&outside_the_recovery_set);
+        assert_eq!(
+            served.is_err(),
+            ends,
+            "the lease's UTC end came right after the copy: {ends}: {served:?}"
+        );
+        // Only the wall reading can have ended it: the continuous clock did not move.
+        let read = held.stands_at(controller.clock.now(), controller.settled_utc_now());
+        let expected = if ends {
+            Stands::EndedInUtc
+        } else {
+            Stands::Holds
+        };
+        assert_eq!(read, expected, "the bound at the readings now");
+    }
+}
+
 /// KR-REQ-17.54: the ask that stands behind a sign-in reads the owner's lease first and the fence
 /// this host owes after it, and reading the fence takes its lock, so the lease's end that the first
 /// reading returned is compared with the clock again after it. A lease that ends in that wait
