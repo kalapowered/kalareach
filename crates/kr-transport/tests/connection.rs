@@ -156,7 +156,7 @@ async fn a_paired_pair_completes_the_handshake_over_loopback() {
     // the host selects the capability that says so and the device that is told takes the label as
     // the host's.
     assert!(
-        kr_protocol::confirmation::states_readings(&selection.capabilities),
+        kr_protocol::confirmation::states_readings(&selection.capabilities).placement,
         "{:?}",
         selection.capabilities
     );
