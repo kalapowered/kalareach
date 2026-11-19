@@ -79,6 +79,9 @@ pub struct Caller {
     /// Asks whether the host's local owner has no live lease now, for a local caller the door
     /// decided as one that is served ([`Self::decided_now`]); none for any other caller.
     closed_now: Option<ClosedNow>,
+    /// Asks whether the lease the door found for a local caller still stands, with no lock
+    /// ([`Self::lease_serves`]); none for any other caller.
+    lease_stands: Option<LeaseStands>,
 }
 
 /// Whether the host's local owner has no live lease at this moment.
@@ -88,6 +91,16 @@ struct ClosedNow(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
 impl std::fmt::Debug for ClosedNow {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("ClosedNow")
+    }
+}
+
+/// Whether the lease the door found for a local caller still stands. It takes no lock.
+#[derive(Clone)]
+struct LeaseStands(std::sync::Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl std::fmt::Debug for LeaseStands {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LeaseStands")
     }
 }
 
@@ -102,6 +115,7 @@ impl Caller {
             confirms_the_clock_only: false,
             confirms_recovery_only: false,
             closed_now: None,
+            lease_stands: None,
         }
     }
 
@@ -115,6 +129,7 @@ impl Caller {
             confirms_the_clock_only: false,
             confirms_recovery_only: false,
             closed_now: None,
+            lease_stands: None,
         }
     }
 
@@ -135,15 +150,28 @@ impl Caller {
         self
     }
 
-    /// Marks a local caller as one whose scope is read again where its request is recorded or
+    /// Marks a local caller as one whose scope is read again before its request is recorded or
     /// answered: `closed_now` says whether the host's local owner has no live lease at that
-    /// moment ([`Self::decided_now`]).
+    /// moment ([`Self::decided_now`]). It waits for the policy's lock, so it is never asked
+    /// inside the transaction that records.
     #[must_use]
     pub fn asking_again_whether_closed(
         mut self,
         closed_now: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Self {
         self.closed_now = Some(ClosedNow(std::sync::Arc::new(closed_now)));
+        self
+    }
+
+    /// Marks a local caller as one whose lease is asked again inside the transaction that records
+    /// its request or answer: `stands` says whether the lease the door found for it still stands.
+    /// It takes no lock ([`Self::lease_serves`]).
+    #[must_use]
+    pub fn asking_again_whether_the_lease_stands(
+        mut self,
+        stands: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.lease_stands = Some(LeaseStands(std::sync::Arc::new(stands)));
         self
     }
 
@@ -159,6 +187,29 @@ impl Caller {
                 self.clone().confirming_recovery_only(true)
             }
             _ => self.clone(),
+        }
+    }
+
+    /// Whether the lease the door found for this caller still serves the confirmation `display`
+    /// describes: a confirmation outside the recovery set needs it, and the recovery set does not.
+    /// It takes no lock, and it is the last question a record asks before it writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the door tells a caller that no lease serves, when the lease has ended and
+    /// `display` is outside the recovery set.
+    pub fn lease_serves(&self, display: &ConfirmationDisplay) -> Result<()> {
+        let Some(stands) = &self.lease_stands else {
+            return Ok(());
+        };
+        if (stands.0)() {
+            return Ok(());
+        }
+        let unserved = self.clone().confirming_recovery_only(true);
+        if unserved.may_confirm_display(display) {
+            Ok(())
+        } else {
+            Err(unserved.refusal_to_confirm())
         }
     }
 
@@ -294,6 +345,12 @@ pub struct OwnerAuthority {
     /// confirmation it spends and before it takes the clock, and inside its commit.
     #[cfg(test)]
     pub(crate) pauses: EstablishPauses,
+    /// Where this host's own tests stop a request or an answer for an owner confirmation inside the
+    /// transaction that records it, which holds the record's lock, before it asks anything there,
+    /// so that a lease can end or a policy commit can take its lock in that wait. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    inside_the_record: crate::service::ThreadPause,
 }
 
 /// What decides whether the controlling terminal can confirm the end of exclusive management.
@@ -427,6 +484,16 @@ impl OwnerAuthority {
         self.clock.pass(by);
     }
 
+    /// Arms the pause the next request or answer for an owner confirmation stops at inside the
+    /// transaction that records it, which holds the record's lock, before it asks anything there.
+    /// Returns the end that says it has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub(crate) fn pause_inside_the_record(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.inside_the_record.arm()
+    }
+
     /// Builds the service for one host.
     #[must_use]
     pub fn new(
@@ -448,6 +515,8 @@ impl OwnerAuthority {
             recovery: None,
             #[cfg(test)]
             pauses: EstablishPauses::default(),
+            #[cfg(feature = "testing")]
+            inside_the_record: crate::service::ThreadPause::default(),
         }
     }
 
@@ -718,15 +787,24 @@ impl OwnerAuthority {
         .map_err(refusal)?;
         // The caller's scope is read again here, after the wait for the lock every challenge is
         // issued under: the lease the door found can end in the waits before it, and the refusal is
-        // the door's own. It is not read inside the transaction that records the request. A policy
-        // commit holds the policy's lock while it writes to that record, so a request that held the
-        // record while it waited for the policy would wait for a commit that waits for the record.
+        // the door's own. The read waits for the policy's lock, so it is made before the
+        // transaction that records the request and never inside it: a policy commit holds the
+        // policy's lock while it writes to that record, so a request that held the record while it
+        // waited for the policy would wait for a commit that waits for the record.
         let now = caller.decided_now();
         if !now.may_confirm_display(&resolved.display) {
             return Err(now.refusal_to_confirm());
         }
         // The admission is asked inside the transaction that records the request, after every wait
-        // before it; nothing is issued unless that record is written.
+        // before it; nothing is issued unless that record is written. The lease the door found is
+        // asked again there, last, with no lock: it can end in the wait for the record's lock.
+        let display = &resolved.display;
+        let in_the_record = || {
+            #[cfg(feature = "testing")]
+            self.inside_the_record.wait();
+            caller.lease_serves(display)?;
+            admission()
+        };
         let recorded = self.rows.record_requested(
             &PairingAction {
                 actor: caller.actor_id.clone(),
@@ -734,7 +812,7 @@ impl OwnerAuthority {
                 digest: action.1,
                 subject: ActionSubject::Requested(Box::new(request.clone())),
             },
-            admission,
+            &in_the_record,
         )?;
         if let Some(request) = recorded {
             copied.store(true, Ordering::Release);
@@ -1179,14 +1257,23 @@ impl OwnerAuthority {
             ));
         }
         // The caller's scope is read again here, after the waits for the challenges' lock: the
-        // lease the door found can end in them, and the refusal is the door's own. It is not read
-        // inside the transaction that records the answer, for the reason it is not in a request's.
+        // lease the door found can end in them, and the refusal is the door's own. It is read
+        // before the transaction that records the answer, for the reason it is read before a
+        // request's.
         let now = caller.decided_now();
         if !now.may_confirm_display(&entry.display) {
             return Err(now.refusal_to_confirm());
         }
         // The admission is asked inside the transaction that records the answer, after every wait
-        // before it.
+        // before it. The lease the door found is asked again there, last, with no lock: it can end
+        // in the wait for the record's lock.
+        let display = &entry.display;
+        let in_the_record = || {
+            #[cfg(feature = "testing")]
+            self.inside_the_record.wait();
+            caller.lease_serves(display)?;
+            admission()
+        };
         let answered_at_ms = self.rows.record_answered(
             proof,
             &PairingAction {
@@ -1196,7 +1283,7 @@ impl OwnerAuthority {
                 subject: ActionSubject::Completed(proof.request.confirmation_id),
             },
             kr_ipc::now_ms(),
-            admission,
+            &in_the_record,
         )?;
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.answer = Some(Answer {
