@@ -2,7 +2,6 @@
 //! controls: the provider's end is the library's own server, and the writes of the adapter's end
 //! pass, stay pending, or fail as the test says. Nothing here waits for time to pass.
 
-use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
