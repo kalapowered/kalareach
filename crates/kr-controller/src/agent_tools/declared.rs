@@ -141,18 +141,20 @@ pub(crate) fn default_host_folders(home: &Path, records: &Path) -> Vec<PathBuf> 
 }
 
 /// The folders this host keeps for its own files as it resolved them for this process, wherever
-/// a variable put them: its state root, its runtime root, its store, and the folder of its
-/// configuration where the platform keeps one apart from the state.
+/// a variable put them: its state root, its runtime root, its stores, and the folder of its
+/// configuration where the platform keeps one apart from the state. The stores are the one the
+/// platform names by default and the one this process runs from, which `kr host install --store`
+/// can have put anywhere.
 #[must_use]
 pub(crate) fn resolved_host_folders(
     state_root: &Path,
     runtime_root: &Path,
-    store: Option<PathBuf>,
+    stores: impl IntoIterator<Item = PathBuf>,
     configuration: Option<PathBuf>,
 ) -> Vec<PathBuf> {
     let mut folders = vec![state_root.to_path_buf()];
     folders.push(runtime_root.to_path_buf());
-    folders.extend(store);
+    folders.extend(stores);
     folders.extend(configuration);
     folders
 }

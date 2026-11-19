@@ -377,27 +377,39 @@ impl Controller {
 
     /// Returns the installer, which keeps this host's record of what it wrote.
     pub(super) fn installer(&self) -> Result<crate::agent_tools::Installer> {
+        // The store this process runs from, as the host resolves it: a store made by
+        // `kr host install --store` is as much the host's own as the default one.
+        let running = kr_ipc::install::this_process()
+            .ok()
+            .and_then(kr_ipc::install::Running::store)
+            .map(|store| store.root().to_path_buf());
         Ok(
             crate::agent_tools::Installer::discover(self.paths.state_dir())?
-                .with_host_folders(self.host_folders()),
+                .with_host_folders(Self::host_folders(&self.paths, running)),
         )
     }
 
-    /// The folders this host keeps for its own files, as it resolved them for this process.
-    fn host_folders(&self) -> Vec<std::path::PathBuf> {
+    /// The folders this host keeps for its own files, as it resolved them for this process:
+    /// `running_store` is the store this process runs from, where it runs from one.
+    fn host_folders(
+        paths: &kr_ipc::paths::EnvironmentPaths,
+        running_store: Option<std::path::PathBuf>,
+    ) -> Vec<std::path::PathBuf> {
         use kr_protocol::hostinfo::configuration;
 
         let mut folders = crate::agent_tools::declared::resolved_host_folders(
-            self.paths.state_root(),
-            self.paths.runtime_root(),
-            kr_ipc::install::Store::default_root(),
+            paths.state_root(),
+            paths.runtime_root(),
+            kr_ipc::install::Store::default_root()
+                .into_iter()
+                .chain(running_store),
             configuration::user_folder(),
         );
         // This environment's own configuration document is in its folder wherever that is.
         let document = configuration::document_path(
-            self.paths.state_dir(),
-            self.paths.state_root(),
-            self.paths.environment_id(),
+            paths.state_dir(),
+            paths.state_root(),
+            paths.environment_id(),
         );
         folders.extend(document.parent().map(std::path::Path::to_path_buf));
         folders
@@ -2230,4 +2242,35 @@ struct StartedLike {
     working_directory: String,
     environment: Vec<PathVariable>,
     configuration_directory: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use kr_ipc::paths::HostPaths;
+    use kr_protocol::ids::EnvironmentId;
+    use kr_protocol::scalars::Uuid;
+
+    use super::Controller;
+
+    /// KR-REQ-11.01: the folders this host keeps for its own files hold the store this process
+    /// runs from, wherever `kr host install --store` put it, beside its state root, its runtime
+    /// root and the default store; where it runs from no store they hold no other.
+    #[cfg(unix)]
+    #[test]
+    fn the_host_keeps_the_store_it_runs_from_wherever_it_was_made() {
+        let paths = HostPaths::new("/srv/kr/run", "/srv/kr/state")
+            .expect("absolute roots")
+            .environment(EnvironmentId::new(Uuid::from_bytes([7; 16])));
+        let running = PathBuf::from("/home/someone/.kr-host");
+        let without = Controller::host_folders(&paths, None);
+        let with = Controller::host_folders(&paths, Some(running.clone()));
+        assert!(with.contains(&running), "{with:?}");
+        assert!(!without.contains(&running), "{without:?}");
+        assert_eq!(with.len(), without.len() + 1, "{with:?} and {without:?}");
+        for root in ["/srv/kr/state", "/srv/kr/run"] {
+            assert!(with.contains(&PathBuf::from(root)), "{root}: {with:?}");
+        }
+    }
 }

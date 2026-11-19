@@ -5355,7 +5355,7 @@ mod tests {
             let folders = declared::resolved_host_folders(
                 &home.join(".kr-state/kalareach"),
                 &home.join(".kr-run/kalareach"),
-                Some(home.join(".kr-data/kalareach/host")),
+                [home.join(".kr-data/kalareach/host")],
                 Some(home.join(".kr-config/kalareach")),
             );
             let installer = |place: &[&str]| {
@@ -5383,6 +5383,65 @@ mod tests {
                 "{variable}: a place beside it installs: {installed:?}"
             );
         }
+    }
+
+    /// KR-REQ-11.01: the store this process runs from is one of the host's folders wherever it was
+    /// made: a declared skills folder inside it, and a declared document that is its record, are
+    /// refused by name and nothing is written, and a folder beside it is the package's to name.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_place_inside_the_store_this_process_runs_from_is_refused() {
+        let tree = Tree::create();
+        let home = tree.home();
+        let folders = declared::resolved_host_folders(
+            &home.join(".kr-state/kalareach"),
+            &home.join(".kr-run/kalareach"),
+            [home.join(".kr-data/kalareach/host"), home.join(".kr-host")],
+            Some(home.join(".kr-config/kalareach")),
+        );
+        let installer = |skills: &[&str], document: &[&str]| {
+            tree.installer().with_host_folders(folders.clone()).with_declaration(
+                Some(declared(
+                    Some(json!({ "path": document, "format": "json_command_args", "shared": false })),
+                    skills,
+                )),
+                Vec::new(),
+            )
+        };
+        for (what, skills, document, untouched) in [
+            (
+                "its skills folder",
+                [".kr-host", "versions"],
+                [".amp", "mcp.json"],
+                ".amp",
+            ),
+            (
+                "its record as the document",
+                [".amp", "skills"],
+                [".kr-host", "install.json"],
+                ".amp",
+            ),
+        ] {
+            let refused = installer(&skills, &document).install(&params(amp(), InstallScope::User));
+            let Err(ControllerError::PermissionDenied { detail }) = refused else {
+                panic!("{what}: a refusal by name: {refused:?}");
+            };
+            assert!(
+                detail.contains("is inside a folder this host keeps for its own files"),
+                "{what}: {detail}"
+            );
+            assert!(!home.join(untouched).exists(), "{what}: nothing is written");
+            assert!(
+                !home.join(".kr-host").exists(),
+                "{what}: the store is not written"
+            );
+        }
+        let beside = installer(&[".kr-other", "skills"], &[".amp", "mcp.json"])
+            .install(&params(amp(), InstallScope::User));
+        assert!(
+            beside.is_ok(),
+            "a place beside the store installs: {beside:?}"
+        );
     }
 
     /// KR-REQ-11.01: a selected project root that is a link into one of the host's folders is one
