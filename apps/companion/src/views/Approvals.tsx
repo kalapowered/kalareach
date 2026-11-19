@@ -28,6 +28,7 @@ import { failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import {
   actionableApprovals,
+  type ApprovalNotice,
   capabilityRecords,
   composerOffers,
   isChannelPackage,
@@ -66,6 +67,43 @@ function sourceText(encoded: string): { readonly text: string; readonly more: nu
   return text.length > SHOWN_SOURCE_CHARS
     ? { text: text.slice(0, SHOWN_SOURCE_CHARS), more: text.length - SHOWN_SOURCE_CHARS }
     : { text, more: 0 }
+}
+
+/**
+ * The notice for an agent that asks for approvals in its terminal: it says so, says why they are not
+ * answered here, and offers the way to the terminal where it can.
+ */
+export function ApprovalOffer({
+  sessionId,
+  notice
+}: {
+  readonly sessionId: string
+  readonly notice: ApprovalNotice
+}): ReactNode {
+  const { go } = useApp()
+  return (
+    <section className="approval-offer" aria-label="Approvals" data-testid="approval-offer">
+      <p>Claude Code asks for approvals in its terminal. Answer them there.</p>
+      <p className="small muted" data-testid="approval-offer-reason">
+        {notice.sentence}
+      </p>
+      {notice.terminal === 'offer' ? (
+        <Button
+          onClick={() => {
+            go({ view: 'session', sessionId, pane: 'terminal' })
+          }}
+        >
+          Open the terminal
+        </Button>
+      ) : (
+        <p className="small muted" data-testid="approval-offer-terminal">
+          {notice.terminal === 'no_input'
+            ? 'This device cannot type in the terminal, so it cannot answer Claude Code’s approvals.'
+            : 'This device is not connected, so it cannot answer Claude Code’s approvals.'}
+        </p>
+      )}
+    </section>
+  )
 }
 
 /** The approvals waiting in one session. */

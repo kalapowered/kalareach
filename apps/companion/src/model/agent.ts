@@ -404,6 +404,75 @@ export function isChannelPackage(pluginId: string | null): boolean {
   return pluginId !== null && CHANNEL_PACKAGES.includes(pluginId)
 }
 
+/** What the notice about approvals says, and what it offers beside the sentence. */
+export interface ApprovalNotice {
+  /** Why approvals are not answered here, in the record's own words where it gave some. */
+  readonly sentence: string
+  /** The way to the terminal: offered, or why it is not. */
+  readonly terminal: 'offer' | 'no_input' | 'not_connected'
+}
+
+/** The sentence for a capability record that is present and says nothing of its own. */
+const APPROVAL_STATE_SENTENCES: Readonly<
+  Record<Exclude<InstanceCapabilityRecord['state'], 'qualified_available'>, string>
+> = {
+  version_qualified:
+    'This version of Claude Code was qualified, but nothing has shown that this host can use Channels with it.',
+  missing_installation: 'Claude Code’s Channels connection is not installed.',
+  permission_required:
+    'An operating-system permission is needed before approvals can be answered from here.',
+  incompatible: 'The installed Claude Code cannot relay approvals to this host.',
+  temporarily_unavailable: 'Channels is not available at the moment.',
+  not_tested: 'Nothing has shown yet whether approvals can be answered from here.'
+}
+
+/** What the notice says when the instance has no record for answering approvals at all. */
+const NO_APPROVAL_RECORD =
+  'This device cannot answer Claude Code’s approvals. Channels has not shown that it is on for this session.'
+
+/**
+ * The notice a session shows when its agent asks for approvals in its terminal, or null when there
+ * is nothing to say.
+ *
+ * It says nothing before the records are read, before a live connection has said what it may do,
+ * for an agent whose package is not in [`CHANNEL_PACKAGES`], and while the approval capability is
+ * usable. A record that
+ * is present and not usable gives its own reason, with one sentence per state where it gave none; an
+ * absent record gives the instance's own refusal where it has one. The terminal is offered only
+ * with a live connection and the right to type in it.
+ */
+export function approvalNoticeFor({
+  instance,
+  capabilities,
+  connected,
+  rights
+}: {
+  readonly instance: AgentInstanceSummary | null
+  readonly capabilities: ReadonlyMap<string, InstanceCapabilityRecord> | null
+  readonly connected: boolean
+  readonly rights: ReadonlySet<string> | null
+}): ApprovalNotice | null {
+  if (instance === null || capabilities === null) return null
+  if (!isChannelPackage(instance.plugin_id)) return null
+  // A connection that has not said what it may do is not told it may not type.
+  if (connected && rights === null) return null
+  const record = capabilities.get(COMPOSER_CAPABILITIES.answer)
+  let sentence: string
+  if (record === undefined) {
+    sentence = instance.refusal ?? NO_APPROVAL_RECORD
+  } else if (record.state === 'qualified_available') {
+    return null
+  } else {
+    sentence = record.disabled_reason ?? APPROVAL_STATE_SENTENCES[record.state]
+  }
+  const terminal = !connected
+    ? 'not_connected'
+    : rights?.has('terminal.input') === true
+      ? 'offer'
+      : 'no_input'
+  return { sentence, terminal }
+}
+
 /**
  * The requests a person can answer now: approvals whose interpretation a granted decoder verified
  * and that are still pending. Section 11: an opaque request is not an actionable approval until

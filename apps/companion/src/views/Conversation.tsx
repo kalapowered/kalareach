@@ -54,6 +54,7 @@ import {
 import { renderMarkdown } from '../markdown/render'
 import {
   actionableApprovals,
+  approvalNoticeFor,
   attachOffer,
   bindingStateOf,
   composerOffers,
@@ -121,7 +122,7 @@ import {
 } from '../model/receipts'
 import { useBook, useSessionDraft } from '../app/drafts'
 import { draftMark, readBeforeQuoting, useReceiptReads } from '../app/receipts'
-import { ApprovalRequests } from './Approvals'
+import { ApprovalOffer, ApprovalRequests } from './Approvals'
 import { KeptAnswers, QuestionRequests } from './Questions'
 
 /** How close to the end still counts as being at it. */
@@ -338,6 +339,18 @@ export function Conversation({
   )
   const waitingOnPerson =
     agent.instances === null ? null : actionableApprovals(agent.resources).length > 0
+  // An agent that asks for approvals in its terminal says so, from what the host's records say.
+  const approvalNotice = useMemo(
+    () =>
+      approvalNoticeFor({
+        instance:
+          agent.instances?.find((each) => each.application_instance_id === agent.instance) ?? null,
+        capabilities: agent.capabilities,
+        connected,
+        rights: rights === null ? null : new Set(rights)
+      }),
+    [agent.instances, agent.instance, agent.capabilities, connected, rights]
+  )
 
   // The conversation the session's agent is in now: what a draft is written for, and what it is
   // checked against before it is sent.
@@ -966,6 +979,9 @@ export function Conversation({
         />
       </div>
 
+      {approvalNotice === null ? null : (
+        <ApprovalOffer sessionId={sessionId} notice={approvalNotice} />
+      )}
       <ApprovalRequests sessionId={sessionId} onAnswered={refresh} />
       <QuestionRequests sessionId={sessionId} onAnswered={refresh} />
       <KeptAnswers sessionId={sessionId} />
