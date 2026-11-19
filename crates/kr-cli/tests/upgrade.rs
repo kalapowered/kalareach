@@ -361,6 +361,9 @@ impl Previous {
     /// The release at `commit`, built in a tree of its own under the cache and copied, with its
     /// programs in a directory of their own: two releases a run builds do not share one.
     fn built(commit: String, release: ReleaseName, level: CompatibilityLevel) -> Self {
+        // The release's own daemon and `kr` are plain builds that hold no refusal, and a case
+        // started from them loads jobs into the account's own launchd on a Mac.
+        kr_ipc::testing::account_launchd::require("the daemon of the release before");
         // Held until the programs are copied and the stores read: another run for another commit
         // removes the trees no case selects, and a tree is read only under this lock.
         let _held = cache_lock();
