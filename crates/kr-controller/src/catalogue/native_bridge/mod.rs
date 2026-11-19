@@ -2433,6 +2433,19 @@ fn registration(
         return Ok(None);
     };
     if let Some(other) = named.next() {
+        // A name repeated in any object is a member one reader takes and another does not: the
+        // value above keeps the last of two, and an application may read the first. The file is
+        // read again, exactly, before anything of it is believed.
+        if value.is_object()
+            && let Err(why) = std::str::from_utf8(bytes)
+                .map_err(|error| error.to_string())
+                .and_then(|text| json::Document::read(text).map(|_| ()))
+        {
+            return Err(format!(
+                "{destination} is not one JSON object with no repeated member, so what it \
+                 registers cannot be checked: {why}"
+            ));
+        }
         return Err(format!(
             "the registration starts the forwarder for {application} and for {other}"
         ));
@@ -2446,6 +2459,17 @@ fn registration(
                  not accept",
                 surface.as_str()
             ));
+        // And last, that no name or text in it is a place: a path, an expansion or a command a
+        // program that reads the file would resolve. Only the record of where the files were
+        // installed from is let through, by the shape that holds it.
+        if let Some(why) = kr_plugin_sdk::placement::Placement::for_label(application)
+            .and_then(|placement| placement.shape_of(tail)?.text_refusal(&value))
+        {
+            return Err(format!(
+                "{destination} is not a registration file this host permits a native bridge for \
+                 {application} to install: {why}"
+            ));
+        }
         }
     }
     Ok(Some(RecordedFacts {
