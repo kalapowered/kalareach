@@ -430,3 +430,56 @@ fn the_readers_of_a_client_error_take_a_proxy_login_failure_as_not_sent() {
         assert!(AnswerFailure::from(ClientError::ProxyLogin(kind)).settled());
     }
 }
+
+/// A join reads the service's description through the proxy with the login it is given: a login the
+/// proxy refuses and a proxy that asks for one nobody gave end as the kind, and a refusal the
+/// client reads only as a failed tunnel is told by one bounded re-check through the same writer,
+/// with no loop.
+///
+/// Covers KR-REQ-10.02.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn join_carries_the_login_it_is_given_keeps_none_and_tells_a_refusal() {
+    use kr_client::services::description::{Unread, connect, fetch, recheck};
+    use kr_protocol::service::GatewayOrigin;
+
+    let origin = GatewayOrigin::new("https://service.example").expect("an origin");
+
+    let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+    let wrong = credential("user", "wrong");
+    let url = proxy_of(&proxy.url, Some(&wrong));
+    let http = connect(&origin, Some(&url)).expect("a client");
+    assert_eq!(
+        fetch(&http, &origin).await.expect_err("a refusal"),
+        Unread::ProxyLogin(ProxyLoginKind::Refused)
+    );
+    assert_eq!(proxy.logins(), vec![Login::Wrong]);
+
+    let none = proxy_of(&proxy.url, None);
+    let http = connect(&origin, Some(&none)).expect("a client");
+    assert_eq!(
+        fetch(&http, &origin).await.expect_err("a login is needed"),
+        Unread::ProxyLogin(ProxyLoginKind::Needed)
+    );
+    assert_eq!(proxy.logins(), vec![Login::Wrong, Login::Absent]);
+
+    // `HTTP/1.0 407` reads as a failed tunnel: the request says only that the service is
+    // unreachable, and the one re-check tells the refusal.
+    let old = ConnectProxy::authenticating_in_http10("user", "password", "Basic").await;
+    let wrong = credential("user", "wrong");
+    let url = proxy_of(&old.url, Some(&wrong));
+    let http = connect(&origin, Some(&url)).expect("a client");
+    assert_eq!(
+        fetch(&http, &origin)
+            .await
+            .expect_err("an unreadable refusal"),
+        Unread::Unreachable
+    );
+    assert_eq!(wrong.stopped(), None, "the request alone sets no verdict");
+    assert_eq!(
+        recheck(Some(&url)).await,
+        Some(Unread::ProxyLogin(ProxyLoginKind::Refused))
+    );
+    assert_eq!(old.logins(), vec![Login::Wrong, Login::Wrong]);
+    assert_eq!(recheck(Some(&url)).await, None, "the re-check is made once");
+    assert_eq!(old.logins().len(), 2, "no loop");
+}
