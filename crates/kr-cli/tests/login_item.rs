@@ -554,10 +554,33 @@ mod written {
                     std::os::unix::fs::symlink(&setup.home, &item).expect("a link");
                 }
             }
+            // What the refused install must leave alone: every file under the home and the roots,
+            // the changed object itself, and the record.
+            let tree = setup.snapshot();
+            let object = |item: &Path| match std::fs::read_link(item) {
+                Ok(target) => target.into_os_string().into_encoded_bytes(),
+                Err(_) => std::fs::read(item).unwrap_or_default(),
+            };
+            let changed = object(&item);
+            let record = setup.record_bytes();
             let refusal = setup.refused("install");
             assert!(
                 refusal.contains("was changed after kr wrote it, so kr does not replace it"),
                 "{change}: {refusal}"
+            );
+            assert!(
+                setup.snapshot() == tree,
+                "{change}: a refused install writes nothing"
+            );
+            assert_eq!(
+                object(&item),
+                changed,
+                "{change}: the changed object is as it was"
+            );
+            assert_eq!(
+                setup.record_bytes(),
+                record,
+                "{change}: the record is as it was"
             );
             let before = std::fs::symlink_metadata(&item).is_ok();
             let text = setup.ok("remove");
@@ -868,78 +891,102 @@ mod written {
     #[test]
     fn status_says_each_state_in_words_and_in_json() {
         let setup = Setup::new();
-        let json = |setup: &Setup| -> serde_json::Value {
-            let output = setup.run(&["--json", "host", "login-item", "status"]);
-            assert_eq!(output.status.code(), Some(0));
-            serde_json::from_slice(&output.stdout).expect("JSON")
+        let kr = setup.bin.join("kr");
+        // One state: `status` exits 0 and says the whole sentence, and `--json` gives the state,
+        // whether a record is there and nothing pending.
+        let says = |kr: &Path, home: &Path, sentence: &str, state: &str, recorded: bool| {
+            let output = setup.run_with(kr, home, &["host", "login-item", "status"]);
+            assert_eq!(output.status.code(), Some(0), "{state}: status exits 0");
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim_end(),
+                sentence,
+                "{state}: the sentence, whole"
+            );
+            let output = setup.run_with(kr, home, &["--json", "host", "login-item", "status"]);
+            assert_eq!(output.status.code(), Some(0), "{state}: --json exits 0");
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+            assert_eq!(document["state"], state, "{state}: the state");
+            assert_eq!(document["recorded"], recorded, "{state}: recorded");
+            assert!(document["pending"].is_null(), "{state}: nothing is pending");
+            document
         };
-        let words = |setup: &Setup| {
-            let output = setup.run(&["host", "login-item", "status"]);
-            assert_eq!(output.status.code(), Some(0));
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        };
-        // none, with no identity yet and with one
-        let fresh = words(&setup);
-        assert!(
-            fresh.contains("this environment has no identity yet"),
-            "{fresh}"
+        // none, with no identity yet
+        let document = says(
+            &kr,
+            &setup.home,
+            "login item: none: kr has no record of a login item for this environment, and this \
+             environment has no identity yet, so kr has no file to name; kr host login-item \
+             install writes one",
+            "none",
+            false,
         );
-        assert!(json(&setup)["file"].is_null());
+        assert!(document["file"].is_null());
         assert!(setup.state_dir().is_none(), "status wrote nothing");
         setup.ok("install");
-        // installed
-        let installed = words(&setup);
-        assert!(
-            installed.starts_with("login item: installed: ")
-                && installed.contains("is there as kr wrote it"),
-            "{installed}"
-        );
-        let document = json(&setup);
-        assert_eq!(document["state"], "installed");
-        assert_eq!(document["recorded"], true);
-        assert!(document["pending"].is_null());
-        // changed
         let item = setup.item();
+        let record = setup.record_path().expect("a record");
+        // installed
+        #[cfg(target_os = "macos")]
+        let installed = format!(
+            "login item: installed: {} is there as kr wrote it, and is meant to start the control \
+             daemon at your next login; whether macOS runs it depends on its own switch for login \
+             items, which kr cannot read, and on whether another daemon already serves this \
+             environment",
+            item.display()
+        );
+        #[cfg(target_os = "linux")]
+        let installed = format!(
+            "login item: installed: {} is there as kr wrote it, and is meant to start the control \
+             daemon at your next login on a desktop that runs autostart entries, unless another \
+             daemon already serves this environment; a systemd user manager reads a new entry \
+             only when it reloads, which systemctl --user daemon-reload does",
+            item.display()
+        );
+        says(&kr, &setup.home, &installed, "installed", true);
+        // changed
         let original = std::fs::read(&item).expect("bytes");
         std::fs::write(&item, b"edited\n").expect("a change");
-        assert!(words(&setup).contains(
-            "was changed after kr wrote it, so it is no longer kr's to replace or remove"
-        ));
-        assert_eq!(json(&setup)["state"], "changed");
+        let changed = format!(
+            "login item: {} was changed after kr wrote it, so it is no longer kr's to replace or \
+             remove; kr host login-item remove drops kr's record and leaves the file, which may \
+             still start a daemon when you log in",
+            item.display()
+        );
+        says(&kr, &setup.home, &changed, "changed", true);
         // gone
         std::fs::remove_file(&item).expect("goes");
-        assert!(
-            words(&setup)
-                .contains(", and the file is gone; kr host login-item remove drops the record")
+        let gone = format!(
+            "login item: the record {} names {}, and the file is gone; kr host login-item remove \
+             drops the record, and kr host login-item install writes the file again",
+            record.display(),
+            item.display()
         );
-        assert_eq!(json(&setup)["state"], "gone");
+        says(&kr, &setup.home, &gone, "gone", true);
         // unrecorded: exactly kr's bytes and no record
         std::fs::write(&item, &original).expect("restored");
         std::fs::set_permissions(&item, std::fs::Permissions::from_mode(0o600)).expect("a mode");
-        let record = setup.record_path().expect("a path");
         let kept = std::fs::read(&record).expect("a record");
         std::fs::remove_file(&record).expect("the record goes");
-        assert!(words(&setup).contains(
-            "is exactly what this installation of kr writes, and kr has no record of writing it"
-        ));
-        assert_eq!(json(&setup)["state"], "unrecorded");
+        let unrecorded = format!(
+            "login item: {} is exactly what this installation of kr writes, and kr has no record \
+             of writing it; kr host login-item install records it and leaves the file as it is",
+            item.display()
+        );
+        says(&kr, &setup.home, &unrecorded, "unrecorded", false);
         // foreign: other bytes and no record
         std::fs::write(&item, b"foreign\n").expect("a change");
-        assert!(words(&setup).contains("kr leaves it as it is and does not write over it"));
-        assert_eq!(json(&setup)["state"], "foreign");
+        let foreign = format!(
+            "login item: {} is not what this installation of kr writes, and kr has no record of \
+             writing it, so kr leaves it as it is and does not write over it",
+            item.display()
+        );
+        says(&kr, &setup.home, &foreign, "foreign", false);
         // outdated: a second layout writes other bytes
         std::fs::write(&item, &original).expect("restored");
         std::fs::write(&record, &kept).expect("the record is back");
         std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).expect("a mode");
         let layout = setup.root.join("bin2");
         setup.layout(&layout);
-        let other = setup.run_with(
-            &layout.join("kr"),
-            &setup.home,
-            &["--json", "host", "login-item", "status"],
-        );
-        let other: serde_json::Value = serde_json::from_slice(&other.stdout).expect("JSON");
-        assert_eq!(other["state"], "outdated");
         // The whole sentence, the refusal that follows from it, and the clause of a pending install.
         let outdated = format!(
             "login item: {} is as kr wrote it, but this installation of kr writes it differently \
@@ -947,10 +994,8 @@ mod written {
              writes this installation's",
             item.display()
         );
+        says(&layout.join("kr"), &setup.home, &outdated, "outdated", true);
         let there = |arguments: &[&str]| setup.run_with(&layout.join("kr"), &setup.home, arguments);
-        let text =
-            String::from_utf8_lossy(&there(&["host", "login-item", "status"]).stdout).into_owned();
-        assert_eq!(text.trim_end(), outdated);
         let before = setup.snapshot();
         let refused = there(&["host", "login-item", "install"]);
         assert_eq!(
@@ -990,16 +1035,22 @@ mod written {
         // elsewhere: another home
         let second = setup.root.join("home2");
         std::fs::create_dir_all(&second).expect("a home");
-        let elsewhere = setup.run_with(
-            &setup.bin.join("kr"),
-            &second,
-            &["host", "login-item", "status"],
+        let place = setup
+            .directory(&second)
+            .join(item.file_name().expect("a name"));
+        #[cfg(target_os = "macos")]
+        let variable = "HOME";
+        #[cfg(target_os = "linux")]
+        let variable = "XDG_CONFIG_HOME or HOME";
+        let elsewhere = format!(
+            "login item: the file the record {} names is not {}, where this command puts this \
+             environment's login item under {variable}; kr host login-item remove takes out the \
+             recorded file if it is as kr wrote it, and kr host login-item install then writes {}",
+            record.display(),
+            place.display(),
+            place.display()
         );
-        let text = String::from_utf8_lossy(&elsewhere.stdout).into_owned();
-        assert!(
-            text.contains("login item: the file the record ") && text.contains(" names is not "),
-            "{text}"
-        );
+        says(&kr, &second, &elsewhere, "elsewhere", true);
         // an unusable record gives its sentence and a non-zero exit
         std::fs::write(&record, b"not json").expect("a bad record");
         let bad = setup.run(&["host", "login-item", "status"]);
@@ -1246,6 +1297,21 @@ mod written {
         let mut changed = std::fs::read(&first).expect("the file");
         changed.extend_from_slice(b"\n");
         std::fs::write(&first, changed).expect("a changed file");
+        // Under the current home, a pending install over a changed file: remove takes out what the
+        // install left and leaves the file, and status says so, after the whole changed sentence.
+        let (ok, said, _) = run_in(&setup, &setup.home, &["host", "login-item", "status"]);
+        assert!(ok, "{said}");
+        assert_eq!(
+            said.trim_end(),
+            format!(
+                "login item: {} was changed after kr wrote it, so it is no longer kr's to replace \
+                 or remove; kr host login-item remove drops kr's record and leaves the file, which \
+                 may still start a daemon when you log in; an earlier kr host login-item install \
+                 did not finish: kr host login-item remove takes out what it left and leaves the \
+                 file",
+                first.display()
+            )
+        );
         let (ok, _, refused) = run_in(&setup, &second, &["host", "login-item", "install"]);
         assert!(!ok, "{refused}");
         assert!(
@@ -1344,6 +1410,46 @@ mod written {
             "{said}{refused}"
         );
         assert!(item.exists(), "the file is still there");
+    }
+
+    /// A removal that leaves the file because it was changed since an install stopped has not
+    /// taken out what that install began: the `left` line says what happened.
+    #[test]
+    fn a_removal_that_leaves_a_changed_file_does_not_say_it_took_out_the_install() {
+        for name in ["publish 4", "publish 5"] {
+            let state = STOPPED
+                .iter()
+                .find(|state| state.name == name)
+                .expect("a state of the table");
+            let setup = Setup::new();
+            let (item, original) = stopped_in(&setup, state);
+            let mut changed = original.clone();
+            changed.extend_from_slice(b"X-Mine=1\n");
+            std::fs::write(&item, &changed).expect("a change after the install stopped");
+            let (ok, said, refused) =
+                run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
+            assert!(ok, "{name}: {said}{refused}");
+            assert!(
+                !said.contains("took out what an earlier"),
+                "{name}: the install's work was not taken out: {said}"
+            );
+            assert!(
+                said.contains(&format!(
+                    "left {}: it was changed after kr wrote it",
+                    item.display()
+                )),
+                "{name}: the file that was left is named: {said}"
+            );
+            assert_eq!(
+                std::fs::read(&item).ok().as_deref(),
+                Some(changed.as_slice()),
+                "{name}: the file is left as it was changed"
+            );
+            assert!(
+                setup.record_bytes().is_none(),
+                "{name}: the record is dropped"
+            );
+        }
     }
 
     #[test]
@@ -1484,56 +1590,74 @@ mod written {
     struct Stopped {
         name: &'static str,
         operation: &'static str,
+        /// Whether the private directory the item is written into is there: a publish that
+        /// stopped before it made the directory (publish 1) is not at the state where it did.
+        directory_is_there: bool,
         file_is_there: bool,
         leftover: Option<&'static str>,
     }
 
-    const STOPPED: [Stopped; 8] = [
+    const STOPPED: [Stopped; 9] = [
         Stopped {
             name: "publish 1",
             operation: "publish",
+            directory_is_there: false,
+            file_is_there: false,
+            leftover: None,
+        },
+        Stopped {
+            name: "publish 2",
+            operation: "publish",
+            directory_is_there: true,
             file_is_there: false,
             leftover: None,
         },
         Stopped {
             name: "publish 3",
             operation: "publish",
+            directory_is_there: true,
             file_is_there: false,
             leftover: Some("staged"),
         },
         Stopped {
             name: "publish 4",
             operation: "publish",
+            directory_is_there: true,
             file_is_there: true,
             leftover: Some("linked"),
         },
         Stopped {
             name: "publish 5",
             operation: "publish",
+            directory_is_there: true,
             file_is_there: true,
             leftover: None,
         },
         Stopped {
             name: "remove 1",
             operation: "remove",
+            directory_is_there: true,
             file_is_there: true,
             leftover: None,
         },
         Stopped {
             name: "remove 2",
             operation: "remove",
+            directory_is_there: true,
             file_is_there: false,
             leftover: Some("moved"),
         },
         Stopped {
             name: "remove 3",
             operation: "remove",
+            directory_is_there: true,
             file_is_there: false,
             leftover: None,
         },
         Stopped {
             name: "put back 1",
             operation: "remove",
+            directory_is_there: true,
             file_is_there: true,
             leftover: Some("linked"),
         },
@@ -1562,6 +1686,9 @@ mod written {
         }
         if !state.file_is_there && state.leftover != Some("moved") {
             std::fs::remove_file(&item).expect("the file is not there");
+        }
+        if !state.directory_is_there {
+            std::fs::remove_dir(item.parent().expect("a directory")).expect("the directory goes");
         }
         let key = if state.operation == "publish" {
             "staging"
@@ -1595,7 +1722,9 @@ mod written {
             let setup = Setup::new();
             let (item, original) = stopped_in(&setup, state);
             let before = setup.snapshot();
-            let said = setup.ok("status");
+            let (ok, said, refused) =
+                run_in(&setup, &setup.home, &["host", "login-item", "status"]);
+            assert!(ok, "{name}: status succeeds: {said}{refused}");
             assert!(
                 said.contains(&format!(
                     "an earlier kr host login-item {} did not finish: ",
@@ -1607,9 +1736,20 @@ mod written {
                 )),
                 "{name}: {said}"
             );
+            assert_eq!(
+                status_word(&setup),
+                if state.file_is_there {
+                    "installed"
+                } else {
+                    "gone"
+                },
+                "{name}: the state the file is in"
+            );
             assert!(setup.snapshot() == before, "{name}: status changes nothing");
             // install finishes it, whole, and says what it did from what it found.
-            let said = setup.ok("install");
+            let (ok, said, refused) =
+                run_in(&setup, &setup.home, &["host", "login-item", "install"]);
+            assert!(ok, "{name}: install finishes it: {said}{refused}");
             assert!(setup.record()["pending"].is_null(), "{name}: {said}");
             assert_eq!(leftovers_in(&setup), Vec::<String>::new(), "{name}: {said}");
             assert_eq!(
@@ -1636,7 +1776,9 @@ mod written {
             // remove finishes it too: no file, no record, no leftover.
             let setup = Setup::new();
             let (item, _) = stopped_in(&setup, state);
-            let said = setup.ok("remove");
+            let (ok, said, refused) =
+                run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
+            assert!(ok, "{name}: remove finishes it: {said}{refused}");
             assert!(setup.record_bytes().is_none(), "{name}: {said}");
             assert!(!item.exists(), "{name}: {said}");
             assert_eq!(leftovers_in(&setup), Vec::<String>::new(), "{name}: {said}");
@@ -1649,26 +1791,35 @@ mod written {
         }
     }
 
-    /// When the directory the item was written into has become a file, status says the file is
-    /// gone and a removal drops the record, as it does for a file that is gone.
+    /// When the directory the item was written into, or the directory above it, has become a file,
+    /// status says the file is gone and a removal drops the record, as it does for a file that is
+    /// gone.
     #[test]
     fn a_login_item_whose_directory_became_a_file_is_gone_and_its_removal_finishes() {
-        let setup = Setup::new();
-        setup.ok("install");
-        let item = setup.item();
-        let directory = item.parent().expect("a directory").to_owned();
-        std::fs::remove_file(&item).expect("the file goes");
-        std::fs::remove_dir(&directory).expect("the directory goes");
-        std::fs::write(&directory, b"a file now\n").expect("a file in its place");
-        assert_eq!(status_word(&setup), "gone");
-        let (ok, said, refused) = run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
-        assert!(ok, "the removal finishes: {said}{refused}");
-        assert!(setup.record_bytes().is_none(), "{said}");
-        assert_eq!(
-            std::fs::read(&directory).ok().as_deref(),
-            Some(&b"a file now\n"[..]),
-            "the file that stands where the directory was is left"
-        );
+        for (name, above) in [("its directory", false), ("the directory above it", true)] {
+            let setup = Setup::new();
+            setup.ok("install");
+            let item = setup.item();
+            let directory = item.parent().expect("a directory").to_owned();
+            let folder = if above {
+                directory.parent().expect("a directory above").to_owned()
+            } else {
+                directory
+            };
+            std::fs::remove_file(&item).expect("the file goes");
+            std::fs::remove_dir_all(&folder).expect("the directory goes");
+            std::fs::write(&folder, b"a file now\n").expect("a file in its place");
+            assert_eq!(status_word(&setup), "gone", "{name}");
+            let (ok, said, refused) =
+                run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
+            assert!(ok, "{name}: the removal finishes: {said}{refused}");
+            assert!(setup.record_bytes().is_none(), "{name}: {said}");
+            assert_eq!(
+                std::fs::read(&folder).ok().as_deref(),
+                Some(&b"a file now\n"[..]),
+                "{name}: the file that stands where the directory was is left"
+            );
+        }
     }
 
     #[test]
@@ -1695,6 +1846,48 @@ mod written {
         assert!(before == setup.snapshot(), "nothing was made: {said}");
     }
 
+    /// The help says the item is meant to start the daemon, and says that a login with no desktop
+    /// host is the case on macOS, where Linux serves desktop workers from the daemon that runs.
+    #[test]
+    fn the_help_says_the_item_is_meant_to_start_the_daemon_and_the_lost_desktop_host_is_macos() {
+        let setup = Setup::new();
+        let help = |arguments: &[&str]| {
+            let output = setup.run(arguments);
+            assert_eq!(output.status.code(), Some(0), "{arguments:?} exits 0");
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let opening = "Install, show or remove the login item that is meant to start the control \
+                       daemon when you log in";
+        let item = help(&["host", "login-item", "--help"]);
+        let whole = format!(
+            "{opening}. It is a launch agent file on macOS and an autostart entry on Linux, \
+             offered apart from the headless host `kr host startup` chooses, the shell startup \
+             entry and the terminal profile. Nothing starts now, and a daemon that is running is \
+             never ended. A daemon that already serves this environment holds its lock, so the \
+             login item's daemon exits. On macOS that login has no desktop host until the other \
+             daemon ends and you log in again; on Linux the other daemon serves desktop workers. \
+             macOS 13 and later may list the item under Login Items, where you can switch it off; \
+             kr cannot read that switch. On Linux the daemon's output goes where your session \
+             sends an autostart program's, not to controller.log, and a desktop setting that \
+             edits the file makes kr read it as changed. kr writes the file where HOME (and \
+             XDG_CONFIG_HOME on Linux) point in the shell that runs it, and the item keeps that \
+             shell's runtime and state directories."
+        );
+        assert!(
+            item.starts_with(&format!("{opening}. It is a launch agent")),
+            "{item}"
+        );
+        assert!(item.contains(&whole), "{item}");
+        let host = help(&["host", "--help"]);
+        assert!(
+            host.contains(&format!("login-item {opening} startup")),
+            "the host's list keeps the one line: {host}"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn a_path_a_property_list_must_escape_reads_back_whole() {
@@ -1714,23 +1907,34 @@ mod written {
             );
             let controller = std::fs::canonicalize(layout.join("kr-controller")).expect("resolves");
             assert_eq!(
-                read_vector(&setup.item())[0],
-                controller.to_string_lossy(),
-                "{name}"
+                read_vector(&setup.item()),
+                vec![
+                    controller.to_string_lossy().into_owned(),
+                    "--runtime-dir".to_owned(),
+                    setup.runtime.to_string_lossy().into_owned(),
+                    "--state-dir".to_owned(),
+                    setup.state.to_string_lossy().into_owned(),
+                ],
+                "{name}: the controller's path reads back whole, in its place"
             );
             // The runtime and state directories read back whole as well.
             let mut setup = Setup::new();
             setup.state = setup.root.join(name).join("s");
             setup.runtime = setup.root.join(name).join("r");
             setup.ok("install");
-            let words = read_vector(&setup.item());
-            for root in [&setup.state, &setup.runtime] {
-                let root = root.to_string_lossy();
-                assert!(
-                    words.iter().any(|word| word.contains(root.as_ref())),
-                    "{name}: {root} reads back whole from {words:?}"
-                );
-            }
+            let controller =
+                std::fs::canonicalize(setup.bin.join("kr-controller")).expect("resolves");
+            assert_eq!(
+                read_vector(&setup.item()),
+                vec![
+                    controller.to_string_lossy().into_owned(),
+                    "--runtime-dir".to_owned(),
+                    setup.runtime.to_string_lossy().into_owned(),
+                    "--state-dir".to_owned(),
+                    setup.state.to_string_lossy().into_owned(),
+                ],
+                "{name}: the runtime and state paths read back whole, each in its place"
+            );
         }
         // A path with a control character cannot be written exactly, and nothing is written.
         let setup = Setup::new();
