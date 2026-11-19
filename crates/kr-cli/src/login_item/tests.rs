@@ -4,6 +4,7 @@
 //! so none can reach a real home. A case runs a step list up to a step and stops, and compares the
 //! tree it leaves with what the record says is under way; the step lists are the product's own.
 
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
@@ -144,7 +145,13 @@ fn a_publish_stopped_after_each_step_leaves_the_state_its_row_names() {
     for done in 1..=6 {
         let tree = Tree::publishing(done);
         let file = tree.file();
-        let record = tree.record().expect("a record is there after every step");
+        let read = record::read(&tree.state(), tree.kind, LABEL, &Shown::said("the record"));
+        assert_eq!(
+            read.as_ref().ok().map(Option::is_some),
+            Some(true),
+            "after step {done}: a record that is read is there"
+        );
+        let record = read.ok().flatten().expect("the record was just read");
         assert_eq!(record.contents, NEW, "after step {done}");
         match done {
             1 | 2 => {
@@ -203,10 +210,22 @@ fn a_removal_stopped_after_each_step_leaves_the_state_its_row_names() {
     for done in 1..=5 {
         let tree = Tree::removing(done);
         let file = tree.file();
+        let read = record::read(&tree.state(), tree.kind, LABEL, &Shown::said("the record"));
+        if done <= 4 {
+            assert_eq!(
+                read.as_ref().ok().map(Option::is_some),
+                Some(true),
+                "after step {done}: a record that is read is there"
+            );
+        }
         match done {
             1 => {
-                let record = tree.record().expect("a record");
-                let aside = aside_of(&record).expect("the record names the aside first");
+                let record = read.ok().flatten().expect("the record was just read");
+                assert!(
+                    aside_of(&record).is_some(),
+                    "the record names the aside before the file moves"
+                );
+                let aside = aside_of(&record).expect("named");
                 assert_eq!(
                     bytes(&file).as_deref(),
                     Some(OLD.as_bytes()),
@@ -245,6 +264,10 @@ fn a_file_put_back_and_stopped_between_its_two_steps_leaves_one_file_under_two_n
     let (mut run, _) = tree.finishing();
     run.paths.aside.clone_from(&aside);
     steps::run_all(&mut run, &PUT_BACK[..1]).unwrap_or_else(|_| panic!("links back"));
+    assert!(
+        tree.file().exists() && aside.exists(),
+        "the file is back and the aside is still there"
+    );
     assert!(same(&tree.file(), &aside), "one file under two names");
     assert_eq!(
         aside_of(&tree.record().expect("a record")),
@@ -305,7 +328,14 @@ fn settle_finishes_each_stopped_state_the_way_its_row_says() {
         let file = bytes(&tree.file());
         let wants_new = name.starts_with("publish");
         assert_eq!(after.contents, if wants_new { NEW } else { OLD }, "{name}");
-        if name == "publish 4" || name == "publish 5" || name.starts_with("remove 1") {
+        // The file is in place after an install settles every state but the ones where the
+        // file was never made: a removal stopped with the file moved aside has it put back.
+        if name == "publish 4"
+            || name == "publish 5"
+            || name == "put back 1"
+            || name.starts_with("remove 1")
+            || name.starts_with("remove 2")
+        {
             assert_eq!(file.as_deref(), Some(after.contents.as_bytes()), "{name}");
         }
     }
@@ -321,6 +351,70 @@ fn settle_finishes_each_stopped_state_the_way_its_row_says() {
         assert!(tree.record().is_none(), "{name}");
         assert_eq!(tree.leftovers(), Vec::<String>::new(), "{name}");
     }
+}
+
+/// A removal stopped with the file moved aside, where the aside holds other owner-only bytes than
+/// the record's: the file goes back, whoever's bytes it holds, and is never removed in its place.
+#[test]
+fn an_aside_that_holds_other_bytes_is_put_back_and_never_removed() {
+    const OTHER: &str = "the person's own bytes\n";
+    let stopped = || {
+        let tree = Tree::removing(2);
+        let record = tree.record().expect("a record");
+        let aside = aside_of(&record).expect("the record names the aside");
+        write_owner_only(&aside, OTHER.as_bytes(), 0o600);
+        assert_eq!(bytes(&tree.file()), None, "the file is moved aside");
+        (tree, record, aside)
+    };
+    // An install puts the file back, sees that it is not what the record vouches for, and stops
+    // with the record as it was.
+    let (tree, record, aside) = stopped();
+    let mut run = tree.run("", Some(record.clone()));
+    let settled = steps::settle(&mut run, &record, Mode::Install)
+        .unwrap_or_else(|_| panic!("the install settles"));
+    assert!(
+        settled == Settled::Changed,
+        "an install stops at bytes it does not vouch for"
+    );
+    assert_eq!(bytes(&tree.file()).as_deref(), Some(OTHER.as_bytes()));
+    assert_eq!(bytes(&aside), None, "the aside went back and is not left");
+    assert_eq!(tree.record(), Some(record), "the record is as it was");
+    // A removal puts it back, drops the record and leaves the file as the person's.
+    let (tree, record, _) = stopped();
+    let mut run = tree.run("", Some(record.clone()));
+    let settled = steps::settle(&mut run, &record, Mode::Remove)
+        .unwrap_or_else(|_| panic!("the removal settles"));
+    assert!(settled == Settled::Done, "a removal settles");
+    assert_eq!(bytes(&tree.file()).as_deref(), Some(OTHER.as_bytes()));
+    let clean = tree.record().expect("a clean record");
+    let mut run = tree.run("", Some(clean));
+    steps::run_all(&mut run, &REMOVE).unwrap_or_else(|_| panic!("the removal runs"));
+    assert_eq!(bytes(&tree.file()).as_deref(), Some(OTHER.as_bytes()));
+    assert!(tree.record().is_none(), "the record is dropped");
+}
+
+#[test]
+fn a_record_whose_path_is_not_text_is_not_written() {
+    let record = Record::clean(
+        Kind::current(),
+        LABEL,
+        Path::new(std::ffi::OsStr::from_bytes(b"/home/\xff/entry")),
+        OLD,
+    );
+    assert!(
+        record.bytes().is_err(),
+        "no empty record is made of a path with no text"
+    );
+    let tree = Tree::new();
+    let mut run = tree.run(OLD, None);
+    run.paths.file = PathBuf::from(std::ffi::OsStr::from_bytes(b"/home/\xff/entry"));
+    let before = read_bytes_of_tree(&tree);
+    let refused = steps::run_all(&mut run, &PUBLISH[..1]);
+    assert!(refused.is_err(), "the first record write is refused");
+    assert!(
+        before == read_bytes_of_tree(&tree),
+        "and nothing was written"
+    );
 }
 
 #[test]
@@ -491,8 +585,11 @@ fn a_leftover_is_removed_only_when_it_is_an_owner_only_regular_file_with_the_rec
 }
 
 fn write_owner_only_file_of_record(tree: &Tree, record: &Record) {
-    kr_ipc::paths::write_owner_only_file(&record::path(&tree.state()), &record.bytes())
-        .expect("writes the record");
+    kr_ipc::paths::write_owner_only_file(
+        &record::path(&tree.state()),
+        &record.bytes().expect("the record encodes"),
+    )
+    .expect("writes the record");
 }
 
 #[test]
@@ -524,7 +621,7 @@ fn a_publication_that_failed_after_the_name_existed_is_finished_not_undone() {
     assert!(tree.record().expect("a record").pending.is_none());
     assert_eq!(tree.leftovers(), Vec::<String>::new());
 
-    // The record's own last write can publish it and then fail to flush: the file is in place.
+    // The record's first write can publish it and then fail to flush: nothing else was written.
     let tree = Tree::new();
     std::fs::create_dir_all(tree.directory()).expect("a directory");
     let guard = kr_flush::testing::refuse_flushes_of(tree.state());
@@ -537,6 +634,25 @@ fn a_publication_that_failed_after_the_name_existed_is_finished_not_undone() {
         "nothing was written yet"
     );
     assert!(tree.record().is_none());
+
+    // The record's last write can publish it and then fail to flush: the file is in place, and
+    // the failure says so and takes nothing back.
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.directory()).expect("a directory");
+    let mut run = tree.run(NEW, None);
+    let before_the_last = PUBLISH.len() - 1;
+    steps::run_all(&mut run, &PUBLISH[..before_the_last]).unwrap_or_else(|_| panic!("runs"));
+    let guard = kr_flush::testing::refuse_flushes_of(tree.state());
+    let error = steps::run_all(&mut run, &PUBLISH[before_the_last..])
+        .expect_err("the last record's flush fails");
+    drop(guard);
+    let failure = steps::fail(&mut run, Operation::Publish, error);
+    assert!(
+        matches!(failure.tail, Tail::InPlace),
+        "the file is in place"
+    );
+    assert_eq!(bytes(&tree.file()).as_deref(), Some(NEW.as_bytes()));
+    assert_eq!(tree.leftovers(), Vec::<String>::new());
 }
 
 #[test]
@@ -582,6 +698,30 @@ fn a_flush_that_fails_keeps_the_record_naming_the_path_it_followed() {
     );
     drop(guard);
     assert!(tree.record().expect("the record stays").pending.is_some());
+
+    // The record's removal is the last step of a removal, and the state directory's flush after
+    // it fails: the step says so, and does not report a removal that is not yet durable.
+    let (tree, _) = Tree::published();
+    let mut run = tree.run("", tree.record());
+    let before_the_end = REMOVE.len() - 1;
+    steps::run_all(&mut run, &REMOVE[..before_the_end]).unwrap_or_else(|_| panic!("runs"));
+    let guard = kr_flush::testing::refuse_flushes_of(tree.state());
+    let result = steps::run_all(&mut run, &REMOVE[before_the_end..]);
+    drop(guard);
+    assert!(result.is_err(), "the state directory's flush fails");
+    assert!(tree.record().is_none(), "the record's name is gone");
+
+    // Settling a publication stopped after its staging file was removed has nothing left to
+    // remove but a name in the record, and its flush before that record is written fails: the
+    // record stays as it was, and a run again finishes it.
+    let tree = Tree::publishing(5);
+    let record = tree.record().expect("a record");
+    let mut run = tree.run("", Some(record.clone()));
+    let guard = kr_flush::testing::refuse_flushes_of(tree.directory());
+    let settled = steps::settle(&mut run, &record, Mode::Install);
+    drop(guard);
+    assert!(settled.is_err(), "the settling's flush fails");
+    assert_eq!(tree.record(), Some(record), "the record is as it was");
 }
 
 #[test]
