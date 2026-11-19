@@ -2666,6 +2666,54 @@ mod tests {
         assert_eq!(shown, vec!["shown".to_owned()]);
     }
 
+    /// A start's answer that passed the hold is recorded in one write of the whole file: the
+    /// earlier starts the pass changed, the start's own entry and what is owed next are all in the
+    /// file that write leaves, and no write leaves one of them without the others.
+    #[test]
+    fn a_start_that_passed_the_hold_is_recorded_in_one_write_of_the_whole_file() {
+        let directory = tempfile::tempdir().expect("a folder");
+        Kept::at(directory.path())
+            .write(&KeptVoice {
+                owed: vec![
+                    entry(START_UNKNOWN, "old", host(1)),
+                    entry(START_KEPT, "older", host(1)),
+                    entry(START_UNKNOWN, "other", host(2)),
+                ],
+                note: None,
+            })
+            .expect("the file is written");
+        let calls = calls_in(directory.path());
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        let owner = shared
+            .next_owner
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(shared.stand_open_durably(owner, entry(START_UNKNOWN, "new", host(1))));
+        let before = shared.kept.writes();
+
+        shared.settle_start(
+            owner,
+            Some(host(1)),
+            Some(entry(START_KEPT, "new", host(1))),
+            Some(entry("revocation", "rev", host(1))),
+        );
+
+        assert_eq!(
+            shared.kept.writes() - before,
+            1,
+            "the pass, the entry and what is owed next are one write"
+        );
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![
+                pair(START_UNANSWERED, "old"),
+                pair(START_UNKNOWN, "other"),
+                pair(START_KEPT, "new"),
+                pair("revocation", "rev"),
+            ],
+            "and that write is the whole change"
+        );
+    }
+
     /// The starts a launch kept, by the kinds of D-3731's table, are what the launch that follows
     /// finds and names: a fresh `Calls` over the file the first one wrote finds the older kept
     /// start and the start the host never answered as candidates, shows only the notices, and
