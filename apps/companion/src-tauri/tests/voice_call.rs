@@ -9168,3 +9168,181 @@ async fn a_spoken_delegation_on_an_own_key_call_is_heard_by_the_host_and_a_refus
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Spoken requests on a call the host controls                                                    */
+/* ---------------------------------------------------------------------------------------------- */
+//
+// On a call on the host's own key the host writes the model's sentences. The phone hands a spoken
+// request to the host as it does on a managed call, and tells the host which sentence the model is
+// owed for it; the host writes that sentence, and for a performed request the summary from its own
+// record. The cases below read what the host wrote to the provider's side channel, the host being
+// the real one.
+
+/// What a phone that manages a host on its own key may do, and what voice may ask: with `close`, a
+/// session may be closed by a spoken request after a confirmation on the phone.
+fn own_standing(close: bool) -> Standing {
+    let mut rights = MANAGER.to_vec();
+    let mut voice_actions = serde_json::Value::Null;
+    if close {
+        rights.push(ActionRight::SessionClose);
+        voice_actions = json!([
+            "navigate",
+            "status",
+            "brief",
+            "compose_prompt",
+            "close_session"
+        ]);
+    }
+    Standing {
+        rights,
+        voice_actions,
+        own_key: Some(OpenAi::new()),
+    }
+}
+
+/// A scene over one real session whose calls run on the host's own key and hand spoken requests to
+/// the host.
+async fn own_acting_with(timings: Timings, standing: Standing) -> Scene {
+    let scene = scene_replacing(
+        timings,
+        None,
+        None,
+        HttpDeadlines::default(),
+        1,
+        standing,
+        |service| service,
+    )
+    .await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .accept_host_delegations(true);
+    scene
+}
+
+/// Starts the call on the host's own key, waits for its control, and has native code show the
+/// recorder delivering.
+async fn own_calling(scene: &Scene) {
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    scene.platform.show_progress_age(Some(10));
+}
+
+/// The delegation the model creates when the last of the words was said: the host's side channel
+/// hears it first, as it does from the provider, and the device's data channel delivers it once the
+/// phone has read the host's news of it.
+async fn own_ask(scene: &Scene, id: &str, offset_ms: u64) {
+    scene
+        .openai
+        .clone()
+        .expect("an own-key scene")
+        .event(&provider_delegation(id, offset_ms));
+    until_announced(scene, id, offset_ms).await;
+    scene
+        .platform
+        .tell_provider(&delegation_event(id, offset_ms));
+}
+
+/// A first sentence that comes to nothing, as [`chatter`] makes one on a managed call.
+async fn own_chatter(scene: &Scene) {
+    speak(scene, 0, "hello there");
+    own_ask(scene, "d-0", 200).await;
+    let row = row_reaching(scene, "d-0", "refused").await;
+    assert_eq!(row["cause"], "first_fragment");
+}
+
+/// What the host wrote to the model for the delegation `id`, in the order it wrote it.
+fn wrote_for(scene: &Scene, id: &str) -> Vec<String> {
+    written_of(scene, "session.commentary.append")
+        .into_iter()
+        .filter(|(_, delegation)| delegation.as_deref() == Some(id))
+        .map(|(content, _)| content)
+        .collect()
+}
+
+/// Waits until the host has written `note`'s sentence for the delegation `id`.
+async fn until_noted(scene: &Scene, id: &str, note: VoiceNote) {
+    until_written(scene, "session.commentary.append", |(content, delegation)| {
+        content == note.words() && delegation.as_deref() == Some(id)
+    })
+    .await;
+}
+
+/// A status asked for after a pause on a call on the host's own key is handed to the host as on a
+/// managed call: the host reads the session, answers performed, and writes the model's sentence
+/// for the delegation with its own summary after it. The phone writes nothing to the provider and
+/// asks nothing of the voice service or the account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_status_asked_for_on_an_own_key_call_is_performed_by_the_host_and_told_with_its_summary() {
+    let mut scene = own_acting_with(delegating_timings(), own_standing(false)).await;
+    own_calling(&scene).await;
+    own_chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    own_ask(&scene, "d-1", end - 200).await;
+
+    let row = row_reaching(&scene, "d-1", "performed").await;
+
+    assert_eq!(row["offset_ms"], end - 200);
+    assert_eq!(at_the_host(&scene), 1, "the host was sent the one request");
+    let performed = VoiceNote::DelegationPerformed.words();
+    until_written(
+        &scene,
+        "session.commentary.append",
+        |(content, delegation)| {
+            delegation.as_deref() == Some("d-1")
+                && content.starts_with(performed)
+                && !content[performed.len()..].trim().is_empty()
+        },
+    )
+    .await;
+    scene
+        .state_where("the model told", |state| {
+            row_of(state, "d-1").is_some_and(|row| row["told"] == true)
+        })
+        .await;
+    let wrote = wrote_for(&scene, "d-1");
+    assert_eq!(wrote.len(), 1, "told once: {wrote:?}");
+    assert!(!wrote[0].contains("Nothing was done"), "{wrote:?}");
+    assert_eq!(
+        what_reached_kalareach(&scene),
+        (0, 0, 0),
+        "the managed service and the account were asked for nothing"
+    );
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A request the host refuses, on a call on the host's own key, is shown as the host's refusal, and
+/// the host writes the sentence that says it refused it. The call is not tainted by it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_host_refuses_on_an_own_key_call_is_told_to_the_model_as_the_hosts_refusal() {
+    let mut scene = own_acting_with(delegating_timings(), own_standing(false)).await;
+    own_calling(&scene).await;
+    own_chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status of session seven");
+    own_ask(&scene, "d-1", end - 200).await;
+
+    let row = row_reaching(&scene, "d-1", "host_refused").await;
+
+    assert!(row["cause"].is_string(), "{row}");
+    assert_eq!(at_the_host(&scene), 1);
+    until_noted(&scene, "d-1", VoiceNote::DelegationHostRefused).await;
+    let wrote = wrote_for(&scene, "d-1");
+    assert_eq!(
+        wrote,
+        [VoiceNote::DelegationHostRefused.words()],
+        "told once, and not as done"
+    );
+    assert!(!kinds_of(&scene.state()).contains(&"spoken_requests".to_owned()));
+    hang_up(&scene);
+    scene.stop_host().await;
+}
