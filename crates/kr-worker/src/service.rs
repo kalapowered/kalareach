@@ -8371,20 +8371,37 @@ impl WorkerService {
         }
         // Most methods act on the session itself, and naming an application instance in the
         // envelope is a request this endpoint cannot serve rather than a field to ignore. The
-        // agent and plugin methods do act on one, and for those the envelope must agree with what
-        // the parameters name: an envelope and a body that disagree are two requests.
+        // agent and plugin methods do act on one, and for those the envelope must name the same
+        // instance at the same binding revision as the parameters: an envelope and a body that
+        // disagree are two requests, and so is an envelope that names less than the body does.
+        // What the envelope names is part of the subject an uncertain outcome holds back, so a
+        // retry that named another revision or none would otherwise be a different subject from
+        // the one it repeats.
+        let selects_an_instance = entry
+            .resource_selectors
+            .contains(&ResourceSelectorKind::ApplicationInstance);
         match mutation.target.application_instance_id.as_ref() {
+            None if selects_an_instance && Self::params_name_an_instance(entry.method) => {
+                return Err(WorkerError::InvalidArgument(format!(
+                    "{} names the application instance it acts on",
+                    entry.name
+                )));
+            }
             None => {}
-            Some(named)
-                if entry
-                    .resource_selectors
-                    .contains(&ResourceSelectorKind::ApplicationInstance) =>
-            {
-                let acted_on = Self::params_application_instance(entry.method, &mutation.params)?;
+            Some(named) if selects_an_instance => {
+                let (acted_on, acted_at) =
+                    Self::params_application_target(entry.method, &mutation.params)?;
                 if acted_on != *named {
                     return Err(WorkerError::InvalidArgument(
                         "this request names one application instance in its envelope and another \
                          in its parameters"
+                            .to_owned(),
+                    ));
+                }
+                if mutation.target.agent_binding_revision.as_ref() != Some(&acted_at) {
+                    return Err(WorkerError::InvalidArgument(
+                        "this request names one binding revision in its envelope and another in \
+                         its parameters"
                             .to_owned(),
                     ));
                 }
@@ -10717,44 +10734,47 @@ impl WorkerService {
         encode(&record)
     }
 
-    /// Returns the application instance one of the agent or plugin methods acts on.
+    /// Whether a method's parameters name the application instance it acts on.
     ///
-    /// It is read from the parameters, so the envelope's own selector can be compared with what
+    /// These are the agent mutations and the plugin action call. A method that merely lists an
+    /// instance among its selectors, such as the daemon's attachment binding, names none here.
+    const fn params_name_an_instance(method: Method) -> bool {
+        matches!(
+            method,
+            Method::AgentPromptSubmit
+                | Method::AgentPromptQueue
+                | Method::AgentTurnSteer
+                | Method::AgentTurnCancel
+                | Method::AgentApprovalRespond
+                | Method::PluginActionInvoke
+        )
+    }
+
+    /// Returns the application instance one of the agent or plugin methods acts on, with the
+    /// binding revision its caller read.
+    ///
+    /// They are read from the parameters, so the envelope's own selector can be compared with what
     /// the request actually does rather than trusted beside it.
-    fn params_application_instance(
+    fn params_application_target(
         method: Method,
         params: &ParamsValue,
-    ) -> Result<kr_protocol::ids::ApplicationInstanceId> {
-        Ok(match method {
+    ) -> Result<(
+        kr_protocol::ids::ApplicationInstanceId,
+        kr_protocol::ids::AgentBindingRevision,
+    )> {
+        let target = match method {
             Method::AgentPromptSubmit | Method::AgentPromptQueue => {
-                parse::<kr_protocol::agent::AgentPromptParams>(params)?
-                    .target
-                    .subject
-                    .application_instance_id
+                parse::<kr_protocol::agent::AgentPromptParams>(params)?.target
             }
-            Method::AgentTurnSteer => {
-                parse::<kr_protocol::agent::AgentSteerParams>(params)?
-                    .target
-                    .subject
-                    .application_instance_id
-            }
+            Method::AgentTurnSteer => parse::<kr_protocol::agent::AgentSteerParams>(params)?.target,
             Method::AgentTurnCancel => {
-                parse::<kr_protocol::agent::AgentCancelParams>(params)?
-                    .target
-                    .subject
-                    .application_instance_id
+                parse::<kr_protocol::agent::AgentCancelParams>(params)?.target
             }
             Method::AgentApprovalRespond => {
-                parse::<kr_protocol::agent::AgentApprovalRespondParams>(params)?
-                    .target
-                    .subject
-                    .application_instance_id
+                parse::<kr_protocol::agent::AgentApprovalRespondParams>(params)?.target
             }
             Method::PluginActionInvoke => {
-                parse::<kr_protocol::agent::PluginActionInvokeParams>(params)?
-                    .target
-                    .subject
-                    .application_instance_id
+                parse::<kr_protocol::agent::PluginActionInvokeParams>(params)?.target
             }
             other => {
                 return Err(WorkerError::InvalidArgument(format!(
@@ -10762,7 +10782,11 @@ impl WorkerService {
                     other.as_str()
                 )));
             }
-        })
+        };
+        Ok((
+            target.subject.application_instance_id,
+            target.binding_revision,
+        ))
     }
 
     /// Refuses a plugin action whose declared class needs a right the caller's grant does not
