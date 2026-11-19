@@ -6464,7 +6464,7 @@ impl WorkerService {
 
     /// The same question as [`Self::check_local_dispatch`], asked by a pass that asks again: the
     /// gate's bound and its time ends are compared with the clocks and the floor as they stand,
-    /// and nothing is raised, owed or kept.
+    /// and nothing is raised or owed; the wall reading is noted, as every wall reading is.
     fn check_local_standing(
         &self,
         facts: &ConnectionFacts,

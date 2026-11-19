@@ -32,7 +32,7 @@ mod scan;
 /// The names of the calls that change state which others read, as the design lists them: a note
 /// of a fault, a send, a map or set insert or remove, an atomic store, an execute, the expiry
 /// sweep, the clock floor's raise and the owed record, the second raise and the full check of the
-/// local owner (which raises and owes), the kept reading and the two functions that make it, a
+/// local owner (which raises and owes), the kept reading and the three functions that make it, a
 /// wake-up and a permit or token taken, and a `&mut` parameter, which counts as a write that its
 /// function may make. A name that ends in `*` is a prefix.
 const WRITES: &[&str] = &[
@@ -52,6 +52,7 @@ const WRITES: &[&str] = &[
     "check_utc_deadline",
     "publish",
     "wall_reading",
+    "read_unbracketed",
     "proven_wall_ms",
     "keep",
     "notify*",
@@ -144,12 +145,25 @@ fn the_proven_reading_planted_in_the_pure_proven_reader_is_reported() {
 fn the_kept_reading_planted_in_the_pure_wall_reader_is_reported() {
     let found = planted(
         TIME,
-        "        self.wall.now_ms().get()\n    }",
-        "        let _kept = self.wall_reading();\n        self.wall.now_ms().get()\n    }",
+        "    pub fn pure_wall_ms(&self) -> u64 {\n        self.read_unbracketed()",
+        "    pub fn pure_wall_ms(&self) -> u64 {\n        let _kept = self.wall_reading();\n        self.read_unbracketed()",
     );
     only_finding(
         &found,
         "action/time.rs pure_wall_ms calls wall_reading 1 time(s)",
+    );
+}
+
+#[test]
+fn a_second_note_of_a_reading_planted_in_the_pure_proven_reader_is_reported() {
+    let found = planted(
+        TIME,
+        "        let state = self.lock();\n        let now = self.pure_wall_ms();",
+        "        let state = self.lock();\n        let _noted = self.read_unbracketed();\n        let now = self.pure_wall_ms();",
+    );
+    only_finding(
+        &found,
+        "action/time.rs pure_proven_ms calls read_unbracketed 1 time(s)",
     );
 }
 

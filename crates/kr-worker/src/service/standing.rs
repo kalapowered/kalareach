@@ -26,7 +26,8 @@
 //! raises the host's clock floor, owes its record and keeps the readings), the session's take for
 //! the envelope, and the note of a journal that could not answer the limits' reads, which the
 //! limits hand back and the first admission makes. A piece reads the clock only through the pure
-//! readers of the time contract.
+//! readers of the time contract, which raise no floor and move no mark or checkpoint, and note
+//! the wall reading in the contract's readings as every wall reading is noted.
 //!
 //! # What a piece writes
 //!
@@ -40,6 +41,10 @@
 //!   broker's view of the journal's health first: a journal that has failed since the broker's
 //!   last decision fences the broker (`follow_health`, `fence`, which raises the volatile
 //!   state's fence);
+//! * `authority`, in the mode that asks again, reads the wall clock for a UTC end through the pure
+//!   readers, which note the reading in the time contract's readings (`read_unbracketed`, under
+//!   the readings' lock, which is taken after the contract's state lock), so that the owner's
+//!   confirmation of the clock is answered to by this reading too;
 //! * a journal that fails a read of the limits records the fault itself, inside the read
 //!   (`JournalHealth::note_fault`), in both modes; the subject's read of the ledger for a
 //!   resource that the broker has forgotten records a fault through the same note;

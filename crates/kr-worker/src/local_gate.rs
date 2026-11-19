@@ -219,8 +219,8 @@ impl LocalGate {
     }
 
     /// Whether a held method is allowed to a local caller now, decided as [`Self::check`] decides
-    /// it and with no side effect: the clocks and the host's floor are read and none is changed,
-    /// and nothing is owed to the daemon's record.
+    /// it and with no change of the floor or the record: the clocks and the floor are read, the
+    /// wall reading is noted as every wall reading is, and nothing is owed to the daemon.
     ///
     /// This is the comparison a pass that asks again makes. The full check stays with the first
     /// admission and with the writer, which raise the floor and lay the lease's end over the
