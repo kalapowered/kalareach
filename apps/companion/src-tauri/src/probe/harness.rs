@@ -432,7 +432,8 @@ async fn start<R: Runtime>(
             return None;
         }
     };
-    let digest = serde_json::from_value(prepared["prepared"].clone());
+    let digest =
+        serde_json::from_value::<kr_protocol::scalars::Digest256>(prepared["prepared"].clone());
     let Ok(digest) = digest else {
         checks.push(Check::found(
             "a call is prepared",
@@ -473,14 +474,14 @@ async fn start<R: Runtime>(
         app.state(),
         app.state(),
         Subject::default(),
-        crate::voice::CallProvider::Managed,
-        vec![session],
-        600,
-        None,
-        digest,
-        prepared["provider"]["managed"]["terms"]["rate"]["version"]
-            .as_str()
-            .map(str::to_owned),
+        json!({
+            "provider": "managed",
+            "session_ids": [session],
+            "duration_seconds": 600,
+            "reasoning_budget_minor": null,
+            "prepared": digest,
+            "expected_rate_version": prepared["provider"]["managed"]["terms"]["rate"]["version"],
+        }),
     )
     .await;
     watcher.abort();
