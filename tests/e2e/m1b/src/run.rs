@@ -1061,6 +1061,33 @@ pub struct RootPin {
 }
 
 /// Opens the directory at `path`, following no link at its last component.
+/// Makes the pipe `name` relative to `directory`, a handle that was checked, refusing a name that
+/// exists.
+#[cfg(not(target_os = "macos"))]
+fn make_fifo_in(directory: &std::os::fd::OwnedFd, name: &str) -> Result<(), String> {
+    rustix::fs::mkfifoat(directory, name, rustix::fs::Mode::from_raw_mode(0o600))
+        .map_err(|error| format!("the pipe {name} is not made: {error}"))
+}
+
+/// Makes the pipe `name` in the place of `directory`, a handle that was checked: macOS has no call
+/// that makes a pipe relative to a handle.
+#[cfg(target_os = "macos")]
+fn make_fifo_in(directory: &std::os::fd::OwnedFd, name: &str) -> Result<(), String> {
+    let place = current_place(directory)
+        .ok_or_else(|| "the system names no place for the directory".to_owned())?;
+    let made = std::process::Command::new("/usr/bin/mkfifo")
+        .arg(place.join(name))
+        .status()
+        .map_err(|error| format!("mkfifo does not start: {error}"))?;
+    if made.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the pipe {name} is not made: mkfifo ended with {made}"
+        ))
+    }
+}
+
 fn open_directory(path: &Path) -> rustix::io::Result<std::os::fd::OwnedFd> {
     use rustix::fs::{Mode, OFlags};
     rustix::fs::open(
@@ -1446,10 +1473,11 @@ impl PlacedDirectory {
     }
 
     /// Makes the named pipe `name` in the directory, and returns its device and inode as made. The
-    /// directory is the held handle's own place (the place of the handle that was checked, which
-    /// no link names, as for a program started in it), the name must not exist (the pipe is made
-    /// by a call that refuses an existing name), and what is at the name afterwards is looked at
-    /// through the handle with no link followed and must be a pipe.
+    /// pipe is made relative to the held handle that was checked (`mkfifoat`), the name must not
+    /// exist (the call refuses an existing name), and what is at the name afterwards is looked at
+    /// through the handle with no link followed and must be a pipe. On macOS, which has no call that
+    /// makes a pipe relative to a handle, `mkfifo` is given the handle's own place, which no link
+    /// names, and the object looked at afterwards is the check.
     ///
     /// # Errors
     ///
@@ -1457,17 +1485,7 @@ impl PlacedDirectory {
     pub fn make_fifo(&self, root: &Path, pin: &RootPin, name: &str) -> Result<(u64, u64), String> {
         let name = one_name(name)?;
         let handle = self.open(root, pin)?;
-        let place = current_place(&handle)
-            .ok_or_else(|| "the system names no place for the directory".to_owned())?;
-        let made = std::process::Command::new("/usr/bin/mkfifo")
-            .arg(place.join(&name))
-            .status()
-            .map_err(|error| format!("mkfifo does not start: {error}"))?;
-        if !made.success() {
-            return Err(format!(
-                "the pipe {name} is not made: mkfifo ended with {made}"
-            ));
-        }
+        make_fifo_in(&handle, &name)?;
         let stat = rustix::fs::statat(
             &handle,
             name.as_str(),
