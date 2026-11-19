@@ -241,8 +241,9 @@ impl Record {
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read or written, or when `bound_passed` fails: the
-    /// transaction is then rolled back and nothing is held.
+    /// Returns an error when the store cannot be read or written, when `bound_passed` fails, or when
+    /// the row that holds the device names an action that cannot be read: the transaction is then
+    /// rolled back and nothing is held.
     pub fn begin(
         &self,
         actor: ActorId,
@@ -270,10 +271,15 @@ impl Record {
             .map_err(ControllerError::registry)?;
         if let Some((standing_action, standing_asked, standing_ends)) = standing {
             let names_it = supersedes.is_some_and(|named| named.to_string() == standing_action);
-            if !names_it
-                && !bound_passed(moment(standing_ends), asked_ms)?
-                && let Ok(held) = standing_action.parse::<ActionId>()
-            {
+            if !names_it && !bound_passed(moment(standing_ends), asked_ms)? {
+                // A row whose action cannot be read is still a row: the device may be held by a
+                // start this process cannot name, so the start is refused, and the sweep ends the
+                // row at its end.
+                let held = standing_action.parse::<ActionId>().map_err(|_| {
+                    ControllerError::registry(
+                        "a standing start hold names an action that cannot be read",
+                    )
+                })?;
                 return Ok(Decision::Held(Row {
                     action: held,
                     asked_ms: moment(standing_asked),
@@ -532,6 +538,50 @@ mod tests {
             .expect("begin");
 
         assert_eq!(later, Decision::Admitted);
+    }
+
+    /// A row whose action cannot be read still holds the device: the start is refused as a store
+    /// failure and is never admitted over it, and the row goes at its end like any other.
+    #[test]
+    fn a_row_whose_action_cannot_be_read_refuses_the_start() {
+        let (_directory, record) = open();
+        record
+            .connection
+            .lock()
+            .expect("the connection")
+            .execute(
+                "INSERT INTO voice_start_holds (actor_id, action_id, asked_ms, ends_ms)
+                 VALUES (?1, 'not an action', 10, 100)",
+                params![actor(1).to_string()],
+            )
+            .expect("a row is written");
+
+        let refused = record.begin(actor(1), action(2), None, &|| (20, 200), &never, &|_| false);
+        assert!(
+            matches!(refused, Err(ControllerError::RegistryUnavailable { .. })),
+            "{refused:?}"
+        );
+        let count: i64 = record
+            .connection
+            .lock()
+            .expect("the connection")
+            .query_row("SELECT COUNT(*) FROM voice_start_holds", [], |row| {
+                row.get(0)
+            })
+            .expect("a count");
+        assert_eq!(count, 1, "the refused start wrote nothing");
+
+        let ended = record
+            .begin(
+                actor(1),
+                action(2),
+                None,
+                &|| (200, 300),
+                &|ends, _| Ok(ends <= 150),
+                &|_| false,
+            )
+            .expect("begin");
+        assert_eq!(ended, Decision::Admitted, "a row past its end is no hold");
     }
 
     /// The delete names the action: a row that another start wrote since stays.
