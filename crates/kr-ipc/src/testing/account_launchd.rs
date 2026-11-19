@@ -146,6 +146,36 @@ pub fn launchctl(arguments: &[&str]) -> std::io::Result<Output> {
     launchctl_at(Path::new(LAUNCHCTL), arguments)
 }
 
+/// What `launchctl print` says about the worker job in `domain` whose process is `pid`: the job is
+/// the one of the jobs the manager lists, labelled `kr-worker-..`, that `print` shows running that
+/// process.
+///
+/// Both commands read, so a run that did not ask may run them; no job is loaded or changed.
+///
+/// # Panics
+///
+/// Panics when `launchctl list` cannot be started.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn worker_job_of(domain: &str, pid: u64) -> Option<String> {
+    let listed = command(&["list"])
+        .output()
+        .expect("launchctl lists the jobs");
+    String::from_utf8_lossy(&listed.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(2))
+        .filter(|label| label.starts_with("kr-worker-"))
+        .find_map(|label| {
+            let printed = command(&["print", &format!("{domain}/{label}")])
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&printed.stdout).into_owned();
+            text.lines()
+                .any(|line| line.trim() == format!("pid = {pid}"))
+                .then_some(text)
+        })
+}
+
 /// Places a program named `launchctl` in `folder` that writes the file `ran` beside itself when it
 /// is run, and returns the program and that file's path.
 ///

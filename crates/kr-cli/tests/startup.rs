@@ -3760,6 +3760,52 @@ fn three_first_invocations_at_once_converge_on_the_one_daemon_the_service_manage
     }
 }
 
+/// KR-REQ-03.02, KR-REQ-07.12: the daemon launchd starts for a run that asked is asked itself: the
+/// service definition carries the run's asking, so that daemon supervises its workers as launchd
+/// jobs, where a daemon that was not asked chooses the detached process. The case stands down where
+/// the run did not ask.
+#[test]
+#[cfg(target_os = "macos")]
+fn the_daemon_launchd_starts_for_a_run_that_asked_supervises_its_workers_as_launchd_jobs() {
+    let Some(host) = ServiceHost::create() else {
+        return;
+    };
+    host.select_service();
+    let output = start(host.new_session()).finish("kr new");
+    let created = document(&output, "kr new");
+    assert!(
+        output.status.success(),
+        "{created}; it said {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let daemon = host
+        .daemon()
+        .expect("the service manager reports the daemon it started");
+    host.assert_started_by_the_manager(daemon);
+    let session_id: SessionId = created["session_id"]
+        .as_str()
+        .expect("a session identifier")
+        .parse()
+        .expect("parses");
+    let worker = kr_ipc::descriptor::read_all(&host.tree.environment())
+        .expect("reads the runtime directory")
+        .into_iter()
+        .filter_map(|entry| entry.descriptor.ok())
+        .find(|descriptor| descriptor.session_id == session_id)
+        .expect("the session's descriptor is published")
+        .process_start_identity
+        .pid
+        .get();
+    let domain = format!("user/{}", kr_ipc::paths::current_uid());
+    assert!(
+        kr_ipc::testing::account_launchd::worker_job_of(&domain, worker).is_some(),
+        "the daemon launchd started, for a run that asked, did not make worker {worker} a job in \
+         {domain}: it chose the detached supervisor, so the definition did not carry the run's \
+         asking"
+    );
+    host.close(&created);
+}
+
 /// KR-REQ-07.12, KR-REQ-26.04: the service start's definition and its record are what
 /// `kr host startup --set service` wrote, `kr doctor` reports the choice, its source and that the
 /// definition matches, and `--clear` removes the definition and its record without ending the

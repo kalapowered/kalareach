@@ -426,28 +426,6 @@ async fn new_attach_detach_and_close_work_in_full_and_in_one_letter() {
     }
 }
 
-/// Returns what `launchctl print` says about the job in `domain` whose process is `pid`.
-#[cfg(target_os = "macos")]
-fn launchd_job_of(domain: &str, pid: u64) -> Option<String> {
-    let listed = kr_ipc::testing::account_launchd::command(&["list"])
-        .output()
-        .expect("launchctl lists the jobs");
-    String::from_utf8_lossy(&listed.stdout)
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(2))
-        .filter(|label| label.starts_with("kr-worker-"))
-        .find_map(|label| {
-            let printed =
-                kr_ipc::testing::account_launchd::command(&["print", &format!("{domain}/{label}")])
-                    .output()
-                    .ok()?;
-            let text = String::from_utf8_lossy(&printed.stdout).into_owned();
-            text.lines()
-                .any(|line| line.trim() == format!("pid = {pid}"))
-                .then_some(text)
-        })
-}
-
 /// Reads one `name = value` field of a `launchctl print` description.
 #[cfg(target_os = "macos")]
 fn field(printed: &str, name: &str) -> String {
@@ -507,7 +485,7 @@ async fn a_worker_on_macos_is_a_per_user_launchd_job_in_its_own_directory() {
             .expect("parses");
         let pid = host.worker_of(session_id);
 
-        let printed = launchd_job_of(&domain, pid)
+        let printed = kr_ipc::testing::account_launchd::worker_job_of(&domain, pid)
             .unwrap_or_else(|| panic!("the {execution} worker {pid} is a job in {domain}"));
         // The graphical domain is followed by the login session it belongs to.
         assert_eq!(
