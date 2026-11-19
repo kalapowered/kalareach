@@ -1010,6 +1010,11 @@ impl HttpService {
     }
 }
 
+/// The stand-in proxy the suites of this crate share, included once for the cases of this module.
+#[cfg(test)]
+#[path = "../../tests/support/connect_proxy.rs"]
+mod connect_proxy;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,6 +1914,52 @@ mod tests {
             assert_eq!(answer.status, status);
             assert_eq!(answer.body, format!("{{\"status\":{status}}}").into_bytes());
         }
+    }
+
+    /// KR-REQ-10.02: a `407` that the service itself answers inside an open tunnel is the service's
+    /// answer and no word of the proxy's: the status comes back as it is, the login is written once
+    /// (to open the tunnel), and the verdict on the login stays clear.
+    #[tokio::test]
+    async fn a_407_from_the_origin_inside_a_tunnel_returns_the_status_and_sets_no_verdict() {
+        use super::connect_proxy::{ConnectProxy, Login};
+        let gateway = Gateway::start(Behaviour::Answer {
+            status: 407,
+            body: b"{}".to_vec(),
+        })
+        .await;
+        let proxy = ConnectProxy::authenticating("user", "pw-7f3c", "Basic realm=\"proxy\"").await;
+        let login = kr_transport::proxy::ProxyCredential::new(
+            kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+            kr_crypto::secret::SecretVec::new(b"pw-7f3c".to_vec()),
+        )
+        .expect("a login");
+        let through = proxy
+            .url
+            .parse::<ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let service = HttpService::build(
+            gateway.origin.clone(),
+            out_of_reach(),
+            ResponseLimits::default(),
+            Some(&through),
+            &[CertificateDer::from(gateway.root.clone())],
+        )
+        .expect("a transport");
+        let answer = service
+            .post_json(&gateway.url("/api/sync/exchange"), b"{}", &[])
+            .await
+            .expect("the origin's own 407 comes back as its answer");
+        assert_eq!(answer.status, 407);
+        assert_eq!(
+            proxy.logins(),
+            vec![Login::Right],
+            "one tunnel, opened with the login"
+        );
+        assert!(
+            login.stopped().is_none(),
+            "an origin's 407 is no word of the proxy's on the login"
+        );
     }
 
     #[tokio::test]

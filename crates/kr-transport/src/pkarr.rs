@@ -605,6 +605,125 @@ mod tests {
         );
     }
 
+    /// A request on a tunnel that is already open, and kept in the pool, is stopped once another
+    /// client has set the verdict: the origin counts no request after it, the proxy no further
+    /// connection, and a publication is stopped as a resolution is.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_login_stops_a_request_on_a_tunnel_that_is_already_open() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let authority = tls::Authority::new("a pkarr origin authority");
+        let acceptor = tokio_rustls::TlsAcceptor::from(authority.server_config("127.0.0.1"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let requests = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&requests);
+        let origin = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let counted = std::sync::Arc::clone(&counted);
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    // Every request the connection carries is counted and answered, and the
+                    // connection is kept open for the next.
+                    loop {
+                        let mut head = Vec::new();
+                        let mut chunk = [0_u8; 512];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            match stream.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => head.extend_from_slice(&chunk[..read]),
+                            }
+                        }
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        if stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let _stop = StopOnDrop(origin);
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let login = login("password");
+        let url = proxy
+            .url
+            .parse::<ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let builder = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .tls_backend_preconfigured(
+                (*tls::client_config(std::slice::from_ref(&authority.der))).clone(),
+            );
+        let client = proxy::proxied(builder, &url)
+            .expect("a proxy the library takes")
+            .build()
+            .expect("a client");
+        let address = format!("https://127.0.0.1:{port}/key");
+
+        // A resolution and a publication, one tunnel: the second request rides the first's.
+        let resolved = get(&client, &url, &address)
+            .await
+            .expect("the origin answers");
+        assert_eq!(resolved.status().as_u16(), 200);
+        let published = send(
+            &client,
+            Some(&url),
+            client.put(&address).build().expect("a request"),
+        )
+        .await
+        .expect("the origin answers");
+        assert_eq!(published.status().as_u16(), 200);
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            proxy.logins(),
+            vec![Login::Right],
+            "one tunnel carried both requests"
+        );
+
+        // Another client's refusal sets the verdict; the tunnel is still open.
+        login.refuse(StopKind::Refused);
+        let resolution = get(&client, &url, &address).await;
+        assert!(
+            matches!(
+                resolution,
+                Err(PkarrError::ProxyLogin(ProxyLoginKind::Refused))
+            ),
+            "the resolution is stopped before it leaves"
+        );
+        let publication = send(
+            &client,
+            Some(&url),
+            client.put(&address).build().expect("a request"),
+        )
+        .await;
+        assert!(
+            matches!(
+                publication,
+                Err(PkarrError::ProxyLogin(ProxyLoginKind::Refused))
+            ),
+            "the publication is stopped before it leaves"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "the open tunnel carried no request after the verdict"
+        );
+        assert_eq!(proxy.logins(), vec![Login::Right], "no further connection");
+    }
+
     /// A refusal the library cannot name, an `HTTP/1.0 407`, is a failed request that queues the
     /// target the failed hop named for the one re-check.
     ///

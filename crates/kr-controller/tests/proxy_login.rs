@@ -288,6 +288,76 @@ async fn the_watch_checks_once_for_each_suspicion_and_stops_at_the_verdict() {
     assert_eq!(refusing.logins(), vec![Login::Wrong]);
 }
 
+/// KR-REQ-10.02: a host whose document names nothing to test the proxy with still finds a proxy
+/// that refuses in `HTTP/1.0`: a request that failed the way such a refusal fails queues the
+/// address it went to, the watch checks that address once through the one writer, and the verdict
+/// is set by that check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_request_to_an_address_the_start_never_tested_is_rechecked_at_that_address() {
+    let (_held, failed) = target().await;
+    let proxy = ConnectProxy::authenticating_in_http10("user", "password", "Basic").await;
+    let wrong = credential("user", "wrong");
+    let through = proxy_at(&proxy, Some(wrong.clone()));
+    assert!(
+        start_target(&Started::default()).is_none(),
+        "the document names no address to test the proxy with"
+    );
+    let tls = proxy_tls(&[]).expect("verification");
+    let watch = Watch::start(
+        through.clone(),
+        tls.clone(),
+        Timing {
+            deadline: Duration::from_secs(5),
+            interval: Duration::from_millis(10),
+        },
+    )
+    .expect("a watch");
+
+    // A service request through the proxy fails the way an `HTTP/1.0 407` fails: the library has
+    // no word for it, and the request that failed names the address the watch checks.
+    let client = kr_transport::proxy::proxied(
+        reqwest::Client::builder()
+            .timeout(WATCHDOG)
+            .tls_backend_preconfigured((*tls).clone()),
+        &through,
+    )
+    .expect("a proxy the library takes")
+    .build()
+    .expect("a client");
+    let address: url::Url = format!("https://127.0.0.1:{}/key", failed.port)
+        .parse()
+        .expect("an address");
+    let error = client
+        .get(address.clone())
+        .send()
+        .await
+        .expect_err("the proxy refuses the tunnel");
+    assert!(
+        wrong.stopped().is_none(),
+        "the library read no refusal of the login in it"
+    );
+    kr_transport::proxy::note_failure(&through, &address, &error);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while wrong.stopped().is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok(),
+        "the watch's check set the verdict"
+    );
+    assert_eq!(wrong.stopped(), Some(StopKind::Refused));
+    assert_eq!(proxy.logins(), vec![Login::Wrong, Login::Wrong]);
+    let asked = proxy.asked();
+    let named = format!("CONNECT 127.0.0.1:{} ", failed.port);
+    assert!(
+        asked.len() == 2 && asked.iter().all(|line| line.starts_with(&named)),
+        "the request and the one re-check named the failed address: {asked:?}"
+    );
+    drop(watch);
+}
+
 /// The daemon of a case: the controller, started over the folders of a temporary host.
 async fn start_controller(
     host: &kr_ipc::testing::TempHost,
