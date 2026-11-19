@@ -776,7 +776,8 @@ jobs:
       #   - the directory secret store and the libsodium boundary (`kr-crypto`), the attention
       #     store (`kr-attention`) and the loopback listener of a sign-in (`kr-loopback`);
       #   - the repository boundary on its own, the change set's apply (`kr-changeset`'s `apply`)
-      #     and the filesystem authority (`kr-transfer`'s library and `authority`);
+      #     and the filesystem authority and the staged transfers over it (`kr-transfer`'s library
+      #     and its `authority`, `uploads` and `downloads` suites);
       #   - how a session's closure reaches its attachments, `kr-worker`'s `closure`: a shell that
       #     exits, one ended from outside, and a close that is ignored until the five seconds are
       #     over;
@@ -1432,6 +1433,22 @@ jobs:
       - name: Test filesystem authority and access-control lists
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-transfer --lib --test authority -- --nocapture
+
+      # The transfer service's two staged paths over that authority on this platform: an upload
+      # (begin, chunks, finish and its resume, then the published file) and a download (a snapshot
+      # of a source, released into the destination the user chose). Three cases are Windows-only:
+      # they hold a payload or a destination that another program holds without sharing its
+      # deletion, as a scanner holds a file it reads. Four cases are Unix-only and absent here.
+      # Two renumber the device a recorded directory is found on, which no volume here can show: a
+      # volume keeps its serial wherever it is mounted, and its device number is the low half of
+      # that serial. One makes the staging area unwritable by its mode, which a file here has not
+      # got. One makes a payload that cannot be removed by putting a directory with a file in it
+      # under the payload's name, which an unlink refuses. The upload cases check a published
+      # file's mode on Unix only. `--nocapture` prints each case's own output, as the steps above
+      # do.
+      - name: Test uploads and downloads
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-transfer --test uploads --test downloads -- --nocapture
 
       # A collection key belongs in the operating system's own credential store, and on this system
       # that is the Credential Manager, which this runner's account already has. The one test that
