@@ -263,7 +263,7 @@ pub(super) async fn held_before_its_claim(
 
 /// A provider that answers without a network call.
 #[derive(Debug)]
-struct OfflineProvider;
+pub(super) struct OfflineProvider;
 
 impl VoiceProviderService for OfflineProvider {
     fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
@@ -496,9 +496,29 @@ pub(super) async fn call_over_for(
     actions: &[VoiceAction],
     duration_seconds: u32,
 ) -> VoiceSessionId {
-    controller.voice().attach_provider(Some(
-        Arc::new(OfflineProvider) as Arc<dyn VoiceProviderService>
-    ));
+    call_over_on(
+        controller,
+        Arc::new(OfflineProvider),
+        device_id,
+        session_id,
+        actions,
+        duration_seconds,
+        9,
+    )
+    .await
+}
+
+/// The same, on the provider `provider`, for the start `action_byte` names.
+pub(super) async fn call_over_on(
+    controller: &Arc<Controller>,
+    provider: Arc<dyn VoiceProviderService>,
+    device_id: kr_protocol::ids::DeviceId,
+    session_id: SessionId,
+    actions: &[VoiceAction],
+    duration_seconds: u32,
+    action_byte: u8,
+) -> VoiceSessionId {
+    controller.voice().attach_provider(Some(provider));
     let coordinator = controller.voice().coordinator();
     let revision = controller.policy().authority_revision();
     let now = kr_ipc::now_ms().get();
@@ -529,7 +549,9 @@ pub(super) async fn call_over_for(
     let started = coordinator
         .start(
             device_id,
-            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [action_byte; 16],
+            )),
             &VoiceStartParams {
                 session_ids: [session_id].into_iter().collect(),
                 offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),

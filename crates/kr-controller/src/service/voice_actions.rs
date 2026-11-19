@@ -785,7 +785,9 @@ impl Controller {
         // came to under it, and a retry after a dropped connection is answered from that record.
         // So does a change of the voice grant that waits for the workers before it answers: the
         // grant is revoked once it has committed, and the answer is owed under the claim whether
-        // or not the link it was asked on is still there to carry it.
+        // or not the link it was asked on is still there to carry it. So does a start, managed or
+        // on the owner's own key: the call it creates at the service is an effect that a dropped
+        // link must not leave unaccounted for, and the start carries it to its end.
         if matches!(
             method,
             Method::VoiceStart
@@ -1308,36 +1310,224 @@ fn answer_keeps_nothing(method: Method, outcome: &Result<ParamsValue>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    /// The body of the account's callback, cut out of the source text.
-    fn callback_body(source: &str) -> &str {
-        let start = source
-            .find("fn end_those_that_are_over")
-            .expect("the callback is in the source");
-        let rest = &source[start..];
-        let end = rest.find("\n    }\n}").unwrap_or(rest.len());
-        &rest[..end]
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kr_client::services::ServiceFuture;
+    use kr_client::services::voice::{
+        VoiceClosure, VoiceProviderService, VoiceProviderTerms, VoiceSessionRequest, VoiceStart,
+    };
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::voice::VoiceAction;
+
+    use crate::service::a_delegation_that_is_asked_again::{OfflineProvider, call_over_on};
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{Scripted, scripted};
+    use crate::service::a_voice_grant_on_the_floor::paired_holding;
+
+    /// A provider whose service says every call is over, that counts the closures it is told of,
+    /// and that is bound to the account or spends the owner's own key.
+    #[derive(Debug)]
+    struct Shut {
+        account: bool,
+        closed: AtomicUsize,
     }
 
-    /// Whether a callback body sweeps the calls bound to the account alone.
-    fn sweeps_the_account_alone(body: &str) -> bool {
-        body.contains(".end_account_calls_that_are_over(")
-            && !body.contains(".end_calls_that_are_over(")
+    impl Shut {
+        fn new(account: bool) -> Arc<Self> {
+            Arc::new(Self {
+                account,
+                closed: AtomicUsize::new(0),
+            })
+        }
+
+        fn closed(&self) -> usize {
+            self.closed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl VoiceProviderService for Shut {
+        fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
+            OfflineProvider.terms()
+        }
+
+        fn account_bound(&self) -> bool {
+            self.account
+        }
+
+        fn spends_the_owners_key(&self) -> bool {
+            !self.account
+        }
+
+        fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn provider(&self) -> String {
+            format!("the shut provider, account {}", self.account)
+        }
+
+        fn begin<'a>(
+            &'a self,
+            request: &'a VoiceSessionRequest,
+        ) -> ServiceFuture<'a, kr_client::services::StartAttempt> {
+            OfflineProvider.begin(request)
+        }
+
+        fn abandon<'a>(
+            &'a self,
+            attempt: kr_client::services::StartAttempt,
+        ) -> ServiceFuture<'a, ()> {
+            OfflineProvider.abandon(attempt)
+        }
+
+        fn dispatch<'a>(
+            &'a self,
+            attempt: kr_client::services::StartAttempt,
+            request: &'a VoiceSessionRequest,
+        ) -> ServiceFuture<'a, VoiceStart> {
+            OfflineProvider.dispatch(attempt, request)
+        }
+
+        fn close<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, VoiceClosure> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+            OfflineProvider.close(call_id)
+        }
+    }
+
+    /// The live voice grants a device holds in the host's own store.
+    fn live_voice_grants(
+        controller: &crate::service::Controller,
+        device: kr_protocol::ids::DeviceId,
+    ) -> usize {
+        controller
+            .sharing()
+            .grants()
+            .records_for_device(device)
+            .expect("the store answers")
+            .into_iter()
+            .filter(|record| record.is_active() && record.revoked_at_ms.is_none())
+            .filter(|record| record.grant.permits(ActionRight::VoiceUse))
+            .count()
     }
 
     /// The account's callback ends the calls bound to the account and no other: a call on the
-    /// owner's own key is the voice tick's. The callback needs a running daemon for its clock and a
-    /// coordinator holding two kinds of call, which no library case builds, so the wiring is held by
-    /// its text, with a plant of each wrong form; the coordinator's own case proves the filter.
-    #[test]
-    fn the_account_callback_sweeps_the_calls_bound_to_the_account_alone() {
-        assert!(sweeps_the_account_alone(callback_body(include_str!(
-            "voice_actions.rs"
-        ))));
-        assert!(!sweeps_the_account_alone(
-            "fn end_those_that_are_over() { module.coordinator().end_calls_that_are_over(now) }"
-        ));
-        assert!(!sweeps_the_account_alone(
-            "fn end_those_that_are_over() { c.end_account_calls_that_are_over(a); c.end_calls_that_are_over(b) }"
-        ));
+    /// owner's own key is the voice tick's, so the callback leaves it standing when the service
+    /// says it is over, and the general sweep then ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_account_callback_ends_the_calls_bound_to_the_account_and_leaves_one_on_the_owners_key()
+     {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        let controller = Arc::clone(&world.controller);
+        let managed = Shut::new(true);
+        let own = Shut::new(false);
+        let managed_device = paired_holding(&controller, 61, &[ActionRight::SessionView], None);
+        let own_device = paired_holding(
+            &controller,
+            62,
+            &[ActionRight::SessionView, ActionRight::HostManage],
+            None,
+        );
+        let actions = [VoiceAction::Status];
+        let _ = call_over_on(
+            &controller,
+            managed.clone(),
+            managed_device.device_id,
+            world.session_id,
+            &actions,
+            600,
+            61,
+        )
+        .await;
+        let _ = call_over_on(
+            &controller,
+            own.clone(),
+            own_device.device_id,
+            world.session_id,
+            &actions,
+            600,
+            62,
+        )
+        .await;
+        let coordinator = controller.voice().coordinator();
+        assert_eq!(coordinator.live_sessions(), 2);
+        let managed_grants = live_voice_grants(&controller, managed_device.device_id);
+        let own_grants = live_voice_grants(&controller, own_device.device_id);
+        assert!(managed_grants > 0 && own_grants > 0);
+
+        let callback = super::VoiceCalls {
+            module: Arc::downgrade(controller.voice()),
+            daemon: Arc::downgrade(&controller),
+        };
+        crate::account::Calls::end_those_that_are_over(&callback).await;
+        assert_eq!(
+            coordinator.live_sessions(),
+            1,
+            "the call on the owner's own key stands"
+        );
+        assert_eq!(managed.closed(), 1, "the account's call ended");
+        assert_eq!(own.closed(), 0, "the own-key call was not closed");
+        assert_eq!(
+            live_voice_grants(&controller, managed_device.device_id),
+            0,
+            "the account call's grant is revoked"
+        );
+        assert_eq!(
+            live_voice_grants(&controller, own_device.device_id),
+            own_grants,
+            "the own-key call keeps its grant"
+        );
+
+        coordinator
+            .end_calls_that_are_over(controller.settled_now_ms())
+            .await;
+        assert_eq!(coordinator.live_sessions(), 0);
+        assert_eq!(own.closed(), 1, "the general sweep ends the own-key call");
+    }
+
+    /// A call on the owner's own key that the provider closed, with no host call registered for
+    /// it, still needs the voice tick, and one pass of the tick ends it in the coordinator with its
+    /// grant revoked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_tick_ends_an_own_key_call_the_provider_closed_though_no_host_call_is_left() {
+        let script = Scripted::new();
+        let world = scripted(&script).await;
+        let controller = Arc::clone(&world.controller);
+        let own = Shut::new(false);
+        let device = paired_holding(
+            &controller,
+            63,
+            &[ActionRight::SessionView, ActionRight::HostManage],
+            None,
+        );
+        let _ = call_over_on(
+            &controller,
+            own.clone(),
+            device.device_id,
+            world.session_id,
+            &[VoiceAction::Status],
+            600,
+            63,
+        )
+        .await;
+        let module = controller.voice();
+        let coordinator = module.coordinator();
+        assert!(module.host_calls().is_empty());
+        assert_eq!(coordinator.live_sessions(), 1);
+        assert!(live_voice_grants(&controller, device.device_id) > 0);
+        assert!(
+            module.needs_tick(),
+            "a call the coordinator holds on the owner's own key needs the tick"
+        );
+
+        module.tick(controller.settled_now_ms()).await;
+        assert_eq!(coordinator.live_sessions(), 0);
+        assert_eq!(own.closed(), 1);
+        assert_eq!(
+            live_voice_grants(&controller, device.device_id),
+            0,
+            "the call's grant is revoked"
+        );
+        assert!(!module.needs_tick(), "nothing is left to watch");
     }
 }
