@@ -9744,3 +9744,55 @@ async fn a_managed_sentence_over_500_bytes_is_refused_before_the_socket_and_the_
     hang_up(&scene);
     scene.stop_host().await;
 }
+
+/// The host's deadline reached before this phone's own timer for it: the host's sweep runs at a time
+/// past the call's closing time, while the phone's timer has most of the call's length still to run.
+/// The host's news of the deadline closes the media, and the end shown is the host's own, with
+/// nothing owed to the host and nothing left to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_news_of_its_deadline_ends_an_own_key_call_before_the_phones_own_timer() {
+    let mut scene = own_scene(own_timings()).await;
+    let prepared = scene.prepared().await;
+    let mut request = scene.own_start_request(&prepared);
+    request["durationSeconds"] = json!(100);
+    let answer = scene.call("voice_start", request);
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    assert_eq!(scene.platform.count("stop"), 0, "the call is running");
+
+    // The host reads its clock as one second past the closing time, which is less than the host
+    // waits for a phone that is absent: the call is over by its deadline and by nothing else.
+    let voice = scene.host().controller().voice();
+    voice.tick(now_ms() + 101_000).await;
+
+    let ended = scene
+        .state_where("the end the host's news brings", |state| {
+            state["ended"]["cause"] == "deadline"
+        })
+        .await;
+    assert_eq!(
+        ended["ended"]["words"], "The call reached its time limit.",
+        "{ended}"
+    );
+    assert_eq!(
+        ended["ended"]["host"]["kind"], "not_held",
+        "the host ended the call: {ended}"
+    );
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    assert!(
+        scene.platform.count("stop") >= 1,
+        "the host's news closes the media: {ended}"
+    );
+    let kinds = owed_kinds_of(&ended);
+    assert!(
+        !kinds.contains(&"host_close".to_owned())
+            && !kinds.contains(&"revocation".to_owned())
+            && !kinds.contains(&"service_close".to_owned()),
+        "nothing is owed or left to the host: {kinds:?}"
+    );
+    scene.stop_host().await;
+}
