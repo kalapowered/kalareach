@@ -2310,7 +2310,8 @@ mod tests {
     /// held at the gate the endpoint is open, the front still serves and a tunnel through it still
     /// carries bytes; after the release, at the first instant the end reads complete, the endpoint
     /// is closed, the tunnel's task is gone (its far end reads the end of the stream) and a connect
-    /// to the front's port is refused by the system, and the steps ran in order.
+    /// to the front's port is refused by the system, and the steps ran in order. The endpoint
+    /// dials nothing through the front, so the one tunnel the opener gives is the case's.
     #[tokio::test]
     async fn the_closer_ends_the_front_after_iroh_closes() {
         use futures::FutureExt as _;
@@ -2322,21 +2323,26 @@ mod tests {
             kr_crypto::secret::SecretVec::new(b"password".to_vec()),
         )
         .expect("a login");
-        let proxy: crate::config::ProxyUrl = "https://proxy.example:3128".parse().expect("a proxy");
         let (ends_in, mut ends) = tokio::sync::mpsc::unbounded_channel();
         let opener = std::sync::Arc::new(OneTunnel {
             armed: std::sync::atomic::AtomicBool::new(false),
             ends: ends_in,
         });
-        let config = EndpointConfig {
-            relay_urls: vec!["https://relay.example./".parse().expect("a relay")],
-            proxy_url: Some(proxy.with_login(login)),
-            login_front: Some(crate::front::FrontOpener(opener.clone())),
-            ..EndpointConfig::default()
-        };
-        let (endpoint, closer) = bind_network(&config, &identity)
+        // The real endpoint is bound with no relay and no proxy, so nothing but this case dials the
+        // front, and its one tunnel is the case's own. The front is started apart, and the closer
+        // joins the two.
+        let endpoint = bind_listener(&EndpointConfig::default(), &identity)
             .await
-            .expect("a network endpoint");
+            .expect("an endpoint");
+        let relays = iroh::RelayMap::from(
+            "https://relay.example./"
+                .parse::<iroh::RelayUrl>()
+                .expect("a relay"),
+        );
+        let front = crate::front::RelayFront::start(opener.clone(), relays, login.verdict())
+            .await
+            .expect("a front");
+        let closer = EndpointCloser::new(endpoint.clone(), Some(front));
         let gate = std::sync::Arc::new(tokio::sync::Notify::new());
         let entered = std::sync::Arc::new(tokio::sync::Notify::new());
         let closer = closer.with_gate({
