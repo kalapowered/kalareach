@@ -65,6 +65,22 @@ pub fn did_not_run(test: &str, why: &str) {
     println!("skipped: {test} did not run: {why}");
 }
 
+/// Set to `1` by the run that holds the weights, which is the build box's workspace step: there a
+/// case that needs the weights and cannot find them fails, as it would on a host that is promised
+/// them, and does not stand down as it does everywhere else.
+pub const REQUIRE_WEIGHTS: &str = "KR_REQUIRE_DESCRIBE_WEIGHTS";
+
+/// Says that `test` did not run for want of the weights, or fails it where [`REQUIRE_WEIGHTS`]
+/// says the weights are promised.
+fn weights_are_missing(test: &str, why: &str) {
+    let required = std::env::var(REQUIRE_WEIGHTS).is_ok_and(|value| value == "1");
+    assert!(
+        !required,
+        "{REQUIRE_WEIGHTS}=1 and {test} could not run: {why}"
+    );
+    did_not_run(test, why);
+}
+
 /// The selected profile and where this host keeps its weights.
 pub struct Weights {
     /// The profile every real-weights test runs against.
@@ -73,7 +89,8 @@ pub struct Weights {
     pub path: PathBuf,
 }
 
-/// Finds the selected profile's weights in the cache, or says that `test` did not run.
+/// Finds the selected profile's weights in the cache, or says that `test` did not run, or fails it
+/// where [`REQUIRE_WEIGHTS`] says they are promised.
 pub fn weights(test: &str) -> Option<Weights> {
     let profile = Catalogue::builtin()
         .expect("this build's profiles")
@@ -86,11 +103,11 @@ pub fn weights(test: &str) -> Option<Weights> {
         .expect("the profile names its weights")
         .clone();
     let Some(path) = cache_directory().map(|cache| cache.join(&asset.file_name)) else {
-        did_not_run(test, "this host has no home directory");
+        weights_are_missing(test, "this host has no home directory");
         return None;
     };
     if std::fs::metadata(&path).map(|about| about.len()).ok() != Some(asset.bytes) {
-        did_not_run(test, &format!("{} is not on this host", path.display()));
+        weights_are_missing(test, &format!("{} is not on this host", path.display()));
         return None;
     }
     Some(Weights { profile, path })

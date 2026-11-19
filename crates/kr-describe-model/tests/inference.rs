@@ -778,6 +778,7 @@ fn a_case_that_needs_weights_this_host_lacks_says_so_on_a_line_of_its_own() {
         .args(["--exact", CASE, "--show-output", "--test-threads=1"])
         .env("KR_DESCRIBE_MODEL_CACHE", empty_cache.path())
         .env_remove("RUST_TEST_NOCAPTURE")
+        .env_remove(support::REQUIRE_WEIGHTS)
         .output()
         .expect("this test program runs again");
     let shown = String::from_utf8_lossy(&ran.stdout);
@@ -792,6 +793,35 @@ fn a_case_that_needs_weights_this_host_lacks_says_so_on_a_line_of_its_own() {
     assert!(
         first.starts_with("skipped:") && first.contains(CASE),
         "the first line of {CASE}'s output is {first:?}:\n{shown}"
+    );
+}
+
+/// A case that needs the weights, on a host without them where the run says they are promised,
+/// fails and names the variable that promised them. This program is run again for one case, with
+/// an empty cache and the variable set, as the build box's workspace step sets it.
+#[test]
+fn a_case_that_needs_weights_fails_where_the_run_says_they_are_there() {
+    const CASE: &str = "the_real_model_stops_a_job_it_is_told_to_cancel";
+    let empty_cache = tempfile::tempdir().expect("an empty cache directory");
+    let ran = Command::new(std::env::current_exe().expect("this test program"))
+        .args(["--exact", CASE, "--show-output", "--test-threads=1"])
+        .env("KR_DESCRIBE_MODEL_CACHE", empty_cache.path())
+        .env(support::REQUIRE_WEIGHTS, "1")
+        .env_remove("RUST_TEST_NOCAPTURE")
+        .output()
+        .expect("this test program runs again");
+    let shown = String::from_utf8_lossy(&ran.stdout);
+    assert!(
+        !ran.status.success(),
+        "{CASE} passed with no weights where {} is set:\n{shown}",
+        support::REQUIRE_WEIGHTS
+    );
+    assert!(
+        shown.contains(&format!(
+            "{}=1 and {CASE} could not run",
+            support::REQUIRE_WEIGHTS
+        )),
+        "the failure names the variable and the case:\n{shown}"
     );
 }
 
