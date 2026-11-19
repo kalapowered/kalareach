@@ -171,6 +171,29 @@ describe('the lines that stay beside the requests', () => {
   })
 })
 
+describe('a typed upstream that took an answer and left its outcome unknown', () => {
+  it('keeps the host’s own words in the danger tone, lets go of nothing and keeps no line', async () => {
+    const { port, controls } = fakeHost()
+    controls.leaveNextApprovalUnconfirmed()
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+        <App />
+      </AppProvider>
+    )
+    await allow()
+    // Either words stand in the same place, so the wait ends the same way whatever the page says.
+    const words = await screen.findByText(
+      /could not confirm what became of that|does not confirm answers/
+    )
+    expect(words).toHaveTextContent('The host could not confirm what became of that.')
+    expect(words.closest('.toast')?.querySelector('.danger-text')).not.toBeNull()
+    await settle()
+    expect(controls.releasedActions).toHaveLength(0)
+    expect(controls.releaseAttempts).toBe(0)
+    expect(screen.queryByTestId('approval-unconfirmed')).toBeNull()
+  })
+})
+
 describe('an unknown outcome that is not a channel end', () => {
   const unknown = { receipt: null, value: null, action_id: 'action-1', answer_lost: false }
 

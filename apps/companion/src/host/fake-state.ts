@@ -912,7 +912,7 @@ export class ScriptedRecords {
     return settled
   }
 
-  respond(params: unknown): Settled<AgentApprovalRespondResult> {
+  respond(params: unknown, unconfirmed = false): Settled<AgentApprovalRespondResult> {
     const read = decodeParams<AgentApprovalRespondParams>(params, AGENT_RESPOND_PARAMS)
     const agent = this.#subjectAgent(read.target.subject)
     // The broker checks the resource before anything else about the answer: whose it is, that it
@@ -950,6 +950,20 @@ export class ScriptedRecords {
       const action = idOf('c4c4c4c4', ++this.#answers)
       if (!lost && !unrecorded) this.#channelReceipts.add(action)
       return { receipt: null, value: null, action_id: action, answer_lost: lost }
+    }
+    if (unconfirmed) {
+      // A typed upstream took the answer and the host cannot tell what became of it: the request is
+      // held as uncertain, and the host's word is the same one a channel's is, from another package.
+      agent.resources = agent.resources.map((each) =>
+        each.resource_id === read.resource_id ? { ...each, state: 'uncertain' } : each
+      )
+      this.#attention = this.#attention.filter((item) => item.rule !== 'attention.pending_approval')
+      return {
+        receipt: null,
+        value: null,
+        action_id: idOf('c4c4c4c4', ++this.#answers),
+        answer_lost: false
+      }
     }
     const mutation = this.#performed(agent).value
     if (mutation === null) refuse('RESOURCE_UNAVAILABLE', 'the answer was not recorded')
