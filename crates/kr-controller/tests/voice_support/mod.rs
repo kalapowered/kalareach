@@ -118,6 +118,9 @@ struct State {
     phone_close_gate: Arc<Gate>,
     /// Whether the service is down: every connection is ended as it is accepted.
     down: bool,
+    /// Whether a creation is read and counted, and its answer is lost on the way back: the
+    /// gateway in front of the service answers 504.
+    losing_creation_answers: bool,
 }
 
 /// What the service does to a close it has been told to fail.
@@ -222,6 +225,7 @@ impl StandIn {
             phone_closes: 0,
             phone_close_gate: Arc::default(),
             down: false,
+            losing_creation_answers: false,
         }));
         let task = accepting(listener, Arc::clone(&route), Arc::clone(&state));
         Self {
@@ -284,6 +288,16 @@ impl StandIn {
     pub fn hold_creations(&self) {
         let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").creation);
         gate.hold();
+    }
+
+    /// Makes the answer to every creation lost, as a gateway in front of the service loses it: the
+    /// request is read and counted, and a 504 with nothing the host can read comes back. Or stops
+    /// that.
+    pub fn lose_creation_answers(&self, lost: bool) {
+        self.state
+            .lock()
+            .expect("the stand-in's state")
+            .losing_creation_answers = lost;
     }
 
     /// Lets the held creations be answered.
@@ -749,6 +763,15 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
     };
     if let Some(gate) = gate {
         gate.pass().await;
+    }
+    if path == "/api/voice/sessions"
+        && state
+            .lock()
+            .expect("the stand-in's state")
+            .losing_creation_answers
+    {
+        let _ = stream.write_all(&response(504, b"")).await;
+        return;
     }
     if path.ends_with("/close")
         && state

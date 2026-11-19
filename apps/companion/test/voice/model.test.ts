@@ -19,7 +19,9 @@ import {
   controlAvailable,
   endedWords,
   needsHost,
+  nextLapseOf,
   owedWords,
+  startNoticeOf,
   rateWords,
   requestedSeconds,
   runningCallFrom,
@@ -405,6 +407,31 @@ describe('what is owed', () => {
       host_name: "Ric's Mac"
     })
     expect(words).toBe("The host never said whether it created the call. It was asked of Ric's Mac.")
+  })
+
+  // A notice of a start has no time lapse: the screen does not wait for it, and a start kept
+  // hidden is not a notice at all.
+  it('waits for the lapse of a grant and never for a notice of a start', () => {
+    const entry = (kind: string, action_id: string | null, until_ms: number) => ({
+      kind,
+      words: 'words',
+      action_id,
+      voice_session_id: null,
+      until_ms,
+      host_reference: 'ref-1',
+      host_name: "Ric's Mac"
+    })
+    const unknown = entry('start_unknown', 'a-1', 5)
+    const unconfirmed = entry('start_unconfirmed', 'a-2', 6)
+    const revocation = entry('revocation', null, 4_000)
+    const kept = entry('start_kept', 'a-3', 7)
+
+    expect(startNoticeOf(unknown)).toBe('a-1')
+    expect(startNoticeOf(unconfirmed)).toBe('a-2')
+    expect(startNoticeOf(kept)).toBeNull()
+    expect(startNoticeOf(revocation)).toBeNull()
+    expect(nextLapseOf([unknown, unconfirmed])).toBeNull()
+    expect(nextLapseOf([unknown, revocation, entry('revocation', null, 9_000)])).toBe(4_000)
   })
 })
 

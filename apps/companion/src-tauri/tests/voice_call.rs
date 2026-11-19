@@ -4721,12 +4721,12 @@ async fn a_start_the_host_declines_is_not_owed_while_the_media_stops() {
     scene.stop_host().await;
 }
 
-/// A call started while the file of what a call left owed cannot be read still stands on its
-/// entry: the entry is kept in memory, nothing is written over the file meanwhile, and the file is
-/// written the first time it can be read, with nothing else having changed.
+/// A start whose record cannot be saved is refused before the host is asked, because a start that
+/// left no record cannot be named later: the file that cannot be read is not written over, nothing is
+/// owed, and the first start after it can be read goes on as any other.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_call_started_while_the_record_cannot_be_read_stands_in_it_once_it_can() {
+async fn a_start_whose_record_cannot_be_saved_is_refused_before_the_host_is_asked() {
     let mut scene = scene().await;
     let prepared = scene.prepared().await;
     let directory = scene.phone.data.path().join("relaunch-standing-locked");
@@ -4734,10 +4734,6 @@ async fn a_call_started_while_the_record_cannot_be_read_stands_in_it_once_it_can
         .write(&companion_tauri::voice::KeptVoice::default())
         .expect("the file is written");
     lock_the_kept_file(&directory);
-    // The scene's native code, so that a step of the start can be held: the control is opened
-    // after native code accepts the answer, so no attach changes the note meanwhile.
-    scene.platform.hold("accept");
-    let _holding = scene.platform.release_when_done("accept");
     let calls = Arc::new(calls_on_phone(
         Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
@@ -4747,48 +4743,157 @@ async fn a_call_started_while_the_record_cannot_be_read_stands_in_it_once_it_can
     let reach = Arc::new(companion_tauri::voice::AppReach::new(
         scene.phone.companion.app.handle().clone(),
     ));
-    let starting = tokio::spawn({
-        let calls = Arc::clone(&calls);
-        let tokens = Arc::clone(&scene.tokens);
-        let request = request_of(&scene, &prepared);
-        async move {
-            calls
-                .start(
-                    request,
-                    reach as Arc<dyn companion_tauri::voice::HostReach>,
-                    tokens,
-                )
-                .await
-        }
-    });
-    tokio::time::timeout(WATCHDOG, async {
-        while scene.platform.count("accept") == 0 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("the owner applied the host's answer");
-
-    // The unlock: the first use of the record reads the file and writes what the call stands on.
-    unlock_the_kept_file(&directory);
-    assert!(calls.state(None).owed.is_empty(), "the call runs");
-    let file = kept_file_where(&directory, |file| {
-        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
-    })
-    .await;
-    assert_eq!(file["owed"][0]["kind"], "revocation", "{file}");
-
-    scene.platform.release("accept");
-    starting
+    let Err(refused) = calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
         .await
-        .expect("the start ran")
-        .expect("the call started");
+    else {
+        panic!("a start that cannot be recorded is refused");
+    };
+    assert!(
+        refused.message.starts_with(
+            "Nothing was sent. This device could not save a record of this start, so it did not ask \
+             the host."
+        ),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        scene.stand_in.count("/api/voice/sessions"),
+        0,
+        "the host was not asked for a call"
+    );
+    assert!(calls.state(None).owed.is_empty(), "nothing is owed");
+
+    // The unlock: what stood where the file was is still the link, and the next start is sent.
+    unlock_the_kept_file(&directory);
+    calls
+        .start(
+            request_of(&scene, &prepared),
+            reach as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("the call started once the record could be saved");
     let _ = calls
         .stop(
             None,
             &companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone()),
         )
         .await;
+    scene.stop_host().await;
+}
+
+/// KR-REQ-23.24: a start whose answer the host lost leaves its creation unknown, which the device
+/// keeps as a notice with no time lapse; a later start the host holds is refused in the host's
+/// words, the refusal offers "Start again" for the kept start, and the start that passes the hold
+/// closes the notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_that_names_the_kept_start_offers_start_again_and_a_pass_closes_the_notice() {
+    let mut scene = scene_with(quick(), Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.lose_creation_answers(true);
+    let first = scene.start().await;
+    assert!(
+        first["value"]["outcome"]["creation_unknown"].is_object(),
+        "the host could not learn what became of the start: {first}"
+    );
+    let earlier = first["action_id"]
+        .as_str()
+        .expect("the start names its action")
+        .to_owned();
+    let state = scene.state();
+    assert_eq!(state["owed"][0]["kind"], "start_unconfirmed", "{state}");
+    assert_eq!(state["owed"][0]["action_id"], earlier.as_str(), "{state}");
+    // A notice that has no time lapse is kept as it was written, with no finite end.
+    assert_eq!(
+        milliseconds(&state["owed"][0]["until_ms"]),
+        u64::MAX,
+        "{state}"
+    );
+
+    // A plain start is held by the host, which names the earlier start in its words.
+    let prepared = scene.prepared().await;
+    let held = scene
+        .call("voice_start", scene.start_request(&prepared))
+        .expect_err("the host holds the device");
+    assert_eq!(held["code"], "DRAFT_CONFLICT", "{held}");
+    assert_eq!(held["start_again_for"], earlier.as_str(), "{held}");
+    assert_eq!(
+        scene.stand_in.count("/api/voice/sessions"),
+        1,
+        "the held start asked the service for nothing"
+    );
+    let state = scene.state();
+    assert_eq!(
+        state["owed"][0]["kind"], "start_unconfirmed",
+        "the notice stands: {state}"
+    );
+
+    // "Start again" names the kept start, passes the hold, and closes its notice.
+    scene.stand_in.lose_creation_answers(false);
+    let mut again = scene.start_request(&prepared);
+    again["afterActionId"] = json!(earlier);
+    let answered = scene
+        .call("voice_start", again)
+        .expect("a start that names the kept start passes the hold");
+    assert!(
+        answered["value"]["outcome"]["started"].is_object(),
+        "{answered}"
+    );
+    let shown = scene.state();
+    assert!(
+        shown["owed"]
+            .as_array()
+            .expect("the entries")
+            .iter()
+            .all(|owed| owed["action_id"] != earlier.as_str()),
+        "{shown}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// KR-REQ-23.24: an earlier kept start survives a later one that the host declines before its hold,
+/// and a start after that is still held in words that name the earlier one, so "Start again" is
+/// still offered for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_earlier_kept_start_survives_a_later_one_declined_before_the_hold() {
+    let mut scene = scene_with(quick(), Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.lose_creation_answers(true);
+    let first = scene.start().await;
+    let earlier = first["action_id"]
+        .as_str()
+        .expect("the start names its action")
+        .to_owned();
+
+    // A digest of a call that is not the one the host would make now: the host declines this start
+    // before its hold is looked at, and the earlier start is not proved to have passed it.
+    let prepared = scene.prepared().await;
+    let mut declined = scene.start_request(&prepared);
+    declined["prepared"] =
+        serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([9; 32]))
+            .expect("a digest");
+    let answer = scene
+        .call("voice_start", declined)
+        .expect("the host answers the declined start");
+    assert!(
+        answer["value"]["outcome"]["preparation_changed"].is_object(),
+        "{answer}"
+    );
+    let state = scene.state();
+    let owed = state["owed"].as_array().expect("the entries");
+    assert_eq!(owed.len(), 1, "{state}");
+    assert_eq!(owed[0]["action_id"], earlier.as_str(), "{state}");
+    assert_eq!(owed[0]["kind"], "start_unconfirmed", "{state}");
+
+    let held = scene
+        .call("voice_start", scene.start_request(&prepared))
+        .expect_err("the host still holds the device");
+    assert_eq!(held["code"], "DRAFT_CONFLICT", "{held}");
+    assert_eq!(held["start_again_for"], earlier.as_str(), "{held}");
     scene.stop_host().await;
 }
 

@@ -621,16 +621,6 @@ impl Shared {
         self.write_kept();
     }
 
-    /// Opens the entry this process owes the host for the call `owner` holds, in the file, replacing
-    /// the one an earlier step of the same call opened.
-    pub(crate) fn stand_open(&self, owner: u64, entry: OwedView) {
-        *self
-            .standing
-            .lock()
-            .expect("the standing lock is not poisoned") = Some((owner, entry));
-        self.keep();
-    }
-
     /// Opens the entry for a start this device is about to send, and says whether it is on disk.
     /// A start that the host may admit must leave a record that a crash does not lose, so a file
     /// that cannot be read, a write that fails and a device with no place to keep anything each
@@ -1973,5 +1963,50 @@ mod named_in_words {
         assert!(!names_token("under action x0f3c-4a, begun", id));
         assert!(!names_token("under action 0f3c-4a-9, begun", id));
         assert!(!names_token("no id here", id));
+    }
+
+    /// The sentences the host's cases read, with the ids a kept start has.
+    const FIXTURE: &str =
+        include_str!("../../../../../crates/kr-controller/tests/fixtures/voice_hold_refusals.txt");
+
+    fn sentence(name: &str, standing: &str, named: &str) -> String {
+        FIXTURE
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+            .expect("the fixture has the sentence")
+            .replace("{A}", standing)
+            .replace("{B}", named)
+            .replace("{T0}", "2026-11-18 10:00:00 UTC")
+            .replace("{T1}", "2026-11-18 10:11:50 UTC")
+    }
+
+    /// The host's refusal names the standing start once, however it is worded: the one kept id that
+    /// the words hold as a whole token is found, a prefix of it is not, and the id the start named is
+    /// not the one it finds.
+    #[test]
+    fn the_hosts_refusal_sentences_name_the_kept_start() {
+        let standing = "7c1e0f3c-4a21-4b6e-9c11-0123456789ab";
+        let named = "d2a9b1c4-5e66-4f70-8a12-ba9876543210";
+        for words in [
+            sentence("unnamed", standing, named),
+            sentence("named", standing, named),
+        ] {
+            assert!(names_token(&words, standing), "{words}");
+            assert!(
+                !names_token(&words, &standing[..13]),
+                "a prefix is not the id: {words}"
+            );
+            assert!(
+                !names_token(&words, "00000000-0000-4000-8000-000000000000"),
+                "{words}"
+            );
+        }
+        // The sentence that says the start was not recorded names no action at all.
+        let unrecorded = sentence("unrecorded", standing, named);
+        assert!(!names_token(&unrecorded, standing), "{unrecorded}");
+        // The sentence for a misnamed start holds both ids: the one the start named is the other
+        // kept id, and a lookup that excludes it finds the standing one.
+        let misnamed = sentence("named", standing, named);
+        assert!(names_token(&misnamed, named), "{misnamed}");
     }
 }
