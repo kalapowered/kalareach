@@ -10428,7 +10428,7 @@ fn the_release_reads_through_the_registry_and_the_configuration_document_and_no_
         .collect();
     assert_eq!(
         through,
-        vec![("configuration".to_owned(), 4), ("registry".to_owned(), 16)]
+        vec![("configuration".to_owned(), 4), ("registry".to_owned(), 17)]
     );
 }
 
