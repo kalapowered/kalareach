@@ -2061,6 +2061,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_worker_job_whose_process_has_ended_goes_with_its_definition() {
+        if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+            return;
+        }
         launchd_domains_are_here();
         let host = kr_ipc::testing::TempHost::create();
         let jobs = host.environment().jobs_dir();
@@ -2095,6 +2098,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_domain_that_is_not_there_does_not_stop_the_removal() {
+        if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+            return;
+        }
         launchd_domains_are_here();
         // An account that never has a graphical login, so its graphical domain is never there.
         let absent = "gui/1".to_owned();
@@ -2154,6 +2160,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_worker_job_whose_process_is_running_is_left_alone() {
+        if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+            return;
+        }
         launchd_domains_are_here();
         let host = kr_ipc::testing::TempHost::create();
         let jobs = host.environment().jobs_dir();
@@ -2325,6 +2334,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_plugin_host_job_whose_process_has_ended_goes_with_its_definition() {
+        if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+            return;
+        }
         launchd_domains_are_here();
         let host = kr_ipc::testing::TempHost::create();
         let jobs = host.environment().jobs_dir();

@@ -165,6 +165,9 @@ fn register(environment: &EnvironmentPaths) -> Registered {
               has one"
 )]
 fn a_job_registered_for_a_tree_goes_with_it() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let tree = teardown::Tree::create();
     let job = register(&tree.environment());
     assert!(registered(&job.0), "{} was registered", job.0);
@@ -187,6 +190,9 @@ fn a_job_registered_for_a_tree_goes_with_it() {
               has one"
 )]
 fn a_job_registered_for_another_environment_of_a_tree_goes_with_it() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let tree = teardown::Tree::create();
     let other = tree
         .paths()
@@ -213,6 +219,9 @@ fn a_job_registered_for_another_environment_of_a_tree_goes_with_it() {
               has one"
 )]
 fn a_job_registered_for_another_tree_is_left_alone() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let other = kr_ipc::testing::TempHost::create();
     let theirs = register(&other.environment());
     let tree = teardown::Tree::create();
