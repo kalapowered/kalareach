@@ -784,11 +784,20 @@ async fn a_start_the_hold_refused_is_told_the_same_refusal_when_it_is_sent_again
 async fn a_start_whose_task_is_dropped_holds_the_device() {
     let (keep_waiting, gate) = tokio::sync::oneshot::channel();
     let (world, service, device_id, actor_id, params) = with_service(
-        vec![Answer::Call {
-            call: "call-1",
-            replayed: false,
-            gate: Some(gate),
-        }],
+        vec![
+            Answer::Call {
+                call: "call-1",
+                replayed: false,
+                gate: Some(gate),
+            },
+            // A host that wrongly admits the fresh start gets this call and fails the case at the
+            // refusal it expects, not at an empty script.
+            Answer::Call {
+                call: "call-2",
+                replayed: false,
+                gate: None,
+            },
+        ],
         true,
         64,
     )
