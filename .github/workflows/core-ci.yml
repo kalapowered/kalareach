@@ -3199,16 +3199,6 @@ jobs:
         timeout-minutes: 2
         run: bash scripts/disk-report.sh end "the release build"
 
-      # The programs a release ships for this platform hold none of the refusal that test builds
-      # carry for the account's own launchd, read in the release build of the workspace above and in
-      # each program built alone, as the Linux job reads them for its platform.
-      - name: The programs a release ships hold no launchd refusal
-        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
-        timeout-minutes: 90
-        env:
-          KR_SHIPPED_WORKSPACE_TARGET: ${{ github.workspace }}/target
-        run: bash scripts/shipped-hold-gate.sh
-
       # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
       # in a release build, each figure printed with the conditions it was taken under. This runner
       # has three processors and 7 GiB, short of section 27's reference host, and is a GitHub-hosted
@@ -3228,6 +3218,16 @@ jobs:
         env:
           KR_PERF_SETTLE_LOAD: "1.5"
         run: bash scripts/performance.sh
+
+      # The programs a release ships for this platform hold none of the refusal that test builds
+      # carry for the account's own launchd, read in the release build of the workspace above and in
+      # each program built alone, as the Linux job reads them for its platform.
+      - name: The programs a release ships hold no launchd refusal
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
+        timeout-minutes: 90
+        env:
+          KR_SHIPPED_WORKSPACE_TARGET: ${{ github.workspace }}/target
+        run: bash scripts/shipped-hold-gate.sh
 
       # The figures and whatever else the steps above wrote to the artefact directory, kept whether
       # or not the run passed: on this platform they are the only record of how a failure looked.
