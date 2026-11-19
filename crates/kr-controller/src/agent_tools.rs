@@ -96,9 +96,9 @@ const DOCUMENT_NOT_SHARED: &str = "{document} is named by {word} and by {other} 
      and they do not both declare it shared, so this host will not install {word}";
 
 /// The refusal of an entry that another record of this host claims with other contents.
-const CLAIMED_DIFFERENTLY: &str = "{path} already holds a server named kalareach, written with \
-     other contents by another installation this host made; remove that installation before \
-     installing this one";
+const CLAIMED_DIFFERENTLY: &str = "another installation this host made claims a server named \
+     kalareach in {path}, or in a place that differs from it only in letter case, with other \
+     contents; remove that installation before installing this one";
 
 /// What a person does where this host will not rewrite an agent's configuration document.
 const CONFIGURATION_BY_HAND: &str = "add or remove the server with the agent's own command instead";
@@ -4340,6 +4340,30 @@ mod tests {
         }
     }
 
+    /// KR-REQ-11.01: a compiled word's entry follows this host's own executable, so an
+    /// installation made by another executable is not a moved place: the record's place is the
+    /// place now, whatever command its entry names.
+    #[cfg(unix)]
+    #[test]
+    fn a_compiled_word_whose_host_executable_changed_is_not_a_moved_place() {
+        let tree = Tree::create();
+        let request = params(
+            AgentTarget::parse("codex").expect("a word"),
+            InstallScope::User,
+        );
+        tree.installer().install(&request).expect("installs");
+        let other = Installer::new(
+            tree.home(),
+            tree.root.join("state").join("agent-tools"),
+            "/opt/other/kr".to_owned(),
+        );
+        let layout = other.layout(&request).expect("a layout");
+        let recorded = other.recorded(&request).expect("reads");
+        other
+            .moved_place(&request, &layout, recorded.as_ref())
+            .expect("another executable is not another place");
+    }
+
     /// A record of version 1 and one of version 2 are read through one reader, as the same shape.
     #[test]
     fn a_version_one_and_a_version_two_record_read_through_one_reader() {
@@ -5028,7 +5052,8 @@ mod tests {
             panic!("a refusal by name: {refused}");
         };
         assert!(
-            detail.contains("already holds a server named kalareach, written with other contents by another installation this host made"),
+            detail
+                .contains("another installation this host made claims a server named kalareach in"),
             "{detail}"
         );
         assert_eq!(

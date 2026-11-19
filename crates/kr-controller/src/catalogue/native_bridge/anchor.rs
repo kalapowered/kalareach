@@ -66,7 +66,7 @@ impl Anchor {
                 let there = Dir::open(&actual).map_err(storage)?;
                 if there.identity() != handle.identity() {
                     return Err(refused(format!(
-                        "{} changed while it was opened, so it is not written under",
+                        "{} changed while it was opened, so this host does not use anything below it",
                         root.display()
                     )));
                 }
