@@ -24,7 +24,7 @@ import { AGENT_READ_CADENCE_MS } from '../app/agent'
 import { readOnCadence } from '../app/cadence'
 import { useConnectionRights } from '../app/rights'
 import { useApp } from '../app/state'
-import { failureMessage, watch, type Watch } from '../host/port'
+import { failureCode, failureMessage, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import {
   actionableApprovals,
@@ -139,28 +139,48 @@ export function ApprovalRequests({
   const again = useRef<() => void>(() => undefined)
 
   // Answers a channel took end for good on the host's own word, and the connection stops counting
-  // them. A release that fails is kept and tried again with the next read.
-  const unreleased = useRef(new Set<string>())
+  // them. The word is the host's only once its receipt for the action reads unknown: a paired
+  // route says the same of an answer that was lost on the way, and then the worker holds no receipt
+  // and nothing is released. A release that fails is kept, by session and action, and tried again
+  // with the next read; one that is still on its way is not started a second time.
+  const unreleased = useRef(new Map<string, { session: string; action: string }>())
+  const releasing = useRef(new Set<string>())
   const release = useCallback(
-    (actionId: string | null) => {
-      if (actionId !== null) unreleased.current.add(actionId)
-      for (const id of [...unreleased.current]) {
-        port.settleAction({ session_id: sessionId, action_id: id }).then(
-          () => {
-            unreleased.current.delete(id)
-          },
-          () => undefined
+    (session: string, action: string) => {
+      const key = `${session}\n${action}`
+      if (releasing.current.has(key)) return
+      releasing.current.add(key)
+      port
+        .actionRead({ session_id: session, action_id: action })
+        .then((record) =>
+          record.receipt.state === 'unknown'
+            ? port.settleAction({ session_id: session, action_id: action })
+            : undefined
         )
-      }
+        .then(
+          () => {
+            unreleased.current.delete(key)
+          },
+          (error: unknown) => {
+            // The host holds no receipt for the action: nothing is released and nothing waits to be.
+            if (failureCode(error) === 'NOT_FOUND') unreleased.current.delete(key)
+            else unreleased.current.set(key, { session, action })
+          }
+        )
+        .finally(() => {
+          releasing.current.delete(key)
+        })
     },
-    [port, sessionId]
+    [port]
   )
 
   const load = useCallback((): Promise<void> => {
     const current = reads.current?.read() ?? null
     if (current === null) return Promise.resolve()
-    // A release that did not reach the session is tried again with each read.
-    release(null)
+    // A release that failed is tried again with each read.
+    for (const { session, action } of unreleased.current.values()) {
+      if (session === sessionId) release(session, action)
+    }
     return ask(async () => {
       const agents = await port.sessionAgents(sessionId)
       const channelInstances = new Set(
@@ -248,7 +268,7 @@ export function ApprovalRequests({
         // host could not confirm.
         if (endsAsChannelAnswer(settled, request.channel)) {
           say(CHANNEL_ANSWER_WORDS, 'neutral')
-          if (settled.action_id !== null) release(settled.action_id)
+          if (settled.action_id !== null) release(sessionId, settled.action_id)
           return
         }
         say(outcomeMessage(`You chose “${decision.label}”`, settled), outcomeTone(settled))

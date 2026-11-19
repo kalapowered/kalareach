@@ -601,6 +601,12 @@ export interface FakeHostControls {
   ): void
   /** The actions the page released from the connection's book of unresolved ones, in order. */
   readonly releasedActions: readonly string[]
+  /** The actions whose receipt the page asked the host for, in order. */
+  readonly readActions: readonly string[]
+  /** How many releases the page has asked the connection for, taken, held or failed. */
+  readonly releaseAttempts: number
+  /** Holds the next release until the returned function is called, as a slow link does. */
+  holdNextRelease(): () => void
   /** Makes the next `count` releases fail before one is taken, as a link that cannot be reached does. */
   failReleases(count: number): void
   /** Sets what the connection may do, and says so as native code does. */
@@ -1623,6 +1629,9 @@ export function fakeHost(
   let submissions = 0
   let heldSends: (() => void)[] | null = null
   let nextSendUnconfirmed = false
+  const readActions: string[] = []
+  let releaseAttempts = 0
+  let heldRelease: Promise<void> | null = null
   /** The actions the page released from the connection's book, in order. */
   const releasedActions: string[] = []
   /** How many of the next releases fail before one is taken. */
@@ -2205,11 +2214,28 @@ export function fakeHost(
     actionRead: (params, opening) => {
       requireConnection()
       checkOpening('actionRead', params.session_id ?? '', opening)
+      readActions.push(params.action_id)
+      // The answers a channel took are the only receipts the scripted host keeps, and each reads
+      // unknown; a test that needs another gives the port its own.
+      if (records.holdsChannelReceipt(params.action_id)) {
+        return Promise.resolve({
+          receipt: receipt(params.action_id, 'unknown', 'agent.approval.respond'),
+          result: null
+        })
+      }
       return refuse('NOT_FOUND', 'The host holds no receipt for that action.')
     },
     settleAction: (params, opening) => {
       requireConnection()
       checkOpening('settleAction', params.session_id, opening)
+      releaseAttempts += 1
+      const waiting = heldRelease
+      heldRelease = null
+      if (waiting !== null) {
+        return waiting.then(() => {
+          releasedActions.push(params.action_id)
+        })
+      }
       if (settleActionFails > 0) {
         settleActionFails -= 1
         return Promise.reject(new Error('The release did not reach the session.'))
@@ -3623,6 +3649,17 @@ export function fakeHost(
     descriptionConfigures,
     descriptionDownloads,
     releasedActions,
+    readActions,
+    get releaseAttempts() {
+      return releaseAttempts
+    },
+    holdNextRelease() {
+      let finish: () => void = () => undefined
+      heldRelease = new Promise<void>((resolve) => {
+        finish = resolve
+      })
+      return finish
+    },
     failReleases(count) {
       settleActionFails = count
     },
