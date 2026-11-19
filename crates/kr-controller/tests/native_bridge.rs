@@ -6035,3 +6035,660 @@ fn kr_req_11_42_the_doctor_reports_a_refused_recipe_as_refused() {
     assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
     assert!(check.detail().contains("refused"), "{}", check.detail());
 }
+
+// ---------------------------------------------------------------------------------------------
+// A package's own placement
+// ---------------------------------------------------------------------------------------------
+
+use kr_plugin_sdk::placement::Placement;
+
+const QUILL_EXECUTABLE: &[u8] = b"\x7fELF a stand-in for Quill CLI, hashed and never run";
+
+const QUILL_MANIFEST: &[u8] = b"{\"name\": \"quill-bridge\", \"version\": \"1.0.0\"}\n";
+
+const QUILL_HOOKS: &str = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "kalareach", "command": "{kr_hook} quill-cli hook", "timeout": 5000}]}]}}"#;
+
+/// What the placement of a made-up application "Quill CLI" says: `directory` under the home, then
+/// `plugins/<folder>/` with a manifest that names its folder and a hooks file whose commands are
+/// one line a shell runs.
+fn quill_placement(directory: &[&str]) -> Placement {
+    serde_json::from_value(serde_json::json!({
+        "directory": directory,
+        "area": "plugins",
+        "files": [
+            {"tail": "plugin.json", "shape": {"kind": "object", "members": [
+                {"name": "name", "required": true, "shape": {"kind": "directory_name"}},
+                {"name": "version", "shape": {"kind": "text", "max_bytes": 4096}}]}},
+            {"tail": "hooks/hooks.json", "shape": {"kind": "object", "members": [
+                {"name": "hooks", "required": true, "shape": {"kind": "map", "values":
+                    {"kind": "array", "items": {"kind": "object", "members": [
+                        {"name": "hooks", "required": true, "shape": {"kind": "array",
+                            "items": {"kind": "command_handler"}}}]}}}}]}}],
+        "command_form": "line",
+        "one_per_name": {"manifest": "plugin.json", "skips_hidden": true}
+    }))
+    .expect("a placement")
+}
+
+/// One test's own directories for a package that declares where its bridge is placed.
+struct QuillSite {
+    _temp: tempfile::TempDir,
+    root: PathBuf,
+}
+
+impl QuillSite {
+    /// A home that holds Quill CLI's directory with somebody's own plugin in it.
+    fn new() -> Self {
+        let temp = tempfile::tempdir().expect("a temporary directory");
+        let site = Self {
+            root: temp.path().to_path_buf(),
+            _temp: temp,
+        };
+        std::fs::create_dir_all(site.application().join("plugins/theirs")).expect("a plugin");
+        std::fs::write(
+            site.application().join("plugins/theirs/plugin.json"),
+            "{\"name\": \"theirs\"}\n",
+        )
+        .expect("a plugin manifest");
+        std::fs::create_dir_all(site.root.join("bin")).expect("a search path");
+        std::fs::write(site.root.join("bin/quill"), QUILL_EXECUTABLE).expect("an executable");
+        std::fs::write(site.forwarder(), b"a stand-in for the forwarder").expect("a forwarder");
+        site.package(QUILL_HOOKS.as_bytes());
+        site
+    }
+
+    fn home(&self) -> PathBuf {
+        self.root.join("home")
+    }
+
+    fn application(&self) -> PathBuf {
+        self.home().join(".quill")
+    }
+
+    fn forwarder(&self) -> PathBuf {
+        self.root.join("bin/kr-hook")
+    }
+
+    fn host(&self) -> BridgeHost {
+        BridgeHost {
+            journals: self.root.join("state/native-bridges"),
+            home: Some(self.home()),
+            search_path: vec![self.root.join("bin")],
+            forwarder: Some(self.forwarder()),
+            signed_records: Vec::new(),
+        }
+    }
+
+    fn bridges(&self) -> NativeBridges {
+        NativeBridges::new(self.host())
+    }
+
+    fn tree(&self) -> BTreeMap<String, Node> {
+        snapshot(&self.home())
+    }
+
+    /// The package's two files, the hooks file holding `hooks`.
+    fn package(&self, hooks: &[u8]) {
+        let bridge = self.root.join("packages/quill/bridge");
+        std::fs::create_dir_all(&bridge).expect("a package");
+        std::fs::write(bridge.join("plugin.json"), QUILL_MANIFEST).expect("a package file");
+        std::fs::write(bridge.join("hooks.json"), hooks).expect("a package file");
+    }
+
+    /// The release a package ships for the folder `folder` of `plugins/`, with the placement it
+    /// declares, and a signed record naming the stand-in executable.
+    fn release(&self, id: &str, folder: &str, placement: Declared) -> BridgeTarget {
+        let manifest = std::fs::read(self.root.join("packages/quill/bridge/plugin.json"))
+            .expect("a package file");
+        let manifest = String::from_utf8(manifest)
+            .expect("text")
+            .replace("quill-bridge", folder)
+            .into_bytes();
+        std::fs::write(
+            self.root.join("packages/quill/bridge/plugin.json"),
+            &manifest,
+        )
+        .expect("a package file");
+        let hooks = std::fs::read(self.root.join("packages/quill/bridge/hooks.json"))
+            .expect("a package file");
+        let manifest_path = format!("plugins/{folder}/plugin.json");
+        let hooks_path = format!("plugins/{folder}/hooks/hooks.json");
+        let (manifest_digest, hooks_digest) = (
+            PayloadDigest::of(&manifest).to_string(),
+            PayloadDigest::of(&hooks).to_string(),
+        );
+        let recipe = serde_json::from_value(serde_json::json!({
+            "application": "Quill CLI",
+            "application_range": ">=1.0.0, <2.0.0",
+            "install": [
+                {"type": "install_file", "source": "bridge/plugin.json",
+                 "destination": manifest_path, "digest": manifest_digest},
+                {"type": "install_file", "source": "bridge/hooks.json",
+                 "destination": hooks_path, "digest": hooks_digest}],
+            "remove": [
+                {"type": "remove_file", "destination": hooks_path, "digest": hooks_digest},
+                {"type": "remove_file", "destination": manifest_path, "digest": manifest_digest}],
+            "grant_statement": "Places two registration files for Quill CLI."
+        }))
+        .expect("a recipe");
+        BridgeTarget {
+            plugin_id: PluginId::new(id).expect("a plugin identifier"),
+            package_digest: PayloadDigest::of(format!("{id} {folder}").as_bytes()),
+            package_dir: self.root.join("packages/quill"),
+            recipe,
+            match_rules: serde_json::from_value(serde_json::json!([
+                {"id": "quill", "executable": {"file_stem": "quill", "path_suffix": [],
+                                               "version_range": null},
+                 "distribution": null, "confidence": "inferred"}]))
+            .expect("match rules"),
+            qualified: vec![QualifiedExecutable {
+                digest: hex_digest(QUILL_EXECUTABLE),
+                version: "1.2.0".to_owned(),
+            }],
+            placement,
+        }
+    }
+
+    /// The release of `quill-bridge` under the placement in `.quill`.
+    fn declared(&self) -> BridgeTarget {
+        self.release(
+            "kalareach/quill",
+            "quill-bridge",
+            Declared::Placement(Box::new(quill_placement(&[".quill"]))),
+        )
+    }
+}
+
+fn quill_id() -> PluginId {
+    PluginId::new("kalareach/quill").expect("a plugin identifier")
+}
+
+/// KR-REQ-11.44: a package that declares where its bridge is placed gets it placed there for an
+/// application the host holds no layout for, and removal gives the directory its tree back. The
+/// control is the same package with no declaration, which the host refuses: it does not know where
+/// that application keeps its plugins.
+#[cfg(unix)]
+#[test]
+fn a_declared_placement_places_a_registration_for_an_application_the_host_does_not_name() {
+    let site = QuillSite::new();
+    let before = site.tree();
+    let bridges = site.bridges();
+    let undeclared = site.release("kalareach/quill", "quill-bridge", Declared::Nothing);
+    let settled = bridges
+        .reconcile(&quill_id(), Some(&undeclared))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("does not know where Quill CLI keeps its plugins"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    assert_eq!(
+        bridges
+            .reconcile(&quill_id(), Some(&site.declared()))
+            .expect("reconciles"),
+        Settled::Applied
+    );
+    let after = site.tree();
+    let hooks = after
+        .get(".quill/plugins/quill-bridge/hooks/hooks.json")
+        .expect("the hooks file is placed");
+    let Node::File(bytes) = hooks else {
+        panic!("a file: {hooks:?}");
+    };
+    let text = String::from_utf8(bytes.clone()).expect("text");
+    assert!(
+        text.contains(&format!("{} quill-cli hook", site.forwarder().display())),
+        "the forwarder's path is written where the package names it: {text}"
+    );
+    assert!(
+        after.contains_key(".quill/plugins/quill-bridge/plugin.json"),
+        "{after:?}"
+    );
+    assert_eq!(
+        after.len(),
+        before.len() + 4,
+        "two folders and two files, and nothing else: {after:?}"
+    );
+    assert_eq!(
+        bridges.reconcile(&quill_id(), None).expect("removes"),
+        Settled::Removed
+    );
+    assert_eq!(site.tree(), before, "removal gives the tree back");
+}
+
+/// KR-REQ-11.44: a declared placement registers the forwarder by its placeholder only. The bare name
+/// is read for the two compiled layouts, which the packages written before the placeholder name.
+#[cfg(unix)]
+#[test]
+fn a_declared_placement_registers_the_forwarder_by_the_placeholder_only() {
+    let site = QuillSite::new();
+    let before = site.tree();
+    site.package(QUILL_HOOKS.replace("{kr_hook}", "kr-hook").as_bytes());
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&site.declared()))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("starts the forwarder with arguments it does not accept"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// KR-REQ-11.44: a declared directory is opened by plain components from the home, and a link at the
+/// first, an intermediate or the final component refuses the placement with nothing written where
+/// the link leads. A directory that is absent is refused and not made.
+#[cfg(unix)]
+#[test]
+fn a_declared_directory_that_is_a_link_at_any_component_is_refused() {
+    for linked in 0..3 {
+        let site = QuillSite::new();
+        let components = ["first", "second", "third"];
+        let outside = site.root.join("elsewhere");
+        let mut path = site.home();
+        for (index, component) in components.iter().enumerate() {
+            path.push(component);
+            if index == linked {
+                // What the link leads to holds a directory the placement could be written in.
+                std::fs::create_dir_all(outside.join("plugins"))
+                    .expect("a place the link leads to");
+                std::os::unix::fs::symlink(&outside, &path).expect("a link");
+                break;
+            }
+            std::fs::create_dir_all(&path).expect("a component");
+        }
+        let led_to = snapshot(&outside);
+        let before = site.tree();
+        let release = site.release(
+            "kalareach/quill",
+            "quill-bridge",
+            Declared::Placement(Box::new(quill_placement(&components))),
+        );
+        let settled = site
+            .bridges()
+            .reconcile(&quill_id(), Some(&release))
+            .expect("reconciles");
+        assert!(
+            refused(&settled).contains("follows no link there"),
+            "component {linked}: {settled:?}"
+        );
+        assert_eq!(site.tree(), before, "component {linked}: nothing written");
+        assert_eq!(
+            snapshot(&outside),
+            led_to,
+            "component {linked}: nothing written where the link leads"
+        );
+    }
+
+    let site = QuillSite::new();
+    let release = site.release(
+        "kalareach/quill",
+        "quill-bridge",
+        Declared::Placement(Box::new(quill_placement(&[".absent"]))),
+    );
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&release))
+        .expect("reconciles");
+    assert!(refused(&settled).contains("it is not there"), "{settled:?}");
+    assert_eq!(site.tree(), before, "the directory is not made");
+}
+
+/// KR-REQ-11.44: a package that copies a compiled default's layout into its own declaration is
+/// placed by plain components like any declared placement: the person's link at the default's
+/// first component is refused, where a package that declares none is placed through it.
+#[cfg(unix)]
+#[test]
+fn a_declared_copy_of_a_compiled_default_refuses_the_link() {
+    let is_link = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .expect("the link")
+            .file_type()
+            .is_symlink()
+    };
+    let site = Site::new();
+    let real = site.root.join("home/dotfiles/claude");
+    std::fs::create_dir_all(real.parent().expect("a parent")).expect("a folder");
+    std::fs::rename(site.application(), &real).expect("moved to where the link leads");
+    std::os::unix::fs::symlink(&real, site.application()).expect("the person's link");
+    let before = snapshot(&real);
+    let copy = BridgeTarget {
+        placement: Declared::Placement(Box::new(Placement::claude_code())),
+        ..site.release()
+    };
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&copy))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("follows no link there"),
+        "{settled:?}"
+    );
+    assert_eq!(
+        snapshot(&real),
+        before,
+        "nothing written where the link leads"
+    );
+    assert!(is_link(&site.application()), "the link is as it was");
+
+    let gemini_site = GeminiSite::new();
+    let real = gemini_site.root.join("home/dotfiles/gemini");
+    std::fs::create_dir_all(real.parent().expect("a parent")).expect("a folder");
+    std::fs::rename(gemini_site.application(), &real).expect("moved to where the link leads");
+    std::os::unix::fs::symlink(&real, gemini_site.application()).expect("the person's link");
+    let before = snapshot(&real);
+    let copy = BridgeTarget {
+        placement: Declared::Placement(Box::new(Placement::gemini_cli())),
+        ..gemini_site.release()
+    };
+    let settled = gemini_site
+        .bridges()
+        .reconcile(&gemini(), Some(&copy))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("follows no link there"),
+        "{settled:?}"
+    );
+    assert_eq!(
+        snapshot(&real),
+        before,
+        "nothing written where the link leads"
+    );
+}
+
+/// KR-REQ-11.44: a declared placement adds no key under another label, and under Claude Code's
+/// label adds only the label's own key, set to true, which removal takes out alone: the person's
+/// other settings keep their bytes.
+#[cfg(unix)]
+#[test]
+fn a_declared_placement_adds_only_the_labels_own_key() {
+    let site = QuillSite::new();
+    let before = site.tree();
+    let mut release = site.declared();
+    let mut recipe = serde_json::to_value(&release.recipe).expect("the recipe encodes");
+    recipe["install"]
+        .as_array_mut()
+        .expect("steps")
+        .push(serde_json::json!(
+        {"type": "add_configuration_key", "file": "settings.json",
+         "key": "enabledPlugins.quill-bridge@skills-dir", "value": "true"}));
+    recipe["remove"]
+        .as_array_mut()
+        .expect("steps")
+        .push(serde_json::json!(
+        {"type": "remove_configuration_key", "file": "settings.json",
+         "key": "enabledPlugins.quill-bridge@skills-dir"}));
+    release.recipe = serde_json::from_value(recipe).expect("a recipe");
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&release))
+        .expect("reconciles");
+    assert!(refused(&settled).contains(UNPERMITTED_KEY), "{settled:?}");
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    let site = Site::new();
+    let before = site.tree();
+    let declared = BridgeTarget {
+        placement: Declared::Placement(Box::new(Placement::claude_code())),
+        ..site.release()
+    };
+    let bridges = site.bridges();
+    assert_eq!(
+        bridges
+            .reconcile(&plugin(), Some(&declared))
+            .expect("applies"),
+        Settled::Applied
+    );
+    assert_eq!(
+        site.tree(),
+        applied_tree(&before, &site.forwarder()),
+        "the three files and the label's key, and nothing else"
+    );
+    assert_eq!(
+        bridges.reconcile(&plugin(), None).expect("removes"),
+        Settled::Removed
+    );
+    assert_eq!(site.tree(), before, "the settings keep their bytes");
+}
+
+/// KR-REQ-11.44: a package that declares its own placement is installed only into a folder this
+/// host made: a folder that is already there is the person's, whatever it holds, and a second
+/// package that declares the same folder is refused while the first stays placed.
+#[cfg(unix)]
+#[test]
+fn a_declared_placement_installs_only_into_a_folder_this_host_made() {
+    let site = QuillSite::new();
+    std::fs::create_dir_all(site.application().join("plugins/quill-bridge")).expect("a folder");
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&site.declared()))
+        .expect("reconciles");
+    assert!(refused(&settled).contains("did not make it"), "{settled:?}");
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    let site = QuillSite::new();
+    let bridges = site.bridges();
+    assert_eq!(
+        bridges
+            .reconcile(&quill_id(), Some(&site.declared()))
+            .expect("applies"),
+        Settled::Applied
+    );
+    let placed = site.tree();
+    let second = site.release(
+        "kalareach/quill-two",
+        "quill-bridge",
+        Declared::Placement(Box::new(quill_placement(&[".quill"]))),
+    );
+    let settled = bridges
+        .reconcile(
+            &PluginId::new("kalareach/quill-two").expect("an id"),
+            Some(&second),
+        )
+        .expect("reconciles");
+    assert!(refused(&settled).contains("did not make it"), "{settled:?}");
+    assert_eq!(
+        site.tree(),
+        placed,
+        "the first package stays as it was placed"
+    );
+}
+
+/// KR-REQ-11.44: a declared placement whose directory is the directory this host keeps another
+/// label's plugins in is refused, compared by what was opened and not by the spelling.
+#[cfg(unix)]
+#[test]
+fn a_declared_placement_in_another_labels_directory_is_refused() {
+    let site = QuillSite::new();
+    std::fs::create_dir_all(site.home().join(".claude/skills")).expect("Claude Code's directory");
+    let before = site.tree();
+    let release = site.release(
+        "kalareach/quill",
+        "quill-bridge",
+        Declared::Placement(Box::new({
+            let mut placement = quill_placement(&[".claude"]);
+            placement.area = "skills".to_owned();
+            placement
+        })),
+    );
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&release))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("keeps Claude Code's plugins in"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// KR-REQ-11.44: a release that moves its placement is taken out of the directory the journal
+/// records before it is placed in the new one, and a removal that comes with no target after a
+/// restart takes it out of the directory the journal records.
+#[cfg(unix)]
+#[test]
+fn a_release_that_moves_its_placement_is_removed_by_the_journal_first() {
+    let site = QuillSite::new();
+    std::fs::create_dir_all(site.home().join(".quill-two/plugins")).expect("a second directory");
+    let before = site.tree();
+    let bridges = site.bridges();
+    assert_eq!(
+        bridges
+            .reconcile(&quill_id(), Some(&site.declared()))
+            .expect("applies"),
+        Settled::Applied
+    );
+    let moved = site.release(
+        "kalareach/quill",
+        "quill-bridge",
+        Declared::Placement(Box::new(quill_placement(&[".quill-two"]))),
+    );
+    // Another release of the package: the same recipe with another digest of the package.
+    let moved = BridgeTarget {
+        package_digest: PayloadDigest::of(b"the second release"),
+        ..moved
+    };
+    assert_eq!(
+        bridges.reconcile(&quill_id(), Some(&moved)).expect("moves"),
+        Settled::Applied
+    );
+    let after = site.tree();
+    assert!(
+        !after.contains_key(".quill/plugins/quill-bridge/plugin.json"),
+        "the old directory is given back: {after:?}"
+    );
+    assert!(
+        after.contains_key(".quill-two/plugins/quill-bridge/plugin.json"),
+        "{after:?}"
+    );
+    // A restart: a new host over the same journals, and a removal with no target.
+    let restarted = site.bridges();
+    assert_eq!(
+        restarted.reconcile(&quill_id(), None).expect("removes"),
+        Settled::Removed
+    );
+    assert_eq!(
+        site.tree(),
+        before,
+        "nothing of the release is left in either directory"
+    );
+}
+
+/// KR-REQ-11.44: a file that is not JSON is refused before anything is written, under a declared
+/// placement as under a compiled one.
+#[cfg(unix)]
+#[test]
+fn a_file_that_is_not_json_is_refused_before_anything_is_written_under_a_declared_placement() {
+    let site = QuillSite::new();
+    site.package(b"{ not json");
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&site.declared()))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("cannot be read as JSON"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// KR-REQ-11.44: a shape a package declares for a file cannot hide a command from the walker: a
+/// declared text member named `command` still has to start the forwarder.
+#[cfg(unix)]
+#[test]
+fn a_declared_shape_cannot_hide_a_command_from_the_walker() {
+    let site = QuillSite::new();
+    site.package(br#"{"command": "echo hello"}"#);
+    let mut placement = quill_placement(&[".quill"]);
+    for file in &mut placement.files {
+        if file.tail == "hooks/hooks.json" {
+            file.shape = serde_json::from_value(serde_json::json!({
+                "kind": "object",
+                "members": [{"name": "command", "required": true,
+                              "shape": {"kind": "text", "max_bytes": 4096}}]
+            }))
+            .expect("a shape");
+        }
+    }
+    let release = site.release(
+        "kalareach/quill",
+        "quill-bridge",
+        Declared::Placement(Box::new(placement)),
+    );
+    let before = site.tree();
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&release))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("starts something other than the forwarder"),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// KR-REQ-11.44: the compiled layouts the host holds as data are the layouts an earlier controller
+/// places by, field by field; a default that moves away from what an installed package was written
+/// for fails here.
+#[test]
+fn the_default_placements_are_the_layout_an_older_controller_places_by() {
+    let claude = Placement::claude_code();
+    assert_eq!(claude.directory, [".claude"]);
+    assert_eq!(claude.area, "skills");
+    assert_eq!(
+        claude
+            .files
+            .iter()
+            .map(|file| file.tail.as_str())
+            .collect::<Vec<_>>(),
+        [
+            ".claude-plugin/plugin.json",
+            ".mcp.json",
+            "hooks/hooks.json"
+        ]
+    );
+    assert_eq!(
+        claude.command_form,
+        kr_plugin_sdk::placement::CommandForm::ArgumentList
+    );
+    let name = claude
+        .one_per_name
+        .as_ref()
+        .expect("one plugin for each name");
+    assert_eq!(
+        (name.manifest.as_str(), name.skips_hidden),
+        (".claude-plugin/plugin.json", true)
+    );
+
+    let gemini = Placement::gemini_cli();
+    assert_eq!(gemini.directory, [".gemini"]);
+    assert_eq!(gemini.area, "extensions");
+    assert_eq!(
+        gemini
+            .files
+            .iter()
+            .map(|file| file.tail.as_str())
+            .collect::<Vec<_>>(),
+        [
+            ".gemini-extension-install.json",
+            "gemini-extension.json",
+            "hooks/hooks.json"
+        ]
+    );
+    assert_eq!(
+        gemini.command_form,
+        kr_plugin_sdk::placement::CommandForm::Line
+    );
+    let name = gemini
+        .one_per_name
+        .as_ref()
+        .expect("one plugin for each name");
+    assert_eq!(
+        (name.manifest.as_str(), name.skips_hidden),
+        ("gemini-extension.json", false)
+    );
+}
