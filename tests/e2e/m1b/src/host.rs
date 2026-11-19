@@ -328,11 +328,21 @@ impl<'r> Host<'r> {
     /// address stays held for the whole of `ADDRESS_FREE`, or when it cannot be bound in any of the
     /// starts.
     pub fn start_daemon(&self) {
+        self.start_daemon_ready_by(&|bound| self.kr_lists(bound));
+    }
+
+    /// [`Self::start_daemon`], where the daemon is ready when `ready` says so within the bound it is
+    /// given, not when `kr list` answers: after the agent under test has started no `kr` is run.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::start_daemon`].
+    pub fn start_daemon_ready_by(&self, ready: &dyn Fn(Duration) -> Result<(), String>) {
         let kept = self
             .configured_address()
             .filter(|address| address.port() != 0);
         for attempt in 1..=RESTART_ATTEMPTS {
-            let Err(said) = self.start_daemon_once() else {
+            let Err(said) = self.start_daemon_once_ready_by(ready) else {
                 return;
             };
             match kept {
@@ -364,6 +374,23 @@ impl<'r> Host<'r> {
     ///
     /// Panics when it does not answer within [`LIVENESS`].
     fn start_daemon_once(&self) -> Result<(), String> {
+        self.start_daemon_once_ready_by(&|bound| self.kr_lists(bound))
+    }
+
+    /// Whether `kr list` answers within `bound`, and why not where it does not.
+    fn kr_lists(&self, bound: Duration) -> Result<(), String> {
+        match self.kr_within(&["list", "--json"], bound) {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => Err(format!("kr list ended with {}", output.status)),
+            Err(why) => Err(format!("kr list {why}")),
+        }
+    }
+
+    /// [`Self::start_daemon_once`], ready where `ready` says so.
+    fn start_daemon_once_ready_by(
+        &self,
+        ready: &dyn Fn(Duration) -> Result<(), String>,
+    ) -> Result<(), String> {
         *self.control.lock().unwrap_or_else(PoisonError::into_inner) = None;
         // What the log holds before this start is an earlier start's, and is not this one's to say.
         let earlier = std::fs::metadata(self.daemon_log()).map_or(0, |log| log.len());
@@ -412,10 +439,9 @@ impl<'r> Host<'r> {
         *self.daemon.lock().unwrap_or_else(PoisonError::into_inner) =
             Some(Daemon { child, identity });
         let answered = Deadline::after(LIVENESS).poll(CLEANUP_COMMAND, ASK_AGAIN, |bound| {
-            let heard = match self.kr_within(&["list", "--json"], bound) {
-                Ok(output) if output.status.success() => return ControlFlow::Break(None),
-                Ok(output) => format!("kr list ended with {}", output.status),
-                Err(why) => format!("kr list {why}"),
+            let heard = match ready(bound) {
+                Ok(()) => return ControlFlow::Break(None),
+                Err(heard) => heard,
             };
             let ended = self
                 .daemon

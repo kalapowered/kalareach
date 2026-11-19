@@ -3023,8 +3023,8 @@ struct Session<'a> {
     host: Host<'a>,
     remote: Remote,
     person: Person,
-    _device: Device,
-    _paired: PairedHost,
+    device: Device,
+    paired: PairedHost,
     /// Whether the shell's environment was read before the agent's first start.
     environment_read: std::cell::Cell<bool>,
     /// A second person on the same host and device, in a second session, with a connection of
@@ -3055,8 +3055,8 @@ impl<'a> Session<'a> {
             host,
             remote,
             person,
-            _device: device,
-            _paired: paired,
+            device,
+            paired,
             environment_read: std::cell::Cell::new(false),
             second: None,
         }
@@ -3089,8 +3089,8 @@ impl<'a> Session<'a> {
             host,
             remote,
             person,
-            _device: device,
-            _paired: paired,
+            device,
+            paired,
             environment_read: std::cell::Cell::new(false),
             second: Some(Second {
                 person: second,
@@ -4901,6 +4901,369 @@ fn gateway_a_release_or_a_pipe_is_made_only_through_the_recorded_directory_and_n
         "a release in a directory that is not the recorded one is refused"
     );
     run.closing_check().expect("nothing runs");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Part 5b: the gateway's request state survives the daemon's crash (stand-in route).
+// ---------------------------------------------------------------------------------------------
+
+/// What the device reads of an agent and one pending request of it: the instances and resources
+/// the host lists, the instance's binding and the host's record of what the decoder read.
+#[derive(Debug)]
+struct Observed {
+    listed: AgentInstancesResult,
+    binding: AgentBindingState,
+    inspected: AgentApprovalInspectResult,
+}
+
+/// Reads `instance` and its pending `resource` as the device sees them.
+///
+/// # Errors
+///
+/// Returns why a read failed.
+fn observes(
+    ctx: &Context,
+    remote: &Remote,
+    session_id: SessionId,
+    instance: ApplicationInstanceId,
+    resource: PendingResourceId,
+) -> Result<Observed, String> {
+    Ok(Observed {
+        listed: ctx.read_instances(remote, session_id)?,
+        binding: ctx.read_binding(remote, session_id, instance)?,
+        inspected: ctx
+            .inspects(remote, session_id, instance, resource)
+            .map_err(|why| format!("agent.approval.inspect: {why}"))?,
+    })
+}
+
+/// The processes of a session's agent: its worker, and the terminal and the server below it.
+#[derive(Debug)]
+struct Agent {
+    worker: ProcessStartIdentity,
+    terminal: ProcessStartIdentity,
+    server: ProcessStartIdentity,
+}
+
+impl Agent {
+    /// The terminal and the server below `worker`, waited for within [`LIVENESS`].
+    ///
+    /// # Errors
+    ///
+    /// Returns why they were not found, or why the process table was not read.
+    fn below(worker: ProcessStartIdentity) -> Result<Self, String> {
+        let pid = u32::try_from(worker.pid.get()).map_err(|_| "a pid".to_owned())?;
+        let started = Instant::now();
+        loop {
+            let table = kr_e2e_m1b::run::process_table()?;
+            let found = below(&table, pid);
+            let one = |needle: &str| {
+                let mut named = found.iter().filter(|(_, command)| command.contains(needle));
+                match (named.next(), named.next()) {
+                    (Some((pid, _)), None) => kr_ipc::identity::process_start_identity(*pid).ok(),
+                    _ => None,
+                }
+            };
+            if let (Some(terminal), Some(server)) = (one("--remote"), one("app-server")) {
+                return Ok(Self {
+                    worker,
+                    terminal,
+                    server,
+                });
+            }
+            if started.elapsed() >= LIVENESS {
+                return Err(format!(
+                    "no one terminal and one server below worker {pid} within {LIVENESS:?}: {found:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Whether all three are the processes recorded, running.
+    fn run(&self) -> bool {
+        [&self.worker, &self.terminal, &self.server]
+            .into_iter()
+            .all(kr_e2e_m1b::run::running)
+    }
+}
+
+/// Lets the stand-in's terminal print its tick `number`: a file of the working directory, made by
+/// exclusive creation through the directory's held handle.
+fn releases_tick(ctx: &Context, number: u64) {
+    ctx.work
+        .as_ref()
+        .expect("the working directory was recorded")
+        .create_new(
+            ctx.run.root(),
+            ctx.run.pin(),
+            &format!("release.tick{number}"),
+            b"go",
+        )
+        .unwrap_or_else(|why| panic!("the tick's release: {why}"));
+}
+
+/// How many times the terminal wrote that the server asked for an approval, as its screen shows.
+fn asked_by_the_screen(person: &Person) -> usize {
+    person
+        .window
+        .screen()
+        .iter()
+        .filter(|row| row.trim() == ASKED)
+        .count()
+}
+
+/// Starts the daemon again over the host's tree and returns the device's connection to it: the
+/// daemon is ready when the device connects, and no `kr` is run, as none may be after the agent
+/// started.
+fn restarts_the_daemon(ctx: &Context, session: &Session<'_>) -> Remote {
+    let connection = std::cell::RefCell::new(None);
+    session.host.start_daemon_ready_by(&|_| match ctx
+        .runtime
+        .block_on(session.device.connect(&session.paired))
+    {
+        Ok(remote) => {
+            *connection.borrow_mut() = Some(remote);
+            Ok(())
+        }
+        Err(why) => Err(format!("the device's connection: {why}")),
+    });
+    let connected = connection.into_inner();
+    assert!(
+        connected.is_some(),
+        "the device connects to the restarted daemon"
+    );
+    connected.expect("asserted above")
+}
+
+/// Reads the host's list of sessions, closed ones too.
+///
+/// # Errors
+///
+/// Returns why the host could not be read.
+fn sessions_within(
+    ctx: &Context,
+    remote: &Remote,
+) -> Result<kr_protocol::session::SessionListResult, String> {
+    ctx.runtime
+        .block_on(remote.read(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: true,
+            },
+        ))
+        .map_err(|why| format!("session.list: {why}"))
+}
+
+/// The gateway's state of a request survives a crash of the control daemon: with a request pending
+/// at the gateway, killing only the daemon leaves the worker, the terminal and the server running
+/// and the terminal writing; a daemon started again, with no `kr` and no client that takes anything
+/// from the run, serves the same instance, the same binding and the same pending resource, field for
+/// field; the request then resolves once, through that daemon, and the terminal that was asked once
+/// is not asked again. The control kills the daemon, then ends the worker, and reads `session.list`
+/// of the daemon started again: the session's service is gone with its worker, so the comparison
+/// above is not one that anything passes.
+///
+/// KR-REQ-12.10, KR-REQ-11.27 (the daemon-reconnect leg). Stand-in route only. Not claimed: a
+/// kill made during a write (KR-ACC-006), keyboard input to a real terminal while the daemon is
+/// dead, and that a real server saw one answer.
+#[test]
+fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted_daemon_serves_the_same_request()
+ {
+    const TEST: &str = "gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_restarted_daemon_serves_the_same_request";
+    run_case(
+        "gateway-restart",
+        "5b",
+        TEST,
+        "leave-unanswered,tick,ping-when-released",
+        |ctx, session| {
+            assert!(
+                matches!(ctx.route, Route::StandIn),
+                "the restart case runs on the stand-in route only"
+            );
+            let session_id = session.session_id();
+            let instance = session.starts_the_agent(&[], None, &[]);
+            let pending = session.interpreted_approval_within();
+            assert!(
+                pending.is_ok(),
+                "a request is pending at the gateway and interpreted: {pending:?}"
+            );
+            let pending = pending.expect("asserted above");
+            assert_eq!(pending.state, PendingState::Pending);
+            let _ = session
+                .person
+                .sees(ASKED, "the terminal is asked for the approval");
+
+            // The state before, read by the device and the process table.
+            let before = observes(
+                ctx,
+                &session.remote,
+                session_id,
+                instance,
+                pending.resource_id,
+            );
+            assert!(before.is_ok(), "the state before the kill: {before:?}");
+            let before = before.expect("asserted above");
+            assert_eq!(before.listed.agent_resources.resources.len(), 1);
+            assert_eq!(before.listed.agent_instances.instances.len(), 1);
+            let agent = Agent::below(ctx.run.worker_of(&session_id.to_string()));
+            assert!(
+                agent.is_ok(),
+                "the worker, the terminal and the server: {agent:?}"
+            );
+            let agent = agent.expect("asserted above");
+            assert_eq!(asked_by_the_screen(&session.person), 1);
+
+            // Only the daemon is killed. The agent goes on, and the terminal writes with no daemon
+            // to carry what it writes.
+            session.host.kill_daemon();
+            assert!(
+                agent.run(),
+                "the worker, the terminal and the server go on without the daemon"
+            );
+            releases_tick(ctx, 1);
+            let _ = session
+                .person
+                .sees("TUI: tick 1", "the terminal writes while no daemon runs");
+            assert!(agent.run(), "all three still run after the tick");
+            assert_eq!(asked_by_the_screen(&session.person), 1);
+
+            // A daemon is started again, and the device connects to it: nothing is asked of `kr`.
+            let remote = restarts_the_daemon(ctx, session);
+            let served = ctx.instances_within(
+                &remote,
+                session_id,
+                "the restarted daemon serves the instance and its request",
+                |read| {
+                    !read.agent_instances.instances.is_empty()
+                        && !read.agent_resources.resources.is_empty()
+                },
+            );
+            assert!(served.is_ok(), "the restarted daemon serves: {served:?}");
+            let after = observes(ctx, &remote, session_id, instance, pending.resource_id);
+            assert!(after.is_ok(), "the state after the restart: {after:?}");
+            let after = after.expect("asserted above");
+            assert_eq!(
+                after.listed.agent_instances.instances, before.listed.agent_instances.instances,
+                "the same instance"
+            );
+            assert_eq!(
+                after.listed.agent_resources.resources, before.listed.agent_resources.resources,
+                "the same pending resource, field for field"
+            );
+            assert_eq!(after.binding, before.binding, "the same binding");
+            assert_eq!(
+                after.inspected.decoding.source_bytes.as_slice(),
+                before.inspected.decoding.source_bytes.as_slice(),
+                "the same decoder record of the request"
+            );
+            assert!(
+                agent.run(),
+                "the processes of the restarted daemon's session are the ones that ran before"
+            );
+            assert_eq!(asked_by_the_screen(&session.person), 1, "not asked again");
+
+            // The request resolves once, through the restarted daemon, and the terminal's own
+            // reads of the server go on after it.
+            let answered = ctx.answers(
+                &remote,
+                session_id,
+                instance,
+                &after.binding,
+                pending.resource_id,
+                ACCEPT,
+            );
+            assert!(
+                answered.is_ok(),
+                "the device's answer through the restarted daemon: {answered:?}"
+            );
+            assert_eq!(
+                answered.expect("asserted above").state,
+                PendingState::Resolved
+            );
+            let _ = session.person.sees(
+                "TUI: serverRequest/resolved",
+                "the terminal reads the server's word that the request was answered",
+            );
+            let resolved =
+                ctx.instances_within(&remote, session_id, "the request resolves", |read| {
+                    read.agent_resources.resources.len() == 1
+                        && read.agent_resources.resources[0].state == PendingState::Resolved
+                });
+            assert!(resolved.is_ok(), "the request resolves: {resolved:?}");
+            assert_eq!(
+                resolved.expect("asserted above").agent_resources.resources[0].resource_id,
+                pending.resource_id,
+                "the same resource resolved"
+            );
+            releases(ctx);
+            let _ = session.person.sees(
+                "TUI: the server answered after the turn",
+                "the terminal's reply to its own question after the turn",
+            );
+            let answers = received_lines(ctx)
+                .iter()
+                .filter(|line| line.starts_with("response "))
+                .count();
+            assert_eq!(answers, 1, "the server received one answer");
+            assert_eq!(asked_by_the_screen(&session.person), 1, "asked once");
+            assert!(
+                agent.run(),
+                "the server goes on: it was sent no second answer"
+            );
+
+            // The control: the daemon is killed first, so no cleanup runs, then the worker ends;
+            // a daemon started again lists the sessions with no worker for this one, and the
+            // instance cannot be read through it.
+            let kept = observes(ctx, &remote, session_id, instance, pending.resource_id);
+            assert!(kept.is_ok(), "the state before the control: {kept:?}");
+            session.host.kill_daemon();
+            kr_e2e_m1b::run::signal(&agent.worker, rustix::process::Signal::KILL);
+            let started = Instant::now();
+            while kr_e2e_m1b::run::running(&agent.worker) {
+                assert!(
+                    started.elapsed() < LIVENESS,
+                    "the worker did not end within {LIVENESS:?} of being killed"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let remote = restarts_the_daemon(ctx, session);
+            let listed = sessions_within(ctx, &remote);
+            assert!(listed.is_ok(), "the host lists its sessions: {listed:?}");
+            let listed = listed.expect("asserted above");
+            let entry = listed
+                .sessions
+                .iter()
+                .find(|entry| entry.session_id == session_id);
+            assert!(
+                entry.is_none_or(|entry| {
+                    !matches!(
+                        entry.state,
+                        kr_protocol::session::SessionState::Live
+                            | kr_protocol::session::SessionState::Creating
+                    )
+                }),
+                "a session whose worker ended is not live: {entry:?}"
+            );
+            let read = ctx.read_instances(&remote, session_id);
+            assert!(
+                read.is_err(),
+                "the instance of a session whose worker ended is not served: {read:?}"
+            );
+            // What is left of the agent is ended by identity: the terminal and the server go with
+            // their session's shell, and anything that does not is ended here.
+            for identity in [&agent.terminal, &agent.server] {
+                kr_e2e_m1b::run::signal(identity, rustix::process::Signal::KILL);
+            }
+            serde_json::json!({
+                "pending_resource_compared_field_for_field": true,
+                "answers_the_server_received": answers,
+                "session_after_the_worker_ended": entry.map(|entry| format!("{:?}", entry.state)),
+                "instance_read_after_the_worker_ended": format!("{read:?}"),
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
