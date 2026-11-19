@@ -7028,6 +7028,7 @@ async fn closing_with(timings: Timings) -> Scene {
                 "compose_prompt",
                 "close_session"
             ]),
+            own_key: None,
         },
         |service| service,
     )
