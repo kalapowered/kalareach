@@ -633,7 +633,7 @@ impl<'de> Visitor<'de> for Descend<'_> {
         formatter.write_str(self.expected())
     }
 
-    fn visit_map<A>(mut self, mut map: A) -> Result<(), A::Error>
+    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
     where
         A: MapAccess<'de>,
     {
