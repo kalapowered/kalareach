@@ -417,12 +417,19 @@ mod tests {
             "the program changed",
             TimestampMs::new(5),
         );
-        let refusal = owner
-            .record(record(
+        // The invalidation moved the stored record to revision 2. A record offered at revision 3
+        // is newer, so only the hold refuses it.
+        let newer = || {
+            let mut next = record(
                 "agent.prompt",
                 InstanceCapabilityState::QualifiedAvailable,
                 InstanceInvalidation::BinaryChanged,
-            ))
+            );
+            next.revision = CapabilityRevision::new(3);
+            next
+        };
+        let refusal = owner
+            .record(newer())
             .expect_err("a held instance takes no record");
         assert!(matches!(refusal, BrokerError::InvalidArgument(_)));
         assert!(
@@ -435,14 +442,7 @@ mod tests {
             !owner.is_usable(instance(), &capability("agent.prompt")),
             "the refused record did not make the evidence usable again"
         );
-        let probed = owner.record_probe(
-            &probe("agent.prompt"),
-            record(
-                "agent.prompt",
-                InstanceCapabilityState::QualifiedAvailable,
-                InstanceInvalidation::BinaryChanged,
-            ),
-        );
+        let probed = owner.record_probe(&probe("agent.prompt"), newer());
         assert!(
             matches!(probed, Err(BrokerError::InvalidArgument(_))),
             "a probe's record is refused too"
