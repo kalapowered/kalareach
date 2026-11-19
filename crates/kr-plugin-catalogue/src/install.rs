@@ -159,12 +159,13 @@ impl Installation {
     /// with a grant.
     ///
     /// A native bridge runs under the application's own permissions, outside the plugin sandbox,
-    /// and a command integration changes how the application starts. The owner is shown the
-    /// publisher's statement of the bridge, or the host's reading of the integration, and the
-    /// host's notice of it when the release is installed with a grant. A grant that only changes
-    /// an installation later shows neither. So for a release that asks for a bridge it only
-    /// narrows, and for a release that asks for a command integration it never adds that
-    /// capability: adding is the install's.
+    /// a command integration changes how the application starts, and a skill target says where
+    /// the host writes files and a server entry for an agent. The owner is shown the publisher's
+    /// statement of the bridge, the host's reading of the integration or of the skill target, and
+    /// the host's notice of each, when the release is installed with a grant. A grant that only
+    /// changes an installation later shows none of them. So for a release that asks for a bridge
+    /// it only narrows, and for a release that asks for a command integration or a skill target
+    /// it never adds that capability: adding is the install's.
     #[must_use]
     pub fn widening_for_a_statement(
         &self,
@@ -179,12 +180,12 @@ impl Installation {
         if asks(PluginCapability::NativeBridgeInstall) {
             return added.first().copied();
         }
-        if asks(PluginCapability::CommandIntegrationLaunch) {
-            return added
-                .into_iter()
-                .find(|capability| *capability == PluginCapability::CommandIntegrationLaunch);
-        }
-        None
+        added.into_iter().find(|capability| {
+            matches!(
+                capability,
+                PluginCapability::CommandIntegrationLaunch | PluginCapability::SkillTargetInstall
+            ) && asks(*capability)
+        })
     }
 
     /// What a refused later grant says to do instead, for the capability `added`: the capability
@@ -319,6 +320,67 @@ mod tests {
         );
         installation.enabled = enabled;
         installation
+    }
+
+    fn asking(capabilities: &[PluginCapability], held: &[PluginCapability]) -> Installation {
+        let mut installed = installation(&entry("0.1.0"), true);
+        installed.requested = capabilities
+            .iter()
+            .map(|capability| kr_plugin_sdk::capability::CapabilityRequest {
+                capability: *capability,
+                reason: kr_plugin_sdk::text::Summary::new("a reason").expect("a summary"),
+            })
+            .collect();
+        installed.grant = InstallationGrant::with(held.iter().copied());
+        installed
+    }
+
+    /// A skill target is granted to an installed release only by installing it: a later grant is
+    /// not where the owner is shown the host's reading of what it declares. Withdrawing it, and
+    /// adding some other capability, stay possible, and the integration's rule does not hide it.
+    #[test]
+    fn a_skill_target_is_granted_only_by_installing_it() {
+        let target = PluginCapability::SkillTargetInstall;
+        let launch = PluginCapability::CommandIntegrationLaunch;
+
+        // A release seeded with an empty grant, or narrowed to nothing, cannot be given the target.
+        let seeded = asking(&[target], &[]);
+        assert_eq!(
+            seeded.widening_for_a_statement(&InstallationGrant::with([target])),
+            Some(target)
+        );
+        assert!(
+            seeded
+                .install_requirement(target)
+                .contains("plugin.install")
+        );
+        // The same grant that adds another capability is the grant path's, and a withdrawal is too.
+        assert_eq!(
+            seeded.widening_for_a_statement(&InstallationGrant::with([
+                PluginCapability::MetadataMatch
+            ])),
+            None
+        );
+        let holding = asking(&[target], &[target]);
+        assert_eq!(
+            holding.widening_for_a_statement(&InstallationGrant::none()),
+            None,
+            "a withdrawal"
+        );
+
+        // A release that asks for the integration and the target: the integration's own rule
+        // returned early before, and a grant that adds only the target passed it.
+        let both = asking(&[launch, target], &[launch]);
+        assert_eq!(
+            both.widening_for_a_statement(&InstallationGrant::with([launch, target])),
+            Some(target)
+        );
+        // A release that does not ask for the target is not held to its statement.
+        let other = asking(&[launch], &[launch]);
+        assert_eq!(
+            other.widening_for_a_statement(&InstallationGrant::with([launch, target])),
+            None
+        );
     }
 
     #[test]
