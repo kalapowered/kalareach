@@ -146,6 +146,10 @@ struct Arrangement {
     /// Whether the service is one its owner runs, which is not the managed account service: the
     /// daemon is given no standing for it as the account service, as a shipped daemon is not.
     owner_run: bool,
+    /// Whether the host sits behind a proxy that holds a login, which stops every request to the
+    /// service: the service's address is plain `http`, and no request goes to one through a proxy
+    /// that holds a login.
+    behind_a_stopped_login: bool,
 }
 
 impl Arrangement {
@@ -156,6 +160,7 @@ impl Arrangement {
         selects_the_service: true,
         first_status: None,
         owner_run: false,
+        behind_a_stopped_login: false,
     };
 
     /// The service is one the owner runs.
@@ -247,7 +252,11 @@ impl Rig {
             served.web().fail_token_endpoint(503);
         }
         if arrangement.selects_the_service {
-            write_document(&host, Some(served.origin()));
+            if arrangement.behind_a_stopped_login {
+                write_document_behind_a_login(&host, served.origin());
+            } else {
+                write_document(&host, Some(served.origin()));
+            }
         }
         sign_in(&host, arrangement.token, served.origin()).await;
         let (controller, client_endpoint, serving) =
@@ -775,6 +784,37 @@ fn write_document_selecting(
         kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
     )
     .expect("the document");
+}
+
+/// The proxy the host's document names when the host sits behind a login.
+const PROXY: &str = "https://proxy.example:3128";
+
+/// Writes the configuration document that selects `storage` as the storage service and names a
+/// proxy, and keeps a login for that proxy in the file store the daemon reads.
+fn write_document_behind_a_login(host: &kr_ipc::testing::TempHost, storage: &str) {
+    let environment = host.environment();
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.revision = 1;
+    document.storage.origin = Nullable::some(storage.to_owned());
+    document.network.proxy_url = Nullable::some(PROXY.to_owned());
+    let path = kr_worker::config::document_path(&environment);
+    std::fs::create_dir_all(path.parent().expect("a state directory")).expect("the directory");
+    kr_ipc::paths::write_owner_only_file(
+        &path,
+        kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+    )
+    .expect("the document");
+    let store = open_store_in(&environment.secrets_dir())
+        .expect("the store the daemon keeps its secrets in")
+        .store;
+    let name = kr_controller::service::net::proxy_login::item_name(host.environment_id())
+        .expect("the item's name");
+    store
+        .set(
+            &name,
+            kr_controller::service::net::proxy_login::item_bytes(PROXY, b"user:password").expose(),
+        )
+        .expect("the item is kept");
 }
 
 /// Signs the host in as `token` says, before its daemon starts.
@@ -1555,6 +1595,42 @@ async fn an_account_the_service_turns_away_is_waited_for_as_a_person() {
     assert!(!rig.published(1));
     let (status, detail) = rig.storage_check().await;
     assert_eq!(status, DoctorStatus::Warning, "{detail}");
+}
+
+/// KR-REQ-10.02: a pass that the proxy's login stopped before any request was sent is waited out
+/// by the carrier with no timer: it waits for work, a fence or a person, and the doctor says the
+/// host waits for a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_the_proxy_login_stopped_is_waited_out_with_no_timer() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(
+        Arrangement {
+            behind_a_stopped_login: true,
+            ..Arrangement::NORMAL
+        },
+        Arc::clone(&timer),
+    )
+    .await;
+    let runtime = rig.controller.backup_runtime().expect("a carrier");
+    let mut settled = runtime.waits_with_nothing_standing();
+    rig.admit(1, &[(1, plaintext(2048))]);
+    runtime.wake();
+    tokio::select! {
+        waited = within("a timer or a settled carrier", timer.next_wait()) => {
+            panic!("the carrier set a timer for a stop that no timer mends: {waited:?}");
+        }
+        () = within("the carrier waits with nothing standing", async {
+            settled.wait_for(|settled| *settled).await.expect("the carrier runs");
+        }) => {}
+    }
+    assert!(!rig.published(1));
+    assert_eq!(rig.served.web().requests_to(STATUS), 0, "nothing was sent");
+    let (status, detail) = rig.storage_check().await;
+    assert_eq!(status, DoctorStatus::Warning, "{detail}");
+    assert!(
+        detail.contains("backup waits until the host restarts"),
+        "{detail}"
+    );
 }
 
 /// While the service asks to be left alone, nothing is sent: work that arrives in the meantime

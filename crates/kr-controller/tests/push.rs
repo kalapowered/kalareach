@@ -10162,6 +10162,121 @@ fn a_push_that_went_without_its_detail_does_not_ask_the_mailbox_again() {
     assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
 }
 
+/// A transport whose proxy's login stops every request before it is sent, and that counts the
+/// requests it was asked for.
+#[derive(Debug, Default)]
+struct StoppedByTheLogin {
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl kr_client::services::ServiceHttp for StoppedByTheLogin {
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Err(kr_client::error::ClientError::ProxyLogin(
+                kr_transport::proxy::ProxyLoginKind::Refused,
+            ))
+        })
+    }
+}
+
+/// A mailbox service whose requests the proxy's login stops, attached to the environment: the
+/// service stand-in is never reached, and the transport counts what the placer asked of it.
+fn mailbox_behind_a_stopped_login(
+    environment: &Environment,
+) -> (MailboxService, Arc<StoppedByTheLogin>) {
+    let service = MailboxService::standing(Box::new(|| {}));
+    let transport = Arc::new(StoppedByTheLogin::default());
+    let placer = Arc::new(kr_controller::push::mailbox::MailboxPlacer::new(
+        kr_protocol::service::GatewayOrigin::new(service.web.origin()).expect("an origin"),
+        Arc::new(OneTransport(
+            Arc::clone(&transport) as Arc<dyn kr_client::services::ServiceHttp>
+        )),
+        Arc::new(kr_controller::push::sender::HostSigner::new(
+            kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair"),
+        )),
+        service._runtime.handle().clone(),
+    ));
+    assert!(environment.module.attach_placer(placer as Arc<_>));
+    (service, transport)
+}
+
+/// KR-REQ-10.02: a mailbox request that the proxy's login stopped is held for the host's restart,
+/// and the push does not wait for it: the push goes without its detail in the pass that found it,
+/// its record says the mailbox service was not asked, and no later pass is made for it.
+#[test]
+fn a_detail_the_proxy_login_stopped_is_not_waited_for_and_no_later_pass_asks_for_it() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let (service, transport) = mailbox_behind_a_stopped_login(&environment);
+    queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(
+        gateway.held_at_the_push(),
+        [0],
+        "the push went with no detail"
+    );
+    let (state, detail) = the_notification_is(&environment);
+    assert_eq!(state, DeliveryState::Accepted);
+    assert!(
+        detail.contains("the mailbox service was not asked"),
+        "the record says why: {detail}"
+    );
+    assert_eq!(
+        pass_at(&environment, &gateway, now + 86_400_000),
+        0,
+        "nothing is scheduled for a day"
+    );
+    assert_eq!(service.asked(), 0, "the mailbox service was never reached");
+    assert_eq!(transport.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// KR-REQ-10.02: the host still owes the mailbox the object while the push that refers to it needs
+/// another attempt, and that attempt goes without the detail again, with the same words, and
+/// leaves nothing owed once the push is taken.
+#[test]
+fn a_held_detail_stays_owed_while_the_push_retries_and_is_given_up_with_it() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let (service, _transport) = mailbox_behind_a_stopped_login(&environment);
+    let object = queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over_answering(
+        &service,
+        vec![SendOutcome::NotDispatched {
+            detail: "the gateway could not be reached".to_owned(),
+        }],
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Retrying);
+    assert!(
+        the_object_is_owed(&environment, object),
+        "the object is owed while the push retries"
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now + 10 * 60_000), 1);
+    assert_eq!(gateway.held_at_the_push(), [0, 0], "two pushes, no detail");
+    let (state, detail) = the_notification_is(&environment);
+    assert_eq!(state, DeliveryState::Accepted);
+    assert!(
+        detail.contains("the mailbox service was not asked"),
+        "{detail}"
+    );
+    assert!(
+        !the_object_is_owed(&environment, object),
+        "nothing is owed once the push is taken"
+    );
+    assert_eq!(service.asked(), 0, "the mailbox service was never reached");
+}
+
 /// A recipient authority that moves the clock on when it is asked for the `nth` time, as an
 /// authority that takes a while to answer does.
 #[derive(Debug)]

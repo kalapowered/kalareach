@@ -1027,6 +1027,10 @@ enum Failure {
 }
 
 fn failure_of(error: &ClientError, quiet: &Quiet) -> Failure {
+    // The proxy's login stopped the request before it was sent: the service did not act.
+    if error.stopped_by_proxy_login().is_some() {
+        return Failure::NotActed(ErrorCode::UpstreamUnavailable);
+    }
     if let ClientError::Refused {
         error: refused,
         retry_after_seconds,
@@ -2200,5 +2204,48 @@ mod a_previous_holder_that_is_letting_go {
         kr_flush::release::assert_an_open_succeeds_while_a_holder_maps_the_index(&database, || {
             Record::open(directory.path(), Kept::Nothing).map(drop)
         });
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_transport::proxy::ProxyLoginKind;
+
+    use super::*;
+    use crate::quiet::RealTimer;
+
+    /// KR-REQ-10.02: a request the proxy's login stopped is one the service did not act on, so a
+    /// lease row keeps the time of a request that never left and the owner is not asked; the same
+    /// words in an answer from the host are read as before.
+    #[test]
+    fn kr_req_10_02_a_request_the_proxy_login_stopped_is_one_the_lease_service_did_not_act_on() {
+        let quiet = Quiet::new(Arc::new(RealTimer));
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            let failure = failure_of(&ClientError::ProxyLogin(kind), &quiet);
+            assert_eq!(failure, Failure::NotActed(ErrorCode::UpstreamUnavailable));
+            let Failure::NotActed(code) = failure else {
+                panic!("{kind:?} is not acted on");
+            };
+            assert!(!needs_the_owner(code), "{kind:?}");
+        }
+        // `Needed` is the retry control: the request may have been tried, so it is read as before.
+        assert_eq!(
+            failure_of(&ClientError::ProxyLogin(ProxyLoginKind::Needed), &quiet),
+            Failure::MayHaveActed
+        );
+        assert_eq!(
+            failure_of(
+                &ClientError::Host(kr_protocol::error::ProtocolError::new(
+                    ErrorCode::UpstreamUnavailable,
+                    ProxyLoginKind::Refused.sentence(),
+                )),
+                &quiet
+            ),
+            Failure::MayHaveActed
+        );
     }
 }

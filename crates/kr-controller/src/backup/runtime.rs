@@ -438,6 +438,7 @@ impl Shared {
             .steps
             .iter()
             .any(|step| matches!(step, Stepped::Waiting { .. }));
+        let by_login = report.hold.filter(Hold::waits_for_restart);
         {
             let mut observed = self.observed();
             if let Some(status) = &report.status {
@@ -454,7 +455,12 @@ impl Shared {
             // stopped at a delay did not, and says nothing of what held the work before. A pass
             // that was turned back at its first question carried no work, and what it met is the
             // status refusal above.
-            if account_moved {
+            if let Some(login) = by_login.filter(|_| account_moved) {
+                // The proxy's login is the host's and not an account's: it stopped every request
+                // of the pass, whichever account it was asked for, so the account's change does
+                // not clear it.
+                observed.pass_hold = Some(login);
+            } else if account_moved {
                 // Only the service names a delay, so a delay the pass was given or stopped at
                 // stands whichever account it was asked for. A pass that stopped at a delay with
                 // no hold of its own says nothing of what held the work before. What else the
@@ -497,6 +503,11 @@ impl Shared {
         }
         if progressed && report.hold.is_none() {
             backoff.reset();
+        }
+        if let Some(login) = by_login {
+            // Held before the account is looked at: no wait, and no account, changes what stopped
+            // the request.
+            return self.after(login, backoff);
         }
         if account_moved {
             return Wait::Timed {
@@ -674,6 +685,16 @@ impl Shared {
         // A fence is answered whatever the service asked and whatever token the host holds: ending
         // work in flight is what the host owes, and a request that cannot be signed in is not sent.
         if !fenced {
+            let held = {
+                let observed = self.observed();
+                observed.pass_hold.or(observed.status_refusal)
+            };
+            if held.is_some_and(|hold| hold.waits_for_restart()) {
+                // The proxy's login stopped the last pass's request before it was sent, and it
+                // stops every other until the host restarts: no pass is made, so a release that
+                // is still pending is looked at again on its own timer and nothing else is tried.
+                return Wait::Signals;
+            }
             if let Some(Owed { until, left }) = self.quiet.owed() {
                 return Wait::Owed {
                     until,
