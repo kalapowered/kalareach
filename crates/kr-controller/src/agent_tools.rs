@@ -39,6 +39,7 @@ use crate::catalogue::files::{
     sync_directory, write_atomically,
 };
 use crate::catalogue::native_bridge::json;
+pub(crate) mod declared;
 use crate::error::{ControllerError, Result};
 use crate::given::Recorded;
 
@@ -64,6 +65,16 @@ pub const ENTRY_ARGS: &[&str] = &["agent-tools", "--stdio"];
 /// writes the deadline into the agent's configuration, so it writes the same number into the
 /// environment the agent launches the server with.
 pub const DEADLINE_VARIABLE: &str = "KR_TOOL_DEADLINE_MS";
+
+/// The refusal of a moved place. Its words are approved: the record, then the package.
+const MOVED_PLACE: &str = "the record of {word} at {scope} scope names {recorded place}, and the \
+     package now declares {declared place}; run kr skill remove --agent {word} --scope {scope}, \
+     with --project-dir for a project, and then install again";
+
+/// The refusal of an entry that another record of this host claims with other contents.
+const CLAIMED_DIFFERENTLY: &str = "{path} already holds a server named kalareach, written with \
+     other contents by another installation this host made; remove that installation before \
+     installing this one";
 
 /// What a person does where this host will not rewrite an agent's configuration document.
 const CONFIGURATION_BY_HAND: &str = "add or remove the server with the agent's own command instead";
@@ -110,6 +121,16 @@ impl Deadline {
     const ENVIRONMENT_MILLISECONDS: i64 = QUALIFIED_DEADLINE_SECONDS * 1_000;
 }
 
+/// A claim a record of this host makes on a configuration entry.
+struct Claim {
+    /// The file of the record that makes it.
+    record: PathBuf,
+    /// The digest of the entry the record says it wrote.
+    digest: Digest256,
+    /// True when the record is for a word a package declares.
+    declared: bool,
+}
+
 /// How one agent's configuration document is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
@@ -141,6 +162,12 @@ pub struct Installer {
     records: PathBuf,
     /// The command an agent runs to reach the tools.
     executable: String,
+    /// The skill target the one admitted package that names the requested word declares, which the
+    /// service resolved for this request; none for one of the six compiled words.
+    declared: Option<kr_plugin_sdk::skill_target::SkillTarget>,
+    /// The words an admitted package declares or a record of this host holds, for the sentence that
+    /// lists what the host knows.
+    known: Vec<String>,
 }
 
 impl Installer {
@@ -151,7 +178,47 @@ impl Installer {
             home,
             records,
             executable,
+            declared: None,
+            known: Vec::new(),
         }
+    }
+
+    /// Returns this installer holding the declaration the service resolved for a request, and the
+    /// words the host knows besides the six.
+    #[must_use]
+    pub fn with_declaration(
+        mut self,
+        declared: Option<kr_plugin_sdk::skill_target::SkillTarget>,
+        known: Vec<String>,
+    ) -> Self {
+        self.declared = declared;
+        self.known = known;
+        self
+    }
+
+    /// The words of the records this host holds, which it can still remove whether or not a package
+    /// declares them.
+    #[must_use]
+    pub fn recorded_words(&self) -> Vec<String> {
+        let Ok(listing) = std::fs::read_dir(&self.records) else {
+            return Vec::new();
+        };
+        let mut words: Vec<String> = listing
+            .filter_map(std::result::Result::ok)
+            .filter_map(|entry| entry.file_name().to_str().and_then(record_word))
+            .collect();
+        words.sort();
+        words.dedup();
+        words
+    }
+
+    /// Whether this host holds a record for the request's word and scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error of reading the record.
+    pub fn holds_record(&self, params: &AgentToolsParams) -> Result<bool> {
+        Ok(self.recorded(params)?.is_some())
     }
 
     /// Builds an installer from this process's own surroundings.
@@ -188,6 +255,7 @@ impl Installer {
         // here rather than in a read, so it happens once and under this mutation's own lock.
         self.migrate_records(params)?;
         let existing = self.recorded(params)?;
+        self.moved_place(params, &layout, existing.as_ref())?;
         if let Some(existing) = existing.as_ref()
             && existing.is_complete()
             && self.drift(&existing.manifest)?.is_empty()
@@ -480,14 +548,75 @@ impl Installer {
         )
     }
 
+    /// Refuses an installation of a declared word whose recorded place is not the place the package
+    /// declares now: the skills folder, the document, the entry's key or the entry it wrote.
+    fn moved_place(
+        &self,
+        params: &AgentToolsParams,
+        layout: &Layout,
+        recorded: Option<&InstallationRecord>,
+    ) -> Result<()> {
+        let Some(record) = recorded.filter(|_| params.agent.compiled().is_none()) else {
+            return Ok(());
+        };
+        let declared_root = display(&layout.skills);
+        let declared_document = layout.configuration.as_ref().map(|document| {
+            (
+                display(&document.path),
+                format!("{}.{SERVER_NAME}", document.format.key()),
+                self.planned_entry_digest(document),
+            )
+        });
+        let recorded_document = record.manifest.operations.iter().find_map(|operation| {
+            if let ChangeOperation::AddConfigurationEntry {
+                path,
+                entry,
+                digest,
+                ..
+            } = operation
+            {
+                Some((path.clone(), entry.clone(), *digest))
+            } else {
+                None
+            }
+        });
+        let same = declared_root == record.manifest.root && declared_document == recorded_document;
+        if same {
+            return Ok(());
+        }
+        let place = |root: &str, document: Option<&str>| match document {
+            Some(document) => format!("{root} and {document}"),
+            None => root.to_owned(),
+        };
+        Err(ControllerError::InvalidArgument(
+            MOVED_PLACE
+                .replace("{word}", params.agent.as_str())
+                .replace("{scope}", &params.scope.to_string())
+                .replace(
+                    "{recorded place}",
+                    &place(
+                        &record.manifest.root,
+                        recorded_document.as_ref().map(|found| found.0.as_str()),
+                    ),
+                )
+                .replace(
+                    "{declared place}",
+                    &place(
+                        &declared_root,
+                        declared_document.as_ref().map(|found| found.0.as_str()),
+                    ),
+                ),
+        ))
+    }
+
     /// Reports what is installed, and what no longer matches what was written.
     ///
     /// # Errors
     ///
     /// Returns an error when the record cannot be read.
     pub fn status(&self, params: &AgentToolsParams) -> Result<AgentToolsStatusResult> {
-        let layout = self.layout(params)?;
         let Some(record) = self.recorded(params)? else {
+            let layout = self.layout(params)?;
             return Ok(AgentToolsStatusResult {
                 agent: params.agent.clone(),
                 scope: params.scope,
@@ -819,8 +948,10 @@ impl Installer {
     fn removable(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
         // A removal of something never installed still has to know where it would have been, or it
         // is not the removal of anything in particular.
-        self.layout(params)?;
         let recorded = self.recorded(params)?;
+        if recorded.is_none() {
+            self.layout(params)?;
+        }
         self.removable_from(recorded)
     }
 
@@ -861,13 +992,14 @@ impl Installer {
     pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
         let layout = self.layout(params)?;
         let recorded = self.recorded(params)?;
-        self.check_before_writing(&layout, recorded.as_ref())
+        self.check_before_writing(params, &layout, recorded.as_ref())
     }
 
     /// What an installation that `recorded` describes would not do to the agent's tree, read
     /// from the tree.
     fn check_before_writing(
         &self,
+        params: &AgentToolsParams,
         layout: &Layout,
         recorded: Option<&InstallationRecord>,
     ) -> Result<()> {
@@ -912,6 +1044,7 @@ impl Installer {
         }
         if let Some(configuration) = layout.configuration.as_ref() {
             self.guard_existing(&configuration.path, configuration.format)?;
+            self.refuse_other_claims(params, configuration)?;
             // The container the entry goes into, not only the entry. A document whose server
             // container is something other than a table is refused here rather than after the
             // skill files have been written.
@@ -919,6 +1052,28 @@ impl Installer {
             // The document's own protection, before anything is written. This host's own files
             // carry no such risk: they are its records and the package it wrote.
             guard_access_controls(&configuration.path, CONFIGURATION_BY_HAND)?;
+        }
+        Ok(())
+    }
+
+    /// Refuses to write an entry over one that another record of this host claims with other
+    /// contents, where either installation is for a declared word: the other record would then
+    /// describe an entry that is no longer in the document. Two packages cannot be made to agree
+    /// on one document, so the host compares what each record claims.
+    fn refuse_other_claims(
+        &self,
+        params: &AgentToolsParams,
+        configuration: &Configuration,
+    ) -> Result<()> {
+        let planned = self.planned_entry_digest(configuration);
+        let own = self.record_path(params);
+        let claims = self.claims_on(&configuration.path, configuration.format.key(), Some(&own))?;
+        if claims.iter().any(|claim| {
+            claim.digest != planned && (claim.declared || params.agent.compiled().is_none())
+        }) {
+            return Err(ControllerError::PermissionDenied {
+                detail: CLAIMED_DIFFERENTLY.replace("{path}", &display(&configuration.path)),
+            });
         }
         Ok(())
     }
@@ -995,13 +1150,24 @@ impl Installer {
         digest: &Digest256,
         except: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .claims_on(path, key, except)?
+            .into_iter()
+            .filter(|claim| claim.digest == *digest)
+            .map(|claim| claim.record)
+            .collect())
+    }
+
+    /// Every claim another record of this host makes on the entry under `key` in the document at
+    /// `path`, whatever digest it names, except the record at `except`.
+    fn claims_on(&self, path: &Path, key: &str, except: Option<&Path>) -> Result<Vec<Claim>> {
         let entry_name = format!("{key}.{SERVER_NAME}");
         let listing = match std::fs::read_dir(&self.records) {
             Ok(listing) => listing,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(storage(error)),
         };
-        let mut found = Vec::new();
+        let mut found: Vec<Claim> = Vec::new();
         for entry in listing {
             let entry = entry.map_err(storage)?;
             // Only this host's own installation records, by the name it gives them. A temporary
@@ -1024,26 +1190,27 @@ impl Installer {
             // count, in both directions: a removal must not take an entry another installation may
             // own, and a repair must be able to finish writing the entry it was interrupted
             // writing.
-            let claims = record
+            for operation in record
                 .manifest
                 .operations
                 .iter()
                 .chain(record.pending.iter())
-                .any(|operation| {
-                    matches!(
-                        operation,
-                        ChangeOperation::AddConfigurationEntry {
-                            path: recorded_path,
-                            entry: recorded_entry,
-                            digest: recorded,
-                            ..
-                        } if names_path(recorded_path, path)
-                            && recorded_entry == &entry_name
-                            && recorded == digest
-                    )
-                });
-            if claims {
-                found.push(entry.path());
+            {
+                if let ChangeOperation::AddConfigurationEntry {
+                    path: recorded_path,
+                    entry: recorded_entry,
+                    digest,
+                    ..
+                } = operation
+                    && names_path(recorded_path, path)
+                    && recorded_entry == &entry_name
+                {
+                    found.push(Claim {
+                        record: entry.path(),
+                        digest: *digest,
+                        declared: record.manifest.agent.compiled().is_none(),
+                    });
+                }
             }
         }
         Ok(found)
@@ -1059,10 +1226,9 @@ impl Installer {
         let Some(text) = read_to_string(path)? else {
             return Ok(None);
         };
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "toml")
-        {
+        // The format is the one the recorded key names, whatever the document's file name says: a
+        // declared document may be called anything.
+        if key == Format::CodexToml.key() {
             let document: toml_edit::DocumentMut = text.parse().map_err(|error| {
                 ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
             })?;
@@ -1114,10 +1280,7 @@ impl Installer {
                 params.scope
             )));
         }
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "toml")
-        {
+        if key == Format::CodexToml.key() {
             let text = read_to_string(path)?.unwrap_or_default();
             let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
                 ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
@@ -1204,6 +1367,68 @@ impl Installer {
     }
 
     /// Returns where one agent keeps its skills and its configuration, at this scope.
+    /// The layout a package declares for `params.agent`, from the declaration the service resolved
+    /// for this request.
+    fn declared_layout(
+        &self,
+        params: &AgentToolsParams,
+        project: &dyn Fn() -> Result<PathBuf>,
+    ) -> Result<Layout> {
+        use kr_plugin_sdk::skill_target::{DeadlineUnit, DocumentFormat};
+        use kr_protocol::skill::InstallScope;
+        let Some(target) = self
+            .declared
+            .as_ref()
+            .filter(|target| target.word == params.agent.as_str())
+        else {
+            return Err(ControllerError::InvalidArgument(format!(
+                "{} is not an agent this host knows; it knows {}",
+                params.agent,
+                known_words(&self.known)
+            )));
+        };
+        let (root, location) = match params.scope {
+            InstallScope::User => (self.home.clone(), target.user.as_ref()),
+            InstallScope::Project => (project()?, target.project.as_ref()),
+        };
+        let Some(location) = location else {
+            return Err(ControllerError::InvalidArgument(
+                SCOPE_NOT_DECLARED
+                    .replace("{word}", params.agent.as_str())
+                    .replace("{scope}", &params.scope.to_string()),
+            ));
+        };
+        let skills: Vec<&str> = location
+            .skills
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(SKILL_NAME))
+            .collect();
+        let configuration = location.configuration.as_ref().map(|document| {
+            let path: Vec<&str> = document.path.iter().map(String::as_str).collect();
+            Configuration {
+                path: under(&root, &path),
+                format: match document.format {
+                    DocumentFormat::CodexToml => Format::CodexToml,
+                    DocumentFormat::JsonCommandArgs => Format::JsonCommandArgs,
+                    DocumentFormat::JsonLocalCommandList => Format::JsonLocalCommandList,
+                },
+                shared: document.shared,
+                deadline: document.deadline.as_ref().map(|deadline| Deadline {
+                    field: deadline.field.clone(),
+                    value: match deadline.unit {
+                        DeadlineUnit::Seconds => QUALIFIED_DEADLINE_SECONDS,
+                        DeadlineUnit::Milliseconds => QUALIFIED_DEADLINE_SECONDS * 1_000,
+                    },
+                }),
+            }
+        });
+        Ok(Layout {
+            skills: under(&root, &skills),
+            configuration,
+        })
+    }
+
     fn layout(&self, params: &AgentToolsParams) -> Result<Layout> {
         use kr_protocol::skill::InstallScope::{Project, User};
 
@@ -1220,11 +1445,7 @@ impl Installer {
         };
         let home = &self.home;
         let Some(compiled) = params.agent.compiled() else {
-            return Err(ControllerError::InvalidArgument(format!(
-                "{} is not an agent this host knows; it knows {}",
-                params.agent,
-                known_words()
-            )));
+            return self.declared_layout(params, &project);
         };
         let layout = match (compiled, params.scope) {
             // Codex reads repository and user skills from `.agents/skills`, and scopes servers to
@@ -1693,16 +1914,24 @@ impl Installer {
         params: &AgentToolsParams,
         removal: bool,
     ) -> std::result::Result<(), Declined> {
-        let layout = self.layout(params).map_err(Declined::ByTheRequest)?;
         let recorded = self
             .recorded(params)
             .map_err(|error| Declined::ByARecord(Recorded::read(error)))?;
         if removal {
-            self.removable_from(recorded).map(|_| ())
-        } else {
-            self.check_before_writing(&layout, recorded.as_ref())
+            // A record decides alone: a package that is gone, disabled or no longer declares the
+            // word blocks nothing.
+            if recorded.is_none() {
+                self.layout(params).map_err(Declined::ByTheRequest)?;
+            }
+            return self
+                .removable_from(recorded)
+                .map(|_| ())
+                .map_err(Declined::ByTheRequest);
         }
-        .map_err(Declined::ByTheRequest)
+        let layout = self.layout(params).map_err(Declined::ByTheRequest)?;
+        self.moved_place(params, &layout, recorded.as_ref())
+            .and_then(|()| self.check_before_writing(params, &layout, recorded.as_ref()))
+            .map_err(Declined::ByTheRequest)
     }
 
     /// Commits the dispatch marker, before anything on disk changes.
@@ -2037,17 +2266,42 @@ fn compiled_deadline(agent: CompiledAgent) -> Option<Deadline> {
     })
 }
 
-/// The words of the agents this host knows, as a sentence part.
-fn known_words() -> String {
+/// The words of the agents this host knows, as a sentence part: the six it compiles in, and the
+/// words an admitted package declares or a record of this host holds, where there are any.
+fn known_words(declared: &[String]) -> String {
     let words: Vec<&str> = CompiledAgent::ALL
         .iter()
         .map(|agent| agent.as_str())
         .collect();
-    match words.split_last() {
+    let mut sentence = match words.split_last() {
         Some((last, first)) => format!("{} and {last}", first.join(", ")),
         None => String::new(),
+    };
+    if !declared.is_empty() {
+        sentence.push_str(", and ");
+        sentence.push_str(&declared.join(", "));
     }
+    sentence
 }
+
+/// The word an installation record's file name belongs to, when the name is a record's.
+fn record_word(name: &str) -> Option<String> {
+    if !is_record_name(name) {
+        return None;
+    }
+    let stem = name.strip_suffix(".json")?;
+    let head = match stem.rsplit_once('-') {
+        Some((head, digest)) if is_digest_name(digest) => head,
+        _ => stem,
+    };
+    head.strip_suffix("-user")
+        .or_else(|| head.strip_suffix("-project"))
+        .map(str::to_owned)
+}
+
+/// The refusal of a scope the declaration has no place for.
+const SCOPE_NOT_DECLARED: &str =
+    "{word} declares no place at {scope} scope, so this host installs nothing there for it";
 
 /// Returns `base` with `names` joined onto it one at a time.
 ///
@@ -2062,9 +2316,15 @@ fn under(base: &Path, names: &[&str]) -> PathBuf {
 /// Returns true when a recorded path names `path`.
 ///
 /// Compared as paths, not as text: an earlier build joined two names at a time, so on Windows the
-/// records it wrote spell some paths with both separators.
+/// records it wrote spell some paths with both separators. ASCII case is ignored, because a file
+/// system that does not tell `Mcp.json` from `mcp.json` holds one document under both spellings.
 fn names_path(recorded: &str, path: &Path) -> bool {
-    Path::new(recorded) == path
+    let folded = |path: &Path| -> Vec<String> {
+        path.components()
+            .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+            .collect()
+    };
+    folded(Path::new(recorded)) == folded(path)
 }
 
 /// The files an installation writes, in the order it writes them.
@@ -3292,6 +3552,367 @@ mod tests {
         let two = read_record(&record(2)).expect("version 2 is read");
         assert_eq!(one.manifest, two.manifest);
         assert!(read_record(&record(INSTALLATION_RECORD_VERSION + 1)).is_err());
+    }
+
+    /// A skill target as a package declares it, for the cases of a declared word.
+    fn declared(
+        configuration: Option<Value>,
+        skills: &[&str],
+    ) -> kr_plugin_sdk::skill_target::SkillTarget {
+        let mut user = json!({ "skills": skills });
+        if let Some(configuration) = configuration {
+            user["configuration"] = configuration;
+        }
+        serde_json::from_value(json!({ "word": "amp", "user": user })).expect("a target")
+    }
+
+    fn amp() -> AgentTarget {
+        AgentTarget::parse("amp").expect("a word")
+    }
+
+    /// KR-REQ-11.01: an installation for a declared word writes the core's three files with the
+    /// digests this binary carries and one entry whose command and arguments are the host's, in each
+    /// of the three formats, whatever the package says.
+    #[test]
+    fn an_installation_for_a_declared_word_writes_the_cores_files_and_one_entry() {
+        for (format, document, found) in [
+            ("json_command_args", "mcp.json", "mcpServers"),
+            ("json_local_command_list", "mcp.json", "mcp"),
+            ("codex_toml", "config.toml", "mcp_servers"),
+        ] {
+            let tree = Tree::create();
+            let target = declared(
+                Some(json!({ "path": [".amp", document], "format": format, "shared": false })),
+                &[".amp", "skills"],
+            );
+            let installer = tree
+                .installer()
+                .with_declaration(Some(target), vec!["amp".to_owned()]);
+            let installed = installer
+                .install(&params(amp(), InstallScope::User))
+                .expect("a declared word installs");
+            assert!(!installed.already_installed);
+            let skill = tree.home().join(".amp/skills").join(SKILL_NAME);
+            for (name, contents) in files() {
+                assert_eq!(
+                    std::fs::read(skill.join(name)).expect("a file"),
+                    contents.as_bytes(),
+                    "{format}: {name}"
+                );
+            }
+            let text = std::fs::read_to_string(tree.home().join(".amp").join(document))
+                .expect("the document");
+            if format == "codex_toml" {
+                let parsed: toml_edit::DocumentMut = text.parse().expect("TOML");
+                let entry = &parsed[found][SERVER_NAME];
+                assert_eq!(entry["command"].as_str(), Some("/opt/kalareach/kr"));
+                let arguments: Vec<&str> = entry["args"]
+                    .as_array()
+                    .expect("arguments")
+                    .iter()
+                    .filter_map(toml_edit::Value::as_str)
+                    .collect();
+                assert_eq!(arguments, ["agent-tools", "--stdio"]);
+            } else {
+                let parsed: Value = serde_json::from_str(&text).expect("JSON");
+                let entry = &parsed[found][SERVER_NAME];
+                if format == "json_command_args" {
+                    assert_eq!(entry["command"], "/opt/kalareach/kr");
+                    assert_eq!(entry["args"], json!(["agent-tools", "--stdio"]));
+                } else {
+                    assert_eq!(
+                        entry["command"],
+                        json!(["/opt/kalareach/kr", "agent-tools", "--stdio"])
+                    );
+                }
+            }
+        }
+    }
+
+    /// KR-REQ-11.01: a declared deadline writes the field and the environment value, in either
+    /// unit, and a configuration with none, a shared document and the command-list form write
+    /// neither.
+    #[test]
+    fn a_declared_deadline_writes_the_field_and_the_environment_value_and_none_without_one() {
+        let installed = |configuration: Value| -> String {
+            let tree = Tree::create();
+            let target = declared(Some(configuration), &[".amp", "skills"]);
+            tree.installer()
+                .with_declaration(Some(target), Vec::new())
+                .install(&params(amp(), InstallScope::User))
+                .expect("installs");
+            std::fs::read_to_string(tree.home().join(".amp/mcp.json")).expect("the document")
+        };
+        let seconds = installed(json!({
+            "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false,
+            "deadline": { "field": "timeout", "unit": "seconds" }
+        }));
+        let parsed: Value = serde_json::from_str(&seconds).expect("JSON");
+        assert_eq!(parsed["mcpServers"]["kalareach"]["timeout"], 660);
+        assert_eq!(
+            parsed["mcpServers"]["kalareach"]["env"][DEADLINE_VARIABLE],
+            "660000"
+        );
+        let milliseconds = installed(json!({
+            "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false,
+            "deadline": { "field": "timeout", "unit": "milliseconds" }
+        }));
+        let parsed: Value = serde_json::from_str(&milliseconds).expect("JSON");
+        assert_eq!(parsed["mcpServers"]["kalareach"]["timeout"], 660_000);
+        let none = installed(json!({
+            "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false
+        }));
+        assert!(
+            !none.contains("timeout") && !none.contains(DEADLINE_VARIABLE),
+            "{none}"
+        );
+        let shared = installed(json!({
+            "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": true
+        }));
+        assert!(
+            !shared.contains("timeout") && !shared.contains(DEADLINE_VARIABLE),
+            "{shared}"
+        );
+    }
+
+    /// KR-REQ-11.01: status and a removal read the record, so a package that is gone or no longer
+    /// declares the word blocks neither; an installation for a place the package no longer declares
+    /// is refused by name, and the removal by the record still works.
+    #[test]
+    fn a_record_for_another_place_is_refused_by_name_and_removed_by_its_record() {
+        let tree = Tree::create();
+        let document =
+            json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false });
+        let first = declared(Some(document.clone()), &[".amp", "skills"]);
+        tree.installer()
+            .with_declaration(Some(first), Vec::new())
+            .install(&params(amp(), InstallScope::User))
+            .expect("installs");
+
+        // No package declares the word any more: status and removal read the record.
+        let gone = tree.installer();
+        let status = gone
+            .status(&params(amp(), InstallScope::User))
+            .expect("status");
+        assert!(status.installed, "the record answers with no package");
+
+        // The package moved the place: an installation is refused, naming both places.
+        let moved = declared(Some(document), &[".amp", "other"]);
+        let refused = tree
+            .installer()
+            .with_declaration(Some(moved), Vec::new())
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a moved place is refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains("the record of amp at user scope names")
+                && message.contains("and the package now declares")
+                && message.contains("run kr skill remove --agent amp --scope user"),
+            "{message}"
+        );
+
+        let removed = gone
+            .remove(&params(amp(), InstallScope::User))
+            .expect("removes");
+        assert!(
+            !removed.removed.is_empty(),
+            "the record is what the removal works from"
+        );
+        assert!(!tree.home().join(".amp/skills").join(SKILL_NAME).exists());
+    }
+
+    /// KR-REQ-11.01: a word no package declares is refused with the words the host knows, which
+    /// include a word a record holds; a declaration that names a compiled word is never served over
+    /// the compiled layout, and two packages that declare one word serve neither.
+    #[test]
+    fn a_word_is_served_only_by_exactly_one_declaring_package() {
+        use declared::{Declaration, Pick, pick};
+        let declaration = |word: &str| Declaration {
+            target: serde_json::from_value(json!({ "word": word, "user": { "skills": [".x"] } }))
+                .expect("a target"),
+        };
+        let one = [declaration("amp")];
+        assert!(matches!(pick("amp", &one), Pick::One(_)));
+        assert!(matches!(pick("other", &one), Pick::Nobody));
+        let two = [declaration("amp"), declaration("amp")];
+        assert!(matches!(pick("amp", &two), Pick::Taken));
+        assert_eq!(
+            declared::served("amp", &two).expect_err("two packages"),
+            "amp is named by more than one package this host admits, so it installs for none of them"
+        );
+        assert!(
+            declared::served("amp", &one)
+                .expect("one package")
+                .is_some()
+        );
+        let compiled = [declaration("codex")];
+        assert!(matches!(pick("codex", &compiled), Pick::Compiled));
+
+        let tree = Tree::create();
+        let refused = tree
+            .installer()
+            .with_declaration(None, vec!["amp".to_owned()])
+            .install(&params(
+                AgentTarget::parse("zed").expect("a word"),
+                InstallScope::User,
+            ))
+            .expect_err("an unknown word");
+        assert_eq!(
+            refused.to_string(),
+            "zed is not an agent this host knows; it knows codex, claude-code, opencode, gemini-cli, \
+             kimi-code-cli and qoder-cli, and amp"
+        );
+    }
+
+    /// KR-REQ-11.01: an entry that another record of this host claims with other contents is not
+    /// replaced, though the package that declared the other record's word is gone; nothing is
+    /// written, and the document keeps the first installation's entry.
+    #[test]
+    fn an_entry_another_record_claims_differently_is_not_replaced_when_its_package_is_gone() {
+        let tree = Tree::create();
+        let document = |deadline: Option<Value>| {
+            let mut found = json!({
+                "path": [".shared", "mcp.json"], "format": "json_command_args", "shared": false
+            });
+            if let Some(deadline) = deadline {
+                found["deadline"] = deadline;
+            }
+            found
+        };
+        tree.installer()
+            .with_declaration(
+                Some(declared(Some(document(None)), &[".amp", "skills"])),
+                Vec::new(),
+            )
+            .install(&params(amp(), InstallScope::User))
+            .expect("the first installs");
+        let path = tree.home().join(".shared/mcp.json");
+        let before = std::fs::read(&path).expect("the document");
+        let mut other = declared(
+            Some(document(Some(
+                json!({ "field": "timeout", "unit": "seconds" }),
+            ))),
+            &[".bmp", "skills"],
+        );
+        other.word = "bmp".to_owned();
+        let refused = tree
+            .installer()
+            .with_declaration(Some(other), Vec::new())
+            .install(&params(
+                AgentTarget::parse("bmp").expect("a word"),
+                InstallScope::User,
+            ))
+            .expect_err("a different claim is refused");
+        let ControllerError::PermissionDenied { detail } = refused else {
+            panic!("a refusal by name: {refused}");
+        };
+        assert!(
+            detail.contains("already holds a server named kalareach, written with other contents by another installation this host made"),
+            "{detail}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the document"),
+            before,
+            "the entry is kept"
+        );
+        assert!(
+            !tree.home().join(".bmp").exists(),
+            "nothing is written for the second word"
+        );
+    }
+
+    /// KR-REQ-11.01: the entry is read back and removed by the key the record names, whatever the
+    /// document's file name says, in each of the three formats.
+    #[test]
+    fn an_entry_is_read_back_by_its_recorded_key_whatever_the_file_name() {
+        for (format, name) in [
+            ("codex_toml", "servers.json"),
+            ("json_command_args", "servers.toml"),
+            ("json_local_command_list", "servers.toml"),
+        ] {
+            let tree = Tree::create();
+            let target = declared(
+                Some(json!({ "path": [".amp", name], "format": format, "shared": false })),
+                &[".amp", "skills"],
+            );
+            let installer = tree.installer().with_declaration(Some(target), Vec::new());
+            let request = params(amp(), InstallScope::User);
+            installer.install(&request).expect("installs");
+            let again = installer.install(&request).expect("installs again");
+            assert!(
+                again.already_installed,
+                "{format} in {name}: the entry reads back as written"
+            );
+            let removed = installer.remove(&request).expect("removes");
+            assert!(
+                removed.removed.iter().any(|operation| matches!(
+                    operation,
+                    ChangeOperation::AddConfigurationEntry { .. }
+                )),
+                "{format} in {name}: {:?}",
+                removed.retained
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: admissions that moved while the packages were read, or a revision that could
+    /// not be read again, refuse the request before the dispatch marker; the same revision passes.
+    #[test]
+    fn a_changed_admission_revision_refuses_before_the_marker() {
+        assert_eq!(declared::admissions_held(7, Some(7)), Ok(()));
+        let refusal =
+            "the packages this host admits changed while this request was read; ask again";
+        assert_eq!(declared::admissions_held(7, Some(8)), Err(refusal));
+        assert_eq!(declared::admissions_held(7, None), Err(refusal));
+    }
+
+    /// KR-REQ-11.01: a package that now declares another entry key or another entry for the same
+    /// place moves the place, so the installation is refused by name and nothing is written.
+    #[test]
+    fn a_moved_entry_key_or_digest_is_a_moved_place() {
+        let tree = Tree::create();
+        let document = |format: &str, deadline: Option<Value>| {
+            let mut found =
+                json!({ "path": [".amp", "mcp.json"], "format": format, "shared": false });
+            if let Some(deadline) = deadline {
+                found["deadline"] = deadline;
+            }
+            found
+        };
+        tree.installer()
+            .with_declaration(
+                Some(declared(
+                    Some(document("json_command_args", None)),
+                    &[".amp", "skills"],
+                )),
+                Vec::new(),
+            )
+            .install(&params(amp(), InstallScope::User))
+            .expect("installs");
+        let before = std::fs::read(tree.home().join(".amp/mcp.json")).expect("the document");
+        for moved in [
+            document("json_local_command_list", None),
+            document(
+                "json_command_args",
+                Some(json!({ "field": "timeout", "unit": "seconds" })),
+            ),
+        ] {
+            let refused = tree
+                .installer()
+                .with_declaration(Some(declared(Some(moved), &[".amp", "skills"])), Vec::new())
+                .install(&params(amp(), InstallScope::User))
+                .expect_err("a moved entry is refused");
+            let message = refused.to_string();
+            assert!(
+                message.contains("the record of amp at user scope names")
+                    && message.contains("run kr skill remove --agent amp --scope user"),
+                "{message}"
+            );
+        }
+        assert_eq!(
+            std::fs::read(tree.home().join(".amp/mcp.json")).expect("the document"),
+            before
+        );
     }
 
     /// A retained installation action names the format it is written in, and one of a later format
