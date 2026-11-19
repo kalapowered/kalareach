@@ -75,6 +75,7 @@ use kr_protocol::scalars::{
     AuthorisationKey, Digest256, EndpointKey, Nonce256, Nullable, Signature64, TimestampMs, U64,
 };
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
+use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 use serde::{Deserialize, Serialize};
 
 use super::ServiceFuture;
@@ -116,6 +117,27 @@ pub const RELAY_LEASE_PATH: &str = "/api/relay/lease";
 /// The path a revocation request is addressed to.
 pub const RELAY_LEASE_REVOKE_PATH: &str = "/api/relay/lease/revoke";
 
+/// The latest moment a request may still be written, on a continuous clock.
+///
+/// A request that is held past it is not sent: the caller asked for it to go out within a limit,
+/// and a late request could be one the caller no longer accounts for.
+#[derive(Clone, Debug)]
+pub struct SendGate {
+    /// The first instant at which the request is no longer sent.
+    pub by: ContinuousInstant,
+    /// The clock `by` is read on. It is the clock the caller took `by` from, so the two compare.
+    pub clock: Arc<dyn ContinuousClock>,
+}
+
+impl SendGate {
+    /// Whether the limit has been reached. A limit that is reached at the instant it names is
+    /// passed, so a window of zero sends nothing.
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.clock.now() >= self.by
+    }
+}
+
 /// One HTTP exchange, as the embedder performs it.
 ///
 /// What an implementation owes this client, because the answers above are read on these terms:
@@ -150,6 +172,29 @@ pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
         body: &'a [u8],
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer>;
+
+    /// Posts a JSON body unless `gate` has passed, and returns what came back, or `None` when
+    /// nothing was sent because the gate had passed.
+    ///
+    /// The check is the last step before the request is written. This default checks the gate and
+    /// calls [`Self::post_json`]. An implementation that does work of its own before it writes, such
+    /// as building a connection or waiting for a lock, overrides it so that the check follows that
+    /// work. A transport that wraps another forwards this method to it: the default would check the
+    /// gate before the wrapped transport's own work.
+    fn post_json_by<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+        gate: &'a SendGate,
+    ) -> ServiceFuture<'a, Option<ServiceHttpAnswer>> {
+        Box::pin(async move {
+            if gate.passed() {
+                return Ok(None);
+            }
+            self.post_json(url, body, headers).await.map(Some)
+        })
+    }
 
     /// Posts content that is not a JSON document, and returns what came back.
     ///

@@ -92,8 +92,8 @@ pub use crate::interpret::{
     VerifiedApprovalAnswer,
 };
 pub use crate::seams::{
-    ActionSubmitter, Admission, ContextItem, ContextRequest, ContextSource, Fence, GatheredContext,
-    HostReceipt, Replaced, Revoked, SelectedItem, Unbounded, VoiceAuthority, VoiceFuture,
-    WithheldRun,
+    ActionSubmitter, Admission, AfterDeferred, BrokerEffect, ContextItem, ContextRequest,
+    ContextSource, Fence, GatheredContext, HostReceipt, Replaced, Revoked, SelectedItem, Unbounded,
+    VoiceAuthority, VoiceFuture, WithheldRun,
 };
 pub use crate::session::{NewVoiceSession, VoiceSessionRecord, VoiceSessions};
