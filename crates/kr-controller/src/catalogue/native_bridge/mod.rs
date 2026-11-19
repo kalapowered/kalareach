@@ -2711,12 +2711,6 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
         .iter()
         .map(|placed| placed.tail.as_str())
         .collect();
-    // Only the key of the label that has one: a placement for another label adds no key.
-    let enabling = (recipe.application.as_str() == "Claude Code").then_some((
-        "settings.json",
-        "enabledPlugins.",
-        "@skills-dir",
-    ));
     let last = record_kept_last(recipe.application.as_str(), area);
     let application = &recipe.application;
     let mut name: Option<&str> = None;
@@ -2795,14 +2789,13 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
     }
     for step in &recipe.install {
         if let BridgeStep::AddConfigurationKey { file, key, value } = step {
-            let enabled = enabling.is_some_and(|(document, prefix, suffix)| {
-                file.as_str() == document
-                    && value == "true"
-                    && key
-                        .strip_prefix(prefix)
-                        .and_then(|rest| rest.strip_suffix(suffix))
-                        .is_some_and(|enabled| plain_name(enabled) && Some(enabled) == name)
-            });
+            // The one key of the label that has one, by the rule the package check and the
+            // installation statement hold: a placement for another label adds no key.
+            let enabled = name
+                .and_then(|folder| Placement::enabling_key(recipe.application.as_str(), folder))
+                .is_some_and(|enabling| {
+                    file.as_str() == enabling.file && *key == enabling.key && value == enabling.value
+                });
             if !enabled {
                 return Err(format!(
                     "the recipe adds the key {key} to {file}, which this host does not permit a \
