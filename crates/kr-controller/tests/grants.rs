@@ -947,6 +947,7 @@ fn a_claimed_revocation_writes_what_it_withdrew_beside_its_claim() {
     directory
         .revoke_claimed(
             parent.grant_id,
+            kr_controller::grants::Scope::Host,
             4_000,
             || {
                 Err(kr_controller::error::ControllerError::PermissionDenied {
@@ -967,11 +968,23 @@ fn a_claimed_revocation_writes_what_it_withdrew_beside_its_claim() {
 
     let (revoked, hold) = claimed(0x11);
     directory
-        .revoke_claimed(parent.grant_id, 4_100, || Ok(()), Some(&hold))
+        .revoke_claimed(
+            parent.grant_id,
+            kr_controller::grants::Scope::Host,
+            4_100,
+            || Ok(()),
+            Some(&hold),
+        )
         .expect("withdrawn");
     // One claim, one withdrawal: a second under the same claim is refused, and withdraws nothing.
     directory
-        .revoke_claimed(other.grant_id, 4_200, || Ok(()), Some(&hold))
+        .revoke_claimed(
+            other.grant_id,
+            kr_controller::grants::Scope::Host,
+            4_200,
+            || Ok(()),
+            Some(&hold),
+        )
         .expect_err("the claim already records a withdrawal");
     drop(hold);
     assert_eq!(
@@ -4690,6 +4703,7 @@ async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled
         .grants()
         .revoke_claimed(
             parent.grant_id,
+            kr_controller::grants::Scope::Host,
             kr_ipc::now_ms().get(),
             || Ok(()),
             Some(&hold),
@@ -4808,6 +4822,7 @@ async fn an_unfinished_revocation_pays_the_fence_it_still_owes_before_it_is_answ
         .grants()
         .revoke_claimed(
             parent.grant_id,
+            kr_controller::grants::Scope::Host,
             kr_ipc::now_ms().get(),
             || Ok(()),
             Some(&hold),
@@ -5974,4 +5989,139 @@ fn issuing_and_revoking_one_subtree_at_once_leaves_a_consistent_store() {
             "a child that is not in the store was refused"
         ),
     }
+}
+
+/// Raw SQL against the host's registry, past what the store's own writers take.
+fn registry_statement(host: &Serving, sql: &str) {
+    let registry = rusqlite::Connection::open(host.temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    registry.execute_batch(sql).expect("the statement runs");
+}
+
+fn key_literal(grant_id: GrantId) -> String {
+    let hex: String = grant_id
+        .get()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("X'{hex}'")
+}
+
+/// A device's revocation through the `device.revoke` method, with the admission a real caller
+/// carries: the answer, or the daemon's refusal.
+async fn device_revoke_method(
+    host: &Serving,
+    action: u8,
+    device: DeviceId,
+) -> Result<kr_protocol::sharing::RevocationResult, kr_protocol::error::ProtocolError> {
+    let mut client = host.client().await;
+    let mutation = client
+        .compose(
+            Method::DeviceRevoke,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([action; 16])),
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::DeviceRevokeParams { device_id: device },
+        )
+        .await
+        .expect("the revocation is composed");
+    client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .map(|value| value.to_typed().expect("a revocation result"))
+}
+
+/// A device whose only grants row cannot be read is revoked by the `device.revoke` method: the
+/// grants transaction marks the row and writes its debt, which counts as a withdrawal, so the
+/// admission is not asked again after a fence is already published, and the device's record is
+/// marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_only_row_is_damaged_is_revoked_through_the_device_revoke_method() {
+    let host = Serving::start().await;
+    let device = device_id(0xd7);
+    host.controller
+        .devices()
+        .commit(&paired_record(device))
+        .expect("a paired device");
+    let held = Grant {
+        recipient_device_id: device,
+        ..grant(0x48, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    host.controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    registry_statement(
+        &host,
+        &format!(
+            "UPDATE grants SET grant = X'00' WHERE grant_id = {};",
+            key_literal(held.grant_id)
+        ),
+    );
+    device_revoke_method(&host, 0x71, device)
+        .await
+        .expect("a row that cannot be read does not stop the revocation");
+    let record = host
+        .controller
+        .devices()
+        .record_for_device(device)
+        .expect("the directory reads")
+        .expect("the device is recorded");
+    assert!(record.revoked_at_ms.is_some(), "the device is revoked");
+}
+
+/// The device's readable grant is withdrawn and another device's damaged row is marked revoked,
+/// in the one call, with the admission the method carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_revoke_beside_another_devices_damaged_row_withdraws_the_grant_and_marks_the_row()
+{
+    let host = Serving::start().await;
+    let device = device_id(0xd8);
+    host.controller
+        .devices()
+        .commit(&paired_record(device))
+        .expect("a paired device");
+    let held = Grant {
+        recipient_device_id: device,
+        ..grant(0x49, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    let other = Grant {
+        recipient_device_id: device_id(0xd9),
+        ..grant(0x4a, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    for row in [&held, &other] {
+        host.controller
+            .sharing()
+            .grants()
+            .issue(&record(row.clone()), || Ok(()))
+            .expect("written");
+    }
+    registry_statement(
+        &host,
+        &format!(
+            "UPDATE grants SET parent_grant_id = X'00' WHERE grant_id = {};",
+            key_literal(other.grant_id)
+        ),
+    );
+    let answer = device_revoke_method(&host, 0x72, device)
+        .await
+        .expect("the revocation is not stopped by another device's row");
+    assert!(answer.revoked_grants.contains(&held.grant_id));
+    let marked: bool = rusqlite::Connection::open(host.temp.environment().registry_database())
+        .expect("opens the registry")
+        .query_row(
+            &format!(
+                "SELECT revoked_at_ms IS NOT NULL FROM grants WHERE grant_id = {}",
+                key_literal(other.grant_id)
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .expect("the row reads");
+    assert!(marked, "the damaged row is marked revoked");
 }
