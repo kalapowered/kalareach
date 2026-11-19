@@ -1515,6 +1515,85 @@ async fn a_closure_on_a_channel_a_fence_overtook_is_read_before_the_channel_is_l
     world.provider.registry().unfence();
 }
 
+/// A mute the provider refused took no effect: the recovery's probe does not restate it.
+#[tokio::test(start_paused = true)]
+async fn a_mute_the_provider_refused_is_not_restated_by_the_recovery() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world.stand_in.acknowledge(false);
+    let mute = VoiceContextFrame::new("m-1", VoiceCommand::Mute, None, None).expect("a frame");
+    assert_eq!(control.write(control.revision(), mute).await, Ok(()));
+    world.stand_in.event(&json!({
+        "type": "error",
+        "event_id": "e",
+        "error": { "client_event_id": "m-1", "type": "invalid_request_error", "message": "refused" },
+    }));
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    world.stand_in.acknowledge(true);
+    world.stand_in.drop_socket();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Ready);
+    assert_eq!(control.revision(), 2);
+    let commands = world.stand_in.recorded().commands;
+    let probe = commands.last().expect("the probe of the reattachment");
+    assert_eq!(
+        probe["type"],
+        json!("session.input_audio.unmute"),
+        "the refused mute is not restated"
+    );
+}
+
+/// A fence that comes while a reattachment waits for its turn stops it before it attaches: a task
+/// of an older epoch attaches nothing, and the call is hung up.
+#[tokio::test(start_paused = true)]
+async fn a_fence_that_comes_while_a_reattachment_waits_for_its_pace_stops_it_before_it_attaches() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    tokio::time::advance(Duration::from_secs(6)).await;
+    let thinking = |id: &str| {
+        VoiceContextFrame::new(id, VoiceCommand::Thinking, None, Some("x".to_owned()))
+            .expect("a frame")
+    };
+    let mut written = 0;
+    while control
+        .write(1, thinking(&format!("w-{written}")))
+        .await
+        .is_ok()
+    {
+        written += 1;
+    }
+    world.stand_in.drop_socket();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Recovering);
+    let asked = world.stand_in.recorded().attaches_asked;
+    let fenced = world.provider.registry().fence().expect("a fence");
+    tokio::time::advance(Duration::from_secs(5)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        world.stand_in.recorded().attaches_asked,
+        asked,
+        "a task of an older epoch attaches nothing"
+    );
+    assert_eq!(
+        world.stand_in.recorded().hangups.len(),
+        1,
+        "the call is hung up instead"
+    );
+    let _ = fenced;
+    world.provider.registry().unfence();
+}
+
 /// A reattachment writes its probe under the call's one pace: after a burst it waits for its
 /// turn, and writes nothing until then.
 #[tokio::test(start_paused = true)]

@@ -1869,6 +1869,15 @@ impl CallTask {
                     .or_else(|| value.get("client_event_id"))
                     .and_then(Value::as_str);
                 if let Some(id) = id {
+                    // A mute or an unmute the provider refused took no effect: the recovery does
+                    // not restate it.
+                    if self
+                        .mute_asked
+                        .as_ref()
+                        .is_some_and(|(asked, _)| asked == id)
+                    {
+                        self.mute_asked = None;
+                    }
                     self.shared.emit(HostCallEvent::WriteRefused {
                         write_id: id.to_owned(),
                     });
@@ -2085,7 +2094,7 @@ impl CallTask {
             // closure may have come while the write waited. Only a close that was written is
             // waited on for the answer.
             let drained = if sent {
-                let answered = tokio::time::timeout(DRAIN_BOUND, async {
+                tokio::time::timeout(DRAIN_BOUND, async {
                     loop {
                         match self.socket_next().await {
                             SocketRead::Closed => return false,
@@ -2097,13 +2106,8 @@ impl CallTask {
                         }
                     }
                 })
-                .await;
-                match answered {
-                    Ok(closed) => closed,
-                    // The wait ran out: what the channel holds in its last moment is read before
-                    // the call is hung up.
-                    Err(_) => self.read_queued().await,
-                }
+                .await
+                .unwrap_or(false)
             } else {
                 self.read_queued().await
             };
