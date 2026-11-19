@@ -1,6 +1,62 @@
 //! What the control daemon can fail with, and the protocol code each failure is reported under.
 
 use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::ids::GrantId;
+
+/// What is wrong with a grants row this build cannot read, in the order the reader finds it: the
+/// first fault is the class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DamageClass {
+    /// A column holds a value of another type than the column's; the field is the column's name.
+    ColumnOfAnotherType(&'static str),
+    /// The grant record in the row does not decode.
+    RecordDoesNotDecode,
+    /// The row's key is not the identifier of the grant it holds.
+    KeyNamesAnotherGrant,
+    /// The recipient column is not the recipient the record names.
+    RecipientColumnDisagrees,
+    /// The parent column is not the parent the record names.
+    ParentColumnDisagrees,
+}
+
+impl DamageClass {
+    /// The fault in a few words, as the doctor and the repair name it.
+    #[must_use]
+    pub fn phrase(self) -> &'static str {
+        match self {
+            Self::ColumnOfAnotherType(_) => "a column holds a value of the wrong type",
+            Self::RecordDoesNotDecode => "its record does not decode",
+            Self::KeyNamesAnotherGrant => "its key does not name the grant it holds",
+            Self::RecipientColumnDisagrees => "its recipient column does not match its record",
+            Self::ParentColumnDisagrees => "its parent column does not match its record",
+        }
+    }
+
+    /// The code a row of this class is reported under: a column of another type is a storage
+    /// fault, every other class an invalid stored value.
+    #[must_use]
+    pub fn code(self) -> ErrorCode {
+        match self {
+            Self::ColumnOfAnotherType(_) => ErrorCode::StorageUnavailable,
+            _ => ErrorCode::InvalidArgument,
+        }
+    }
+}
+
+/// The sentence a grants row that cannot be read is refused with.
+fn grants_row_sentence(key: Option<GrantId>, class: DamageClass, detail: Option<&str>) -> String {
+    let whose = key.map_or_else(|| "with a malformed key".to_owned(), |key| key.to_string());
+    let why = match class {
+        DamageClass::RecordDoesNotDecode => {
+            detail.unwrap_or("its record does not decode").to_owned()
+        }
+        DamageClass::ColumnOfAnotherType(column) => {
+            format!("its {column} column holds a value of the wrong type")
+        }
+        other => other.phrase().to_owned(),
+    };
+    format!("the grants row of grant {whose} cannot be read: {why}")
+}
 
 /// A control-daemon failure.
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +175,16 @@ pub enum ControllerError {
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
+    /// A grants row this build cannot read.
+    #[error("{}", grants_row_sentence(*.key, *.class, .detail.as_deref()))]
+    GrantRowDamaged {
+        /// The row's key, when it is an identifier.
+        key: Option<GrantId>,
+        /// What is wrong with the row.
+        class: DamageClass,
+        /// The decoder's own words, for a record that does not decode.
+        detail: Option<String>,
+    },
     /// A file this daemon had to read or write could not be reached.
     #[error("could not {operation}: {detail}")]
     Storage {
@@ -369,12 +435,29 @@ impl ControllerError {
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::NotListed { .. } | Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
             Self::InvalidArgument(_) | Self::Configuration(_) => ErrorCode::InvalidArgument,
+            Self::GrantRowDamaged { class, .. } => class.code(),
             Self::Uncertain { .. } => ErrorCode::OutcomeUnknown,
             Self::ClockUntrusted { .. } => ErrorCode::ClockUntrusted,
             Self::Refused { code, .. } => *code,
             Self::ShellIntegrationUnsupported(_) => ErrorCode::ShellIntegrationUnsupported,
             Self::Ipc(error) | Self::SessionDirectory(error) => error.code(),
             Self::NotConfigured(_) => ErrorCode::HostNotConfigured,
+        }
+    }
+
+    /// Whether this refusal is a grants row this build cannot read, also behind an effect.
+    #[must_use]
+    pub fn is_a_damaged_grants_row(&self) -> bool {
+        self.damage_class().is_some()
+    }
+
+    /// The class of the grants row this refusal names, also behind an effect.
+    #[must_use]
+    pub fn damage_class(&self) -> Option<DamageClass> {
+        match self {
+            Self::GrantRowDamaged { class, .. } => Some(*class),
+            Self::AfterAnEffect { refusal, .. } => refusal.damage_class(),
+            _ => None,
         }
     }
 
