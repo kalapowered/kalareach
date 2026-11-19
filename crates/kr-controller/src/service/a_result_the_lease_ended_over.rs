@@ -572,6 +572,36 @@ async fn a_reply_read_from_a_record_is_not_written_when_the_lease_ends_after_it_
     }
 }
 
+/// KR-REQ-17.54: the question a record asks again of the lease its caller was found under copies the
+/// bound's published snapshot before it reads a clock, so the clocks it decides on are newer than
+/// the copy, which can wait. A lease that ends right after the copy is read as ended. The control:
+/// where the lease still stands after the copy, it serves the confirmation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_asked_again_in_a_record_reads_its_clocks_after_the_bound_is_copied() {
+    use kr_protocol::confirmation::ConfirmationDisplay;
+
+    for ends in [false, true] {
+        let (_temp, controller, continuous, _writer, _reader) = connected_under_a_lease().await;
+        let actor = kr_protocol::ids::ActorId::new("local:501").expect("an actor");
+        let caller = controller.local_caller(&actor);
+        let outside_the_recovery_set = ConfirmationDisplay::ExclusiveManagement {
+            exclusive: true,
+            organisation_ids: Vec::new(),
+        };
+        if ends {
+            crate::grants::policy::publishing::stop_after_a_copy(move || {
+                continuous.advance(std::time::Duration::from_secs(16 * 60));
+            });
+        }
+        let served = caller.lease_serves(&outside_the_recovery_set);
+        assert_eq!(
+            served.is_err(),
+            ends,
+            "a lease that ended right after the copy: {ends}: {served:?}"
+        );
+    }
+}
+
 /// KR-REQ-17.54: the ask that stands behind a sign-in reads the owner's lease first and the fence
 /// this host owes after it, and reading the fence takes its lock, so the lease's end that the first
 /// reading returned is compared with the clock again after it. A lease that ends in that wait
