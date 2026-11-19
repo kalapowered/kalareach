@@ -2247,7 +2247,7 @@ struct StartedLike {
     configuration_directory: Option<String>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use std::path::PathBuf;
 
@@ -2260,7 +2260,6 @@ mod tests {
     /// KR-REQ-11.01: the folders this host keeps for its own files hold the store this process
     /// runs from, wherever `kr host install --store` put it, beside its state root, its runtime
     /// root and the default store; where it runs from no store they hold no other.
-    #[cfg(unix)]
     #[test]
     fn the_host_keeps_the_store_it_runs_from_wherever_it_was_made() {
         let paths = HostPaths::new("/srv/kr/run", "/srv/kr/state")
