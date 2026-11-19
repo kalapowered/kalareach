@@ -68,7 +68,7 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::PluginId;
 use kr_protocol::scalars::Digest256;
 pub use kr_worker::broker::bridge::BridgeSurface;
-use kr_worker::broker::bridge::forwarder_serves;
+use kr_worker::broker::bridge::{forwarder_serves, plain_word};
 pub use kr_worker::broker::connectors::{BridgeFacts, QualifiedExecutable};
 
 pub use self::check::{check, unread_check};
@@ -2922,16 +2922,6 @@ fn plain_name(name: &str) -> bool {
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-}
-
-/// True for a word of lower-case letters, digits and hyphens that does not begin with a hyphen,
-/// which a shell reads as itself and the forwarder never reads as an option.
-fn plain_word(word: &str) -> bool {
-    !word.starts_with('-')
-        && !word.is_empty()
-        && word
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 /// True when the file at `path` is one this host published with this digest and still holds it;

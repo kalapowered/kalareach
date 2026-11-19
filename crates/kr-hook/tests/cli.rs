@@ -80,21 +80,47 @@ fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
     }
 }
 
-/// KR-REQ-11.44: every invocation the host lists as one a registration may start parses, as the
-/// command the forwarder runs it for, through the one function the program parses with.
+/// KR-REQ-11.44: the forwarder accepts exactly what the host says it serves: for each word and each
+/// surface, the program's own parse gives a hook or Claude Code's command exactly when the host's
+/// `forwarder_serves` is true. It holds the forwarder's word rule and the host's equal, over the
+/// words that are options, the forwarder's own subcommands and words of the wrong kind.
 #[test]
-fn kr_req_11_44_every_invocation_the_host_may_place_parses() {
-    for (word, surface) in kr_worker::broker::bridge::SERVED_INVOCATIONS {
-        match kr_hook::cli::parse_from(["kr-hook", word, surface.as_str()]) {
-            Ok(cli) => assert!(
+fn kr_req_11_44_the_forwarder_accepts_exactly_what_the_host_says_it_serves() {
+    use kr_worker::broker::bridge::{BridgeSurface, forwarder_serves};
+
+    for word in [
+        "claude-code",
+        "gemini-cli",
+        "qoder-cli",
+        "amp",
+        "codex",
+        "a1-b",
+        "7zip",
+        "launch",
+        "relay",
+        "Amp",
+        "a_b",
+        "",
+        "-amp",
+        "-x",
+        "-",
+        "--",
+        "--help",
+        "--version",
+    ] {
+        for surface in [BridgeSurface::Hook, BridgeSurface::Channel] {
+            let parsed = kr_hook::cli::parse_from(["kr-hook", word, surface.as_str()]);
+            let accepted = parsed.as_ref().is_ok_and(|cli| {
                 matches!(
                     cli.command,
                     kr_hook::cli::Command::Hook(_) | kr_hook::cli::Command::ClaudeCode { .. }
-                ),
-                "{word} {surface:?} parsed as {:?}",
-                cli.command
-            ),
-            Err(error) => panic!("{word} {surface:?} is refused: {error}"),
+                )
+            });
+            assert_eq!(
+                accepted,
+                forwarder_serves(word, surface),
+                "{word:?} {surface:?}: the forwarder parsed {parsed:?}"
+            );
         }
     }
 }

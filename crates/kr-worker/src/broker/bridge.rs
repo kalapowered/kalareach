@@ -57,23 +57,31 @@ use crate::broker::framing::Framing;
 /// bridge that is not going to send it.
 pub const BRIDGE_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The registrations the installed forwarder, `kr-hook`, answers to: the application name it is
-/// started with, and the surface it is started for. A registration for any other pair starts a
-/// forwarder that refuses its command line, so the host places none. This stands until the
-/// forwarder serves an application by the word it is started with.
-pub const SERVED_INVOCATIONS: [(&str, BridgeSurface); 4] = [
-    ("claude-code", BridgeSurface::Hook),
-    ("claude-code", BridgeSurface::Channel),
-    ("gemini-cli", BridgeSurface::Hook),
-    ("qoder-cli", BridgeSurface::Hook),
-];
+/// The forwarder's own subcommands, which it never serves as an application word.
+const RESERVED_WORDS: [&str; 2] = ["launch", "relay"];
 
-/// Returns whether the installed forwarder answers to `application` started for `surface`.
+/// Returns whether `word` is a word of lower-case letters, digits and hyphens that does not begin
+/// with a hyphen, which a shell reads as itself and the forwarder never reads as an option.
+#[must_use]
+pub fn plain_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The registrations the installed forwarder, `kr-hook`, answers to: a hook for any application
+/// whose name is a word (lower-case letters, digits and hyphens, not beginning with a hyphen) that
+/// is not one of the forwarder's own subcommands, and Claude Code's Channels server. A registration
+/// for any other pair starts a forwarder that refuses its command line, so the host places none.
 #[must_use]
 pub fn forwarder_serves(application: &str, surface: BridgeSurface) -> bool {
-    SERVED_INVOCATIONS
-        .iter()
-        .any(|(word, served)| *word == application && *served == surface)
+    match (application, surface) {
+        ("claude-code", BridgeSurface::Channel) => true,
+        (word, BridgeSurface::Hook) => plain_word(word) && !RESERVED_WORDS.contains(&word),
+        _ => false,
+    }
 }
 
 /// One of the registrations an installed bridge put into the application's configuration.
@@ -1193,37 +1201,15 @@ mod tests {
         }
     }
 
-    /// KR-REQ-11.44: each invocation the host lists as one the forwarder serves names an
-    /// application by a plain word and is listed once.
+    /// KR-REQ-11.44: the forwarder serves a hook for any application word it is started with, and
+    /// the Channels server for Claude Code: not a surface it serves to no other application, not
+    /// one of its own subcommands, not a label, and not a word that starts with a hyphen.
     #[test]
-    fn kr_req_11_44_each_served_invocation_is_a_plain_word_named_once() {
-        let mut seen = BTreeSet::new();
-        for (word, surface) in SERVED_INVOCATIONS {
-            assert!(
-                !word.is_empty()
-                    && !word.starts_with('-')
-                    && word.bytes().all(|byte| byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || byte == b'-'),
-                "{word:?} is not a plain word"
-            );
-            assert!(
-                seen.insert((word, surface)),
-                "{word} {surface:?} is listed twice"
-            );
-        }
-    }
-
-    /// KR-REQ-11.44: the forwarder serves each listed pair and no other: not an application it has
-    /// no hook for, not a surface it serves only to another application, not a label, and not a
-    /// word that starts with a hyphen.
-    #[test]
-    fn kr_req_11_44_the_forwarder_serves_each_listed_pair_and_no_other() {
+    fn kr_req_11_44_the_forwarder_serves_each_application_word_it_is_started_with() {
         for (word, surface) in [
-            ("claude-code", BridgeSurface::Hook),
+            ("amp", BridgeSurface::Hook),
+            ("7zip", BridgeSurface::Hook),
             ("claude-code", BridgeSurface::Channel),
-            ("gemini-cli", BridgeSurface::Hook),
-            ("qoder-cli", BridgeSurface::Hook),
         ] {
             assert!(
                 forwarder_serves(word, surface),
@@ -1231,12 +1217,17 @@ mod tests {
             );
         }
         for (word, surface) in [
-            ("amp", BridgeSurface::Hook),
-            ("gemini-cli", BridgeSurface::Channel),
-            ("qoder-cli", BridgeSurface::Channel),
-            ("Claude Code", BridgeSurface::Hook),
+            ("amp", BridgeSurface::Channel),
+            ("launch", BridgeSurface::Hook),
+            ("relay", BridgeSurface::Hook),
+            ("a_b", BridgeSurface::Hook),
+            ("", BridgeSurface::Hook),
+            ("Amp", BridgeSurface::Hook),
             ("-amp", BridgeSurface::Hook),
             ("--help", BridgeSurface::Hook),
+            ("--version", BridgeSurface::Hook),
+            ("--", BridgeSurface::Hook),
+            ("-", BridgeSurface::Hook),
         ] {
             assert!(
                 !forwarder_serves(word, surface),

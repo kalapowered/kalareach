@@ -1227,33 +1227,40 @@ fn a_bridge_is_placed_for_the_application_its_package_declares_and_for_no_other(
     assert_eq!(site.tree(), before, "nothing was written");
 }
 
-/// KR-REQ-11.44: a registration for another application the forwarder serves is applied under the
-/// word it names, whatever application the package's recipe is for: the recorded word is the
-/// registration's, and the recipe's application stays the label the doctor reports.
+/// KR-REQ-11.44: a registration for another application word is applied under the word it names,
+/// whatever application the package's recipe is for: the recorded word is the registration's, and
+/// the recipe's application stays the label the doctor reports.
 #[cfg(unix)]
 #[test]
 fn kr_req_11_44_a_registration_for_another_served_application_is_applied_under_its_own_word() {
-    let site = GeminiSite::new();
-    let bridges = site.bridges();
-    let target = gemini_target_with_hooks(&site, &gemini_hooks(&["kr-hook qoder-cli hook"]));
-    let settled = bridges
-        .reconcile(&gemini(), Some(&target))
-        .expect("reconciles");
-    match settled {
-        Settled::Applied => {}
-        other => panic!("not applied: {other:?}"),
+    for word in ["qoder-cli", "amp", "codex"] {
+        let site = GeminiSite::new();
+        let bridges = site.bridges();
+        let line = format!("kr-hook {word} hook");
+        let target = gemini_target_with_hooks(&site, &gemini_hooks(&[line.as_str()]));
+        let settled = bridges
+            .reconcile(&gemini(), Some(&target))
+            .expect("reconciles");
+        match settled {
+            Settled::Applied => {}
+            other => panic!("{word}: not applied: {other:?}"),
+        }
+        let facts = bridges
+            .facts(&gemini(), site.release().package_digest)
+            .expect("reads")
+            .expect("applied");
+        assert_eq!(facts.application, word);
+        assert_eq!(
+            facts.surfaces,
+            [BridgeSurface::Hook].into_iter().collect(),
+            "{word}"
+        );
+        let reports = bridges.reports().expect("reads");
+        let [report] = reports.as_slice() else {
+            panic!("{word}: one bridge: {reports:?}");
+        };
+        assert_eq!(report.application.as_deref(), Some("Gemini CLI"), "{word}");
     }
-    let facts = bridges
-        .facts(&gemini(), site.release().package_digest)
-        .expect("reads")
-        .expect("applied");
-    assert_eq!(facts.application, "qoder-cli");
-    assert_eq!(facts.surfaces, [BridgeSurface::Hook].into_iter().collect());
-    let reports = bridges.reports().expect("reads");
-    let [report] = reports.as_slice() else {
-        panic!("one bridge: {reports:?}");
-    };
-    assert_eq!(report.application.as_deref(), Some("Gemini CLI"));
 }
 
 /// What the refusal of a configuration key this host does not permit a bridge to add says.
@@ -5438,14 +5445,19 @@ fn kr_req_11_42_every_command_a_registration_runs_is_the_forwarder_in_a_form_the
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-11.44: a registration that starts an invocation the installed forwarder does not accept
-/// is refused before anything is written, naming the invocation: an application it serves no hook
-/// for, and a surface it serves only to another application. The line the package ships is the
-/// control.
+/// is refused before anything is written, naming the invocation: one of its own subcommands named
+/// as an application, and a channel for an application other than Claude Code. The line the
+/// package ships is the control.
 #[cfg(unix)]
 #[test]
 fn kr_req_11_44_a_registration_the_forwarder_does_not_accept_is_refused_before_anything_is_written()
 {
-    for invocation in ["kr-hook amp hook", "kr-hook gemini-cli channel"] {
+    for invocation in [
+        "kr-hook launch hook",
+        "kr-hook relay hook",
+        "kr-hook gemini-cli channel",
+        "kr-hook amp channel",
+    ] {
         let site = GeminiSite::new();
         let before = site.tree();
         let target = gemini_target_with_hooks(&site, &gemini_hooks(&[invocation]));
@@ -5544,7 +5556,7 @@ fn kr_req_11_44_an_application_word_in_an_argument_list_is_a_plain_word_or_refus
 #[cfg(unix)]
 #[test]
 fn kr_req_11_44_an_application_word_that_starts_with_a_hyphen_is_refused_in_every_form() {
-    for word in ["-amp", "--help", "--version", "--"] {
+    for word in ["-amp", "-x", "--help", "--version", "--"] {
         let site = Site::new();
         let before = site.tree();
         let target = site.release_registering("odd", word);

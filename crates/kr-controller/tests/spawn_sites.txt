@@ -467,6 +467,7 @@ names | kr_worker::action::adapter::PlatformTimeAdapter::new
 names | kr_worker::attention_source::page
 names | kr_worker::attention_source::texts
 names | kr_worker::broker::bridge::forwarder_serves
+names | kr_worker::broker::bridge::plain_word
 names | kr_worker::broker::commands::runnable
 names | kr_worker::broker::commands::starts_directly
 names | kr_worker::broker::probe::run_within
