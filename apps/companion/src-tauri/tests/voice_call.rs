@@ -4787,6 +4787,85 @@ async fn a_start_whose_record_cannot_be_saved_is_refused_before_the_host_is_aske
     scene.stop_host().await;
 }
 
+/// A start whose record cannot be written is refused as one whose record cannot be read is: the
+/// write cannot make its file where the device keeps them, so nothing was sent, and the next start
+/// after the folder can be written goes on as any other.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_whose_record_cannot_be_written_is_refused_before_the_host_is_asked() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut scene = scene().await;
+    let prepared = scene.prepared().await;
+    let directory = scene.phone.data.path().join("relaunch-standing-unwritable");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice::default())
+        .expect("the file is written");
+    let calls = Arc::new(calls_on_phone(
+        Arc::clone(&scene.platform) as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    ));
+    let reach = Arc::new(companion_tauri::voice::AppReach::new(
+        scene.phone.companion.app.handle().clone(),
+    ));
+    // The folder takes no new file, so the write that replaces the record cannot be made.
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("the folder is made read-only");
+    // A user that the folder's mode does not bind (root) can still write: the case shows nothing
+    // there, and says so rather than passing for what it did not check.
+    let probe = directory.join("probe");
+    if std::fs::File::create(&probe).is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the folder is made writable again");
+        eprintln!("the folder's mode does not bind this user, so the write cannot be made to fail");
+        scene.stop_host().await;
+        return;
+    }
+    let refused = calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await;
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the folder is made writable again");
+    let Err(refused) = refused else {
+        panic!("a start that cannot be recorded is refused");
+    };
+    assert!(
+        refused
+            .message
+            .starts_with("Nothing was sent. This device could not save a record of this start"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(
+        scene.stand_in.count("/api/voice/sessions"),
+        0,
+        "the host was not asked for a call"
+    );
+    assert!(calls.state(None).owed.is_empty(), "nothing is owed");
+
+    calls
+        .start(
+            request_of(&scene, &prepared),
+            reach as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("the call started once the record could be written");
+    let _ = calls
+        .stop(
+            None,
+            &companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone()),
+        )
+        .await;
+    scene.stop_host().await;
+}
+
 /// KR-REQ-23.24: a start whose answer the host lost leaves its creation unknown, which the device
 /// keeps as a notice with no time lapse; a later start the host holds is refused in the host's
 /// words, the refusal offers "Start again" for the kept start, and the start that passes the hold

@@ -777,4 +777,22 @@ mod tests {
             "nine that had not lapsed, and the new one"
         );
     }
+
+    /// No reading of this device's clock, however far from the host's, lapses the entry of a start:
+    /// what the host holds is the host's to end, and this device cannot read that on its own clock.
+    #[test]
+    fn a_start_entry_stays_at_every_reading_of_the_device_clock() {
+        for now in [0, 1_000, u64::MAX / 2, u64::MAX - 1] {
+            let mut state = VoiceCallState::no_call();
+            for (kind, action) in [
+                (START_UNKNOWN, "a"),
+                (START_UNCONFIRMED, "b"),
+                (START_KEPT, "c"),
+                (START_UNANSWERED, "d"),
+            ] {
+                state.owe(now, start(kind, action, host(1)));
+            }
+            assert_eq!(state.owed.len(), 4, "at {now}");
+        }
+    }
 }
