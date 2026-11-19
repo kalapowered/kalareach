@@ -1075,11 +1075,6 @@ impl Controller {
         kr_protocol::metrics::MetricsReport::joined(parts)
     }
 
-    /// The doctor's checks of what this host serves a paired device in repository operations:
-    /// whether it qualifies, and what it shows of the mount residual that remains where it does.
-    ///
-    /// The proof is made again here and held in place of the last one, so the door and the report
-    /// say the same thing.
     /// One line for each call on the owner's own key that is not confirmed closed, with the
     /// command that clears it.
     fn own_key_call_checks(&self) -> Vec<DoctorCheck> {
@@ -1108,6 +1103,11 @@ impl Controller {
             .collect()
     }
 
+    /// The doctor's checks of what this host serves a paired device in repository operations:
+    /// whether it qualifies, and what it shows of the mount residual that remains where it does.
+    ///
+    /// The proof is made again here and held in place of the last one, so the door and the report
+    /// say the same thing.
     async fn device_repository_checks(&self) -> Vec<DoctorCheck> {
         use kr_project::service::Refusal;
 

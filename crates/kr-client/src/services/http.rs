@@ -467,7 +467,9 @@ impl HttpService {
         body: Option<(&str, &[u8])>,
         headers: &[ServiceHeader<'_>],
     ) -> Result<ServiceHttpAnswer> {
-        let answer = self.exchange_status(method, target, body, headers).await?;
+        let answer = self
+            .exchange_status(method, target, body, headers, None)
+            .await?;
         Ok(ServiceHttpAnswer {
             status: answer.status,
             body: answer.body?,
@@ -485,7 +487,11 @@ impl HttpService {
         target: Url,
         body: Option<(&str, &[u8])>,
         headers: &[ServiceHeader<'_>],
+        bound: Option<Duration>,
     ) -> Result<StatusAnswer> {
+        // The caller's own bound is kept inside the exchange, so that a status that arrived is
+        // not lost to a watchdog wrapped round the whole of it.
+        let bound_ends = bound.map(|bound| tokio::time::Instant::now() + bound);
         let limit = self.limits.of(target.path());
         let named = crate::shown!("{}{}", self.origin.clone(), Shown::route(target.path()));
         // A header value can be a token, so neither the name's value nor the value itself reaches
@@ -516,7 +522,13 @@ impl HttpService {
             }
 
             self.entered(ExchangePhase::Connect);
-            match request.send().await {
+            let sent = match bound_ends {
+                Some(ends) => tokio::time::timeout_at(ends, request.send())
+                    .await
+                    .map_err(|_| refused("the request got no status within its bound"))?,
+                None => request.send().await,
+            };
+            match sent {
                 Ok(response) => break response,
                 Err(error) if !replaced && connection_may_be_replaced(&error) => replaced = true,
                 Err(error) => return Err(failure(&named, phase_of(&error), &error)),
@@ -538,7 +550,7 @@ impl HttpService {
             });
         }
 
-        let body = async {
+        let read_body = async {
             let mut read = Vec::new();
             loop {
                 let chunk = response
@@ -552,8 +564,15 @@ impl HttpService {
                 read.extend_from_slice(&chunk);
             }
             Ok(read)
-        }
-        .await;
+        };
+        let body = match bound_ends {
+            Some(ends) => tokio::time::timeout_at(ends, read_body)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(refused("the answer's body did not arrive within its bound"))
+                }),
+            None => read_body.await,
+        };
 
         Ok(StatusAnswer { status, body })
     }
@@ -569,6 +588,7 @@ impl HttpService {
         url: &str,
         body: &[u8],
         headers: &[ServiceHeader<'_>],
+        bound: Duration,
     ) -> Result<StatusAnswer> {
         let target = self.target(url)?;
         self.exchange_status(
@@ -576,6 +596,7 @@ impl HttpService {
             target,
             Some(("application/json", body)),
             headers,
+            Some(bound),
         )
         .await
     }
@@ -589,9 +610,10 @@ impl HttpService {
         &self,
         url: &str,
         headers: &[ServiceHeader<'_>],
+        bound: Duration,
     ) -> Result<StatusAnswer> {
         let target = self.target(url)?;
-        self.exchange_status(reqwest::Method::POST, target, None, headers)
+        self.exchange_status(reqwest::Method::POST, target, None, headers, Some(bound))
             .await
     }
 }

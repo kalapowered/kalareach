@@ -100,7 +100,15 @@ impl Controller {
             self.sharing.host_device_id(),
             self.me.clone(),
         ));
-        let provider = self.clients.managed_inference.clone();
+        // One choice over what the document names: the owner's own key when it selects one,
+        // the managed broker otherwise. The own-key provider is never among the managed
+        // services this host reports.
+        let provider: Option<Arc<dyn kr_client::services::voice::VoiceProviderService>> =
+            if self.started.own_voice.provider().is_some() {
+                Some(Arc::clone(&self.own_voice) as _)
+            } else {
+                self.clients.managed_inference.clone()
+            };
         let module = crate::voice::VoiceModule::new(
             Arc::new(crate::voice::ControllerFacts::new(self.me.clone())),
             authority,

@@ -582,6 +582,59 @@ async fn a_start_checks_what_it_can_before_it_writes_anything_and_a_standing_row
     assert_eq!(own.expect_err("blocked").code(), ErrorCode::DraftConflict);
 }
 
+/// The lines of `source` that use the stand-in and sit in an item that does not carry exactly
+/// `#[cfg(feature = "testing")]`. The item is the nearest enclosing one, found by indentation, and
+/// its attributes are the ones directly above it: a `cfg(any(..))`, a `cfg_attr` and a `cfg(test)`
+/// are not the gate.
+fn ungated_stand_in_uses(source: &str) -> Vec<usize> {
+    let lines: Vec<&str> = source.lines().collect();
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let starts_an_item = |line: &str| {
+        let line = line.trim_start();
+        let line = line.strip_prefix("pub(crate) ").unwrap_or(line);
+        let line = line.strip_prefix("pub ").unwrap_or(line);
+        let line = line.strip_prefix("async ").unwrap_or(line);
+        [
+            "fn ", "mod ", "impl", "static ", "const ", "use ", "struct ", "enum ",
+        ]
+        .iter()
+        .any(|keyword| line.starts_with(keyword))
+    };
+    let mut found = Vec::new();
+    for (at, line) in lines.iter().enumerate() {
+        let code = line.split("//").next().unwrap_or_default();
+        if !(code.contains("stand_in::") || code.contains("mod stand_in")) {
+            continue;
+        }
+        let item = (0..=at)
+            .rev()
+            .find(|&before| {
+                starts_an_item(lines[before])
+                    && (before == at || indent(lines[before]) < indent(lines[at]))
+            })
+            .unwrap_or(at);
+        let mut gated = false;
+        let mut above = item;
+        while above > 0 {
+            above -= 1;
+            let attribute = lines[above].trim();
+            if attribute.starts_with("///") {
+                continue;
+            }
+            if !attribute.starts_with("#[") {
+                break;
+            }
+            if attribute == "#[cfg(feature = \"testing\")]" {
+                gated = true;
+            }
+        }
+        if !gated {
+            found.push(at + 1);
+        }
+    }
+    found
+}
+
 #[test]
 fn the_working_path_is_compiled_only_under_the_testing_gate() {
     let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src/services/");
@@ -590,22 +643,28 @@ fn the_working_path_is_compiled_only_under_the_testing_gate() {
         !product.contains("STAND_IN_MARKER"),
         "the marker is used by the stand-in alone"
     );
-    let lines: Vec<&str> = product.lines().collect();
-    for (at, line) in lines.iter().enumerate() {
-        let code = line.split("//").next().unwrap_or_default();
-        if code.contains("stand_in::") || code.contains("mod stand_in") {
-            let gated = lines[at.saturating_sub(8)..at]
-                .iter()
-                .any(|before| before.contains("#[cfg(feature = \"testing\")]"));
-            assert!(
-                gated,
-                "line {} uses the stand-in outside the testing gate",
-                at + 1
-            );
-        }
-    }
+    assert_eq!(
+        ungated_stand_in_uses(&product),
+        Vec::<usize>::new(),
+        "a use of the stand-in sits outside the testing gate"
+    );
     let stand_in = std::fs::read_to_string(format!("{base}own_voice/stand_in.rs")).expect("source");
     assert!(stand_in.contains("black_box(STAND_IN_MARKER)"));
+}
+
+#[test]
+fn the_gate_check_finds_a_use_whatever_cfg_surrounds_it() {
+    let gated = "#[cfg(feature = \"testing\")]\nfn f() {\n    stand_in::X;\n}\n";
+    assert!(ungated_stand_in_uses(gated).is_empty());
+    for plant in [
+        "fn f() {\n    stand_in::X;\n}\n",
+        "#[cfg(any(feature = \"testing\", test))]\nfn f() {\n    stand_in::X;\n}\n",
+        "#[cfg_attr(feature = \"testing\", allow(dead_code))]\nfn f() {\n    stand_in::X;\n}\n",
+        "#[cfg(test)]\nfn f() {\n    stand_in::X;\n}\n",
+        "#[cfg(not(feature = \"testing\"))]\npub mod stand_in;\n",
+    ] {
+        assert_eq!(ungated_stand_in_uses(plant).len(), 1, "{plant}");
+    }
 }
 
 fn stored(world: &World, byte: u8, state: CallState, session: Option<&str>) {
@@ -716,4 +775,150 @@ async fn a_reconcile_at_start_refuses_starts_while_it_runs_and_leaves_the_regist
         .await
         .expect_err("a start during a settle");
     assert!(refusal.to_string().contains(words::SETTLING));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_start_stays_open_until_its_caller_has_published_the_call() {
+    let world = fresh();
+    let own = started(&world).await;
+    let provider = &world.provider;
+    let begun = Instant::now();
+    let publishing = async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        provider.start_published(&own.call_id);
+    };
+    let settling = async {
+        let _fence = provider.registry().fence().expect("a fence");
+        provider.settle().await
+    };
+    let (settled, ()) = tokio::join!(settling, publishing);
+    assert_eq!(settled, Settled::NothingStarting);
+    assert!(
+        Instant::now() - begun >= Duration::from_secs(5),
+        "the settle waited for the publication"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_session_a_fence_finds_keeps_its_id_and_its_row_when_the_hangup_is_not_confirmed() {
+    let world = fresh();
+    world.stand_in.script_create(CreateScript::After(
+        Duration::from_secs(10),
+        Box::new(CreateScript::Answer(201, Some(created_body("live_late")))),
+    ));
+    world.stand_in.script_hangup(HangupScript::Lost);
+    let request = request(1);
+    let attempt = world.provider.begin(&request).await.expect("begin");
+    let provider = &world.provider;
+    let dispatch = provider.dispatch(attempt, &request);
+    let removal = async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _fence = provider.registry().fence().expect("a fence");
+        provider.settle().await
+    };
+    let (_, settled) = tokio::join!(dispatch, removal);
+    assert_eq!(settled, Settled::MayStillRun);
+    let rows = world.ledger.rows().expect("rows");
+    assert_eq!(rows.len(), 1, "the late session keeps its row");
+    assert_eq!(rows[0].state, CallState::Unresolved);
+    assert_eq!(rows[0].provider_session_id.as_deref(), Some("live_late"));
+    assert_eq!(
+        provider.close_stored_calls().await,
+        StoredCalls::NoneLeft,
+        "a later removal closes it with the same key"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fence_during_readiness_reports_what_the_hangup_came_to() {
+    for (script, expected) in [
+        (HangupScript::Lost, Settled::MayStillRun),
+        (HangupScript::Answer(200, None), Settled::LateSessionClosed),
+    ] {
+        let world = fresh();
+        world.stand_in.acknowledge(false);
+        world.stand_in.script_hangup(script);
+        let request = request(1);
+        let attempt = world.provider.begin(&request).await.expect("begin");
+        let provider = &world.provider;
+        let dispatch = provider.dispatch(attempt, &request);
+        let removal = async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let _fence = provider.registry().fence().expect("a fence");
+            provider.settle().await
+        };
+        let (outcome, settled) = tokio::join!(dispatch, removal);
+        assert!(matches!(
+            outcome.expect("an answer"),
+            VoiceStart::Refused(_)
+        ));
+        assert_eq!(settled, expected);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_a_session_closed_the_profile_defines_closes_the_call() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world.stand_in.event(&json!({ "type": "session.closed" }));
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        control.state(),
+        SidebandState::Ready,
+        "a bare type is not a closure"
+    );
+    assert_eq!(world.provider.unknown_events(&own.call_id), Some(1));
+    world.stand_in.event(&json!({
+        "type": "session.closed", "event_id": "e1", "reason": "expired",
+        "session": { "id": "live_1", "model": "gpt-live-1", "status": "active", "expires_at": 1 },
+        "usage": { "seconds": 3 },
+    }));
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed)
+    );
+    assert!(world.stand_in.recorded().hangups.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_start_that_sent_nothing_or_was_refused_marks_its_row_closed_before_deleting_it() {
+    let world = fresh();
+    world.ledger.failing("delete", true);
+    world
+        .stand_in
+        .script_create(CreateScript::Answer(401, None));
+    let _ = start(&world, 1).await.expect("an answer");
+    assert_eq!(
+        states(&world),
+        [CallState::Closed],
+        "a closed row blocks nothing"
+    );
+    let request = request(2);
+    let attempt = world
+        .provider
+        .begin(&request)
+        .await
+        .expect("a closed row blocks nothing");
+    drop(attempt);
+    assert_eq!(
+        world.provider.registry().state(),
+        RegistryState::Idle,
+        "the abandoned attempt released the registry"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_slot_a_normal_end_leaves_is_not_told_by_a_later_settle() {
+    let world = fresh();
+    world
+        .stand_in
+        .script_create(CreateScript::Answer(401, None));
+    let _ = start(&world, 1).await.expect("an answer");
+    assert_eq!(world.provider.settle().await, Settled::NothingStarting);
 }

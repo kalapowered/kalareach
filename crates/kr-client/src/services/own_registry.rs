@@ -649,4 +649,51 @@ mod tests {
         registry.call_ended(old_epoch);
         assert_eq!(registry.state(), RegistryState::Running);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_change_runs_only_while_idle_and_a_start_cannot_pass_it() {
+        let rows = Rows::with(CallState::Closed, 1);
+        let registry = CallRegistry::new(rows);
+        assert_eq!(registry.while_idle(|| 7), Ok(7));
+        let ticket = registry.begin_start().expect("a start");
+        assert_eq!(registry.while_idle(|| 7), Err(StartRefusal::InProgress));
+        drop(ticket);
+        let blocked = CallRegistry::new(Rows::with(CallState::Open, 2));
+        assert!(matches!(
+            blocked.while_idle(|| 7),
+            Err(StartRefusal::Blocked { .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_waits_for_every_task_it_tracks() {
+        let registry = CallRegistry::new(Rows::with(CallState::Closed, 1));
+        let token = registry.track();
+        assert!(!registry.quiesce(Duration::from_secs(1)).await);
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(token);
+        };
+        let (quiet, ()) = tokio::join!(registry.quiesce(Duration::from_secs(5)), release);
+        assert!(quiet);
+    }
+
+    #[test]
+    fn a_start_that_ends_before_a_fence_leaves_no_slot_and_one_a_fence_found_stays() {
+        let registry = CallRegistry::new(Rows::with(CallState::Closed, 1));
+        let ticket = registry.begin_start().expect("a start");
+        assert!(registry.slot().is_some(), "the slot is made at admission");
+        registry.finished(ticket, StartEnd::Ended);
+        assert!(
+            registry.slot().is_none(),
+            "a normal end leaves nothing to tell"
+        );
+        let ticket = registry.begin_start().expect("a start");
+        let _fence = registry.fence().expect("a fence");
+        registry.finished(ticket, StartEnd::NeverAnswered);
+        assert_eq!(
+            registry.slot().and_then(|slot| slot.ended()),
+            Some(StartEnd::NeverAnswered)
+        );
+    }
 }

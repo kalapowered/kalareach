@@ -80,6 +80,10 @@ pub const HANGUP_BOUND: Duration = Duration::from_secs(15);
 /// How long a close waits for the provider to say the session closed before it hangs up.
 pub const DRAIN_BOUND: Duration = Duration::from_secs(5);
 
+/// How much longer than a transport's own bound the provider waits before it counts the answer
+/// lost, for a transport that does not keep to its bound itself.
+const WATCHDOG_MARGIN: Duration = Duration::from_millis(500);
+
 /// How long a lost side channel is attached again for before the call is hung up.
 pub const RECOVERY_BOUND: Duration = Duration::from_secs(10);
 
@@ -347,17 +351,23 @@ pub trait SidebandSocket: Send {
 /// The three things this host asks of OpenAI.
 pub trait OwnVoiceTransport: Send + Sync + fmt::Debug {
     /// Creates a session from `body`.
+    ///
+    /// The operation keeps to `bound` itself: a status that arrived is returned with no body when
+    /// the body does not come within it, so a refusal or a confirmation is not lost to a slow
+    /// answer.
     fn create<'a>(
         &'a self,
         key: &'a SecretText,
         body: Vec<u8>,
+        bound: Duration,
     ) -> TransportFuture<'a, std::result::Result<Reply, Lost>>;
 
-    /// Hangs up the session `session_id`.
+    /// Hangs up the session `session_id`, with the same bound and the same rule for the body.
     fn hangup<'a>(
         &'a self,
         key: &'a SecretText,
         session_id: &'a str,
+        bound: Duration,
     ) -> TransportFuture<'a, std::result::Result<Reply, Lost>>;
 
     /// Attaches to the session `session_id` as a message stream.
@@ -680,9 +690,12 @@ impl Core {
         let Ok(Some(key)) = self.keys.key() else {
             return false;
         };
-        let reply = tokio::time::timeout(HANGUP_BOUND, self.transport.hangup(&key, session_id))
-            .await
-            .unwrap_or(Err(Lost));
+        let reply = tokio::time::timeout(
+            HANGUP_BOUND + WATCHDOG_MARGIN,
+            self.transport.hangup(&key, session_id, HANGUP_BOUND),
+        )
+        .await
+        .unwrap_or(Err(Lost));
         closure_recognised(&reply)
     }
 
@@ -1030,9 +1043,12 @@ impl OwnVoiceProvider {
         };
         let body = serde_json::to_vec(&creation_body(&request.offer_sdp)).unwrap_or_default();
         let remaining = DISPATCH_BOUND.min(window_end.saturating_duration_since(Instant::now()));
-        let reply = tokio::time::timeout(remaining, core.transport.create(&key, body))
-            .await
-            .unwrap_or(Err(Lost));
+        let reply = tokio::time::timeout(
+            remaining + WATCHDOG_MARGIN,
+            core.transport.create(&key, body, remaining),
+        )
+        .await
+        .unwrap_or(Err(Lost));
         drop(key);
 
         match classify_creation(&reply) {
@@ -2013,8 +2029,9 @@ impl OpenAiLiveTransport {
     }
 }
 
-fn authorisation(key: &SecretText) -> String {
-    format!("Bearer {}", key.expose())
+/// The bearer value for one request, in a buffer that is overwritten when the request is done.
+fn authorisation(key: &SecretText) -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(format!("Bearer {}", key.expose()))
 }
 
 fn reply_of(answer: Result<super::http::StatusAnswer>) -> std::result::Result<Reply, Lost> {
@@ -2065,6 +2082,7 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
         &'a self,
         key: &'a SecretText,
         body: Vec<u8>,
+        bound: Duration,
     ) -> TransportFuture<'a, std::result::Result<Reply, Lost>> {
         Box::pin(async move {
             let value = authorisation(key);
@@ -2078,6 +2096,7 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
                             "authorization",
                             value.as_str(),
                         )],
+                        bound,
                     )
                     .await,
             )
@@ -2088,6 +2107,7 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
         &'a self,
         key: &'a SecretText,
         session_id: &'a str,
+        bound: Duration,
     ) -> TransportFuture<'a, std::result::Result<Reply, Lost>> {
         Box::pin(async move {
             let value = authorisation(key);
@@ -2103,6 +2123,7 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
                             "authorization",
                             value.as_str(),
                         )],
+                        bound,
                     )
                     .await,
             )
@@ -2153,6 +2174,7 @@ impl OwnVoiceTransport for UnreachableTransport {
         &'a self,
         _key: &'a SecretText,
         _body: Vec<u8>,
+        _bound: Duration,
     ) -> TransportFuture<'a, std::result::Result<Reply, Lost>> {
         Box::pin(async { Err(Lost) })
     }
@@ -2161,6 +2183,7 @@ impl OwnVoiceTransport for UnreachableTransport {
         &'a self,
         _key: &'a SecretText,
         _session_id: &'a str,
+        _bound: Duration,
     ) -> TransportFuture<'a, std::result::Result<Reply, Lost>> {
         Box::pin(async { Err(Lost) })
     }

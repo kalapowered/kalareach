@@ -287,6 +287,7 @@ impl OwnVoiceTransport for StandIn {
         &'a self,
         key: &'a SecretText,
         body: Vec<u8>,
+        _bound: Duration,
     ) -> TransportFuture<'a, Result<Reply, Lost>> {
         Box::pin(async move {
             let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
@@ -320,6 +321,7 @@ impl OwnVoiceTransport for StandIn {
         &'a self,
         key: &'a SecretText,
         session_id: &'a str,
+        _bound: Duration,
     ) -> TransportFuture<'a, Result<Reply, Lost>> {
         Box::pin(async move {
             self.record(|recorded| {

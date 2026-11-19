@@ -1080,11 +1080,6 @@ impl Controller {
         // background, with starts refused meanwhile, and never inside a start.
         let reconciling = Arc::clone(&own_voice);
         tokio::spawn(async move { reconciling.reconcile_at_start().await });
-        if started.own_voice.provider().is_some() {
-            clients.managed_inference =
-                Some(Arc::clone(&own_voice)
-                    as Arc<dyn kr_client::services::voice::VoiceProviderService>);
-        }
         let destination_secrets = crate::push::secrets::DestinationSecrets::new(
             Arc::clone(&secret_store),
             setup.environment_id,
