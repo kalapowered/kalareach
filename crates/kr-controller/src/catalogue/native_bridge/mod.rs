@@ -272,6 +272,7 @@ struct Testing {
     stop_at: std::sync::atomic::AtomicUsize,
     taken: std::sync::atomic::AtomicUsize,
     before_publishing: std::sync::Mutex<Option<PublishingHook>>,
+    before_publishing_directory: std::sync::Mutex<Option<PublishingHook>>,
     staging_fails: std::sync::Mutex<Option<PublishingHook>>,
     trace: std::sync::Mutex<Vec<String>>,
 }
@@ -397,6 +398,9 @@ struct Plan {
     release: Release,
     root: Dir,
     steps: Vec<Planned>,
+    /// The plugin folder, `<area>/<name>`, of a package that declares its own placement: every
+    /// write into it requires the folder to be one this host made, at the moment of the write.
+    owned: Option<String>,
 }
 
 /// One install step still to be carried out.
@@ -632,6 +636,16 @@ impl NativeBridges {
         *self
             .testing
             .before_publishing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+    }
+
+    /// Runs `hook` with each directory's path just before it is published.
+    #[cfg(feature = "testing")]
+    pub fn before_publishing_directory(&self, hook: impl Fn(&Path) + Send + Sync + 'static) {
+        *self
+            .testing
+            .before_publishing_directory
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
     }
@@ -942,6 +956,7 @@ impl NativeBridges {
             },
             root,
             steps,
+            owned: declared.then(|| plugin_folder(recipe)).flatten(),
         })
     }
 
@@ -1036,7 +1051,7 @@ impl NativeBridges {
                     path,
                     digest,
                     bytes,
-                } => self.place_file(journal, &plan.root, path, digest, bytes)?,
+                } => self.place_file(journal, plan, path, digest, bytes)?,
                 Planned::Key { file, key, value } => {
                     self.place_key(journal, &plan.root, file, key, value)?;
                 }
@@ -1048,7 +1063,17 @@ impl NativeBridges {
     /// Makes the directories on a path's way that are not there and returns the one that holds the
     /// path. Each is made under a temporary name, recorded with its identity and renamed into place
     /// only where nothing is, so the directory this host made is the one it can show it made.
-    fn make_directories(&self, journal: &mut Journal, root: &Dir, path: &str) -> Run<Option<Dir>> {
+    ///
+    /// `owned` is the plugin folder a declared placement writes into and the application it is
+    /// for: that folder, however it came to be there, must be one this host made, checked here, at
+    /// the write, and not only in the preflight that came before it.
+    fn make_directories(
+        &self,
+        journal: &mut Journal,
+        root: &Dir,
+        path: &str,
+        owned: Option<(&str, &str)>,
+    ) -> Run<Option<Dir>> {
         let parts = tree::components(path);
         let directories = parts
             .split_last()
@@ -1078,6 +1103,12 @@ impl NativeBridges {
                     }
                 }
             };
+            if let Some((folder, application)) = owned
+                && walked == folder
+                && !made_by_this_host(journal, &walked, &next)
+            {
+                return Err(Fault::Refused(not_made_by_this_host(&walked, application)));
+            }
             current = Some(next);
         }
         Ok(current)
@@ -1126,6 +1157,7 @@ impl NativeBridges {
         );
         self.save(journal)?;
         self.step("rename", &base.join(name))?;
+        self.about_to_publish_directory(&base.join(name));
         match base.rename_new(&temporary, name) {
             Ok(()) => {
                 self.flush(base)
@@ -1158,12 +1190,17 @@ impl NativeBridges {
     fn place_file(
         &self,
         journal: &mut Journal,
-        root: &Dir,
+        plan: &Plan,
         path: &str,
         digest: &str,
         bytes: &[u8],
     ) -> Run<()> {
-        let parent = self.make_directories(journal, root, path)?;
+        let root = &plan.root;
+        let owned = plan
+            .owned
+            .as_deref()
+            .map(|folder| (folder, plan.release.application.as_str()));
+        let parent = self.make_directories(journal, root, path, owned)?;
         let directory = parent.as_ref().unwrap_or(root);
         let name = last_component(path);
         match directory
@@ -1228,7 +1265,7 @@ impl NativeBridges {
         key: &str,
         value: &str,
     ) -> Run<()> {
-        let parent = self.make_directories(journal, root, file)?;
+        let parent = self.make_directories(journal, root, file, None)?;
         let directory = parent.as_ref().unwrap_or(root);
         let name = last_component(file);
         let members: Vec<&str> = key.split('.').collect();
@@ -2308,6 +2345,21 @@ impl NativeBridges {
         Ok(identity)
     }
 
+    fn about_to_publish_directory(&self, destination: &Path) {
+        #[cfg(feature = "testing")]
+        if let Some(hook) = self
+            .testing
+            .before_publishing_directory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            hook(destination);
+        }
+        #[cfg(not(feature = "testing"))]
+        let _ = destination;
+    }
+
     fn about_to_publish(&self, destination: &Path) {
         #[cfg(feature = "testing")]
         if let Some(hook) = self
@@ -2726,7 +2778,7 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
                     .and_then(|rest| rest.strip_prefix('/'))
                     .and_then(|rest| rest.split_once('/'))
                     .filter(|(directory, tail)| plain_name(directory) && tails.contains(tail));
-                let Some((directory, _)) = placed else {
+                let Some((directory, tail)) = placed else {
                     return Err(format!(
                         "the recipe installs {destination}, which this host does not permit a \
                          native bridge for {application} to install: it installs {}/<name>/ with \
@@ -2743,7 +2795,7 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
                     ));
                 }
                 name = Some(directory);
-                placed_tails.push(destination);
+                placed_tails.push(tail);
             }
         }
     }
@@ -2751,10 +2803,9 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
     // ones a recipe leaves out, and a directory that holds another manifest or server file is
     // not one this host has checked.
     for tail in &tails {
-        let times = placed_tails
-            .iter()
-            .filter(|destination| destination.ends_with(&format!("/{tail}")))
-            .count();
+        // The complete tail after `<area>/<name>/` is compared: another tail that ends the same
+        // way is another file.
+        let times = placed_tails.iter().filter(|placed| **placed == *tail).count();
         match times {
             1 => {}
             0 => {
@@ -2773,10 +2824,15 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
         }
     }
     if let Some(record) = last {
-        let last_removed = match recipe.remove.last() {
-            Some(BridgeRemoval::RemoveFile { destination, .. }) => {
-                destination.as_str().rsplit_once('/').map(|(_, name)| name)
-            }
+        // The record is the file the recipe removes last by its complete tail, in the plugin's
+        // folder: a file of the same name deeper in the folder is another file.
+        let last_removed = match (recipe.remove.last(), name) {
+            (Some(BridgeRemoval::RemoveFile { destination, .. }), Some(folder)) => destination
+                .as_str()
+                .strip_prefix(area)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .and_then(|rest| rest.strip_prefix(folder))
+                .and_then(|rest| rest.strip_prefix('/')),
             _ => None,
         };
         if last_removed != Some(record) {
@@ -2858,10 +2914,7 @@ fn place_is_free(
         Child::Absent | Child::NotADirectory => None,
     };
     if let Some(existing) = own.as_ref() {
-        let made = journal.changes.iter().any(|change| {
-            matches!(change, Change::Directory { path: made, publication: Publication::Published { identity }, .. }
-                if *made == path && identity.same_object(&existing.identity()))
-        });
+        let made = made_by_this_host(journal, &path, existing);
         let registration: Vec<&str> = recipe
             .install
             .iter()
@@ -2879,12 +2932,7 @@ fn place_is_free(
             // layouts keep what the installed packages were written for: a folder that holds
             // only this registration is taken.
             if declared {
-                return Err(format!(
-                    "{path} is already there and this host did not make it, so it does not permit \
-                     a native bridge for {application} placed by its package's own declaration \
-                     to install into it: {application} would enable everything in it with the \
-                     registration"
-                ));
+                return Err(not_made_by_this_host(&path, application));
             }
             if !holds_only(existing.path(), "", &registration)
                 .map_err(|error| format!("{path} cannot be read: {error}"))?
@@ -2939,6 +2987,36 @@ fn place_is_free(
         }
     }
     Ok(())
+}
+
+/// Whether the journal records a publication of the directory at `path` under the identity
+/// `existing` has now: the directory this host made, and never one that only has its path.
+fn made_by_this_host(journal: &Journal, path: &str, existing: &Dir) -> bool {
+    journal.changes.iter().any(|change| {
+        matches!(change, Change::Directory { path: made, publication: Publication::Published { identity }, .. }
+            if made == path && identity.same_object(&existing.identity()))
+    })
+}
+
+/// Why a package that declares its own placement is refused a folder that is there and that this
+/// host did not make.
+fn not_made_by_this_host(path: &str, application: &str) -> String {
+    format!(
+        "{path} is already there and this host did not make it, so it does not permit a native \
+         bridge for {application} placed by its package's own declaration to install into it: \
+         {application} would enable everything in it with the registration"
+    )
+}
+
+/// The plugin folder, `<area>/<name>`, the recipe's first file is installed into.
+fn plugin_folder(recipe: &NativeBridge) -> Option<String> {
+    recipe.install.iter().find_map(|step| match step {
+        BridgeStep::InstallFile { destination, .. } => {
+            let mut parts = destination.as_str().splitn(3, '/');
+            Some(format!("{}/{}", parts.next()?, parts.next()?))
+        }
+        BridgeStep::AddConfigurationKey { .. } => None,
+    })
 }
 
 /// The name the plugin manifest at `path` gives itself, read as an application reads it: one

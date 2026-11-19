@@ -6589,6 +6589,179 @@ fn a_declared_placement_in_another_labels_directory_is_refused() {
     assert_eq!(site.tree(), before, "nothing was written");
 }
 
+/// The release of the Quill site whose recipe installs the files of `tails` in the plugin's folder
+/// (each from the manifest or the hooks file of the package, by its name) and takes them out in
+/// the reverse order, under `placement`.
+fn quill_release_of(site: &QuillSite, placement: Placement, tails: &[&str]) -> BridgeTarget {
+    let mut release = site.release(
+        "kalareach/quill",
+        "quill-bridge",
+        Declared::Placement(Box::new(placement)),
+    );
+    let recipe = serde_json::to_value(&release.recipe).expect("the recipe encodes");
+    let digest_of = |source: &str| {
+        recipe["install"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .find(|step| step["source"] == source)
+            .map(|step| step["digest"].clone())
+            .expect("a step of the package's own")
+    };
+    let step = |tail: &str| {
+        let source = if tail == "plugin.json" {
+            "bridge/plugin.json"
+        } else {
+            "bridge/hooks.json"
+        };
+        (
+            serde_json::json!({"type": "install_file", "source": source,
+                "destination": format!("plugins/quill-bridge/{tail}"), "digest": digest_of(source)}),
+            serde_json::json!({"type": "remove_file",
+                "destination": format!("plugins/quill-bridge/{tail}"), "digest": digest_of(source)}),
+        )
+    };
+    let (install, mut remove): (Vec<_>, Vec<_>) = tails.iter().map(|tail| step(tail)).unzip();
+    remove.reverse();
+    let mut recipe = recipe;
+    recipe["install"] = serde_json::Value::Array(install);
+    recipe["remove"] = serde_json::Value::Array(remove);
+    release.recipe = serde_json::from_value(recipe).expect("a recipe");
+    release
+}
+
+/// KR-REQ-11.44: the files a placement names are compared by their complete tails: of tails that
+/// end alike, installing only the longer one does not satisfy both, and installing both counts
+/// each once.
+#[cfg(unix)]
+#[test]
+fn a_declared_placement_holds_each_file_to_its_complete_tail() {
+    let overlapping = || {
+        let mut placement = quill_placement(&[".quill"]);
+        let hooks = placement.files.remove(1);
+        placement.files.push(kr_plugin_sdk::placement::PlacedFile {
+            tail: "hooks.json".to_owned(),
+            shape: hooks.shape.clone(),
+        });
+        placement.files.push(kr_plugin_sdk::placement::PlacedFile {
+            tail: "x/hooks.json".to_owned(),
+            shape: hooks.shape,
+        });
+        placement
+    };
+    let site = QuillSite::new();
+    let before = site.tree();
+    let release = quill_release_of(&site, overlapping(), &["plugin.json", "x/hooks.json"]);
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&release))
+        .expect("reconciles");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains("does not install hooks.json")),
+        "the longer tail does not stand for the shorter: {settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    let site = QuillSite::new();
+    let release = quill_release_of(
+        &site,
+        overlapping(),
+        &["plugin.json", "hooks.json", "x/hooks.json"],
+    );
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&release))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied, "each tail once: {settled:?}");
+
+    let site = QuillSite::new();
+    let before = site.tree();
+    let release = quill_release_of(&site, quill_placement(&[".quill"]), &["plugin.json"]);
+    let settled = site
+        .bridges()
+        .reconcile(&quill_id(), Some(&release))
+        .expect("reconciles");
+    assert!(
+        refusal_of(&settled)
+            .is_some_and(|reason| reason.contains("does not install hooks/hooks.json")),
+        "a file left out: {settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// KR-REQ-11.42: the record Gemini CLI needs is the file the recipe removes last by its complete
+/// tail in the extension's folder: a placement that names the record deeper in the folder does
+/// not stand for it.
+#[cfg(unix)]
+#[test]
+fn a_gemini_cli_record_in_a_nested_place_is_not_the_record() {
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let mut placement = Placement::gemini_cli();
+    placement.files[0].tail = "hooks/.gemini-extension-install.json".to_owned();
+    let mut release = site.release();
+    let mut recipe = serde_json::to_value(&release.recipe).expect("the recipe encodes");
+    for list in ["install", "remove"] {
+        for step in recipe[list].as_array_mut().expect("steps") {
+            let destination = step["destination"].as_str().expect("a path").to_owned();
+            if destination.ends_with("/.gemini-extension-install.json") {
+                step["destination"] = serde_json::json!(
+                    destination.replace("/.gemini-extension-install.json", "/hooks/.gemini-extension-install.json")
+                );
+            }
+        }
+    }
+    release.recipe = serde_json::from_value(recipe).expect("a recipe");
+    release.placement = Declared::Placement(Box::new(placement));
+    let settled = site
+        .bridges()
+        .reconcile(&gemini(), Some(&release))
+        .expect("reconciles");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains("out last")),
+        "{settled:?}"
+    );
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// KR-REQ-11.44: the plugin's folder is held to be this host's at the write, not only at the
+/// preflight: a folder that appears in the instant between making this host's own and publishing
+/// it is another's, nothing is written into it, and its own content stays.
+#[cfg(unix)]
+#[test]
+fn a_declared_folder_that_wins_the_publication_race_is_never_written_into() {
+    let site = QuillSite::new();
+    let before = site.tree();
+    let bridges = site.bridges();
+    bridges.before_publishing_directory(|destination| {
+        if destination.ends_with("plugins/quill-bridge") {
+            std::fs::create_dir_all(destination).expect("a competing folder");
+            std::fs::write(destination.join("their-own.txt"), b"theirs").expect("their file");
+        }
+    });
+    let settled = bridges
+        .reconcile(&quill_id(), Some(&site.declared()))
+        .expect("reconciles");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains("did not make it")),
+        "{settled:?}"
+    );
+    let after = site.tree();
+    let added: std::collections::BTreeSet<&str> = after
+        .keys()
+        .filter(|path| !before.contains_key(*path))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        added,
+        std::collections::BTreeSet::from([
+            ".quill/plugins/quill-bridge",
+            ".quill/plugins/quill-bridge/their-own.txt"
+        ]),
+        "only the competing folder and its own file are there: {after:?}"
+    );
+}
+
 /// KR-REQ-11.44: a release that moves its placement is taken out of the directory the journal
 /// records before it is placed in the new one, and a removal that comes with no target after a
 /// restart takes it out of the directory the journal records.
