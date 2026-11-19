@@ -2325,6 +2325,10 @@ impl OwnerChannel for WatchedChannel {
         self.completions.fetch_add(1, Ordering::SeqCst);
         self.inner.complete(params)
     }
+
+    fn host_states_placement_reading(&self) -> bool {
+        self.inner.host_states_placement_reading()
+    }
 }
 
 /// The owner device a host was started with, as the product client knows its host.

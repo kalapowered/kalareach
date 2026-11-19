@@ -85,9 +85,7 @@ pub trait OwnerChannel: Send + Sync {
 
     /// Whether the host's hello says it writes the placement reading under its own label. A
     /// channel with no hello of a host says no, and a statement is then the publisher's whole.
-    fn host_states_placement_reading(&self) -> bool {
-        false
-    }
+    fn host_states_placement_reading(&self) -> bool;
 }
 
 /// A method that takes no parameters, as the empty map the protocol expects.
@@ -2829,6 +2827,10 @@ mod tests {
     }
 
     impl OwnerChannel for Listing {
+        fn host_states_placement_reading(&self) -> bool {
+            false
+        }
+
         fn pending(&self) -> BoxFuture<'_, Result<OwnerConfirmationPendingResult, ClientError>> {
             let pending = self.pending.lock().expect("the listing").clone();
             Box::pin(async move { Ok(OwnerConfirmationPendingResult { pending }) })

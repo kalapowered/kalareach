@@ -864,7 +864,7 @@ fn a_registration_file_with_a_repeated_member_is_refused_in_either_order_and_whe
             .reconcile(&plugin(), Some(&site.release_with_hooks("repeat", &hooks)))
             .expect("reconciles");
         assert!(
-            refused(&settled).contains("no repeated member"),
+            refusal_of(&settled).is_some_and(|reason| reason.contains("appears more than once")),
             "{what}: {settled:?}"
         );
         assert_eq!(site.tree(), before, "{what}: nothing was written");
@@ -6895,10 +6895,11 @@ fn a_declared_shape_cannot_hide_a_command_from_the_walker() {
 }
 
 /// KR-REQ-11.44: a file a declared placement gives an array for its root is read exactly, whole,
-/// like every other: a name repeated in an object inside it refuses the file, in either order and
-/// when the repeat is spelt with an escape, and nothing is written. The placement is held here
-/// directly, as a controller that did not check the table would hold it: the strict reader is the
-/// floor under the declaration's own check.
+/// like every other, and the strict reader refuses it at its root as a document that is not a JSON
+/// object, before it reads any member, however a name is repeated in an object inside it: in
+/// either order or spelt with an escape. Nothing is written. The placement is held here directly,
+/// as a controller that did not check the table would hold it: the strict reader is the floor
+/// under the declaration's own check.
 #[cfg(unix)]
 #[test]
 fn a_registration_file_with_an_array_root_and_a_repeated_member_is_refused_before_any_write() {
@@ -6938,7 +6939,7 @@ fn a_registration_file_with_an_array_root_and_a_repeated_member_is_refused_befor
             .reconcile(&quill_id(), Some(&release))
             .expect("reconciles");
         assert!(
-            matches!(&settled, Settled::Refused(reason) if reason.contains("no repeated member")),
+            refusal_of(&settled).is_some_and(|reason| reason.contains("is not a JSON object")),
             "{what}: {settled:?}"
         );
         assert_eq!(site.tree(), before, "{what}: nothing was written");
