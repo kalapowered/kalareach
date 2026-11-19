@@ -2,12 +2,16 @@
 //! connector table of a whole package directory and run the package check every host, publisher
 //! and pipeline runs, and check the placement type and its engine directly.
 
+use std::cell::RefCell;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::placement::{Placement, PlacementRefusal, Shape, is_plain_component};
 use kr_plugin_sdk::schema::package_contract;
-use kr_plugin_sdk::validate::{FindingCode, Validated, validate_package_directory};
+use kr_plugin_sdk::validate::{
+    FindingCode, Validated, validate_package_directory, validate_package_directory_in_order,
+};
 use kr_plugin_sdk::version::SDK_VERSION;
 use serde_json::{Value, json};
 
@@ -1225,6 +1229,14 @@ fn the_package_check_refuses_every_key_but_the_labels_one() {
 /// The bundled Gemini CLI package under a fresh directory, `edit` applied to the directory and
 /// to the manifest before the check runs.
 fn gemini_directory(edit: impl FnOnce(&Path, &mut Value)) -> Validated {
+    gemini_directory_checked(edit, validate_package_directory)
+}
+
+/// The same package as [`gemini_directory`], checked by `check`.
+fn gemini_directory_checked(
+    edit: impl FnOnce(&Path, &mut Value),
+    check: impl FnOnce(&Path) -> Validated,
+) -> Validated {
     let home = tempfile::tempdir().expect("a directory");
     let directory = home.path().join("package");
     copy_tree(&bundled("gemini-cli"), &directory);
@@ -1237,7 +1249,7 @@ fn gemini_directory(edit: impl FnOnce(&Path, &mut Value)) -> Validated {
         serde_json::to_vec_pretty(&manifest).expect("writes"),
     )
     .expect("writes");
-    validate_package_directory(&directory)
+    check(&directory)
 }
 
 /// Writes `bytes` to `name` in `directory` and declares it in `manifest` as a payload of `role`.
@@ -1367,44 +1379,42 @@ fn a_package_whose_other_files_fill_the_cache_first_still_has_its_bridge_files_r
 
 /// The files a recipe installs from the package's root are kept whatever order the directory
 /// lists its entries in: the manifest is read first, so the recipe is known when the first of
-/// them is. Files are added until the listing gives one of them before the manifest.
+/// them is. The case sets the order itself, the manifest after every other entry, so that no file
+/// system's listing decides whether a bridge file is met before the manifest.
 #[test]
 fn a_bridge_file_at_the_root_is_kept_whatever_the_order_of_the_listing() {
-    let validated = gemini_directory(|directory, manifest| {
-        let bytes = object_of(2);
-        let listed_before_the_manifest = || {
-            let names: Vec<String> = std::fs::read_dir(directory)
-                .expect("lists")
-                .map(|entry| {
-                    entry
-                        .expect("an entry")
-                        .file_name()
-                        .to_string_lossy()
-                        .into_owned()
-                })
-                .collect();
-            let manifest_at = names
-                .iter()
-                .position(|name| name == "plugin.json")
-                .expect("the manifest is listed");
-            names[..manifest_at]
-                .iter()
-                .any(|name| name.starts_with("root-"))
-        };
-        let mut number = 0;
-        while !listed_before_the_manifest() {
-            assert!(number < 512, "no listing order put a root file first");
-            let name = format!("root-{number}.json");
-            declare_file(directory, manifest, &name, "native_bridge", &bytes);
+    let bytes = object_of(2);
+    let root_listing = RefCell::new(Vec::<OsString>::new());
+    let manifest_last = |names: &mut Vec<OsString>| {
+        names.sort_by_key(|name| name == "plugin.json");
+        if names.iter().any(|name| name == "plugin.json") {
+            *root_listing.borrow_mut() = names.clone();
+        }
+    };
+    let validated = gemini_directory_checked(
+        |directory, manifest| {
+            let name = "root-0.json";
+            declare_file(directory, manifest, name, "native_bridge", &bytes);
             install_file(
                 manifest,
-                &name,
+                name,
                 &format!("extensions/kalareach/{name}"),
                 &bytes,
             );
-            number += 1;
-        }
-    });
+        },
+        |directory| validate_package_directory_in_order(directory, &manifest_last),
+    );
+    let listed = root_listing.into_inner();
+    let at = |wanted: &str| {
+        listed
+            .iter()
+            .position(|name| name == wanted)
+            .expect("the root lists it")
+    };
+    assert!(
+        at("root-0.json") < at("plugin.json"),
+        "the bridge file is met before the manifest: {listed:?}"
+    );
     assert_eq!(
         unread_bridge_files(&validated),
         Vec::<String>::new(),

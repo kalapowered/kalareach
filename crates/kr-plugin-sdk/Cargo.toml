@@ -16,6 +16,11 @@ path = "src/bin/kr-plugin-sdk-gen.rs"
 name = "kr-plugin-sandbox"
 path = "src/bin/kr-plugin-sandbox.rs"
 
+[features]
+# Lets a test set the order in which the package check meets the entries of a directory, so that
+# what it shows does not depend on the order a file system lists them in.
+testing = []
+
 [dependencies]
 cap-fs-ext.workspace = true
 cap-std.workspace = true
@@ -32,6 +37,7 @@ thiserror.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+kr-plugin-sdk = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 wit-parser.workspace = true
 

@@ -5037,6 +5037,7 @@ dependencies = [
  "cap-fs-ext",
  "cap-std",
  "hex",
+ "kr-plugin-sdk",
  "kr-protocol",
  "libc",
  "schemars 1.2.2",
