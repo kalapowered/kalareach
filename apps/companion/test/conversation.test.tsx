@@ -576,6 +576,37 @@ describe('what the person writes goes where they wrote it (KR-REQ-13.12)', () =>
       expect(endings(ends)).toEqual(['unknown'])
     })
   })
+
+  it("says why no package takes a prompt, in the host's own words, for an agent no package took (KR-REQ-12.23)", async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    // What the host writes in the refusal of an agent that two packages recognise equally well.
+    const tie =
+      'it was not launched through the integration, and acme.codex and openai.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+    openConversation({
+      ...port,
+      sessionAgents: async (...args) => {
+        const read = await port.sessionAgents(...args)
+        const instances = read.instances.instances.map((each) => ({
+          ...each,
+          plugin_id: null,
+          refusal: tie
+        }))
+        return { ...read, instances: { ...read.instances, instances } }
+      }
+    })
+    await waitFor(() => {
+      expect(shown()).toEqual(HISTORY)
+    })
+    await person.type(screen.getByTestId('composer-input'), 'Keep the timer')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(
+        `No package is bound to this agent. The host says ${tie}.`
+      )
+    })
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+    expect(screen.queryByText('No agent is running in this session.')).toBeNull()
+  })
 })
 
 describe('what packages show arrives on the stream (KR-REQ-11.48)', () => {
