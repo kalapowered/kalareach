@@ -461,7 +461,16 @@ A test that returns early, because what it needs is absent, passes as far as the
 concerned. The suites say so on a line that starts `skipped:`, `skipping:` or `not exercised`, or
 that names the suite and then says `: skipped, because`, and the report finds that line in what the
 test wrote and reports the test as not run, with the line as its reason. A line of that kind the
-report cannot give to one test makes its binary's output unreadable, which fails the step.
+report cannot give to one test makes its binary's output unreadable, which fails the step. A test
+that skips only part of its case says `not exercised:`, so that the whole case reads as not run: the
+report then claims too little and never too much. A scan of the repository's tests
+(`tests/conformance/tests/early_returns.rs`) holds the rule: a print that speaks of a skip, or that
+a `return` or a `continue` follows at once in test code, starts with one of these words, or is on
+the scan's list with its reason. It does not see a print made through a variable or a helper, or a
+`return` with no print before it. The cases that need the real description weights stand down with
+that line too, and fail instead where the run sets `KR_REQUIRE_DESCRIBE_WEIGHTS=1`, which a run that
+holds the weights sets: there the weights are promised, and a case that stood down would read as
+passed in a log that shows no output.
 
 A test that several steps list takes the strongest outcome among them: failed, then passed, then
 ignored, then not run, then not built. A test keyed to one identifier twice, by its own comment and
