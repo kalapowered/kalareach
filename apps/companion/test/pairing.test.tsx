@@ -726,6 +726,7 @@ function request(overrides: Partial<ConfirmationRequest> = {}): ConfirmationRequ
     facts: [],
     notice: null,
     statement: null,
+    placement: null,
     reading: null,
     expires_at_ms: Date.now() + 110_000,
     checkable: true,
@@ -847,6 +848,43 @@ describe("the owner's confirmation of a repository and of an installation", () =
         ).toBeTruthy()
       }
     }
+  })
+
+  it("captions this host's reading of a placement as the host's, between the publisher's words and the integration reading", async () => {
+    const { controls } = start({ view: 'attention' })
+    const words = 'Adds one registration file for the application.'
+    const placement =
+      'This package places files for "Quill CLI" in a folder it chose: .quill/plugins/quill-bridge/ under your home folder, files plugin.json.'
+    const reading = 'Runs "codex" in KalaReach sessions with these arguments added: "--remote".'
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          request({
+            title: 'Install a plugin',
+            detail: 'Install kalareach/quill 0.3.0 from community on studio.',
+            value: null,
+            facts: [{ label: 'Plugin', value: 'kalareach/quill 0.3.0', code: true }],
+            statement: words,
+            placement,
+            reading
+          })
+        ]
+      })
+    })
+    const shown = await screen.findByTestId('confirmation-placement')
+    expect(within(shown).getByText(placement).tagName).toBe('BLOCKQUOTE')
+    expect(within(shown).getByText("This host's exact reading of the placement")).toBeInTheDocument()
+    expect(within(shown).queryByText('The publisher says')).toBeNull()
+    const publisher = screen.getByTestId('confirmation-statement')
+    expect(publisher.textContent).not.toContain('Quill CLI')
+    const integration = screen.getByTestId('confirmation-reading')
+    expect(
+      publisher.compareDocumentPosition(shown) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+    expect(
+      shown.compareDocumentPosition(integration) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
   })
 
   it('shows no statement for an installation whose release says nothing of a bridge', async () => {

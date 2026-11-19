@@ -29,9 +29,9 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_pairing::platform::PairingClock;
 use kr_protocol::confirmation::{
     CLOCK_PURPOSE, CatalogueTrustPlan, ConfirmationDisplay, DescribedAction,
-    ExclusiveManagementPlan, OrganisationEnrolPlan,
-    OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
-    OwnerConfirmationPendingResult, PendingConfirmation, PluginInstallPlan, TransferControlPlan,
+    ExclusiveManagementPlan, OrganisationEnrolPlan, OwnerConfirmationCompleteParams,
+    OwnerConfirmationPendingParams, OwnerConfirmationPendingResult, PendingConfirmation,
+    PluginInstallPlan, TransferControlPlan,
 };
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
@@ -82,6 +82,12 @@ pub trait OwnerChannel: Send + Sync {
         &'a self,
         params: &'a OwnerConfirmationCompleteParams,
     ) -> BoxFuture<'a, Result<(), ClientError>>;
+
+    /// Whether the host's hello says it writes the placement reading under its own label. A
+    /// channel with no hello of a host says no, and a statement is then the publisher's whole.
+    fn host_states_placement_reading(&self) -> bool {
+        false
+    }
 }
 
 /// A method that takes no parameters, as the empty map the protocol expects.
@@ -117,6 +123,10 @@ impl SessionChannel {
 }
 
 impl OwnerChannel for SessionChannel {
+    fn host_states_placement_reading(&self) -> bool {
+        self.session.transport().host_states_placement_reading()
+    }
+
     fn pending(&self) -> BoxFuture<'_, Result<OwnerConfirmationPendingResult, ClientError>> {
         Box::pin(async move {
             self.session
@@ -1134,6 +1144,10 @@ pub struct Listed {
     pub subject: Result<Subject, CannotCheck>,
     /// True once a proof has answered it and it waits for its action.
     pub answered: bool,
+    /// Whether the host's hello says it writes the placement reading under its own label, which
+    /// decides whether a statement is told apart at that label
+    /// ([`kr_protocol::confirmation::split_install_statement`]).
+    pub host_states_placement_reading: bool,
 }
 
 /// How a review ended.
@@ -1203,6 +1217,7 @@ impl OwnerConfirmations {
     /// Returns the channel's failure.
     pub async fn pending(&self) -> Result<Vec<Listed>, ClientError> {
         let listed = self.channel.pending().await?;
+        let host_states_placement_reading = self.channel.host_states_placement_reading();
         Ok(listed
             .pending
             .iter()
@@ -1210,6 +1225,7 @@ impl OwnerConfirmations {
                 request: pending.request.clone(),
                 subject: check(pending, &self.host),
                 answered: pending.answered,
+                host_states_placement_reading,
             })
             .collect())
     }

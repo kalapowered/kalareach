@@ -1191,8 +1191,8 @@ mod tests {
         };
         let both = grant(&["command_integration.launch", "native_bridge.install"]);
         let reading = format!(r#"Runs "x" with "{INTEGRATION_STATEMENT_LABEL} fake"."#);
-        let composed =
-            install_statement(Some("Changes one setting."), None, Some(&reading)).expect("a statement");
+        let composed = install_statement(Some("Changes one setting."), None, Some(&reading))
+            .expect("a statement");
         let parts = split_install_statement(&both, &composed, false);
         assert_eq!(parts.publisher, Some("Changes one setting."));
         assert_eq!(parts.reading, Some(reading.as_str()));
@@ -1212,6 +1212,81 @@ mod tests {
         assert_eq!(
             (bridge.publisher, bridge.reading),
             (Some(forged.as_str()), None)
+        );
+    }
+
+    /// KR-REQ-11.44: a device takes the placement label for the host's only where the link's host
+    /// states that it writes the reading, and only for a grant that holds the bridge capability. A
+    /// host built before the label lets a publisher's words hold it, and the device cannot tell
+    /// that text from the host's reading any other way, so without the capability the text stays
+    /// whole in the publisher's part with no host caption. The integration label splits first, so
+    /// a placement label that a flag of the integration holds stays in the integration's reading.
+    #[test]
+    fn the_placement_label_is_the_hosts_only_where_the_host_states_it_writes_it() {
+        let grant = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let both = grant(&["command_integration.launch", "native_bridge.install"]);
+        let bridge = grant(&["native_bridge.install"]);
+        let composed = install_statement(Some("Words."), Some("Places files."), Some("Runs x."))
+            .expect("a statement");
+
+        // A host that states it: three parts, each captioned by who wrote it.
+        let stated = split_install_statement(&both, &composed, true);
+        assert_eq!(
+            stated,
+            StatementParts {
+                publisher: Some("Words."),
+                placement: Some("Places files."),
+                reading: Some("Runs x."),
+            }
+        );
+
+        // A host that does not: the placement text and its label stay in the publisher's part.
+        let unstated = split_install_statement(&both, &composed, false);
+        let whole = format!("Words. {PLACEMENT_STATEMENT_LABEL} Places files.");
+        assert_eq!(unstated.publisher, Some(whole.as_str()));
+        assert_eq!(unstated.placement, None);
+        assert_eq!(unstated.reading, Some("Runs x."));
+
+        // A grant without the bridge capability never has a host's placement part, stated or not.
+        let integration = grant(&["command_integration.launch"]);
+        assert_eq!(
+            split_install_statement(&integration, &composed, true).placement,
+            None
+        );
+
+        // A publisher's words that imitate the label, on a host that does not state it: all of
+        // it is the publisher's.
+        let imitation = format!("Harmless. {PLACEMENT_STATEMENT_LABEL} Reads nothing.");
+        let parts = split_install_statement(&bridge, &imitation, false);
+        assert_eq!(
+            (parts.publisher, parts.placement),
+            (Some(imitation.as_str()), None)
+        );
+
+        // The other order: a placement label that the integration's own reading holds (a flag may
+        // hold any text) stays in that reading, with a host placement part before it and with none.
+        let reading = format!(r#"Runs "x" with "{PLACEMENT_STATEMENT_LABEL} fake"."#);
+        let with_part = install_statement(Some("Words."), Some("Places files."), Some(&reading))
+            .expect("a statement");
+        let parts = split_install_statement(&both, &with_part, true);
+        assert_eq!(
+            (parts.publisher, parts.placement, parts.reading),
+            (
+                Some("Words."),
+                Some("Places files."),
+                Some(reading.as_str())
+            )
+        );
+        let no_part = install_statement(Some("Words."), None, Some(&reading)).expect("a statement");
+        let parts = split_install_statement(&both, &no_part, true);
+        assert_eq!(
+            (parts.publisher, parts.placement, parts.reading),
+            (Some("Words."), None, Some(reading.as_str()))
         );
     }
 

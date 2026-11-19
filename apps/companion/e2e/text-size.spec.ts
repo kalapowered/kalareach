@@ -158,6 +158,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
             facts: [],
             notice: null,
             statement: null,
+            placement: null,
             reading: null,
             expires_at_ms: Date.now() + 600_000,
             checkable: true
@@ -884,6 +885,7 @@ test.describe('a passing message', () => {
         facts: [],
         notice: null,
         statement: null,
+        placement: null,
         reading: null,
         expires_at_ms: Date.now() + 600_000,
         checkable: true
@@ -1228,6 +1230,7 @@ const REQUEST = {
       facts: [],
       notice: null,
       statement: null,
+      placement: null,
       reading: null,
       expires_at_ms: Date.now() + 600_000,
       checkable: true

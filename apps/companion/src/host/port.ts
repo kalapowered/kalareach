@@ -891,6 +891,12 @@ export interface ConfirmationRequest {
   /** What the publisher says in its own words about the release, quoted apart from the host's. */
   readonly statement: string | null
   /**
+   * What the host reads of where the release's bridge is placed, exactly, where the release
+   * declares a placement and the host says it writes that reading. It is the host's, captioned
+   * apart from the publisher's words; otherwise the text stays in the publisher's.
+   */
+  readonly placement: string | null
+  /**
    * What the host reads of the release's command integration, exactly, where the request would
    * grant one. It is the host's, captioned apart from the publisher's words.
    */

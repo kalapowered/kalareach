@@ -183,6 +183,13 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// Revokes every data stream, which is what the end of the control stream means.
     fn revoke_streams(&self);
 
+    /// Whether the host's hello says it writes the placement reading under its own label and
+    /// refuses that label in a publisher's words. A transport that has no hello of a host says no,
+    /// and a statement it carries is then read whole as the publisher's.
+    fn host_states_placement_reading(&self) -> bool {
+        false
+    }
+
     /// Ends the connection.
     fn close(&self);
 }
@@ -200,6 +207,8 @@ pub struct NetworkTransport {
     streams: Arc<StreamRegistry>,
     opener: Arc<NetworkStreams>,
     reach: Reach,
+    /// Whether the host selected the capability that says it writes the placement reading.
+    host_states_placement_reading: bool,
 }
 
 crate::debug_fields!(NetworkTransport { connection_id });
@@ -254,6 +263,9 @@ impl NetworkTransport {
                 host: format!("host:{}", host_record.device_id),
                 actor: format!("device:{}", identity.device_id),
             },
+            host_states_placement_reading: kr_protocol::confirmation::states_placement_reading(
+                &authorised.selection.capabilities,
+            ),
         })
     }
 
@@ -294,6 +306,10 @@ impl ControlTransport for NetworkTransport {
 
     fn limits(&self) -> ReceiveLimits {
         self.limits
+    }
+
+    fn host_states_placement_reading(&self) -> bool {
+        self.host_states_placement_reading
     }
 
     fn initial_action_window(&self) -> ActionWindow {
