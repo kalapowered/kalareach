@@ -204,3 +204,108 @@ fn a_backend_that_never_answers_is_bounded_and_the_real_launcher_runs() {
     assert!(error.contains("no answer"), "{error}");
     assert_eq!(out.trim(), "real:launch -- /bin/true true --flag");
 }
+
+/// The directory this test program's own build put its programs in, the real launcher among them.
+fn built_directory() -> PathBuf {
+    let mut directory = std::env::current_exe().expect("the test program");
+    directory.pop();
+    if directory.file_name().is_some_and(|name| name == "deps") {
+        directory.pop();
+    }
+    directory
+}
+
+/// The frame the forging launcher presents for a launch is the frame the real launcher presents for
+/// the same launch, member for member: they differ in the credential, which is the point, and in the
+/// pid and the start of the process that presents each, which are the processes'.
+#[test]
+fn a_frame_the_forging_launcher_presents_equals_the_real_launchers_but_for_the_credential_and_its_own_identity()
+ {
+    let real = built_directory().join("kr-hook");
+    assert!(
+        real.is_file(),
+        "the real launcher is not built at {}; build it with `cargo build -p kr-hook --bins`",
+        real.display()
+    );
+    let scene = Scene::new(true);
+    // The real launcher takes where the added flags stand from the registration's name, and
+    // refuses one that does not say: this launch has none added.
+    let registration = scene.root.join("launch/registration.0.0");
+    write_private(&registration, "");
+    let listener = scene.listener.try_clone().expect("the listener");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let backend = std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        let began = std::time::Instant::now();
+        while lines.len() < 2 && began.elapsed() < std::time::Duration::from_secs(30) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).expect("blocking");
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                        .expect("a bound");
+                    let mut line = String::new();
+                    std::io::BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .expect("the frame");
+                    lines.push(line);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("the listener: {error}"),
+            }
+        }
+        lines
+    });
+    // The real launcher presents first, then the forging one, each in the same environment.
+    let _ = Command::new(&real)
+        .args(LAUNCH)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("KALAREACH_E2E_FORGE_ROOT", &scene.root)
+        .env("KR_REGISTRATION", &registration)
+        .output()
+        .expect("the real launcher runs");
+    let _ = scene.run(&registration, &LAUNCH);
+    let lines = backend.join().expect("the backend");
+    assert_eq!(
+        lines.len(),
+        2,
+        "both launchers presented a frame: {lines:?}"
+    );
+    let frame = |line: &str| -> serde_json::Map<String, serde_json::Value> {
+        let parsed: serde_json::Value = serde_json::from_str(line.trim()).expect("one JSON frame");
+        parsed["kr_launch"]
+            .as_object()
+            .cloned()
+            .expect("a launch frame")
+    };
+    let (real_frame, forged_frame) = (frame(&lines[0]), frame(&lines[1]));
+    let keys = |frame: &serde_json::Map<String, serde_json::Value>| {
+        frame.keys().cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(keys(&real_frame), keys(&forged_frame));
+    assert!(
+        real_frame.contains_key("environment"),
+        "a record with a gateway is presented the environment: {real_frame:?}"
+    );
+    for (key, value) in &real_frame {
+        if matches!(key.as_str(), "credential" | "pid" | "start") {
+            continue;
+        }
+        assert_eq!(
+            Some(value),
+            forged_frame.get(key),
+            "the member {key} of the two frames"
+        );
+    }
+    assert_eq!(real_frame["credential"], "ab".repeat(32));
+    let forged = forged_frame["credential"].as_str().expect("a credential");
+    assert!(forged.len() == 64 && forged.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_ne!(forged, "ab".repeat(32));
+    for frame in [&real_frame, &forged_frame] {
+        assert!(frame["pid"].is_u64() && frame["start"].is_u64());
+    }
+    assert_ne!(real_frame["pid"], forged_frame["pid"]);
+}
