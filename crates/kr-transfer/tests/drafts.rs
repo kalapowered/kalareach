@@ -1690,9 +1690,10 @@ fn kr_req_12_06_a_draft_keeps_the_binding_revision_it_was_written_under() {
 }
 
 /// KR-REQ-12.06: no draft that names an application is made while the journal holds sessions of an
-/// earlier build, because a build that ignores the revision could send it under another. A repeat of
-/// a create that was performed is answered from its record, a draft that names no application is
-/// made, and a draft that names one is made once the sessions have ended.
+/// earlier build, because a build that ignores the revision could send it under another: not while
+/// the sessions are owed their noting, and not while they are noted and held. A repeat of a create
+/// that was performed is answered from its record, a draft that names no application is made, and a
+/// draft that names one is made once the sessions have been settled.
 #[test]
 fn kr_req_12_06_no_draft_that_names_an_application_is_made_while_the_journal_is_owed_its_sessions()
 {
@@ -1734,8 +1735,12 @@ fn kr_req_12_06_no_draft_that_names_an_application_is_made_while_the_journal_is_
         )
         .expect("made in a journal this build made");
 
-    // The journal is now one that still holds sessions of an earlier build.
+    // The journal is now one that still holds sessions of an earlier build, which are not yet noted.
     set_version(2);
+    assert_eq!(
+        harness.service.noting().expect("reads the noting"),
+        kr_transfer::Noting::Owed
+    );
     let repeat = harness.service.draft_create(
         &harness.actor,
         &params(named()),
@@ -1775,8 +1780,72 @@ fn kr_req_12_06_no_draft_that_names_an_application_is_made_while_the_journal_is_
         "a draft that names no application is made: {unnamed:?}"
     );
 
-    // The sessions have ended: the journal is at the current version, and the create goes through.
-    set_version(kr_transfer::store::SCHEMA_VERSION);
+    // The host notes the sessions of the earlier build when it starts over the journal, and holds
+    // them until none can run a worker: a daemon serves a create in this state, not in the one above.
+    harness
+        .service
+        .note_unseen_prompt_sessions(&std::collections::BTreeSet::from([SessionId::new(
+            Uuid::from_bytes([9; 16]),
+        )]))
+        .expect("notes the session");
+    assert_eq!(
+        harness.service.noting().expect("reads the noting"),
+        kr_transfer::Noting::Held
+    );
+    let held_repeat = harness.service.draft_create(
+        &harness.actor,
+        &params(named()),
+        revision,
+        Some(&action(1)),
+        None,
+    );
+    assert!(
+        held_repeat
+            .as_ref()
+            .is_ok_and(|repeat| repeat.draft.draft_id == first.draft.draft_id),
+        "a repeat is answered from its record while the sessions are held: {held_repeat:?}"
+    );
+    let held_refused = harness
+        .service
+        .draft_create(
+            &harness.actor,
+            &params(named()),
+            revision,
+            Some(&action(2)),
+            None,
+        )
+        .expect_err(
+            "a new create that names an application is refused while the sessions are held",
+        );
+    assert!(
+        matches!(
+            held_refused,
+            kr_transfer::TransferError::StoreUnavailable { .. }
+        ),
+        "{held_refused:?}"
+    );
+    let held_unnamed = harness.service.draft_create(
+        &harness.actor,
+        &params(Nullable::null()),
+        None,
+        Some(&action(4)),
+        None,
+    );
+    assert!(
+        held_unnamed.is_ok(),
+        "a draft that names no application is made while the sessions are held: {held_unnamed:?}"
+    );
+
+    // No noted session can run a worker any more: the journal is settled, and the create goes
+    // through.
+    harness
+        .service
+        .settle_unseen_prompt_sessions()
+        .expect("settles the journal");
+    assert_eq!(
+        harness.service.noting().expect("reads the noting"),
+        kr_transfer::Noting::Done
+    );
     let made = harness.service.draft_create(
         &harness.actor,
         &params(named()),
@@ -1784,7 +1853,178 @@ fn kr_req_12_06_no_draft_that_names_an_application_is_made_while_the_journal_is_
         Some(&action(2)),
         None,
     );
-    assert!(made.is_ok(), "made once the sessions have ended: {made:?}");
+    assert!(
+        made.is_ok(),
+        "made once the sessions have been settled: {made:?}"
+    );
+}
+
+/// KR-REQ-12.06: a journal that a build before the binding revision wrote, with a draft and a
+/// session that can still run a worker, is opened by the service at its version with the column
+/// added, and holds the first draft that names an application back until that session has ended and
+/// the journal is settled. The draft the earlier build wrote stays unsendable, and the same create
+/// that was refused is made once the journal is settled.
+#[test]
+fn kr_req_12_06_a_journal_of_an_earlier_build_with_a_session_still_active_refuses_the_first_draft_that_names_an_application()
+ {
+    use kr_protocol::ids::{ActorId, AgentBindingRevision};
+    use kr_transfer::staging::StagingArea;
+
+    let host = kr_ipc::testing::TempHost::create();
+    let paths = host.environment();
+    StagingArea::prepare_root(&paths).expect("the service's directory");
+    let journal = StagingArea::store_path(&paths);
+    let actor = ActorId::new("local:transfer-test").expect("a valid principal");
+    let earlier_session = SessionId::new(Uuid::from_bytes([9; 16]));
+    let old_draft = DraftId::new(Uuid::from_bytes([0x0B; 16]));
+    let recorded_version = || -> i64 {
+        rusqlite::Connection::open(&journal)
+            .expect("opens")
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("reads the version")
+    };
+    let has_the_column = || -> bool {
+        rusqlite::Connection::open(&journal)
+            .expect("opens")
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('drafts')
+                  WHERE name = 'agent_binding_revision'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("reads the schema")
+            == 1
+    };
+
+    // The journal as a build before the revision was kept left it: at version 2, with the table of
+    // drafts as that build made it and a draft that names an application and targets a session.
+    {
+        let earlier = rusqlite::Connection::open(&journal).expect("makes the journal");
+        earlier
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (2);
+                 CREATE TABLE drafts (
+                     draft_id BLOB PRIMARY KEY, environment_id BLOB NOT NULL,
+                     actor_id TEXT NOT NULL, device_id BLOB, session_id BLOB,
+                     application_instance_id BLOB, revision INTEGER NOT NULL,
+                     state TEXT NOT NULL, text TEXT NOT NULL, created_at_ms INTEGER NOT NULL,
+                     updated_at_ms INTEGER NOT NULL);",
+            )
+            .expect("writes the tables");
+        earlier
+            .execute(
+                "INSERT INTO drafts (draft_id, environment_id, actor_id, session_id,
+                                     application_instance_id, revision, state, text,
+                                     created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, 'open', 'an old draft', 1, 1)",
+                rusqlite::params![
+                    old_draft.get().as_bytes().as_slice(),
+                    paths.environment_id().get().as_bytes().as_slice(),
+                    actor.as_str(),
+                    earlier_session.get().as_bytes().as_slice(),
+                    support::an_application().get().as_bytes().as_slice(),
+                ],
+            )
+            .expect("writes the draft");
+    }
+    assert_eq!(recorded_version(), 2);
+    assert!(!has_the_column());
+
+    let service = kr_transfer::TransferService::with_clock(
+        &paths,
+        std::sync::Arc::new(kr_transfer::ManualClock::new(support::START_MS)),
+    )
+    .expect("the service opens the journal and migrates it");
+    // The migration added the column and left the version for the settling.
+    assert_eq!(recorded_version(), 2);
+    assert!(has_the_column());
+    assert_eq!(
+        service.noting().expect("reads the noting"),
+        kr_transfer::Noting::Owed
+    );
+    // The draft the earlier build wrote is read through the service, and no prompt can send it.
+    let old = service
+        .record_prompt(
+            &actor,
+            old_draft,
+            earlier_session,
+            support::an_application(),
+            AgentBindingRevision::new(1),
+            &Admission::none(),
+        )
+        .expect_err("a draft with no revision is not sent");
+    assert_eq!(old.code(), ErrorCode::DraftConflict);
+    assert!(
+        old.to_string()
+            .contains("before this host kept the binding revision"),
+        "{old}"
+    );
+
+    // The host's start notes the sessions it knows, and holds them until none can run a worker.
+    service
+        .note_unseen_prompt_sessions(&std::collections::BTreeSet::from([earlier_session]))
+        .expect("notes the session");
+    assert_eq!(
+        service.noting().expect("reads the noting"),
+        kr_transfer::Noting::Held
+    );
+    let params = DraftCreateParams {
+        environment_id: service.environment_id(),
+        device_id: Nullable::null(),
+        session_id: Nullable::null(),
+        application_instance_id: Nullable::some(support::an_application()),
+        text: "have a look at this".to_owned(),
+    };
+    let action = Action {
+        actor_id: actor.clone(),
+        action_id: Uuid::from_bytes([1; 16]),
+        method: "draft.create".to_owned(),
+        payload_digest: support::digest(b"create"),
+        admission: Admission::none(),
+    };
+    let revision = Some(support::a_binding());
+    let refused = service
+        .draft_create(&actor, &params, revision, Some(&action), None)
+        .expect_err(
+            "the first draft that names an application is refused while the session may run",
+        );
+    assert!(
+        matches!(refused, kr_transfer::TransferError::StoreUnavailable { .. }),
+        "{refused:?}"
+    );
+
+    // The session's worker ends, which the host learns before it settles the journal: ending the
+    // session does not settle by itself, so the create is still refused until it does.
+    service
+        .end_session_insertions(&std::collections::BTreeSet::from([earlier_session]))
+        .expect("ends the session");
+    assert_eq!(
+        service.noting().expect("reads the noting"),
+        kr_transfer::Noting::Held
+    );
+    let still_refused = service
+        .draft_create(&actor, &params, revision, Some(&action), None)
+        .expect_err("refused until the journal is settled");
+    assert!(
+        matches!(
+            still_refused,
+            kr_transfer::TransferError::StoreUnavailable { .. }
+        ),
+        "{still_refused:?}"
+    );
+
+    // No noted session can run a worker: the host settles the journal, and the same create is made.
+    service
+        .settle_unseen_prompt_sessions()
+        .expect("settles the journal");
+    assert_eq!(
+        service.noting().expect("reads the noting"),
+        kr_transfer::Noting::Done
+    );
+    assert_eq!(recorded_version(), kr_transfer::store::SCHEMA_VERSION);
+    let made = service.draft_create(&actor, &params, revision, Some(&action), None);
+    assert!(made.is_ok(), "made once the journal is settled: {made:?}");
 }
 
 /// A draft for no session, made for `actor` with at most `limit` open drafts.
