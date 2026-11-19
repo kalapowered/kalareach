@@ -540,7 +540,8 @@ impl Controller {
                         if !plan.devices.contains(&record.device_id) {
                             plan.devices.push(record.device_id);
                         }
-                    } else if self.sharing.grants().record(grant_id)?.is_some() {
+                    } else if self.sharing.grants().probe(grant_id)? != crate::grants::Probe::Absent
+                    {
                         plan.grants.push(grant_id);
                     }
                 }
@@ -593,20 +594,42 @@ impl Controller {
     async fn apply_feed_plan_unwoken(&self, plan: &Plan) -> Result<Applied> {
         let mut revision = self.authority_revision().await?;
         let mut pending = 0_u64;
+        // Every target is attempted whatever an earlier one returned: a target that fails for
+        // another reason must not leave the targets after it paired. The first failure is kept and
+        // returned after the revision the completed targets reached has been noted; a target that
+        // completed is not repeated by the retry, because a revocation of what is withdrawn
+        // withdraws nothing and advances no revision.
+        let mut first_failure = None;
         for device_id in &plan.devices {
-            let result = self.revoke_device_authority(*device_id, None, None).await?;
-            revision = revision.max(result.authority_revision);
-            pending += result.barrier.pending().len() as u64;
+            match self.revoke_device_authority(*device_id, None, None).await {
+                Ok(result) => {
+                    revision = revision.max(result.authority_revision);
+                    pending += result.barrier.pending().len() as u64;
+                }
+                Err(error) => {
+                    first_failure.get_or_insert(error);
+                }
+            }
         }
         for grant_id in &plan.grants {
-            let result = self
+            match self
                 .revoke_grant(*grant_id, Audience::Host, None, None)
-                .await?;
-            revision = revision.max(result.authority_revision);
-            pending += result.barrier.pending().len() as u64;
+                .await
+            {
+                Ok(result) => {
+                    revision = revision.max(result.authority_revision);
+                    pending += result.barrier.pending().len() as u64;
+                }
+                Err(error) => {
+                    first_failure.get_or_insert(error);
+                }
+            }
         }
         self.compared_revision
             .fetch_max(revision.get(), std::sync::atomic::Ordering::SeqCst);
+        if let Some(error) = first_failure {
+            return Err(error);
+        }
         Ok(Applied {
             revision,
             completion: if pending == 0 {
@@ -1022,12 +1045,13 @@ impl Controller {
             grants: Vec::new(),
         };
         for grant_id in named.grants.iter().copied() {
-            if self
-                .sharing
-                .grants()
-                .record(grant_id)?
-                .is_some_and(|record| record.revoked_at_ms.is_none())
-            {
+            // A grant whose row cannot be read is live until a revocation has marked it: the
+            // request is carried out for it, and a repeat after the mark finds it revoked.
+            if matches!(
+                self.sharing.grants().probe(grant_id)?,
+                crate::grants::Probe::Readable { revoked: false }
+                    | crate::grants::Probe::Damaged { revoked: false }
+            ) {
                 plan.grants.push(grant_id);
             }
         }

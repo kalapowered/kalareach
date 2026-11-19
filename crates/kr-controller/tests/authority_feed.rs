@@ -8866,3 +8866,134 @@ async fn a_connection_that_waits_for_the_feed_counts_and_is_withdrawn_at_once() 
         assert!(is_served(raw).await, "no other connection was withdrawn");
     }
 }
+
+/// Raw SQL against the host's registry, past what the store's own writers take.
+fn registry_statement(host: &Host, sql: &str) {
+    let registry =
+        rusqlite::Connection::open(host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    registry.execute_batch(sql).expect("the statement runs");
+}
+
+fn key_literal(grant_id: kr_protocol::ids::GrantId) -> String {
+    let hex: String = grant_id
+        .get()
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("X'{hex}'")
+}
+
+fn revoked_in_the_registry(host: &Host, grant_id: kr_protocol::ids::GrantId) -> bool {
+    rusqlite::Connection::open(host.registry_database())
+        .expect("opens the registry")
+        .query_row(
+            &format!(
+                "SELECT revoked_at_ms IS NOT NULL FROM grants WHERE grant_id = {}",
+                key_literal(grant_id)
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .expect("the row reads")
+}
+
+/// Lets one pass of the carrier finish after the owner has published.
+async fn one_pass(rig: &Rig) {
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+    rig.timer.release_held();
+    within("a pass finishes", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+}
+
+/// A request that names only a grant whose row cannot be read is carried out in the pass that reads
+/// it: the grant's row is marked revoked, what is derived from the grant is withdrawn, and the
+/// request is acknowledged complete. It is not stopped, and not taken for a request that names
+/// nothing this host holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_request_naming_only_a_damaged_grant_is_carried_out_numbered_and_acknowledged() {
+    let rig = Rig::start().await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    let session_id = net_support::an_open_session(&rig.host).0;
+    let share = net_support::worker::share(
+        &rig.host,
+        session_id,
+        &kept.0,
+        &kept.1,
+        kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer),
+    )
+    .await;
+    rig.until_the_carrier_is_idle().await;
+    registry_statement(
+        &rig.host,
+        &format!(
+            "UPDATE grants SET grant = X'00' WHERE grant_id = {};",
+            key_literal(share.grant_id)
+        ),
+    );
+    rig.owner_publishes(
+        0xa4,
+        RevocationTarget::Grants {
+            grant_ids: [share.grant_id].into_iter().collect::<CanonicalSet<_>>(),
+        },
+    )
+    .await;
+    one_pass(&rig).await;
+    let held = rig.feed_as_the_owner_sees_it().await;
+    assert!(
+        held.records.iter().all(|record| record
+            .acknowledgement
+            .0
+            .as_ref()
+            .is_some_and(|ack| ack.completion == RevocationCompletion::Complete)),
+        "the request is acknowledged: {held:?}"
+    );
+    assert!(
+        revoked_in_the_registry(&rig.host, share.grant_id),
+        "the row that cannot be read is marked revoked"
+    );
+}
+
+/// A request that names a readable grant beside a row that cannot be read is carried out whole: the
+/// grant is withdrawn, the other row is marked, and the pass finishes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_request_naming_a_readable_grant_beside_a_damaged_row_is_carried_out_and_the_pass_synchronises()
+ {
+    let rig = Rig::start().await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    let session_id = net_support::an_open_session(&rig.host).0;
+    let role =
+        || kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer);
+    let readable =
+        net_support::worker::share(&rig.host, session_id, &kept.0, &kept.1, role()).await;
+    let damaged = net_support::worker::share(&rig.host, session_id, &kept.0, &kept.1, role()).await;
+    rig.until_the_carrier_is_idle().await;
+    registry_statement(
+        &rig.host,
+        &format!(
+            "UPDATE grants SET parent_grant_id = X'00' WHERE grant_id = {};",
+            key_literal(damaged.grant_id)
+        ),
+    );
+    rig.owner_publishes(
+        0xa5,
+        RevocationTarget::Grants {
+            grant_ids: [readable.grant_id].into_iter().collect::<CanonicalSet<_>>(),
+        },
+    )
+    .await;
+    one_pass(&rig).await;
+    assert!(revoked_in_the_registry(&rig.host, readable.grant_id));
+    assert!(
+        revoked_in_the_registry(&rig.host, damaged.grant_id),
+        "the owner's revocation marks the row it cannot read"
+    );
+}

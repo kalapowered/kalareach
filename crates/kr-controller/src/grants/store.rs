@@ -4821,6 +4821,71 @@ pub(crate) fn plan_withdrawal(scan: &Scan, roots: Roots, scope: Scope) -> Result
     Ok(plan)
 }
 
+/// What a grant's row is, as a request that names the grant needs to know it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Probe {
+    /// No row is keyed by the grant, and no row that cannot be read names it.
+    Absent,
+    /// A row this build reads holds the grant.
+    Readable {
+        /// Whether the grant is revoked.
+        revoked: bool,
+    },
+    /// Every row that cannot be read and is keyed by the grant or names it.
+    Damaged {
+        /// Whether every such row carries a revocation mark that is an integer.
+        revoked: bool,
+    },
+}
+
+impl GrantDirectory {
+    /// What the store holds for `grant_id`, without refusing a row it cannot read.
+    ///
+    /// The row keyed by the grant is read first, which costs one row for a readable grant. Only a
+    /// grant with no readable row reads the whole table, to find the rows that cannot be read and
+    /// are keyed by it or name it: a request that names such a grant is carried out, and is not
+    /// told that the grant is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be read.
+    pub fn probe(&self, grant_id: GrantId) -> Result<Probe> {
+        let key = grant_id.get().as_bytes().to_vec();
+        let keyed: Option<Result<Judged>> = self.with(|connection| {
+            connection
+                .query_row(
+                    concat!(
+                        "SELECT ",
+                        grant_columns!(),
+                        " FROM grants g WHERE g.grant_id = ?1"
+                    ),
+                    params![key],
+                    |row| Ok(judge_row(row)),
+                )
+                .optional()
+        })?;
+        if let Some(Judged::Readable(record)) = keyed.transpose()? {
+            return Ok(Probe::Readable {
+                revoked: record.revoked_at_ms.is_some(),
+            });
+        }
+        let scan = self.in_transaction(scan_all)?;
+        let mut named = scan.damaged.iter().filter(|row| {
+            row.damage.key == Some(grant_id)
+                || row
+                    .damage
+                    .decoded
+                    .is_some_and(|decoded| decoded.id == grant_id)
+        });
+        Ok(match named.next() {
+            None => Probe::Absent,
+            Some(first) => Probe::Damaged {
+                revoked: first.damage.marked && named.all(|row| row.damage.marked),
+            },
+        })
+    }
+}
+
 /// Whether withdrawing `grant` always owes a fence: whether a worker can hold work under it.
 ///
 /// Every grant but a voice grant, the one that carries `voice.use`. A voice grant is decided only
