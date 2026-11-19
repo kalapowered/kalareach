@@ -1103,6 +1103,87 @@ fn kr_req_12_07_a_launch_is_published_before_the_program_runs() {
     );
 }
 
+/// KR-REQ-11.44: a launch through the worker's own command backends names the hook events its
+/// package declares: while the program runs, its registration has one `events=` line that names the
+/// file `hook-events.json` in the backend's directory, and the file holds the declared value. A
+/// package that declares none publishes no such line.
+#[test]
+fn kr_req_11_44_a_launch_names_the_hook_events_its_package_declares_in_its_registration() {
+    let place = |names: &[&str]| {
+        serde_json::json!({"segments": names.iter()
+            .map(|name| serde_json::json!({"type": "member", "name": name}))
+            .collect::<Vec<_>>()})
+    };
+    let declared = serde_json::json!({
+        "event": place(&["event", "name"]),
+        "thread": place(&["thread", "id"]),
+        "events": [{"name": "session_open", "report": "session_started"}],
+    });
+    let shell = Shell::with_package(
+        fixture::COMMAND,
+        |store, forwarder| {
+            fixture::package(
+                store,
+                forwarder,
+                &fixture::Shape {
+                    hook_events: Some(declared.clone()),
+                    ..fixture::Shape::claude_code()
+                },
+            )
+            .expect("the package is written")
+        },
+        false,
+    );
+    let answer = shell.establish();
+    let directory = Shell::directory(&answer);
+    let registration = Shell::registration(&answer);
+    let child = shell.launch(&answer, "declared", &[("LINGER", "1")]);
+    let report = shell.report("declared");
+    assert_eq!(
+        report["registered"], "yes",
+        "the registration was there first"
+    );
+    let text = std::fs::read_to_string(&registration).expect("the registration is there");
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("events="))
+        .collect();
+    assert_eq!(
+        lines,
+        [format!(
+            "events={}",
+            directory.join("hook-events.json").display()
+        )],
+        "{text}"
+    );
+    let written = std::fs::read(directory.join("hook-events.json")).expect("the events are there");
+    assert_eq!(
+        serde_json::from_slice::<kr_plugin_sdk::hook_events::HookEvents>(&written)
+            .expect("the file holds hook events"),
+        serde_json::from_value::<kr_plugin_sdk::hook_events::HookEvents>(declared.clone())
+            .expect("the declared events read"),
+    );
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+
+    let plain = Shell::new();
+    let answer = plain.establish();
+    let registration = Shell::registration(&answer);
+    let child = plain.launch(&answer, "plain", &[("LINGER", "1")]);
+    let report = plain.report("plain");
+    assert_eq!(
+        report["registered"], "yes",
+        "the registration was there first"
+    );
+    let text = std::fs::read_to_string(&registration).expect("the registration is there");
+    assert!(
+        !text.lines().any(|line| line.starts_with("events=")),
+        "a package that declares no hook events publishes no line for them: {text}"
+    );
+    let (status, said) = finish(child);
+    assert!(status.success(), "{said}");
+}
+
 /// KR-REQ-12.07: a backend that its program's end has retired is retired once. Its directory's
 /// name is free from then, so when its line ends afterwards and retires it again, the files of
 /// another backend that took the name are left where they are.

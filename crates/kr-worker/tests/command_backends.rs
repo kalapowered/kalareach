@@ -412,8 +412,9 @@ async fn kr_req_11_44_a_launch_publishes_the_hook_events_its_package_declares() 
     let directory = registration.parent().expect("the backend's directory");
     let written =
         kr_ipc::paths::read_owner_only_file(&directory.join("hook-events.json"), 16 * 1024)
-            .expect("the events are owner-only")
-            .expect("the events are there");
+            .expect("the events are owner-only");
+    assert!(written.is_some(), "the events are there");
+    let written = written.unwrap_or_default();
     let expected: kr_plugin_sdk::hook_events::HookEvents =
         serde_json::from_value(declared).expect("the declared events read");
     assert_eq!(

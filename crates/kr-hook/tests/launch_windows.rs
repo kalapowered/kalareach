@@ -155,10 +155,33 @@ impl Shell {
         )
     }
 
+    /// A shell whose package declares `events` as its hook events.
+    fn declaring(events: serde_json::Value) -> Self {
+        Self::build_shaped(
+            |source, _| source,
+            fixture::Shape {
+                hook_events: Some(events),
+                ..fixture::Shape::gemini_cli(&[])
+            },
+            &[],
+            0,
+        )
+    }
+
     /// Builds a shell whose package declares `flags` and is written, then handed to `installed`
     /// with the path of the program, to be made into the source the connector is admitted from.
     fn build(
         installed: impl FnOnce(ConnectorSource, &Path) -> ConnectorSource,
+        flags: &[&str],
+        padding: u64,
+    ) -> Self {
+        Self::build_shaped(installed, fixture::Shape::gemini_cli(flags), flags, padding)
+    }
+
+    /// As [`Self::build`], for a package of the shape `shape`, which declares `flags`.
+    fn build_shaped(
+        installed: impl FnOnce(ConnectorSource, &Path) -> ConnectorSource,
+        shape: fixture::Shape,
         flags: &[&str],
         padding: u64,
     ) -> Self {
@@ -183,12 +206,7 @@ impl Shell {
         std::fs::create_dir_all(&store).expect("a store");
         let sources = Arc::new(ConnectorSources::new());
         let source = installed(
-            fixture::package(
-                &store,
-                &placed.forwarder,
-                &fixture::Shape::gemini_cli(flags),
-            )
-            .expect("the package is written"),
+            fixture::package(&store, &placed.forwarder, &shape).expect("the package is written"),
             &executable,
         );
         let broker = Arc::new(
@@ -447,6 +465,62 @@ impl Drop for Shell {
         let _ = self.job.terminate(1);
         let _ = self.backends.close();
     }
+}
+
+/// KR-REQ-11.44: a launch through the worker's own command backends names the hook events its
+/// package declares: its registration has one `events=` line that names the file `hook-events.json`
+/// in the backend's directory, and the file holds the declared value. A package that declares none
+/// publishes no such line.
+#[test]
+fn a_launch_names_the_hook_events_its_package_declares_in_its_registration() {
+    let place = |names: &[&str]| {
+        serde_json::json!({"segments": names.iter()
+            .map(|name| serde_json::json!({"type": "member", "name": name}))
+            .collect::<Vec<_>>()})
+    };
+    let declared = serde_json::json!({
+        "event": place(&["event", "name"]),
+        "thread": place(&["thread", "id"]),
+        "events": [{"name": "session_open", "report": "session_started"}],
+    });
+    let shell = Shell::declaring(declared.clone());
+    let answer = shell.establish();
+    let mut launcher = shell.launch(&answer, "declared", &[]);
+    let report = shell.report_from("declared", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "it was launched");
+    let registration = Shell::registration(&answer);
+    let directory = registration.parent().expect("the backend's directory");
+    let text = std::fs::read_to_string(&registration).expect("the registration");
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("events="))
+        .collect();
+    assert_eq!(
+        lines,
+        [format!(
+            "events={}",
+            directory.join("hook-events.json").display()
+        )],
+        "{text}"
+    );
+    let written = std::fs::read(directory.join("hook-events.json")).expect("the events are there");
+    assert_eq!(
+        serde_json::from_slice::<kr_plugin_sdk::hook_events::HookEvents>(&written)
+            .expect("the file holds hook events"),
+        serde_json::from_value::<kr_plugin_sdk::hook_events::HookEvents>(declared)
+            .expect("the declared events read"),
+    );
+
+    let plain = Shell::new();
+    let answer = plain.establish();
+    let mut launcher = plain.launch(&answer, "plain", &[]);
+    let report = plain.report_from("plain", &mut launcher);
+    assert_eq!(report["relaunch"], "true", "it was launched");
+    let text = std::fs::read_to_string(Shell::registration(&answer)).expect("the registration");
+    assert!(
+        !text.lines().any(|line| line.starts_with("events=")),
+        "a package that declares no hook events publishes no line for them: {text}"
+    );
 }
 
 /// KR-REQ-05.09 and KR-REQ-07.61: a launch is committed for the program the launcher created and
