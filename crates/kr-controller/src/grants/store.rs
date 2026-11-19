@@ -46,7 +46,16 @@ use super::durable::{StoredFeed, StoredPolicy};
 use super::policy::{Bound, UtcFloor};
 use crate::service::net::lifetimes::Anchored;
 
-use crate::error::{ControllerError, Result};
+use crate::error::{ControllerError, DamageClass, Result};
+
+/// The columns every select of a grant reads, first and in this order, from the table aliased `g`.
+macro_rules! grant_columns {
+    () => {
+        "g.grant, g.session_id, g.issued_at_ms, g.revoked_at_ms, g.revoked_by_parent, \
+         g.activated_at_ms, g.grant_id, g.recipient_device_id AS g_recipient, \
+         g.parent_grant_id AS g_parent"
+    };
+}
 
 /// One grant as the store holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -990,9 +999,11 @@ impl GrantDirectory {
         let row: Option<Row> = self.with(|connection| {
             connection
                 .query_row(
-                    "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms, grant_id
-                     FROM grants WHERE grant_id = ?1",
+                    concat!(
+                        "SELECT ",
+                        grant_columns!(),
+                        " FROM grants g WHERE grant_id = ?1"
+                    ),
                     params![key],
                     |row| Ok(read_row(row)),
                 )
@@ -1008,11 +1019,11 @@ impl GrantDirectory {
     /// Returns an error when the rows cannot be read.
     pub fn records(&self) -> Result<Vec<GrantRecord>> {
         let rows: Vec<Row> = self.with(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms, grant_id
-                 FROM grants ORDER BY grant_id",
-            )?;
+            let mut statement = connection.prepare(concat!(
+                "SELECT ",
+                grant_columns!(),
+                " FROM grants g ORDER BY grant_id"
+            ))?;
             let rows = statement
                 .query_map([], |row| Ok(read_row(row)))?
                 .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -1029,11 +1040,11 @@ impl GrantDirectory {
     pub fn records_for_device(&self, device_id: DeviceId) -> Result<Vec<GrantRecord>> {
         let key = device_id.get().as_bytes().to_vec();
         let rows: Vec<Row> = self.with(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms, grant_id
-                 FROM grants WHERE recipient_device_id = ?1 ORDER BY grant_id",
-            )?;
+            let mut statement = connection.prepare(concat!(
+                "SELECT ",
+                grant_columns!(),
+                " FROM grants g WHERE recipient_device_id = ?1 ORDER BY grant_id"
+            ))?;
             let rows = statement
                 .query_map(params![key], |row| Ok(read_row(row)))?
                 .collect::<rusqlite::Result<Vec<Row>>>()?;
@@ -1068,16 +1079,17 @@ impl GrantDirectory {
             )
         });
         let rows: Vec<(Row, Option<Vec<u8>>, i64)> = self.with(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT g.grant, g.session_id, g.issued_at_ms, g.revoked_at_ms, g.revoked_by_parent,
-                        g.activated_at_ms, g.grant_id, i.invitation_id, i.issued_at_ms
+            let mut statement = connection.prepare(concat!(
+                "SELECT ",
+                grant_columns!(),
+                ", i.invitation_id AS i_invitation_id, i.issued_at_ms AS i_issued_at_ms
                  FROM session_invitations i JOIN grants g ON g.grant_id = i.grant_id
                  WHERE i.recipient_device_id = ?1 AND i.state = 'open'
                    AND g.revoked_at_ms IS NULL AND g.activated_at_ms IS NULL
                    AND (i.issued_at_ms > ?2 OR (i.issued_at_ms = ?2 AND i.invitation_id > ?3))
                  ORDER BY i.issued_at_ms, i.invitation_id
-                 LIMIT ?4",
-            )?;
+                 LIMIT ?4"
+            ))?;
             let rows = statement
                 .query_map(
                     params![
@@ -1086,7 +1098,13 @@ impl GrantDirectory {
                         after_id,
                         i64::try_from(limit).unwrap_or(i64::MAX)
                     ],
-                    |row| Ok((read_row(row), row.get(7)?, row.get(8)?)),
+                    |row| {
+                        Ok((
+                            read_row(row),
+                            row.get("i_invitation_id")?,
+                            row.get("i_issued_at_ms")?,
+                        ))
+                    },
                 )?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
@@ -1137,16 +1155,16 @@ impl GrantDirectory {
             )
         });
         let rows: Vec<Row> = self.with(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-                        activated_at_ms, grant_id
-                 FROM grants
+            let mut statement = connection.prepare(concat!(
+                "SELECT ",
+                grant_columns!(),
+                " FROM grants g
                  WHERE recipient_device_id = ?1 AND session_id IS NOT NULL
                    AND activated_at_ms IS NOT NULL AND revoked_at_ms IS NULL
                    AND (issued_at_ms > ?2 OR (issued_at_ms = ?2 AND grant_id > ?3))
                  ORDER BY issued_at_ms, grant_id
-                 LIMIT ?4",
-            )?;
+                 LIMIT ?4"
+            ))?;
             let rows = statement
                 .query_map(
                     params![
@@ -3279,10 +3297,15 @@ fn check_parent(
 /// their fence still owed, proposals included: the grants a revocation of the tree can reach.
 ///
 /// The tree is everything below the grant that has no parent in this store, found from `member` up
-/// and counted from there down, in the store, without reading a grant.
+/// and counted from there down. Every row the walk touches, up or down, counted or not, is judged
+/// like any other read of a grant: a tree that holds a row this build cannot read is refused with
+/// that row's refusal, so a limit decision never rests on a copy column that disagrees with its
+/// record. The walk follows the parent column, so a damaged parent column can hide the rows below
+/// it from the count; those rows are not placed in any tree, and every owner's revocation
+/// withdraws them.
 fn live_in_tree(connection: &Connection, member: GrantId) -> Result<usize> {
-    let counted: i64 = connection
-        .query_row(
+    let mut statement = connection
+        .prepare(concat!(
             "WITH RECURSIVE up(id, parent) AS (
                  SELECT grant_id, parent_grant_id FROM grants WHERE grant_id = ?1
                  UNION
@@ -3294,15 +3317,30 @@ fn live_in_tree(connection: &Connection, member: GrantId) -> Result<usize> {
                  UNION
                  SELECT g.grant_id FROM grants g JOIN down ON g.parent_grant_id = down.id
              )
-             SELECT COUNT(*) FROM grants
-              WHERE grant_id IN (SELECT id FROM down)
-                AND (revoked_at_ms IS NULL
-                     OR revoked_at_ms IN (SELECT recorded_at_ms FROM fence_debt))",
-            params![member.get().as_bytes().as_slice()],
-            |row| row.get(0),
-        )
+             SELECT ",
+            grant_columns!(),
+            ", (g.grant_id IN (SELECT id FROM down)) AS in_the_tree,
+                (g.revoked_at_ms IS NULL
+                 OR g.revoked_at_ms IN (SELECT recorded_at_ms FROM fence_debt)) AS reachable
+             FROM grants g
+             WHERE g.grant_id IN (SELECT id FROM up) OR g.grant_id IN (SELECT id FROM down)"
+        ))
         .map_err(ControllerError::registry)?;
-    Ok(usize::try_from(counted).unwrap_or(usize::MAX))
+    let rows: Vec<(Result<Judged>, bool, bool)> = statement
+        .query_map(params![member.get().as_bytes().as_slice()], |row| {
+            Ok((judge_row(row), row.get(9)?, row.get(10)?))
+        })
+        .map_err(ControllerError::registry)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ControllerError::registry)?;
+    let mut counted = 0_usize;
+    for (judged, in_the_tree, reachable) in rows {
+        if let Judged::Damaged(damage) = judged? {
+            return Err(damage.refusal());
+        }
+        counted = counted.saturating_add(usize::from(in_the_tree && reachable));
+    }
+    Ok(counted)
 }
 
 /// The refusal of a grant a full delegation tree cannot take.
@@ -4179,9 +4217,11 @@ fn read_invitation(row: &rusqlite::Row<'_>) -> Result<InvitationRecord> {
 fn read_one(connection: &Connection, grant_id: GrantId) -> Result<Option<GrantRecord>> {
     let row: Option<Row> = connection
         .query_row(
-            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms, grant_id
-             FROM grants WHERE grant_id = ?1",
+            concat!(
+                "SELECT ",
+                grant_columns!(),
+                " FROM grants g WHERE grant_id = ?1"
+            ),
             params![grant_id.get().as_bytes().as_slice()],
             |row| Ok(read_row(row)),
         )
@@ -4193,11 +4233,11 @@ fn read_one(connection: &Connection, grant_id: GrantId) -> Result<Option<GrantRe
 /// Every grant, on a connection the caller is already holding.
 fn read_all(connection: &Connection) -> Result<Vec<GrantRecord>> {
     let mut statement = connection
-        .prepare(
-            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms, grant_id
-             FROM grants ORDER BY grant_id",
-        )
+        .prepare(concat!(
+            "SELECT ",
+            grant_columns!(),
+            " FROM grants g ORDER BY grant_id"
+        ))
         .map_err(ControllerError::registry)?;
     let rows: Vec<Row> = statement
         .query_map([], |row| Ok(read_row(row)))
@@ -4210,11 +4250,11 @@ fn read_all(connection: &Connection) -> Result<Vec<GrantRecord>> {
 /// Every grant one device holds, on a connection the caller is already holding.
 fn read_for_device(connection: &Connection, device_id: DeviceId) -> Result<Vec<GrantRecord>> {
     let mut statement = connection
-        .prepare(
-            "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
-             activated_at_ms, grant_id
-             FROM grants WHERE recipient_device_id = ?1 ORDER BY grant_id",
-        )
+        .prepare(concat!(
+            "SELECT ",
+            grant_columns!(),
+            " FROM grants g WHERE recipient_device_id = ?1 ORDER BY grant_id"
+        ))
         .map_err(ControllerError::registry)?;
     let rows: Vec<Row> = statement
         .query_map(params![device_id.get().as_bytes().as_slice()], |row| {
@@ -4280,32 +4320,137 @@ pub(crate) fn grant_rows_read() -> u64 {
     GRANT_ROWS_READ.with(std::cell::Cell::get)
 }
 
-/// Reads one grant row. A grant this build cannot read is refused with its table and the grant its
-/// key column names, read apart from the payload, so the row can be found and removed.
+/// What a grants row holds that [`judge_row`] could read from its record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Decoded {
+    /// The grant's own identifier.
+    pub id: GrantId,
+    /// The grant it is delegated from.
+    pub parent: Option<GrantId>,
+    /// The device it names as holder.
+    pub recipient: DeviceId,
+}
+
+/// A grants row this build cannot read, with what could still be learned from it.
+#[derive(Clone, Debug)]
+pub(crate) struct Damage {
+    /// The key column, when it is an identifier.
+    pub key: Option<GrantId>,
+    /// The first fault found.
+    pub class: DamageClass,
+    /// The record's own identity, whenever the record decodes.
+    pub decoded: Option<Decoded>,
+    /// The recipient column, when it is an identifier.
+    pub recipient_column: Option<DeviceId>,
+    /// Whether the revocation column holds anything but NULL, of whatever type.
+    pub marked: bool,
+    /// The decoder's own words, for a record that does not decode: shown in the refusal only.
+    detail: Option<String>,
+}
+
+impl Damage {
+    /// The refusal a reader answers with.
+    pub(crate) fn refusal(&self) -> ControllerError {
+        ControllerError::GrantRowDamaged {
+            key: self.key,
+            class: self.class,
+            detail: self.detail.clone(),
+        }
+    }
+}
+
+/// What one row of the grants table is.
+#[derive(Clone, Debug)]
+pub(crate) enum Judged {
+    /// A grant this build reads.
+    Readable(GrantRecord),
+    /// A row this build cannot read.
+    Damaged(Damage),
+}
+
+/// Judges one grants row, selected with [`grant_columns`] first.
 ///
-/// A row whose key is not the identifier of the grant in its payload cannot be read either. Every
-/// writer files a grant under its own identifier, so such a row is a damaged file or an edit by
-/// hand, and it would otherwise be read as a grant of the identifier its payload carries: a
-/// revocation finds the row to withdraw by that identifier, so it would leave this row live.
-fn read_row(row: &rusqlite::Row<'_>) -> Row {
+/// A row that cannot be read is a value, not an error: the outer error is only a failure of the
+/// statement itself. Every reader, the scan and the tree count judge a row here, so none of them
+/// can disagree about which rows they refuse. A row is judged by the first fault in the order a
+/// reader meets them: its record's column, whether the record decodes, whether the key names the
+/// grant it holds, the types of the other columns, and last the two columns that copy the record's
+/// recipient and parent.
+fn judge_row(row: &rusqlite::Row<'_>) -> Result<Judged> {
+    use rusqlite::types::ValueRef;
     #[cfg(feature = "testing")]
     GRANT_ROWS_READ.with(|rows| rows.set(rows.get().saturating_add(1)));
-    let encoded: Vec<u8> = row.get(0).map_err(ControllerError::registry)?;
-    let key: Option<kr_protocol::scalars::Uuid> =
-        row.get::<_, Vec<u8>>(6).ok().as_deref().and_then(uuid_of);
-    let unreadable = |why: &dyn std::fmt::Display| {
-        ControllerError::InvalidArgument(format!(
-            "the grants row of grant {} cannot be read: {why}",
-            key.map_or_else(
-                || "with a malformed key".to_owned(),
-                |key| GrantId::new(key).to_string()
-            )
-        ))
+    let cell = |index: usize| row.get_ref(index).map_err(ControllerError::registry);
+    let key = match cell(6)? {
+        ValueRef::Blob(bytes) => uuid_of(bytes),
+        _ => None,
     };
-    let grant: Grant = kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
-        .map_err(|error| unreadable(&error))?;
+    let recipient_column = match cell(7)? {
+        ValueRef::Blob(bytes) => uuid_of(bytes),
+        _ => None,
+    };
+    let marked = !matches!(cell(3)?, ValueRef::Null);
+    let (grant, detail): (Option<Grant>, Option<String>) = match cell(0)? {
+        ValueRef::Blob(bytes) => {
+            match kr_cbor::from_canonical_slice::<Grant>(bytes, &kr_cbor::Limits::DEFAULT) {
+                Ok(grant) => (Some(grant), None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        }
+        _ => (None, None),
+    };
+    let decoded = grant.as_ref().map(|grant| Decoded {
+        id: grant.grant_id,
+        parent: grant.parent_grant_id.as_ref().copied(),
+        recipient: grant.recipient_device_id,
+    });
+    let damaged = |class: DamageClass, detail: Option<String>| {
+        Ok(Judged::Damaged(Damage {
+            key: key.map(GrantId::new),
+            class,
+            decoded,
+            recipient_column: recipient_column.map(DeviceId::new),
+            marked,
+            detail,
+        }))
+    };
+    let encoded = matches!(cell(0)?, ValueRef::Blob(_));
+    if !encoded {
+        return damaged(DamageClass::ColumnOfAnotherType("grant"), None);
+    }
+    let Some(grant) = grant else {
+        return damaged(DamageClass::RecordDoesNotDecode, detail);
+    };
     if key != Some(grant.grant_id.get()) {
-        return Err(unreadable(&"its key does not name the grant it holds"));
+        return damaged(DamageClass::KeyNamesAnotherGrant, None);
+    }
+    for (index, name) in [
+        (1, "session_id"),
+        (2, "issued_at_ms"),
+        (3, "revoked_at_ms"),
+        (4, "revoked_by_parent"),
+        (5, "activated_at_ms"),
+    ] {
+        let fits = match (index, cell(index)?) {
+            (1 | 4, ValueRef::Null | ValueRef::Blob(_)) => true,
+            (3 | 5, ValueRef::Null | ValueRef::Integer(_)) => true,
+            (2, ValueRef::Integer(_)) => true,
+            _ => false,
+        };
+        if !fits {
+            return damaged(DamageClass::ColumnOfAnotherType(name), None);
+        }
+    }
+    if recipient_column != Some(grant.recipient_device_id.get()) {
+        return damaged(DamageClass::RecipientColumnDisagrees, None);
+    }
+    let parent_agrees = match (cell(8)?, grant.parent_grant_id.as_ref().copied()) {
+        (ValueRef::Null, None) => true,
+        (ValueRef::Blob(bytes), Some(parent)) => uuid_of(bytes) == Some(parent.get()),
+        _ => false,
+    };
+    if !parent_agrees {
+        return damaged(DamageClass::ParentColumnDisagrees, None);
     }
     let session: Option<Vec<u8>> = row.get(1).map_err(ControllerError::registry)?;
     let issued: i64 = row.get(2).map_err(ControllerError::registry)?;
@@ -4319,14 +4464,115 @@ fn read_row(row: &rusqlite::Row<'_>) -> Row {
     if let Some(started_at_ms) = activated_at_ms {
         grant.history = grant.history.from_start(started_at_ms);
     }
-    Ok(GrantRecord {
+    Ok(Judged::Readable(GrantRecord {
         grant,
         session_id: session.as_deref().and_then(uuid_of).map(SessionId::new),
         issued_at_ms: u64::try_from(issued).unwrap_or_default(),
         activated_at_ms,
         revoked_at_ms: revoked.map(|moment| u64::try_from(moment).unwrap_or_default()),
         revoked_by_parent: by_parent.as_deref().and_then(uuid_of).map(GrantId::new),
-    })
+    }))
+}
+
+/// Reads one grant row, for a reader that refuses a row it cannot read. The refusal names the key
+/// column, read apart from the record, so the row can be found and removed.
+///
+/// A row whose key is not the identifier of the grant in its record, or whose recipient or parent
+/// column is not the one the record names, cannot be read either. Every writer files a grant under
+/// its own identifier with its own copies, so such a row is a damaged file or an edit by hand, and
+/// it would otherwise be read as a grant it is not: a revocation finds the row to withdraw by the
+/// record's identifier, and a holder is looked for by the recipient column.
+fn read_row(row: &rusqlite::Row<'_>) -> Row {
+    match judge_row(row)? {
+        Judged::Readable(record) => Ok(record),
+        Judged::Damaged(damage) => Err(damage.refusal()),
+    }
+}
+
+/// Every grants row, each judged once, in the order the table stores them.
+#[derive(Debug, Default)]
+pub(crate) struct Scan {
+    /// The rows this build reads, in the table's order.
+    pub readable: Vec<GrantRecord>,
+    /// The rows it cannot read.
+    pub damaged: Vec<Damaged>,
+}
+
+/// A row of the scan that cannot be read.
+#[derive(Clone, Debug)]
+pub(crate) struct Damaged {
+    /// The row's 1-based position in the table's order: a pointer for the person, never a selector.
+    pub place: u64,
+    /// The row's rowid in this scan's transaction.
+    pub rowid: i64,
+    /// What the row is.
+    pub damage: Damage,
+}
+
+impl Scan {
+    /// The readable rows reachable by the record's parent from a readable row with no parent,
+    /// through readable rows only.
+    pub(crate) fn placed(&self) -> BTreeSet<GrantId> {
+        let mut below: BTreeMap<GrantId, Vec<GrantId>> = BTreeMap::new();
+        for record in &self.readable {
+            if let Some(parent) = record.grant.parent_grant_id.as_ref().copied() {
+                below.entry(parent).or_default().push(record.grant.grant_id);
+            }
+        }
+        let mut placed: BTreeSet<GrantId> = BTreeSet::new();
+        let mut queue: VecDeque<GrantId> = self
+            .readable
+            .iter()
+            .filter(|record| record.grant.parent_grant_id.as_ref().is_none())
+            .map(|record| record.grant.grant_id)
+            .collect();
+        while let Some(id) = queue.pop_front() {
+            if placed.insert(id) {
+                queue.extend(below.get(&id).into_iter().flatten().copied());
+            }
+        }
+        placed
+    }
+
+    /// The readable rows that are not revoked and are not reachable from a root.
+    pub(crate) fn unplaced_live(&self) -> Vec<&GrantRecord> {
+        let placed = self.placed();
+        self.readable
+            .iter()
+            .filter(|record| {
+                record.revoked_at_ms.is_none() && !placed.contains(&record.grant.grant_id)
+            })
+            .collect()
+    }
+}
+
+/// Reads and judges every grants row once, in the table's order.
+fn scan_all(connection: &Connection) -> Result<Scan> {
+    let mut statement = connection
+        .prepare(concat!(
+            "SELECT ",
+            grant_columns!(),
+            ", ROW_NUMBER() OVER (ORDER BY g.rowid) AS place, g.rowid AS rid
+             FROM grants g ORDER BY g.rowid"
+        ))
+        .map_err(ControllerError::registry)?;
+    let rows: Vec<(Result<Judged>, i64, i64)> = statement
+        .query_map([], |row| Ok((judge_row(row), row.get(9)?, row.get(10)?)))
+        .map_err(ControllerError::registry)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(ControllerError::registry)?;
+    let mut scan = Scan::default();
+    for (judged, place, rowid) in rows {
+        match judged? {
+            Judged::Readable(record) => scan.readable.push(record),
+            Judged::Damaged(damage) => scan.damaged.push(Damaged {
+                place: u64::try_from(place).unwrap_or_default(),
+                rowid,
+                damage,
+            }),
+        }
+    }
+    Ok(scan)
 }
 
 /// Whether withdrawing `grant` always owes a fence: whether a worker can hold work under it.
@@ -4355,7 +4601,8 @@ fn next_moment(connection: &Connection, now_ms: u64) -> Result<u64> {
     let latest: Option<i64> = connection
         .query_row(
             "SELECT MAX(moment) FROM (
-                 SELECT MAX(revoked_at_ms) AS moment FROM grants
+                 SELECT MAX(CASE WHEN typeof(revoked_at_ms) = 'integer' THEN revoked_at_ms END)
+                        AS moment FROM grants
                  UNION ALL
                  SELECT MAX(recorded_at_ms) FROM fence_debt
              )",
@@ -5280,6 +5527,8 @@ mod a_previous_holder_that_is_letting_go {
 /// the stores an edit by hand leaves.
 #[cfg(test)]
 mod a_devices_revocation {
+    mod damaged_rows;
+
     use super::*;
     use kr_protocol::grant::{EnvironmentSelector, HistoryScope, SessionSelector};
     use kr_protocol::ids::{AuthorityRevision, EnvironmentId};
