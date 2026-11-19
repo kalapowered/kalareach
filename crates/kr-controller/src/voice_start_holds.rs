@@ -629,4 +629,23 @@ mod tests {
         assert_eq!(hold_ends_ms(1_000, 600), 1_000 + 600_000 + 120_000);
         assert_eq!(hold_ends_ms(u64::MAX - 5, 600), u64::MAX);
     }
+
+    /// A request read at the latest moment the host allows ends inside the hold: whatever the
+    /// requested length, the hold outlasts the call by the send limit, the exchange and the skew,
+    /// and the exchange is the one the client's own deadlines allow.
+    #[test]
+    fn a_request_read_at_the_latest_allowed_moment_ends_inside_the_hold() {
+        for seconds in [1_u32, 60, 600, 1_800, 7_200] {
+            let call = u64::from(seconds).min(VOICE_CALL_LIMIT_SECONDS) * 1_000;
+            assert_eq!(
+                hold_ends_ms(5_000, seconds) - 5_000 - call,
+                SEND_LIMIT_MS + POST_LIMIT_MS + SKEW_MS,
+                "{seconds} s"
+            );
+        }
+        assert_eq!(
+            POST_LIMIT_MS,
+            u64::try_from(VOICE_DEADLINES.total.as_millis()).expect("a short deadline")
+        );
+    }
 }
