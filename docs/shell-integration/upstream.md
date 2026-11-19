@@ -388,7 +388,7 @@ A `.zshrc` that loads a few modules of its own pays about a quarter of a millise
    which `scripts/e2e-fence.sh` does as one of its own steps.
 4. `bash scripts/fetch-shell-stacks.sh`: the startup customisations, if they are not already here.
 5. `bash scripts/e2e-fence.sh`: the whole qualification against the rebuilt package, on a real
-   daemon and a real shell.
+   daemon and a real shell. On macOS, set KR_ALLOW_ACCOUNT_LAUNCHD=1 for this command: it starts a daemon and a session, which load a job into the account's own launchd.
 6. `cargo test -p kr-shell-integration --test module_abi --test relocation -- --include-ignored`, which runs
    the native-module proof and the relocation proof against the rebuilt package.
 7. Add a row to the triage record with the date, the change, the packages, the assessment, the

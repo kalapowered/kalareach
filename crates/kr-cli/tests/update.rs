@@ -11405,7 +11405,9 @@ async fn a_rollback_is_refused_to_a_release_that_lists_no_store() {
 /// bring the lock past a version that was not raised.
 ///
 /// Run it after raising the version of a store whose tables or values changed:
-/// `cargo test -p kr-cli --test update write_the_lock -- --ignored`.
+/// `cargo test -p kr-cli --test update write_the_lock -- --ignored`. On macOS, set
+/// KR_ALLOW_ACCOUNT_LAUNCHD=1 for this command: it starts a daemon and a session, which load a job
+/// into the account's own launchd.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "writes stored-formats.lock"]

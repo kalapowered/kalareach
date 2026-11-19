@@ -1917,6 +1917,8 @@ produce, and the tools an agent reaches for on that desktop. It ends every proce
 logged in at the console; on a host without a graphical login it fails and says so, because a run
 that checked nothing has not passed.
 
+On macOS, set KR_ALLOW_ACCOUNT_LAUNCHD=1 for this command: it starts a daemon and a session, which load a job into the account's own launchd.
+
 ## Sleep
 
 This host does not change the machine's sleep policy unless the owner asks it to. The setting is
