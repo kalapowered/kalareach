@@ -266,10 +266,11 @@ fn build() -> BuildId {
 /// altered trust paths.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_joined_runs_on_what_the_command_wrote() {
-    let controller = beside_this_test("kr-controller").unwrap_or_else(|| {
+    let controller = beside_this_test("kr-controller-held").unwrap_or_else(|| {
         panic!(
-            "the kr-controller executable is not built beside this test, so this check cannot \
-             run; a workspace test run builds it, and so does `cargo build -p kr-controller`"
+            "the kr-controller-held executable is not built beside this test, so this check cannot \
+             run; a workspace test run builds it, and so does `cargo build -p kr-controller \
+             --features testing --bin kr-controller-held`"
         )
     });
     let service = Service::start().await;
@@ -353,7 +354,7 @@ impl Daemon {
     async fn start(controller: &Path, tree: &Tree) -> Self {
         let bin = tree.temp.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a directory for the executable");
-        let destination = bin.join(controller.file_name().expect("the executable has a name"));
+        let destination = bin.join(format!("kr-controller{}", std::env::consts::EXE_SUFFIX));
         kr_ipc::testing::place_program(controller, &destination);
         let log = std::fs::File::create(tree.temp.root().join("daemon.log")).expect("a log");
         let child = std::process::Command::new(&destination)

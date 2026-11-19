@@ -69,20 +69,21 @@ impl Host {
     /// Starts the daemon on a host of its own, or fails and says why it cannot.
     async fn start() -> Self {
         let (Some(controller), Some(worker)) = (
-            beside_this_test("kr-controller"),
+            beside_this_test("kr-controller-held"),
             beside_this_test("kr-worker"),
         ) else {
             panic!(
-                "the kr-controller and kr-worker executables are not built beside this test, so \
-                 this check cannot run; a workspace test run builds them, and so does \
-                 `cargo build -p kr-controller -p kr-worker`"
+                "the kr-controller-held and kr-worker executables are not built beside this test, \
+                 so this check cannot run; a workspace test run builds them, and so do \
+                 `cargo build -p kr-controller --features testing --bin kr-controller-held` \
+                 and `cargo build -p kr-worker`"
             );
         };
         let temp = teardown::Tree::create();
         let bin = temp.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a directory for the executables");
-        let controller = copy_into(&controller, &bin);
-        let worker = copy_into(&worker, &bin);
+        let controller = copy_into(&controller, &bin, "kr-controller");
+        let worker = copy_into(&worker, &bin, "kr-worker");
         let log = std::fs::File::create(temp.root().join("daemon.log")).expect("the daemon's log");
         let mut command = std::process::Command::new(&controller);
         // The daemon's sessions run a login shell: they are given a home inside the tree, not the
@@ -218,8 +219,8 @@ fn build() -> BuildId {
 /// Copies an executable into `directory` and starts the copy once, where nothing is timed, so the
 /// operating system's check of a newly written executable is paid here rather than inside the
 /// daemon's start or a create's rendezvous.
-fn copy_into(source: &Path, directory: &Path) -> PathBuf {
-    let destination = directory.join(source.file_name().expect("an executable has a name"));
+fn copy_into(source: &Path, directory: &Path, name: &str) -> PathBuf {
+    let destination = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     kr_ipc::testing::place_and_start_once(source, &destination, &["--version"]);
     destination
 }
@@ -428,8 +429,7 @@ async fn new_attach_detach_and_close_work_in_full_and_in_one_letter() {
 /// Returns what `launchctl print` says about the job in `domain` whose process is `pid`.
 #[cfg(target_os = "macos")]
 fn launchd_job_of(domain: &str, pid: u64) -> Option<String> {
-    let listed = std::process::Command::new("/bin/launchctl")
-        .arg("list")
+    let listed = kr_ipc::testing::account_launchd::command(&["list"])
         .output()
         .expect("launchctl lists the jobs");
     String::from_utf8_lossy(&listed.stdout)
@@ -437,11 +437,10 @@ fn launchd_job_of(domain: &str, pid: u64) -> Option<String> {
         .filter_map(|line| line.split_whitespace().nth(2))
         .filter(|label| label.starts_with("kr-worker-"))
         .find_map(|label| {
-            let printed = std::process::Command::new("/bin/launchctl")
-                .arg("print")
-                .arg(format!("{domain}/{label}"))
-                .output()
-                .ok()?;
+            let printed =
+                kr_ipc::testing::account_launchd::command(&["print", &format!("{domain}/{label}")])
+                    .output()
+                    .ok()?;
             let text = String::from_utf8_lossy(&printed.stdout).into_owned();
             text.lines()
                 .any(|line| line.trim() == format!("pid = {pid}"))
@@ -468,9 +467,7 @@ fn field(printed: &str, name: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_on_macos_is_a_per_user_launchd_job_in_its_own_directory() {
     let uid = kr_ipc::paths::current_uid();
-    let graphical = std::process::Command::new("/bin/launchctl")
-        .arg("print")
-        .arg(format!("gui/{uid}"))
+    let graphical = kr_ipc::testing::account_launchd::command(&["print", &format!("gui/{uid}")])
         .output()
         .is_ok_and(|output| output.status.success());
     assert!(

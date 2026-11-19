@@ -235,9 +235,11 @@ jobs:
       # This is also where the executables this release carries are held to the workspace. The
       # program list names them, and the workspace is asked what binaries the crates that build them
       # declare: a binary added to one of those crates fails this step by name until it is in the
-      # list, rather than being left out of the release quietly. Two binaries those crates declare
+      # list, rather than being left out of the release quietly. Three binaries those crates declare
       # are not part of a release and are named here as such: the stub the description tests start
-      # in place of the model, and the benchmark that measures the model against real weights.
+      # in place of the model, the benchmark that measures the model against real weights, and the
+      # control daemon that the test suites start, which refuses a launchd command the run did not
+      # ask for.
       - name: What this release is
         id: release
         run: |
@@ -255,7 +257,7 @@ jobs:
 
           $builds = @($env:KR_BUILDS -split ' ' | Where-Object { $_ })
           $crates = @($builds | ForEach-Object { ($_ -split '/')[0] } | Sort-Object -Unique)
-          $notShipped = @('kr-stub-inference', 'kr-describe-bench')
+          $notShipped = @('kr-stub-inference', 'kr-describe-bench', 'kr-controller-held')
           $declared = @(
             $metadata.packages |
               Where-Object { $_.name -in $crates } |

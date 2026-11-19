@@ -50,17 +50,18 @@ impl Drop for Host {
 
 impl Host {
     async fn start() -> Self {
-        let controller = beside_this_test("kr-controller").unwrap_or_else(|| {
+        let controller = beside_this_test("kr-controller-held").unwrap_or_else(|| {
             panic!(
-                "the kr-controller executable is not built beside this test, so this check cannot \
-                 run; a workspace test run builds it, and so does `cargo build -p kr-controller`"
+                "the kr-controller-held executable is not built beside this test, so this check \
+                 cannot run; a workspace test run builds it, and so does `cargo build -p \
+                 kr-controller --features testing --bin kr-controller-held`"
             )
         });
         let temp = kr_ipc::testing::TempHost::create();
         let bin = temp.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a directory for the executable");
         let controller = {
-            let destination = bin.join(controller.file_name().expect("the executable has a name"));
+            let destination = bin.join(format!("kr-controller{}", std::env::consts::EXE_SUFFIX));
             kr_ipc::testing::place_program(&controller, &destination);
             destination
         };

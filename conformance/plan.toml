@@ -248,6 +248,24 @@ command = [
 ]
 
 [[step]]
+id = 'rust-the-control-daemon-the-suites-start-built-with-the'
+group = 'rust'
+what = 'the control daemon the suites start, built with the testing feature'
+platforms = ['windows']
+reading = 'build'
+command = [
+    'cargo',
+    'build',
+    '--locked',
+    '-p',
+    'kr-controller',
+    '--features',
+    'testing',
+    '--bin',
+    'kr-controller-held',
+]
+
+[[step]]
 id = 'rust-the-description-process-the-update-suite-assembles-into'
 group = 'rust'
 what = 'the description process the update suite assembles into releases'

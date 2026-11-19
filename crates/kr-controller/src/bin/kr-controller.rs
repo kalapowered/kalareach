@@ -94,7 +94,8 @@ impl From<SecretStoreChoice> for StoreSelection {
     }
 }
 
-fn main() -> ExitCode {
+/// Runs the daemon.
+pub fn main() -> ExitCode {
     // A program whose release is being removed starts nothing, not even the printing of its version
     // or of a usage error, so the release is asked about before the command line is allowed to
     // end the process.

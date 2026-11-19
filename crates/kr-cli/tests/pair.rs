@@ -69,10 +69,11 @@ impl Drop for Host {
 
 impl Host {
     async fn start() -> Self {
-        let controller = beside_this_test("kr-controller").unwrap_or_else(|| {
+        let controller = beside_this_test("kr-controller-held").unwrap_or_else(|| {
             panic!(
-                "the kr-controller executable is not built beside this test, so this check cannot \
-                 run; a workspace test run builds it, and so does `cargo build -p kr-controller`"
+                "the kr-controller-held executable is not built beside this test, so this check \
+                 cannot run; a workspace test run builds it, and so does `cargo build -p \
+                 kr-controller --features testing --bin kr-controller-held`"
             )
         });
         let temp = kr_ipc::testing::TempHost::create();
@@ -92,7 +93,7 @@ impl Host {
         .expect("the configuration document");
         let bin = temp.root().join("bin");
         std::fs::create_dir_all(&bin).expect("a directory for the executable");
-        let controller = copy_into(&controller, &bin);
+        let controller = copy_into(&controller, &bin, "kr-controller");
         let log = std::fs::File::create(temp.root().join("daemon.log")).expect("the daemon's log");
         let child = std::process::Command::new(&controller)
             .current_dir(temp.root())
@@ -473,8 +474,8 @@ fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
 
-fn copy_into(source: &Path, directory: &Path) -> PathBuf {
-    let destination = directory.join(source.file_name().expect("the executable has a name"));
+fn copy_into(source: &Path, directory: &Path, name: &str) -> PathBuf {
+    let destination = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     kr_ipc::testing::place_program(source, &destination);
     destination
 }
