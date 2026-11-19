@@ -30,6 +30,11 @@ use super::{Controller, encode, parse, wall_clock_ms};
 /// commands name: an agent's executable can be a large file.
 const DOCTOR_READS: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// The refusal of a declared word when the admitted packages could not be read in time; the bound
+/// is [`DOCTOR_READS`].
+const PACKAGES_UNREAD: &str = "this host could not read the packages it admits within {seconds} \
+     seconds, so it could not find the one that names {word}; ask again";
+
 /// What an environment record change answers with, and where the answer came from.
 enum Reading {
     /// What this request did, or was refused before it could.
@@ -98,6 +103,12 @@ impl Controller {
         {
             return self.retained_given(&carried, kept).await;
         }
+        // A word the host does not compile in is resolved to the one admitted package that
+        // declares it, here, after the lock and the look at what the host holds, and never before.
+        let installer = match self.resolve_declared(installer, &params, method).await {
+            Ok(installer) => installer,
+            Err(refusal) => return Given::fresh(Err(refusal)),
+        };
         // What either change can refuse without touching anything, refused here: the platform, the
         // scope, a file or entry this host did not write, a record it cannot read, a document whose
         // protection it cannot keep. A refusal after the marker below would be reported as a change
@@ -203,6 +214,88 @@ impl Controller {
         };
         installer.settle(actor_id, mutation.action_id, digest, &result, &params.agent)?;
         Ok(result)
+    }
+
+    /// Resolves the skill target that the request's word names, for a word the host does not
+    /// compile in: the one admitted package, whose current admission's effective grants hold
+    /// `skill_target.install`, whose verified connector table declares the word. A removal that
+    /// has a record resolves no package: the record's operations alone decide. The admission
+    /// revision is read again at the end, so a grant or a package that changed while the packages
+    /// were read refuses the request before the dispatch marker; the time between that read and
+    /// the registration is the window that is left.
+    async fn resolve_declared(
+        &self,
+        installer: crate::agent_tools::Installer,
+        params: &kr_protocol::skill::AgentToolsParams,
+        method: Method,
+    ) -> Result<crate::agent_tools::Installer> {
+        use crate::agent_tools::declared::{Declaration, admissions_held, served};
+        if params.agent.compiled().is_some() {
+            return Ok(installer);
+        }
+        if method == Method::AgentToolsRemove && installer.holds_record(params)? {
+            return Ok(installer);
+        }
+        let unread = || {
+            ControllerError::InvalidArgument(
+                PACKAGES_UNREAD
+                    .replace("{seconds}", &DOCTOR_READS.as_secs().to_string())
+                    .replace("{word}", params.agent.as_str()),
+            )
+        };
+        let Some(snapshot) = self.current_snapshot(tokio::time::Instant::now()).await else {
+            return Err(unread());
+        };
+        let held: Vec<_> = snapshot
+            .packages
+            .iter()
+            .filter(|package| {
+                package
+                    .grants
+                    .iter()
+                    .any(|name| name == "skill_target.install")
+            })
+            .map(|package| (package.package_dir.clone(), package.package_digest))
+            .collect();
+        let read = tokio::task::spawn_blocking(move || {
+            held.into_iter()
+                .filter_map(|(directory, digest)| {
+                    let package = kr_worker::broker::connectors::InstalledConnector::check(
+                        std::path::Path::new(&directory),
+                        digest,
+                    )
+                    .ok()?;
+                    let target = package.connector?.skill_target?;
+                    Some(Declaration { target })
+                })
+                .collect::<Vec<Declaration>>()
+        });
+        let declarations = match tokio::time::timeout(DOCTOR_READS, read).await {
+            Ok(Ok(found)) => found,
+            _ => {
+                return Err(unread());
+            }
+        };
+        let mut known: Vec<String> = declarations
+            .iter()
+            .map(|declaration| declaration.target.word.clone())
+            .chain(installer.recorded_words())
+            .collect();
+        known.sort();
+        known.dedup();
+        known.retain(|word| {
+            kr_protocol::skill::AgentTarget::parse(word).is_ok_and(|word| word.compiled().is_none())
+        });
+        let declared = served(params.agent.as_str(), &declarations)
+            .map_err(ControllerError::InvalidArgument)?;
+        let now = self
+            .catalogue
+            .admission_revision_within(tokio::time::Instant::now() + DOCTOR_READS)
+            .await
+            .ok();
+        admissions_held(snapshot.revision, now)
+            .map_err(|refusal| ControllerError::InvalidArgument(refusal.to_owned()))?;
+        Ok(installer.with_declaration(declared, known))
     }
 
     /// Returns the installer, which keeps this host's record of what it wrote.

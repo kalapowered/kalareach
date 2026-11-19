@@ -451,7 +451,10 @@ mod tests {
         assert_eq!(params.agent.as_str(), "some-agent");
         let error = parse("Some Agent", "user", None).expect_err("refused");
         assert_eq!(error.exit_code(), 2);
-        assert!(error.to_string().contains("not a valid agent word"), "{error}");
+        assert!(
+            error.to_string().contains("not a valid agent word"),
+            "{error}"
+        );
     }
 
     /// KR-REQ-23.33: an agent-tools change names its scope, user or project.
