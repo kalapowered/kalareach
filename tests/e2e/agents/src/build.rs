@@ -982,6 +982,12 @@ pub struct Newer {
     pub sha256: String,
     /// Text its first screen shows.
     pub ready: String,
+    /// The commands that say, with no model called and no login, that the newer build loads
+    /// nothing of the person's own, as the account's own `isolated` say it of the pinned build;
+    /// each is run with the newer build's own configuration directory ([`Account::switch_keys_file`]).
+    /// A newer build with none has no real arm.
+    #[serde(default)]
+    pub isolated: Vec<Probe>,
 }
 
 /// One action the package's manifest declares, as a part uses it: the declaration as the manifest
@@ -1206,6 +1212,23 @@ impl Account {
             }
         }
         Ok(keys)
+    }
+
+    /// The text of a configuration file that holds the entry's switches as keys and nothing else:
+    /// none of the text of the entry's own configuration directory, which names the provider the
+    /// pinned build is routed to, so a build given this file has no provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the switches are not keys of a file, or the text is not TOML.
+    pub fn switch_keys_file(&self, root: &str, work: &str) -> Result<String, String> {
+        let mut text = String::new();
+        for (key, value) in self.switches_as_keys(root, work)? {
+            text.push_str(&format!("{key} = {value}\n"));
+        }
+        text.parse::<toml_edit::DocumentMut>()
+            .map_err(|error| format!("the switches as a file are not TOML: {error}"))?;
+        Ok(text)
     }
 
     /// The files of the agent's configuration directory with the keys of [`Account::switches_as_keys`]

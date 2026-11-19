@@ -672,6 +672,19 @@ impl PlacedProgram {
                 return Err(said(&format!("the link agent/runtime/{name} is another")));
             }
         }
+        self.checked_as_recorded()
+    }
+
+    /// Checks the recorded build as it was recorded and nothing of the installation's link: the
+    /// build's command resolves to the recorded file through the recorded directories, and the
+    /// bytes of the file, read now, are the digest recorded. A build that is not the one the link
+    /// names yet, such as the newer one before the upgrade, is checked by this alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns what is not as it was recorded, as a class and no name outside the run.
+    pub fn checked_as_recorded(&self) -> Result<&Path, String> {
+        let said = |what: &str| format!("the agent's program is not as the run placed it: {what}");
         match std::fs::canonicalize(self.prefix.join("bin").join(&self.command)) {
             Ok(now) if now == self.program => {}
             _ => {
@@ -705,6 +718,20 @@ impl PlacedProgram {
     /// Returns why the route or the directory is not as it was placed.
     pub fn command(&self, root: &Path, pin: &RootPin) -> Result<Command, String> {
         let mut command = Command::new(self.checked(root, pin)?);
+        std::os::unix::process::CommandExt::arg0(&mut command, &self.command);
+        command.current_dir(self.work.place_for_a_start(root, pin)?);
+        Ok(command)
+    }
+
+    /// [`PlacedProgram::command`] for a build the installation's link does not name yet: the build
+    /// is checked as it was recorded ([`PlacedProgram::checked_as_recorded`]) and the directory it
+    /// is started in as for any start.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the build or the directory is not as it was placed.
+    pub fn command_as_recorded(&self, root: &Path, pin: &RootPin) -> Result<Command, String> {
+        let mut command = Command::new(self.checked_as_recorded()?);
         std::os::unix::process::CommandExt::arg0(&mut command, &self.command);
         command.current_dir(self.work.place_for_a_start(root, pin)?);
         Ok(command)
@@ -1564,6 +1591,22 @@ pub fn beneath(run: &Run, ancestor: &ProcessStartIdentity, what: &str) -> Vec<Ag
 /// # Errors
 ///
 /// Returns why the mapping could not be read.
+#[cfg(target_os = "linux")]
+pub fn text_image(pid: u32) -> Result<(PathBuf, u64), String> {
+    let exe = format!("/proc/{pid}/exe");
+    let path = std::fs::read_link(&exe).map_err(|error| format!("{exe}: {error}"))?;
+    let inode = std::fs::metadata(&exe)
+        .map_err(|error| format!("{exe}: {error}"))?
+        .ino();
+    Ok((path, inode))
+}
+
+/// [`text_image`] where `lsof` is the system's way to say what a process maps.
+///
+/// # Errors
+///
+/// Returns why the mapping could not be read.
+#[cfg(not(target_os = "linux"))]
 pub fn text_image(pid: u32) -> Result<(PathBuf, u64), String> {
     let mut lsof = Command::new("/usr/sbin/lsof");
     lsof.args(["-a", "-p", &pid.to_string(), "-d", "txt", "-Fin"])
@@ -1589,6 +1632,47 @@ pub fn text_image(pid: u32) -> Result<(PathBuf, u64), String> {
 /// # Errors
 ///
 /// Returns why the mappings could not be read.
+#[cfg(target_os = "linux")]
+pub fn mapped_files(pid: u32) -> Result<Vec<(PathBuf, u64)>, String> {
+    let mut found = vec![text_image(pid)?];
+    let maps = format!("/proc/{pid}/maps");
+    let text = std::fs::read_to_string(&maps).map_err(|error| format!("{maps}: {error}"))?;
+    for line in text.lines() {
+        // The address range, the permissions, the offset, the device, the inode and the file.
+        let mut fields = line.splitn(6, char::is_whitespace);
+        let (Some(_), Some(permissions), Some(_), Some(_), Some(inode)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let Some(name) = fields
+            .next()
+            .map(str::trim)
+            .filter(|name| name.starts_with('/'))
+        else {
+            continue;
+        };
+        let Ok(inode) = inode.parse::<u64>() else {
+            continue;
+        };
+        if permissions.contains('x') && inode != 0 && !found.iter().any(|(_, seen)| *seen == inode)
+        {
+            found.push((PathBuf::from(name), inode));
+        }
+    }
+    Ok(found)
+}
+
+/// [`mapped_files`] where `lsof` is the system's way to say what a process maps.
+///
+/// # Errors
+///
+/// Returns why the mappings could not be read.
+#[cfg(not(target_os = "linux"))]
 pub fn mapped_files(pid: u32) -> Result<Vec<(PathBuf, u64)>, String> {
     let mut lsof = Command::new("/usr/sbin/lsof");
     lsof.args(["-a", "-p", &pid.to_string(), "-d", "txt", "-Fin"])
