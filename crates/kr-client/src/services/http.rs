@@ -708,6 +708,20 @@ pub fn client_builder(proxy: Option<&ProxyUrl>) -> Result<reqwest::ClientBuilder
     builder_trusting(proxy, &[])
 }
 
+/// As [`client_builder`], also trusting `extra_roots`, for a suite that stands an authority of its
+/// own in front of a service the product would reach with the platform's trust.
+///
+/// # Errors
+///
+/// Returns an error when the platform's certificate verification cannot be set up.
+#[cfg(any(test, feature = "testing"))]
+pub fn client_builder_trusting(
+    proxy: Option<&ProxyUrl>,
+    extra_roots: &[CertificateDer<'static>],
+) -> Result<reqwest::ClientBuilder> {
+    builder_trusting(proxy, extra_roots)
+}
+
 /// As [`client_builder`], also trusting `extra_roots`.
 fn builder_trusting(
     proxy: Option<&ProxyUrl>,

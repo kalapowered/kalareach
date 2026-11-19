@@ -56,13 +56,25 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 ///
 /// Returns [`ControllerError::Refused`] when the client cannot be built.
 pub(crate) fn client(proxy: Option<&kr_transport::config::ProxyUrl>) -> Result<FileClient> {
-    let refused = |why: String| ControllerError::Refused {
+    let builder = kr_client::services::http::client_builder(proxy)
+        .map_err(|error| refused_client(error.to_string()))?;
+    client_over(builder, proxy)
+}
+
+/// The refusal for a client that cannot be built.
+fn refused_client(why: String) -> ControllerError {
+    ControllerError::Refused {
         code: kr_protocol::error::ErrorCode::ResourceUnavailable,
         detail: format!("this host cannot fetch the model's files: {why}"),
-    };
-    let builder = kr_client::services::http::client_builder(proxy)
-        .map_err(|error| refused(error.to_string()))?
-        .connect_timeout(CONNECT);
+    }
+}
+
+/// The fetch client built over `builder`, which carries the product's trust and the proxy.
+fn client_over(
+    builder: reqwest::ClientBuilder,
+    proxy: Option<&kr_transport::config::ProxyUrl>,
+) -> Result<FileClient> {
+    let builder = builder.connect_timeout(CONNECT);
     // A proxy that holds a login gets a client that follows no redirect by itself: `send`
     // follows them, gating each hop.
     let login = proxy.filter(|proxy| proxy.login().is_some()).cloned();
@@ -73,7 +85,7 @@ pub(crate) fn client(proxy: Option<&kr_transport::config::ProxyUrl>) -> Result<F
     };
     let client = builder
         .build()
-        .map_err(|error| refused(error.to_string()))?;
+        .map_err(|error| refused_client(error.to_string()))?;
     Ok(FileClient { client, login })
 }
 
@@ -721,5 +733,177 @@ mod proxy_login_gate {
         };
         assert!(said.contains(ProxyLoginKind::Refused.clause()), "{said}");
         assert_eq!(proxy.accepted(), 0, "nothing reached the proxy");
+    }
+
+    /// The pieces of a case that stands a TLS origin behind the stand-in proxy: the authority, the
+    /// login, the proxy address that holds it, and a client of the fetch's own kind that trusts the
+    /// authority.
+    struct Standing {
+        authority: crate::catalogue::tls::Authority,
+        login: ProxyCredential,
+        url: kr_transport::config::ProxyUrl,
+        client: FileClient,
+    }
+
+    fn standing(proxy: &ConnectProxy) -> Standing {
+        let authority = crate::catalogue::tls::Authority::new("a model file authority");
+        let login = ProxyCredential::new(
+            SecretVec::new(b"user".to_vec()),
+            SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login");
+        let url = proxy
+            .url
+            .parse::<kr_transport::config::ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let builder = kr_client::services::http::client_builder_trusting(
+            Some(&url),
+            &[rustls::pki_types::CertificateDer::from(
+                authority.der.clone(),
+            )],
+        )
+        .expect("a client builder");
+        let client = client_over(builder, Some(&url)).expect("a client");
+        Standing {
+            authority,
+            login,
+            url,
+            client,
+        }
+    }
+
+    fn acceptor(authority: &crate::catalogue::tls::Authority) -> tokio_rustls::TlsAcceptor {
+        tokio_rustls::TlsAcceptor::from(authority.server_config("127.0.0.1"))
+    }
+
+    /// KR-REQ-10.02: a request of the model files on a tunnel that is already open, and kept in the
+    /// pool, is stopped once another client has set the verdict: the origin reads no request after
+    /// it and the proxy sees no further connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_model_files_client_stops_a_request_on_a_tunnel_that_is_already_open() {
+        use crate::catalogue::connect_proxy::Login;
+
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let held = standing(&proxy);
+        let origin =
+            crate::catalogue::pooled_origin::PooledOrigin::start(acceptor(&held.authority)).await;
+        let address = format!("https://127.0.0.1:{}/file", origin.port);
+
+        for _ in 0..2 {
+            let Ok(answered) = held.client.send(&address).await else {
+                panic!("the origin answers");
+            };
+            assert_eq!(answered.status().as_u16(), 200);
+        }
+        assert_eq!(origin.requests(), 2);
+        assert_eq!(
+            proxy.logins(),
+            vec![Login::Right],
+            "one tunnel carried both requests"
+        );
+
+        held.login.refuse(StopKind::Refused);
+        let Err(Ended::Failed(said)) = held.client.send(&address).await else {
+            panic!("a request on the open tunnel is refused after the verdict");
+        };
+        assert!(said.contains(ProxyLoginKind::Refused.clause()), "{said}");
+        assert_eq!(
+            origin.requests(),
+            2,
+            "the open tunnel carried no request after the verdict"
+        );
+        assert_eq!(proxy.logins(), vec![Login::Right], "no further connection");
+    }
+
+    /// KR-REQ-10.02: the model files follow a redirect through the proxy for five hops and no
+    /// more, and a hop to a plain `http` address is refused at the hop with the sentence, so the
+    /// origin reads one request and the proxy is written no other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_model_files_client_follows_five_hops_and_refuses_a_hop_to_plain_http() {
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let held = standing(&proxy);
+        let acceptor = acceptor(&held.authority);
+
+        let to_http = crate::catalogue::pooled_origin::PooledOrigin::answering(
+            acceptor.clone(),
+            b"HTTP/1.1 302 Found\r\nLocation: http://models.example/file\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let Err(Ended::Failed(said)) = held
+            .client
+            .send(&format!("https://127.0.0.1:{}/file", to_http.port))
+            .await
+        else {
+            panic!("a hop to plain http is refused");
+        };
+        assert!(
+            said.contains(ProxyLoginKind::ClearTextTarget.clause()),
+            "{said}"
+        );
+        assert_eq!(to_http.requests(), 1, "the first hop was answered, no more");
+
+        let endless = crate::catalogue::pooled_origin::PooledOrigin::answering(
+            acceptor,
+            b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+        let Err(Ended::Failed(said)) = held
+            .client
+            .send(&format!("https://127.0.0.1:{}/file", endless.port))
+            .await
+        else {
+            panic!("a redirect with no end is refused");
+        };
+        assert!(said.to_lowercase().contains("redirect"), "{said}");
+        assert_eq!(
+            endless.requests(),
+            REDIRECTS + 1,
+            "the first request and five followed hops, and no sixth"
+        );
+    }
+
+    /// KR-REQ-10.02: a redirect from an address the proxy tunnels to an address it refuses in
+    /// words no library reads is rechecked at the address that failed, the second, and not at the
+    /// first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_to_a_failing_target_is_rechecked_at_that_target() {
+        let proxy = ConnectProxy::authenticating_in_http10("user", "password", "Basic").await;
+        let held = standing(&proxy);
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let second_port = second.local_addr().expect("an address").port();
+        drop(second);
+        proxy.refuse_target(&format!("127.0.0.1:{second_port}"));
+        let first = crate::catalogue::pooled_origin::PooledOrigin::answering(
+            acceptor(&held.authority),
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{second_port}/file\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes(),
+        )
+        .await;
+
+        let Err(Ended::Failed(said)) = held
+            .client
+            .send(&format!("https://127.0.0.1:{}/file", first.port))
+            .await
+        else {
+            panic!("the second address is refused");
+        };
+        assert!(said.contains("could not be reached"), "{said}");
+        assert_eq!(first.requests(), 1, "the first address answered once");
+        let suspected = tokio::time::timeout(
+            Duration::from_secs(10),
+            held.url.login().expect("a login").suspicion().wait_take(),
+        )
+        .await
+        .expect("the failed request queued an address to check");
+        assert_eq!(
+            suspected.port, second_port,
+            "the address to check is the one that failed, not the one that answered"
+        );
     }
 }
