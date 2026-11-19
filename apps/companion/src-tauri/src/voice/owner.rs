@@ -1607,11 +1607,12 @@ impl Owner {
                         view.capture = capture_word(held.capture);
                         view.playing = held.playing;
                     }
-                    let _ = reply.send(Ok(shared
+                    let state = shared
                         .view
                         .lock()
                         .expect("the view lock is not poisoned")
-                        .clone()));
+                        .clone();
+                    let _ = reply.send(Ok(shared.shown(state)));
                     // The service is told after the person has their answer: it is advice to the
                     // provider, and the mute does not wait for it.
                     if what == Mute::Microphone
