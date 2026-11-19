@@ -3190,4 +3190,76 @@ mod tests {
             r#"SignedService{gateway_origin:GatewayOrigin("https://reach.kala.to"),signer:Installation,..}"#,
         );
     }
+
+    /// A transport whose every request ends the way the service client ends one that a proxy's
+    /// login stopped before anything was written.
+    struct Stopped(Box<dyn Fn() -> ClientError + Send + Sync>);
+
+    impl fmt::Debug for Stopped {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("Stopped")
+        }
+    }
+
+    impl ServiceHttp for Stopped {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            let failure = (self.0)();
+            Box::pin(async move { Err(failure) })
+        }
+
+        fn post_bytes<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            let failure = (self.0)();
+            Box::pin(async move { Err(failure) })
+        }
+    }
+
+    /// KR-REQ-10.02: a signed request that a proxy's login stopped is not sent, for every kind of
+    /// stop, and a transport failure of any other sort is a request that may have been.
+    #[tokio::test]
+    async fn a_request_a_proxy_login_stopped_is_unanswered_and_not_sent() {
+        use kr_transport::proxy::ProxyLoginKind;
+
+        let dispatch = |http: Arc<dyn ServiceHttp>| async move {
+            service_over(http)
+                .dispatch(
+                    "/api/a-method",
+                    Method::MailboxDeliver,
+                    &serde_json::json!({ "recipient_key": "a key" }),
+                    256 * 1024,
+                    None,
+                    None,
+                )
+                .await
+        };
+        for kind in [
+            ProxyLoginKind::Needed,
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            let answer = dispatch(Arc::new(Stopped(Box::new(move || {
+                ClientError::ProxyLogin(kind)
+            }))))
+            .await;
+            assert!(
+                matches!(&answer, Err(Unanswered::NotSent(ClientError::ProxyLogin(seen))) if *seen == kind),
+                "{kind:?}"
+            );
+        }
+        let control = dispatch(Arc::new(Stopped(Box::new(|| {
+            ClientError::Transport(kr_transport::TransportError::Bind("a failure".to_owned()))
+        }))))
+        .await;
+        assert!(matches!(control, Err(Unanswered::Sent(_))));
+    }
 }
