@@ -92,6 +92,42 @@ pub(super) trait HostLink: Send + Sync + 'static {
     ) -> LinkFuture<'a, VoiceContextSendResult>;
 }
 
+/// An action this device holds the book of until it settles it: dropped before it was settled, it
+/// is settled on a task of its own, so that a write that was cut short leaves nothing unresolved
+/// on the connection.
+struct Settling {
+    session: Arc<Session>,
+    action_id: ActionId,
+    settled: bool,
+}
+
+impl Settling {
+    const fn new(session: Arc<Session>, action_id: ActionId) -> Self {
+        Self {
+            session,
+            action_id,
+            settled: false,
+        }
+    }
+
+    async fn settle(&mut self) {
+        self.session.settle(self.action_id).await;
+        self.settled = true;
+    }
+}
+
+impl Drop for Settling {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let (session, action_id) = (Arc::clone(&self.session), self.action_id);
+            runtime.spawn(async move { session.settle(action_id).await });
+        }
+    }
+}
+
 /// The host's connection, written to as a paired device writes any action. The connection can be
 /// replaced while the call runs, and the next write goes over the one that reaches the host.
 pub(super) struct SessionLink {
@@ -143,10 +179,12 @@ impl SessionLink {
             )
             .await
             .map_err(|_| LinkError::NotSent)?;
-        let sent = session.send(&composed).await;
         // The device never repeats one of these under the same action, and an action it keeps
-        // unsettled is counted against it: it is settled whatever the host answered.
-        session.settle(action_id).await;
+        // unsettled is counted against it: it is settled whatever the host answered, and also
+        // when a time-out drops this write before the host answers.
+        let mut settling = Settling::new(Arc::clone(&session), action_id);
+        let sent = session.send(&composed).await;
+        settling.settle().await;
         match sent {
             Ok(Settled::Result(value)) => value.to_typed::<T>().map_err(|_| LinkError::Unknown),
             // A receipt shows that the host holds the action, never what became of it.
