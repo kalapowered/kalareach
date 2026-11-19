@@ -2155,6 +2155,14 @@ impl UpstreamDispatch for WaitingUpstream {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_mutation() {
     let host = host().await;
+    // The prompt stays with the upstream until the connection's keepalive, which is sent ten
+    // seconds after the connection was made, has been read. The worker's shipped bound for an
+    // operation with its upstream is also ten seconds, so a host that is slow to serve this
+    // connection's other requests would use up the margin and the prompt would end unknown before
+    // the upstream was let go. This case is about what the connection serves while the prompt is
+    // outstanding, not about the bound, so the worker takes the longest wait this suite allows.
+    host.service
+        .set_upstream_deadline_for_tests(LIVENESS_DEADLINE);
     let (release, waiting) = tokio::sync::oneshot::channel();
     let mut release = Some(release);
     let upstream = Arc::new(WaitingUpstream {
@@ -2183,10 +2191,8 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
     let attachment_id = attached.attachment.attachment_id;
 
     // The connection's own keepalive runs on its own timer, started when the connection was
-    // established. The prompt is sent part way through that interval, so the beat this test waits
-    // for falls inside the window in which the prompt is outstanding rather than racing the
-    // worker's own submission deadline.
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // established, so the beat this test waits for falls inside the window in which the prompt is
+    // outstanding: the upstream is not let go until it has been read.
     let mutation = prompt_mutation(&client, &host, 21);
     let action_id = mutation.action_id;
 
