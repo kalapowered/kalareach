@@ -1167,8 +1167,12 @@ fn a_bridge_file_the_check_did_not_keep_is_refused() {
         let home = tempfile::tempdir().expect("a directory");
         let directory = home.path().join("package");
         copy_tree(&bundled("gemini-cli"), &directory);
+        // The cache holds 8 MiB: the other root file of the package and the pads fill it to the
+        // byte, in whatever order they are read, so no file of a folder below it is kept.
+        let readme = std::fs::metadata(directory.join("README.md")).expect("a file").len() as usize;
         for number in 0..pads {
-            std::fs::write(directory.join(format!("pad-{number}.bin")), vec![0_u8; 1 << 20])
+            let size = if number + 1 == pads { (1 << 20) - readme } else { 1 << 20 };
+            std::fs::write(directory.join(format!("pad-{number}.bin")), vec![0_u8; size])
                 .expect("writes");
         }
         validate_package_directory(&directory)
