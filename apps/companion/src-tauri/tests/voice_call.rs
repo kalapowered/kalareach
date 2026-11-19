@@ -9346,3 +9346,235 @@ async fn a_request_the_host_refuses_on_an_own_key_call_is_told_to_the_model_as_t
     hang_up(&scene);
     scene.stop_host().await;
 }
+
+/// A scene over one real session whose calls run on the host's own key, whose phone may close
+/// sessions and whose allowance lets voice ask for a close.
+async fn own_closing(timings: Timings) -> Scene {
+    own_acting_with(timings, own_standing(true)).await
+}
+
+/// A call on the host's own key over the session, past the first sentence that never acts, and the
+/// close said.
+async fn own_closing_asked(scene: &Scene, id: &str) {
+    own_calling(scene).await;
+    own_chatter(scene).await;
+    let end = say_close(scene, 6_000).await;
+    own_ask(scene, id, end - 200).await;
+}
+
+/// A close said aloud on a call on the host's own key is confirmed on the phone and closes the
+/// session, and the host tells the model what the phone owed it: that a confirmation is being asked
+/// for, then what the host did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_said_aloud_on_an_own_key_call_is_confirmed_on_the_phone_and_the_host_tells_the_model_each_step()
+ {
+    let mut scene = own_closing(delegating_timings()).await;
+    own_closing_asked(&scene, "d-1").await;
+
+    let row = row_reaching(&scene, "d-1", "performed").await;
+
+    assert_eq!(row["delegation_id"], "d-1");
+    scene.until_closed().await;
+    assert_eq!(
+        at_the_host(&scene),
+        2,
+        "the delegation, and the same delegation with the confirmation"
+    );
+    let actions = scene.link.sent_actions(HostMethod::VoiceDelegate);
+    assert_eq!(actions[0], actions[1], "under one action: {actions:?}");
+    let number = scene.display_number().await;
+    let asked = scene.ceremony.asked();
+    assert_eq!(asked.len(), 1, "the person was asked once: {asked:?}");
+    assert!(
+        asked[0].contains(&format!("session {number}")),
+        "about the session: {asked:?}"
+    );
+    let performed = VoiceNote::DelegationPerformed.words();
+    until_written(
+        &scene,
+        "session.commentary.append",
+        |(content, delegation)| delegation.as_deref() == Some("d-1") && content.starts_with(performed),
+    )
+    .await;
+    let wrote = wrote_for(&scene, "d-1");
+    assert_eq!(
+        wrote.first().map(String::as_str),
+        Some(VoiceNote::DelegationConfirmation.words()),
+        "first, that the person is being asked: {wrote:?}"
+    );
+    assert!(
+        wrote.last().is_some_and(|words| words.starts_with(performed)),
+        "last, what the host did: {wrote:?}"
+    );
+    assert!(
+        !wrote
+            .iter()
+            .any(|words| words == VoiceNote::NothingWasDone.words()),
+        "{wrote:?}"
+    );
+    assert_eq!(what_reached_kalareach(&scene), (0, 0, 0));
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A person who does not confirm, or whose phone has no ceremony to run, signs nothing on a call on
+/// the host's own key: the host was sent the delegation once and no signature, the session is open,
+/// and the host writes the sentence for the reason. The same request said again, once the person does
+/// confirm, closes the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_who_does_not_confirm_on_an_own_key_call_signs_nothing_and_the_host_tells_the_model_why() {
+    use kr_client::pairing::owner::CeremonyOutcome;
+
+    for (outcome, cause, note) in [
+        (
+            CeremonyOutcome::NotConfirmed,
+            "not_confirmed",
+            VoiceNote::DelegationNotConfirmed,
+        ),
+        (
+            CeremonyOutcome::Unavailable,
+            "no_ceremony",
+            VoiceNote::DelegationNoCeremony,
+        ),
+    ] {
+        let mut scene = own_closing(delegating_timings()).await;
+        scene.ceremony.answer_with(outcome);
+        own_closing_asked(&scene, "d-1").await;
+
+        let row = row_reaching(&scene, "d-1", "cancelled").await;
+
+        assert_eq!(row["cause"], cause, "{outcome:?}");
+        until_noted(&scene, "d-1", note).await;
+        assert_eq!(scene.ceremony.asked().len(), 1, "{outcome:?}");
+        assert_eq!(at_the_host(&scene), 1, "no signature was sent: {outcome:?}");
+        assert!(!scene.is_closed().await, "{outcome:?}");
+        // The control: said again, once the person does confirm, the host closes the session.
+        scene.ceremony.answer_with(CeremonyOutcome::Confirmed);
+        let again = say_close(&scene, 12_000).await;
+        own_ask(&scene, "d-2", again - 200).await;
+        row_reaching(&scene, "d-2", "performed").await;
+        scene.until_closed().await;
+        assert_eq!(at_the_host(&scene), 3, "{outcome:?}");
+        hang_up(&scene);
+        scene.stop_host().await;
+    }
+}
+
+/// A challenge that does not agree with the call is put to nobody on a call on the host's own key,
+/// and a challenge the phone's own clock says has run out is not put to the person, and one that
+/// runs out while the person is asked is not signed: the host writes the sentence for each and is
+/// sent no signature.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_challenge_that_does_not_agree_or_ran_out_on_an_own_key_call_is_not_signed_and_the_host_tells_the_model_why()
+ {
+    const TEN_MINUTES_MS: u64 = 10 * 60 * 1000;
+
+    // A challenge for another action than the one the phone made.
+    let mut scene = own_closing(delegating_timings()).await;
+    own_calling(&scene).await;
+    own_chatter(&scene).await;
+    scene.link.change_the_next_challenge(|result, _| {
+        challenge_of(result).action_id = kr_protocol::ids::ActionId::new(an_id(0xa1));
+    });
+    let end = say_close(&scene, 6_000).await;
+    own_ask(&scene, "d-1", end - 200).await;
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "challenge_mismatch");
+    until_noted(&scene, "d-1", VoiceNote::DelegationChallengeMismatch).await;
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1);
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+
+    // A clock that says the challenge ran out before the person was asked.
+    let mut scene = own_closing(delegating_timings()).await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .run_the_confirmation_clock_ahead(TEN_MINUTES_MS);
+    own_closing_asked(&scene, "d-1").await;
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "confirmation_expired");
+    until_noted(&scene, "d-1", VoiceNote::DelegationConfirmationExpired).await;
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1);
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+
+    // A clock that runs it out while the person is asked.
+    let mut scene = own_closing(delegating_timings()).await;
+    own_calling(&scene).await;
+    own_chatter(&scene).await;
+    scene.ceremony.hold();
+    let end = say_close(&scene, 6_000).await;
+    own_ask(&scene, "d-1", end - 200).await;
+    scene.ceremony.until_asked(1).await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .run_the_confirmation_clock_ahead(TEN_MINUTES_MS);
+    scene.ceremony.release();
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "confirmation_expired");
+    until_noted(&scene, "d-1", VoiceNote::DelegationConfirmationExpired).await;
+    assert_eq!(at_the_host(&scene), 1);
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A confirmation whose session the host does not name to the phone in time asks nobody, and more
+/// said that belongs to the request while the person is asked drops the confirmation at once: on a
+/// call on the host's own key the host writes the sentence for each, and no signature is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_not_named_or_more_said_on_an_own_key_call_stops_the_confirmation_and_the_host_tells_the_model_why()
+ {
+    // The session's number is not read in time.
+    let timings = Timings {
+        session_name_within: Duration::from_millis(100),
+        ..delegating_timings()
+    };
+    let mut scene = own_closing(timings).await;
+    own_calling(&scene).await;
+    own_chatter(&scene).await;
+    scene.link.hold_next_request(HostMethod::SessionRead);
+    let end = say_close(&scene, 6_000).await;
+    own_ask(&scene, "d-1", end - 200).await;
+    scene.link.until_request_held().await;
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "session_not_named", "{row}");
+    until_noted(&scene, "d-1", VoiceNote::DelegationSessionNotNamed).await;
+    assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    scene.link.release_request();
+    hang_up(&scene);
+    scene.stop_host().await;
+
+    // More is said while the person is asked.
+    let mut scene = own_closing(delegating_timings()).await;
+    own_calling(&scene).await;
+    own_chatter(&scene).await;
+    scene.ceremony.hold();
+    let end = say_close(&scene, 6_000).await;
+    own_ask(&scene, "d-1", end).await;
+    scene.ceremony.until_asked(1).await;
+    scene
+        .platform
+        .tell_provider(&fragment(end, end + 200, " not"));
+    let row = row_reaching(&scene, "d-1", "cancelled").await;
+    assert_eq!(row["cause"], "late_fragment");
+    until_noted(&scene, "d-1", VoiceNote::DelegationLate).await;
+    scene.ceremony.release();
+    until_the_ceremony_is_handled(&scene, "d-1").await;
+    assert_eq!(at_the_host(&scene), 1, "no signature was sent");
+    assert!(!scene.is_closed().await);
+    hang_up(&scene);
+    scene.stop_host().await;
+}
