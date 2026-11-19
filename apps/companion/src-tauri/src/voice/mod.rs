@@ -1445,7 +1445,9 @@ pub type Pairings = Arc<dyn Fn(kr_protocol::ids::DeviceId) -> PairedNow + Send +
 
 /// Whether the pairing `entry` was made under is the one `paired` reports for its host now: `None`
 /// while the records cannot say, and `Some(false)` for a start entry whose host was unpaired, or
-/// paired again since, which gave the device another identity. Only a start entry is told: what
+/// paired again since, which gave the device another identity. The one exception is a start notice
+/// the release before wrote (no pairing, a finite lapse): it stands after a re-pairing, until its
+/// own lapse, and goes at once only when its host is not paired. Only a start entry is told: what
 /// else is owed stands whatever the pairings are.
 fn pairing_holds(paired: &Pairings, entry: &OwedView) -> Option<bool> {
     let Some((host, _)) = entry.host.filter(|_| entry.is_start()) else {
