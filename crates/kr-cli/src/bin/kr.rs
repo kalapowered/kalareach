@@ -1409,6 +1409,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 kr_cli::login_item::run(&paths, &arguments.command, cli.json)
             }
             HostCommand::ImportJournals => kr_cli::import::run(&paths, cli.json),
+            HostCommand::RepairGrants(arguments) => kr_cli::repair::run(&paths, &arguments),
             HostCommand::Install(install) => {
                 let installed = kr_cli::update::install(
                     install.release.as_deref(),
