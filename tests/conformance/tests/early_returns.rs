@@ -232,6 +232,20 @@ fn tracked_sources(root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The tokens of `source`, the file at `path`, without its comments, which the reading of the
+/// code never looks at.
+///
+/// # Errors
+///
+/// Returns where the source cannot be read as Rust.
+fn code_tokens(path: &str, source: &str) -> Result<Vec<Token>, String> {
+    let tokens = lex(source).map_err(|error| format!("{path}:{}: {}", error.line, error.what))?;
+    Ok(tokens
+        .into_iter()
+        .filter(|token| !token.is_comment())
+        .collect())
+}
+
 /// Where the token at `open`, one of `(`, `[` and `{`, closes.
 fn closing(tokens: &[Token], open: usize) -> Option<usize> {
     let mut depth = 0_usize;
@@ -268,12 +282,15 @@ fn prints(tokens: &[Token]) -> Vec<Print> {
         let Some(name) = token.ident() else {
             continue;
         };
-        if !PRINTS.contains(&name)
-            || !tokens.get(at + 1).is_some_and(|next| next.is_punct('!'))
-            || !tokens.get(at + 2).is_some_and(|next| next.is_punct('('))
-        {
+        if !PRINTS.contains(&name) || !tokens.get(at + 1).is_some_and(|next| next.is_punct('!')) {
             continue;
         }
+        // A macro takes any of the three delimiters.
+        let Some(Tok::Punct(delimiter @ ('(' | '[' | '{'))) =
+            tokens.get(at + 2).map(|next| &next.tok)
+        else {
+            continue;
+        };
         let Some(close) = closing(tokens, at + 2) else {
             continue;
         };
@@ -291,11 +308,16 @@ fn prints(tokens: &[Token]) -> Vec<Print> {
                 _ => {}
             }
         }
-        let leaves = tokens.get(close + 1).is_some_and(|next| next.is_punct(';'))
-            && tokens
-                .get(close + 2)
-                .and_then(Token::ident)
-                .is_some_and(|word| matches!(word, "return" | "continue"));
+        // A brace macro in the place of a statement needs no semicolon; the others do.
+        let after = match tokens.get(close + 1) {
+            Some(next) if next.is_punct(';') => Some(close + 2),
+            _ if *delimiter == '{' => Some(close + 1),
+            _ => None,
+        };
+        let leaves = after
+            .and_then(|next| tokens.get(next))
+            .and_then(Token::ident)
+            .is_some_and(|word| matches!(word, "return" | "continue"));
         found.push(Print {
             line: token.line,
             said,
@@ -390,7 +412,7 @@ struct Candidate {
 ///
 /// Returns where the source cannot be read as Rust.
 fn candidates(path: &str, source: &str) -> Result<Vec<Candidate>, String> {
-    let tokens = lex(source).map_err(|error| format!("{path}:{}: {}", error.line, error.what))?;
+    let tokens = code_tokens(path, source)?;
     let under_attribute = cfg_test_lines(&tokens);
     let found = prints(&tokens)
         .into_iter()
@@ -629,4 +651,85 @@ fn the_reading_does_not_see_a_print_through_a_helper_or_a_return_with_nothing_be
         .is_empty()
     );
     assert!(found(target, "fn f() { if no { return; } }").is_empty());
+}
+
+/// The control: a print is read whatever its delimiters.
+#[test]
+fn the_reading_takes_each_delimiter_of_a_print() {
+    let product = "crates/x/src/lib.rs";
+    let target = "crates/x/tests/a.rs";
+
+    // By its words, with a bracket and with a brace, which needs no semicolon after it.
+    assert_eq!(
+        found(
+            product,
+            "fn f() { eprintln! { \"skipping the leg\" } done(); }"
+        ),
+        [(1, Why::Words, false)]
+    );
+    assert_eq!(
+        found(product, "fn f() { eprintln![\"skipping the leg\"]; }"),
+        [(1, Why::Words, false)]
+    );
+    // By its shape: the brace with and without a semicolon, and the bracket.
+    for printing in [
+        "eprintln! { \"no IPv6 here\" };",
+        "eprintln! { \"no IPv6 here\" }",
+        "eprintln![\"no IPv6 here\"];",
+    ] {
+        assert_eq!(
+            found(target, &format!("fn f() {{ {printing} return; }}")),
+            [(1, Why::Shape, false)],
+            "{printing}"
+        );
+    }
+    // A paren or a bracket macro with no semicolon is part of a larger expression, not a statement.
+    assert!(found(target, "fn f() { eprintln!(\"no IPv6 here\") return; }").is_empty());
+}
+
+/// The control: a comment between the tokens of a print, or after it and before the `return`,
+/// does not hide it, and one inside it is not its literal.
+#[test]
+fn the_reading_passes_over_comments_between_the_tokens_of_a_print() {
+    let product = "crates/x/src/lib.rs";
+    let target = "crates/x/tests/a.rs";
+
+    // A comment after the print, before the `return`.
+    assert_eq!(
+        found(
+            target,
+            "fn f() {\n    eprintln!(\"no IPv6 here\"); // The host has no suitable address.\n    return;\n}"
+        ),
+        [(2, Why::Shape, false)]
+    );
+    assert_eq!(
+        found(
+            target,
+            "fn f() {\n    eprintln!(\"no IPv6 here\");\n    /* Nothing to do. */\n    continue;\n}"
+        ),
+        [(2, Why::Shape, false)]
+    );
+    // A comment between the print's closing token and its semicolon.
+    assert_eq!(
+        found(
+            target,
+            "fn f() { eprintln!(\"no IPv6 here\") /* why */; return; }"
+        ),
+        [(1, Why::Shape, false)]
+    );
+    // A print inside a comment is no print, and a comment inside a print is not its literal.
+    assert!(
+        found(
+            target,
+            "/* eprintln! { \"skipping\" }; return; */\nfn f() {}"
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        found(
+            product,
+            "fn f() { eprintln!(/* skipping: not this */ \"skipped: the leg\"); }"
+        ),
+        [(1, Why::Words, true)]
+    );
 }
