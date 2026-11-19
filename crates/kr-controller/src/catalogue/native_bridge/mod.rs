@@ -2541,15 +2541,17 @@ fn registration(
         // one reader takes and another does not: a value keeps the last of two, and an application
         // may read the first. So the file is read exactly, whole, before any value is made of it
         // and before anything of it is believed; a root that is not an object is refused there.
-        if serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_err() {
-            return Err(format!(
-                "{destination} cannot be read as JSON, so what it registers cannot be checked"
-            ));
-        }
         if let Err(why) = std::str::from_utf8(bytes)
             .map_err(|error| error.to_string())
             .and_then(|text| json::Document::read(text).map(|_| ()))
         {
+            // Only the words differ: bytes no JSON reader takes are not JSON, and the rest are
+            // JSON that is not one object with no repeated member.
+            if serde_json::from_slice::<serde_json::Value>(bytes).is_err() {
+                return Err(format!(
+                    "{destination} cannot be read as JSON, so what it registers cannot be checked"
+                ));
+            }
             return Err(format!(
                 "{destination} is not one JSON object with no repeated member, so what it \
                  registers cannot be checked: {why}"
