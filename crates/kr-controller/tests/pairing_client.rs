@@ -900,11 +900,13 @@ impl Preauth for Watched {
             let (question, back) = self.transit.now();
             tokio::time::sleep(question).await;
             let answer = self.inner.status(params).await;
-            if answer.is_err() {
-                self.failed_statuses.fetch_add(1, Ordering::SeqCst);
-            }
+            // The refusal is counted before the failure, so a case that has seen the failure has
+            // seen every refusal that came with it.
             if matches!(answer, Err(LinkError::Refused(_))) {
                 self.refused_statuses.fetch_add(1, Ordering::SeqCst);
+            }
+            if answer.is_err() {
+                self.failed_statuses.fetch_add(1, Ordering::SeqCst);
             }
             tokio::time::sleep(back).await;
             if answer.is_ok() {

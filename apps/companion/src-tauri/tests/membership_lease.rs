@@ -892,6 +892,19 @@ impl Rig {
         .expect("the device asks on a fresh connection after the approval");
     }
 
+    /// Waits until a connection to the host has presented a lease or a second connection to it has
+    /// been asked for. A device that recovers as the device it became presents the lease on the
+    /// connection it recovers with, which is the first it makes to the host.
+    async fn until_the_recovery_has_connected(&self) {
+        tokio::time::timeout(WATCHDOG, async {
+            while self.control.presented() == 0 && self.control.asked() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the device connects to the host as the device it became");
+    }
+
     /// The host stops and starts again on its tree, where it was.
     async fn restarted(self) -> Self {
         Self {
@@ -3092,6 +3105,11 @@ async fn a_stranded_member_recovers_as_the_device_it_became_and_presents_its_lea
         rig.control.statuses_refused() >= 1,
         "the host's refusal of the device's question reached it as a refusal"
     );
+    rig.until_the_recovery_has_connected().await;
+    assert!(
+        rig.control.presented() >= 1,
+        "the device presents its lease on the connection it recovers with"
+    );
     rig.phone
         .companion
         .reached(|state| state["state"] == "paired")
@@ -3112,13 +3130,14 @@ async fn a_stranded_member_recovers_as_the_device_it_became_and_presents_its_lea
 async fn a_member_that_moved_to_another_connection_before_the_approval_recovers_and_is_served() {
     let (rig, awaiting) = Rig::awaiting_with(SERVED, 0).await;
     rig.control.silence_the_first_surface();
+    let answered = rig.control.statuses_answered();
     tokio::time::timeout(WATCHDOG, async {
-        while rig.control.surfaces_opened() < 2 {
+        while rig.control.statuses_answered() == answered {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the device moves to a fresh connection once the first went quiet");
+    .expect("the host tells the device on a fresh connection that the owner has not decided");
     awaiting
         .approved_without_waiting(&rig.fixture.host, &rig.fixture.owner)
         .await;
@@ -3126,6 +3145,11 @@ async fn a_member_that_moved_to_another_connection_before_the_approval_recovers_
     assert!(
         rig.control.statuses_refused() >= 1,
         "the host's refusal of the device's question reached it as a refusal"
+    );
+    rig.until_the_recovery_has_connected().await;
+    assert!(
+        rig.control.presented() >= 1,
+        "the device presents its lease on the connection it recovers with"
     );
     rig.phone
         .companion
@@ -3154,6 +3178,11 @@ async fn a_stranded_member_whose_host_restarted_presents_again_and_is_served() {
     assert!(
         rig.control.statuses_refused() >= 1,
         "the host's refusal of the device's question reached it as a refusal"
+    );
+    rig.until_the_recovery_has_connected().await;
+    assert!(
+        rig.control.presented() >= 1,
+        "the device presents its lease on the connection it recovers with"
     );
     rig.phone
         .companion

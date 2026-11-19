@@ -1236,9 +1236,11 @@ pub struct LinkControl {
     /// Whether the first surface answers nothing more: an answer it has not given is withheld, and
     /// so is one that has been read.
     first_surface_silent: std::sync::atomic::AtomicBool,
-    /// How many status questions the host did not answer, and how many of those it refused.
+    /// How many status questions the host did not answer, how many of those it refused, and how
+    /// many it answered.
     statuses_failed: std::sync::atomic::AtomicUsize,
     statuses_refused: std::sync::atomic::AtomicUsize,
+    statuses_answered: std::sync::atomic::AtomicUsize,
 }
 
 /// A change a case makes to the voice result that carries a challenge.
@@ -1341,6 +1343,12 @@ impl LinkControl {
     /// How many status questions the host refused in a frame the device read.
     pub fn statuses_refused(&self) -> usize {
         self.statuses_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many status questions the host answered, on a surface that was not silent.
+    pub fn statuses_answered(&self) -> usize {
+        self.statuses_answered
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -1950,12 +1958,17 @@ impl kr_client::pairing::link::Preauth for Silenceable {
             if self.silent() {
                 std::future::pending::<()>().await;
             }
+            let counted = std::sync::atomic::Ordering::SeqCst;
+            if answer.is_ok() {
+                self.control.statuses_answered.fetch_add(1, counted);
+            }
             if let Err(error) = &answer {
-                let counted = std::sync::atomic::Ordering::SeqCst;
-                self.control.statuses_failed.fetch_add(1, counted);
+                // The refusal is counted before the failure, so a case that has seen the failure
+                // has seen every refusal that came with it.
                 if matches!(error, kr_client::pairing::link::LinkError::Refused(_)) {
                     self.control.statuses_refused.fetch_add(1, counted);
                 }
+                self.control.statuses_failed.fetch_add(1, counted);
             }
             answer
         })

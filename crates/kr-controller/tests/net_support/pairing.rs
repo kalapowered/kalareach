@@ -29,8 +29,8 @@ use kr_protocol::invitation::{
 };
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
-    ConfirmationChannel, DirectQrPayload, OwnerConfirmationProof, OwnerConfirmationRequest,
-    ProposedGrant, QrPayload,
+    ConfirmationChannel, DirectQrPayload, DirectRedeemProof, OwnerConfirmationProof,
+    OwnerConfirmationRequest, ProposedGrant, QrPayload,
 };
 use kr_protocol::preauth::{
     PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
@@ -499,6 +499,22 @@ pub async fn redeem(
     device: &Candidate<'_>,
     invited: &PairInviteResult,
 ) -> (iroh::endpoint::Connection, CandidateConnection, String) {
+    let (connection, candidate, verification_value, _proof) =
+        redeem_keeping_proof(device, invited).await;
+    (connection, candidate, verification_value)
+}
+
+/// Redeems as [`redeem`] does and also returns the proof the candidate sent, which a second
+/// connection of the same endpoint can send again.
+pub async fn redeem_keeping_proof(
+    device: &Candidate<'_>,
+    invited: &PairInviteResult,
+) -> (
+    iroh::endpoint::Connection,
+    CandidateConnection,
+    String,
+    DirectRedeemProof,
+) {
     let payload = direct_payload(invited);
     let (connection, mut candidate, challenge) = until_challenged(device, &payload).await;
     let PairRedeemResult::Challenge(challenge) = challenge else {
@@ -516,7 +532,7 @@ pub async fn redeem(
     let locked: PairRedeemResult = candidate
         .call(
             Method::PairRedeem,
-            &PairRedeemParams::Direct(Box::new(proof)),
+            &PairRedeemParams::Direct(Box::new(proof.clone())),
         )
         .await
         .expect("the host accepts the redemption");
@@ -526,7 +542,7 @@ pub async fn redeem(
     else {
         panic!("a redemption locks the invitation");
     };
-    (connection, candidate, verification_value)
+    (connection, candidate, verification_value, proof)
 }
 
 /// Reads the owner's view of one invitation.
