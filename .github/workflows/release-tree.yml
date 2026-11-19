@@ -379,6 +379,11 @@ jobs:
       # of its own, and start the Zsh package from the unpacked tree and from the store, which is a
       # package moved from where it was built.
       - name: Unpack, verify, install and start it
+        # The host start loads jobs into the account's own launchd, and stands down with a refusal in
+        # a run that does not ask for it, as a person's own Mac does. This runner's account is for
+        # the run alone, so here it asks.
+        env:
+          KR_ALLOW_ACCOUNT_LAUNCHD: "1"
         run: |
           mkdir -p "$RUNNER_TEMP/unpacked"
           tar -C "$RUNNER_TEMP/unpacked" -xzf "$RUNNER_TEMP/archive/$TOP.tar.gz"

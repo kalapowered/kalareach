@@ -25,12 +25,16 @@
 #
 # Nothing the person at this machine owns is touched: the graphical application is a new instance
 # started in the background, and this script ends only the processes it started itself.
+# On macOS this script needs KR_ALLOW_ACCOUNT_LAUNCHD=1: it starts a daemon and sessions, which load jobs into the account's own launchd, and it refuses to start without it.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
 # shellcheck source=scripts/lib/owned-processes.sh
 . "$root/scripts/lib/owned-processes.sh"
+# shellcheck source=scripts/lib/account-launchd.sh
+. "$root/scripts/lib/account-launchd.sh"
+require_account_launchd "$(uname -s)"
 
 log="${1:-}"
 if [ -n "$log" ]; then

@@ -13,6 +13,7 @@
 # or a guest, with KR_THROWAWAY_HOST=1): a started host keeps its device keys in the machine's key
 # store, which on macOS is the login keychain of the account that runs it, and on macOS the startup
 # entries go into that account's shell startup files.
+# On macOS this script needs KR_ALLOW_ACCOUNT_LAUNCHD=1: it starts a daemon and sessions, which load jobs into the account's own launchd, and it refuses to start without it.
 
 set -euo pipefail
 
@@ -105,6 +106,10 @@ if [ "${CI:-}" != true ] && [ "${KR_THROWAWAY_HOST:-}" != 1 ]; then
     echo "check-host-start: this starts a host and keeps its keys in the machine's key store; run it on a throwaway machine (CI=true or KR_THROWAWAY_HOST=1)" >&2
     exit 2
 fi
+
+# shellcheck source=scripts/lib/account-launchd.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/account-launchd.sh"
+require_account_launchd "$(uname -s)"
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/kr-host-start.XXXXXX")"
 chmod 700 "$work"

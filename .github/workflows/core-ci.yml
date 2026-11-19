@@ -822,6 +822,11 @@ jobs:
       - name: Build the control daemon, the worker and the forwarder the suites run
         run: cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host -p kr-release
 
+      # The daemon as the suites start it, built with the `testing` feature, which the build above
+      # leaves off: `kr-cli`'s `stack_windows` case reads its header as well.
+      - name: Build the control daemon the suites start
+        run: cargo build --locked -p kr-controller --features testing --bin kr-controller-held
+
       # The update suite assembles releases from the programs built beside it, the description
       # process among them, and fails and says so when one is missing.
       - name: Build the description process the update suite assembles into releases
@@ -2726,6 +2731,12 @@ jobs:
     # its work can grow before the limit is reached. The measurement step's limit is set by its own
     # waits. The job's own limit is under GitHub's six hours.
     timeout-minutes: 355
+    # The launchd checks and the daemons the workspace's tests, the demonstrations and the
+    # measurements start load jobs into the account's own launchd, and stand down with a printed
+    # reason, or run detached, in a run that does not ask for it, as a person's own Mac does. This
+    # runner's account is for the run alone, so here the whole job asks.
+    env:
+      KR_ALLOW_ACCOUNT_LAUNCHD: "1"
     steps:
       - name: Check out
         timeout-minutes: 5
@@ -2984,10 +2995,6 @@ jobs:
           # The terminfo checks that run tmux and tic stand down with a printed reason where the
           # host has none. Here a missing tmux or tic fails them.
           KR_REQUIRE_MULTIPLEXERS: "1"
-          # The service-start checks load jobs into the account's own launchd, and stand down with
-          # a printed reason in a run that does not ask for it, as a person's own Mac does. This
-          # runner's account is for the run alone, so here they run.
-          KR_ALLOW_ACCOUNT_LAUNCHD: "1"
         run: >-
           cargo test --locked --workspace --exclude kr-sync-integration --no-fail-fast --
           --skip the_helper_inside_a_container_refuses_a_handshake_that_declares_a_network_actor
@@ -3532,6 +3539,12 @@ jobs:
     # limits add up to less than this one: the build's 240 minutes, twice the 120, and the other
     # steps' 114 make 354, and this limit of 355 is under the 360 at which GitHub ends a hosted job.
     timeout-minutes: 355
+    # The launchd checks and the daemons the workspace's tests, the demonstrations and the
+    # measurements start load jobs into the account's own launchd, and stand down with a printed
+    # reason, or run detached, in a run that does not ask for it, as a person's own Mac does. This
+    # runner's account is for the run alone, so here the whole job asks.
+    env:
+      KR_ALLOW_ACCOUNT_LAUNCHD: "1"
     steps:
       - name: Check out
         timeout-minutes: 5

@@ -537,6 +537,11 @@ jobs:
         run: bash scripts/check-macos-signatures.sh "$RUNNER_TEMP/unpacked/kalareach-$TARGET-$RELEASE" notarized
 
       - name: Install it into a store, and start the host
+        # The host start loads jobs into the account's own launchd, and stands down with a refusal in
+        # a run that does not ask for it, as a person's own Mac does. This runner's account is for
+        # the run alone, so here it asks.
+        env:
+          KR_ALLOW_ACCOUNT_LAUNCHD: "1"
         run: |
           bash scripts/check-host-start.sh self-test
           top="kalareach-$TARGET-$RELEASE"
