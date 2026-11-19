@@ -3507,7 +3507,7 @@ impl ServiceHost {
             [format!("gui/{uid}"), format!("user/{uid}")]
                 .into_iter()
                 .find_map(|domain| {
-                    let mut print = kr_ipc::testing::account_launchd::command(&[
+                    let print = kr_ipc::testing::account_launchd::command(&[
                         "print",
                         &format!("{domain}/{}", self.label()),
                     ]);
@@ -3603,13 +3603,13 @@ impl ServiceHost {
             for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
                 let target = format!("{domain}/{}", self.label());
                 let loaded = |target: &str| {
-                    let mut print = kr_ipc::testing::account_launchd::command(&["print", target]);
+                    let print = kr_ipc::testing::account_launchd::command(&["print", target]);
                     bounded(print, STREAMS_DEADLINE).map(|printed| printed.status.success())
                 };
                 if !loaded(&target)? {
                     continue;
                 }
-                let mut bootout = kr_ipc::testing::account_launchd::command(&["bootout", &target]);
+                let bootout = kr_ipc::testing::account_launchd::command(&["bootout", &target]);
                 let removed = bounded(bootout, TEARDOWN_BOUND)?;
                 // The job goes a moment after `bootout` answers, so it is asked about again until
                 // the bound.
@@ -4116,13 +4116,13 @@ fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_
             "the setup names the remedy and leaves it to the person: {message}"
         );
         // Still the other form: the setup did not replace it.
-        let mut print = kr_ipc::testing::account_launchd::command(&["print", &target]);
+        let print = kr_ipc::testing::account_launchd::command(&["print", &target]);
         let printed = bounded(print, STREAMS_DEADLINE).expect("launchctl answers");
         assert!(
             String::from_utf8_lossy(&printed.stdout).contains("/usr/bin/false"),
             "launchd still holds the other form"
         );
-        let mut bootout = kr_ipc::testing::account_launchd::command(&["bootout", &target]);
+        let bootout = kr_ipc::testing::account_launchd::command(&["bootout", &target]);
         let removed = bounded(bootout, STREAMS_DEADLINE).expect("launchctl answers");
         assert!(removed.status.success(), "the person removes it");
     }
