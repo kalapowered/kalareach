@@ -1782,7 +1782,9 @@ impl Journal {
                     .iter()
                     .copied()
                     .find(|provenance| provenance.as_str() == text)
-                    .ok_or_else(|| self.corrupt("a stored action provenance is not one this build writes"))
+                    .ok_or_else(|| {
+                        self.corrupt("a stored action provenance is not one this build writes")
+                    })
             })
             .transpose()
     }
