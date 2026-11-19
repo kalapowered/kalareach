@@ -81,6 +81,12 @@ pub const ARRIVALS: &[Arrival] = &[
         sdk_version: crate::launch_variables::ARRIVAL,
         carried_by: |table| table.get("launch_variables").is_some(),
     },
+    Arrival {
+        definition: "ConnectorManifest",
+        member: "skill_target",
+        sdk_version: crate::skill_target::ARRIVAL,
+        carried_by: |table| table.get("skill_target").is_some(),
+    },
 ];
 
 /// The table as the package contract carries it.

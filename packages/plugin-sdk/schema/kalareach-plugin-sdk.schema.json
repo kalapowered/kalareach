@@ -1138,6 +1138,17 @@
           },
           "type": "array"
         },
+        "skill_target": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillTarget"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The agent the package names, and where the host installs the KalaReach contact skill for it:\na word, and for the user scope, the project scope or both, a skills folder and at most one\nconfiguration document, each below the home or the project folder. The rules of\n[`crate::skill_target`] hold every part.\n\nA table that does not state it leaves the member out, so a connector written before the\nmember existed reads and hashes exactly as it did. A package that states it requests\n`skill_target.install`, which the owner confirms on every release, and declares an\n`sdk_range` that admits no SDK version before [`crate::skill_target::ARRIVAL`]."
+        },
         "transport": {
           "$ref": "#/$defs/BrokerTransport",
           "description": "How the broker reaches the upstream."
@@ -1247,6 +1258,40 @@
       "maximum": 4294967295,
       "minimum": 0,
       "type": "integer"
+    },
+    "Deadline": {
+      "additionalProperties": false,
+      "description": "The member of the entry that holds the agent's own deadline for the server.",
+      "properties": {
+        "field": {
+          "description": "The member's name: a letter, then letters, digits and `_`, at most 32 bytes, and not a member\nthe host writes into the entry (`type`, `command`, `args`, `env`, `enabled`).",
+          "type": "string"
+        },
+        "unit": {
+          "$ref": "#/$defs/DeadlineUnit",
+          "description": "The unit the agent reads the member in."
+        }
+      },
+      "required": [
+        "field",
+        "unit"
+      ],
+      "type": "object"
+    },
+    "DeadlineUnit": {
+      "description": "The unit of a deadline member.",
+      "oneOf": [
+        {
+          "const": "seconds",
+          "description": "Whole seconds.",
+          "type": "string"
+        },
+        {
+          "const": "milliseconds",
+          "description": "Whole milliseconds.",
+          "type": "string"
+        }
+      ]
     },
     "DecisionDestination": {
       "additionalProperties": false,
@@ -1537,6 +1582,26 @@
             "image"
           ],
           "type": "object"
+        }
+      ]
+    },
+    "DocumentFormat": {
+      "description": "The three ways the host writes a configuration entry.",
+      "oneOf": [
+        {
+          "const": "codex_toml",
+          "description": "The table `mcp_servers.kalareach` of a TOML file.",
+          "type": "string"
+        },
+        {
+          "const": "json_command_args",
+          "description": "`mcpServers.kalareach` of a JSON file, with a command and its arguments.",
+          "type": "string"
+        },
+        {
+          "const": "json_local_command_list",
+          "description": "`mcp.kalareach` of a JSON file, with one command list.",
+          "type": "string"
         }
       ]
     },
@@ -4916,6 +4981,108 @@
       "required": [
         "name",
         "shape"
+      ],
+      "type": "object"
+    },
+    "SkillConfiguration": {
+      "additionalProperties": false,
+      "description": "One configuration document and how the host writes its entry into it.",
+      "properties": {
+        "deadline": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Deadline"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The deadline member the host writes into the entry, where the agent has one."
+        },
+        "format": {
+          "$ref": "#/$defs/DocumentFormat",
+          "description": "How the entry is written. A file name ending in `.toml` takes `codex_toml`, and one ending\nin `.json` takes the other two."
+        },
+        "path": {
+          "description": "The document, as plain components (one to three), the first of them hidden.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "shared": {
+          "description": "True when other agents read this document too, so that what the host writes there is the\nsame for every installation and carries no deadline.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "format",
+        "shared"
+      ],
+      "type": "object"
+    },
+    "SkillLocation": {
+      "additionalProperties": false,
+      "description": "The places of one scope, each below the home folder or the project folder.",
+      "properties": {
+        "configuration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The configuration document the tool server's entry is added to, where there is one. A\nlocation with none installs the skill's files only."
+        },
+        "skills": {
+          "description": "The folder the skill's files go in, as plain components (one to three), the first of them\nhidden. The host writes `kalareach-contact` inside it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "skills"
+      ],
+      "type": "object"
+    },
+    "SkillTarget": {
+      "additionalProperties": false,
+      "description": "The agent a package names, and where the host installs the contact skill for it.",
+      "properties": {
+        "project": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillLocation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The places for an installation in one project's folder."
+        },
+        "user": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillLocation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The places for the account's own installation."
+        },
+        "word": {
+          "description": "The word `kr skill install --agent` takes: lower-case letters and digits in segments joined\nby one `-`, at most 32 bytes, not one of the six agents the host compiles in, not ending in\n`-user` or `-project`, and not ending in a segment of sixteen hexadecimal digits.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "word"
       ],
       "type": "object"
     },

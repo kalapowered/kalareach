@@ -1396,6 +1396,20 @@ fn check_manifest(
         };
         report.push(Finding::at(code, file, problem.message()));
     }
+    // A skill target says where the host writes files and a server entry for an agent, so it has a
+    // capability of its own and what it may declare is closed. Every reason is about the table.
+    if let Some(target) = connector.and_then(|table| table.skill_target.as_ref()) {
+        for problem in crate::skill_target::problems(
+            target,
+            manifest.requests(PluginCapability::SkillTargetInstall),
+        ) {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                problem.message(),
+            ));
+        }
+    }
     // A launch probe runs the application's own executable with arguments the package chose, so it
     // has a capability of its own, and what it may declare is closed.
     if let Some(probe) = &manifest.launch_probe {

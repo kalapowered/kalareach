@@ -42,7 +42,7 @@ fn fixtures_root() -> PathBuf {
 fn the_contract_lists_the_members_that_arrived_inside_a_level() {
     let contract = package_contract();
     assert_eq!(contract["sdk_version"], SDK_VERSION);
-    assert_eq!(SDK_VERSION, "0.1.10");
+    assert_eq!(SDK_VERSION, "0.1.11");
     assert_eq!(
         contract["arrivals"],
         json!([
@@ -65,6 +65,11 @@ fn the_contract_lists_the_members_that_arrived_inside_a_level() {
                 "definition": "ConnectorManifest",
                 "member": "launch_variables",
                 "sdk_version": "0.1.10",
+            },
+            {
+                "definition": "ConnectorManifest",
+                "member": "skill_target",
+                "sdk_version": "0.1.11",
             },
         ])
     );
@@ -96,6 +101,37 @@ fn the_arrival_table_lists_launch_variables_above_placement_and_not_above_the_sd
     let before = PackageVersion::parse(placement.sdk_version).expect("an exact version");
     let host = PackageVersion::parse(SDK_VERSION).expect("a version");
     assert!(arrives > before, "it arrives above placement's version");
+    assert!(arrives <= host, "it arrives after this SDK");
+}
+
+/// The skill target arrives at an SDK version above launch variables' and not above the SDK this
+/// crate implements. The entry is found by the member's name, and the case holds no version.
+#[test]
+fn the_arrival_table_lists_skill_target_above_launch_variables_and_not_above_the_sdk() {
+    let find = |member: &str| {
+        ARRIVALS
+            .iter()
+            .find(|arrival| arrival.definition == "ConnectorManifest" && arrival.member == member)
+    };
+    let (skill_target, launch_variables) = (find("skill_target"), find("launch_variables"));
+    assert!(
+        skill_target.is_some(),
+        "ConnectorManifest.skill_target is not in the arrival table"
+    );
+    assert!(
+        launch_variables.is_some(),
+        "ConnectorManifest.launch_variables is not in the arrival table"
+    );
+    let (Some(skill_target), Some(launch_variables)) = (skill_target, launch_variables) else {
+        return;
+    };
+    let arrives = PackageVersion::parse(skill_target.sdk_version).expect("an exact version");
+    let before = PackageVersion::parse(launch_variables.sdk_version).expect("an exact version");
+    let host = PackageVersion::parse(SDK_VERSION).expect("a version");
+    assert!(
+        arrives > before,
+        "it arrives above launch variables' version"
+    );
     assert!(arrives <= host, "it arrives after this SDK");
 }
 
