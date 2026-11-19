@@ -29,8 +29,10 @@ use crate::service::Controller;
 
 /// What the scripted service answers one start with.
 enum Answer {
-    /// The service refuses the start: nothing was created.
-    Refuses,
+    /// The service refuses the start once `gate` says so: nothing was created.
+    Refuses {
+        gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    },
     /// The service answers with the call `call`, once `gate` says so, as the call an earlier
     /// attempt made when `replayed`.
     Call {
@@ -139,13 +141,18 @@ impl ManagedVoiceService for ServiceScript {
                 .expect("a start the script answers");
             self.arrived.add_permits(1);
             match answer {
-                Answer::Refuses => Ok(VoiceStart::Refused(Box::new(VoiceRefusal {
-                    reason: VoiceRefusalReason::ServiceCapacity,
-                    message: "Managed capacity is spent.".to_owned(),
-                    alternatives: Vec::new(),
-                    attempt_id: None,
-                    call_id: None,
-                }))),
+                Answer::Refuses { gate } => {
+                    if let Some(gate) = gate {
+                        let _ = gate.await;
+                    }
+                    Ok(VoiceStart::Refused(Box::new(VoiceRefusal {
+                        reason: VoiceRefusalReason::ServiceCapacity,
+                        message: "Managed capacity is spent.".to_owned(),
+                        alternatives: Vec::new(),
+                        attempt_id: None,
+                        call_id: None,
+                    })))
+                }
                 Answer::Call {
                     call,
                     replayed,
@@ -265,7 +272,8 @@ fn hold_of(controller: &Controller, actor_id: &ActorId) -> Option<crate::voice_s
 async fn a_start_whose_answer_could_not_be_kept_leaves_its_hold_standing() {
     let world = scripted(&Scripted::new()).await;
     let controller = Arc::clone(&world.controller);
-    let service = ServiceScript::new(vec![Answer::Refuses], true);
+    let (let_it_answer, gate) = tokio::sync::oneshot::channel();
+    let service = ServiceScript::new(vec![Answer::Refuses { gate: Some(gate) }], true);
     controller
         .voice()
         .attach_provider(Some(Arc::clone(&service) as Arc<dyn ManagedVoiceService>));
@@ -278,8 +286,7 @@ async fn a_start_whose_answer_could_not_be_kept_leaves_its_hold_standing() {
         .busy_timeout(std::time::Duration::from_secs(10))
         .expect("waits for the daemon's own writes");
 
-    // The start is answered and its effect is known; its claim is not yet settled.
-    let (arrived, go) = controller.before_a_voice_claim_settles.arm();
+    // The start is at the service, and its claim is not settled while the service has not answered.
     let making = starting(
         &controller,
         world.environment_id,
@@ -287,7 +294,7 @@ async fn a_start_whose_answer_could_not_be_kept_leaves_its_hold_standing() {
         device.device_id,
         &params,
     );
-    arrived.await.expect("the start reaches its settlement");
+    service.a_start_arrives().await;
     assert!(
         hold_of(&controller, &actor_id).is_some(),
         "the claim has not settled, so the row stands"
@@ -301,7 +308,7 @@ async fn a_start_whose_answer_could_not_be_kept_leaves_its_hold_standing() {
     registry
         .execute_batch("BEGIN IMMEDIATE")
         .expect("another writer holds the store");
-    let _ = go.send(());
+    let _ = let_it_answer.send(());
     let given = making.await.expect("the start ran");
     registry
         .execute_batch("ROLLBACK")
@@ -333,6 +340,11 @@ async fn a_start_whose_answer_could_not_be_kept_leaves_its_hold_standing() {
     .into_answer_for_test()
     .expect_err("the device is held");
     assert_eq!(again.code(), ErrorCode::DraftConflict, "{again}");
+    assert_eq!(
+        service.arrived.available_permits(),
+        0,
+        "the held device's next start did not reach the service"
+    );
     assert_eq!(
         hold_of(&controller, &actor_id).map(|row| row.action),
         Some(standing.action),

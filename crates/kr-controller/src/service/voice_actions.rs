@@ -804,8 +804,6 @@ impl Controller {
         }
         // Recorded before the hold goes, so a retry finds the answer rather than a claim with
         // neither an answer nor an attempt behind it.
-        #[cfg(test)]
-        self.before_a_voice_claim_settles.wait().await;
         self.settle_claim(&hold, &outcome)?;
         // Whatever the claim recorded, and only now: the hold's row ends when its start's effect is
         // known and its claim is settled, in either order.
@@ -1338,8 +1336,6 @@ impl kr_voice::Admission for VoiceAdmission {
         };
         let controller = &self.controller;
         let first = controller.clock.now();
-        #[cfg(test)]
-        controller.after_a_start_reads_its_first_moment.run();
         let wall = controller.settled_now_ms();
         let at_the_lock = std::cell::Cell::new(first);
         let moments = || {
@@ -1686,24 +1682,51 @@ mod a_start_hold_on_clocks_moved_by_hand {
 
     /// Every wait before the write lock counts toward the start's moment: the time the continuous
     /// clock counts between the start's first reading and the write adds to the wall reading, and
-    /// the wall clock itself is read once.
+    /// the wall clock itself is read once. The wall clock this case gives the daemon moves the
+    /// continuous clock four seconds when the start reads it, which is after the start's first
+    /// reading of the continuous clock and before the lock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_moment_of_a_start_counts_what_the_continuous_clock_counted_before_the_lock() {
         let temp = kr_ipc::testing::TempHost::create();
-        let (continuous, _wall, clocks) = manual_clocks();
+        let continuous = kr_transport::clock::ManualClock::new();
+        let wall_ms = kr_ipc::now_ms().get();
+        let armed = Arc::new(std::sync::Mutex::new(None::<std::thread::ThreadId>));
+        let clocks = crate::service::Clocks {
+            continuous: Arc::new(continuous.clone()),
+            wall: {
+                let (armed, continuous) = (Arc::clone(&armed), continuous.clone());
+                crate::service::WallClock::from_fn(move || {
+                    let mut on = armed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if *on == Some(std::thread::current().id()) {
+                        *on = None;
+                        continuous.advance(std::time::Duration::from_secs(4));
+                    }
+                    wall_ms
+                })
+            },
+        };
         let controller = daemon_on_clocks_to_move(&temp, clocks).await;
-        let wall = controller.settled_now_ms();
         let (start, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
-        // Only the continuous clock moves, four seconds, after the first reading.
-        controller
-            .after_a_start_reads_its_first_moment
-            .set(move || continuous.advance(std::time::Duration::from_secs(4)));
+        // The start's own thread, and no other, moves the continuous clock at its next reading of
+        // the wall clock.
+        *armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current().id());
         start.before_the_broker(600).expect("admitted");
+        assert_eq!(
+            *armed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            None,
+            "the start read the wall clock on its own thread"
+        );
         let row = standing(&controller);
-        assert_eq!(row.asked_ms, wall + 4_000);
+        assert_eq!(row.asked_ms, wall_ms + 4_000);
         assert_eq!(
             row.ends_ms,
-            crate::voice_start_holds::hold_ends_ms(wall + 4_000, 600)
+            crate::voice_start_holds::hold_ends_ms(wall_ms + 4_000, 600)
         );
     }
 
