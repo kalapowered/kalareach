@@ -565,11 +565,12 @@ that writes nothing:
 - the application is one whose directory this host knows: Claude Code's is `.claude` in the
   account's home, the directory it reads when `CLAUDE_CONFIG_DIR` is not set, and Gemini CLI's is
   `.gemini` in the account's home, where it reads `extensions/`;
-- the forwarder the registration is expected to start is the `kr-hook` beside the daemon, and it
-  starts it for the application the recipe declares: a package of any publisher and any name
-  places a bridge for an application this host names a bridge for and knows the directory of
-  (today Claude Code and Gemini CLI), and a registration for an application other than the one the recipe
-  declares is refused;
+- the forwarder the registration is expected to start is the `kr-hook` beside the daemon, for one
+  application word, which the host records as the application the bridge is admitted for: a
+  package of any publisher and any name places a bridge for an application this host knows the
+  directory and the layout of (today Claude Code and Gemini CLI), and a registration that starts
+  the forwarder for two application words, or for an invocation the installed forwarder does not
+  accept, is refused;
 - every step the recipe installs has the removal that undoes it, and every file it installs is the
   bytes its recipe names;
 - every executable the package's match rules name on the daemon's search path is read, never run,
