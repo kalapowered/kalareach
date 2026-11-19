@@ -2973,11 +2973,13 @@ async fn a_change_to_the_feeds_list_answered_by_its_removal_refuses_the_grants_t
 #[test]
 fn a_revision_answered_by_the_feeds_removal_refuses_the_grants_that_rest_on_it_at_once() {
     // Declared before the runtime, so that a panic drops the runtime first and the watchdog's
-    // thread outlives a drop that waits for a task which never ends. The case reaches seven of
-    // `within`'s timers, one after another (the daemon's start, two pairings, the carrier going
-    // idle, the owner's publication, the request reaching the feed, and the pass ending), each of
-    // 180 seconds: the worst case of them all together is 1,260 seconds, far beyond this bound,
-    // which therefore decides alone that a case that does not end is ended.
+    // thread outlives a drop that waits for a task which never ends. Ten sequential outer
+    // `within` budgets of 180 seconds each allow 1,800 seconds in total: the daemon's start and
+    // the two waits that end its set-up, the two pairings, the carrier going idle, the owner's
+    // publication, the request reaching the feed, the pass ending, and what the owner is shown.
+    // The idle budget contains two further poll timers. Other operations lie outside these
+    // budgets. The 240-second watchdog independently bounds the whole case, and so decides alone
+    // that a case that does not end is ended.
     let _watchdog = Watchdog::arm(Duration::from_secs(240));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
