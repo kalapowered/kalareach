@@ -242,6 +242,21 @@ impl HostEnd {
     pub const fn settles(&self) -> bool {
         matches!(self, Self::Revoked { .. } | Self::NotHeld { .. })
     }
+
+    /// Whether the host's answer says the call is closed at its provider: it revoked the grant and
+    /// the provider confirmed the closure, or it holds no call of this device by that name, so its
+    /// own end closed it. A revoked grant is not a closed call: the host may have revoked the grant
+    /// and not been able to confirm the provider's closure, and the call is then left to the host.
+    #[must_use]
+    pub const fn closes_the_call(&self) -> bool {
+        matches!(
+            self,
+            Self::Revoked {
+                broker_notified: true,
+                ..
+            } | Self::NotHeld { .. }
+        )
+    }
 }
 
 impl OwedView {

@@ -2832,7 +2832,7 @@ impl Owner {
         // The host that ended the call itself closed it, and a call the host lost is left to it.
         let host_ended = matches!(cause, Cause::Host(HostEnding::Reason(_)));
         let host_lost = matches!(cause, Cause::Host(HostEnding::NotKnown(_)));
-        let left_to_host = own_key_call && !host_ended && (host_lost || !host_end.settles());
+        let left_to_host = own_key_call && !host_ended && (host_lost || !host_end.closes_the_call());
         // A request written to the host and not answered may have been carried out, and the aftermath
         // never says nothing was done.
         let unsettled = self.accepting && self.requests_unsettled();

@@ -1024,7 +1024,7 @@ impl Shared {
             (None, end)
                 if kept.provider == CallProvider::OwnKey && kept.grant_until_ms.is_some() =>
             {
-                if end.settles() {
+                if end.closes_the_call() {
                     "closed_by_host"
                 } else {
                     "left_to_host"
