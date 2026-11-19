@@ -279,6 +279,9 @@ pub fn install_package(
         holds("native_bridge.install")
             .then(|| native_bridge_statement(copy, entry))
             .as_deref(),
+        // The packages this stage installs declare no placement, so the host writes no reading
+        // of one.
+        None,
         holds("command_integration.launch")
             .then(|| integration_statement(copy, entry))
             .as_deref(),
