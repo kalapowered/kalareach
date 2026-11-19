@@ -627,6 +627,56 @@ mod tests {
         assert!(matches!(trust(&managed, &arguments), Ok(Trust::Pinned(_))));
     }
 
+    /// KR-REQ-10.02: a proxy credential file holds one line, a user name, a colon and a password,
+    /// split at the first colon with every space kept and one line ending removed; each other file
+    /// is refused in words that name the file and never what it held.
+    #[test]
+    fn a_proxy_credential_file_is_read_once_and_never_printed() {
+        let folder = kr_ipc::testing::PrivateTempDir::create();
+        let file = |name: &str, bytes: &[u8]| {
+            let path = folder.path().join(name);
+            std::fs::write(&path, bytes).expect("a file");
+            path
+        };
+        let credential = |bytes: &[u8]| {
+            ProxyCredential::parse_line(&kr_crypto::secret::SecretVec::new(bytes.to_vec()))
+                .expect("a credential")
+        };
+
+        for (stored, line) in [
+            (&b"user:pass:word\n"[..], &b"user:pass:word"[..]),
+            (b"user:pass word \r\n", b"user:pass word "),
+            (b"us\xc3\xa9r:\n", b"us\xc3\xa9r:"),
+            (b"user:password", b"user:password"),
+        ] {
+            let (read, _) = login_of(&file("login", stored)).expect("a login");
+            assert!(read == credential(line), "{stored:?}");
+        }
+
+        let long_user = format!("{}:hunter2", "a".repeat(256)).into_bytes();
+        for (name, bytes) in [
+            ("empty", &b""[..]),
+            ("no-colon", b"hunter2"),
+            ("no-user", b":hunter2"),
+            ("not-utf8", b"us\xffer:hunter2"),
+            ("control", b"us\x07er:hunter2"),
+            ("long", long_user.as_slice()),
+        ] {
+            let refused = match login_of(&file(name, bytes)) {
+                Ok(_) => panic!("{name} is refused"),
+                Err(refused) => refused.to_string(),
+            };
+            assert!(refused.contains(name), "{name} names its file: {refused}");
+            assert!(!refused.contains("hunter2"), "{name} repeats its content");
+        }
+        for (name, path) in [
+            ("a folder", folder.path().to_path_buf()),
+            ("a missing file", folder.path().join("missing")),
+        ] {
+            assert!(login_of(&path).is_err(), "{name} is refused");
+        }
+    }
+
     /// KR-REQ-10.02: the proxy login's flags combine as the command's help says. The file needs
     /// `--join` or `--proxy-login`; `--proxy-login` needs the file; the four modes exclude each
     /// other.
