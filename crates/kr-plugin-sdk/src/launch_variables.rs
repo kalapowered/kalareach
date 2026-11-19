@@ -6,7 +6,7 @@
 //! the declaration to syntax rules and a floor of reserved names:
 //!
 //! * the value is `1` or `0`, or repeats exactly a pair of
-//!   [`PERMITTED_VARIABLES`](crate::integration::PERMITTED_VARIABLES);
+//!   [`PERMITTED_VARIABLES`];
 //! * the name is two or more words of upper-case letters and digits joined by `_`, the first
 //!   beginning with a letter, at most [`MAX_NAME_BYTES`] bytes, and its first word is the
 //!   upper-case first word of the package's plugin name, so a package sets only the switches of
@@ -42,7 +42,7 @@ pub const MAX_NAME_BYTES: usize = 64;
 pub const MIN_NAME_WORDS: usize = 2;
 
 /// The only values a declaration may state, apart from a pair of
-/// [`PERMITTED_VARIABLES`](crate::integration::PERMITTED_VARIABLES) it repeats exactly.
+/// [`PERMITTED_VARIABLES`] it repeats exactly.
 pub const VALUES: [&str; 2] = ["1", "0"];
 
 /// Words a name may not begin with, in the first position only.
