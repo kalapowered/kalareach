@@ -5092,12 +5092,14 @@ async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
     );
 }
 
-/// KR-REQ-23.30, KR-REQ-23.24 and KR-REQ-11.27: a plugin action whose outcome is uncertain holds
-/// back no other plugin action of the same actor on the same session. The package's answer action
-/// carries an approval's decision, and each approval is its own question put to the person: the
-/// uncertain answer to one is not the earlier outcome a later answer to another has to show.
+/// KR-REQ-23.30, KR-REQ-23.24 and KR-REQ-11.27: an uncertain plugin answer to one approval holds
+/// back no plugin answer to another approval of the same actor on the same session. The package's
+/// answer action carries an approval's decision, and each approval is its own question put to the
+/// person: the uncertain answer to one is not the earlier outcome a later answer to another has to
+/// show.
 ///
-/// Not shown here: the answers one subject keeps together, which have to name the uncertain one.
+/// Not shown here: the answers to one approval, which are one subject and have to name the
+/// uncertain one (the case after this one).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_uncertain_plugin_answer_to_one_approval_does_not_hold_back_the_plugin_answer_to_another()
  {
@@ -5177,6 +5179,194 @@ async fn an_uncertain_plugin_answer_to_one_approval_does_not_hold_back_the_plugi
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "both answers went to the transport"
+    );
+}
+
+/// KR-REQ-23.30 and KR-REQ-23.24: two plugin answers to one approval are one subject, whichever
+/// decision they carry. After the first answer's outcome is uncertain, an answer to the same
+/// approval under a fresh identifier that does not name the uncertain one is held back, the other
+/// decision included, and nothing more is carried to the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_plugin_answer_retried_under_a_fresh_identifier_still_has_to_name_the_uncertain_one() {
+    let host = host().await;
+    // The transport takes the first answer and never says what came of it.
+    let (_never, waiting) = tokio::sync::oneshot::channel::<()>();
+    let upstream = Arc::new(WaitingUpstream {
+        release: std::sync::Mutex::new(Some(waiting)),
+        carried: std::sync::atomic::AtomicUsize::new(0),
+    });
+    register(&host, None);
+    let first = offer_approval(&host, Arc::clone(&upstream));
+    register_class_actions(&host);
+    let mut client = cli(&host).await;
+    let window = client.action_window().action_window_id.clone();
+
+    let lost = plugin_invocation(
+        &host,
+        310,
+        window.clone(),
+        "request.answer",
+        Nullable::some(first),
+        br#"{"decision":"allow"}"#,
+    );
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, lost),
+    )
+    .await
+    .expect("the caller is answered at the deadline");
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer nobody acknowledged is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+
+    let retried = plugin_invocation(
+        &host,
+        311,
+        window,
+        "request.answer",
+        Nullable::some(first),
+        br#"{"decision":"deny"}"#,
+    );
+    let outcome = send(&mut client, retried).await;
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer to the same approval has to name the uncertain one: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::DraftConflict, "{}", error.message);
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the first answer was carried"
+    );
+}
+
+/// KR-REQ-23.30 and KR-REQ-23.24: a package replaced on an instance does not hand its uncertain
+/// actions to the package that replaced it. The first package is bound through the admission and
+/// binding paths the installation uses, one of its actions is left uncertain, a snapshot that
+/// ends its release closes the binding, and a second package is bound to the same instance. The
+/// binding revision does not move, so a call on the second package names the complete target the
+/// first one's did, and its action of the same name is admitted: the package is part of the
+/// subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_action_of_a_replaced_package_does_not_hold_the_same_named_action_of_the_one_that_replaced_it()
+ {
+    use kr_worker::broker::catalogue::testing;
+    let host = host().await;
+    register(&host, None);
+    let packages = tempfile::tempdir().expect("a directory on the internal disk");
+    let write = |name: &str| {
+        kr_worker::broker::connectors::fixture::declarative_package(
+            packages.path(),
+            name,
+            "example-agent",
+            kr_plugin_sdk::matching::MatchConfidence::Exact,
+        )
+        .expect("the package is written")
+    };
+    let first = write("example-declarative");
+    let second = write("example-declarative-b");
+    let first_admitted = testing::admitted(&first);
+    let second_admitted = testing::admitted(&second);
+    let broker = host.service.broker();
+    let frame = testing::admit(
+        host.service.plugin_admissions(),
+        host.service.connector_sources(),
+        broker,
+        vec![first_admitted.clone(), second_admitted.clone()],
+        1,
+    );
+    let matched = || kr_worker::broker::binder::MatchedExecutable {
+        path: "/usr/local/bin/example-agent".to_owned(),
+        digest: Digest256::from_bytes([3; 32]),
+    };
+    let first_binding = BrokerBindingId::new(Uuid::from_bytes([41; 16]));
+    let second_binding = BrokerBindingId::new(Uuid::from_bytes([42; 16]));
+    // The suite's own descriptor is bound to the instance, and an instance has one binding.
+    broker.forget_binding(binding());
+    broker
+        .bind(
+            first_binding,
+            instance(),
+            first.package_digest,
+            frame,
+            matched(),
+            TimestampMs::new(2),
+        )
+        .expect("the first package is bound");
+
+    let mut client = cli(&host).await;
+    let window = client.action_window().action_window_id.clone();
+    let call = |request_id: u64, plugin: &str| {
+        refresh_invocation_with(&host, request_id, window.clone(), plugin, Nullable::null())
+    };
+
+    // The first package's action runs, and its outcome is left uncertain on disk, as a worker that
+    // stopped before it learned the outcome leaves it.
+    let uncertain = call(150, "kalareach/example-declarative");
+    let uncertain_id = uncertain.action_id;
+    assert!(
+        matches!(send(&mut client, uncertain).await, Outcome::Ok(_)),
+        "the first package's action is admitted"
+    );
+    rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal opens")
+        .execute(
+            "UPDATE receipts SET state = 'unknown' WHERE action_id = ?1",
+            rusqlite::params![uncertain_id.get().as_bytes().as_slice()],
+        )
+        .expect("the receipt is left uncertain");
+
+    // The control: the same action of the same package, under a fresh identifier, is held back.
+    let outcome = send(&mut client, call(151, "kalareach/example-declarative")).await;
+    let Outcome::Error(held) = outcome else {
+        panic!("the uncertain action holds back the same action of its own package: {outcome:?}");
+    };
+    assert_eq!(held.code, ErrorCode::DraftConflict, "{}", held.message);
+
+    // The snapshot ends the first package's release, which closes its binding, and the second
+    // package is bound to the instance.
+    let frame = testing::hand_over(
+        host.service.plugin_admissions(),
+        host.service.connector_sources(),
+        broker,
+        testing::Snapshot {
+            releases: vec![
+                kr_protocol::admission::ReleaseState {
+                    ends_at_next_boundary: true,
+                    ..testing::release_of(&first_admitted)
+                },
+                testing::release_of(&second_admitted),
+            ],
+            ..testing::Snapshot::admitting(2, vec![second_admitted.clone()])
+        },
+    );
+    assert!(
+        broker.binding_record(first_binding).is_none(),
+        "the first package's binding ended"
+    );
+    broker
+        .bind(
+            second_binding,
+            instance(),
+            second.package_digest,
+            frame,
+            matched(),
+            TimestampMs::new(3),
+        )
+        .expect("the package that replaced it is bound");
+
+    // The call carries the same target, binding revision included, and the same action name.
+    let replaced = call(152, "kalareach/example-declarative-b");
+    let replaced_id = replaced.action_id;
+    let outcome = send(&mut client, replaced).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the replaced package's uncertain action stands in the way of the package that replaced it: {outcome:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, replaced_id).await.state,
+        ReceiptState::Applied
     );
 }
 

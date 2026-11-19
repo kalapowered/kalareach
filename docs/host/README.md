@@ -4536,7 +4536,7 @@ observed.
 A new action identifier cannot silently take an uncertain outcome's place. The journal stores a
 **subject digest** beside the payload digest: the method and version, the complete target and the
 parameters that select the resource, and nothing that differs between a first attempt and the later
-request that supersedes it. So a fresh identifier for a subject that already carries an uncertain outcome is refused unless
+request that supersedes it. The subject of a `plugin.action.invoke` call is the package, the action, the draft and the resource it names, and not its `parameters`. So a fresh identifier for a subject that already carries an uncertain outcome is refused unless
 its preconditions name that action and the receipt revision the caller read it at. A service that
 wanted to hide the uncertainty would have to name the receipt it was hiding. The control daemon
 applies a narrower rule to a share it makes itself (`grant.create`), which is described with the

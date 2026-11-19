@@ -201,7 +201,8 @@ pub struct SubjectSelectors {
     ///
     /// No method selects by a precondition. A precondition guards when a request may run, and the
     /// worker refuses any key it does not evaluate, so identity that a subject needs has to travel
-    /// as a parameter: `agent.approval.respond` names the approval it answers by `resource_id`.
+    /// as a parameter: `agent.approval.respond` names the approval it answers by `resource_id`, and
+    /// `plugin.action.invoke` names the package, the action, the draft and the resource.
     pub params: &'static [&'static str],
 }
 
@@ -251,6 +252,20 @@ pub fn subject_selectors(method: Option<crate::method::Method>) -> SubjectSelect
         // whichever option they choose.
         Some(Method::AgentApprovalRespond) => SubjectSelectors {
             params: &["resource_id"],
+        },
+        // A plugin action is one package's action on a draft or a pending resource: those four
+        // are what it acts on. Two answers to two approvals, a prompt and a cancellation, an
+        // attachment on two drafts, and one action name in two packages are different subjects,
+        // so an uncertain outcome of one holds back none of the others.
+        //
+        // `parameters` is how the call asks, and stays out. An answer's decision travels there, and
+        // two answers to one approval are one subject whichever option they choose. The broker
+        // also reads those bytes as JSON and writes them again after the subject is computed, so a
+        // subject over them would let a respelled retry past the hold. The cost is that two
+        // attachments of one draft are one subject: the handle that tells them apart is in
+        // `parameters`.
+        Some(Method::PluginActionInvoke) => SubjectSelectors {
+            params: &["plugin_id", "action", "draft_id", "resource_id"],
         },
         _ => SubjectSelectors::TARGET_ONLY,
     }
@@ -1230,6 +1245,182 @@ mod tests {
         assert_ne!(
             subject_digest(&decision("deny")).expect("a digest"),
             subject_digest(&other_session).expect("a digest")
+        );
+    }
+
+    /// One `plugin.action.invoke` of `action` of the package `plugin`, naming the draft and the
+    /// pending resource given by the bytes `draft` and `resource` (none when zero), and carrying
+    /// `parameters`.
+    fn plugin_action(
+        plugin: &str,
+        action: &str,
+        draft: u8,
+        resource: u8,
+        parameters: &[u8],
+    ) -> MutationRequest {
+        mutation(
+            Method::PluginActionInvoke,
+            ParamsValue::from_typed(&crate::agent::PluginActionInvokeParams {
+                target: crate::agent::AgentMutationTarget {
+                    subject: crate::agent::AgentSubject {
+                        session_id: crate::ids::SessionId::new(Uuid::from_bytes([3; 16])),
+                        application_instance_id: crate::ids::ApplicationInstanceId::new(
+                            Uuid::from_bytes([5; 16]),
+                        ),
+                    },
+                    binding_revision: crate::ids::AgentBindingRevision::new(7),
+                },
+                plugin_id: crate::ids::PluginId::new(plugin).expect("a package"),
+                action: crate::broker::ActionName::new(action).expect("an action"),
+                draft_id: if draft == 0 {
+                    Nullable::null()
+                } else {
+                    Nullable::some(crate::ids::DraftId::new(Uuid::from_bytes([draft; 16])))
+                },
+                resource_id: if resource == 0 {
+                    Nullable::null()
+                } else {
+                    Nullable::some(crate::ids::PendingResourceId::new(Uuid::from_bytes(
+                        [resource; 16],
+                    )))
+                },
+                parameters: crate::scalars::Bytes::from(parameters.to_vec()),
+            })
+            .expect("parameters"),
+        )
+    }
+
+    #[test]
+    fn the_subject_digest_separates_two_plugin_answers_to_two_approvals() {
+        // The package's answer action carries an approval's decision, and the resource it names
+        // says which approval. Two answers to two approvals are two subjects.
+        let answer = |resource: u8| {
+            plugin_action(
+                "kalareach.codex",
+                "request.answer",
+                0,
+                resource,
+                br#"{"decision":"deny"}"#,
+            )
+        };
+        assert_ne!(
+            subject_digest(&answer(1)).expect("a digest"),
+            subject_digest(&answer(2)).expect("a digest"),
+            "an uncertain plugin answer to one approval does not stand in another's way"
+        );
+    }
+
+    #[test]
+    fn the_subject_digest_separates_plugin_actions_by_package_action_and_draft() {
+        let subject = |request: &MutationRequest| subject_digest(request).expect("a digest");
+        // Each pair differs in one selected key only.
+        let attach = plugin_action("kalareach.codex", "draft.attach", 1, 0, b"{}");
+        let other_package = plugin_action("kalareach.other", "draft.attach", 1, 0, b"{}");
+        assert_ne!(
+            subject(&attach),
+            subject(&other_package),
+            "one action name in two packages is two subjects"
+        );
+        let prompt = plugin_action("kalareach.codex", "prompt.send", 0, 0, b"{}");
+        let cancel = plugin_action("kalareach.codex", "turn.cancel", 0, 0, b"{}");
+        assert_ne!(
+            subject(&prompt),
+            subject(&cancel),
+            "a prompt and a cancellation of one package are two subjects"
+        );
+        let second_draft = plugin_action("kalareach.codex", "draft.attach", 2, 0, b"{}");
+        assert_ne!(
+            subject(&attach),
+            subject(&second_draft),
+            "an attachment on one draft is not an attachment on another"
+        );
+    }
+
+    #[test]
+    fn the_subject_digest_of_a_plugin_action_is_what_it_acts_on_rather_than_how_it_asks() {
+        let subject = |request: &MutationRequest| subject_digest(request).expect("a digest");
+        // Two answers to one approval are one subject whichever decision they carry.
+        assert_eq!(
+            subject(&plugin_action(
+                "kalareach.codex",
+                "request.answer",
+                0,
+                1,
+                br#"{"decision":"deny"}"#
+            )),
+            subject(&plugin_action(
+                "kalareach.codex",
+                "request.answer",
+                0,
+                1,
+                br#"{"decision":"allow"}"#
+            )),
+        );
+        // Two prompts of one package and target are one subject whatever they say.
+        assert_eq!(
+            subject(&plugin_action(
+                "kalareach.codex",
+                "prompt.send",
+                0,
+                0,
+                br#"{"text":"one"}"#
+            )),
+            subject(&plugin_action(
+                "kalareach.codex",
+                "prompt.send",
+                0,
+                0,
+                br#"{"text":"two"}"#
+            )),
+        );
+        // A handle spelled two ways is the same handle, and one attachment of one draft.
+        let handle = "11111111-1111-4111-8111-111111111111";
+        assert_eq!(
+            subject(&plugin_action(
+                "kalareach.codex",
+                "draft.attach",
+                1,
+                0,
+                format!(r#"{{"attachment":"{handle}"}}"#).as_bytes()
+            )),
+            subject(&plugin_action(
+                "kalareach.codex",
+                "draft.attach",
+                1,
+                0,
+                format!(r#"{{ "attachment" : "{handle}" }}"#).as_bytes()
+            )),
+        );
+
+        // A later request for the same thing changes what it has to: the guard it adds, the two
+        // preconditions that show the earlier outcome, a new action number, window, lifetime and
+        // request identifier. None of them is what the call acts on.
+        let first = plugin_action("kalareach.codex", "prompt.send", 0, 0, b"{}");
+        let mut later = first.clone();
+        later.action_id = action(10);
+        later.action_window_id =
+            ActionWindowId::new("window-2".to_owned()).expect("a valid window");
+        later.requested_ttl_ms = DurationMs::new(60_000);
+        later.request_id = RequestId::new(8);
+        let mut expected = kr_cbor::CanonicalMap::new();
+        for (key, value) in [
+            ("session_state", kr_cbor::CanonicalValue::text("live")),
+            (
+                SUPERSEDES_ACTION_KEY,
+                kr_cbor::to_canonical_value(&action(9)).expect("encodes"),
+            ),
+            (
+                SUPERSEDES_REVISION_KEY,
+                kr_cbor::CanonicalValue::integer(3).expect("a revision"),
+            ),
+        ] {
+            expected.insert(key.to_owned(), value).expect("a key");
+        }
+        later.expected = ParamsValue::new(kr_cbor::CanonicalValue::Map(expected));
+        assert_eq!(
+            subject(&first),
+            subject(&later),
+            "a later request for the same thing has the same subject"
         );
     }
 
