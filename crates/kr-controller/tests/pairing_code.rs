@@ -971,9 +971,10 @@ async fn a_second_connection_that_repeats_the_finish_is_refused_once_the_owner_a
         }
         other => panic!("the repeating connection is refused, not {other:?}"),
     }
-    let told = status_of(&mut proved, invited.invitation_id)
-        .await
-        .expect("the proving connection is answered");
+    let told = match status_of(&mut proved, invited.invitation_id).await {
+        Ok(told) => told,
+        refused => panic!("the proving connection is answered, not {refused:?}"),
+    };
     assert!(
         matches!(told.status, PairStatus::Committed { device_id, .. } if device_id == confirmed.device_id),
         "{:?}",
@@ -1032,9 +1033,10 @@ async fn a_repeated_finish_with_a_wrong_binding_tag_is_refused_once_the_owner_ap
         }
         other => panic!("the repeating connection is refused, not {other:?}"),
     }
-    let told = status_of(&mut proved, invited.invitation_id)
-        .await
-        .expect("the proving connection is answered");
+    let told = match status_of(&mut proved, invited.invitation_id).await {
+        Ok(told) => told,
+        refused => panic!("the proving connection is answered, not {refused:?}"),
+    };
     assert!(
         matches!(told.status, PairStatus::Committed { device_id, .. } if device_id == confirmed.device_id),
         "{:?}",
@@ -1101,9 +1103,10 @@ async fn a_code_confirmation_that_fails_after_its_commitment_tells_only_the_prov
         }
         other => panic!("the second connection is refused, not {other:?}"),
     }
-    let told = status_of(&mut proved, invited.invitation_id)
-        .await
-        .expect("the proving connection is answered");
+    let told = match status_of(&mut proved, invited.invitation_id).await {
+        Ok(told) => told,
+        refused => panic!("the proving connection is answered, not {refused:?}"),
+    };
     let PairStatus::Committed { device_id, .. } = told.status else {
         panic!(
             "the proving connection is told it is committed: {:?}",
