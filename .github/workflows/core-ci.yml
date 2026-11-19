@@ -3220,14 +3220,19 @@ jobs:
         run: bash scripts/performance.sh
 
       # The programs a release ships for this platform hold none of the refusal that test builds
-      # carry for the account's own launchd, read in the release build of the workspace above and in
-      # each program built alone, as the Linux job reads them for its platform.
+      # carry for the account's own launchd, read in the release build of the workspace and in each
+      # program built alone, as the Linux job reads them for its platform. The test builds of the
+      # steps above (`cargo test --release -p kr-worker`) put their own build of a program in the
+      # place of the workspace's in the same target directory, so the workspace is built again
+      # first, which puts each program of the plain build back in its place, and the gate reads that.
       - name: The programs a release ships hold no launchd refusal
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
         timeout-minutes: 90
         env:
           KR_SHIPPED_WORKSPACE_TARGET: ${{ github.workspace }}/target
-        run: bash scripts/shipped-hold-gate.sh
+        run: |
+          CARGO_TARGET_DIR="$KR_SHIPPED_WORKSPACE_TARGET" cargo build --locked --release --workspace
+          bash scripts/shipped-hold-gate.sh
 
       # The figures and whatever else the steps above wrote to the artefact directory, kept whether
       # or not the run passed: on this platform they are the only record of how a failure looked.
