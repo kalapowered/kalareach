@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use kr_plugin_sdk::capability::PluginCapability;
 use kr_protocol::admission::AdmittedPackage;
 use kr_protocol::ids::{PluginId, SessionId};
-use kr_worker::broker::catalogue::testing::admitted;
+use kr_worker::broker::catalogue::testing::{admitted, checked};
 use kr_worker::broker::connectors::fixture;
 
 use super::*;
@@ -21,6 +21,11 @@ impl Store {
         Self(root)
     }
 
+    /// One package of `shape`, written to this store and not yet checked.
+    fn written(&self, shape: &fixture::Shape) -> kr_worker::broker::connectors::ConnectorSource {
+        fixture::package(&self.0, &self.0.join("kr-hook"), shape).expect("the package is written")
+    }
+
     /// One package of `shape`, as an admission hands it over, with what `installed` makes of its
     /// installation.
     fn admitted(
@@ -28,8 +33,7 @@ impl Store {
         shape: &fixture::Shape,
         installed: impl FnOnce(&mut kr_worker::broker::connectors::ConnectorSource),
     ) -> AdmittedPackage {
-        let mut source = fixture::package(&self.0, &self.0.join("kr-hook"), shape)
-            .expect("the package is written");
+        let mut source = self.written(shape);
         installed(&mut source);
         admitted(&source)
     }
@@ -442,6 +446,27 @@ fn the_doctor_reports_each_integration_and_its_resolution() {
         fixture::qoder_flags(),
         "a release not granted says what it declares"
     );
+}
+
+/// KR-REQ-12.20: the doctor reports a variable a package declares in its connector table by its exact
+/// name and value, as it reports the one an older release sets without declaring it.
+#[test]
+fn the_doctor_reports_a_declared_variable_by_its_name_and_value() {
+    let store = Store::new("declared");
+    let source = store.written(&fixture::Shape::gemini_cli_declaring());
+    let result = checked(&source);
+    assert!(
+        result.is_ok(),
+        "a package that declares its variable passes the worker's check: {result:?}"
+    );
+    let reading = Integrations::new().read(&[admitted(&source)]);
+    let reports = report(Some(&reading), &[], &[], &able(Vec::new())).reports;
+    let variables: Vec<(&str, &str)> = reports
+        .iter()
+        .flat_map(|report| report.variables.iter())
+        .map(|variable| (variable.name.as_str(), variable.value.as_str()))
+        .collect();
+    assert_eq!(variables, [("GEMINI_CLI_NO_RELAUNCH", "1")]);
 }
 
 /// KR-REQ-07.45: the doctor says why an invocation runs as typed where the first hit on the search
@@ -1013,6 +1038,7 @@ fn many(store: &Store, prefix: &str, count: usize, flags: &[String]) -> Vec<Admi
                     volatile_forwarding: false,
                     answers: false,
                     hook_events: None,
+                    launch_variables: None,
                 },
                 |_| {},
             )
