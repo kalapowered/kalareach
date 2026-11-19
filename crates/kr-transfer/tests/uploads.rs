@@ -1699,6 +1699,12 @@ fn a_replaced_staging_directory_is_refused() {
 /// recorded, as a container's is when it starts again, is still the recorded one, and an attachment
 /// published before is still the object that was published. Another directory is refused under any
 /// number.
+///
+/// A volume on Windows keeps its serial wherever it is mounted, and its device number is the low
+/// half of that serial, so no volume there is numbered differently: a record found under another
+/// device number is another volume's and is refused (`filesystem.rs`). Only Unix has this case to
+/// show.
+#[cfg(unix)]
 #[test]
 fn a_staging_directory_found_under_another_device_number_is_still_the_recorded_one() {
     let harness = support::Harness::create();
