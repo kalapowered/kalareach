@@ -197,7 +197,10 @@ fn free(_: &Url) -> Result<(), ProxyLoginKind> {
 }
 
 fn following(limit: usize, deadline: Duration) -> Following {
-    Following { limit, deadline }
+    Following {
+        limit,
+        deadline: Some(deadline),
+    }
 }
 
 fn request(client: &reqwest::Client, method: &Method, url: &Url) -> reqwest::Request {

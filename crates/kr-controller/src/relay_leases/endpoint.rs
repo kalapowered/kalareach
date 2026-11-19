@@ -105,7 +105,6 @@ enum Mode {
 }
 
 /// The relays of this host's own endpoint.
-#[derive(Debug)]
 pub struct EndpointRelays {
     endpoint: iroh::Endpoint,
     /// The relays the configuration document lists.
@@ -113,6 +112,16 @@ pub struct EndpointRelays {
     /// Lets one change of the endpoint's relays finish before the next begins.
     changing: tokio::sync::Mutex<()>,
     mode: Mutex<Mode>,
+}
+
+/// The endpoint a value of this type holds prints the address its network library was given,
+/// which carries the front's secret, so this says only what the value is.
+impl std::fmt::Debug for EndpointRelays {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EndpointRelays")
+            .finish_non_exhaustive()
+    }
 }
 
 impl EndpointRelays {

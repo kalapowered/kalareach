@@ -38,7 +38,7 @@ pub mod native_bridge;
 
 use std::sync::Arc;
 
-use kr_plugin_catalogue::transport::RepositoryTransport;
+use kr_plugin_catalogue::transport::{DirectEgress, Egress, EgressError, RepositoryTransport};
 use kr_plugin_catalogue::{
     Authority, CapabilityCeiling, Catalogue, CatalogueError, CatalogueResult, Change, Claimed,
     Effect, Enrolment, Installation, InstallationGrant, InstallationView, Owner, ReceiptClaim,
@@ -218,10 +218,63 @@ pub fn repository_transport(outbound: &crate::config::Outbound) -> RepositoryTra
         Err(refusal) => return RepositoryTransport::local_only(refusal.to_string()),
     };
     match kr_client::services::http::client_builder(proxy) {
-        Ok(builder) => RepositoryTransport::over(builder),
+        Ok(builder) => {
+            let egress: Arc<dyn Egress> = match proxy {
+                Some(proxy) if proxy.login().is_some() => Arc::new(LoginEgress {
+                    proxy: proxy.clone(),
+                }),
+                _ => Arc::new(DirectEgress),
+            };
+            RepositoryTransport::over(builder, egress)
+        }
         Err(error) => {
             RepositoryTransport::local_only(format!("this host fetches no repository: {error}"))
         }
+    }
+}
+
+/// How many redirects a repository fetch follows when its proxy holds a login: the library's own
+/// limit, which a fetch through no login keeps.
+const REDIRECT_LIMIT: usize = 10;
+
+/// Sends the catalogue's requests when the proxy holds a login: the client follows no redirect
+/// itself, so each hop is gated here, a refusal of the login ends the fetch without another try,
+/// and a hop that fails is named by its own address.
+#[derive(Debug)]
+struct LoginEgress {
+    proxy: kr_transport::config::ProxyUrl,
+}
+
+impl Egress for LoginEgress {
+    fn execute<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        request: reqwest::Request,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<reqwest::Response, EgressError>> + Send + 'a>,
+    > {
+        use kr_transport::proxy::{self, FollowFailure, Following};
+
+        Box::pin(async move {
+            let following = Following {
+                limit: REDIRECT_LIMIT,
+                deadline: Some(kr_plugin_catalogue::transport::FETCH_DEADLINE),
+            };
+            proxy::follow(client, request, following, |url| {
+                proxy::admit(Some(&self.proxy), url)
+            })
+            .await
+            .map_err(|error| {
+                proxy::note_failure(&self.proxy, &error.url, &error);
+                if let Some(kind) = proxy::proxy_login_kind(&error) {
+                    return EgressError::Refused(kind.clause().to_owned());
+                }
+                match error.failure {
+                    FollowFailure::Send(error) => EgressError::Send(error),
+                    other => EgressError::Refused(other.to_string()),
+                }
+            })
+        })
     }
 }
 

@@ -187,7 +187,6 @@ impl NetworkSetup {
 /// and the host's own tasks live here, outside the handler, and go when the last holder of this
 /// goes. The host is reachable through it, because a revocation needs the host and the daemon
 /// reaches it through this.
-#[derive(Debug)]
 pub struct NetworkGuard {
     host: Arc<NetworkHost>,
     /// The listener serving this host, once it is accepting.
@@ -201,6 +200,16 @@ pub struct NetworkGuard {
     tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     /// The relays the endpoint is selected to use, which the relay leases the host holds decide.
     relays: std::sync::OnceLock<Arc<crate::relay_leases::endpoint::EndpointRelays>>,
+}
+
+/// The endpoint a value of this type holds prints the address its network library was given,
+/// which carries the front's secret, so this says only what the value is.
+impl std::fmt::Debug for NetworkGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NetworkGuard")
+            .finish_non_exhaustive()
+    }
 }
 
 impl NetworkGuard {
@@ -344,9 +353,16 @@ impl Drop for NetworkGuard {
 }
 
 /// A daemon that is on the network.
-#[derive(Debug)]
 pub struct Network {
     guard: Arc<NetworkGuard>,
+}
+
+/// The endpoint a value of this type holds prints the address its network library was given,
+/// which carries the front's secret, so this says only what the value is.
+impl std::fmt::Debug for Network {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Network").finish_non_exhaustive()
+    }
 }
 
 impl Network {
