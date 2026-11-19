@@ -92,16 +92,15 @@ mod tests {
     /// reach the service, or that it refused, changes nothing, and an accepted one is the new state.
     #[test]
     fn an_unanswered_mute_is_not_asked_for_again_and_an_unmute_still_is() {
-        for outcome in [Reached::Maybe] {
-            // The person mutes and the request is never answered. The task sends only while the
-            // state asked for differs from the person's mute, so a later wake with the mute still
-            // on sends nothing, and the person's unmute differs and is sent.
-            let (mute, unmute) = (true, false);
-            let asked = asked_after(unmute, mute, outcome);
-            assert_eq!(asked, mute, "the mute was asked for, whatever became of it");
-            assert_ne!(asked, unmute, "an unmute differs from it and is asked for");
-            assert_eq!(asked_after(asked, unmute, outcome), unmute);
-        }
+        // The person mutes and the request is never answered. The task sends only while the state
+        // asked for differs from the person's mute, so a later wake with the mute still on sends
+        // nothing, and the person's unmute differs and is sent.
+        let outcome = Reached::Maybe;
+        let (mute, unmute) = (true, false);
+        let asked = asked_after(unmute, mute, outcome);
+        assert_eq!(asked, mute, "the mute was asked for, whatever became of it");
+        assert_ne!(asked, unmute, "an unmute differs from it and is asked for");
+        assert_eq!(asked_after(asked, unmute, outcome), unmute);
         // A request that was never sent, or that the service refused, asks for nothing: the next
         // wake sends it again.
         assert!(!asked_after(false, true, Reached::NotTold));
