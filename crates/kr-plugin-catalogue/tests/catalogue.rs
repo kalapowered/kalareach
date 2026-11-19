@@ -2417,12 +2417,14 @@ async fn kr_req_11_11_an_owner_is_shown_the_reading_of_a_command_integration_the
 
 /// Writes the example package at `version` into `directory`, asking for a native bridge whose
 /// statement is `words`, and a command integration too where `integration` is true. The bridge's
-/// recipe changes one configuration key, which is all a statement needs of it.
+/// recipe installs one file, which is all a statement needs of it; `edit` changes the manifest
+/// before it is written.
 fn bridging(
     directory: &std::path::Path,
     version: &str,
     words: &str,
     integration: bool,
+    edit: impl FnOnce(&mut serde_json::Value),
 ) -> std::path::PathBuf {
     let package = integrating(directory, version, &["--flag"]);
     let path = package.join(kr_plugin_sdk::package::MANIFEST_FILE);
@@ -2440,21 +2442,22 @@ fn bridging(
         "application": "Example Agent",
         "application_range": ">=1.0.0, <2.0.0",
         "install": [{
-            "type": "add_configuration_key",
-            "file": "settings.json",
-            "key": "enabled.example",
-            "value": "true"
+            "type": "install_file",
+            "source": "bridge/example.json",
+            "destination": "plugins/example/example.json",
+            "digest": PayloadDigest::of(b"{}").to_string()
         }],
         "remove": [{
-            "type": "remove_configuration_key",
-            "file": "settings.json",
-            "key": "enabled.example"
+            "type": "remove_file",
+            "destination": "plugins/example/example.json",
+            "digest": PayloadDigest::of(b"{}").to_string()
         }],
         "grant_statement": words
     });
     if !integration {
         manifest["command_integration"] = serde_json::Value::Null;
     }
+    edit(&mut manifest);
     let mut text = serde_json::to_string_pretty(&manifest).expect("the manifest serialises");
     text.push('\n');
     std::fs::write(&path, text).expect("the manifest writes");
@@ -2464,12 +2467,22 @@ fn bridging(
 /// What an owner is shown of a release whose bridge says `words`, for a grant that holds the
 /// bridge and the integration, where the release declares an integration or `integration` is false.
 async fn statement_of(words: &str, integration: bool) -> CatalogueResult<Option<String>> {
+    statement_of_edited(words, integration, |_| {}).await
+}
+
+/// [`statement_of`] for a package whose manifest `edit` has changed. The package holds no
+/// connector table.
+async fn statement_of_edited(
+    words: &str,
+    integration: bool,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> CatalogueResult<Option<String>> {
     let home = tempfile::tempdir().expect("a temporary directory");
     let packages = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(
         home.path(),
         GenerationSpec {
-            package: Some(bridging(packages.path(), "0.1.0", words, integration)),
+            package: Some(bridging(packages.path(), "0.1.0", words, integration, edit)),
             ..GenerationSpec::default()
         },
     )
@@ -2932,6 +2945,105 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_never_reaches_a_statement() {
             "{what}: {refusal:?}"
         );
     }
+}
+
+/// KR-REQ-11.44: the key rule holds for a release that declares no placement: a recipe that adds
+/// a configuration key that is not the label's is refused before any statement, as it is where a
+/// table declares one, and the label's own key is not refused for want of a declared area.
+#[tokio::test]
+async fn kr_req_11_44_a_key_that_is_not_the_labels_is_refused_where_no_placement_is_declared() {
+    let control = placed_statement_edited("claude-code", |_| {}, |_| {}, false)
+        .await
+        .expect("the undamaged release is read")
+        .expect("a statement");
+    assert!(
+        !control.contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL),
+        "the control declares no placement and gets no reading of one: {control}"
+    );
+    let integration = format!(
+        "x {} Runs nothing.",
+        kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL
+    );
+    for (what, key) in [
+        (
+            "another plugin's folder",
+            "enabledPlugins.other@skills-dir".to_owned(),
+        ),
+        ("the integration label inside a key", integration),
+    ] {
+        let refusal = placed_statement_edited(
+            "claude-code",
+            |_| {},
+            |manifest| manifest["native_bridge"]["install"][3]["key"] = serde_json::json!(key),
+            false,
+        )
+        .await;
+        assert!(
+            matches!(&refusal, Err(CatalogueError::UnsafePackage { detail })
+                if detail.contains("placement.key_not_the_labels")
+                    && !detail.contains("Runs nothing")),
+            "{what}: {refusal:?}"
+        );
+    }
+}
+
+/// KR-REQ-11.44: the key rule holds for a release that holds no connector table at all, with the
+/// area the label's compiled layout gives: the label's own key is read, another key is refused
+/// before any statement, and a label that has no key of its own is refused any key.
+#[tokio::test]
+async fn kr_req_11_44_a_key_that_is_not_the_labels_is_refused_where_no_table_is_held() {
+    let words = "Changes one setting of the example agent.";
+    let claude = |key: &'static str| {
+        move |manifest: &mut serde_json::Value| {
+            let bridge = &mut manifest["native_bridge"];
+            bridge["application"] = serde_json::json!("Claude Code");
+            bridge["install"][0]["destination"] =
+                serde_json::json!("skills/kalareach-example/example.json");
+            bridge["install"]
+                .as_array_mut()
+                .expect("the install steps")
+                .push(serde_json::json!({
+                    "type": "add_configuration_key",
+                    "file": "settings.json",
+                    "key": key,
+                    "value": "true"
+                }));
+        }
+    };
+    let own = statement_of_edited(
+        words,
+        false,
+        claude("enabledPlugins.kalareach-example@skills-dir"),
+    )
+    .await
+    .expect("the label's own key is read")
+    .expect("a statement");
+    assert!(own.contains(words), "the control: {own}");
+
+    let other = statement_of_edited(words, false, claude("enabledPlugins.other@skills-dir")).await;
+    assert!(
+        matches!(&other, Err(CatalogueError::UnsafePackage { detail })
+            if detail.contains("placement.key_not_the_labels")),
+        "another plugin's folder: {other:?}"
+    );
+
+    let unkeyed = statement_of_edited(words, false, |manifest| {
+        manifest["native_bridge"]["install"]
+            .as_array_mut()
+            .expect("the install steps")
+            .push(serde_json::json!({
+                "type": "add_configuration_key",
+                "file": "settings.json",
+                "key": "enabled.example",
+                "value": "true"
+            }));
+    })
+    .await;
+    assert!(
+        matches!(&unkeyed, Err(CatalogueError::UnsafePackage { detail })
+            if detail.contains("placement.key_not_the_labels")),
+        "a label that has no key of its own: {unkeyed:?}"
+    );
 }
 
 /// A command integration is granted to an installed release only by installing it, as a native
