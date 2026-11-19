@@ -930,7 +930,10 @@ mod tests {
             ),
         ];
         for (which, words) in &refusals {
-            assert!(!words.trim().is_empty(), "{which} says something: {words:?}");
+            assert!(
+                !words.trim().is_empty(),
+                "{which} says something: {words:?}"
+            );
             assert_eq!(
                 words.trim(),
                 words,
