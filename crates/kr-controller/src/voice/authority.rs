@@ -184,7 +184,71 @@ fn store(error: crate::error::ControllerError) -> VoiceError {
     ))
 }
 
+/// What a device's pairing says about the grant it was paired under.
+enum Pairing {
+    /// The device has no record: it was never paired.
+    Absent,
+    /// The device is not paired, or its pairing grant is out of force: it has no grant at all.
+    Refused,
+    /// The grant the device was paired under, while it stands, without the voice right.
+    Held(Box<Grant>),
+}
+
+impl GrantAuthority {
+    /// The grant a device was paired under, while it stands. A request under a share needs this
+    /// grant to stand, so a device that has been revoked, or whose pairing grant has run out and
+    /// is recorded as having, has no grant, and neither has one whose pairing grant runs out as
+    /// it is read; one whose end is not on record yet is refused with the host's reason. It may
+    /// carry the voice right (an owner is paired with every right), which is a voice grant's
+    /// marker everywhere else and is taken out of it here, as the door takes it out before it
+    /// decides a request: the voice right comes from a voice grant alone.
+    fn paired_grant(
+        &self,
+        device_id: DeviceId,
+        lifetimes: &GrantLifetimes,
+    ) -> kr_voice::Result<Pairing> {
+        Ok(
+            match self.devices.record_for_device(device_id).map_err(store)? {
+                None => Pairing::Absent,
+                Some(record) if !super::authority::DeviceRecordExt::is_paired_record(&record) => {
+                    Pairing::Refused
+                }
+                Some(record) => match lifetimes.paired_standing(&record).map_err(store)? {
+                    GrantStanding::InForce => Pairing::Held(Box::new(Grant {
+                        actions: record
+                            .grant
+                            .actions
+                            .iter()
+                            .copied()
+                            .filter(|right| *right != ActionRight::VoiceUse)
+                            .collect(),
+                        ..record.grant
+                    })),
+                    GrantStanding::OutOfForce => Pairing::Refused,
+                    GrantStanding::Unrecorded => {
+                        return Err(store(crate::grants::store::unrecorded()));
+                    }
+                },
+            },
+        )
+    }
+}
+
 impl VoiceAuthority for GrantAuthority {
+    fn holds_host_management(&self, device_id: DeviceId) -> kr_voice::Result<bool> {
+        let lifetimes = self.lifetimes()?;
+        match self.paired_grant(device_id, &lifetimes)? {
+            Pairing::Absent | Pairing::Refused => Ok(false),
+            // The pairing grant as this host lets it be used: a right the rights ceiling takes
+            // away from every grant is not one the device holds here.
+            Pairing::Held(grant) => self
+                .daemon()?
+                .as_this_host_lets_it_be_used(*grant)
+                .map(|usable| usable.permits(ActionRight::HostManage))
+                .map_err(|refusal| VoiceError::Host(refusal.to_protocol_error())),
+        }
+    }
+
     fn device_grant(
         &self,
         device_id: DeviceId,
@@ -201,34 +265,10 @@ impl VoiceAuthority for GrantAuthority {
         // been paired, which is every device before anything is shared with it.
         let standing = self.standing_records(device_id)?;
         let lifetimes = self.lifetimes()?;
-        // The grant a device was paired under, while it stands. A request under a share needs this
-        // grant to stand, so a device that has been revoked, or whose pairing grant has run out and
-        // is recorded as having, has no grant, and neither has one whose pairing grant runs out as
-        // it is read; one whose end is not on record yet is refused with the host's reason. It may
-        // carry the voice right (an owner is paired with every right), which is a voice grant's
-        // marker everywhere else and is taken out of it here, as the door takes it out before it
-        // decides a request: the voice right comes from a voice grant alone.
-        let paired = match self.devices.record_for_device(device_id).map_err(store)? {
-            None => None,
-            Some(record) if !super::authority::DeviceRecordExt::is_paired_record(&record) => {
-                return Ok(None);
-            }
-            Some(record) => match lifetimes.paired_standing(&record).map_err(store)? {
-                GrantStanding::InForce => Some(Grant {
-                    actions: record
-                        .grant
-                        .actions
-                        .iter()
-                        .copied()
-                        .filter(|right| *right != ActionRight::VoiceUse)
-                        .collect(),
-                    ..record.grant
-                }),
-                GrantStanding::OutOfForce => return Ok(None),
-                GrantStanding::Unrecorded => {
-                    return Err(store(crate::grants::store::unrecorded()));
-                }
-            },
+        let paired = match self.paired_grant(device_id, &lifetimes)? {
+            Pairing::Refused => return Ok(None),
+            Pairing::Absent => None,
+            Pairing::Held(grant) => Some(*grant),
         };
         // As this host lets it be used: a right the rights ceiling takes away from every grant, or
         // that an organisation's lease does not give, is not one a spoken action may use, whichever

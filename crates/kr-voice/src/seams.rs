@@ -230,6 +230,19 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
         session_id: Option<SessionId>,
     ) -> Result<Option<Grant>>;
 
+    /// Says whether this device is an owner device: a paired device whose record stands and whose
+    /// pairing grant, read as this host lets it be used, holds host management.
+    ///
+    /// This is the host's own owner rule. It is not [`device_grant`](Self::device_grant), which
+    /// answers the widest live grant the device holds, a share included: a share that carries host
+    /// management does not make a device an owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read, and the host's own refusal when the pairing
+    /// grant has no standing the host can state because an end that decides it is not on record.
+    fn holds_host_management(&self, device_id: DeviceId) -> Result<bool>;
+
     /// Returns the grant with this identity, when it stands.
     ///
     /// # Errors

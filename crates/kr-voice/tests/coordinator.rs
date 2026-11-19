@@ -99,6 +99,8 @@ struct Authority {
     spent: Mutex<std::collections::BTreeMap<(DeviceId, String), ActionId>>,
     /// The fence the next withdrawal owes, once a test has set one.
     fence: Mutex<Option<Arc<OwedFence>>>,
+    /// The devices this host treats as owners: paired with host management.
+    owners: Mutex<Vec<DeviceId>>,
 }
 
 /// A fence a test holds: it says when it is first waited on, and ends when the test lets go of it.
@@ -184,6 +186,7 @@ impl Authority {
             refusing: Mutex::new(None),
             spent: Mutex::new(std::collections::BTreeMap::new()),
             fence: Mutex::new(None),
+            owners: Mutex::new(Vec::new()),
         }
     }
 
@@ -367,6 +370,10 @@ impl Authority {
 }
 
 impl VoiceAuthority for Authority {
+    fn holds_host_management(&self, device_id: DeviceId) -> kr_voice::Result<bool> {
+        Ok(self.owners.lock().expect("the owners").contains(&device_id))
+    }
+
     fn device_grant(
         &self,
         device_id: DeviceId,

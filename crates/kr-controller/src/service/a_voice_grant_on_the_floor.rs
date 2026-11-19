@@ -1157,3 +1157,88 @@ async fn a_spent_delegation_is_not_forgotten_on_a_reading_the_floor_on_disk_does
         "the retention had not run out at the reading the floor on disk covers"
     );
 }
+
+/// A device is an owner device when it was paired with host management; a device paired with less
+/// is not, and a device that was never paired is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_paired_with_host_management_holds_it_and_one_paired_without_does_not() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let owner = paired_holding(&controller, 70, ActionRight::ALL, None);
+    let viewer = paired_holding(&controller, 71, &[ActionRight::SessionView], None);
+    let seam = authority(&controller);
+
+    assert!(
+        seam.holds_host_management(owner.device_id)
+            .expect("the host answers")
+    );
+    assert!(
+        !seam
+            .holds_host_management(viewer.device_id)
+            .expect("the host answers")
+    );
+    assert!(
+        !seam
+            .holds_host_management(DeviceId::new(kr_ipc::new_uuid()))
+            .expect("the host answers"),
+        "a device the host never paired is not an owner device"
+    );
+}
+
+/// A share that carries host management does not make a device an owner: the rule reads the
+/// grant the device was paired under, and `device_grant`, which answers the widest grant, does see
+/// the share. The second reading is the positive control for the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_share_that_carries_host_management_does_not_make_a_device_an_owner() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired_holding(&controller, 72, &[ActionRight::SessionView], None);
+    shared_with(
+        &controller,
+        &device,
+        &[ActionRight::SessionView, ActionRight::HostManage],
+        false,
+    );
+    let seam = authority(&controller);
+
+    let widest = seam
+        .device_grant(device.device_id, None)
+        .expect("the host answers")
+        .expect("a grant the host lets be used");
+    assert!(
+        widest.permits(ActionRight::HostManage),
+        "control: the widest grant is the share, and it carries host management"
+    );
+    assert!(
+        !seam
+            .holds_host_management(device.device_id)
+            .expect("the host answers"),
+        "the pairing grant is what decides who is an owner"
+    );
+}
+
+/// A pairing grant the host refuses to let be used is not host management the device holds: the
+/// refusal is the answer, never a "no" that a caller could mistake for a settled fact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pairing_grant_the_host_refuses_is_a_refusal_and_not_a_no_to_host_management() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired_needing_a_lease(
+        &controller,
+        73,
+        &[ActionRight::SessionView, ActionRight::HostManage],
+    );
+
+    let refused = authority(&controller)
+        .holds_host_management(device.device_id)
+        .expect_err("the pairing grant needs a lease this host holds none for");
+
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+}
