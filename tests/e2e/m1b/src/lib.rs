@@ -147,7 +147,7 @@ impl Checkpoint {
                 "{REQUIRE_VARIABLE}=1 and {ORIGIN_VARIABLE} names no deployment, so the {leg} leg \
                  could not run"
             );
-            eprintln!("skipping the {leg} leg: {ORIGIN_VARIABLE} names no deployment");
+            eprintln!("skipped: the {leg} leg did not run: {ORIGIN_VARIABLE} names no deployment");
             return None;
         }
         let (origin, gateway) = canonical_origin(&named)
@@ -175,5 +175,54 @@ impl Checkpoint {
     /// Says what one leg left on the deployment, which the report gathers after the legs.
     pub fn left(&self, leg: &str, what: &str) {
         println!("left on the deployment by the {leg} leg: {what}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Checkpoint, ORIGIN_VARIABLE, REQUIRE_VARIABLE};
+
+    /// The test the case below runs this program again for, which stands in for a leg that is
+    /// given no deployment.
+    const PROBE: &str = "tests::a_leg_given_no_deployment_stands_down";
+
+    #[test]
+    #[ignore = "run by the case that shows what a leg says when it is given no deployment"]
+    fn a_leg_given_no_deployment_stands_down() {
+        assert!(Checkpoint::from_environment("probe").is_none());
+    }
+
+    /// A leg that is given no deployment returns early and passes, and says so in its own output on
+    /// a line that starts `skipped:`, which the conformance report reads as a leg that did not run.
+    /// This program is run again for one test, with no deployment named and every test's output
+    /// shown under its name, as the report runs it.
+    #[test]
+    fn a_leg_given_no_deployment_says_so_on_a_line_the_report_reads() {
+        let ran = std::process::Command::new(std::env::current_exe().expect("this test program"))
+            .args([
+                "--ignored",
+                "--exact",
+                PROBE,
+                "--show-output",
+                "--test-threads=1",
+            ])
+            .env_remove(ORIGIN_VARIABLE)
+            .env_remove(REQUIRE_VARIABLE)
+            .env_remove("RUST_TEST_NOCAPTURE")
+            .output()
+            .expect("this test program runs again");
+        let shown = String::from_utf8_lossy(&ran.stdout);
+        assert!(ran.status.success(), "{shown}");
+        let header = format!("---- {PROBE} stdout ----");
+        let mut its_output = shown.lines().skip_while(|line| *line != header);
+        assert!(
+            its_output.next().is_some(),
+            "no output shown for {PROBE}:\n{shown}"
+        );
+        let first = its_output.next().unwrap_or_default();
+        assert!(
+            first.starts_with("skipped:") && first.contains("probe leg"),
+            "the first line of {PROBE}'s output is {first:?}:\n{shown}"
+        );
     }
 }

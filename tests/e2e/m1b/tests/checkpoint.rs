@@ -610,7 +610,7 @@ fn a_device_uses_an_agent_in_a_managed_shell_and_reattaches_to_the_screen_kr_att
         Ok(shell) => shell,
         Err(why) if shells::required() => panic!("the terminal leg's managed shell: {why}"),
         Err(why) => {
-            eprintln!("skipping the terminal leg: {why}");
+            eprintln!("skipped: the terminal leg did not run: {why}");
             return;
         }
     };
