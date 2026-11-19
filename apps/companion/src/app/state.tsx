@@ -354,6 +354,8 @@ export function useKeptPlace(sessionId: string): KeptPlace {
     () => ({
       read: () => sessions.get(sessionId).terminal,
       keep: (place: TerminalPlace | null) => {
+        // A tab that was closed has forgotten its place: the view that closes with it keeps nothing.
+        if (!sessions.holds(sessionId)) return
         sessions.update(sessionId, (current) =>
           current.terminal === place ? current : { ...current, terminal: place }
         )

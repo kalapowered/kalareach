@@ -569,12 +569,16 @@ export function RawTerminal({
     y: -shift.down * drawnCell.height
   }
 
+  // The window cannot move yet: a place is being restored and there is no frame to move. With a
+  // frame kept from before, the window moves and native code queues the move behind the restore.
+  const awaitsPlace = restoring && frame === null
+
   // What the mode does, in the words of its state, or why control last ended; while the view
   // controls the program, why the last input did not reach it, until one does.
   const sentence =
     control === null || control.state === 'watching'
       ? (control?.ended ??
-        (restoring ? MOVES_LATER : 'Scroll or drag to move around the session. The program gets nothing.'))
+        (awaitsPlace ? MOVES_LATER : 'Scroll or drag to move around the session. The program gets nothing.'))
       : control.state === 'taking'
         ? ASKING
         : (unsent ??
@@ -614,7 +618,7 @@ export function RawTerminal({
             role="status"
             id={sentenceId}
             data-testid="terminal-mode-sentence"
-            data-moves={restoring ? 'later' : undefined}
+            data-moves={awaitsPlace ? 'later' : undefined}
           >
             {sentence}
           </span>
@@ -805,7 +809,7 @@ export function RawTerminal({
               <Button
                 key={move.name}
                 aria-label={`Move the window ${move.name}`}
-                disabled={mode !== 'view' || restoring || room === null || room[move.limit] === 0}
+                disabled={mode !== 'view' || room === null || room[move.limit] === 0}
                 onClick={() => {
                   if (frame === null) return
                   pan({

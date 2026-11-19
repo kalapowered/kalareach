@@ -351,6 +351,8 @@ describe('a terminal view keeps its place across a pane change', () => {
       for (const button of within(screen.getByRole('group', { name: 'Move the window' })).getAllByRole('button')) {
         expect(button).toBeDisabled()
       }
+      // A wheel turn has no window to move either: nothing is sent.
+      wheel(-32)
       expect(view?.moves).toEqual([])
       await person.click(screen.getByRole('button', { name: 'Take control' }))
       await waitFor(() => {
@@ -361,6 +363,97 @@ describe('a terminal view keeps its place across a pane change', () => {
         view?.show()
       })
       expect(screen.getByTestId('terminal-mode-sentence').getAttribute('data-moves')).toBeNull()
+    } finally {
+      restore()
+    }
+  })
+
+  it('does not say it waits for a place when the view attaches again with its frame kept', async () => {
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await scrolledUp(controls)
+      controls.holdTerminalViews()
+      act(() => {
+        controls.terminalViews[0]?.end('The session closed.')
+      })
+      await userEvent.setup().click(await screen.findByRole('button', { name: /Attach again/ }))
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      const view = controls.terminalViews[1]
+      act(() => {
+        view?.attach()
+      })
+      // The opening asks for the place it was left at, and the kept frame can move: the window
+      // moves, and native code queues the move behind the restore.
+      expect(view?.anchor).toMatchObject({ row: '10' })
+      const sentence = screen.getByTestId('terminal-mode-sentence')
+      expect(sentence.getAttribute('data-moves')).toBeNull()
+      expect(sentence.textContent).not.toBe(MOVES_LATER)
+      wheel(-16)
+      await waitFor(() => {
+        expect(view?.moves).toHaveLength(1)
+      })
+    } finally {
+      restore()
+    }
+  })
+
+  it('stops waiting for a place when the open itself is refused', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      let opens = 0
+      const refusing: HostPort = {
+        ...port,
+        openTerminalView: (sessionId, grid, listener, opening, anchor) => {
+          opens += 1
+          if (opens === 1) return port.openTerminalView(sessionId, grid, listener, opening, anchor)
+          return Promise.reject(new Error('This session could not be reached'))
+        }
+      }
+      open(refusing)
+      await scrolledUp(controls)
+      await awayAndBack(person)
+      expect(await screen.findByTestId('terminal-ended')).toHaveTextContent(
+        'This session could not be reached'
+      )
+      const sentence = screen.getByTestId('terminal-mode-sentence')
+      expect(sentence.getAttribute('data-moves')).toBeNull()
+      expect(sentence.textContent).not.toBe(MOVES_LATER)
+      expect(screen.getByRole('button', { name: /Attach again/ })).toBeInTheDocument()
+    } finally {
+      restore()
+    }
+  })
+
+  it("forgets a closed tab's place: the session opens again with none", async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port, { view: 'sessions' })
+      await person.click(await screen.findByTestId('session-row-2'))
+      await screen.findByText('Session 2 · Working')
+      await person.click(screen.getByRole('button', { name: 'Sessions' }))
+      await person.click(await screen.findByTestId('session-row-1'))
+      await screen.findByText('Session 1 · Waiting for you')
+      await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+      await scrolledUp(controls)
+      // The tab closes with the view still open: the view's cleanup runs after the session was
+      // forgotten, and must not make it again.
+      await person.click(screen.getByRole('button', { name: /Close the tab for session 01/ }))
+      await person.click(await screen.findByTestId('session-row-1'))
+      await screen.findByText('Session 1 · Waiting for you')
+      await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      expect(controls.terminalViews[1]?.sessionId).toBe(SESSION_MAIN)
+      expect(controls.terminalViews[1]?.anchor).toBeNull()
     } finally {
       restore()
     }

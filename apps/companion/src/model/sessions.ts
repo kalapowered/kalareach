@@ -117,6 +117,11 @@ export class SessionStates {
   #states = new Map<string, SessionState>()
   #listeners = new Set<() => void>()
 
+  /** Whether a state is held for the session: one that was forgotten is not held again by being written to. */
+  holds(sessionId: string): boolean {
+    return this.#states.has(sessionId)
+  }
+
   /** Reads one session's state, creating it the first time it is asked for. */
   get(sessionId: string): SessionState {
     const held = this.#states.get(sessionId)

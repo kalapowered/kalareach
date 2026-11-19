@@ -596,9 +596,18 @@ textarea::placeholder {
 }
 
 /* The terminal's note on a restored place is one badge whose words may wrap, so the whole fact stays
-   reachable at a large text size and in the phone's expanded status; empty, it has no box. */
+   reachable at a large text size and in the phone's expanded status. Empty, it takes no room and
+   stays in the accessibility tree, so its words are announced when they arrive. */
 .terminal-place-note:empty {
-  display: none;
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 .terminal-place-note .badge {
