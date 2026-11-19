@@ -25,6 +25,8 @@ mod credentials;
 mod host;
 mod host_call;
 pub mod own_key_calls;
+#[cfg(feature = "testing")]
+pub mod own_key_hooks;
 mod submit;
 mod worker_half;
 

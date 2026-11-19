@@ -85,6 +85,7 @@ url.workspace = true
 # service's Git reads, and the hold a suite puts on the end of a network connection. It compiles to
 # nothing without this feature, and no shipped build enables it.
 testing = [
+    "kr-client/testing",
     "kr-describe/testing",
     "kr-transport/testing",
     "kr-voice/testing",

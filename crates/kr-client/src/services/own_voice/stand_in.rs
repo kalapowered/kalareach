@@ -42,6 +42,8 @@ pub enum CreateScript {
     Lost,
     /// The same answer after a wait.
     After(Duration, Box<CreateScript>),
+    /// The same answer once the test lets it go.
+    Held(Arc<tokio::sync::Notify>, Box<CreateScript>),
 }
 
 /// What the stand-in answers to a hangup.
@@ -297,6 +299,10 @@ impl OwnVoiceTransport for StandIn {
                 match script {
                     CreateScript::After(wait, next) => {
                         tokio::time::sleep(wait).await;
+                        script = *next;
+                    }
+                    CreateScript::Held(release, next) => {
+                        release.notified().await;
                         script = *next;
                     }
                     CreateScript::Lost => return Err(Lost),

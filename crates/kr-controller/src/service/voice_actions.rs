@@ -147,6 +147,14 @@ impl Controller {
         .await;
     }
 
+    /// Where the registry of calls on the owner's own key stands: idle, a call starting or
+    /// running, or a settle after a removal.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn own_key_registry_state(&self) -> kr_client::services::RegistryState {
+        self.own_voice.registry().state()
+    }
+
     /// The environment's voice service.
     ///
     /// # Panics

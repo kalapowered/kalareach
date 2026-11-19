@@ -555,6 +555,43 @@ impl Host {
         host
     }
 
+    /// Starts a daemon whose configuration document selects the owner's own OpenAI key for voice
+    /// calls, with `owner` as its first owner. The provider reaches OpenAI by `transport`, which
+    /// stays placed while the returned guard lives, across a stop and a start of this environment.
+    pub async fn start_with_own_voice(
+        owner: &DeviceKeys,
+        transport: Arc<dyn kr_client::services::own_voice::OwnVoiceTransport>,
+    ) -> (Self, kr_controller::voice::own_key_hooks::Placed) {
+        let temp = kr_ipc::testing::TempHost::create();
+        let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+        document.own_voice = kr_protocol::hostinfo::configuration::OwnVoiceSelection {
+            provider: kr_protocol::scalars::Nullable::some(
+                kr_protocol::hostinfo::configuration::OwnVoiceProvider::OpenaiLive,
+            ),
+        };
+        write_document(&temp, &document);
+        let placed =
+            kr_controller::voice::own_key_hooks::place(temp.environment().state_dir(), transport);
+        let mut host = Self::start_on(
+            temp,
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            Clocks::system(),
+            None,
+            Waits::default(),
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        (host, placed)
+    }
+
     /// Where this daemon's runtime root is, which is where an operator puts what the host reads
     /// at run time.
     #[must_use]

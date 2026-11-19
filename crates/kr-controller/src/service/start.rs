@@ -1043,14 +1043,24 @@ impl Controller {
             };
             let proxy = Self::outbound_of(&started)
                 .and_then(|route| route.proxy().map(|proxy| proxy.cloned()));
+            #[cfg(feature = "testing")]
+            let placed = crate::voice::own_key_hooks::transport_for(setup.paths.state_dir());
+            #[cfg(not(feature = "testing"))]
+            let placed: Option<
+                Arc<dyn kr_client::services::own_voice::OwnVoiceTransport>,
+            > = None;
             let transport: Arc<dyn kr_client::services::own_voice::OwnVoiceTransport> =
-                match proxy.map_err(|error| error.to_string()).and_then(|proxy| {
-                    connect_production(proxy.as_ref()).map_err(|error| error.to_string())
-                }) {
-                    Ok(transport) => transport,
-                    Err(reason) => {
-                        eprintln!("kr-controller: own-key voice has no transport: {reason}");
-                        Arc::new(UnreachableTransport)
+                if let Some(placed) = placed {
+                    placed
+                } else {
+                    match proxy.map_err(|error| error.to_string()).and_then(|proxy| {
+                        connect_production(proxy.as_ref()).map_err(|error| error.to_string())
+                    }) {
+                        Ok(transport) => transport,
+                        Err(reason) => {
+                            eprintln!("kr-controller: own-key voice has no transport: {reason}");
+                            Arc::new(UnreachableTransport)
+                        }
                     }
                 };
             Arc::new(OwnVoiceProvider::new(
