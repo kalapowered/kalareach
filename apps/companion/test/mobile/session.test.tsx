@@ -448,9 +448,6 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
       expect(field).toHaveAttribute('aria-describedby', notice.id)
       expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
       expect(screen.queryByText('No agent is running in this session.')).toBeNull()
-      // An empty draft needs no words beside the line: the notice goes with the text.
-      await person.clear(field)
-      expect(screen.queryByText(TIE_NOTICE)).toBeNull()
     } finally {
       heights.mockRestore()
       root.style.removeProperty('font-size')
@@ -474,8 +471,55 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
     expect(field).toHaveAttribute('aria-describedby', notice.id)
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
     expect(screen.queryByText('No agent is running in this session.')).toBeNull()
-    await person.clear(field)
-    expect(screen.queryByText(TIE_NOTICE)).toBeNull()
+  })
+
+  it('keeps the tie notice beside Send for an empty draft on a short session, without the empty draft’s own words (KR-REQ-12.23)', async () => {
+    const { port } = fakeHost()
+    const root = document.documentElement
+    root.style.fontSize = '16px'
+    const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (
+      this: Element
+    ) {
+      return this.classList.contains('m-session') ? 20 * 16 : 0
+    })
+    try {
+      render(
+        <AppProvider port={tiedAgent(port)}>
+          <OnSession sessionId={SESSION_MAIN} />
+        </AppProvider>
+      )
+      const field = await screen.findByLabelText('Message this session')
+      await waitFor(() => {
+        expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'line')
+      })
+      expect(field).toHaveValue('')
+      const notice = await screen.findByText(TIE_NOTICE)
+      expect(field).toHaveAttribute('aria-describedby', notice.id)
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+      expect(screen.queryByText('Write something to send.')).toBeNull()
+    } finally {
+      heights.mockRestore()
+      root.style.removeProperty('font-size')
+    }
+  })
+
+  it('keeps the tie notice beside Send for an empty draft in the terminal view, without the empty draft’s own words (KR-REQ-12.23)', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    render(
+      <AppProvider port={tiedAgent(port)}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Find why the reconnect test is flaky.')
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    const field = screen.getByLabelText('Message this session')
+    expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'line')
+    expect(field).toHaveValue('')
+    const notice = await screen.findByText(TIE_NOTICE)
+    expect(field).toHaveAttribute('aria-describedby', notice.id)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.queryByText('Write something to send.')).toBeNull()
   })
 })
 
