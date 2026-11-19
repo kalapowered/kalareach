@@ -344,3 +344,239 @@ fn a_program_the_started_environment_gives_a_cleared_environment_still_holds_the
     );
     assert!(child.passed, "a run that asked:\n{}", child.log);
 }
+
+/// A case stands down exactly where the platform is a Mac and the run did not ask with exactly `1`.
+#[test]
+fn a_run_stands_down_where_the_platform_is_a_mac_and_the_run_did_not_ask() {
+    use std::ffi::OsStr;
+
+    use kr_ipc::testing::account_launchd::stands_down_given;
+
+    assert!(stands_down_given(None, true));
+    for value in ["", "0", "yes", "11", " 1"] {
+        assert!(
+            stands_down_given(Some(OsStr::new(value)), true),
+            "{value:?} does not ask, so a Mac stands down"
+        );
+    }
+    assert!(!stands_down_given(Some(OsStr::new("1")), true));
+    for value in [None, Some(OsStr::new("1")), Some(OsStr::new("yes"))] {
+        assert!(
+            !stands_down_given(value, false),
+            "no other platform stands down, whatever the value ({value:?})"
+        );
+    }
+}
+
+/// A launch of a run that did not ask is refused on a Mac, naming the variable and the head a case
+/// begins with, and is refused nowhere else.
+#[test]
+fn a_launch_where_the_run_did_not_ask_is_refused_on_a_mac_and_nowhere_else() {
+    use std::ffi::OsStr;
+
+    use kr_ipc::testing::account_launchd::require_given;
+
+    let refusal =
+        require_given(None, true, "a session create").expect_err("a Mac that did not ask");
+    assert!(
+        refusal.starts_with("a session create would load a job"),
+        "{refusal}"
+    );
+    assert!(refusal.contains(VARIABLE), "{refusal}");
+    assert!(
+        refusal.contains("account_launchd::stands_down"),
+        "{refusal}"
+    );
+    assert!(require_given(Some(OsStr::new("yes")), true, "x").is_err());
+    assert!(require_given(Some(OsStr::new("1")), true, "x").is_ok());
+    assert!(require_given(None, false, "x").is_ok());
+}
+
+/// The notice is one line that begins with the case's whole name and says what would have loaded a
+/// job and what asks for it.
+#[test]
+fn the_notice_of_a_stand_down_names_the_case_and_what_would_load_and_is_one_line() {
+    use kr_ipc::testing::account_launchd::notice;
+
+    let line = notice("tests::a_case", "the service start");
+    assert!(
+        line.starts_with("stood down tests::a_case: the service start needs "),
+        "{line}"
+    );
+    assert!(line.contains(VARIABLE), "{line}");
+    assert!(line.ends_with('\n'), "{line:?}");
+    assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+}
+
+/// What a child of the case runs: a case that stands down, which only reports its own passing.
+#[test]
+#[ignore = "run by a child of the case"]
+#[cfg(target_os = "macos")]
+fn the_stood_down_fixture() {
+    let _ = kr_ipc::testing::account_launchd::stands_down("a probe");
+}
+
+/// A case that stands down shows its notice, with its whole name, in a default run and in a run that
+/// shows the output of passing cases, and a run that asked shows none.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_stood_down_case_shows_its_notice_in_a_default_run_and_in_one_that_shows_output() {
+    use kr_ipc::testing::account_launchd::run_fixture_with;
+
+    let fixture = concat!(module_path!(), "::the_stood_down_fixture");
+    for options in [&[][..], &["--show-output"][..]] {
+        let run = run_fixture_with(fixture, None, options);
+        assert!(run.passed, "{options:?}: {}", run.log);
+        assert!(
+            run.log.contains(
+                "stood down the_stood_down_fixture: a probe needs the account's own launchd"
+            ),
+            "{options:?}: {}",
+            run.log
+        );
+        assert_eq!(
+            run.log.matches("stood down ").count(),
+            1,
+            "{options:?}: {}",
+            run.log
+        );
+    }
+    let asked = run_fixture_with(fixture, Some("1"), &["--show-output"]);
+    assert!(asked.passed, "{}", asked.log);
+    assert!(!asked.log.contains("stood down"), "{}", asked.log);
+}
+
+/// What a child of the case runs: a launch function's guard.
+#[test]
+#[ignore = "run by a child of the case"]
+#[cfg(target_os = "macos")]
+fn the_launch_guard_fixture() {
+    kr_ipc::testing::account_launchd::require("a probe");
+}
+
+/// The guard of a launch function panics, naming the variable, in a run that did not ask on a Mac,
+/// and passes in one that asked.
+#[test]
+#[cfg(target_os = "macos")]
+fn a_launch_function_of_a_run_that_did_not_ask_panics_naming_the_variable_and_passes_where_it_asked()
+ {
+    use kr_ipc::testing::account_launchd::run_fixture;
+
+    let fixture = concat!(module_path!(), "::the_launch_guard_fixture");
+    let refused = run_fixture(fixture, None);
+    assert!(!refused.passed, "{}", refused.log);
+    assert!(
+        refused.log.contains("a probe would load a job"),
+        "{}",
+        refused.log
+    );
+    assert!(refused.log.contains(VARIABLE), "{}", refused.log);
+    let asked = run_fixture(fixture, Some("1"));
+    assert!(asked.passed, "{}", asked.log);
+}
+
+/// A program makes a session when it is `kr` and its first argument that is no option is `new`, its
+/// alias `n`, or `workflow`.
+#[test]
+fn a_create_is_the_first_word_that_is_no_option_and_is_new_or_its_alias_or_workflow() {
+    use kr_ipc::testing::account_launchd::creates_a_session;
+
+    let kr = Path::new("/usr/local/bin/kr");
+    for arguments in [
+        &["new"][..],
+        &["n"],
+        &["workflow"],
+        &["--json", "new"],
+        &["--json", "n", "--headless"],
+    ] {
+        assert!(
+            creates_a_session(kr, arguments),
+            "kr {arguments:?} makes a session"
+        );
+    }
+    for arguments in [
+        &["ls"][..],
+        &["close", "x"],
+        &["attach", "new"],
+        &[],
+        &["--json"],
+    ] {
+        assert!(
+            !creates_a_session(kr, arguments),
+            "kr {arguments:?} makes none"
+        );
+    }
+    assert!(creates_a_session(Path::new("kr.exe"), &["new"]));
+    for program in ["kr-controller", "sh", "krypton"] {
+        assert!(
+            !creates_a_session(Path::new(program), &["new"]),
+            "{program} new is not kr"
+        );
+    }
+}
+
+/// Shell text makes a session when it runs `kr` with that command word, and not when it only names
+/// the words.
+#[test]
+fn a_shell_text_that_runs_kr_new_is_a_create_and_one_that_only_names_it_is_not() {
+    use kr_ipc::testing::account_launchd::creates_in_text;
+
+    for text in [
+        "kr new --shell x",
+        "cd /x && kr n",
+        "/usr/local/bin/kr --json new",
+        "kr workflow run",
+    ] {
+        assert!(creates_in_text(text), "{text:?} makes a session");
+    }
+    for text in ["echo new", "kr ls new", "krypton new", "", "kr"] {
+        assert!(!creates_in_text(text), "{text:?} makes none");
+    }
+}
+
+/// What a child of the case runs: each wrapper refuses a command that makes a session exactly when
+/// the run did not ask, and none refuses another command.
+#[test]
+#[ignore = "run by a child of the case"]
+#[cfg(target_os = "macos")]
+fn the_wrapper_fixture_for_commands_that_make_a_session_and_commands_that_do_not() {
+    use std::panic::catch_unwind;
+
+    use kr_ipc::testing::account_launchd::{
+        asked, require_for_arguments, require_for_command, require_for_text,
+    };
+
+    let kr = Path::new("kr");
+    require_for_command("a probe", kr, &["ls"]);
+    require_for_command("a probe", Path::new("sh"), &["new"]);
+    require_for_arguments("a probe", &["--json", "close", "x"]);
+    require_for_text("a probe", "echo new");
+    let refused = [
+        catch_unwind(|| require_for_command("a probe", Path::new("kr"), &["new"])),
+        catch_unwind(|| require_for_arguments("a probe", &["--json", "n"])),
+        catch_unwind(|| require_for_text("a probe", "cd /x && kr workflow run")),
+    ];
+    for result in refused {
+        assert_eq!(
+            result.is_err(),
+            !asked(),
+            "a wrapper refuses exactly where the run did not ask"
+        );
+    }
+}
+
+/// The wrappers refuse only a command that makes a session, and only where the run did not ask.
+#[test]
+#[cfg(target_os = "macos")]
+fn the_wrappers_refuse_a_command_that_makes_a_session_and_pass_every_other() {
+    use kr_ipc::testing::account_launchd::run_fixture;
+
+    let fixture = concat!(
+        module_path!(),
+        "::the_wrapper_fixture_for_commands_that_make_a_session_and_commands_that_do_not"
+    );
+    for asked in [None, Some("1")] {
+        let run = run_fixture(fixture, asked);
+        assert!(run.passed, "{asked:?}: {}", run.log);
+    }
+}
