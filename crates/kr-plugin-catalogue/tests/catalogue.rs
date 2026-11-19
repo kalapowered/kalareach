@@ -3226,6 +3226,177 @@ async fn the_connector_table_is_fetched_once_for_a_release_with_a_bridge_and_a_t
     assert_eq!(fetches, 0, "a grant that reads no table fetches none");
 }
 
+/// The format the catalogue's database records, read through a connection of its own.
+fn recorded_format(home: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(
+        home.join("catalogue")
+            .join(kr_plugin_catalogue::db::DATABASE_FILE),
+    )
+    .expect("the catalogue's database")
+    .pragma_query_value(None, "user_version", |row| row.get(0))
+    .expect("the format")
+}
+
+/// Sets the format the catalogue's database records, as a store that never held the capability
+/// records it.
+fn record_format(home: &std::path::Path, format: i64) {
+    rusqlite::Connection::open(
+        home.join("catalogue")
+            .join(kr_plugin_catalogue::db::DATABASE_FILE),
+    )
+    .expect("the catalogue's database")
+    .pragma_update(None, "user_version", format)
+    .expect("the format is written");
+}
+
+/// A catalogue whose enrolled repository publishes the example package, asking for the
+/// skill-target capability when `asks` says so, and the directory the catalogue is under.
+async fn publishing(asks: bool) -> (tempfile::TempDir, Generation, Catalogue) {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            capabilities: if asks {
+                passive_and(&[PluginCapability::SkillTargetInstall])
+            } else {
+                passive_and(&[])
+            },
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    (home, generation, catalogue)
+}
+
+/// The format that makes an older build refuse the store is recorded in the commit that makes an
+/// index listing a release requesting the skill-target capability the repository's active one, and
+/// by no sync whose index lists no such release.
+#[tokio::test]
+async fn a_sync_of_an_index_listing_the_skill_target_raises_the_format_in_its_activation() {
+    let (home, _generation, mut catalogue) = publishing(true).await;
+    assert_eq!(
+        recorded_format(home.path()),
+        kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION,
+        "enrolling under the default ceiling stores nothing that names the capability"
+    );
+    catalogue.sync(&repository()).await.expect("a generation");
+    assert_eq!(
+        recorded_format(home.path()),
+        kr_plugin_catalogue::db::SCHEMA_VERSION,
+        "the index lists a release that asks for the capability"
+    );
+
+    let (home, _generation, mut catalogue) = publishing(false).await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    assert_eq!(
+        recorded_format(home.path()),
+        kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION,
+        "an index that lists no such release leaves the format an earlier build reads"
+    );
+}
+
+/// An authority that lets the first commit it is asked for through, which writes the index
+/// document, and refuses the second, which activates the generation.
+#[derive(Debug, Default)]
+struct RefusesTheActivation {
+    commits: std::sync::atomic::AtomicUsize,
+}
+
+impl Authority for RefusesTheActivation {
+    fn check(&self) -> CatalogueResult<()> {
+        Ok(())
+    }
+
+    fn commit(
+        &self,
+        _effect: &Effect,
+        commit: &mut dyn FnMut() -> CatalogueResult<()>,
+    ) -> CatalogueResult<()> {
+        if self
+            .commits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            return commit();
+        }
+        Err(CatalogueError::PermissionDenied {
+            detail: "the authority behind this action was withdrawn".to_owned(),
+        })
+    }
+
+    fn owner_confirmed(&self) -> bool {
+        true
+    }
+}
+
+/// A sync that stops before the commit that activates its generation leaves the format as it was,
+/// whether the authority refuses the index's write, the write is not confirmed after it was made,
+/// or the authority refuses the activation after the index is written, and none of them activates
+/// the generation.
+#[tokio::test]
+async fn a_sync_that_stops_before_its_activation_leaves_the_format_as_it_was() {
+    let refusing: [(&str, Box<dyn Authority>); 3] = [
+        (
+            "refuses the index write",
+            Box::new(WithdrawnAtCommit::default()),
+        ),
+        ("fails after the index write", Box::new(FailsAfterCommit)),
+        (
+            "refuses the activation",
+            Box::new(RefusesTheActivation::default()),
+        ),
+    ];
+    for (what, authority) in refusing {
+        let (home, _generation, mut catalogue) = publishing(true).await;
+        catalogue
+            .sync_with(&repository(), &mut Change::new(authority.as_ref()))
+            .await
+            .expect_err(what);
+        assert_eq!(
+            recorded_format(home.path()),
+            kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION,
+            "an authority that {what}"
+        );
+        assert!(
+            catalogue.active(&repository()).expect("enrolled").is_none(),
+            "an authority that {what} activates nothing"
+        );
+    }
+}
+
+/// An installation whose grant names the capability records the format in the commit that records
+/// it, so a store at the baseline that holds it is refused by an older build.
+#[tokio::test]
+async fn installing_a_release_that_asks_for_the_skill_target_raises_the_format() {
+    let (home, generation, mut catalogue) = publishing(true).await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    record_format(
+        home.path(),
+        kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION,
+    );
+    install_as(
+        &mut catalogue,
+        &repository(),
+        "0.1.0",
+        generation.manifest_digest(),
+        &passive_and(&[PluginCapability::SkillTargetInstall]),
+        true,
+    )
+    .await
+    .expect("the owner confirmed this package and grant");
+    assert_eq!(
+        recorded_format(home.path()),
+        kr_plugin_catalogue::db::SCHEMA_VERSION
+    );
+}
+
 /// KR-REQ-11.44: the key rule holds for a release that holds no connector table at all, with the
 /// area the label's compiled layout gives: the label's own key is read, another key is refused
 /// before any statement, and a label that has no key of its own is refused any key.

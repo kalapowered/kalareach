@@ -195,6 +195,9 @@ impl Db {
     /// why the database is named through the canonical path of the catalogue's directory on Unix:
     /// a link the host keeps higher up is resolved first, and is no refusal.
     ///
+    /// The format the file records is read, checked and, where none is recorded, stamped under one
+    /// write lock, so an open cannot lower a format another connection raised in between.
+    ///
     /// # Errors
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when the database or a file beside it is a
@@ -216,7 +219,7 @@ impl Db {
             ),
         )
         .map_err(|source| failed(&path, &source))?;
-        let db = Self { connection, path };
+        let mut db = Self { connection, path };
         db.connection
             .busy_timeout(BUSY_TIMEOUT)
             .map_err(|source| db.failure(&source))?;
@@ -226,10 +229,22 @@ impl Db {
         db.connection
             .pragma_update(None, "synchronous", "FULL")
             .map_err(|source| db.failure(&source))?;
-        let recorded: i64 = db
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
+        // Outside the transaction below, where SQLite ignores it.
+        db.connection
+            .pragma_update(None, "foreign_keys", true)
             .map_err(|source| db.failure(&source))?;
+        // The format is read, checked and stamped under one write lock: a connection that reads
+        // an older format and stamps after another has raised it would lower the format the other
+        // one made durable, and a build that cannot read that state would be let in.
+        let transaction = db
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| failed(&db.path, &source))?;
+        let recorded: i64 = transaction
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|source| failed(&db.path, &source))?;
+        #[cfg(test)]
+        open_pause::run(&db.path);
         if !(OLDEST_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&recorded) {
             return Err(CatalogueError::StorageUnavailable {
                 detail: format!(
@@ -239,30 +254,18 @@ impl Db {
                 ),
             });
         }
-        db.connection
+        transaction
             .execute_batch(SCHEMA)
-            .map_err(|source| db.failure(&source))?;
+            .map_err(|source| failed(&db.path, &source))?;
         if recorded < BASELINE_SCHEMA_VERSION {
-            db.connection
+            transaction
                 .pragma_update(None, "user_version", BASELINE_SCHEMA_VERSION)
-                .map_err(|source| db.failure(&source))?;
+                .map_err(|source| failed(&db.path, &source))?;
         }
+        transaction
+            .commit()
+            .map_err(|source| failed(&db.path, &source))?;
         Ok(db)
-    }
-
-    /// Raises the format to [`SCHEMA_VERSION`], for state that names the skill-target capability
-    /// and is made durable outside this database, before it is made.
-    ///
-    /// A crash after this and before that state is written leaves the store at the higher format,
-    /// which only stops a rollback that nothing needed to stop.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
-    pub(crate) fn raise_format(&mut self) -> CatalogueResult<()> {
-        self.connection
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(|source| self.failure(&source))
     }
 
     /// Returns the durability settings this connection runs under.
@@ -502,7 +505,6 @@ CREATE TABLE IF NOT EXISTS receipts (
     updated_at_ms   INTEGER NOT NULL,
     PRIMARY KEY (actor, action)
 );
-PRAGMA foreign_keys = ON;
 ";
 
 /// A release an installation left, with the most a binding still holding it may use.
@@ -980,7 +982,7 @@ impl Changes<'_> {
     /// Raises the format to [`SCHEMA_VERSION`] in this commit when what the commit writes names
     /// the skill-target capability, so the state and the format that says an older build cannot
     /// read it become durable together.
-    fn raise_for(
+    pub(crate) fn raise_for(
         &self,
         capabilities: impl IntoIterator<Item = PluginCapability>,
     ) -> CatalogueResult<()> {
@@ -1995,6 +1997,31 @@ fn capabilities_from(text: &str) -> CatalogueResult<Vec<PluginCapability>> {
         .collect()
 }
 
+/// What the unit tests run inside [`Db::open`], after it has read the format and before it checks
+/// it, to reach an open that another connection races.
+#[cfg(test)]
+pub(crate) mod open_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static AFTER_READ: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time an open on this thread has read the format.
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        AFTER_READ.with(|after| *after.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(database: &Path) {
+        if let Some(then) = AFTER_READ.with(|after| after.borrow_mut().take()) {
+            then(database);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2083,16 +2110,50 @@ mod tests {
         assert_eq!(recorded(&path), SCHEMA_VERSION, "opening does not lower it");
     }
 
-    /// An index generation that lists a release requesting the capability is written outside the
-    /// database, so the format is raised before it is written.
+    /// An open reads the format, checks it and stamps it under one write lock: a connection that
+    /// reads an unstamped database cannot stamp the baseline over a format another connection
+    /// raises after that read, because the other connection's write waits for the lock.
     #[test]
-    fn the_format_is_raised_before_an_index_that_names_the_capability_is_written() {
+    fn an_open_cannot_lower_a_format_another_connection_raises() {
         let root = tempfile::tempdir().expect("a directory");
         let path = root.path().join(DATABASE_FILE);
-        let mut db = Db::open(root.path()).expect("a new database");
-        assert_eq!(recorded(&path), BASELINE_SCHEMA_VERSION);
-        db.raise_format().expect("raised");
-        assert_eq!(recorded(&path), SCHEMA_VERSION);
+        drop(Db::open(root.path()).expect("a new database"));
+        Connection::open(&path)
+            .expect("opens")
+            .pragma_update(None, "user_version", 0)
+            .expect("writes");
+
+        let raised = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let raising = std::rc::Rc::clone(&raised);
+        open_pause::once(move |database| {
+            let other = Connection::open(database).expect("a second connection");
+            // No wait: a lock held by the open is a refusal here, not a pause.
+            other
+                .busy_timeout(std::time::Duration::ZERO)
+                .expect("no wait");
+            *raising.borrow_mut() = Some(other.pragma_update(None, "user_version", SCHEMA_VERSION));
+        });
+        drop(Db::open(root.path()).expect("an unstamped database opens"));
+        assert!(
+            raised
+                .borrow()
+                .as_ref()
+                .expect("the second connection tried")
+                .is_err(),
+            "the second connection cannot raise the format between the open's read and its stamp"
+        );
+        assert_eq!(
+            recorded(&path),
+            BASELINE_SCHEMA_VERSION,
+            "the open stamped it"
+        );
+
+        Connection::open(&path)
+            .expect("opens")
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .expect("raised after the open");
+        drop(Db::open(root.path()).expect("opens again"));
+        assert_eq!(recorded(&path), SCHEMA_VERSION, "and no open lowers it");
     }
 }
 
