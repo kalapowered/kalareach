@@ -225,6 +225,33 @@ fn kr_req_12_27_input_a_hook_cannot_read_is_answered_neutrally() {
     }
 }
 
+/// KR-REQ-12.27: outside a launch a hook reads its input to the end without parsing it, so an
+/// application's write of a large input completes and a malformed one is not a diagnostic: the
+/// answer is the neutral one, standard error is empty, and it comes inside the shortest timeout.
+#[test]
+fn outside_a_launch_the_input_is_drained_without_a_parse_and_without_a_diagnostic() {
+    let placed = Placed::new();
+    let large = format!(
+        r#"{{"session_id":"s","hook_event_name":"PostToolUse","tool_response":"{}"}}"#,
+        "x".repeat(4 * 1024 * 1024)
+    );
+    for hooks in every_application() {
+        for input in [
+            large.as_bytes(),
+            &b"not json"[..],
+            &b"[]"[..],
+            &b"{\"session_id\":\"4d1c0a57\",\"hook_event_name\":\"SessionStart\""[..],
+        ] {
+            let ran = run_with_input(placed.command(&[hooks.application, "hook"]), input);
+            let case = format!("{} {} bytes", hooks.application, input.len());
+            assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
+            assert_eq!(ran.stdout, b"{}\n", "{case}");
+            assert_eq!(ran.stderr, "", "{case}: nothing is said about an input nobody reads");
+            common::assert_answered_in_time(&ran.stderr, SHORTEST_TIMEOUT, &case);
+        }
+    }
+}
+
 /// KR-REQ-12.27: an application that never closes a hook's input cannot hold the hook open.
 #[test]
 fn kr_req_12_27_input_that_never_closes_cannot_hold_a_hook() {

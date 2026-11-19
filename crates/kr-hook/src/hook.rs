@@ -7,9 +7,12 @@
 //! never waits for a person.
 //!
 //! What differs between applications is the name the bridge declares, which an [`Application`]
-//! holds. What each hook event reports is [`EVENTS`], the same for every application. The deadline,
-//! the input bound, the exchange with the worker and the answer are this module's, the same for all
-//! of them.
+//! holds, and how the application writes a hook's input: the names of its events and the places in
+//! the input of the members a report carries. The package declares those as hook events in its
+//! connector table, the worker publishes them for the launch and the registration names them; a
+//! package that declares none gets Claude Code's, which [`HookEvents::claude_code`] holds. What a
+//! hook can report is five things, whatever the package says. The deadline, the input bound, the
+//! exchange with the worker and the answer are this module's, the same for all of them.
 //!
 //! Every run waits for its observation for at most [`HOOK_DEADLINE`] from its start, well inside the
 //! shortest timeout any registration names (one second, for a session ending). When that passes,
@@ -30,7 +33,11 @@
 //! machine took to start the process and to let it end lies outside the run.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::time::Duration;
+
+use kr_plugin_sdk::hook_events::{CONTACT_REQUEST_MEMBER, HookEvent, HookEvents, HookReport};
+use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Unexpected, Visitor};
 
 use crate::exchange::Exchange;
 use crate::registration::{Bridge, Paths, Registration};
@@ -93,29 +100,7 @@ pub struct Application {
     /// The application name its registration invokes the forwarder with, which is also the
     /// application its bridge declares to the worker.
     pub name: Cow<'static, str>,
-    /// The events the forwarder reads, each with what it reports: [`EVENTS`], for every
-    /// application. An application's registration decides which of them start the forwarder. An
-    /// event not named here is answered and reports nothing.
-    pub events: &'static [(&'static str, Report)],
 }
-
-/// The hook events the forwarder reports, and what each reports, for every application.
-///
-/// A session starting after a compaction goes on in the same thread; every other start is a new
-/// selection. A registration that names only some of these events, as Gemini CLI's does, is
-/// started for those alone.
-pub static EVENTS: [(&str, Report); 5] = [
-    (
-        "SessionStart",
-        Report::SessionStarted {
-            continued_by: Some("compact"),
-        },
-    ),
-    ("SessionEnd", Report::SessionEnded),
-    ("PostToolUse", Report::ToolFinished),
-    ("PostToolUseFailure", Report::ToolFailed),
-    ("Notification", Report::Notification),
-];
 
 impl Application {
     /// The hooks of the application a registration names by `word`.
@@ -123,17 +108,7 @@ impl Application {
     pub fn for_word(word: &str) -> Self {
         Self {
             name: Cow::Owned(word.to_owned()),
-            events: &EVENTS,
         }
-    }
-
-    /// What an event reports, where it is one of the events the forwarder reads.
-    #[must_use]
-    pub fn report(&self, event: &str) -> Option<Report> {
-        self.events
-            .iter()
-            .find(|(name, _)| *name == event)
-            .map(|(_, report)| *report)
     }
 
     /// The bridge a hook of this application declares.
@@ -144,26 +119,6 @@ impl Application {
             surface: SURFACE,
         }
     }
-}
-
-/// What one registered event reports to the worker.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Report {
-    /// A session starting, with how it started as its detail: a new selection of its thread.
-    SessionStarted {
-        /// The start source that means the same thread goes on in a new context of its own, as a
-        /// compaction makes, rather than a new selection; `None` where no start does.
-        continued_by: Option<&'static str>,
-    },
-    /// A session ending, with why as its detail.
-    SessionEnded,
-    /// A tool finishing, with its name as its detail and, for the contact skill's `ask_user`, the
-    /// request it asked.
-    ToolFinished,
-    /// A tool failing, with its name as its detail.
-    ToolFailed,
-    /// A notification, with its kind as its detail and its message as its text.
-    Notification,
 }
 
 /// Runs one hook of `application`, which started at `started`, and answers neutrally.
@@ -388,16 +343,25 @@ fn observe(application: &Application, started: std::time::Instant) -> Result<(),
     // reason to go on directly when that one cannot be started.
     #[cfg(unix)]
     let _ = crate::helper::hand_over(REGISTRATION_WAIT, Some((started, HOOK_DEADLINE)));
-    let input = read_input(std::io::stdin().lock())?;
+    let mut stdin = std::io::stdin().lock();
     // Outside a launch there is nobody to tell, and the answer is the same neutral one.
     let Some(paths) = Paths::from_environment() else {
+        return drain_input(&mut stdin);
+    };
+    // The registration comes first: the events the launch's package declares decide how the input
+    // is read. A run that reports nothing still reads its input to the end, so the application's
+    // write completes.
+    let registration = match Registration::read(&paths, REGISTRATION_WAIT) {
+        Ok(registration) => registration,
+        Err(error) => {
+            drain_input(&mut stdin)?;
+            return Err(error.to_string());
+        }
+    };
+    let input = read_input(&mut stdin, &registration.events)?;
+    let Some(observation) = observation(&registration.events, &input) else {
         return Ok(());
     };
-    let Some(observation) = observation(application, &input) else {
-        return Ok(());
-    };
-    let registration =
-        Registration::read(&paths, REGISTRATION_WAIT).map_err(|error| error.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -408,10 +372,24 @@ fn observe(application: &Application, started: std::time::Instant) -> Result<(),
             deliver(&mut exchange, &observation).await
         })
         .map_err(|error| error.to_string())?;
-    if reports_thread(application, &input) {
+    if reports_thread(&registration.events, &input) {
         std::thread::sleep(THREAD_REPORT_LINGER.saturating_sub(started.elapsed()));
     }
     Ok(())
+}
+
+/// Reads a hook's input to its end, bounded by [`MAX_HOOK_INPUT_BYTES`], and parses none of it.
+///
+/// A run that reports nothing says nothing about its input either, however the application wrote
+/// it, and an application's write of a large input does not complete until it is read.
+///
+/// # Errors
+///
+/// Returns what went wrong reading standard input.
+fn drain_input(input: impl std::io::Read) -> Result<(), String> {
+    std::io::copy(&mut input.take(MAX_HOOK_INPUT_BYTES), &mut std::io::sink())
+        .map(|_| ())
+        .map_err(|error| format!("the hook's input could not be read: {error}"))
 }
 
 /// Delivers one observation over an exchange whose hello has just been written, and waits until the
@@ -436,105 +414,355 @@ async fn deliver(
 }
 
 /// Whether the event is one the worker decides the thread by: a session starting or ending.
-fn reports_thread(application: &Application, input: &HookInput) -> bool {
-    matches!(
-        application.report(&input.hook_event_name),
-        Some(Report::SessionStarted { .. } | Report::SessionEnded)
-    )
+fn reports_thread(events: &HookEvents, input: &Observed) -> bool {
+    events.events.iter().any(|event| {
+        event.name == input.event
+            && matches!(
+                event.report,
+                HookReport::SessionStarted | HookReport::SessionEnded
+            )
+    })
 }
 
-/// What this forwarder reads of a hook's input, whichever application wrote it.
+/// The name of the contact skill's tool on its server.
+const CONTACT_TOOL: &str = "ask_user";
+
+/// What this forwarder read of a hook's input, at the places the launch's hook events name.
 ///
 /// Every application names the session and the event; the rest is read where the event carries
 /// it. Everything else in the payload, a tool's whole response included, is skipped as it is read
 /// and never held.
-#[derive(Debug, Default, serde::Deserialize)]
-pub struct HookInput {
+#[derive(Debug, Default)]
+pub struct Observed {
     /// The session the event happened in, which is the thread KalaReach binds to.
-    pub session_id: String,
+    pub thread: String,
     /// Which event this is.
-    pub hook_event_name: String,
+    pub event: String,
     /// How a session started.
-    #[serde(default)]
-    pub source: Option<String>,
+    pub start_source: Option<String>,
     /// Why a session ended.
-    #[serde(default)]
-    pub reason: Option<String>,
+    pub end_reason: Option<String>,
     /// The tool that ran.
-    #[serde(default)]
     pub tool_name: Option<String>,
     /// The `request_id` member of the tool's input, where it has a string one.
-    #[serde(default, rename = "tool_input", deserialize_with = "request_id_in")]
     pub tool_request_id: Option<String>,
-    /// The MCP server the tool came from, as Claude Code names it.
-    #[serde(default)]
-    pub mcp_server: Option<McpServer>,
-    /// The MCP server and tool the tool call went to, as Qoder CLI names them.
-    #[serde(default)]
-    pub mcp_context: Option<McpContext>,
     /// Which notification this is.
-    #[serde(default)]
-    pub notification_type: Option<String>,
+    pub notification_kind: Option<String>,
     /// The notification's text.
-    #[serde(default)]
-    pub message: Option<String>,
+    pub notification_text: Option<String>,
+    /// What each member the contact is named by held, in the order the events declare them.
+    pub agreeing: Vec<Option<String>>,
 }
 
-/// The MCP server a tool came from, as Claude Code names it.
-#[derive(Debug, Default, serde::Deserialize)]
-pub struct McpServer {
-    /// Its name.
-    #[serde(default)]
-    pub name: Option<String>,
+/// What one place of a hook's input is read as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Slot {
+    Event,
+    Thread,
+    StartSource,
+    EndReason,
+    ToolName,
+    NotificationKind,
+    NotificationText,
+    Agreeing(usize),
+    RequestId,
 }
 
-/// The MCP server and tool a tool call went to, as Qoder CLI names them.
-#[derive(Debug, Default, serde::Deserialize)]
-pub struct McpContext {
-    /// The server's name.
-    #[serde(default)]
-    pub server_name: Option<String>,
-    /// The tool's own name on that server.
-    #[serde(default)]
-    pub tool_name: Option<String>,
+/// One member of the input on the way to the places the events name, and what each member below it
+/// is.
+#[derive(Debug, Default)]
+struct Node {
+    children: BTreeMap<String, Node>,
+    /// What a string at this member is read as; a member that has some has no children.
+    slots: Vec<Slot>,
+    /// Whether this is the contact tool's input, which is read for one member and skipped when it
+    /// is not an object.
+    contact_input: bool,
 }
 
-/// Reads and parses one hook's input, bounded by [`MAX_HOOK_INPUT_BYTES`].
+impl Node {
+    fn insert(&mut self, names: &[&str], slot: Slot) -> &mut Self {
+        let mut node = self;
+        for name in names {
+            node = node.children.entry((*name).to_owned()).or_default();
+        }
+        node.slots.push(slot);
+        node
+    }
+
+    fn at(&mut self, names: &[&str]) -> &mut Self {
+        let mut node = self;
+        for name in names {
+            node = node.children.entry((*name).to_owned()).or_default();
+        }
+        node
+    }
+
+    /// The tree of the places `events` names. Each place passed the check every reader makes, so
+    /// one that holds an index segment is left out.
+    fn of(events: &HookEvents) -> Self {
+        let mut root = Self::default();
+        let mut add = |place: &kr_plugin_sdk::connector::FieldPath, slot| {
+            if let Some(names) = place.member_names() {
+                root.insert(&names, slot);
+            }
+        };
+        add(&events.event, Slot::Event);
+        add(&events.thread, Slot::Thread);
+        let details = &events.details;
+        for (place, slot) in [
+            (&details.start_source, Slot::StartSource),
+            (&details.end_reason, Slot::EndReason),
+            (&details.tool_name, Slot::ToolName),
+            (&details.notification_kind, Slot::NotificationKind),
+            (&details.notification_text, Slot::NotificationText),
+        ] {
+            if let Some(place) = place {
+                add(place, slot);
+            }
+        }
+        if let Some(contact) = &events.contact {
+            for (index, agreement) in contact.agreeing.iter().enumerate() {
+                add(&agreement.place, Slot::Agreeing(index));
+            }
+            if let Some(mut names) = contact.tool_input.member_names() {
+                root.at(&names).contact_input = true;
+                names.push(CONTACT_REQUEST_MEMBER);
+                root.insert(&names, Slot::RequestId);
+            }
+        }
+        root
+    }
+}
+
+/// Reads a hook's input along the tree, holding the strings at the places it names and skipping
+/// everything else.
+struct Descend<'a> {
+    node: &'a Node,
+    found: &'a mut BTreeMap<Slot, String>,
+}
+
+impl Descend<'_> {
+    fn required(&self) -> bool {
+        self.node
+            .slots
+            .iter()
+            .any(|slot| matches!(slot, Slot::Event | Slot::Thread))
+    }
+
+    /// Whether this member is read as the contact's request identifier, which is a string where
+    /// the tool's input has one and nothing otherwise, and never an error.
+    fn request_id(&self) -> bool {
+        self.node.slots.contains(&Slot::RequestId)
+    }
+
+    /// A value that is not a string. The contact's request identifier takes it as no value, and
+    /// so does the contact tool's input, which is read for one member and skipped when it is not
+    /// an object; every other place the events name refuses it.
+    fn not_a_string<E: serde::de::Error>(self, what: Unexpected<'_>) -> Result<(), E> {
+        if self.request_id() {
+            self.found.remove(&Slot::RequestId);
+            return Ok(());
+        }
+        if self.node.contact_input {
+            return Ok(());
+        }
+        Err(E::invalid_type(what, &self))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for Descend<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Descend<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(if self.node.children.is_empty() {
+            "a string"
+        } else {
+            "a hook's input"
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        if self.node.children.is_empty() {
+            // A member read as a string, holding an object.
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            return self.not_a_string(Unexpected::Map);
+        }
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let Some(child) = self.node.children.get(&key) else {
+                map.next_value::<IgnoredAny>()?;
+                continue;
+            };
+            let lenient = child.slots.contains(&Slot::RequestId);
+            if !lenient && seen.contains(&key) {
+                return Err(A::Error::custom(format!("duplicate field `{key}`")));
+            }
+            seen.push(key);
+            map.next_value_seed(Descend {
+                node: child,
+                found: &mut *self.found,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<(), A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        self.not_a_string(Unexpected::Seq)
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        if self.node.slots.is_empty() {
+            // A member the events read below it, holding a string.
+            return if self.node.contact_input {
+                Ok(())
+            } else {
+                Err(E::invalid_type(Unexpected::Str(value), &self))
+            };
+        }
+        for slot in &self.node.slots {
+            self.found.insert(*slot, value.to_owned());
+        }
+        Ok(())
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        self.not_a_string(Unexpected::Bool(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        self.not_a_string(Unexpected::Signed(value))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        self.not_a_string(Unexpected::Unsigned(value))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        self.not_a_string(Unexpected::Float(value))
+    }
+
+    fn visit_unit<E>(self) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        if self.required() {
+            return Err(E::invalid_type(Unexpected::Unit, &"a string"));
+        }
+        if self.request_id() {
+            self.found.remove(&Slot::RequestId);
+        }
+        Ok(())
+    }
+}
+
+/// Reads and parses one hook's input at the places `events` names, bounded by
+/// [`MAX_HOOK_INPUT_BYTES`].
+///
+/// A member the events do not name is skipped as it is read. A member they name is a string, or
+/// null where it is optional, or absent; an event and a session that are absent, null or not a
+/// string, a named member held twice and a named object that is not one are not an event this
+/// bridge reads.
 ///
 /// # Errors
 ///
 /// Returns what went wrong for a payload that is not a hook's input or is past the bound.
-pub fn read_input(input: impl std::io::Read) -> Result<HookInput, String> {
+pub fn read_input(input: impl std::io::Read, events: &HookEvents) -> Result<Observed, String> {
+    let tree = Node::of(events);
+    let mut found = BTreeMap::new();
     let reader = std::io::BufReader::new(input.take(MAX_HOOK_INPUT_BYTES));
-    serde_json::from_reader(reader)
-        .map_err(|error| format!("the hook's input is not an event this bridge reads: {error}"))
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    Descend {
+        node: &tree,
+        found: &mut found,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end())
+    .map_err(|error| format!("the hook's input is not an event this bridge reads: {error}"))?;
+    let mut take = |slot| found.remove(&slot);
+    let (Some(event), Some(thread)) = (take(Slot::Event), take(Slot::Thread)) else {
+        return Err(
+            "the hook's input is not an event this bridge reads: it names no event or no session"
+                .to_owned(),
+        );
+    };
+    Ok(Observed {
+        thread,
+        event,
+        start_source: take(Slot::StartSource),
+        end_reason: take(Slot::EndReason),
+        tool_name: take(Slot::ToolName),
+        tool_request_id: take(Slot::RequestId),
+        notification_kind: take(Slot::NotificationKind),
+        notification_text: take(Slot::NotificationText),
+        agreeing: (0..events.contact.as_ref().map_or(0, |contact| contact.agreeing.len()))
+            .map(|index| take(Slot::Agreeing(index)))
+            .collect(),
+    })
 }
 
 /// Translates one hook's input into the observation the worker reads, or `None` for an event
-/// outside the application's event vocabulary, or input that names no thread.
+/// outside the events' vocabulary, or input that names no thread.
 ///
-/// A session starting or ending selects or ends the thread, and a start the application marks as
-/// a continuation goes on in it; a tool finishing or failing and a notification are recorded as
+/// A session starting or ending selects or ends the thread, and a start the events mark as a
+/// continuation goes on in it; a tool finishing or failing and a notification are recorded as
 /// observed history. A finished call of the contact skill's `ask_user` also names the request it
 /// asked, so the worker learns which thread the question was asked in.
 #[must_use]
-pub fn observation(application: &Application, input: &HookInput) -> Option<serde_json::Value> {
-    let report = application.report(&input.hook_event_name)?;
-    let thread = kr_protocol::ids::AgentThreadId::new(input.session_id.clone()).ok()?;
-    let (event, detail) = match report {
-        Report::SessionStarted {
-            continued_by: Some(continuation),
-        } if input.source.as_deref() == Some(continuation) => {
-            ("thread_continued", input.source.as_deref())
+pub fn observation(events: &HookEvents, input: &Observed) -> Option<serde_json::Value> {
+    let event: &HookEvent = events
+        .events
+        .iter()
+        .find(|event| event.name == input.event)?;
+    let thread = kr_protocol::ids::AgentThreadId::new(input.thread.clone()).ok()?;
+    let (word, detail) = match event.report {
+        HookReport::SessionStarted
+            if event.continued_by.is_some()
+                && event.continued_by.as_deref() == input.start_source.as_deref() =>
+        {
+            ("thread_continued", input.start_source.as_deref())
         }
-        Report::SessionStarted { .. } => ("thread_started", input.source.as_deref()),
-        Report::SessionEnded => ("thread_ended", input.reason.as_deref()),
-        Report::ToolFinished => ("tool_finished", input.tool_name.as_deref()),
-        Report::ToolFailed => ("tool_failed", input.tool_name.as_deref()),
-        Report::Notification => ("notification", input.notification_type.as_deref()),
+        HookReport::SessionStarted => ("thread_started", input.start_source.as_deref()),
+        HookReport::SessionEnded => ("thread_ended", input.end_reason.as_deref()),
+        HookReport::ToolFinished => ("tool_finished", input.tool_name.as_deref()),
+        HookReport::ToolFailed => ("tool_failed", input.tool_name.as_deref()),
+        HookReport::Notification => ("notification", input.notification_kind.as_deref()),
     };
     let mut reported = serde_json::Map::new();
-    reported.insert("event".to_owned(), serde_json::json!(event));
+    reported.insert("event".to_owned(), serde_json::json!(word));
     reported.insert("thread".to_owned(), serde_json::json!(thread.as_str()));
     if let Some(detail) = detail {
         reported.insert(
@@ -542,16 +770,16 @@ pub fn observation(application: &Application, input: &HookInput) -> Option<serde
             serde_json::json!(bounded(detail, MAX_DETAIL_BYTES)),
         );
     }
-    if report == Report::Notification
-        && let Some(message) = &input.message
+    if event.report == HookReport::Notification
+        && let Some(message) = &input.notification_text
     {
         reported.insert(
             "text".to_owned(),
             serde_json::json!(bounded(message, MAX_TEXT_BYTES)),
         );
     }
-    if report == Report::ToolFinished
-        && let Some(request) = contact_request(input)
+    if event.report == HookReport::ToolFinished
+        && let Some(request) = contact_request(events, input)
     {
         reported.insert("contact_request".to_owned(), serde_json::json!(request));
     }
@@ -561,35 +789,27 @@ pub fn observation(application: &Application, input: &HookInput) -> Option<serde
 /// The request identifier of the contact skill's `ask_user` call, when this finished tool call was
 /// one.
 ///
-/// Claude Code and Qoder CLI both name an MCP server's tool `mcp__<server>__<tool>`, and the
-/// contact skill's server is registered as [`kr_protocol::skill::SERVER_NAME`]. Where the
+/// The events say how the application spells the tool's name, over the two words the host expands:
+/// the contact skill's server is registered as [`kr_protocol::skill::SERVER_NAME`]. Where the
 /// application also names the server, or the tool on it, every name it gives must agree.
-fn contact_request(input: &HookInput) -> Option<&str> {
+fn contact_request<'a>(events: &HookEvents, input: &'a Observed) -> Option<&'a str> {
+    let contact = events.contact.as_ref()?;
     let server = kr_protocol::skill::SERVER_NAME;
-    let expected = format!("mcp__{server}__ask_user");
+    let expected = contact
+        .tool_name
+        .replace("{server}", server)
+        .replace("{tool}", CONTACT_TOOL);
     if input.tool_name.as_deref() != Some(expected.as_str()) {
         return None;
     }
-    let named = [
-        input
-            .mcp_server
-            .as_ref()
-            .and_then(|named| named.name.as_deref()),
-        input
-            .mcp_context
-            .as_ref()
-            .and_then(|named| named.server_name.as_deref()),
-    ];
-    if named.into_iter().flatten().any(|name| name != server) {
-        return None;
-    }
-    if input
-        .mcp_context
-        .as_ref()
-        .and_then(|named| named.tool_name.as_deref())
-        .is_some_and(|tool| tool != "ask_user")
-    {
-        return None;
+    for (agreement, named) in contact.agreeing.iter().zip(&input.agreeing) {
+        let own = match agreement.names {
+            kr_plugin_sdk::hook_events::HookAgreed::Server => server,
+            kr_plugin_sdk::hook_events::HookAgreed::Tool => CONTACT_TOOL,
+        };
+        if named.as_deref().is_some_and(|name| name != own) {
+            return None;
+        }
     }
     input
         .tool_request_id
@@ -607,74 +827,6 @@ fn bounded(text: &str, limit: usize) -> &str {
         end -= 1;
     }
     &text[..end]
-}
-
-/// Reads the `request_id` member of a tool's input without holding the rest of it.
-fn request_id_in<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserializer.deserialize_any(RequestIdIn)
-}
-
-struct RequestIdIn;
-
-impl<'de> serde::de::Visitor<'de> for RequestIdIn {
-    type Value = Option<String>;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("a tool's input")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::MapAccess<'de>,
-    {
-        let mut found = None;
-        while let Some(key) = map.next_key::<String>()? {
-            if key == "request_id" {
-                found = match map.next_value::<serde_json::Value>()? {
-                    serde_json::Value::String(text) => Some(text),
-                    _ => None,
-                };
-            } else {
-                map.next_value::<serde::de::IgnoredAny>()?;
-            }
-        }
-        Ok(found)
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: serde::de::SeqAccess<'de>,
-    {
-        while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-        Ok(None)
-    }
-
-    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
-        Ok(None)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(None)
-    }
 }
 
 /// Writes the neutral answer and flushes it, so the application has it before anything else the
@@ -1293,12 +1445,24 @@ mod tests {
         ["claude-code", "gemini-cli", "qoder-cli"].map(Application::for_word)
     }
 
-    fn translated(
-        application: &Application,
-        payload: &serde_json::Value,
-    ) -> Option<serde_json::Value> {
-        let input = read_input(payload.to_string().as_bytes()).expect("a hook's input");
-        observation(application, &input).map(|frame| frame["kr_observation"].clone())
+    fn translated(events: &HookEvents, payload: &serde_json::Value) -> Option<serde_json::Value> {
+        let input = read_input(payload.to_string().as_bytes(), events).expect("a hook's input");
+        observation(events, &input).map(|frame| frame["kr_observation"].clone())
+    }
+
+    /// Claude Code's events with only `events` mapped, and its contact and places as they are.
+    fn mapping(events: &[(&str, HookReport, Option<&str>)]) -> HookEvents {
+        HookEvents {
+            events: events
+                .iter()
+                .map(|(name, report, continued_by)| HookEvent {
+                    name: (*name).to_owned(),
+                    report: *report,
+                    continued_by: continued_by.map(str::to_owned),
+                })
+                .collect(),
+            ..HookEvents::claude_code()
+        }
     }
 
     /// Each application declares itself under its own name, as the `hook` surface, and holds each
@@ -1314,7 +1478,12 @@ mod tests {
         for application in &every {
             assert_eq!(application.bridge().application, application.name);
             assert_eq!(application.bridge().surface, "hook");
-            let mut events: Vec<&str> = application.events.iter().map(|(name, _)| *name).collect();
+            let defaults = HookEvents::claude_code();
+            let mut events: Vec<&str> = defaults
+                .events
+                .iter()
+                .map(|event| event.name.as_str())
+                .collect();
             let registered = events.len();
             events.sort_unstable();
             events.dedup();
@@ -1328,16 +1497,18 @@ mod tests {
     fn a_thread_report_is_held_two_ticks_and_inside_the_deadline() {
         assert!(THREAD_REPORT_LINGER < HOOK_DEADLINE);
         for application in &every() {
-            for (event, report) in application.events {
+            let events = HookEvents::claude_code();
+            for HookEvent { name: event, report, .. } in &events.events {
                 let input = read_input(
                     serde_json::json!({"session_id": "t", "hook_event_name": event})
                         .to_string()
                         .as_bytes(),
+                    &events,
                 )
                 .expect("a hook's input");
                 assert_eq!(
-                    reports_thread(application, &input),
-                    matches!(report, Report::SessionStarted { .. } | Report::SessionEnded),
+                    reports_thread(&events, &input),
+                    matches!(report, HookReport::SessionStarted | HookReport::SessionEnded),
                     "{} {event}",
                     application.name
                 );
@@ -1349,34 +1520,20 @@ mod tests {
     /// only from that source.
     #[test]
     fn a_continuation_is_the_named_source_and_nothing_else() {
-        const WITHOUT: Application = Application {
-            name: Cow::Borrowed("no-continuation"),
-            events: &[(
-                "SessionStart",
-                Report::SessionStarted { continued_by: None },
-            )],
-        };
-        const WITH: Application = Application {
-            name: Cow::Borrowed("continuation"),
-            events: &[(
-                "SessionStart",
-                Report::SessionStarted {
-                    continued_by: Some("compact"),
-                },
-            )],
-        };
-        for (application, source, event) in [
-            (&WITHOUT, "compact", "thread_started"),
-            (&WITH, "compact", "thread_continued"),
-            (&WITH, "Compact", "thread_started"),
-            (&WITH, "resume", "thread_started"),
+        let without = mapping(&[("SessionStart", HookReport::SessionStarted, None)]);
+        let with = mapping(&[("SessionStart", HookReport::SessionStarted, Some("compact"))]);
+        for (application, name, source, event) in [
+            (&without, "no-continuation", "compact", "thread_started"),
+            (&with, "continuation", "compact", "thread_continued"),
+            (&with, "continuation", "Compact", "thread_started"),
+            (&with, "continuation", "resume", "thread_started"),
         ] {
             let reported = translated(
                 application,
                 &serde_json::json!({"session_id": "s", "hook_event_name": "SessionStart", "source": source}),
             )
             .expect("an observation");
-            assert_eq!(reported["event"], event, "{} {source}", application.name);
+            assert_eq!(reported["event"], event, "{name} {source}");
         }
     }
 
@@ -1385,17 +1542,14 @@ mod tests {
     /// Code does or as Qoder CLI does.
     #[test]
     fn a_contact_request_is_named_only_when_every_name_agrees() {
-        const FINISHED: Application = Application {
-            name: Cow::Borrowed("tools"),
-            events: &[("PostToolUse", Report::ToolFinished)],
-        };
+        let finished = mapping(&[("PostToolUse", HookReport::ToolFinished, None)]);
         let asked = |tool: &str, extra: serde_json::Value| {
             let mut payload = serde_json::json!({"session_id": "s", "hook_event_name": "PostToolUse",
                 "tool_name": tool, "tool_input": {"request_id": "r-7f3a", "question": "which?"}});
             for (key, value) in extra.as_object().expect("members") {
                 payload[key] = value.clone();
             }
-            translated(&FINISHED, &payload).expect("an observation")["contact_request"].clone()
+            translated(&finished, &payload).expect("an observation")["contact_request"].clone()
         };
         for extra in [
             serde_json::json!({}),
@@ -1438,14 +1592,11 @@ mod tests {
 
     #[test]
     fn long_text_is_cut_at_a_character_boundary() {
-        const NOTIFIED: Application = Application {
-            name: Cow::Borrowed("notifications"),
-            events: &[("Notification", Report::Notification)],
-        };
+        let notified = mapping(&[("Notification", HookReport::Notification, None)]);
         let message = format!("{}{}", "x".repeat(MAX_TEXT_BYTES - 1), "\u{00e9}");
         let payload = serde_json::json!({"session_id": "s", "hook_event_name": "Notification",
             "message": message, "notification_type": "y".repeat(MAX_DETAIL_BYTES + 10)});
-        let reported = translated(&NOTIFIED, &payload).expect("an observation");
+        let reported = translated(&notified, &payload).expect("an observation");
         let text = reported["text"].as_str().expect("text");
         assert_eq!(
             text.len(),
@@ -1592,11 +1743,12 @@ mod tests {
                 None,
             ),
         ];
+        // The events a launch gets when its package declares none do not depend on the word.
+        let events = HookEvents::claude_code();
         for word in ["claude-code", "gemini-cli", "qoder-cli", "amp"] {
-            let application = Application::for_word(word);
             for (payload, expected) in &cases {
                 assert_eq!(
-                    translated(&application, payload),
+                    translated(&events, payload),
                     *expected,
                     "{word} {payload}"
                 );
@@ -1606,13 +1758,14 @@ mod tests {
 
     /// Qoder CLI: the events its hooks send, read through the one vocabulary.
     mod qoder_cli {
-        use super::{Application, observation, read_input};
+        use super::{HookEvents, observation, read_input};
 
         const THREAD: &str = "6b3bbfa1-1e44-480a-ae1f-a44fb86916f2";
 
         fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
-            let input = read_input(payload.to_string().as_bytes()).expect("a hook's input");
-            observation(&Application::for_word("qoder-cli"), &input)
+            let events = HookEvents::claude_code();
+            let input = read_input(payload.to_string().as_bytes(), &events).expect("a hook's input");
+            observation(&events, &input)
                 .map(|frame| frame["kr_observation"].clone())
         }
 
@@ -1717,13 +1870,14 @@ mod tests {
 
     /// Gemini CLI: the events its hooks send, read through the one vocabulary.
     mod gemini_cli {
-        use super::{Application, observation, read_input};
+        use super::{HookEvents, observation, read_input};
 
         const THREAD: &str = "1740a246-b45f-4436-932a-3107700094f5";
 
         fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
-            let input = read_input(payload.to_string().as_bytes()).expect("a hook's input");
-            observation(&Application::for_word("gemini-cli"), &input)
+            let events = HookEvents::claude_code();
+            let input = read_input(payload.to_string().as_bytes(), &events).expect("a hook's input");
+            observation(&events, &input)
                 .map(|frame| frame["kr_observation"].clone())
         }
 
@@ -1787,6 +1941,192 @@ mod tests {
                     "mcp_context": {"server_name": "kalareach", "tool_name": "ask_user"}});
                 assert_eq!(translated(&payload), None, "{event}");
             }
+        }
+    }
+
+    /// An application that names its events and members another way than Claude Code does.
+    fn vendor() -> HookEvents {
+        let place = |names: &[&str]| {
+            serde_json::json!({"segments": names.iter()
+                .map(|name| serde_json::json!({"type": "member", "name": name}))
+                .collect::<Vec<_>>()})
+        };
+        let events: HookEvents = serde_json::from_value(serde_json::json!({
+            "event": place(&["event", "name"]),
+            "thread": place(&["thread", "id"]),
+            "events": [
+                {"name": "session_open", "report": "session_started", "continued_by": "resume"},
+                {"name": "session_close", "report": "session_ended"},
+                {"name": "tool_done", "report": "tool_finished"},
+            ],
+            "details": {
+                "start_source": place(&["origin"]),
+                "end_reason": place(&["cause"]),
+                "tool_name": place(&["tool", "label"]),
+            },
+            "contact": {
+                "tool_name": "{server}.{tool}",
+                "tool_input": place(&["call", "arguments"]),
+                "agreeing": [{"place": place(&["call", "server"]), "names": "server"}],
+            },
+        }))
+        .expect("events");
+        assert_eq!(events.refusals(), Vec::new());
+        events
+    }
+
+    /// A package that declares its own names is read by them: its events report, Claude Code's
+    /// names report nothing, and a continuation is the source the package names.
+    #[test]
+    fn an_application_with_other_event_names_reports_by_its_declared_map() {
+        let events = vendor();
+        let opened = translated(
+            &events,
+            &serde_json::json!({"event": {"name": "session_open"}, "thread": {"id": "t-1"},
+                "origin": "startup"}),
+        )
+        .expect("an observation");
+        assert_eq!(
+            opened,
+            serde_json::json!({"event": "thread_started", "thread": "t-1", "detail": "startup"})
+        );
+        let resumed = translated(
+            &events,
+            &serde_json::json!({"event": {"name": "session_open"}, "thread": {"id": "t-1"},
+                "origin": "resume"}),
+        )
+        .expect("an observation");
+        assert_eq!(resumed["event"], "thread_continued");
+        let closed = translated(
+            &events,
+            &serde_json::json!({"event": {"name": "session_close"}, "thread": {"id": "t-1"},
+                "cause": "logout"}),
+        )
+        .expect("an observation");
+        assert_eq!(
+            closed,
+            serde_json::json!({"event": "thread_ended", "thread": "t-1", "detail": "logout"})
+        );
+        // Claude Code's names are not this application's.
+        assert_eq!(
+            translated(
+                &events,
+                &serde_json::json!({"event": {"name": "SessionStart"}, "thread": {"id": "t-1"}})
+            ),
+            None
+        );
+        // And the members of Claude Code's places are not read.
+        let read = read_input(
+            br#"{"hook_event_name":"SessionStart","session_id":"x"}"#.as_slice(),
+            &events,
+        );
+        assert!(read.is_err(), "{read:?}");
+    }
+
+    /// A member the events do not name is skipped as it is read, however large, and changes
+    /// nothing about what is observed.
+    #[test]
+    fn a_member_outside_the_declared_places_is_skipped() {
+        let events = vendor();
+        let plain = serde_json::json!({"event": {"name": "session_open"}, "thread": {"id": "t-1"},
+            "origin": "startup"});
+        let mut crowded = plain.clone();
+        crowded["tool_response"] = serde_json::json!("x".repeat(1024 * 1024));
+        crowded["event"]["extra"] = serde_json::json!({"a": [1, 2, {"b": null}]});
+        crowded["thread"]["more"] = serde_json::json!("y".repeat(1024));
+        crowded["call"] = serde_json::json!({"unrelated": ["z".repeat(4096)]});
+        assert_eq!(
+            translated(&events, &crowded),
+            translated(&events, &plain),
+            "what is not named changes nothing"
+        );
+    }
+
+    /// The contact skill's tool is named by the template the package declares, expanded by the core
+    /// over its own server and tool names, and every member the package names the server by has to
+    /// agree.
+    #[test]
+    fn a_declared_contact_template_is_expanded_by_the_core_and_agrees_by_its_places() {
+        let events = vendor();
+        let finished = |label: &str, server: serde_json::Value| {
+            let mut payload = serde_json::json!({"event": {"name": "tool_done"},
+                "thread": {"id": "t-1"}, "tool": {"label": label},
+                "call": {"arguments": {"request_id": "r-9"}}});
+            if !server.is_null() {
+                payload["call"]["server"] = server;
+            }
+            translated(&events, &payload).expect("an observation")["contact_request"].clone()
+        };
+        assert_eq!(finished("kalareach.ask_user", serde_json::Value::Null), "r-9");
+        assert_eq!(finished("kalareach.ask_user", serde_json::json!("kalareach")), "r-9");
+        assert!(finished("kalareach.ask_user", serde_json::json!("elsewhere")).is_null());
+        assert!(finished("mcp__kalareach__ask_user", serde_json::Value::Null).is_null());
+        assert!(finished("elsewhere.ask_user", serde_json::Value::Null).is_null());
+    }
+
+    /// Reading by the default places gives what the reader gave before the places were data: an
+    /// input that names no event or no session, one with a named member of the wrong type or held
+    /// twice, and a named object that is not one are refused; a null optional member is absent; a
+    /// member nothing names may repeat; the request identifier takes the last of its repeats and
+    /// nothing from a value that is not a string.
+    #[test]
+    fn the_default_map_reads_missing_null_wrong_type_and_repeated_members_as_before() {
+        let events = HookEvents::claude_code();
+        let refused = |text: &str| read_input(text.as_bytes(), &events).is_err();
+        for text in [
+            r#"{"hook_event_name":"SessionStart"}"#,
+            r#"{"session_id":"s"}"#,
+            r#"{"session_id":null,"hook_event_name":"SessionStart"}"#,
+            r#"{"session_id":"s","hook_event_name":null}"#,
+            r#"{"session_id":7,"hook_event_name":"SessionStart"}"#,
+            r#"{"session_id":"s","hook_event_name":"SessionStart","source":3}"#,
+            r#"{"session_id":"s","hook_event_name":"SessionStart","source":["a"]}"#,
+            r#"{"session_id":"s","session_id":"t","hook_event_name":"SessionStart"}"#,
+            r#"{"session_id":"s","hook_event_name":"SessionStart","source":"a","source":"b"}"#,
+            r#"{"session_id":"s","hook_event_name":"PostToolUse","mcp_server":"kalareach"}"#,
+            r#"{"session_id":"s","hook_event_name":"PostToolUse","mcp_server":{"name":5}}"#,
+            r#"{"session_id":"s","hook_event_name":"PostToolUse","mcp_context":[1]}"#,
+            r#"{"session_id":"s","hook_event_name":"SessionStart"} {}"#,
+            r#"[]"#,
+            r#"7"#,
+            "",
+        ] {
+            assert!(refused(text), "{text}");
+        }
+        let read = |text: &str| read_input(text.as_bytes(), &events).expect(text);
+        assert_eq!(
+            read(r#"{"session_id":"s","hook_event_name":"SessionStart","source":null}"#)
+                .start_source,
+            None
+        );
+        assert_eq!(
+            read(r#"{"session_id":"s","hook_event_name":"X","other":1,"other":2}"#).thread,
+            "s"
+        );
+        for text in [
+            r#"{"session_id":"s","hook_event_name":"PostToolUse","mcp_server":null}"#,
+            r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":null}"#,
+            r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":[1,{"a":2}]}"#,
+            r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":"text"}"#,
+            r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":{"request_id":5}}"#,
+        ] {
+            assert_eq!(read(text).tool_request_id, None, "{text}");
+        }
+        for (text, request) in [
+            (
+                r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":{"request_id":"a","request_id":"b"}}"#,
+                Some("b"),
+            ),
+            (
+                r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":{"request_id":"a","request_id":3}}"#,
+                None,
+            ),
+            (
+                r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":{"request_id":"a"}}"#,
+                Some("a"),
+            ),
+        ] {
+            assert_eq!(read(text).tool_request_id.as_deref(), request, "{text}");
         }
     }
 }

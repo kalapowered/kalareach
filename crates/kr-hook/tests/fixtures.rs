@@ -226,9 +226,11 @@ fn the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else() {
 
     let events = &settings["hooks"];
     let mut registered = members(events);
-    let mut reported: Vec<&str> = kr_hook::hook::EVENTS
+    let default = kr_plugin_sdk::hook_events::HookEvents::claude_code();
+    let mut reported: Vec<&str> = default
+        .events
         .iter()
-        .map(|(event, _)| *event)
+        .map(|event| event.name.as_str())
         .collect();
     registered.sort_unstable();
     reported.sort_unstable();
@@ -320,7 +322,10 @@ fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
     );
     for event in &registered {
         assert!(
-            kr_hook::hook::EVENTS.iter().any(|(name, _)| name == event),
+            kr_plugin_sdk::hook_events::HookEvents::claude_code()
+                .events
+                .iter()
+                .any(|known| known.name == *event),
             "{event} is an event the forwarder reads"
         );
     }

@@ -517,12 +517,43 @@ impl Launch {
         )
     }
 
+    /// Launches the stand-in application as [`Self::start_as`] does, for a package that declares
+    /// `events` as its hook events: the file is written beside the credential, and the registration
+    /// names it.
+    pub fn start_with_events(
+        placed: &Placed,
+        hook_program: &Path,
+        invoked: &str,
+        installed: InstalledBridge,
+        events: &kr_plugin_sdk::hook_events::HookEvents,
+    ) -> Self {
+        Self::start_running_with(
+            placed,
+            APPLICATION,
+            hook_program,
+            invoked,
+            installed,
+            Some(events),
+        )
+    }
+
     fn start_running(
         placed: &Placed,
         script: &str,
         program: &Path,
         invoked: &str,
         installed: InstalledBridge,
+    ) -> Self {
+        Self::start_running_with(placed, script, program, invoked, installed, None)
+    }
+
+    fn start_running_with(
+        placed: &Placed,
+        script: &str,
+        program: &Path,
+        invoked: &str,
+        installed: InstalledBridge,
+        events: Option<&kr_plugin_sdk::hook_events::HookEvents>,
     ) -> Self {
         let runtime = placed.host.root().join("l");
         let inbox = placed.host.root().join("h");
@@ -609,6 +640,18 @@ impl Launch {
         .expect("the endpoint binds")
         .with_bridge(installed)
         .expect("the bridge is this launch's connector's");
+        let gateway = match events {
+            Some(events) => {
+                let file = runtime.join(kr_worker::broker::attach::EVENTS_FILE);
+                kr_ipc::paths::write_owner_only_file(
+                    &file,
+                    &serde_json::to_vec(events).expect("the events encode"),
+                )
+                .expect("the events are published");
+                gateway.with_events(file)
+            }
+            None => gateway,
+        };
         kr_ipc::paths::write_owner_only_file(
             &registration,
             gateway
