@@ -462,7 +462,16 @@ methods! {
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Delete the OpenAI key this host holds for voice calls on the owner's own account. \
-          Removing a key the host does not hold is answered as removing one it does.";
+          Removing a key the host does not hold is answered as removing one it does. The host \
+          keeps the key, and says so, while a call on it is not confirmed closed.";
+
+    VoiceCredentialForgetCalls = "voice.credential.forget_calls", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Forget this host's record of calls on the owner's own OpenAI key, and keep the key. \
+          The owner runs it when a call has ended and the host could not confirm it, for example \
+          after the key was revoked at the provider.";
 
     PrivacySet = "privacy.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
@@ -2248,6 +2257,7 @@ mod tests {
         // management, at this machine.
         ("voice.credential.set", &[ActionRight::HostManage]),
         ("voice.credential.remove", &[ActionRight::HostManage]),
+        ("voice.credential.forget_calls", &[ActionRight::HostManage]),
         // Privacy mode: switching this host's retention, and reading what it kept and what left.
         ("privacy.set", &[ActionRight::HostManage]),
         ("privacy.status", &[ActionRight::HostManage]),

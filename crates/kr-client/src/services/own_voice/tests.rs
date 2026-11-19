@@ -611,3 +611,88 @@ fn the_working_path_is_compiled_only_under_the_testing_gate() {
     );
     assert!(format!("{:?}", StandIn::new()).contains(STAND_IN_MARKER));
 }
+
+fn stored(world: &World, byte: u8, state: CallState, session: Option<&str>) {
+    world.ledger.put(super::super::own_call::CallRow {
+        call: NewCall {
+            call_id: format!("call-{byte}"),
+            attempt_id: format!("attempt-{byte}"),
+            action_id: ActionId::new(Uuid::from_bytes([byte; 16])),
+            device_id: "device-1".to_owned(),
+            asked_ms: 1_000,
+            closes_at_ms: 2_000,
+        },
+        state,
+        provider_session_id: session.map(str::to_owned),
+        provider_expires_ms: None,
+        closed_ms: (state == CallState::Closed).then_some(1),
+    });
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_removal_closes_each_stored_call_with_the_key_and_says_what_stands_afterwards() {
+    // A call that OpenAI confirms closed is marked and deleted, and nothing stands.
+    let world = fresh();
+    stored(&world, 1, CallState::Open, Some("live_a"));
+    stored(&world, 2, CallState::Closed, Some("live_b"));
+    assert_eq!(
+        world.provider.close_stored_calls().await,
+        StoredCalls::NoneLeft
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+    let hangups = world.stand_in.recorded().hangups;
+    assert_eq!(hangups.len(), 1, "a closed row needs no request");
+    assert_eq!(hangups[0], (KEY.to_owned(), "live_a".to_owned()));
+    // A creation never learned has nothing to hang up, and the key stays.
+    let world = fresh();
+    stored(&world, 3, CallState::Creating, None);
+    assert_eq!(
+        world.provider.close_stored_calls().await,
+        StoredCalls::OnlyCreating
+    );
+    assert!(world.stand_in.recorded().hangups.is_empty());
+    // A hangup that is not confirmed leaves the call unresolved and the key kept.
+    let world = fresh();
+    stored(&world, 4, CallState::Open, Some("live_c"));
+    world.stand_in.script_hangup(HangupScript::Lost);
+    assert_eq!(
+        world.provider.close_stored_calls().await,
+        StoredCalls::NotConfirmed
+    );
+    assert_eq!(states(&world), [CallState::Unresolved]);
+    // With no key held nothing is confirmed.
+    let world = fresh();
+    stored(&world, 5, CallState::Open, Some("live_d"));
+    world.keys.set(None);
+    assert_eq!(
+        world.provider.close_stored_calls().await,
+        StoredCalls::NotConfirmed
+    );
+    assert!(world.stand_in.recorded().hangups.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reconcile_closes_stored_calls_that_no_live_call_owns_and_deletes_closed_rows_without_a_request()
+ {
+    let world = fresh();
+    stored(&world, 1, CallState::Closed, Some("live_a"));
+    stored(&world, 2, CallState::Open, Some("live_b"));
+    stored(&world, 3, CallState::Creating, None);
+    world.provider.reconcile().await;
+    assert_eq!(states(&world), [CallState::Creating]);
+    assert_eq!(world.stand_in.recorded().hangups.len(), 1);
+    // An empty 404 is no closure: the call is unresolved, and the doctor names the command.
+    let world = fresh();
+    stored(&world, 4, CallState::Open, Some("live_c"));
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, Some(Vec::new())));
+    world.provider.reconcile().await;
+    assert_eq!(states(&world), [CallState::Unresolved]);
+    // A mark that cannot be written keeps the row's earlier state.
+    let world = fresh();
+    stored(&world, 5, CallState::Open, Some("live_d"));
+    world.ledger.failing("record_closed", true);
+    world.provider.reconcile().await;
+    assert_eq!(states(&world), [CallState::Open]);
+}

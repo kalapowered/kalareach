@@ -43,7 +43,7 @@ pub use authority::GrantAuthority;
 pub use context::{
     FilteredContext, SessionFacts, SessionSnapshot, filtered, snapshot_of, snapshot_with,
 };
-pub use credentials::VoiceCredentials;
+pub use credentials::{OwnKey, VoiceCredentials};
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use host_call::{
     ContextSelected, DelegationKind, DelegationRecord, FINAL_STATUS_KEEP_MS, FINAL_STATUS_RECORDS,
@@ -226,6 +226,20 @@ impl VoiceModule {
                 .await;
         }
         self.coordinator.end_calls_that_are_over(now_ms).await;
+    }
+
+    /// Ends every call the host controls itself, as a stop would (the grant first, then the
+    /// provider), for `reason`.
+    pub async fn end_host_calls(
+        &self,
+        reason: kr_protocol::voice_host::VoiceEndReason,
+        now_ms: u64,
+    ) {
+        for voice_session_id in self.host_calls.voice_session_ids() {
+            self.coordinator
+                .end_call(voice_session_id, reason, now_ms)
+                .await;
+        }
     }
 
     /// The managed broker's origin this service names to a device whose voice session starts,

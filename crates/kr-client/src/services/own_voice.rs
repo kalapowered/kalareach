@@ -160,6 +160,28 @@ pub mod words {
         "The host-management authority is the right that decides whose OpenAI key a call uses; what a call may do on this host is decided by the voice grant and the device's own grant, as for every voice call.",
     ];
 
+    /// A key is replaced while a call is using it.
+    pub const KEY_IN_USE: &str =
+        "A call is using this key; replace it after the call has ended and is confirmed closed.";
+
+    /// A removal found a call it could not confirm closed.
+    pub const NOT_CONFIRMED_CLOSED: &str = "The call on this key could not be confirmed closed, so the host kept the key to try again. If you revoked the key at OpenAI, or your OpenAI usage shows that the call has ended, run kr voice credential forget-calls, then remove the key again.";
+
+    /// A removal found a start whose creation was never learned.
+    pub const CREATION_NOT_LEARNED: &str = "This host started a call on this key and did not learn whether OpenAI created it, so the host kept the key. If your OpenAI usage shows that no call is running, run kr voice credential forget-calls, then remove the key again.";
+
+    /// The record of calls could not be emptied.
+    pub const NOT_FORGOTTEN: &str = "This host could not forget its record of calls on your OpenAI key, so the record stays as it was.";
+
+    /// The doctor's line for a call that is not confirmed closed.
+    #[must_use]
+    pub fn not_confirmed_closed_since(action: ActionId, begun: &str) -> String {
+        format!(
+            "own-key voice call {action}: not confirmed closed since {begun} UTC; if it has \
+             ended, run kr voice credential forget-calls"
+        )
+    }
+
     /// A start while the host is removing the key or forgetting calls.
     pub const SETTLING: &str =
         "This host is still closing its earlier OpenAI key calls, so it starts no new call now.";
@@ -526,6 +548,17 @@ pub enum Settled {
     MayStillRun,
 }
 
+/// What stands among the stored calls after each that could be closed was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoredCalls {
+    /// No call that is not closed stands.
+    NoneLeft,
+    /// Only calls that never learned a session id stand.
+    OnlyCreating,
+    /// A call that holds a session id stands, not confirmed closed.
+    NotConfirmed,
+}
+
 struct StartSlot {
     asked: Instant,
     end: Mutex<Option<StartEnd>>,
@@ -799,6 +832,38 @@ impl OwnVoiceProvider {
                     .reconcile_row(&row.call.call_id, Some(session_id))
                     .await;
             }
+        }
+    }
+
+    /// Closes every stored call that holds a session id, with the key still in the store, and
+    /// says what stands afterwards. A closed row is deleted with no request.
+    pub async fn close_stored_calls(&self) -> StoredCalls {
+        let Ok(rows) = self.core.ledger.rows() else {
+            return StoredCalls::NotConfirmed;
+        };
+        for row in rows {
+            if row.state == CallState::Closed {
+                let _ = self.core.ledger.delete(&row.call.call_id);
+            } else if let Some(session_id) = row.provider_session_id.as_deref() {
+                let _ = self
+                    .core
+                    .hang_up_and_mark(&row.call.call_id, session_id)
+                    .await;
+            }
+        }
+        let Ok(rows) = self.core.ledger.rows() else {
+            return StoredCalls::NotConfirmed;
+        };
+        let mut standing = rows
+            .iter()
+            .filter(|row| row.state.blocks_a_start())
+            .peekable();
+        if standing.peek().is_none() {
+            StoredCalls::NoneLeft
+        } else if standing.all(|row| row.provider_session_id.is_none()) {
+            StoredCalls::OnlyCreating
+        } else {
+            StoredCalls::NotConfirmed
         }
     }
 
@@ -1975,6 +2040,37 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
             })?;
             Ok(Box::new(WebSocketSideband { socket }) as Box<dyn SidebandSocket>)
         })
+    }
+}
+
+/// The transport of a host that could not build the real one: it reaches nothing, so every
+/// request is a lost answer and no call is made or confirmed closed through it.
+#[derive(Debug)]
+pub struct UnreachableTransport;
+
+impl OwnVoiceTransport for UnreachableTransport {
+    fn create<'a>(
+        &'a self,
+        _key: &'a SecretText,
+        _body: Vec<u8>,
+    ) -> TransportFuture<'a, std::result::Result<Reply, Lost>> {
+        Box::pin(async { Err(Lost) })
+    }
+
+    fn hangup<'a>(
+        &'a self,
+        _key: &'a SecretText,
+        _session_id: &'a str,
+    ) -> TransportFuture<'a, std::result::Result<Reply, Lost>> {
+        Box::pin(async { Err(Lost) })
+    }
+
+    fn attach<'a>(
+        &'a self,
+        _key: &'a SecretText,
+        _session_id: &'a str,
+    ) -> TransportFuture<'a, std::result::Result<Box<dyn SidebandSocket>, AttachFault>> {
+        Box::pin(async { Err(AttachFault::Unavailable) })
     }
 }
 

@@ -455,6 +455,8 @@ pub struct Started {
     pub network: configuration::NetworkSelection,
     /// The voice broker this daemon starts its paired devices' calls at.
     pub voice: configuration::VoiceSelection,
+    /// The provider whose account this daemon runs its own voice calls on.
+    pub own_voice: configuration::OwnVoiceSelection,
     /// The managed storage service this daemon uploads its backups to.
     pub storage: configuration::StorageSelection,
     /// The authority feed this daemon reads its remote revocations from.
@@ -471,6 +473,7 @@ impl PartialEq for Started {
     fn eq(&self, other: &Self) -> bool {
         network_selects_alike(&self.network, &other.network)
             && self.voice == other.voice
+            && self.own_voice == other.own_voice
             && self.storage == other.storage
             && self.authority == other.authority
             && self.mailbox == other.mailbox
@@ -533,6 +536,7 @@ impl Started {
             |document| Self {
                 network: document.network.clone(),
                 voice: document.voice.clone(),
+                own_voice: document.own_voice.clone(),
                 storage: document.storage.clone(),
                 authority: document.authority.clone(),
                 mailbox: document.mailbox.clone(),

@@ -87,9 +87,12 @@ service with content at all; the only calls it makes are reading the terms the s
 creating a call and ending one. When a call's control first attaches, the phone reads the
 selection for the call's first session and sends exactly that as the call's opening context.
 
-The host owner keeps one OpenAI key in this host's secret store with `voice.credential.set` and
-deletes it with `voice.credential.remove`. Both are served on the local socket only, and no answer
-carries the key. A call does not use the key.
+The host owner keeps one OpenAI key in this host's secret store with `voice.credential.set`,
+deletes it with `voice.credential.remove`, and forgets the host's record of calls on it with
+`voice.credential.forget_calls`, which keeps the key. All three are served on the local socket only,
+and no answer carries the key. A call uses the key only when this host's configuration names
+`own_voice.provider`, and only a device that holds host-management authority on this host can start
+one.
 
 ## The OpenAI key on this host
 
@@ -97,7 +100,10 @@ carries the key. A call does not use the key.
 replaces the one it holds. The command reads the key from standard input, either typed where nothing
 is shown or piped in. It takes the key from no argument and no environment variable, because both
 stay in your shell's history or in the process list. `kr voice credential remove --provider
-openai-live` deletes the key.
+openai-live` deletes the key. `kr voice credential forget-calls --provider openai-live` forgets this
+host's record of calls on the key and keeps the key. Run it after a call has ended when the host
+could not confirm that the call closed. While a call on the key is not confirmed closed, `kr voice credential remove` keeps
+the key and says so.
 
 A key is 20 to 256 printable ASCII characters with no space. The host checks that shape and asks
 OpenAI nothing, so a key that OpenAI would refuse is kept as it is. Neither command prints the key,

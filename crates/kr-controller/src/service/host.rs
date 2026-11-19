@@ -961,6 +961,7 @@ impl Controller {
             self.in_force().unusable.as_ref(),
         ));
         checks.extend(self.device_repository_checks().await);
+        checks.extend(self.own_key_call_checks());
         // The configuration, its precedence, its overrides and its ceilings. After the checks
         // above because those are about whether this host is working; these are about what it is
         // working from.
@@ -1079,6 +1080,34 @@ impl Controller {
     ///
     /// The proof is made again here and held in place of the last one, so the door and the report
     /// say the same thing.
+    /// One line for each call on the owner's own key that is not confirmed closed, with the
+    /// command that clears it.
+    fn own_key_call_checks(&self) -> Vec<DoctorCheck> {
+        let Ok(rows) = self.own_voice.ledger().rows() else {
+            return Vec::new();
+        };
+        rows.iter()
+            .filter(|row| row.state.blocks_a_start())
+            .map(|row| {
+                // The words are this build's; the action and the time are composed from the row, one
+                // character of a fixed set at a time.
+                let line = Sentence::new().stated("own-key voice call ");
+                let line = append_plain(line, &row.call.action_id.to_string());
+                let line = append_plain(
+                    line.stated(": not confirmed closed since "),
+                    &kr_client::services::own_voice::utc(row.call.asked_ms),
+                );
+                DoctorCheck::new(
+                    "voice-own-key-call",
+                    "A call on the owner's own key",
+                    DoctorStatus::Warning,
+                    line.stated(" UTC; if it has ended, run kr voice credential forget-calls"),
+                    None,
+                )
+            })
+            .collect()
+    }
+
     async fn device_repository_checks(&self) -> Vec<DoctorCheck> {
         use kr_project::service::Refusal;
 
@@ -2038,4 +2067,34 @@ struct StartedLike {
     working_directory: String,
     environment: Vec<PathVariable>,
     configuration_directory: Option<String>,
+}
+
+/// Appends text made of digits, the letters a to f, and the characters of a date and an
+/// identifier, one fixed character at a time. Anything else is shown as a question mark.
+fn append_plain(mut sentence: Sentence, text: &str) -> Sentence {
+    for character in text.chars() {
+        sentence = sentence.stated(match character.to_ascii_lowercase() {
+            '0' => "0",
+            '1' => "1",
+            '2' => "2",
+            '3' => "3",
+            '4' => "4",
+            '5' => "5",
+            '6' => "6",
+            '7' => "7",
+            '8' => "8",
+            '9' => "9",
+            'a' => "a",
+            'b' => "b",
+            'c' => "c",
+            'd' => "d",
+            'e' => "e",
+            'f' => "f",
+            '-' => "-",
+            ':' => ":",
+            ' ' => " ",
+            _ => "?",
+        });
+    }
+    sentence
 }

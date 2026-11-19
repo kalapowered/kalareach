@@ -352,6 +352,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         // socket alone, asking for host management, and answered without the key.
         ("voice.credential.set", EffectClass::Write),
         ("voice.credential.remove", EffectClass::Write),
+        ("voice.credential.forget_calls", EffectClass::Write),
     ];
     for (name, effect) in delivery {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));

@@ -194,6 +194,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::DeliveryDestinationSecretSet
         | Method::VoiceCredentialSet
         | Method::VoiceCredentialRemove
+        | Method::VoiceCredentialForgetCalls
         | Method::PrivacySet
         | Method::PrivacyRetainedDelete
         | Method::HostPolicyConfirm

@@ -1,7 +1,7 @@
 //! The key a host owner sets for voice calls that run on the owner's own provider account.
 //!
 //! The owner sets the key once, at this machine, with `voice.credential.set`, and the host keeps it
-//! in its secret store. `voice.credential.remove` deletes it. No method answers with the key
+//! in its secret store. `voice.credential.remove` deletes it, and `voice.credential.forget_calls` forgets the host's record of calls on it and keeps it. No method answers with the key
 //! afterwards, no field of any answer has room for it, and a paired device never sees it: the
 //! methods are on the local socket alone.
 //!
@@ -75,6 +75,42 @@ pub struct VoiceCredentialRemoveResult {
     pub kind: VoiceCredentialKind,
     /// Whether the host held a key that this call deleted.
     pub removed: bool,
+    /// What became of a call that was still starting when the key was removed.
+    pub late_start: VoiceLateStart,
+}
+
+/// What became of a call that was still starting when the owner removed the key or forgot the
+/// calls. It is read from what the start did, never guessed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceLateStart {
+    /// No call was still starting.
+    None,
+    /// A call that was still starting was closed at the provider.
+    Closed,
+    /// A call that was still starting may be running at the provider: it was not confirmed
+    /// closed, or the provider never said whether it created it.
+    MayStillRun,
+}
+
+/// Parameters of `voice.credential.forget_calls`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceCredentialForgetCallsParams {
+    /// Which provider's call records to forget.
+    pub kind: VoiceCredentialKind,
+}
+
+/// The result of `voice.credential.forget_calls`. The key stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceCredentialForgetCallsResult {
+    /// Which provider's records the answer is about.
+    pub kind: VoiceCredentialKind,
+    /// How many call records the host forgot.
+    pub calls_forgotten: u32,
+    /// What became of a call that was still starting.
+    pub late_start: VoiceLateStart,
 }
 
 /// Checks the shape of a key: 20 to 256 bytes of printable ASCII with no whitespace.

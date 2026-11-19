@@ -915,7 +915,14 @@ pub enum VoiceCredentialCommand {
     /// shown, or pipe it in. This host keeps it in its secret store and never prints it.
     Set(VoiceCredentialSetArguments),
     /// Delete the key this host holds for a provider.
+    ///
+    /// The host keeps the key, and says so, while a call on it is not confirmed closed.
     Remove(VoiceCredentialRemoveArguments),
+    /// Forget this host's record of calls on a provider's key, and keep the key.
+    ///
+    /// Run it when a call has ended and the host could not confirm it, for example after the key
+    /// was revoked at the provider. Then remove the key again if you want it gone.
+    ForgetCalls(VoiceCredentialRemoveArguments),
 }
 
 /// `kr voice credential set`.

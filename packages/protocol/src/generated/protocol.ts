@@ -2922,6 +2922,11 @@ export type VoiceHostRefusal =
   | 'privacy'
   | 'busy'
 /**
+ * What became of a call that was still starting when the owner removed the key or forgot the
+ * calls. It is read from what the start did, never guessed.
+ */
+export type VoiceLateStart = 'none' | 'closed' | 'may_still_run'
+/**
  * What happened on the host that the device needs to know. Carries states, offsets and counts
  * and no content.
  */
@@ -3807,6 +3812,8 @@ export interface KalaReachProtocol {
   voice_control_arm?: VoiceControlArm
   voice_control_params?: VoiceControlParams
   voice_control_result?: VoiceControlResult
+  voice_credential_forget_calls_params?: VoiceCredentialForgetCallsParams
+  voice_credential_forget_calls_result?: VoiceCredentialForgetCallsResult
   voice_credential_kind?: VoiceCredentialKind
   voice_credential_remove_params?: VoiceCredentialRemoveParams
   voice_credential_remove_result?: VoiceCredentialRemoveResult
@@ -3821,6 +3828,7 @@ export interface KalaReachProtocol {
   voice_host_call_state?: VoiceHostCallState
   voice_host_refusal?: VoiceHostRefusal
   voice_instructions?: VoiceInstructions
+  voice_late_start?: VoiceLateStart
   voice_managed_terms?: VoiceManagedTerms
   voice_news?: VoiceNews
   voice_news_item?: VoiceNewsItem
@@ -19891,6 +19899,7 @@ export interface MethodEntry {
     | 'delivery.destination.secret.set'
     | 'voice.credential.set'
     | 'voice.credential.remove'
+    | 'voice.credential.forget_calls'
     | 'privacy.set'
     | 'privacy.status'
     | 'privacy.retained.delete'
@@ -29027,6 +29036,7 @@ export interface ServiceRequestPayload {
     | 'delivery.destination.secret.set'
     | 'voice.credential.set'
     | 'voice.credential.remove'
+    | 'voice.credential.forget_calls'
     | 'privacy.set'
     | 'privacy.status'
     | 'privacy.retained.delete'
@@ -32637,6 +32647,32 @@ export interface VoiceNews {
   seq: string
 }
 /**
+ * Parameters of `voice.credential.forget_calls`.
+ */
+export interface VoiceCredentialForgetCallsParams {
+  /**
+   * Which provider's call records to forget.
+   */
+  kind: 'openai_live'
+}
+/**
+ * The result of `voice.credential.forget_calls`. The key stays.
+ */
+export interface VoiceCredentialForgetCallsResult {
+  /**
+   * How many call records the host forgot.
+   */
+  calls_forgotten: number
+  /**
+   * Which provider's records the answer is about.
+   */
+  kind: 'openai_live'
+  /**
+   * What became of a call that was still starting.
+   */
+  late_start: 'none' | 'closed' | 'may_still_run'
+}
+/**
  * Parameters of `voice.credential.remove`.
  */
 export interface VoiceCredentialRemoveParams {
@@ -32653,6 +32689,10 @@ export interface VoiceCredentialRemoveResult {
    * Which provider's key the answer is about.
    */
   kind: 'openai_live'
+  /**
+   * What became of a call that was still starting when the key was removed.
+   */
+  late_start: 'none' | 'closed' | 'may_still_run'
   /**
    * Whether the host held a key that this call deleted.
    */

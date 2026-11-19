@@ -129,6 +129,24 @@ impl Controller {
         let _ = self.voice.set(module);
     }
 
+    /// Ends every call this host controls itself. A host whose voice service is not registered
+    /// holds none.
+    pub(crate) async fn end_host_calls(&self, reason: kr_protocol::voice_host::VoiceEndReason) {
+        if let Some(voice) = self.voice.get() {
+            voice.end_host_calls(reason, self.settled_now_ms()).await;
+        }
+    }
+
+    /// Closes the calls this host controls itself before the daemon exits, within a bound. A
+    /// crash, a sleep or a lost network leaves their records for the next start to reconcile.
+    pub async fn close_host_calls_for_stop(&self) {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(25),
+            self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::Stop),
+        )
+        .await;
+    }
+
     /// The environment's voice service.
     ///
     /// # Panics

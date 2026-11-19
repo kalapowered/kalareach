@@ -333,7 +333,9 @@ pub(crate) const fn described_in(method: Method) -> Section {
         Method::VoiceControl | Method::VoiceContextSend => {
             at(VOICE, "A call on the host's own key")
         }
-        Method::VoiceCredentialSet | Method::VoiceCredentialRemove => at(VOICE, "Where it goes"),
+        Method::VoiceCredentialSet
+        | Method::VoiceCredentialRemove
+        | Method::VoiceCredentialForgetCalls => at(VOICE, "Where it goes"),
 
         Method::WorkflowInstall
         | Method::WorkflowEnable

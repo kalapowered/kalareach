@@ -272,8 +272,9 @@ use crate::voice::{
     VoiceSessionDescriptor, VoiceStartParams, VoiceStartResult, VoiceStopParams, VoiceStopResult,
 };
 use crate::voice_credential::{
-    VoiceCredentialKind, VoiceCredentialRemoveParams, VoiceCredentialRemoveResult,
-    VoiceCredentialSetParams, VoiceCredentialSetResult,
+    VoiceCredentialForgetCallsParams, VoiceCredentialForgetCallsResult, VoiceCredentialKind,
+    VoiceCredentialRemoveParams, VoiceCredentialRemoveResult, VoiceCredentialSetParams,
+    VoiceCredentialSetResult, VoiceLateStart,
 };
 use crate::voice_host::{
     VoiceContextSendParams, VoiceContextSendResult, VoiceContextState, VoiceContextStop,
@@ -901,6 +902,9 @@ pub fn protocol_schema() -> Value {
         "voice_credential_set_result" => VoiceCredentialSetResult,
         "voice_credential_remove_params" => VoiceCredentialRemoveParams,
         "voice_credential_remove_result" => VoiceCredentialRemoveResult,
+        "voice_credential_forget_calls_params" => VoiceCredentialForgetCallsParams,
+        "voice_credential_forget_calls_result" => VoiceCredentialForgetCallsResult,
+        "voice_late_start" => VoiceLateStart,
         "voice_credential_kind" => VoiceCredentialKind,
         "destination_secret" => DestinationSecret,
         "destination_secret_kind" => DestinationSecretKind,

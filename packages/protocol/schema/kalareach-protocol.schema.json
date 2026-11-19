@@ -22693,7 +22693,12 @@
         },
         {
           "const": "voice.credential.remove",
-          "description": "Delete the OpenAI key this host holds for voice calls on the owner's own account. Removing a key the host does not hold is answered as removing one it does.",
+          "description": "Delete the OpenAI key this host holds for voice calls on the owner's own account. Removing a key the host does not hold is answered as removing one it does. The host keeps the key, and says so, while a call on it is not confirmed closed.",
+          "type": "string"
+        },
+        {
+          "const": "voice.credential.forget_calls",
+          "description": "Forget this host's record of calls on the owner's own OpenAI key, and keep the key. The owner runs it when a call has ended and the host could not confirm it, for example after the key was revoked at the provider.",
           "type": "string"
         },
         {
@@ -41714,6 +41719,46 @@
         }
       ]
     },
+    "VoiceCredentialForgetCallsParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.credential.forget_calls`.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/VoiceCredentialKind",
+          "description": "Which provider's call records to forget."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "VoiceCredentialForgetCallsResult": {
+      "additionalProperties": false,
+      "description": "The result of `voice.credential.forget_calls`. The key stays.",
+      "properties": {
+        "calls_forgotten": {
+          "description": "How many call records the host forgot.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/VoiceCredentialKind",
+          "description": "Which provider's records the answer is about."
+        },
+        "late_start": {
+          "$ref": "#/$defs/VoiceLateStart",
+          "description": "What became of a call that was still starting."
+        }
+      },
+      "required": [
+        "kind",
+        "calls_forgotten",
+        "late_start"
+      ],
+      "type": "object"
+    },
     "VoiceCredentialKind": {
       "description": "The providers a key can be kept for.",
       "oneOf": [
@@ -41746,6 +41791,10 @@
           "$ref": "#/$defs/VoiceCredentialKind",
           "description": "Which provider's key the answer is about."
         },
+        "late_start": {
+          "$ref": "#/$defs/VoiceLateStart",
+          "description": "What became of a call that was still starting when the key was removed."
+        },
         "removed": {
           "description": "Whether the host held a key that this call deleted.",
           "type": "boolean"
@@ -41753,7 +41802,8 @@
       },
       "required": [
         "kind",
-        "removed"
+        "removed",
+        "late_start"
       ],
       "type": "object"
     },
@@ -42296,6 +42346,26 @@
         "text"
       ],
       "type": "object"
+    },
+    "VoiceLateStart": {
+      "description": "What became of a call that was still starting when the owner removed the key or forgot the\ncalls. It is read from what the start did, never guessed.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "No call was still starting.",
+          "type": "string"
+        },
+        {
+          "const": "closed",
+          "description": "A call that was still starting was closed at the provider.",
+          "type": "string"
+        },
+        {
+          "const": "may_still_run",
+          "description": "A call that was still starting may be running at the provider: it was not confirmed\nclosed, or the provider never said whether it created it.",
+          "type": "string"
+        }
+      ]
     },
     "VoiceManagedTerms": {
       "additionalProperties": false,
@@ -47374,6 +47444,12 @@
     "voice_control_result": {
       "$ref": "#/$defs/VoiceControlResult"
     },
+    "voice_credential_forget_calls_params": {
+      "$ref": "#/$defs/VoiceCredentialForgetCallsParams"
+    },
+    "voice_credential_forget_calls_result": {
+      "$ref": "#/$defs/VoiceCredentialForgetCallsResult"
+    },
     "voice_credential_kind": {
       "$ref": "#/$defs/VoiceCredentialKind"
     },
@@ -47415,6 +47491,9 @@
     },
     "voice_instructions": {
       "$ref": "#/$defs/VoiceInstructions"
+    },
+    "voice_late_start": {
+      "$ref": "#/$defs/VoiceLateStart"
     },
     "voice_managed_terms": {
       "$ref": "#/$defs/VoiceManagedTerms"

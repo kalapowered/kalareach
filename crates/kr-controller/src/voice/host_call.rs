@@ -452,6 +452,12 @@ impl HostCalls {
         self.registry().calls.len()
     }
 
+    /// The voice session of each call the host holds.
+    #[must_use]
+    pub fn voice_session_ids(&self) -> Vec<VoiceSessionId> {
+        self.registry().calls.keys().copied().collect()
+    }
+
     /// Whether the host holds no call.
     #[must_use]
     pub fn is_empty(&self) -> bool {

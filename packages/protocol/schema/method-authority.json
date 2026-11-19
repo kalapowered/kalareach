@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 203,
+  "method_count": 204,
   "methods": [
     {
       "capability": "none",
@@ -398,7 +398,36 @@
       "resource_selectors": [
         "environment"
       ],
-      "summary": "Delete the OpenAI key this host holds for voice calls on the owner's own account. Removing a key the host does not hold is answered as removing one it does.",
+      "summary": "Delete the OpenAI key this host holds for voice calls on the owner's own account. Removing a key the host does not hold is answered as removing one it does. The host keeps the key, and says so, while a call on it is not confirmed closed.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "voice.credential.forget_calls",
+      "name": "voice.credential.forget_calls",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Forget this host's record of calls on the owner's own OpenAI key, and keep the key. The owner runs it when a call has ended and the host could not confirm it, for example after the key was revoked at the provider.",
       "version": 1
     },
     {

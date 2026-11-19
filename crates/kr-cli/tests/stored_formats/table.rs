@@ -508,6 +508,10 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
         ),
         (Method::VoiceCredentialSet, "VoiceCredentialSetResult"),
         (Method::VoiceCredentialRemove, "VoiceCredentialRemoveResult"),
+        (
+            Method::VoiceCredentialForgetCalls,
+            "VoiceCredentialForgetCallsResult",
+        ),
         (Method::DevicePushRegister, "DevicePushRegisterResult"),
         (Method::OrganisationEnrol, "OrganisationEnrolResult"),
         (
@@ -682,6 +686,9 @@ pub fn table() -> Vec<Store> {
                 protocol::<voice_credential::VoiceCredentialSetResult>("VoiceCredentialSetResult"),
                 protocol::<voice_credential::VoiceCredentialRemoveResult>(
                     "VoiceCredentialRemoveResult",
+                ),
+                protocol::<voice_credential::VoiceCredentialForgetCallsResult>(
+                    "VoiceCredentialForgetCallsResult",
                 ),
                 protocol::<identity::EnvironmentEnrolResult>("EnvironmentEnrolResult"),
                 protocol::<identity::EnvironmentForgetResult>("EnvironmentForgetResult"),

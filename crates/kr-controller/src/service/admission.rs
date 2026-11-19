@@ -1422,6 +1422,17 @@ impl Controller {
                 kr_protocol::voice_credential::check_voice_key(&params.key)
                     .map_err(|rule| ControllerError::InvalidArgument(rule.to_owned()))?;
             }
+            Method::VoiceCredentialForgetCalls => {
+                if mutation.target.session_id.as_ref().is_some()
+                    || mutation.target.application_instance_id.is_present()
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "a voice key belongs to this environment, not to one session".to_owned(),
+                    ));
+                }
+                let _: kr_protocol::voice_credential::VoiceCredentialForgetCallsParams =
+                    parse(&mutation.params)?;
+            }
             Method::VoiceCredentialRemove => {
                 if mutation.target.session_id.as_ref().is_some()
                     || mutation.target.application_instance_id.is_present()

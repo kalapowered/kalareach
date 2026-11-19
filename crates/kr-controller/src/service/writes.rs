@@ -84,6 +84,7 @@ impl LocalWrite {
             | Method::DeliveryDestinationSecretSet
             | Method::VoiceCredentialSet
             | Method::VoiceCredentialRemove
+            | Method::VoiceCredentialForgetCalls
             | Method::OrganisationEnrol
             | Method::OrganisationExclusiveSet
             | Method::OrganisationWithdraw => Self::Authority,

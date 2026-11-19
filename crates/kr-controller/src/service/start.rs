@@ -854,7 +854,7 @@ impl Controller {
         // nothing a process inherited. They go through the proxy this daemon started with, the
         // endpoint's own, and nothing runs yet: settling comes before the store is reconciled,
         // and the carrier starts after it.
-        let clients = Self::build_service_clients(
+        let mut clients = Self::build_service_clients(
             &started,
             &super::clients::ClientParts {
                 account: &account,
@@ -1001,7 +1001,9 @@ impl Controller {
         let capability_answers = crate::capability_answers::Record::open(setup.paths.state_dir())?;
         // The record of own-key calls exists whether or not a key is held or a provider is named,
         // so the environment's stored formats do not depend on the configuration.
-        crate::voice::own_key_calls::OwnKeyCalls::open(setup.paths.state_dir())?;
+        let own_key_calls = Arc::new(crate::voice::own_key_calls::OwnKeyCalls::open(
+            setup.paths.state_dir(),
+        )?);
         let mailbox_reader = match started.authority.origin() {
             None => None,
             Some(origin) => {
@@ -1032,6 +1034,43 @@ impl Controller {
         // in a scope of their own, and never in the delivery journal.
         let voice_credentials =
             crate::voice::VoiceCredentials::new(Arc::clone(&secret_store), setup.environment_id);
+        // The calls on the owner's own key. The provider reads the key from the store for each
+        // use, and reaches OpenAI through the proxy this daemon started with, or reaches nothing
+        // when no transport can be built. The document decides only whether devices are given it.
+        let own_voice = {
+            use kr_client::services::own_voice::{
+                OwnVoiceProvider, UnreachableTransport, connect_production,
+            };
+            let proxy = Self::outbound_of(&started)
+                .and_then(|route| route.proxy().map(|proxy| proxy.cloned()));
+            let transport: Arc<dyn kr_client::services::own_voice::OwnVoiceTransport> =
+                match proxy.map_err(|error| error.to_string()).and_then(|proxy| {
+                    connect_production(proxy.as_ref()).map_err(|error| error.to_string())
+                }) {
+                    Ok(transport) => transport,
+                    Err(reason) => {
+                        eprintln!("kr-controller: own-key voice has no transport: {reason}");
+                        Arc::new(UnreachableTransport)
+                    }
+                };
+            Arc::new(OwnVoiceProvider::new(
+                Arc::clone(&own_key_calls) as Arc<dyn kr_client::services::OwnCallLedger>,
+                kr_client::services::CallRegistry::new(Arc::clone(&own_key_calls) as _),
+                Arc::new(crate::voice::OwnKey::new(
+                    crate::voice::VoiceCredentials::new(
+                        Arc::clone(&secret_store),
+                        setup.environment_id,
+                    ),
+                )),
+                transport,
+                Arc::new(|| kr_ipc::now_ms().get()),
+            ))
+        };
+        if started.own_voice.provider().is_some() {
+            clients.managed_inference =
+                Some(Arc::clone(&own_voice)
+                    as Arc<dyn kr_client::services::voice::VoiceProviderService>);
+        }
         let destination_secrets = crate::push::secrets::DestinationSecrets::new(
             Arc::clone(&secret_store),
             setup.environment_id,
@@ -1395,6 +1434,7 @@ impl Controller {
             descriptions,
             delivery,
             voice_credentials,
+            own_voice,
             delivery_runtime,
             gateways,
             #[cfg(feature = "testing")]

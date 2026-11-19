@@ -11,8 +11,9 @@ use kr_ipc::paths::HostPaths;
 use kr_protocol::delivery::SecretText;
 use kr_protocol::method::Method;
 use kr_protocol::voice_credential::{
-    VoiceCredentialKind, VoiceCredentialRemoveParams, VoiceCredentialRemoveResult,
-    VoiceCredentialSetParams, VoiceCredentialSetResult,
+    VoiceCredentialForgetCallsParams, VoiceCredentialForgetCallsResult, VoiceCredentialKind,
+    VoiceCredentialRemoveParams, VoiceCredentialRemoveResult, VoiceCredentialSetParams,
+    VoiceCredentialSetResult, VoiceLateStart,
 };
 
 use crate::cli::{
@@ -36,6 +37,9 @@ pub async fn run(paths: &HostPaths, command: VoiceCommand, json: bool) -> Result
         }
         VoiceCommand::Credential(VoiceCredentialCommand::Remove(arguments)) => {
             remove(paths, &arguments, json).await
+        }
+        VoiceCommand::Credential(VoiceCredentialCommand::ForgetCalls(arguments)) => {
+            forget_calls(paths, &arguments, json).await
         }
     }
 }
@@ -101,11 +105,66 @@ async fn remove(
     if json {
         output::document(&remove_document(&removed));
     } else if removed.removed {
-        output::say(&Shown::said("This host deleted the OpenAI key."));
+        output::say(&Shown::said(match removed.late_start {
+            VoiceLateStart::None => "This host deleted the OpenAI key.",
+            VoiceLateStart::Closed => {
+                "This host deleted the key. A call that was still starting was closed at OpenAI."
+            }
+            VoiceLateStart::MayStillRun => {
+                "This host deleted the key. A call that was still starting may be running at OpenAI, because this host could not confirm that it was closed or learn whether it was created. Check your OpenAI usage."
+            }
+        }));
     } else {
         output::say(&Shown::said("This host held no OpenAI key."));
     }
     Ok(())
+}
+
+/// `kr voice credential forget-calls`.
+async fn forget_calls(
+    paths: &HostPaths,
+    arguments: &VoiceCredentialRemoveArguments,
+    json: bool,
+) -> Result<()> {
+    let kind = kind_of(&arguments.provider)?;
+    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
+    let forgotten: VoiceCredentialForgetCallsResult = daemon
+        .mutate(
+            Method::VoiceCredentialForgetCalls,
+            &VoiceCredentialForgetCallsParams { kind },
+        )
+        .await?;
+    if json {
+        output::document(
+            &Document::new()
+                .with("kind", forgotten.kind.as_str())
+                .with("calls_forgotten", u64::from(forgotten.calls_forgotten))
+                .with("late_start", late_start_word(forgotten.late_start))
+                .with("ok", true),
+        );
+    } else {
+        output::say(&Shown::said(match forgotten.late_start {
+            VoiceLateStart::None => {
+                "This host forgot every call record and kept the key. No call was still starting."
+            }
+            VoiceLateStart::Closed => {
+                "This host forgot every call record and kept the key. A call that was still starting was closed at OpenAI."
+            }
+            VoiceLateStart::MayStillRun => {
+                "This host forgot every call record and kept the key. A call that was still starting may be running at OpenAI, because this host could not confirm that it was closed or learn whether it was created. Check your OpenAI usage."
+            }
+        }));
+    }
+    Ok(())
+}
+
+/// The word a script reads for what became of a call that was still starting.
+const fn late_start_word(late: VoiceLateStart) -> &'static str {
+    match late {
+        VoiceLateStart::None => "none",
+        VoiceLateStart::Closed => "closed",
+        VoiceLateStart::MayStillRun => "may_still_run",
+    }
 }
 
 /// What setting a key did, for a script, in the shape the protocol answers it.
@@ -121,6 +180,7 @@ fn remove_document(removed: &VoiceCredentialRemoveResult) -> Document {
     Document::new()
         .with("kind", removed.kind.as_str())
         .with("removed", removed.removed)
+        .with("late_start", late_start_word(removed.late_start))
         .with("ok", true)
 }
 

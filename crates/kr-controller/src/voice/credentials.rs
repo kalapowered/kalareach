@@ -48,6 +48,29 @@ impl fmt::Debug for VoiceCredentials {
     }
 }
 
+/// The key as the own-key provider reads it: from the store, for each use, never held between.
+#[derive(Debug)]
+pub struct OwnKey(VoiceCredentials);
+
+impl OwnKey {
+    /// A key source over the host's voice credentials.
+    #[must_use]
+    pub const fn new(credentials: VoiceCredentials) -> Self {
+        Self(credentials)
+    }
+}
+
+impl kr_client::services::own_voice::OwnKeySource for OwnKey {
+    fn key(
+        &self,
+    ) -> std::result::Result<Option<SecretText>, kr_client::services::own_voice::KeyUnreadable>
+    {
+        self.0
+            .get(VoiceCredentialKind::OpenaiLive)
+            .map_err(|_| kr_client::services::own_voice::KeyUnreadable)
+    }
+}
+
 impl VoiceCredentials {
     /// Keeps keys in `store`, inside the scope of one environment.
     #[must_use]

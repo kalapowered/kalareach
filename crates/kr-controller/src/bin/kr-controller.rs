@@ -352,6 +352,8 @@ async fn run(
             println!("kr-controller: stopped: a stop was requested on the local socket");
         }
     }
+    // A clean stop closes the calls on the owner's own key before the stores close.
+    controller.close_host_calls_for_stop().await;
     Ok(())
 }
 

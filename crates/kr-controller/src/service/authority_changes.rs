@@ -20,6 +20,8 @@ use kr_protocol::sharing::{
     MAX_NAMED_RESOURCES, NamedApprovalPreview, NamedQuestionPreview, RoleSelection,
 };
 
+use kr_client::services::own_voice::{StoredCalls, words};
+
 use crate::error::{ControllerError, Result};
 use crate::given::{Given, Recorded, Settled};
 
@@ -1346,6 +1348,9 @@ impl Controller {
                 Method::VoiceCredentialRemove => {
                     self.voice_credential_remove(mutation, carried).await
                 }
+                Method::VoiceCredentialForgetCalls => {
+                    self.voice_credential_forget_calls(mutation, carried).await
+                }
                 Method::DeliveryDestinationConfigure => {
                     self.delivery_destination_configure(mutation, carried).await
                 }
@@ -1438,6 +1443,19 @@ impl Controller {
             .map_err(|rule| ControllerError::InvalidArgument(rule.to_owned()))?;
         let registry = self.registry.lock().await;
         self.check_admission(&registry, &carried)?;
+        // A key in use is not replaced: a call that is starting, running or not confirmed closed
+        // is paid for with it, and its closure needs the key that made it.
+        if self.own_voice.registry().state() != kr_client::services::RegistryState::Idle
+            || self
+                .own_voice
+                .ledger()
+                .rows()
+                .map_err(|_| refused_voice(words::RECORD_UNREADABLE))?
+                .iter()
+                .any(|row| row.state.blocks_a_start())
+        {
+            return Err(refused_voice(words::KEY_IN_USE));
+        }
         self.voice_credentials.put(params.kind, &params.key)?;
         drop(registry);
         encode(&kr_protocol::voice_credential::VoiceCredentialSetResult {
@@ -1459,14 +1477,79 @@ impl Controller {
             mutation.params.to_typed().map_err(|_| {
                 ControllerError::InvalidArgument(VOICE_REMOVE_PARAMS_REFUSAL.to_owned())
             })?;
-        let registry = self.registry.lock().await;
-        self.check_admission(&registry, &carried)?;
-        let removed = self.voice_credentials.delete(params.kind)?;
-        drop(registry);
+        {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+        }
+        // Settle before delete: nothing starts, the calls this host controls end, a start in
+        // flight is waited for, and each stored call is closed with the key still in the store.
+        let provider = &self.own_voice;
+        if provider.registry().fence().is_none() {
+            return Err(refused_voice(words::SETTLING));
+        }
+        self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
+            .await;
+        let settled = provider.settle().await;
+        let left = provider.close_stored_calls().await;
+        let outcome = match left {
+            StoredCalls::NoneLeft => {
+                // The admission is asked again under the registry lock, which is held across the
+                // deletion, so a withdrawal that completed while this waited stops it.
+                let registry = self.registry.lock().await;
+                self.check_admission(&registry, &carried)
+                    .and_then(|()| self.voice_credentials.delete(params.kind))
+            }
+            StoredCalls::OnlyCreating => Err(refused_voice(words::CREATION_NOT_LEARNED)),
+            StoredCalls::NotConfirmed => Err(refused_voice(words::NOT_CONFIRMED_CLOSED)),
+        };
+        provider.registry().unfence();
         encode(
             &kr_protocol::voice_credential::VoiceCredentialRemoveResult {
                 kind: params.kind,
-                removed,
+                removed: outcome?,
+                late_start: late_start_of(settled),
+            },
+        )
+    }
+
+    /// Forgets the host's record of calls on the owner's own key, and keeps the key.
+    ///
+    /// The same fence and settle as a removal: no call starts, the calls this host controls end,
+    /// a start in flight is waited for at most 45 seconds after it asked, and the answer says
+    /// which of three things is true by what that start did.
+    async fn voice_credential_forget_calls(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::voice_credential::VoiceCredentialForgetCallsParams =
+            mutation.params.to_typed().map_err(|_| {
+                ControllerError::InvalidArgument(VOICE_FORGET_PARAMS_REFUSAL.to_owned())
+            })?;
+        {
+            let registry = self.registry.lock().await;
+            self.check_admission(&registry, &carried)?;
+        }
+        let provider = &self.own_voice;
+        if provider.registry().fence().is_none() {
+            return Err(refused_voice(words::SETTLING));
+        }
+        let sessions = provider.live_sessions();
+        self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
+            .await;
+        // One bounded best-effort hangup of each call that was live, before its record goes.
+        for session in &sessions {
+            let _ = provider.cleanup_hangup(session).await;
+        }
+        let settled = provider.settle().await;
+        let forgotten = provider.ledger().forget_all();
+        provider.registry().unfence();
+        let forgotten = forgotten.map_err(|_| refused_voice(words::NOT_FORGOTTEN))?;
+        encode(
+            &kr_protocol::voice_credential::VoiceCredentialForgetCallsResult {
+                kind: params.kind,
+                calls_forgotten: u32::try_from(forgotten).unwrap_or(u32::MAX),
+                late_start: late_start_of(settled),
             },
         )
     }
@@ -3071,6 +3154,31 @@ pub(super) fn secret_params(
 /// The one refusal of parameters that do not read as `voice.credential.set`'s.
 const VOICE_SET_PARAMS_REFUSAL: &str = "voice.credential.set takes one provider and one key: \
      {kind: openai_live, key}";
+
+/// The one refusal of parameters that do not read as `voice.credential.forget_calls`'s.
+const VOICE_FORGET_PARAMS_REFUSAL: &str = "voice.credential.forget_calls takes one provider: \
+    {kind: \"openai_live\"}";
+
+/// What the owner is told when this host keeps or refuses a key because of a call.
+fn refused_voice(detail: &str) -> ControllerError {
+    ControllerError::Refused {
+        code: kr_protocol::error::ErrorCode::ResourceUnavailable,
+        detail: detail.to_owned(),
+    }
+}
+
+/// What became of a call that was still starting, as the protocol says it.
+fn late_start_of(
+    settled: kr_client::services::own_voice::Settled,
+) -> kr_protocol::voice_credential::VoiceLateStart {
+    use kr_client::services::own_voice::Settled;
+    use kr_protocol::voice_credential::VoiceLateStart;
+    match settled {
+        Settled::NothingStarting => VoiceLateStart::None,
+        Settled::LateSessionClosed => VoiceLateStart::Closed,
+        Settled::MayStillRun => VoiceLateStart::MayStillRun,
+    }
+}
 
 /// The one refusal of parameters that do not read as `voice.credential.remove`'s.
 const VOICE_REMOVE_PARAMS_REFUSAL: &str = "voice.credential.remove takes one provider: {kind: \
