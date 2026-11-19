@@ -2412,14 +2412,15 @@ impl Catalogue {
         // from the table the verified manifest pins, which is read only after the range test and
         // by the one function the controller reads it with. A table that cannot be fetched, read
         // or used is a refusal, never a statement without the reading.
-        let placement = match manifest.native_bridge.0.as_ref().filter(|_| {
-            grant.holds(PluginCapability::NativeBridgeInstall)
-        }) {
+        let placement = match manifest
+            .native_bridge
+            .0
+            .as_ref()
+            .filter(|_| grant.holds(PluginCapability::NativeBridgeInstall))
+        {
             Some(recipe) => {
-                self.placement_reading(
-                    &enrolled, &store, &entry, &manifest, recipe, &subject,
-                )
-                .await?
+                self.placement_reading(&enrolled, &store, &entry, &manifest, recipe, &subject)
+                    .await?
             }
             None => None,
         };
@@ -2496,8 +2497,7 @@ impl Catalogue {
                     "{PACKAGE_PREFIX}{}/{}/{}",
                     entry.publisher_id, entry.plugin_name, entry.version
                 );
-                let package: BTreeSet<PayloadDigest> =
-                    std::iter::once(payload.digest).collect();
+                let package: BTreeSet<PayloadDigest> = std::iter::once(payload.digest).collect();
                 self.fetch(
                     enrolled,
                     store,
@@ -2515,7 +2515,11 @@ impl Catalogue {
         let declared = kr_plugin_sdk::placement::declared_in(&bytes, recipe.application.as_str())
             .map_err(unsafe_package)?;
         declared
-            .map(|placement| placement.statement(recipe).map_err(|why| unsafe_package(why.to_string())))
+            .map(|placement| {
+                placement
+                    .statement(recipe)
+                    .map_err(|why| unsafe_package(why.to_string()))
+            })
             .transpose()
     }
 
