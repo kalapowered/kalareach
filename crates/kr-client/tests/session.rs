@@ -1864,6 +1864,70 @@ async fn sends_refused_for_now_do_not_use_up_the_bound_on_unresolved_actions() {
     serving.abort();
 }
 
+/// A caller that knows the host's own word ended an action for good lets it go, and the place the
+/// action held is free: at the bound a new send is refused, and after the release of one unknown
+/// action the next send goes, and the bound is reached again with it.
+#[tokio::test]
+async fn settling_an_unknown_action_frees_its_place_at_the_bound_on_unresolved_actions() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+    let send = || async {
+        session
+            .mutate(
+                Method::SessionCreate,
+                target.clone(),
+                None,
+                &Empty {},
+                &Empty {},
+                DurationMs::new(120_000),
+            )
+            .await
+            .expect_err("the host cannot establish any send")
+    };
+
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::OutcomeUnknown);
+    for _ in 0..MAX_UNRESOLVED_ACTIONS {
+        send().await;
+    }
+    let refused = send().await;
+    assert!(
+        matches!(refused, ClientError::TooManyUnresolvedActions { .. }),
+        "the bound is reached: {refused:?}"
+    );
+
+    let released = session
+        .submitted_actions()
+        .await
+        .first()
+        .expect("an unresolved action")
+        .action_id;
+    session.settle(released).await;
+    let kept = session.submitted_actions().await;
+    assert_eq!(kept.len(), MAX_UNRESOLVED_ACTIONS - 1);
+    assert!(
+        kept.iter().all(|action| action.action_id != released),
+        "the book let go of the action the caller named"
+    );
+    let taken = send().await;
+    assert_eq!(
+        taken.code(),
+        ErrorCode::OutcomeUnknown,
+        "the freed place is used by the next send: {taken:?}"
+    );
+    let full = send().await;
+    assert!(
+        matches!(full, ClientError::TooManyUnresolvedActions { .. }),
+        "and the bound is reached again: {full:?}"
+    );
+
+    session.close();
+    serving.abort();
+}
+
 /// A send the host refused for now is sent again as it first went, window included. The host
 /// keys its record of an action by the request, so the same send under the window it has issued
 /// since is another request under the identifier, and the host refuses it. The renewal is read by
