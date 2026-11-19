@@ -1139,6 +1139,9 @@ pub struct Controller {
     /// the outcome are one sequence, and two callers running it at once could both find no record
     /// and both do the work. One daemon owns an environment, so one lock covers it.
     agent_tools: tokio::sync::Mutex<()>,
+    /// Admitted packages that a test adds to the ones read for a declared word.
+    #[cfg(feature = "testing")]
+    admitted_for_test: std::sync::Mutex<Vec<kr_protocol::admission::AdmittedPackage>>,
     worker_program: PathBuf,
     build_id: BuildId,
     release: String,

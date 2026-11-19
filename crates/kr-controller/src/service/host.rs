@@ -32,8 +32,8 @@ const DOCTOR_READS: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The refusal of a declared word when the admitted packages could not be read in time; the bound
 /// is [`DOCTOR_READS`].
-const PACKAGES_UNREAD: &str = "this host could not read the packages it admits within {seconds} \
-     seconds, so it could not find the one that names {word}; ask again";
+const PACKAGES_UNREAD: &str = "this host could not read the packages it admits, so it could not \
+     find the one that names {word}; ask again";
 
 /// What an environment record change answers with, and where the answer came from.
 enum Reading {
@@ -45,9 +45,25 @@ enum Reading {
 
 impl Controller {
     /// Reports what is installed for one agent.
-    pub(super) fn agent_tools_status(&self, params: &ParamsValue) -> Result<ParamsValue> {
+    ///
+    /// A word the host does not compile in is resolved to the package that declares it before the
+    /// answer, whether or not a record holds it, so a word an admitted package declares is told
+    /// by its place when nothing is installed yet, and the words the host knows are those the
+    /// packages declare and the records name. A record the package no longer matches is still
+    /// reported by itself.
+    pub(super) async fn agent_tools_status(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::skill::AgentToolsParams = parse(params)?;
-        encode(&self.installer()?.status(&params)?)
+        let installer = self.installer()?;
+        if params.agent.compiled().is_some() {
+            return encode(&installer.status(&params)?);
+        }
+        let held = installer.holds_record(&params)?;
+        let installer = match self.resolve_declared(installer.clone(), &params).await {
+            Ok((resolved, _)) => resolved,
+            Err(_) if held => installer,
+            Err(refusal) => return Err(refusal),
+        };
+        encode(&installer.status(&params)?)
     }
 
     /// Installs or removes the contact skill for one agent.
@@ -103,11 +119,30 @@ impl Controller {
         {
             return self.retained_given(&carried, kept).await;
         }
+        // A removal that a record of this host decides alone resolves no package: a package that
+        // is gone, disabled or no longer declares the word blocks nothing. A record this host
+        // cannot read says that a record exists.
+        let by_record = match method {
+            Method::AgentToolsRemove => match installer.removal_by_record(&params) {
+                Ok(by_record) => by_record,
+                Err(crate::agent_tools::Declined::ByARecord(record)) => {
+                    return record.copied().map(Err);
+                }
+                Err(crate::agent_tools::Declined::ByTheRequest(refusal)) => {
+                    return Given::fresh(Err(refusal));
+                }
+            },
+            _ => false,
+        };
         // A word the host does not compile in is resolved to the one admitted package that
         // declares it, here, after the lock and the look at what the host holds, and never before.
-        let (installer, read_at) = match self.resolve_declared(installer, &params, method).await {
-            Ok(resolved) => resolved,
-            Err(refusal) => return Given::fresh(Err(refusal)),
+        let (installer, read_at) = if by_record {
+            (installer, None)
+        } else {
+            match self.resolve_declared(installer, &params).await {
+                Ok(resolved) => resolved,
+                Err(refusal) => return Given::fresh(Err(refusal)),
+            }
         };
         // What either change can refuse without touching anything, refused here: the platform, the
         // scope, a file or entry this host did not write, a record it cannot read, a document whose
@@ -229,8 +264,7 @@ impl Controller {
 
     /// Resolves the skill target that the request's word names, for a word the host does not
     /// compile in: the one admitted package, whose current admission's effective grants hold
-    /// `skill_target.install`, whose verified connector table declares the word. A removal that
-    /// has a record resolves no package: the record's operations alone decide. The admission
+    /// `skill_target.install`, whose verified connector table declares the word. The admission
     /// revision is read again at the end, and the revision the packages were read under comes back
     /// with the installer to be read once more just before the registration, so a grant or a
     /// package that changed while the packages were read, or while the file system was checked,
@@ -240,7 +274,6 @@ impl Controller {
         &self,
         installer: crate::agent_tools::Installer,
         params: &kr_protocol::skill::AgentToolsParams,
-        method: Method,
     ) -> Result<(crate::agent_tools::Installer, Option<u64>)> {
         use crate::agent_tools::declared::{
             Declaration, admissions_held, holding_the_capability, platform_refusal, served,
@@ -251,19 +284,27 @@ impl Controller {
         if let Some(refusal) = platform_refusal(cfg!(windows)) {
             return Err(ControllerError::InvalidArgument(refusal.to_owned()));
         }
-        if method == Method::AgentToolsRemove && installer.holds_record(params)? {
-            return Ok((installer, None));
-        }
         let unread = || {
             ControllerError::InvalidArgument(
-                PACKAGES_UNREAD
-                    .replace("{seconds}", &DOCTOR_READS.as_secs().to_string())
-                    .replace("{word}", params.agent.as_str()),
+                PACKAGES_UNREAD.replace("{word}", params.agent.as_str()),
             )
         };
         let Some(snapshot) = self.current_snapshot(tokio::time::Instant::now()).await else {
             return Err(unread());
         };
+        #[cfg(feature = "testing")]
+        let held = {
+            let mut admitted = snapshot.packages.clone();
+            admitted.extend(
+                self.admitted_for_test
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .cloned(),
+            );
+            holding_the_capability(&admitted)
+        };
+        #[cfg(not(feature = "testing"))]
         let held = holding_the_capability(&snapshot.packages);
         let read = tokio::task::spawn_blocking(move || {
             held.into_iter()
@@ -311,6 +352,17 @@ impl Controller {
             installer.with_declaration(declared, known),
             Some(snapshot.revision),
         ))
+    }
+
+    /// Adds one admitted package to the ones this daemon reads for a declared word, so that a test
+    /// can serve a package its own catalogue did not admit. The package is read and held to the
+    /// capability as every admitted one is. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn admit_package_for_test(&self, package: kr_protocol::admission::AdmittedPackage) {
+        self.admitted_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(package);
     }
 
     /// Returns the installer, which keeps this host's record of what it wrote.

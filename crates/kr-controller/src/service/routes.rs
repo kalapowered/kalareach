@@ -348,7 +348,7 @@ impl Controller {
                 self.archive_action_read(actor_id, &request.params, owner)
                     .await
             }
-            Method::AgentToolsStatus => self.agent_tools_status(&request.params),
+            Method::AgentToolsStatus => self.agent_tools_status(&request.params).await,
             Method::GrantList => self.grant_list(self.host_device_id(), &request.params),
             Method::DeviceList => self.device_list(&request.params).await,
             Method::DeliveryDestinationList => self.delivery_destination_list(&request.params),

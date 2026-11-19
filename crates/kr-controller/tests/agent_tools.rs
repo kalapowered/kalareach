@@ -322,6 +322,179 @@ async fn a_change_of_the_admissions_while_the_packages_are_read_refuses_before_t
     assert!(no_marker_was_written(&host));
 }
 
+/// Writes the package a test admits for the word `word`: the example connector with a skill target
+/// for the project scope (the skills folder `.amp/skills` only) and the capability requested, its
+/// manifest's digest of the table brought up to date. Returns its source as the admissions name it.
+#[cfg(unix)]
+fn package_declaring(
+    host: &Host,
+    word: &str,
+) -> (
+    kr_protocol::admission::AdmittedPackage,
+    kr_worker::broker::connectors::ConnectorSource,
+) {
+    use kr_plugin_sdk::capability::PluginCapability;
+    use kr_plugin_sdk::digest::PayloadDigest;
+    use serde_json::json;
+
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/plugins/valid/example-connector");
+    let directory = host._temp.root().join(format!("package-{word}"));
+    std::fs::create_dir_all(&directory).expect("a directory");
+    for name in ["plugin.json", "presentation.json", "connector.json"] {
+        std::fs::copy(example.join(name), directory.join(name)).expect("copies");
+    }
+    let table = directory.join("connector.json");
+    let mut connector: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&table).expect("reads")).expect("JSON");
+    connector["skill_target"] =
+        json!({ "word": word, "project": { "skills": [".amp", "skills"] } });
+    let bytes = serde_json::to_vec_pretty(&connector).expect("writes");
+    std::fs::write(&table, &bytes).expect("writes");
+    let manifest_path = directory.join("plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("reads")).expect("JSON");
+    manifest["sdk_range"] = json!(">=0.1.11, <0.2.0");
+    manifest["capabilities"]
+        .as_array_mut()
+        .expect("capabilities")
+        .push(json!({
+            "capability": "skill_target.install",
+            "reason": "Install the contact skill for the agent this package names"
+        }));
+    let record = manifest["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .iter_mut()
+        .find(|payload| payload["path"] == "connector.json")
+        .expect("the connector payload");
+    record["digest"] = json!(PayloadDigest::of(&bytes).to_string());
+    record["size_bytes"] = json!(bytes.len().to_string());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("writes"),
+    )
+    .expect("writes");
+    let checked = kr_plugin_sdk::validate::validate_package_directory(&directory);
+    assert!(checked.report.is_valid(), "{:?}", checked.report.findings);
+    let package = checked.package.expect("a package");
+    let manifest_file = package
+        .files
+        .iter()
+        .find(|file| file.path.as_str() == kr_plugin_sdk::package::MANIFEST_FILE)
+        .expect("a manifest");
+    let source = kr_worker::broker::connectors::ConnectorSource {
+        package_digest: kr_protocol::scalars::Digest256::from_bytes(
+            *manifest_file.digest.as_bytes(),
+        ),
+        package_dir: directory,
+        bridge: None,
+        granted: [PluginCapability::SkillTargetInstall].into_iter().collect(),
+        qualified: Vec::new(),
+    };
+    (
+        kr_worker::broker::catalogue::testing::admitted(&source),
+        source,
+    )
+}
+
+/// Admits a package that declares `word`, as the daemon reads the packages it admits.
+#[cfg(unix)]
+fn admit_declaring(host: &Host, word: &str) {
+    let (admitted, _) = package_declaring(host, word);
+    host._controller.admit_package_for_test(admitted);
+}
+
+/// KR-REQ-11.01: through the daemon, the status of a word an admitted package declares is answered
+/// with the place the package declares before anything is installed: the host resolves the word
+/// before it answers, and does not say it does not know a word it admits.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_status_of_an_admitted_word_with_no_record_names_its_declared_place() {
+    use kr_protocol::skill::AgentToolsStatusResult;
+
+    let host = host().await;
+    admit_declaring(&host, "amp");
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let params = install_for_amp(&host);
+    let answer = client
+        .request(Method::AgentToolsStatus, &params)
+        .await
+        .expect("the call reaches the daemon");
+    assert!(
+        answer.is_ok(),
+        "an admitted word's status is answered: {answer:?}"
+    );
+    let status: AgentToolsStatusResult = answer
+        .expect("answered")
+        .to_typed()
+        .expect("the answer decodes");
+    assert!(!status.installed, "{status:?}");
+    assert!(status.files.is_empty(), "{status:?}");
+    assert_eq!(
+        status.root,
+        host._temp
+            .root()
+            .join("project/.amp/skills/kalareach-contact")
+            .to_string_lossy(),
+        "{status:?}"
+    );
+}
+
+/// KR-REQ-11.01: through the daemon, the refusal of a word nobody declares lists every word the host
+/// knows besides the six: the ones an admitted package declares and the ones a record names, each
+/// once.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_unknown_word_list_holds_the_declared_and_the_recorded_words() {
+    let host = host().await;
+    admit_declaring(&host, "amp");
+    // A record for `bmp`, as an earlier installation of it left one in this daemon's records.
+    let home = host._temp.root().join("home");
+    std::fs::create_dir_all(&home).expect("a home");
+    kr_controller::agent_tools::Installer::new(
+        home,
+        host.state_dir.join("agent-tools"),
+        "/opt/kalareach/kr".to_owned(),
+    )
+    .with_declaration(
+        Some(
+            serde_json::from_value(serde_json::json!({
+                "word": "bmp", "user": { "skills": [".bmp", "skills"] }
+            }))
+            .expect("a target"),
+        ),
+        Vec::new(),
+    )
+    .install(&AgentToolsParams {
+        agent: AgentTarget::parse("bmp").expect("a word"),
+        scope: InstallScope::User,
+        project_dir: Nullable::null(),
+    })
+    .expect("the record is made");
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let params = AgentToolsParams {
+        agent: AgentTarget::parse("zed").expect("a word"),
+        ..install_for_amp(&host)
+    };
+    let refused = client
+        .request(Method::AgentToolsStatus, &params)
+        .await
+        .expect("the call reaches the daemon");
+    let Err(refused) = refused else {
+        panic!("a word nobody declares is refused");
+    };
+    assert_eq!(
+        refused.message,
+        "zed is not an agent this host knows; it knows codex, claude-code, opencode, gemini-cli, \
+         kimi-code-cli and qoder-cli, and amp, bmp"
+    );
+}
+
 mod fence_support;
 
 /// KR-REQ-09.09, 09.12 and 26.16: a withdrawal whose fence could not be raised stops an

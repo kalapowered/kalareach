@@ -1416,6 +1416,8 @@ impl Controller {
             sessions_in_force: std::sync::atomic::AtomicU64::new(sessions_in_force),
             attention,
             agent_tools: tokio::sync::Mutex::new(()),
+            #[cfg(feature = "testing")]
+            admitted_for_test: std::sync::Mutex::new(Vec::new()),
             worker_program,
             build_id: setup.build_id,
             release: setup.release,

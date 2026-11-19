@@ -79,6 +79,10 @@ const MOVED_PLACE: &str = "the record of {word} at {scope} scope names {recorded
      package now declares {declared place}; run kr skill remove --agent {word} --scope {scope}, \
      with --project-dir for a project, and then install again";
 
+/// The refusal of an installation for a word that only a record of this host holds.
+const ONLY_BY_RECORD: &str = "no package this host admits declares {word} now, so this host cannot \
+     install it at {scope} scope; it can only remove what its own record of {word} names";
+
 /// The refusal of an entry that another record of this host claims with other contents.
 const CLAIMED_DIFFERENTLY: &str = "{path} already holds a server named kalareach, written with \
      other contents by another installation this host made; remove that installation before \
@@ -376,6 +380,24 @@ impl Installer {
     /// Returns the error of reading the record.
     pub fn holds_record(&self, params: &AgentToolsParams) -> Result<bool> {
         Ok(self.recorded(params)?.is_some())
+    }
+
+    /// Whether a record of this host decides a removal alone: one declared word's removal, which
+    /// needs no package where a record names what to undo.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Declined::ByARecord`] when the record cannot be read, because a record this host
+    /// cannot read says that a record exists.
+    pub(crate) fn removal_by_record(
+        &self,
+        params: &AgentToolsParams,
+    ) -> std::result::Result<bool, Declined> {
+        if params.agent.compiled().is_some() {
+            return Ok(false);
+        }
+        self.holds_record(params)
+            .map_err(|error| Declined::ByARecord(Recorded::read(error)))
     }
 
     /// This installer with its places reached the way the request's word needs: by path for one of
@@ -1641,7 +1663,6 @@ impl Installer {
         }
     }
 
-    /// Returns where one agent keeps its skills and its configuration, at this scope.
     /// The layout a package declares for `params.agent`, from the declaration the service resolved
     /// for this request.
     fn declared_layout(
@@ -1656,6 +1677,14 @@ impl Installer {
             .as_ref()
             .filter(|target| target.word == params.agent.as_str())
         else {
+            // A word that only a record holds is known, and no package serves it now.
+            if self.known.iter().any(|word| word == params.agent.as_str()) {
+                return Err(ControllerError::InvalidArgument(
+                    ONLY_BY_RECORD
+                        .replace("{word}", params.agent.as_str())
+                        .replace("{scope}", &params.scope.to_string()),
+                ));
+            }
             return Err(ControllerError::InvalidArgument(format!(
                 "{} is not an agent this host knows; it knows {}",
                 params.agent,
@@ -4056,6 +4085,62 @@ mod tests {
             refused.to_string(),
             "zed is not an agent this host knows; it knows codex, claude-code, opencode, gemini-cli, \
              kimi-code-cli and qoder-cli, and amp"
+        );
+    }
+
+    /// KR-REQ-11.01: a word that only a record of this host holds is not called unknown: no
+    /// package declares it now, so an installation or a status without a record at that scope says
+    /// so, and the list of words the host knows is not shown for it.
+    #[cfg(unix)]
+    #[test]
+    fn a_word_only_a_record_holds_is_refused_as_one_no_package_declares_now() {
+        let tree = Tree::create();
+        let installer = tree
+            .installer()
+            .with_declaration(None, vec!["amp".to_owned()]);
+        let expected = "no package this host admits declares amp now, so this host cannot install it \
+                        at user scope; it can only remove what its own record of amp names";
+        let refused = installer
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("no package declares it");
+        assert_eq!(refused.to_string(), expected);
+        let told = installer
+            .status(&params(amp(), InstallScope::User))
+            .expect_err("a status with no record names the same refusal");
+        assert_eq!(told.to_string(), expected);
+    }
+
+    /// KR-REQ-11.01: a record decides a declared word's removal alone, and a record this host
+    /// cannot read is declined as a record, not as a fresh refusal of the request.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_decides_a_declared_removal_and_an_unreadable_one_is_declined_as_a_record() {
+        let tree = Tree::create();
+        let declaring = tree
+            .installer()
+            .with_declaration(Some(declared(None, &[".amp", "skills"])), Vec::new());
+        let request = params(amp(), InstallScope::User);
+        assert!(
+            matches!(declaring.removal_by_record(&request), Ok(false)),
+            "no record yet"
+        );
+        declaring.install(&request).expect("installs");
+        assert!(
+            matches!(declaring.removal_by_record(&request), Ok(true)),
+            "a record decides"
+        );
+        assert!(
+            matches!(
+                declaring.removal_by_record(&params(AgentTarget::CODEX, InstallScope::User)),
+                Ok(false)
+            ),
+            "a compiled word has no record that decides"
+        );
+        std::fs::write(declaring.record_path(&request), "not a record").expect("writes");
+        let declined = declaring.removal_by_record(&request);
+        assert!(
+            matches!(declined, Err(Declined::ByARecord(_))),
+            "an unreadable record is declined as a record: {declined:?}"
         );
     }
 
