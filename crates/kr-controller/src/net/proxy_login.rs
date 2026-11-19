@@ -104,17 +104,23 @@ pub fn proxy_tls(anchors: &[Vec<u8>]) -> Result<Arc<ClientConfig>, rustls::Error
     kr_client::services::http::platform_tls(&roots).map(Arc::new)
 }
 
-/// Whether `origin` is one this build's route serves: the managed origin counts only where this
-/// build serves it, so a test build that leaves an origin at the managed service reaches nothing.
+/// Whether `origin` is one this build's route serves through the proxy: a plain-`http` origin is
+/// never sent a `CONNECT`, and the managed origin counts only where this build serves it, so a
+/// test build that leaves an origin at the managed service reaches nothing.
 fn served(origin: &str) -> bool {
     let managed = kr_client::services::account::ACCOUNT_ORIGIN;
-    origin != managed || crate::release_matrix::managed_origin().as_deref() == Some(managed)
+    let secure = origin
+        .parse::<Url>()
+        .is_ok_and(|url| url.scheme() == "https");
+    secure
+        && (origin != managed
+            || crate::release_matrix::managed_origin().as_deref() == Some(managed))
 }
 
 /// The address the start check tests the proxy with: the first selected relay, else the first
-/// Pkarr server (the publisher, then the resolver), else the first origin the route serves among
-/// the authority feed, the mailbox, the relay lease service, the storage service and the voice
-/// broker. None when the document names none of them.
+/// Pkarr server (the publisher, then the resolver), else the first `https` origin the route serves
+/// among the authority feed, the mailbox, the relay lease service, the storage service and the
+/// voice broker. None when the document names none of them.
 #[must_use]
 pub fn start_target(started: &Started) -> Option<Target> {
     let network = &started.network;
