@@ -32,6 +32,14 @@ means the layout the host holds for the application's label. A package whose tab
 that admits an earlier SDK version or one with a prerelease part. The plugin reference's
 [Placement](README.md#placement) section holds the grammar and what the host checks.
 
+The `launch_variables` member of a connector table is in version 0.1.10. It lists the environment
+variables the package's command integration sets, each by exact name and value with a reason for
+reviewers; a table without it declares none. A table that states it needs an `sdk_range` written in
+release versions only that admits no SDK version before 0.1.10, such as `">=0.1.10, <0.2.0"`; the
+package check refuses a table that carries it under a range that admits an earlier version or has
+a prerelease part. The plugin reference's [Command integration](README.md#command-integration)
+section holds the rules.
+
 The `hidden_when` member of a selection route is in version 0.1.7. It lists conditions on the
 request: each names a place in the request's message and the strings, booleans or integers that
 place may hold. A request that meets every condition starts a thread that the terminal never shows,

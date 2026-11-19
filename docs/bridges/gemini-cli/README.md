@@ -138,12 +138,23 @@ launched process runs the session and starts the hooks itself. It then gives up 
 a very large session runs out of memory sooner, and the restart: when Gemini CLI exits with code
 199 after an update or to apply a change, the session ends and the person starts `gemini` again.
 The relay of administrator settings serves only a restarted child. A package declares the variable
-as its command integration's, the one pair the package contract permits. The integration adds no
-flag and still integrates the invocation. The worker names the variable in the backend's launch
-record, and the launcher sets it only once the launch is committed, so a `gemini` that runs as
-typed keeps the person's own environment, their own value of `GEMINI_CLI_NO_RELAUNCH` included. The
-integration applies to the sessions created after the owner turns it on with `kr plugin integration
-enable kalareach/gemini-cli`.
+as its command integration's. A release that declares no launch variables, and whose `sdk_range` is
+written in release versions only and admits an SDK version before launch variables arrived, as the
+ranges of the 0.4.0 and 0.5.0 releases do today, may set it without declaring it in its connector
+table. Any other release that sets it declares it in its connector table's `launch_variables`, as
+`GEMINI_CLI_NO_RELAUNCH` with the value `true`, a pair the package contract lets a declared entry
+repeat, under an `sdk_range` written in release versions only that admits no SDK version before
+that member arrived. The integration adds no flag and still integrates the invocation. The worker
+names the variable in the backend's launch record, and the launcher sets it only once the launch is
+committed, so a `gemini` that runs as typed keeps the person's own environment, their own value of
+`GEMINI_CLI_NO_RELAUNCH` included. The integration applies to the sessions created after the owner
+turns it on with `kr plugin integration enable kalareach/gemini-cli`.
+
+The host checks each declared name and value against its syntax rules and reserved names. These
+checks do not establish how a program interprets the variable. A program or library can read a
+permitted value as a relative path or use it to select code or disable checks. A program that
+starts through a committed integration receives the declared variables. Its child processes can
+inherit them. An invocation that runs as typed receives no variables added by this integration.
 
 An interactive Gemini CLI runs its `SessionEnd` hooks more than once when it exits, with the same
 session and reason (twice in one run, three times in two others), and prints three lines of its own

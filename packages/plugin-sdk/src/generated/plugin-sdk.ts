@@ -1486,6 +1486,19 @@ export interface ConnectorManifest {
    */
   hook_events?: HookEvents | null
   /**
+   * The environment variables the package's command integration sets, each by exact name and
+   * value with the reason a reviewer reads. The rules of [`crate::launch_variables`] hold every
+   * entry.
+   *
+   * A table that does not state it leaves the member out, and the integration may then set only
+   * a pair of [`crate::integration::PERMITTED_VARIABLES`], for a release whose `sdk_range`
+   * admits an SDK that predates the member, so a connector written before the member existed
+   * reads and hashes exactly as it did. A package that states it declares an `sdk_range` that
+   * admits no SDK version before [`crate::launch_variables::ARRIVAL`], and the statement the
+   * owner confirms says that every program the command starts gets the variables too.
+   */
+  launch_variables?: LaunchVariable[] | null
+  /**
    * The manifest format version.
    */
   manifest_version: number
@@ -1812,6 +1825,25 @@ export interface FieldPath6 {
    * The path segments, from the root of the message.
    */
   segments: FieldSegment[]
+}
+/**
+ * One environment variable a package's command integration sets, with the reason a reviewer
+ * reads.
+ */
+export interface LaunchVariable {
+  /**
+   * The variable's name.
+   */
+  name: string
+  /**
+   * Why the package needs the variable, in the package's own words. A reviewer reads it; the
+   * owner's statement does not carry it.
+   */
+  reason: string
+  /**
+   * The value the integration sets it to.
+   */
+  value: string
 }
 /**
  * The top-level members a message is read by, beyond its identifier and its method.
