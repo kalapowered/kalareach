@@ -4144,7 +4144,9 @@ const VOICE_OWN_KEY = {
     'OpenAI processes the audio and the context this host selects, under your agreement with OpenAI and at your cost. Transcripts of the call reach this host, which discards them.',
     "KalaReach's voice service is not used for this call.",
     'This host keeps the key in its secret store and sends it only to OpenAI.',
-    'A call may run past 30 minutes if this host stops, loses its network or cannot confirm the close, and OpenAI may keep charging your account until it ends the call; the host tries to close it again when it restarts.'
+    'A call may run past 30 minutes if this host stops, loses its network or cannot confirm the close, and OpenAI may keep charging your account until it ends the call; the host tries to close it again when it restarts.',
+    'A device that loses host-management authority during a call keeps that call until it ends; remove the key to end it.',
+    "The host-management authority is the right that decides whose OpenAI key a call uses; what a call may do on this host is decided by the voice grant and the device's own grant, as for every voice call."
   ]
 } as const
 
