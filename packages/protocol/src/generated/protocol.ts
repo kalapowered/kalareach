@@ -5462,7 +5462,7 @@ export interface ChangeManifest {
   /**
    * The agent it was installed for.
    */
-  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  agent: string
   /**
    * The command the agent runs to reach the tools.
    */
@@ -5494,7 +5494,7 @@ export interface AgentToolsParams {
   /**
    * The agent.
    */
-  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  agent: string
   /**
    * The project directory, for project scope.
    */
@@ -5511,7 +5511,7 @@ export interface AgentToolsRemoveResult {
   /**
    * The agent.
    */
-  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  agent: string
   /**
    * What was undone.
    */
@@ -5532,7 +5532,7 @@ export interface AgentToolsStatusResult {
   /**
    * The agent.
    */
-  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  agent: string
   /**
    * What no longer matches the record, in the words a person reads.
    */
@@ -11164,7 +11164,7 @@ export interface ChangeManifest1 {
   /**
    * The agent it was installed for.
    */
-  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  agent: string
   /**
    * The command the agent runs to reach the tools.
    */

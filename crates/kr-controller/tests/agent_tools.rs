@@ -121,7 +121,7 @@ async fn a_removal_the_daemon_will_not_do_leaves_no_dispatch_marker() {
     };
     // A project removal that says nothing about which project. There is no such removal to do.
     let params = AgentToolsParams {
-        agent: AgentTarget::Codex,
+        agent: AgentTarget::CODEX,
         scope: InstallScope::Project,
         project_dir: Nullable::null(),
     };
@@ -180,7 +180,7 @@ async fn an_installation_is_not_dispatched_while_a_fence_is_owed() {
         agent_binding_revision: Nullable::null(),
     };
     let params = AgentToolsParams {
-        agent: AgentTarget::Codex,
+        agent: AgentTarget::CODEX,
         scope: InstallScope::Project,
         project_dir: Nullable::some(project.path().display().to_string()),
     };
@@ -380,12 +380,12 @@ async fn the_skill_installs_reports_and_removes_at_both_scopes_by_its_removal_re
 
     let environment_id = host.environment_id();
     let user = AgentToolsParams {
-        agent: AgentTarget::ClaudeCode,
+        agent: AgentTarget::CLAUDE_CODE,
         scope: InstallScope::User,
         project_dir: Nullable::null(),
     };
     let in_project = AgentToolsParams {
-        agent: AgentTarget::Codex,
+        agent: AgentTarget::CODEX,
         scope: InstallScope::Project,
         project_dir: Nullable::some(project.display().to_string()),
     };

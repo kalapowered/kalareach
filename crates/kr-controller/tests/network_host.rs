@@ -268,7 +268,7 @@ async fn a_paired_device_is_refused_the_skill_setup_and_nothing_is_written_for_i
     let project = host.tree().root().join("project");
     std::fs::create_dir_all(project.join(".codex")).expect("a project directory");
     let params = AgentToolsParams {
-        agent: AgentTarget::Codex,
+        agent: AgentTarget::CODEX,
         scope: InstallScope::Project,
         project_dir: Nullable::some(project.display().to_string()),
     };

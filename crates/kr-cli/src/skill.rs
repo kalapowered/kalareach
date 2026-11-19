@@ -29,15 +29,10 @@ use crate::stdout_line;
 /// Returns [`CliError::Usage`] when the agent or the scope is not one this host supports, or when
 /// a project scope names no directory and none can be resolved.
 pub fn parse(agent: &str, scope: &str, project_dir: Option<&str>) -> Result<AgentToolsParams> {
-    let agent: AgentTarget = agent.parse().map_err(|_| {
+    let agent: AgentTarget = agent.parse().map_err(|refusal| {
         CliError::Usage(shown!(
-            "the agent given is not one this host installs for: {}",
-            Shown::joined(
-                AgentTarget::ALL
-                    .iter()
-                    .map(|target| Shown::said(target.as_str())),
-                ", "
-            )
+            "the agent given is not a valid agent word: {}",
+            Shown::said(refusal.reason())
         ))
     })?;
     let scope: InstallScope = scope
@@ -461,7 +456,7 @@ mod tests {
     fn a_scope_is_user_or_project() {
         assert!(parse("codex", "global", None).is_err());
         let params = parse("codex", "user", None).expect("parses");
-        assert_eq!(params.agent, AgentTarget::Codex);
+        assert_eq!(params.agent, AgentTarget::CODEX);
         assert!(!params.project_dir.is_present());
     }
 

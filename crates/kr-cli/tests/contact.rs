@@ -1207,7 +1207,7 @@ async fn an_installed_skill_asks_returns_the_answer_and_raises_an_alert() {
         );
         let installed = installer
             .install(&kr_protocol::skill::AgentToolsParams {
-                agent: kr_protocol::skill::AgentTarget::ClaudeCode,
+                agent: kr_protocol::skill::AgentTarget::CLAUDE_CODE,
                 scope: kr_protocol::skill::InstallScope::User,
                 project_dir: kr_protocol::scalars::Nullable::null(),
             })
@@ -2512,5 +2512,39 @@ async fn a_question_asked_for_a_launched_agent_ends_with_the_agents_instance() {
     assert!(
         !answered.status.success(),
         "an answer to an invalidated question is refused"
+    );
+}
+
+/// KR-REQ-11.01: a word in the grammar that no admitted package declares is refused by the host
+/// with the words it knows, in text that only the host's refusal says (the command line's parser
+/// accepts the word and does not list the six), and nothing is written.
+#[test]
+fn an_unknown_agent_word_is_refused_by_the_host_with_the_words_it_knows() {
+    let home = tempfile::tempdir().expect("a home directory on the internal disk");
+    let state = tempfile::tempdir().expect("a state directory on the internal disk");
+    let installer = kr_controller::agent_tools::Installer::new(
+        home.path().to_path_buf(),
+        state.path().join("agent-tools"),
+        "kr".to_owned(),
+    );
+    let refused = installer
+        .install(&kr_protocol::skill::AgentToolsParams {
+            agent: kr_protocol::skill::AgentTarget::parse("amp").expect("a word in the grammar"),
+            scope: kr_protocol::skill::InstallScope::User,
+            project_dir: kr_protocol::scalars::Nullable::null(),
+        })
+        .expect_err("a word no package declares is refused");
+    let text = refused.to_string();
+    assert!(
+        text.contains(
+            "amp is not an agent this host knows; it knows codex, claude-code, opencode, \
+             gemini-cli, kimi-code-cli and qoder-cli"
+        ),
+        "{text}"
+    );
+    assert_eq!(
+        std::fs::read_dir(home.path()).expect("the home").count(),
+        0,
+        "nothing is written for a word the host does not know"
     );
 }

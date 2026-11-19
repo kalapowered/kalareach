@@ -28,8 +28,8 @@ use kr_flush::NameKind;
 use kr_protocol::scalars::{Digest256, Nullable};
 use kr_protocol::skill::{
     AgentTarget, AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult,
-    AgentToolsStatusResult, ChangeManifest, ChangeOperation, InstalledFile, SERVER_NAME,
-    SKILL_NAME,
+    AgentToolsStatusResult, ChangeManifest, ChangeOperation, CompiledAgent, InstalledFile,
+    SERVER_NAME, SKILL_NAME,
 };
 use serde_json::{Value, json};
 
@@ -89,6 +89,25 @@ struct Configuration {
     /// agent-specific field there would make the second installation rewrite the first's entry and
     /// leave its record describing something that is no longer in the file.
     shared: bool,
+    /// The deadline member this installation writes into the entry and the environment value that
+    /// goes with it, where the agent takes one. A shared document carries none.
+    deadline: Option<Deadline>,
+}
+
+/// The deadline an installation promises the tool server: the member of the entry that holds it,
+/// and the number written there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Deadline {
+    /// The member of the entry.
+    field: String,
+    /// What the member holds, in the unit the agent reads it in.
+    value: i64,
+}
+
+impl Deadline {
+    /// The number the server is told through [`DEADLINE_VARIABLE`], in milliseconds. It is the same
+    /// ceiling whatever unit the agent reads its own member in.
+    const ENVIRONMENT_MILLISECONDS: i64 = QUALIFIED_DEADLINE_SECONDS * 1_000;
 }
 
 /// How one agent's configuration document is written.
@@ -188,7 +207,7 @@ impl Installer {
                 (
                     ChangeManifest {
                         skill_version: SKILL_VERSION.to_owned(),
-                        agent: params.agent,
+                        agent: params.agent.clone(),
                         scope: params.scope,
                         root: display(&root),
                         entry_point: self.entry_point(),
@@ -203,7 +222,7 @@ impl Installer {
             |existing| (existing.manifest, existing.pending),
         );
         let mut record = InstallationRecord {
-            version: InstallationRecord::VERSION,
+            version: record_version(&params.agent),
             state: InstallationRecord::INSTALLING.to_owned(),
             manifest: previous,
             pending: carried,
@@ -257,7 +276,7 @@ impl Installer {
             let planned = ChangeOperation::AddConfigurationEntry {
                 path: display(&configuration.path),
                 entry: format!("{}.{SERVER_NAME}", configuration.format.key()),
-                digest: self.planned_entry_digest(configuration, params.agent),
+                digest: self.planned_entry_digest(configuration),
                 // Whether this host created the document is a fact about the first installation
                 // that wrote it, not about this one. A repair keeps what was recorded.
                 created_document: self.created_document(&record, &configuration.path)
@@ -265,7 +284,7 @@ impl Installer {
             };
             self.confirm_existing(params, &mut record, &planned)?;
             self.begin(params, &mut record, planned)?;
-            let written = self.write_entry(configuration, params.agent)?;
+            let written = self.write_entry(configuration)?;
             let written = self.keep_provenance(&record, written, &configuration.path);
             self.finish(params, &mut record, written)?;
         }
@@ -434,8 +453,7 @@ impl Installer {
     ///
     /// The plan carries it so a removal after an interrupted installation can tell the entry this
     /// host wrote from one somebody else put there.
-    fn planned_entry_digest(&self, configuration: &Configuration, agent: AgentTarget) -> Digest256 {
-        let declaring = (!configuration.shared).then_some(agent);
+    fn planned_entry_digest(&self, configuration: &Configuration) -> Digest256 {
         if configuration.format == Format::CodexToml {
             let mut entry = toml_edit::Table::new();
             entry["command"] = toml_edit::value(self.executable.clone());
@@ -444,20 +462,19 @@ impl Installer {
                 args.push(*argument);
             }
             entry["args"] = toml_edit::value(args);
-            if let Some((field, seconds)) = declaring.and_then(deadline_field)
-                && let Some(seconds) = seconds.as_i64()
-            {
-                entry[field] = toml_edit::value(seconds);
-            }
-            if let Some(milliseconds) = declaring.and_then(deadline_milliseconds) {
+            if let Some(deadline) = configuration.deadline.as_ref() {
+                entry[deadline.field.as_str()] = toml_edit::value(deadline.value);
                 let mut environment = toml_edit::InlineTable::new();
-                environment.insert(DEADLINE_VARIABLE, milliseconds.to_string().into());
+                environment.insert(
+                    DEADLINE_VARIABLE,
+                    Deadline::ENVIRONMENT_MILLISECONDS.to_string().into(),
+                );
                 entry["env"] = toml_edit::value(environment);
             }
             return digest_of(toml_edit::Item::Table(entry).to_string().trim().as_bytes());
         }
         digest_of(
-            self.entry_value(configuration.format, declaring)
+            self.entry_value(configuration.format, configuration.deadline.as_ref())
                 .to_string()
                 .as_bytes(),
         )
@@ -472,7 +489,7 @@ impl Installer {
         let layout = self.layout(params)?;
         let Some(record) = self.recorded(params)? else {
             return Ok(AgentToolsStatusResult {
-                agent: params.agent,
+                agent: params.agent.clone(),
                 scope: params.scope,
                 root: display(&layout.skills),
                 installed: false,
@@ -509,7 +526,7 @@ impl Installer {
             ));
         }
         Ok(AgentToolsStatusResult {
-            agent: params.agent,
+            agent: params.agent.clone(),
             scope: params.scope,
             root: manifest.root.clone(),
             installed: record.is_complete(),
@@ -536,7 +553,7 @@ impl Installer {
         self.migrate_records(params)?;
         let Some(record) = read else {
             return Ok(AgentToolsRemoveResult {
-                agent: params.agent,
+                agent: params.agent.clone(),
                 scope: params.scope,
                 removed: Vec::new(),
                 retained: vec![format!(
@@ -622,7 +639,7 @@ impl Installer {
             sync_directory(&self.records, NameKind::File)?;
         }
         Ok(AgentToolsRemoveResult {
-            agent: params.agent,
+            agent: params.agent.clone(),
             scope: params.scope,
             removed,
             retained,
@@ -679,23 +696,19 @@ impl Installer {
     }
 
     /// Adds the server entry to an agent's configuration, leaving its other settings alone.
-    fn write_entry(
-        &self,
-        configuration: &Configuration,
-        agent: AgentTarget,
-    ) -> Result<ChangeOperation> {
+    fn write_entry(&self, configuration: &Configuration) -> Result<ChangeOperation> {
         let created_document = !configuration.path.exists();
         if let Some(parent) = configuration.path.parent()
             && !parent.exists()
         {
             std::fs::create_dir_all(parent).map_err(storage)?;
         }
-        // A shared document gets the same entry whichever agent's installation writes it, so the
-        // deadline an individual agent would declare is left out of one.
-        let declaring = (!configuration.shared).then_some(agent);
+        // A shared document gets the same entry whichever agent's installation writes it, so it
+        // holds no deadline: the configuration of one carries none.
+        let deadline = configuration.deadline.as_ref();
         let digest = match configuration.format {
-            Format::CodexToml => self.write_toml_entry(&configuration.path, declaring)?,
-            format => self.write_json_entry(&configuration.path, format, declaring)?,
+            Format::CodexToml => self.write_toml_entry(&configuration.path, deadline)?,
+            format => self.write_json_entry(&configuration.path, format, deadline)?,
         };
         Ok(ChangeOperation::AddConfigurationEntry {
             path: display(&configuration.path),
@@ -705,7 +718,7 @@ impl Installer {
         })
     }
 
-    fn write_toml_entry(&self, path: &Path, agent: Option<AgentTarget>) -> Result<Digest256> {
+    fn write_toml_entry(&self, path: &Path, deadline: Option<&Deadline>) -> Result<Digest256> {
         let text = read_to_string(path)?.unwrap_or_default();
         let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
             ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
@@ -730,14 +743,13 @@ impl Installer {
             args.push(*argument);
         }
         entry["args"] = toml_edit::value(args);
-        if let Some((field, seconds)) = agent.and_then(deadline_field)
-            && let Some(seconds) = seconds.as_i64()
-        {
-            entry[field] = toml_edit::value(seconds);
-        }
-        if let Some(milliseconds) = agent.and_then(deadline_milliseconds) {
+        if let Some(deadline) = deadline {
+            entry[deadline.field.as_str()] = toml_edit::value(deadline.value);
             let mut environment = toml_edit::InlineTable::new();
-            environment.insert(DEADLINE_VARIABLE, milliseconds.to_string().into());
+            environment.insert(
+                DEADLINE_VARIABLE,
+                Deadline::ENVIRONMENT_MILLISECONDS.to_string().into(),
+            );
             entry["env"] = toml_edit::value(environment);
         }
         table.insert(SERVER_NAME, toml_edit::Item::Table(entry));
@@ -760,11 +772,11 @@ impl Installer {
         &self,
         path: &Path,
         format: Format,
-        agent: Option<AgentTarget>,
+        deadline: Option<&Deadline>,
     ) -> Result<Digest256> {
         let key = format.key();
         let members = [key, SERVER_NAME];
-        let value = self.entry_value(format, agent);
+        let value = self.entry_value(format, deadline);
         let entry = value.to_string();
         let edited = match read_exact(path)? {
             // A document this host creates holds the entry and the container on the way to it.
@@ -1151,7 +1163,7 @@ impl Installer {
         Ok(Removal::Removed)
     }
 
-    fn entry_value(&self, format: Format, agent: Option<AgentTarget>) -> Value {
+    fn entry_value(&self, format: Format, deadline: Option<&Deadline>) -> Value {
         let arguments: Vec<&str> = ENTRY_ARGS.to_vec();
         match format {
             Format::JsonLocalCommandList => {
@@ -1169,11 +1181,11 @@ impl Installer {
                 // server with, so the server bounds its own waits by what this client allows
                 // instead of by a guess.
                 if let Some(object) = entry.as_object_mut()
-                    && let Some(milliseconds) = agent.and_then(deadline_milliseconds)
+                    && deadline.is_some()
                 {
                     object.insert(
                         "env".to_owned(),
-                        json!({ DEADLINE_VARIABLE: milliseconds.to_string() }),
+                        json!({ DEADLINE_VARIABLE: Deadline::ENVIRONMENT_MILLISECONDS.to_string() }),
                     );
                 }
                 // Section 11 shortens a long poll to the installed client's qualified tool
@@ -1181,10 +1193,10 @@ impl Installer {
                 // declares one long enough for the host's own ceiling, so a wait returns the
                 // durable question rather than being cut off by a default the agent chose for
                 // ordinary tools.
-                if let Some((field, value)) = agent.and_then(deadline_field)
+                if let Some(deadline) = deadline
                     && let Some(object) = entry.as_object_mut()
                 {
-                    object.insert(field.to_owned(), value);
+                    object.insert(deadline.field.clone(), json!(deadline.value));
                 }
                 entry
             }
@@ -1207,105 +1219,135 @@ impl Installer {
                 })
         };
         let home = &self.home;
-        let layout = match (params.agent, params.scope) {
+        let Some(compiled) = params.agent.compiled() else {
+            return Err(ControllerError::InvalidArgument(format!(
+                "{} is not an agent this host knows; it knows {}",
+                params.agent,
+                known_words()
+            )));
+        };
+        let layout = match (compiled, params.scope) {
             // Codex reads repository and user skills from `.agents/skills`, and scopes servers to
             // a project with `.codex/config.toml`.
-            (AgentTarget::Codex, User) => Layout {
+            (CompiledAgent::Codex, User) => Layout {
                 skills: under(home, &[".agents", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(home, &[".codex", "config.toml"]),
                     format: Format::CodexToml,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::Codex, Project) => Layout {
+            (CompiledAgent::Codex, Project) => Layout {
                 skills: under(&project()?, &[".agents", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(&project()?, &[".codex", "config.toml"]),
                     format: Format::CodexToml,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::ClaudeCode, User) => Layout {
+            (CompiledAgent::ClaudeCode, User) => Layout {
                 skills: under(home, &[".claude", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(home, &[".claude.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::ClaudeCode, Project) => Layout {
+            (CompiledAgent::ClaudeCode, Project) => Layout {
                 skills: under(&project()?, &[".claude", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(&project()?, &[".mcp.json"]),
                     format: Format::JsonCommandArgs,
                     shared: true,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::Opencode, User) => Layout {
+            (CompiledAgent::Opencode, User) => Layout {
                 skills: under(home, &[".config", "opencode", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(home, &[".config", "opencode", "opencode.json"]),
                     format: Format::JsonLocalCommandList,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::Opencode, Project) => Layout {
+            (CompiledAgent::Opencode, Project) => Layout {
                 skills: under(&project()?, &[".opencode", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(&project()?, &["opencode.json"]),
                     format: Format::JsonLocalCommandList,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::GeminiCli, User) => Layout {
+            (CompiledAgent::GeminiCli, User) => Layout {
                 skills: under(home, &[".gemini", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(home, &[".gemini", "settings.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::GeminiCli, Project) => Layout {
+            (CompiledAgent::GeminiCli, Project) => Layout {
                 skills: under(&project()?, &[".gemini", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(&project()?, &[".gemini", "settings.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::KimiCodeCli, User) => Layout {
+            (CompiledAgent::KimiCodeCli, User) => Layout {
                 skills: under(home, &[".kimi-code", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(home, &[".kimi-code", "mcp.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::KimiCodeCli, Project) => Layout {
+            (CompiledAgent::KimiCodeCli, Project) => Layout {
                 skills: under(&project()?, &[".kimi", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(&project()?, &[".mcp.json"]),
                     format: Format::JsonCommandArgs,
                     shared: true,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::QoderCli, User) => Layout {
+            (CompiledAgent::QoderCli, User) => Layout {
                 skills: under(home, &[".qoder", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(home, &[".qoder", "settings.json"]),
                     format: Format::JsonCommandArgs,
                     shared: false,
+                    deadline: None,
                 }),
             },
-            (AgentTarget::QoderCli, Project) => Layout {
+            (CompiledAgent::QoderCli, Project) => Layout {
                 skills: under(&project()?, &[".qoder", "skills", SKILL_NAME]),
                 configuration: Some(Configuration {
                     path: under(&project()?, &[".mcp.json"]),
                     format: Format::JsonCommandArgs,
                     shared: true,
+                    deadline: None,
                 }),
             },
+        };
+        // The deadline an agent takes is the compiled table's, and none is written into a document
+        // that more than one agent reads.
+        let layout = Layout {
+            configuration: layout.configuration.map(|configuration| Configuration {
+                deadline: (!configuration.shared)
+                    .then(|| compiled_deadline(compiled))
+                    .flatten(),
+                ..configuration
+            }),
+            ..layout
         };
         Ok(layout)
     }
@@ -1477,16 +1519,28 @@ struct InstallationRecord {
     pending: Vec<ChangeOperation>,
 }
 
-/// The format of the retained installation actions this build writes, recorded in each as `version`.
-pub const ACTION_RECORD_VERSION: u32 = 1;
+/// The highest format of the retained installation actions this build writes, recorded in each as
+/// `version`. A record of an action for one of the six compiled agents is version 1, as every
+/// earlier build wrote it, and one that names any other word is version 2 ([`record_version`]).
+pub const ACTION_RECORD_VERSION: u32 = 2;
+
+/// The format a record of an installation or of an action for `word` is written in: 1 for one of
+/// the six compiled agents, which every earlier build reads, and 2 for any other word, which an
+/// earlier build cannot read and so refuses a switch to itself while one is held.
+#[must_use]
+pub fn record_version(word: &AgentTarget) -> u32 {
+    if word.compiled().is_some() { 1 } else { 2 }
+}
 
 /// The shape of the installation record this build writes, recorded in it as `version`. A record
 /// that states none is one of two earlier shapes, which `read_record` converts.
 pub const INSTALLATION_RECORD_VERSION: u32 = InstallationRecord::VERSION;
 
 impl InstallationRecord {
-    /// The shape this build writes, in which a recorded operation is one that happened.
-    const VERSION: u32 = 1;
+    /// The highest shape this build writes, in which a recorded operation is one that happened.
+    /// A record is written in [`record_version`] of its agent, so a host that uses only the six
+    /// compiled agents still writes what an earlier build reads.
+    const VERSION: u32 = 2;
 
     /// The state of a record whose journal has been carried out.
     const INSTALLED: &'static str = "installed";
@@ -1540,7 +1594,7 @@ impl ActionRecord {
             }
         };
         Some(Self {
-            version: ACTION_RECORD_VERSION,
+            version: 1,
             digest: self.digest.clone(),
             state: self.state.clone(),
             result,
@@ -1601,7 +1655,7 @@ impl Installer {
         // its result converted and its format stated, so that a stamped record is wholly current.
         // The answer is owed either way: a record that cannot be written stays as it was and is
         // written the next time it is asked for.
-        if record.version < ACTION_RECORD_VERSION
+        if record.version == 0
             && let Some(current) = record.carried_forward()
         {
             let _ = self.write_action(actor_id, action_id, &current);
@@ -1666,7 +1720,8 @@ impl Installer {
             actor_id,
             action_id,
             &ActionRecord {
-                version: ACTION_RECORD_VERSION,
+                // A marker names no word and no result, so every build reads it.
+                version: 1,
                 digest: hex(digest.as_bytes()),
                 state: "dispatching".to_owned(),
                 result: None,
@@ -1674,7 +1729,7 @@ impl Installer {
         )
     }
 
-    /// Records what the effect produced.
+    /// Records what the effect produced, in the format of the agent's word.
     ///
     /// # Errors
     ///
@@ -1685,12 +1740,13 @@ impl Installer {
         action_id: kr_protocol::ids::ActionId,
         digest: &Digest256,
         result: &kr_protocol::envelope::ParamsValue,
+        word: &AgentTarget,
     ) -> Result<()> {
         self.write_action(
             actor_id,
             action_id,
             &ActionRecord {
-                version: ACTION_RECORD_VERSION,
+                version: record_version(word),
                 digest: hex(digest.as_bytes()),
                 state: "applied".to_owned(),
                 result: Some(hex(&kr_cbor::encode(result.as_value()))),
@@ -1822,7 +1878,7 @@ fn read_record(text: &str) -> std::result::Result<InstallationRecord, String> {
         let manifest: ChangeManifest =
             serde_json::from_value(value).map_err(|error| error.to_string())?;
         return Ok(InstallationRecord {
-            version: InstallationRecord::VERSION,
+            version: record_version(&manifest.agent),
             state: InstallationRecord::INSTALLING.to_owned(),
             manifest,
             pending: Vec::new(),
@@ -1832,7 +1888,7 @@ fn read_record(text: &str) -> std::result::Result<InstallationRecord, String> {
     // journal wrote a `pending` list, the plan before it had no such thing. Serde's default would
     // erase that difference, so it is read from the document.
     let predicted = version == UNVERSIONED && value.get("pending").is_none();
-    if version != UNVERSIONED && version != u64::from(InstallationRecord::VERSION) {
+    if version > u64::from(InstallationRecord::VERSION) {
         return Err(format!(
             "this record was written in version {version}, which this build does not read; a \
              newer build wrote it and only that one should change it"
@@ -1840,7 +1896,7 @@ fn read_record(text: &str) -> std::result::Result<InstallationRecord, String> {
     }
     let mut record: InstallationRecord =
         serde_json::from_value(value).map_err(|error| error.to_string())?;
-    record.version = InstallationRecord::VERSION;
+    record.version = record_version(&record.manifest.agent);
     if predicted {
         // A record from the build that wrote its intentions rather than its effects. Those
         // operations may or may not have happened, so they become evidence of uncertainty: a
@@ -1886,16 +1942,12 @@ fn is_record_name(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".json") else {
         return false;
     };
-    AgentTarget::ALL.iter().any(|agent| {
-        stem.strip_prefix(agent.as_str())
-            .and_then(|rest| rest.strip_prefix('-'))
-            .is_some_and(|rest| {
-                rest == "user"
-                    || rest == "project"
-                    || rest
-                        .strip_prefix("project-")
-                        .or_else(|| rest.strip_prefix("user-"))
-                        .is_some_and(is_digest_name)
+    let is_word = |word: &str| AgentTarget::problem(word).is_none();
+    ["user", "project"].iter().any(|scope| {
+        let ending = format!("-{scope}");
+        stem.strip_suffix(ending.as_str()).is_some_and(is_word)
+            || stem.rsplit_once('-').is_some_and(|(head, digest)| {
+                is_digest_name(digest) && head.strip_suffix(ending.as_str()).is_some_and(is_word)
             })
     })
 }
@@ -1961,7 +2013,7 @@ enum Removal {
 /// never cuts off a wait the host would have finished.
 const QUALIFIED_DEADLINE_SECONDS: i64 = 660;
 
-/// The field one agent declares a server's tool deadline in, where it has one.
+/// The deadline one compiled agent takes, where it has one.
 ///
 /// Each spelling belongs to that agent's own configuration document. A document more than one
 /// agent reads carries none of them: the three agents that share a project's `.mcp.json` do not
@@ -1970,26 +2022,31 @@ const QUALIFIED_DEADLINE_SECONDS: i64 = 660;
 ///
 /// OpenCode is deliberately absent. What its configuration exposes is broader than one server, and
 /// a setting that changes how every server behaves is not this installation's to write.
-fn deadline_field(agent: AgentTarget) -> Option<(&'static str, Value)> {
-    match agent {
-        AgentTarget::Codex => Some(("tool_timeout_sec", json!(QUALIFIED_DEADLINE_SECONDS))),
-        AgentTarget::KimiCodeCli => {
-            Some(("toolTimeoutMs", json!(QUALIFIED_DEADLINE_SECONDS * 1_000)))
+fn compiled_deadline(agent: CompiledAgent) -> Option<Deadline> {
+    let (field, value) = match agent {
+        CompiledAgent::Codex => ("tool_timeout_sec", QUALIFIED_DEADLINE_SECONDS),
+        CompiledAgent::KimiCodeCli => ("toolTimeoutMs", QUALIFIED_DEADLINE_SECONDS * 1_000),
+        CompiledAgent::ClaudeCode | CompiledAgent::QoderCli | CompiledAgent::GeminiCli => {
+            ("timeout", QUALIFIED_DEADLINE_SECONDS * 1_000)
         }
-        AgentTarget::ClaudeCode | AgentTarget::QoderCli | AgentTarget::GeminiCli => {
-            Some(("timeout", json!(QUALIFIED_DEADLINE_SECONDS * 1_000)))
-        }
-        AgentTarget::Opencode => None,
-    }
+        CompiledAgent::Opencode => return None,
+    };
+    Some(Deadline {
+        field: field.to_owned(),
+        value,
+    })
 }
 
-/// The deadline this installation can promise the tool server, in milliseconds.
-///
-/// It is the declared deadline where the agent takes one. An agent that takes none gets nothing
-/// here either, and the server bounds its own waits conservatively instead of against a number
-/// nobody agreed to.
-fn deadline_milliseconds(agent: AgentTarget) -> Option<i64> {
-    deadline_field(agent).map(|_| QUALIFIED_DEADLINE_SECONDS * 1_000)
+/// The words of the agents this host knows, as a sentence part.
+fn known_words() -> String {
+    let words: Vec<&str> = CompiledAgent::ALL
+        .iter()
+        .map(|agent| agent.as_str())
+        .collect();
+    match words.split_last() {
+        Some((last, first)) => format!("{} and {last}", first.join(", ")),
+        None => String::new(),
+    }
 }
 
 /// Returns `base` with `names` joined onto it one at a time.
@@ -2228,7 +2285,7 @@ mod tests {
     fn a_held_record_from_an_earlier_build_is_moved_once_it_is_let_go() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         let (modern, legacy) = record_under_its_earlier_name(&installer, &params);
         let kept = std::fs::read(&legacy).expect("the record");
         let (refusals, guard) = crate::catalogue::files::tests::at_the_first_refusal(
@@ -2251,7 +2308,7 @@ mod tests {
     fn a_record_written_under_the_new_name_while_the_move_waits_is_not_replaced() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         let (modern, legacy) = record_under_its_earlier_name(&installer, &params);
         let kept = std::fs::read(&legacy).expect("the record");
         let written = modern.clone();
@@ -2366,7 +2423,7 @@ mod tests {
         // An installation writes its own record, in a state directory with no records yet.
         let tree = Tree::create();
         tree.installer()
-            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .install(&params(AgentTarget::CLAUDE_CODE, InstallScope::User))
             .expect("installs");
         let records = tree.root.join("state").join("agent-tools");
         assert_eq!(mode(&records), 0o700, "{}", records.display());
@@ -2421,13 +2478,13 @@ mod tests {
     fn an_installation_writes_the_skill_and_registers_the_server() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         let result = installer.install(&params).expect("installs");
         assert!(!result.already_installed);
         assert!(result.unresolved.is_empty());
 
         let manifest = &result.manifest;
-        assert_eq!(manifest.agent, AgentTarget::ClaudeCode);
+        assert_eq!(manifest.agent, AgentTarget::CLAUDE_CODE);
         assert_eq!(manifest.scope, InstallScope::User);
         assert_eq!(manifest.skill_version, SKILL_VERSION);
         let skill_root = tree.home().join(".claude/skills/kalareach-contact");
@@ -2489,7 +2546,7 @@ mod tests {
         let server = &written["mcpServers"]["kalareach"];
         assert_eq!(
             *server,
-            installer.entry_value(Format::JsonCommandArgs, Some(AgentTarget::ClaudeCode))
+            installer.entry_value(Format::JsonCommandArgs, compiled_deadline(CompiledAgent::ClaudeCode).as_ref())
         );
         assert_eq!(server["args"], json!(ENTRY_ARGS));
         assert_eq!(
@@ -2537,7 +2594,7 @@ mod tests {
     fn a_second_installation_is_the_same_installation() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
         let again = installer.install(&params).expect("installs");
         assert!(again.already_installed);
@@ -2548,7 +2605,7 @@ mod tests {
     fn status_reports_what_changed_since_the_installation() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
         let status = installer.status(&params).expect("reads");
         assert!(status.installed);
@@ -2577,7 +2634,7 @@ mod tests {
             r#"{"mcpServers":{"theirs":{"command":"their-server"}},"theme":"dark"}"#,
         )
         .expect("writes");
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
         let removed = installer.remove(&params).expect("removes");
         assert!(!removed.removed.is_empty());
@@ -2604,7 +2661,7 @@ mod tests {
     fn a_removal_keeps_a_file_somebody_edited() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
         let edited = tree
             .home()
@@ -2630,7 +2687,7 @@ mod tests {
         )
         .expect("writes");
         let error = installer
-            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .install(&params(AgentTarget::CLAUDE_CODE, InstallScope::User))
             .expect_err("refuses");
         assert_eq!(
             error.to_protocol_error().code,
@@ -2648,7 +2705,7 @@ mod tests {
             "# a comment somebody wrote\nmodel = \"something\"\n\n[mcp_servers.theirs]\ncommand = \"their-server\"\n",
         )
         .expect("writes");
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         installer.install(&params).expect("installs");
         let text =
             std::fs::read_to_string(tree.home().join(".codex/config.toml")).expect("the file");
@@ -2673,7 +2730,7 @@ mod tests {
         std::fs::create_dir_all(&skills).expect("a directory");
         std::fs::write(skills.join("SKILL.md"), "somebody's own notes").expect("writes");
         let error = installer
-            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .install(&params(AgentTarget::CLAUDE_CODE, InstallScope::User))
             .expect_err("refuses");
         assert_eq!(
             error.to_protocol_error().code,
@@ -2697,7 +2754,7 @@ mod tests {
         std::fs::set_permissions(&configuration, std::fs::Permissions::from_mode(0o600))
             .expect("makes it private");
         tree.installer()
-            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .install(&params(AgentTarget::CLAUDE_CODE, InstallScope::User))
             .expect("installs");
         let mode = std::fs::metadata(&configuration)
             .expect("the file")
@@ -2719,16 +2776,16 @@ mod tests {
             project_dir: Nullable::some(display(&project)),
         };
         installer
-            .install(&with_project(AgentTarget::ClaudeCode))
+            .install(&with_project(AgentTarget::CLAUDE_CODE))
             .expect("installs");
         installer
-            .install(&with_project(AgentTarget::QoderCli))
+            .install(&with_project(AgentTarget::QODER_CLI))
             .expect("installs");
         let shared = project.join(".mcp.json");
         assert!(shared.is_file());
 
         let removed = installer
-            .remove(&with_project(AgentTarget::ClaudeCode))
+            .remove(&with_project(AgentTarget::CLAUDE_CODE))
             .expect("removes");
         let configuration: Value =
             serde_json::from_str(&std::fs::read_to_string(&shared).expect("the file"))
@@ -2747,7 +2804,7 @@ mod tests {
         );
 
         installer
-            .remove(&with_project(AgentTarget::QoderCli))
+            .remove(&with_project(AgentTarget::QODER_CLI))
             .expect("removes");
         let configuration: Value =
             serde_json::from_str(&std::fs::read_to_string(&shared).expect("the file"))
@@ -2789,14 +2846,14 @@ mod tests {
         );
 
         let result = kr_protocol::envelope::ParamsValue::from_typed(&AgentToolsRemoveResult {
-            agent: AgentTarget::Codex,
+            agent: AgentTarget::CODEX,
             scope: InstallScope::User,
             removed: Vec::new(),
             retained: Vec::new(),
         })
         .expect("encodes");
         installer
-            .settle(&actor, action, &digest, &result)
+            .settle(&actor, action, &digest, &result, &AgentTarget::CODEX)
             .expect("settles");
         assert_eq!(
             installer
@@ -2821,7 +2878,7 @@ mod tests {
     fn repairing_a_deleted_file_keeps_the_entry_this_host_already_claimed() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
         std::fs::remove_file(
             tree.home()
@@ -2844,7 +2901,7 @@ mod tests {
     fn an_installation_that_did_not_finish_is_not_reported_as_installed() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
         // What a crash between the plan and the last effect leaves behind.
         let path = installer.record_path(&params);
@@ -2869,7 +2926,7 @@ mod tests {
     fn a_change_that_may_not_have_happened_is_reported_and_left_alone() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
 
         // What a crash between the note and the effect leaves: a record that says a file may or
@@ -2918,7 +2975,7 @@ mod tests {
     fn a_file_left_in_flight_is_repaired_rather_than_refused() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
 
         // What a crash between writing a skill file and recording it leaves: the file is on disk
@@ -2968,7 +3025,7 @@ mod tests {
     fn an_interrupted_configuration_entry_is_finished_by_installing_again() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         installer.install(&params).expect("installs");
 
         // What a crash between writing the entry and recording it leaves: the entry is in the
@@ -3018,7 +3075,7 @@ mod tests {
     fn an_interrupted_entry_is_adopted_before_it_is_replaced() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         installer.install(&params).expect("installs");
 
         // Interrupted after the entry was written and before it was recorded.
@@ -3087,7 +3144,7 @@ mod tests {
         // not resolve, because it had no such account to give.
         let manifest = ChangeManifest {
             skill_version: SKILL_VERSION.to_owned(),
-            agent: params(AgentTarget::Codex, InstallScope::User).agent,
+            agent: params(AgentTarget::CODEX, InstallScope::User).agent,
             scope: InstallScope::User,
             root: "/somewhere".to_owned(),
             entry_point: vec!["kr".to_owned()],
@@ -3136,7 +3193,10 @@ mod tests {
         let text =
             std::fs::read_to_string(installer.action_path(&actor, action)).expect("a record");
         let record: ActionRecord = serde_json::from_str(&text).expect("a record");
-        assert_eq!(record.version, ACTION_RECORD_VERSION);
+        assert_eq!(
+            record.version, 1,
+            "a result of a compiled agent is written in version 1"
+        );
         let kept = kr_cbor::decode(
             &unhex(&record.result.expect("a result")).expect("hexadecimal"),
             &kr_cbor::Limits::DEFAULT,
@@ -3146,6 +3206,89 @@ mod tests {
             panic!("a result is a map");
         };
         assert!(kept.get("unresolved").is_some(), "the result is converted");
+    }
+
+    /// A record is written at the version an earlier build reads for one of the six compiled words
+    /// and at the next version for any other word, in every writer of an action record: the
+    /// dispatching marker names no word and is always version 1, a settled result takes its word's
+    /// version, and a replay of a result that carried no version stamps version 1.
+    #[test]
+    fn a_record_carries_version_one_for_the_six_and_two_for_a_declared_word() {
+        let declared = AgentTarget::parse("amp").expect("a word in the grammar");
+        for word in AgentTarget::ALL {
+            assert_eq!(record_version(word), 1, "{word} is one of the six");
+        }
+        assert_eq!(record_version(&declared), 2);
+        assert_eq!(
+            ACTION_RECORD_VERSION, 2,
+            "the highest version this build writes"
+        );
+        assert_eq!(INSTALLATION_RECORD_VERSION, 2);
+
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");
+        let digest = Digest256::from_bytes([9; 32]);
+        let read = |path: &Path| -> Value {
+            serde_json::from_slice(&std::fs::read(path).expect("the record")).expect("JSON")
+        };
+        let settled = |word: &AgentTarget| {
+            let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+            installer
+                .mark_dispatching(&actor, action, &digest)
+                .expect("marks");
+            let path = installer.action_path(&actor, action);
+            assert_eq!(read(&path)["version"], 1, "a marker names no word");
+            let result = kr_protocol::envelope::ParamsValue::from_typed(&AgentToolsRemoveResult {
+                agent: word.clone(),
+                scope: InstallScope::User,
+                removed: Vec::new(),
+                retained: Vec::new(),
+            })
+            .expect("encodes");
+            installer
+                .settle(&actor, action, &digest, &result, word)
+                .expect("settles");
+            let version = read(&path)["version"].clone();
+            // Answering from the record again changes nothing: a replay never stamps 2 on a
+            // result of one of the six.
+            installer
+                .retained(&actor, action, &digest)
+                .copied()
+                .into_answer_for_test()
+                .expect("reads")
+                .expect("an answer");
+            assert_eq!(
+                read(&path)["version"],
+                version,
+                "a replay keeps the version"
+            );
+            version
+        };
+        assert_eq!(
+            settled(&AgentTarget::CODEX),
+            1,
+            "a result for one of the six"
+        );
+        assert_eq!(settled(&declared), 2, "a result for a declared word");
+    }
+
+    /// A record of version 1 and one of version 2 are read through one reader, as the same shape.
+    #[test]
+    fn a_version_one_and_a_version_two_record_read_through_one_reader() {
+        let record = |version: u32| {
+            serde_json::json!({
+                "version": version,
+                "state": "installed",
+                "manifest": manifest_value(),
+                "pending": [],
+            })
+            .to_string()
+        };
+        let one = read_record(&record(1)).expect("version 1 is read");
+        let two = read_record(&record(2)).expect("version 2 is read");
+        assert_eq!(one.manifest, two.manifest);
+        assert!(read_record(&record(INSTALLATION_RECORD_VERSION + 1)).is_err());
     }
 
     /// A retained installation action names the format it is written in, and one of a later format
@@ -3164,7 +3307,11 @@ mod tests {
         let read = |path: &Path| -> Value {
             serde_json::from_slice(&std::fs::read(path).expect("the record")).expect("JSON")
         };
-        assert_eq!(read(&path)["version"], ACTION_RECORD_VERSION);
+        assert_eq!(
+            read(&path)["version"],
+            1,
+            "a dispatching marker names no word"
+        );
 
         // A record written before the format was recorded is written again, stamped, when it is
         // read for an answer.
@@ -3177,7 +3324,11 @@ mod tests {
             .into_answer_for_test()
             .expect_err("a marker with no outcome is uncertain");
         assert!(matches!(answered, ControllerError::Uncertain { .. }));
-        assert_eq!(read(&path)["version"], ACTION_RECORD_VERSION);
+        assert_eq!(
+            read(&path)["version"],
+            1,
+            "a replay stamps the version of a record that had none"
+        );
 
         let mut later = read(&path);
         later["version"] = serde_json::json!(ACTION_RECORD_VERSION + 1);
@@ -3200,7 +3351,7 @@ mod tests {
     fn a_document_in_a_directory_that_grants_access_is_not_replaced() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         installer.install(&params).expect("installs");
         let document = tree.home().join(".codex/config.toml");
         // The document itself carries nothing; its directory gives what is made in it a grant the
@@ -3238,7 +3389,7 @@ mod tests {
     fn an_unaccounted_change_keeps_an_installation_open() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
 
         // A note about something this installation no longer touches. Nothing this run does can
@@ -3281,7 +3432,7 @@ mod tests {
     fn a_directory_an_earlier_attempt_was_unsure_of_does_not_hold_an_installation_open() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
 
         let path = installer.record_path(&params);
@@ -3320,7 +3471,7 @@ mod tests {
     fn a_configuration_protected_by_an_access_control_list_is_refused() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         installer.install(&params).expect("installs");
         let document = tree.home().join(".codex/config.toml");
         // Declared after the tree, so it is dropped first however the test ends: a document this
@@ -3403,7 +3554,7 @@ mod tests {
     fn a_configuration_with_an_entry_set_on_it_is_refused_before_anything_is_written() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         installer.install(&params).expect("installs");
         let document = tree.home().join(".codex/config.toml");
         run(
@@ -3453,7 +3604,7 @@ mod tests {
         std::fs::write(&document, r#"{"theme":"dark"}"#).expect("writes the configuration");
         let before = access_of(&document);
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
 
         installer.install(&params).expect("installs");
         let written = std::fs::read_to_string(&document).expect("the document");
@@ -3495,7 +3646,7 @@ mod tests {
         let bytes = std::fs::read(&document).expect("the document");
         let access = access_of(&document);
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
 
         installer
             .check(&params)
@@ -3536,7 +3687,7 @@ mod tests {
         let before = files_under(&tree.root);
         let refused = tree
             .installer()
-            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .install(&params(AgentTarget::CLAUDE_CODE, InstallScope::User))
             .expect_err("refuses");
         assert!(
             matches!(refused, ControllerError::PermissionDenied { ref detail }
@@ -3578,7 +3729,7 @@ mod tests {
         let tree = Tree::create();
         let installer = tree.installer();
         // An ordinary user request: no project directory, which is what the command line sends.
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         installer.install(&params).expect("installs");
         let modern = installer.record_path(&params);
         // The name an earlier build gave it, after a project directory that request happened to
@@ -3609,7 +3760,7 @@ mod tests {
     fn two_records_from_an_earlier_build_are_reported_rather_than_guessed_between() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::Codex, InstallScope::User);
+        let params = params(AgentTarget::CODEX, InstallScope::User);
         std::fs::create_dir_all(&installer.records).expect("a records directory");
         for hash in ["aa", "bb"] {
             std::fs::write(
@@ -3634,7 +3785,7 @@ mod tests {
     #[test]
     fn a_record_from_a_newer_build_is_refused_rather_than_migrated() {
         let text = serde_json::json!({
-            "version": 2,
+            "version": INSTALLATION_RECORD_VERSION + 1,
             "state": "installed",
             "manifest": manifest_value(),
             "pending": [],
@@ -3643,7 +3794,10 @@ mod tests {
 
         let error = read_record(&text).expect_err("refuses");
 
-        assert!(error.contains("version 2"), "{error}");
+        assert!(
+            error.contains(&format!("version {}", INSTALLATION_RECORD_VERSION + 1)),
+            "{error}"
+        );
     }
 
     #[test]
@@ -3671,7 +3825,7 @@ mod tests {
     fn a_directory_that_was_already_there_is_not_claimed() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         // Somebody else's directory, in the place this installation would have made one.
         let skills = tree.home().join(".claude/skills/kalareach-contact");
         std::fs::create_dir_all(&skills).expect("a directory");
@@ -3700,7 +3854,7 @@ mod tests {
         // than claimed as complete.
         let manifest = ChangeManifest {
             skill_version: SKILL_VERSION.to_owned(),
-            agent: AgentTarget::Codex,
+            agent: AgentTarget::CODEX,
             scope: InstallScope::User,
             root: "/somewhere".to_owned(),
             entry_point: vec!["kr".to_owned()],
@@ -3746,13 +3900,13 @@ mod tests {
         // A project directory on a user-scope request changes nothing about where the record goes,
         // so the record keeps a name the reader recognises.
         let named = AgentToolsParams {
-            agent: AgentTarget::Codex,
+            agent: AgentTarget::CODEX,
             scope: InstallScope::User,
             project_dir: Nullable::some("/somewhere".to_owned()),
         };
         assert_eq!(
             installer.record_path(&named),
-            installer.record_path(&params(AgentTarget::Codex, InstallScope::User))
+            installer.record_path(&params(AgentTarget::CODEX, InstallScope::User))
         );
         assert!(is_record_name(
             &installer
@@ -3775,20 +3929,20 @@ mod tests {
             project_dir: Nullable::some(display(&project)),
         };
         installer
-            .install(&with_project(AgentTarget::ClaudeCode))
+            .install(&with_project(AgentTarget::CLAUDE_CODE))
             .expect("installs");
         installer
-            .install(&with_project(AgentTarget::QoderCli))
+            .install(&with_project(AgentTarget::QODER_CLI))
             .expect("installs");
         // Somebody's record is now unreadable. It still claims the shared entry, and a removal
         // that treated it as absent would take a server that installation is using.
         std::fs::write(
-            installer.record_path(&with_project(AgentTarget::QoderCli)),
+            installer.record_path(&with_project(AgentTarget::QODER_CLI)),
             "not a record",
         )
         .expect("writes");
         let error = installer
-            .remove(&with_project(AgentTarget::ClaudeCode))
+            .remove(&with_project(AgentTarget::CLAUDE_CODE))
             .expect_err("refuses");
         assert_eq!(
             error.to_protocol_error().code,
@@ -3804,12 +3958,12 @@ mod tests {
         let tree = Tree::create();
         let installer = tree.installer();
         for agent in AgentTarget::ALL {
-            let params = params(*agent, InstallScope::User);
+            let params = params(agent.clone(), InstallScope::User);
             let layout = installer.layout(&params).expect("a layout");
             let Some(configuration) = layout.configuration.as_ref() else {
                 continue;
             };
-            let planned = installer.planned_entry_digest(configuration, *agent);
+            let planned = installer.planned_entry_digest(configuration);
             installer.install(&params).expect("installs");
             let written = installer
                 .entry_digest_under(&configuration.path, configuration.format.key())
@@ -3825,12 +3979,12 @@ mod tests {
     fn a_project_scope_installation_needs_the_project_directory() {
         let tree = Tree::create();
         tree.installer()
-            .install(&params(AgentTarget::Codex, InstallScope::User))
+            .install(&params(AgentTarget::CODEX, InstallScope::User))
             .expect("an earlier installation");
         let before = files_under(&tree.root);
         let error = tree
             .installer()
-            .install(&params(AgentTarget::ClaudeCode, InstallScope::Project))
+            .install(&params(AgentTarget::CLAUDE_CODE, InstallScope::Project))
             .expect_err("refuses");
         assert_eq!(
             error.to_protocol_error().code,
@@ -3845,10 +3999,10 @@ mod tests {
         let installer = tree.installer();
         for agent in AgentTarget::ALL {
             installer
-                .install(&params(*agent, InstallScope::User))
+                .install(&params(agent.clone(), InstallScope::User))
                 .unwrap_or_else(|error| panic!("{agent} installs: {error}"));
             let status = installer
-                .status(&params(*agent, InstallScope::User))
+                .status(&params(agent.clone(), InstallScope::User))
                 .expect("reads");
             assert!(status.installed, "{agent} is installed");
             assert!(status.drift.is_empty(), "{agent} has no drift");
@@ -3868,7 +4022,7 @@ mod tests {
                     {\"command\": \"a\"}, \"theirs\": {\"command\": \"b\"}}}\n";
         std::fs::write(&document, text).expect("writes");
         let before = files_under(&tree.root);
-        let refused = match installer.install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+        let refused = match installer.install(&params(AgentTarget::CLAUDE_CODE, InstallScope::User))
         {
             Ok(_) => panic!(
                 "installed, and the document is now {:?}",
@@ -3896,7 +4050,7 @@ mod tests {
     fn a_removal_is_refused_before_anything_is_removed_when_its_document_names_a_member_twice() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         installer.install(&params).expect("installs");
         let document = tree.home().join(".claude.json");
         let installed = std::fs::read_to_string(&document).expect("reads");
@@ -3932,7 +4086,7 @@ mod tests {
         ] {
             let tree = Tree::create();
             let installer = tree.installer();
-            let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+            let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
             let document = tree.home().join(".claude.json");
             std::fs::write(&document, original).expect("writes");
             installer.install(&params).expect("installs");
@@ -3946,7 +4100,7 @@ mod tests {
             let written: Value = serde_json::from_str(&installed).expect("json");
             assert_eq!(
                 written["mcpServers"]["kalareach"],
-                installer.entry_value(Format::JsonCommandArgs, Some(AgentTarget::ClaudeCode))
+                installer.entry_value(Format::JsonCommandArgs, compiled_deadline(CompiledAgent::ClaudeCode).as_ref())
             );
             installer.remove(&params).expect("removes");
             assert_eq!(
@@ -3972,21 +4126,21 @@ mod tests {
         for (original, first, last, expected) in [
             (
                 Some("{\n  \"theirs\": true\n}\n"),
-                AgentTarget::ClaudeCode,
-                AgentTarget::QoderCli,
+                AgentTarget::CLAUDE_CODE,
+                AgentTarget::QODER_CLI,
                 Some("{\n  \"theirs\": true,\n  \"mcpServers\": {}\n}\n"),
             ),
             (
                 Some("{\n  \"theirs\": true\n}\n"),
-                AgentTarget::QoderCli,
-                AgentTarget::ClaudeCode,
+                AgentTarget::QODER_CLI,
+                AgentTarget::CLAUDE_CODE,
                 Some("{\n  \"theirs\": true,\n  \"mcpServers\": {}\n}\n"),
             ),
-            (None, AgentTarget::QoderCli, AgentTarget::ClaudeCode, None),
+            (None, AgentTarget::QODER_CLI, AgentTarget::CLAUDE_CODE, None),
             (
                 None,
-                AgentTarget::ClaudeCode,
-                AgentTarget::QoderCli,
+                AgentTarget::CLAUDE_CODE,
+                AgentTarget::QODER_CLI,
                 Some("{\n  \"mcpServers\": {\n  }\n}\n"),
             ),
         ] {
@@ -4000,13 +4154,13 @@ mod tests {
             }
             // Claude Code's installation comes first, so it is the one that creates a document
             // that was not there.
-            for agent in [AgentTarget::ClaudeCode, AgentTarget::QoderCli] {
+            for agent in [AgentTarget::CLAUDE_CODE, AgentTarget::QODER_CLI] {
                 installer
                     .install(&with_project(&project, agent))
                     .expect("installs");
             }
             installer
-                .remove(&with_project(&project, first))
+                .remove(&with_project(&project, first.clone()))
                 .expect("removes");
             let kept: Value =
                 serde_json::from_str(&std::fs::read_to_string(&shared).expect("the file"))
@@ -4016,7 +4170,7 @@ mod tests {
                 "{first} goes first and the entry stays"
             );
             installer
-                .remove(&with_project(&project, last))
+                .remove(&with_project(&project, last.clone()))
                 .expect("removes");
             assert_eq!(
                 std::fs::read_to_string(&shared).ok().as_deref(),
@@ -4032,7 +4186,7 @@ mod tests {
     #[test]
     fn an_entry_this_host_wrote_is_replaced_in_its_place() {
         let tree = Tree::create();
-        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        let params = params(AgentTarget::CLAUDE_CODE, InstallScope::User);
         let document = tree.home().join(".claude.json");
         let original = "{\n\t\"mcpServers\": {\n\t\t\"theirs\": {\"command\": \"their-server\"}\n\t},\n\t\
                         \"theme\": \"dark\"\n}\n";
@@ -4093,7 +4247,7 @@ mod tests {
         let before = files_under(&tree.root);
         match tree
             .installer()
-            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .install(&params(AgentTarget::CLAUDE_CODE, InstallScope::User))
         {
             Ok(_) => panic!(
                 "installed, and the document's group is now {} rather than {group}",
@@ -4111,16 +4265,16 @@ mod tests {
 
     /// Where each agent's skills and configuration live under a user's home, name by name.
     fn user_layout(agent: AgentTarget) -> (&'static [&'static str], &'static [&'static str]) {
-        match agent {
-            AgentTarget::Codex => (&[".agents", "skills"], &[".codex", "config.toml"]),
-            AgentTarget::ClaudeCode => (&[".claude", "skills"], &[".claude.json"]),
-            AgentTarget::Opencode => (
+        match agent.compiled().expect("a compiled agent") {
+            CompiledAgent::Codex => (&[".agents", "skills"], &[".codex", "config.toml"]),
+            CompiledAgent::ClaudeCode => (&[".claude", "skills"], &[".claude.json"]),
+            CompiledAgent::Opencode => (
                 &[".config", "opencode", "skills"],
                 &[".config", "opencode", "opencode.json"],
             ),
-            AgentTarget::GeminiCli => (&[".gemini", "skills"], &[".gemini", "settings.json"]),
-            AgentTarget::KimiCodeCli => (&[".kimi-code", "skills"], &[".kimi-code", "mcp.json"]),
-            AgentTarget::QoderCli => (&[".qoder", "skills"], &[".qoder", "settings.json"]),
+            CompiledAgent::GeminiCli => (&[".gemini", "skills"], &[".gemini", "settings.json"]),
+            CompiledAgent::KimiCodeCli => (&[".kimi-code", "skills"], &[".kimi-code", "mcp.json"]),
+            CompiledAgent::QoderCli => (&[".qoder", "skills"], &[".qoder", "settings.json"]),
         }
     }
 
@@ -4134,10 +4288,10 @@ mod tests {
         let installer = tree.installer();
         let foreign = if cfg!(windows) { '/' } else { '\\' };
         for agent in AgentTarget::ALL {
-            let params = params(*agent, InstallScope::User);
+            let params = params(agent.clone(), InstallScope::User);
             let installed = installer.install(&params).expect("installs");
             let status = installer.status(&params).expect("reads");
-            let (skills, configuration) = user_layout(*agent);
+            let (skills, configuration) = user_layout(agent.clone());
             let mut spelled = vec![installed.manifest.root.clone(), status.root.clone()];
             spelled.extend(
                 installed
@@ -4229,7 +4383,7 @@ mod tests {
     fn a_record_an_earlier_build_spelled_is_repaired_and_removed() {
         let tree = Tree::create();
         let installer = tree.installer();
-        let params = params(AgentTarget::GeminiCli, InstallScope::User);
+        let params = params(AgentTarget::GEMINI_CLI, InstallScope::User);
         let gemini = tree.home().join(".gemini");
         let skill = gemini.join("skills").join(SKILL_NAME);
         let respelled = |installer: &Installer| {

@@ -1118,6 +1118,62 @@ mod tests {
         );
     }
 
+    /// The store of installation records or of retained actions as the release a switch goes back
+    /// to lists it, one that is before a declared agent: it writes version 1 and reads from none.
+    fn records_before_a_declared_agent(inner: &str) -> ReleaseStore {
+        ReleaseStore {
+            store: "agent-tools".to_owned(),
+            scope: StoreScope::StateRoot,
+            path: format!("{inner}/*.json"),
+            recording: Recording::JsonMember {
+                member: "version".to_owned(),
+                absent: 0,
+            },
+            version: 1,
+            migrates_from: 0,
+            reads_through: None,
+        }
+    }
+
+    /// A record of a declared word is written at version 2, which a release before declared agents
+    /// cannot read, so the switch to it is refused for the version, in the directory of installation
+    /// records and in the directory of retained actions. A host that installed for only the six
+    /// compiled words has records at version 1 only and switches back.
+    #[test]
+    fn a_record_of_a_declared_word_is_refused_by_a_switch_to_a_release_that_cannot_read_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let write = |inner: &str, name: &str, version: u32| {
+            let folder = directory.path().join(inner);
+            std::fs::create_dir_all(&folder).expect("a folder");
+            std::fs::write(folder.join(name), format!("{{\"version\": {version}}}"))
+                .expect("a record");
+        };
+        for inner in ["agent-tools", "agent-tools/actions"] {
+            let listed = records_before_a_declared_agent(inner);
+            write(inner, "codex-user.json", 1);
+            let only_six = files(directory.path(), &listed).expect("a listing");
+            assert!(
+                only_six
+                    .iter()
+                    .all(|file| look(&listed, file, false).is_none()),
+                "{inner}: a host that used only the six switches back"
+            );
+            write(inner, "amp-project-0123456789abcdef.json", 2);
+            let named = files(directory.path(), &listed).expect("a listing");
+            assert!(
+                named.iter().any(|file| matches!(
+                    look(&listed, file, false),
+                    Some(Why::Version {
+                        found: 2,
+                        highest: 1,
+                        ..
+                    })
+                )),
+                "{inner}: a record of a declared word refuses the switch for its version"
+            );
+        }
+    }
+
     /// A directory of records is listed, by the extension the store names, and one that cannot be
     /// listed is a store that cannot be read: only a directory that is not there holds no record.
     #[test]
