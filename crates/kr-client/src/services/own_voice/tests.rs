@@ -1935,6 +1935,72 @@ async fn a_closure_that_comes_while_the_hangup_of_a_failed_recovery_waits_is_rea
     );
 }
 
+/// A write that times out while a fence stands gives a recovery that attaches nothing, so the
+/// channel the write was held on is the only one the call has. It is kept through the hangup, and
+/// a closure that comes on it while the hangup waits is read after its answer: the empty 404 does
+/// not leave the call unresolved, no replacement channel is attached, and the call is hung up
+/// once.
+#[tokio::test(start_paused = true)]
+async fn a_closure_that_comes_while_the_hangup_of_a_fenced_recovery_waits_is_read_on_the_original_channel()
+ {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    // A write is held on the channel, and the hangup that follows it is held too.
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    let release = held_hangup(&world);
+    let frame = VoiceContextFrame::new("w-1", VoiceCommand::Thinking, None, Some("x".to_owned()))
+        .expect("frame");
+    let writing = control.write(control.revision(), frame);
+    let events = async {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // The fence comes while the write is held, and then the write passes its bound.
+        let fenced = world.provider.registry().fence().expect("a fence");
+        tokio::time::advance(DRAIN_BOUND).await;
+        until_hung_up(&world, 1).await;
+        assert_eq!(
+            world.stand_in.recorded().hangups.len(),
+            1,
+            "the hangup is held"
+        );
+        // The provider's closure comes on the channel the write was held on, and then the hangup
+        // is answered.
+        world.stand_in.event(&closed_event("close_requested", None));
+        release.notify_one();
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        fenced
+    };
+    let (written, fenced) = tokio::join!(writing, events);
+    assert_eq!(
+        written,
+        Err(WriteRefusal::Lost),
+        "the write was held when the fence came"
+    );
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed),
+        "the closure behind an unconfirmed hangup is the confirmed end"
+    );
+    let seen = world.stand_in.recorded();
+    assert_eq!(seen.hangups.len(), 1, "the call is hung up once");
+    assert_eq!(
+        seen.attaches_asked, 1,
+        "no replacement channel is attached or asked for"
+    );
+    assert!(
+        world.ledger.rows().expect("rows").is_empty(),
+        "no row stands for a call the provider closed"
+    );
+    let _ = fenced;
+    world.provider.registry().unfence();
+}
+
 /// A close that reaches a call while its recovery runs stays unread when the recovery ends the
 /// call, and its reply sender goes with the task: the close is answered by what the record says,
 /// and a call that ended cleanly is closed.

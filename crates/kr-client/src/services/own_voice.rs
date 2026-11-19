@@ -2068,7 +2068,10 @@ impl CallTask {
         if self.read_queued().await {
             return Some(Outcome::ProviderClosed);
         }
-        self.socket = None;
+        // The channel that was lost is kept until its replacement is attached, or until the
+        // hangup and the read after it have ended the call: a write that timed out leaves it
+        // open, and where a fence stands no replacement is attached, so a closure that comes
+        // while the hangup waits can only be read on it.
         self.shared.set_state(SidebandState::Recovering);
         let ends = Instant::now() + RECOVERY_BOUND;
         let revision = self.shared.inner().revision + 1;
