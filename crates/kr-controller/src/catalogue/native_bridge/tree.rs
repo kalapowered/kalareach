@@ -204,6 +204,25 @@ mod platform {
             }
         }
 
+        /// Opens a directory in this one, following a link at its name: for the one place a person's
+        /// own link is kept, an application's directory a package declares no placement for.
+        pub(in crate::catalogue::native_bridge) fn child_following(
+            &self,
+            name: &str,
+        ) -> std::io::Result<Child> {
+            match rustix::fs::openat(
+                self.handle.as_fd(),
+                name,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(handle) => Ok(Child::Directory(Self::held(handle, self.join(name))?)),
+                Err(Errno::NOENT) => Ok(Child::Absent),
+                Err(Errno::NOTDIR) => Ok(Child::NotADirectory),
+                Err(error) => Err(error.into()),
+            }
+        }
+
         /// Returns who owns what is at `name`, without following a link; `None` when nothing is.
         pub(in crate::catalogue::native_bridge) fn owners(
             &self,
@@ -518,6 +537,13 @@ mod platform {
         }
 
         pub(in crate::catalogue::native_bridge) fn child(
+            &self,
+            _name: &str,
+        ) -> std::io::Result<Child> {
+            Err(unsupported())
+        }
+
+        pub(in crate::catalogue::native_bridge) fn child_following(
             &self,
             _name: &str,
         ) -> std::io::Result<Child> {

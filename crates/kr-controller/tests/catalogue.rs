@@ -3594,7 +3594,7 @@ mod native_bridges {
     use super::generations;
 
     use kr_controller::catalogue::native_bridge::{
-        ApplicationDirectory, BridgeHost, BridgeSurface, QualifiedExecutable,
+        BridgeHost, BridgeSurface, QualifiedExecutable,
     };
 
     use super::*;
@@ -3674,10 +3674,7 @@ mod native_bridges {
         fn bridges(&self, environment: &kr_ipc::paths::EnvironmentPaths) -> BridgeHost {
             BridgeHost {
                 journals: environment.state_dir().join("native-bridges"),
-                applications: vec![ApplicationDirectory {
-                    application: "Claude Code".to_owned(),
-                    directory: self.application(),
-                }],
+                home: Some(self.root.join("home")),
                 search_path: vec![self.root.join("bin")],
                 forwarder: Some(self.root.join("bin/kr-hook")),
                 signed_records: self.signed_records.clone(),

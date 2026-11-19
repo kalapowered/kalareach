@@ -2324,15 +2324,67 @@ fn wanted_bridge(
             .collect(),
         _ => Vec::new(),
     };
+    let package_dir = store.package_dir(installation.package_digest);
+    let placement = declared_placement(manifest, &package_dir, recipe.application.as_str());
     let target = native_bridge::BridgeTarget {
         plugin_id: plugin_id.clone(),
         package_digest: installation.package_digest,
-        package_dir: store.package_dir(installation.package_digest),
+        package_dir,
         recipe,
         match_rules: manifest.match_rules.clone(),
         qualified,
+        placement,
     };
     Ok(WantedBridge::Release(Box::new(target)))
+}
+
+/// Reads where a package says its bridge is placed: from the connector payload at the digest and
+/// size the verified manifest pins, and only after the manifest's `sdk_range` admits this host's
+/// SDK, so a table written for another SDK is never read for a member this host does not know. A
+/// package with no connector payload, or a table that declares none, has the layout this host
+/// holds for the application's label. A table that cannot be read or that holds a refused placement
+/// is a refusal, never the label's layout.
+fn declared_placement(
+    manifest: &kr_plugin_sdk::plugin::PluginManifest,
+    package_dir: &std::path::Path,
+    application: &str,
+) -> native_bridge::Declared {
+    use kr_plugin_sdk::plugin::PayloadRole;
+    if let Some(finding) = kr_plugin_sdk::validate::sdk_range_refusal(&manifest.sdk_range) {
+        return native_bridge::Declared::Refused(format!(
+            "the package's sdk_range does not admit this host's SDK, so the placement its table \
+             declares is not read: {finding}"
+        ));
+    }
+    let Some(payload) = manifest
+        .payloads
+        .iter()
+        .find(|payload| payload.role == PayloadRole::Connector)
+    else {
+        return native_bridge::Declared::Nothing;
+    };
+    let refused = |why: String| {
+        native_bridge::Declared::Refused(format!(
+            "the package's connector table cannot be used to place its bridge: {why}"
+        ))
+    };
+    let bytes = match std::fs::read(package_dir.join(payload.path.as_str())) {
+        Ok(bytes) => bytes,
+        Err(error) => return refused(format!("{} cannot be read: {error}", payload.path)),
+    };
+    if bytes.len() as u64 != payload.size_bytes.get()
+        || kr_plugin_sdk::digest::PayloadDigest::of(&bytes) != payload.digest
+    {
+        return refused(format!(
+            "{} is not the bytes the manifest names",
+            payload.path
+        ));
+    }
+    match kr_plugin_sdk::placement::declared_in(&bytes, application) {
+        Ok(None) => native_bridge::Declared::Nothing,
+        Ok(Some(placement)) => native_bridge::Declared::Placement(Box::new(placement)),
+        Err(why) => refused(why),
+    }
 }
 
 /// Runs one reconciliation and says what went wrong, where something did.
@@ -3695,3 +3747,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod declared_placement_tests;

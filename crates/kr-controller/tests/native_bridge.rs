@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_controller::catalogue::native_bridge::{
-    ApplicationDirectory, BridgeHost, BridgeSurface, BridgeTarget, NativeBridges,
+    BridgeHost, BridgeSurface, Declared, BridgeTarget, NativeBridges,
     QualifiedExecutable, Settled,
 };
 use kr_plugin_sdk::digest::PayloadDigest;
@@ -206,10 +206,7 @@ impl Site {
     fn host(&self) -> BridgeHost {
         BridgeHost {
             journals: self.root.join("state/native-bridges"),
-            applications: vec![ApplicationDirectory {
-                application: "Claude Code".to_owned(),
-                directory: self.application(),
-            }],
+            home: Some(self.root.join("home")),
             search_path: vec![self.root.join("bin")],
             forwarder: Some(self.forwarder()),
             signed_records: Vec::new(),
@@ -233,6 +230,7 @@ impl Site {
                 digest: hex_digest(EXECUTABLE),
                 version: version.to_owned(),
             }],
+            placement: Declared::Nothing,
         }
     }
 
@@ -264,6 +262,7 @@ impl Site {
                 digest: hex_digest(EXECUTABLE),
                 version: "2.1.278".to_owned(),
             }],
+            placement: Declared::Nothing,
         }
     }
 
@@ -289,6 +288,7 @@ impl Site {
                 digest: hex_digest(EXECUTABLE),
                 version: "2.1.278".to_owned(),
             }],
+            placement: Declared::Nothing,
         }
     }
 
@@ -321,6 +321,7 @@ impl Site {
                 digest: hex_digest(EXECUTABLE),
                 version: "2.1.278".to_owned(),
             }],
+            placement: Declared::Nothing,
         }
     }
 
@@ -806,17 +807,56 @@ fn a_registration_string_that_names_a_place_is_refused_whatever_the_shape() {
     let target = gemini_target_with_hooks(&site, gemini_hooks.as_bytes());
     let settled = site
         .bridges()
-        .reconcile(&plugin(), Some(&site.release_with_hooks("literal", &hooks)))
+        .reconcile(&gemini(), Some(&target))
         .expect("reconciles");
-    assert_eq!(settled, Settled::Applied);
-    let written =
-        String::from_utf8(std::fs::read(site.application().join(HOOKS_PATH)).expect("the hooks"))
-            .expect("text");
     assert!(
-        written.contains(r#""name": "\\u007bkr_hook}""#)
-            && written.contains(r#""\\u007bkr_hook}": ["#),
-        "{written}"
+        refused(&settled).contains("holds a slash, a backslash"),
+        "{settled:?}"
     );
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// KR-REQ-11.42: a name repeated in a registration file refuses the file, in either order and when
+/// the repeat is spelt with an escape: a value that keeps the last of two members would show the
+/// forwarder where the application reads another command.
+#[cfg(unix)]
+#[test]
+fn a_registration_file_with_a_repeated_member_is_refused_in_either_order_and_when_escaped() {
+    let handler = |command: &str, repeat: &str| {
+        format!(
+            r#"{{"hooks": {{"SessionStart": [{{"hooks": [{{"type": "command", {repeat} "args": ["claude-code", "hook"], "timeout": 5, "command": "{command}"}}]}}]}}}}"#
+        )
+    };
+    for (what, hooks) in [
+        (
+            "the forwarder last",
+            handler("{kr_hook}", r#""command": "other","#),
+        ),
+        (
+            "the forwarder first",
+            handler("other", r#""command": "{kr_hook}","#),
+        ),
+        (
+            "spelt with an escape",
+            handler("{kr_hook}", r#""comm\u0061nd": "other","#),
+        ),
+        (
+            "a repeated event",
+            r#"{"hooks": {"SessionStart": [], "SessionStart": []}}"#.to_owned(),
+        ),
+    ] {
+        let site = Site::new();
+        let before = site.tree();
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&site.release_with_hooks("repeat", &hooks)))
+            .expect("reconciles");
+        assert!(
+            refused(&settled).contains("no repeated member"),
+            "{what}: {settled:?}"
+        );
+        assert_eq!(site.tree(), before, "{what}: nothing was written");
+    }
 }
 
 /// KR-REQ-11.42: the placeholder is written in the form this host registers the forwarder in for its
@@ -898,6 +938,7 @@ fn kr_req_11_42_the_placeholder_is_written_in_the_form_this_host_registers_for_i
             digest: hex_digest(EXECUTABLE),
             version: "2.1.278".to_owned(),
         }],
+        placement: Declared::Nothing,
     };
     let settled = site
         .bridges()
@@ -991,10 +1032,7 @@ fn a_release_follows_the_application_directory_to_another_place() {
     std::fs::write(other.join("settings.json"), SETTINGS).expect("settings");
     let other_before = snapshot(&other);
     let moved = NativeBridges::new(BridgeHost {
-        applications: vec![ApplicationDirectory {
-            application: "Claude Code".to_owned(),
-            directory: other.clone(),
-        }],
+        home: Some(site.root.join("other")),
         ..site.host()
     });
 
@@ -1262,32 +1300,6 @@ fn a_bridge_is_placed_for_the_application_its_package_declares_and_for_no_other(
         other => panic!("not refused: {other:?}"),
     }
     assert_eq!(site.tree(), before, "nothing was written");
-
-    // Declares an application whose directory the host knows and whose layout it does not name.
-    let site = Site::new();
-    let before = site.tree();
-    let mut host = site.host();
-    host.applications.push(ApplicationDirectory {
-        application: "Amp".to_owned(),
-        directory: site.root.join("home/.amp"),
-    });
-    std::fs::create_dir_all(site.root.join("home/.amp")).expect("the application's directory");
-    let target = BridgeTarget {
-        plugin_id: another.clone(),
-        recipe: serde_json::from_value(recipe).expect("a recipe"),
-        ..site.release()
-    };
-    let settled = NativeBridges::new(host)
-        .reconcile(&another, Some(&target))
-        .expect("reconciles");
-    match settled {
-        Settled::Refused(reason) => assert!(
-            reason.contains("does not name what a native bridge for Amp may place"),
-            "{reason}"
-        ),
-        other => panic!("not refused: {other:?}"),
-    }
-    assert_eq!(site.tree(), before, "nothing was written");
 }
 
 /// KR-REQ-11.44: a registration for another application word is applied under the word it names,
@@ -1507,7 +1519,7 @@ fn target_named(site: &Site, directory: &str, with_key: bool) -> BridgeTarget {
     }
     target.recipe = serde_json::from_value(recipe).expect("a recipe");
     target
-}
+    }
 
 /// What the refusal of a file outside the shape this host names says.
 #[cfg(unix)]
@@ -2363,7 +2375,7 @@ fn a_recipe_the_host_cannot_place_is_refused() {
     assert!(refused(&settled).contains("kr-hook"), "{settled:?}");
 
     let unknown = NativeBridges::new(BridgeHost {
-        applications: Vec::new(),
+        home: None,
         ..site.host()
     });
     let settled = unknown
@@ -2861,10 +2873,7 @@ fn a_refusal_names_what_it_left_when_an_earlier_leftover_goes_in_the_same_run() 
     std::fs::write(other.join("settings.json"), SETTINGS).expect("settings");
     let other_hooks = other.join(HOOKS_PATH);
     let moved = NativeBridges::new(BridgeHost {
-        applications: vec![ApplicationDirectory {
-            application: "Claude Code".to_owned(),
-            directory: other.clone(),
-        }],
+        home: Some(site.root.join("other")),
         ..site.host()
     });
     {
@@ -4878,10 +4887,7 @@ impl GeminiSite {
     fn host(&self) -> BridgeHost {
         BridgeHost {
             journals: self.root.join("state/native-bridges"),
-            applications: vec![ApplicationDirectory {
-                application: "Gemini CLI".to_owned(),
-                directory: self.application(),
-            }],
+            home: Some(self.root.join("home")),
             search_path: vec![self.root.join("bin")],
             forwarder: Some(self.forwarder()),
             signed_records: Vec::new(),
@@ -4905,6 +4911,7 @@ impl GeminiSite {
                 digest: hex_digest(GEMINI_EXECUTABLE),
                 version: "0.60.0".to_owned(),
             }],
+            placement: Declared::Nothing,
         }
     }
 
@@ -4937,20 +4944,113 @@ impl GeminiSite {
 /// Gemini CLI's, `.gemini`, and no other application's.
 #[test]
 fn kr_req_11_42_the_host_names_claude_codes_and_gemini_clis_directories_and_no_other() {
-    use kr_controller::catalogue::native_bridge::application_directories;
-    let home = Path::new("/home/somebody");
-    let named: Vec<(String, PathBuf)> = application_directories(home)
+    use kr_plugin_sdk::placement::Placement;
+    let named: Vec<(&str, Vec<String>)> = Placement::defaults()
         .into_iter()
-        .map(|directory| (directory.application, directory.directory))
+        .map(|(label, placement)| (label, placement.directory))
         .collect();
     assert_eq!(
         named,
         [
-            ("Claude Code".to_owned(), home.join(".claude")),
-            ("Gemini CLI".to_owned(), home.join(".gemini")),
+            ("Claude Code", vec![".claude".to_owned()]),
+            ("Gemini CLI", vec![".gemini".to_owned()]),
         ],
         "the application directories a host names"
     );
+    assert!(Placement::for_label("Amp").is_none());
+}
+
+/// A person who keeps an application's directory as a link (a dotfiles manager does) keeps the
+/// bridge where the link leads, for a package that declares no placement: the host follows the
+/// link at the compiled default's directory, writes every file and the key in what it leads to,
+/// leaves the link as it is, and removal gives the target its tree back.
+#[cfg(unix)]
+#[test]
+fn a_compiled_labels_directory_is_reached_through_the_persons_own_link_when_no_placement_is_declared()
+ {
+    let is_link = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .expect("the link")
+            .file_type()
+            .is_symlink()
+    };
+    let site = Site::new();
+    let real = site.root.join("home/dotfiles/claude");
+    std::fs::create_dir_all(real.parent().expect("a parent")).expect("a folder");
+    std::fs::rename(site.application(), &real).expect("moved to where the link leads");
+    std::os::unix::fs::symlink(&real, site.application()).expect("the person's link");
+    let before = snapshot(&real);
+    let bridges = site.bridges();
+    assert_eq!(
+        bridges
+            .reconcile(&plugin(), Some(&site.release()))
+            .expect("applies"),
+        Settled::Applied
+    );
+    assert!(real.join(HOOKS_PATH).exists(), "written where the link leads");
+    assert!(is_link(&site.application()), "the link is the link it was");
+    assert_eq!(
+        bridges.reconcile(&plugin(), None).expect("removes"),
+        Settled::Removed
+    );
+    assert_eq!(snapshot(&real), before, "the target has its tree back");
+    assert!(is_link(&site.application()), "and the link is still there");
+
+    let gemini_site = GeminiSite::new();
+    let real = gemini_site.root.join("home/dotfiles/gemini");
+    std::fs::create_dir_all(real.parent().expect("a parent")).expect("a folder");
+    std::fs::rename(gemini_site.application(), &real).expect("moved to where the link leads");
+    std::os::unix::fs::symlink(&real, gemini_site.application()).expect("the person's link");
+    let before = snapshot(&real);
+    let bridges = gemini_site.bridges();
+    assert_eq!(
+        bridges
+            .reconcile(&gemini(), Some(&gemini_site.release()))
+            .expect("applies"),
+        Settled::Applied
+    );
+    assert!(
+        real.join("extensions/kalareach/hooks/hooks.json").exists(),
+        "written where the link leads"
+    );
+    assert!(is_link(&gemini_site.application()));
+    assert_eq!(
+        bridges.reconcile(&gemini(), None).expect("removes"),
+        Settled::Removed
+    );
+    assert_eq!(snapshot(&real), before, "the target has its tree back");
+}
+
+/// The default directory is reached from the home through plain components, and none is made: a
+/// home that has no `.claude`, and one that has a file of that name, give a refusal that names the
+/// directory and leave the home as it was.
+#[cfg(unix)]
+#[test]
+fn the_default_directory_is_reached_from_the_home_through_plain_components() {
+    let site = Site::new();
+    std::fs::remove_dir_all(site.application()).expect("no directory");
+    let home = site.root.join("home");
+    let before = snapshot(&home);
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("cannot be opened") && refused(&settled).contains("not there"),
+        "{settled:?}"
+    );
+    assert_eq!(snapshot(&home), before, "the directory was not made");
+    std::fs::write(site.application(), b"a file").expect("a file of that name");
+    let before = snapshot(&home);
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert!(
+        refused(&settled).contains("cannot be opened"),
+        "{settled:?}"
+    );
+    assert_eq!(snapshot(&home), before, "nothing was written");
 }
 
 /// KR-REQ-11.42: the Gemini CLI recipe writes the extension's three files, in the directories it
@@ -5176,31 +5276,31 @@ fn kr_req_11_42_a_gemini_cli_recipe_that_does_not_take_its_record_out_last_is_re
     assert_eq!(site.tree(), before, "nothing was written");
 }
 
-/// KR-REQ-11.42: an application the host does not know places nothing: a Gemini CLI recipe on a
-/// host that names only Claude Code's directory is refused, naming the application, and nothing is
-/// written anywhere.
+/// KR-REQ-11.42: a home without an application's directory places nothing: a Gemini CLI recipe on a
+/// host whose home holds no `.gemini` is refused, naming the application, nothing is written
+/// anywhere, and the host makes no application's directory.
 #[cfg(unix)]
 #[test]
-fn kr_req_11_42_an_application_the_host_does_not_know_places_nothing() {
+fn kr_req_11_42_a_home_without_the_applications_directory_places_nothing() {
     let site = GeminiSite::new();
     let before = site.tree();
-    let claude_only = NativeBridges::new(BridgeHost {
-        applications: vec![ApplicationDirectory {
-            application: "Claude Code".to_owned(),
-            directory: site.root.join("home/.claude"),
-        }],
+    let bare = site.root.join("bare");
+    std::fs::create_dir_all(&bare).expect("a home");
+    let bare_home = NativeBridges::new(BridgeHost {
+        home: Some(bare.clone()),
         ..site.host()
     });
 
-    let settled = claude_only
+    let settled = bare_home
         .reconcile(&gemini(), Some(&site.release()))
         .expect("reconciles");
 
     assert!(refused(&settled).contains("Gemini CLI"), "{settled:?}");
+    assert!(refused(&settled).contains("cannot be opened"), "{settled:?}");
     assert_eq!(site.tree(), before, "nothing was written");
     assert!(
-        !site.root.join("home/.claude").exists(),
-        "no other application's directory was made"
+        !bare.join(".gemini").exists() && !bare.join(".claude").exists(),
+        "no application's directory was made"
     );
 }
 
@@ -5912,18 +6012,17 @@ fn kr_req_11_42_the_doctor_warns_for_a_removal_that_left_something_in_place() {
 fn kr_req_11_42_the_doctor_reports_a_refused_recipe_as_refused() {
     use kr_protocol::hostinfo::DoctorStatus;
     let site = GeminiSite::new();
-    let claude_only = NativeBridges::new(BridgeHost {
-        applications: vec![ApplicationDirectory {
-            application: "Claude Code".to_owned(),
-            directory: site.root.join("home/.claude"),
-        }],
+    let bare = site.root.join("bare");
+    std::fs::create_dir_all(&bare).expect("a home");
+    let bare_home = NativeBridges::new(BridgeHost {
+        home: Some(bare),
         ..site.host()
     });
-    claude_only
+    bare_home
         .reconcile(&gemini(), Some(&site.release()))
         .expect("reconciles");
 
-    let check = doctor_check(&claude_only);
+    let check = doctor_check(&bare_home);
     assert_eq!(check.status, DoctorStatus::Ok, "{check:?}");
     assert!(check.detail().contains("refused"), "{}", check.detail());
 }
