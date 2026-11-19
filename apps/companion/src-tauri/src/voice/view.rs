@@ -602,6 +602,8 @@ mod tests {
             start(START_KEPT, "c", host(1)),
             start(START_UNANSWERED, "d", host(1)),
             start(START_UNKNOWN, "e", host(2)),
+            start(START_KEPT, "f", host(2)),
+            start(START_UNCONFIRMED, "g", host(2)),
         ] {
             state.owe(0, entry);
         }
@@ -614,6 +616,8 @@ mod tests {
                 (START_UNANSWERED.to_owned(), "a".to_owned()),
                 (START_UNANSWERED.to_owned(), "d".to_owned()),
                 (START_UNKNOWN.to_owned(), "e".to_owned()),
+                (START_KEPT.to_owned(), "f".to_owned()),
+                (START_UNCONFIRMED.to_owned(), "g".to_owned()),
             ]
         );
     }
