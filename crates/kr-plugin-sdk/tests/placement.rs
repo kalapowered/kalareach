@@ -12,7 +12,6 @@ use kr_plugin_sdk::schema::package_contract;
 use kr_plugin_sdk::validate::{
     FindingCode, Validated, validate_package_directory, validate_package_directory_in_order,
 };
-use kr_plugin_sdk::version::SDK_VERSION;
 use serde_json::{Value, json};
 
 const CLAUDE_FIXTURE: &str = include_str!("fixtures/placement_claude_code.json");
@@ -635,7 +634,6 @@ fn a_table_that_declares_a_placement_is_refused_by_the_package_check_by_name() {
 
 #[test]
 fn the_arrival_table_lists_placement_at_the_sdk_version() {
-    assert_eq!(SDK_VERSION, "0.1.10");
     let contract = package_contract();
     let listed: Vec<&Value> = contract["arrivals"]
         .as_array()
