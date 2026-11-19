@@ -47,10 +47,11 @@
 //! place is never taken for it, and nothing at its path is not taken as its deletion: what was
 //! placed stays recorded until the directory is back.
 
+pub(crate) mod anchor;
 mod check;
 mod journal;
 pub(crate) mod json;
-pub(crate) mod tree;
+mod tree;
 
 /// The shape a package's native-bridge journal is written in, recorded in it as `version`. A
 /// journal of any other shape is refused rather than read.

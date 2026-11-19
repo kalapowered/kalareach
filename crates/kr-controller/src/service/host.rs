@@ -275,11 +275,12 @@ impl Controller {
                 })
                 .collect::<Vec<Declaration>>()
         });
-        let declarations = match tokio::time::timeout(DOCTOR_READS, read).await {
-            Ok(Ok(found)) => found,
-            _ => {
-                return Err(unread());
-            }
+        let declarations = tokio::select! {
+            found = read => match found {
+                Ok(found) => found,
+                Err(_) => return Err(unread()),
+            },
+            () = tokio::time::sleep(DOCTOR_READS) => return Err(unread()),
         };
         let mut known: Vec<String> = declarations
             .iter()

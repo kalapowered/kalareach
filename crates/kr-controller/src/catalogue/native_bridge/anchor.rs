@@ -1,4 +1,5 @@
 //! The folder an installation for a declared agent is written under, walked from one handle on it.
+//! It lives beside the native bridge's walk, whose handle type it uses.
 //!
 //! A package declares the places, so the host cannot know them to be its own. Every name an
 //! installation for a declared word reads, writes or removes is reached from the handle this host
@@ -13,8 +14,8 @@ use std::path::{Component, Path, PathBuf};
 
 use kr_protocol::scalars::Digest256;
 
+use super::tree::{Child, Dir, Entry, Fetched};
 use crate::catalogue::files::{digest_of, storage};
-use crate::catalogue::native_bridge::tree::{Child, Dir, Entry, Fetched};
 use crate::error::{ControllerError, Result};
 
 /// The most bytes of one file this walk reads: a configuration document an agent keeps, which the
@@ -29,7 +30,7 @@ fn refused(detail: String) -> ControllerError {
 /// What the last name of a place is to be: a file the installation writes, or a folder it writes
 /// into.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Expect {
+pub(crate) enum Expect {
     /// A regular file.
     File,
     /// A folder.
@@ -38,7 +39,7 @@ pub(super) enum Expect {
 
 /// One selected root, held open.
 #[derive(Debug)]
-pub(super) struct Anchor {
+pub(crate) struct Anchor {
     root: Dir,
     path: PathBuf,
 }
@@ -53,7 +54,7 @@ impl Anchor {
     /// Opens the selected root once, or says there is none where it is not there. The root itself is
     /// opened by its name: it is the one the request selected, and a link there is the person's
     /// own layout.
-    pub(super) fn open(root: &Path) -> Result<Option<Self>> {
+    pub(crate) fn open(root: &Path) -> Result<Option<Self>> {
         match Dir::open(root) {
             Ok(handle) => Ok(Some(Self {
                 root: handle,
@@ -133,7 +134,7 @@ impl Anchor {
     /// Refuses a link or a file at any folder on the way to `path`, a link at its last name, and a
     /// last name that is a folder where a file is to be written or a file where a folder is to be
     /// made, before anything is written. A folder or a name that is not there is not an error.
-    pub(super) fn refuse_links(&self, path: &Path, expect: Expect) -> Result<()> {
+    pub(crate) fn refuse_links(&self, path: &Path, expect: Expect) -> Result<()> {
         if self.is_root(path) {
             return Ok(());
         }
@@ -160,7 +161,7 @@ impl Anchor {
 
     /// Reads the file at `path`, or `None` where nothing is there. A directory, a link or a
     /// special file at that name is refused.
-    pub(super) fn read(&self, path: &Path) -> Result<Option<Vec<u8>>> {
+    pub(crate) fn read(&self, path: &Path) -> Result<Option<Vec<u8>>> {
         let place = self.place(path)?;
         let Some(parent) = self.parent(&place, false)? else {
             return Ok(None);
@@ -181,7 +182,7 @@ impl Anchor {
     }
 
     /// Reads the file at `path` as text, or `None` where nothing is there.
-    pub(super) fn read_text(&self, path: &Path) -> Result<Option<String>> {
+    pub(crate) fn read_text(&self, path: &Path) -> Result<Option<String>> {
         match self.read(path)? {
             None => Ok(None),
             Some(bytes) => String::from_utf8(bytes)
@@ -191,12 +192,12 @@ impl Anchor {
     }
 
     /// The digest of the file at `path`, or `None` where nothing is there.
-    pub(super) fn digest(&self, path: &Path) -> Result<Option<Digest256>> {
+    pub(crate) fn digest(&self, path: &Path) -> Result<Option<Digest256>> {
         Ok(self.read(path)?.map(|bytes| digest_of(&bytes)))
     }
 
     /// True when a folder is at `path`, found without following a link.
-    pub(super) fn is_directory(&self, path: &Path) -> Result<bool> {
+    pub(crate) fn is_directory(&self, path: &Path) -> Result<bool> {
         if self.is_root(path) {
             return Ok(true);
         }
@@ -211,7 +212,7 @@ impl Anchor {
     }
 
     /// True when anything is at `path`.
-    pub(super) fn exists(&self, path: &Path) -> Result<bool> {
+    pub(crate) fn exists(&self, path: &Path) -> Result<bool> {
         if self.is_root(path) {
             return Ok(true);
         }
@@ -227,7 +228,7 @@ impl Anchor {
 
     /// The folders on the way to `path` that are not there yet, shallowest first, with `path`
     /// itself last where it is a folder that is missing.
-    pub(super) fn missing_folders(&self, folder: &Path) -> Result<Vec<PathBuf>> {
+    pub(crate) fn missing_folders(&self, folder: &Path) -> Result<Vec<PathBuf>> {
         if self.is_root(folder) {
             return Ok(Vec::new());
         }
@@ -260,7 +261,7 @@ impl Anchor {
     }
 
     /// Makes the folder at `path` and the missing ones before it, each flushed.
-    pub(super) fn make_folders(&self, folder: &Path) -> Result<()> {
+    pub(crate) fn make_folders(&self, folder: &Path) -> Result<()> {
         if self.is_root(folder) {
             return Ok(());
         }
@@ -292,7 +293,7 @@ impl Anchor {
     /// Writes `bytes` to the file at `path`: under a temporary name beside it, flushed, and renamed
     /// into place, the folder flushed after. A file that is there keeps its permission bits; a new
     /// one gets `default_mode`. A folder, a link or a special file at the name is refused.
-    pub(super) fn write(&self, path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
+    pub(crate) fn write(&self, path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
         let place = self.place(path)?;
         let Some(parent) = self.parent(&place, true)? else {
             return Err(refused(format!(
@@ -329,7 +330,7 @@ impl Anchor {
     }
 
     /// Removes the file at `path`; a name that is not there is already gone.
-    pub(super) fn remove_file(&self, path: &Path) -> Result<()> {
+    pub(crate) fn remove_file(&self, path: &Path) -> Result<()> {
         let place = self.place(path)?;
         let Some(parent) = self.parent(&place, false)? else {
             return Ok(());
@@ -343,7 +344,7 @@ impl Anchor {
 
     /// Removes the empty folder at `path`. The error says why it stayed, so the caller can report
     /// a folder that is not empty and leave it.
-    pub(super) fn remove_directory(&self, path: &Path) -> std::io::Result<()> {
+    pub(crate) fn remove_directory(&self, path: &Path) -> std::io::Result<()> {
         let place = self
             .place(path)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
