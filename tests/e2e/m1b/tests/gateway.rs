@@ -323,7 +323,7 @@ impl Context {
             Ok(shell) => shell,
             Err(why) if shells::required() => panic!("the {leg} leg's managed shell: {why}"),
             Err(why) => {
-                eprintln!("skipping the {leg} leg: {why}");
+                eprintln!("skipped: the {leg} leg did not run: {why}");
                 return None;
             }
         };
