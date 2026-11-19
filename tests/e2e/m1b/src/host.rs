@@ -342,7 +342,8 @@ impl<'r> Host<'r> {
     /// reads the address from the configuration document, opens the log by its path, and starts the
     /// programs placed under `b/` with no check that they are the placed files, and a live agent
     /// runs in the same account and may have changed any of them. The stand-in is the harness's own
-    /// program, which changes none.
+    /// program, which changes none, but for the variant that rewrites the run's state for another
+    /// host: a run with that variant is not said to be a stand-in here.
     ///
     /// # Panics
     ///
@@ -496,7 +497,8 @@ impl<'r> Host<'r> {
 
     /// Says that the agent under test is the harness's own stand-in, which runs none of the run's
     /// programs and changes nothing of its tree: only then does [`Host::start_daemon_ready_by`]
-    /// start a daemon after [`Host::agent_starts`].
+    /// start a daemon after [`Host::agent_starts`]. A stand-in variant that rewrites the run's
+    /// state, as the one that leaves for another host does, is not that: the caller does not say it.
     pub fn agent_is_a_stand_in(&self) {
         self.stand_in.store(true, Ordering::SeqCst);
     }
