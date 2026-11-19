@@ -6876,6 +6876,231 @@ async fn kr_req_12_18_an_answer_a_full_live_queue_refuses_is_refused_and_its_req
     );
 }
 
+/// A transport that refuses every answer it is asked to carry, and says whether the refusal proves
+/// that no byte of the answer was queued.
+#[derive(Debug)]
+struct RefusingUpstream {
+    proves_unsent: bool,
+}
+
+impl UpstreamDispatch for RefusingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, _request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        let refusal = BrokerError::UpstreamUnavailable {
+            detail: "the transport refused the answer".to_owned(),
+        };
+        Err(if self.proves_unsent {
+            BrokerError::NotTransmitted(Box::new(refusal))
+        } else {
+            refusal
+        })
+    }
+}
+
+/// The state and dispatch marker the ledger's own file holds for one pending resource, read as a
+/// later run reads them.
+fn durable_row(host: &Host, resource_id: kr_protocol::ids::PendingResourceId) -> (String, i64) {
+    rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal's file opens")
+        .query_row(
+            "SELECT state, dispatched FROM broker_pending WHERE resource_id = ?1",
+            [resource_id.get().as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the resource's row is stored")
+}
+
+/// Sends one approval answer whose call is held on the thread that makes the transport's call,
+/// before the broker's checks are asked once more there. `at_the_pause` runs while it is held, and
+/// what the answer came to is returned with the client.
+async fn answer_held_at_the_submit_pause(
+    host: &Host,
+    resource_id: kr_protocol::ids::PendingResourceId,
+    at_the_pause: impl FnOnce(),
+) -> (Outcome, LocalClient) {
+    let mut client = cli(host).await;
+    let mutation = approval_mutation(&client, host, 22, resource_id);
+    let (arrived, release) = host.service.broker().pause_before_submit();
+    let sending = tokio::spawn(async move {
+        let outcome = send(&mut client, mutation).await;
+        (outcome, client)
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends")
+        .expect("the call reaches the thread that makes the transport's call");
+    at_the_pause();
+    release.send(()).expect("the call is let go");
+    sending.await.expect("the mutation is answered")
+}
+
+/// KR-REQ-12.18: a give-back the store cannot write leaves the request uncertain, in memory and in
+/// the row, and does not clear the marker in memory alone.
+///
+/// The binding moves while the call waits for the thread that makes the transport's call, so the
+/// answer is refused there with nothing queued and its claim goes back. The store refuses that one
+/// write, the clearing of the dispatch marker, and nothing else. A marker cleared in memory and
+/// kept in the row would leave memory saying the request is pending while the row refuses every
+/// later answer for it, and the recovery that writes the gap keeps a marker it finds set. So the
+/// request is left uncertain, as dropping its claim leaves it, and after the recovery memory and
+/// the row say the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_a_give_back_the_store_cannot_write_leaves_the_request_uncertain_in_memory_and_in_the_row()
+ {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(&host, None);
+    let resource_id = offer_approval(&host, Arc::clone(&upstream));
+    let journal = rusqlite::Connection::open(&host.journal_path).expect("the journal opens");
+
+    let (outcome, _client) = answer_held_at_the_submit_pause(&host, resource_id, || {
+        host.service
+            .broker()
+            .advance_binding(
+                instance(),
+                Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+                TimestampMs::new(5),
+            )
+            .expect("the binding moves");
+        journal
+            .execute_batch(
+                "CREATE TRIGGER refuse_give_back BEFORE UPDATE ON broker_pending
+                 WHEN OLD.dispatched = 1 AND NEW.dispatched = 0
+                 BEGIN SELECT RAISE(ABORT, 'a dispatch marker cannot be cleared'); END;",
+            )
+            .expect("the trigger is installed");
+    })
+    .await;
+    let Outcome::Error(_) = outcome else {
+        panic!("an answer whose binding moved before the call applied: {outcome:?}");
+    };
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the transport was never asked to carry the answer"
+    );
+    assert_eq!(
+        resource_state(&host, resource_id),
+        kr_protocol::gateway::PendingState::Uncertain,
+        "the store could not record the give-back, so the request is not called pending"
+    );
+
+    journal
+        .execute_batch("DROP TRIGGER refuse_give_back")
+        .expect("the store takes the write again");
+    until_rich_work_is_back(&host).await;
+    assert_eq!(
+        resource_state(&host, resource_id),
+        kr_protocol::gateway::PendingState::Uncertain
+    );
+    assert_eq!(
+        durable_row(&host, resource_id),
+        ("uncertain".to_owned(), 1),
+        "the row says what memory says, with the marker the answer may have gone under"
+    );
+}
+
+/// KR-REQ-12.18: an answer refused at the thread that makes the transport's call because the fence
+/// went up while the call waited there leaves the request uncertain, and after the recovery memory
+/// and the row say the same.
+///
+/// The fence is raised by a write the store refuses, at the pause, after the marker was committed.
+/// The recheck refuses with nothing queued, and the give-back is never taken without its record,
+/// which the store cannot take while the fence is up. A marker cleared in memory while the row
+/// keeps it would refuse every later answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_an_answer_refused_by_the_fence_at_the_transports_call_leaves_the_request_uncertain()
+ {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(&host, None);
+    let resource_id = offer_approval(&host, Arc::clone(&upstream));
+    let broker = Arc::clone(host.service.broker());
+
+    let (outcome, _client) = answer_held_at_the_submit_pause(&host, resource_id, || {
+        broker
+            .refuse_ledger_writes(true)
+            .expect("the ledger's store is put in query-only mode");
+        broker
+            .bind_descriptor(
+                BrokerBindingId::new(Uuid::from_bytes([77; 16])),
+                instance(),
+                PluginId::new("kalareach.other").expect("valid"),
+                PublisherId::new("kalareach").expect("valid"),
+                Digest256::from_bytes([6; 32]),
+                BrokerGrants::granted([BrokerGrant::Observation]),
+                None,
+                TimestampMs::new(40),
+            )
+            .expect_err("the ledger's store refuses the write, and the fence goes up");
+        broker
+            .refuse_ledger_writes(false)
+            .expect("the ledger takes writes again");
+    })
+    .await;
+    let Outcome::Error(_) = outcome else {
+        panic!("an answer refused by the fence did not apply: {outcome:?}");
+    };
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the transport was never asked to carry the answer"
+    );
+    assert_eq!(
+        resource_state(&host, resource_id),
+        kr_protocol::gateway::PendingState::Uncertain,
+        "the give-back could not be recorded under the fence, so the request is not called pending"
+    );
+
+    until_rich_work_is_back(&host).await;
+    assert_eq!(
+        resource_state(&host, resource_id),
+        kr_protocol::gateway::PendingState::Uncertain
+    );
+    assert_eq!(
+        durable_row(&host, resource_id),
+        ("uncertain".to_owned(), 1),
+        "the row says what memory says, with the marker the answer may have gone under"
+    );
+}
+
+/// KR-REQ-12.18: the control of the two cases above. A refusal that proves nothing was queued
+/// gives the claim back and clears the marker where the store takes the write, and any other
+/// refusal leaves the request uncertain with its marker kept, in memory and in the row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_only_a_refusal_that_proves_nothing_was_queued_clears_the_marker() {
+    for proves_unsent in [true, false] {
+        let host = host().await;
+        register(&host, None);
+        let resource_id = offer_approval(&host, Arc::new(RefusingUpstream { proves_unsent }));
+        let mut client = cli(&host).await;
+        let mutation = approval_mutation(&client, &host, 22, resource_id);
+        let outcome = send(&mut client, mutation).await;
+        assert!(
+            matches!(outcome, Outcome::Error(_)),
+            "the transport refused it: {outcome:?}"
+        );
+        let (state, marker) = if proves_unsent {
+            (kr_protocol::gateway::PendingState::Pending, 0)
+        } else {
+            (kr_protocol::gateway::PendingState::Uncertain, 1)
+        };
+        assert_eq!(
+            resource_state(&host, resource_id),
+            state,
+            "proven unsent: {proves_unsent}"
+        );
+        assert_eq!(
+            durable_row(&host, resource_id),
+            (state.as_str().to_owned(), marker),
+            "proven unsent: {proves_unsent}"
+        );
+    }
+}
+
 /// KR-REQ-12.09: each action records its provenance, and an answer written on a channel is one:
 /// the worker stores, with the receipt that says unknown, that the answer went by the host's own
 /// authenticated bridge. The record is read from the journal's file, as a later run reads it.
