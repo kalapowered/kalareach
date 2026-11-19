@@ -54,8 +54,10 @@ fn open_invitation(number: u32, device: u8) -> String {
     )
 }
 
-fn class_of<T: std::fmt::Debug>(read: Result<T>) -> Option<DamageClass> {
-    read.expect_err("the row is refused").damage_class()
+/// The class of damage a read refused with; `None` when the read succeeded or failed for another
+/// reason, so that the caller's own assertion says which.
+fn class_of<T>(read: Result<T>) -> Option<DamageClass> {
+    read.err().and_then(|error| error.damage_class())
 }
 
 /// Every reader of a grants row, each asked for what the damaged rows of a store hold: `device` is
@@ -99,14 +101,16 @@ fn readers(
     ]
 }
 
-fn assert_each_reader_refuses(readers: Vec<(&'static str, Result<()>)>, class: DamageClass) {
-    for (name, read) in readers {
-        assert_eq!(
-            class_of(read.map(|()| 0)),
-            Some(class),
-            "the reader {name} refuses the row"
-        );
-    }
+/// The class of damage that each reader refuses with, by the reader's name; `None` for a reader
+/// that read the row or failed for another reason. A case asserts on this itself, so that a
+/// reader that stops judging the row fails the case's own assertion.
+fn classes_of(
+    readers: Vec<(&'static str, Result<()>)>,
+) -> Vec<(&'static str, Option<DamageClass>)> {
+    readers
+        .into_iter()
+        .map(|(name, read)| (name, class_of(read.map(|()| 0))))
+        .collect()
 }
 
 #[test]
@@ -126,10 +130,13 @@ fn a_row_whose_recipient_column_names_another_device_is_refused_by_each_reader()
             key(2)
         ),
     );
-    assert_each_reader_refuses(
-        readers(&store, 1, OTHER_DEVICE, DEVICE),
-        DamageClass::RecipientColumnDisagrees,
-    );
+    for (name, class) in classes_of(readers(&store, 1, OTHER_DEVICE, DEVICE)) {
+        assert_eq!(
+            class,
+            Some(DamageClass::RecipientColumnDisagrees),
+            "the reader {name} refuses the row"
+        );
+    }
 }
 
 #[test]
@@ -150,10 +157,13 @@ fn a_row_whose_parent_column_names_another_grant_is_refused_by_each_reader_and_b
             key(3)
         ),
     );
-    assert_each_reader_refuses(
-        readers(&store, 2, DEVICE, DEVICE),
-        DamageClass::ParentColumnDisagrees,
-    );
+    for (name, class) in classes_of(readers(&store, 2, DEVICE, DEVICE)) {
+        assert_eq!(
+            class,
+            Some(DamageClass::ParentColumnDisagrees),
+            "the reader {name} refuses the row"
+        );
+    }
     let counted = store.in_transaction(|connection| live_in_tree(connection, id_of(1)));
     assert_eq!(
         class_of(counted),
