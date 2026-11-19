@@ -65,6 +65,11 @@ pub trait HomeRelays: Send + Sync {
         leased: Option<&'a str>,
         now: Instant,
     ) -> Pin<Box<dyn Future<Output = Homing> + Send + 'a>>;
+
+    /// Whether the endpoint has ended or is ending: the proxy refused the login its relays are
+    /// reached through, or the endpoint closed. Nothing is asked of the relay lease service then,
+    /// and no relay is dialled.
+    fn stopped(&self) -> bool;
 }
 
 /// Where the endpoint stands with the relay the leases are installed on.
@@ -112,6 +117,8 @@ pub struct EndpointRelays {
     /// Lets one change of the endpoint's relays finish before the next begins.
     changing: tokio::sync::Mutex<()>,
     mode: Mutex<Mode>,
+    /// The login the endpoint's proxy holds, whose verdict ends the relay work.
+    login: Option<kr_transport::proxy::ProxyCredential>,
 }
 
 /// The endpoint a value of this type holds prints the address its network library was given,
@@ -133,6 +140,11 @@ impl EndpointRelays {
             configured: config.relay_urls.clone(),
             changing: tokio::sync::Mutex::new(()),
             mode: Mutex::new(Mode::Configured),
+            login: config
+                .proxy_url
+                .as_ref()
+                .and_then(|proxy| proxy.login())
+                .cloned(),
         }
     }
 
@@ -360,6 +372,11 @@ impl HomeRelays for EndpointRelays {
         now: Instant,
     ) -> Pin<Box<dyn Future<Output = Homing> + Send + 'a>> {
         Box::pin(async move {
+            // An endpoint that is ending takes no relay: inserting one would start another actor
+            // that writes through the front while the close drains.
+            if self.stopped() {
+                return Homing::default();
+            }
             // No relay selected is a choice not to use one: nothing is connected to for a lease.
             if self.configured.is_empty() {
                 return Homing::default();
@@ -377,5 +394,12 @@ impl HomeRelays for EndpointRelays {
             let _changing = self.changing.lock().await;
             self.look(target, now).await
         })
+    }
+
+    fn stopped(&self) -> bool {
+        self.login
+            .as_ref()
+            .is_some_and(|login| login.stopped().is_some())
+            || self.endpoint.is_closed()
     }
 }

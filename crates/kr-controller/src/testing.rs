@@ -74,6 +74,29 @@ pub(crate) fn release_matrix_pins() -> Option<kr_client::services::matrix::Pins>
 }
 
 tokio::task_local! {
+    /// How long the check of the proxy and the wait between two re-checks last, for the daemon
+    /// being started in this task.
+    static PROXY_LOGIN_TIMING: crate::service::net::proxy_login::Timing;
+}
+
+/// Runs `start` so that the daemon it starts checks its proxy under `timing` in place of the
+/// product's ten seconds and sixty seconds.
+///
+/// The check and the wait between two re-checks run in real time. A suite about them gives short
+/// ones; a suite about something else gives a deadline longer than its own bound on a wait.
+pub async fn with_proxy_login_timing<F: Future>(
+    timing: crate::service::net::proxy_login::Timing,
+    start: F,
+) -> F::Output {
+    PROXY_LOGIN_TIMING.scope(timing, start).await
+}
+
+/// The timing a suite gave the start in progress, when it did.
+pub(crate) fn proxy_login_timing() -> Option<crate::service::net::proxy_login::Timing> {
+    PROXY_LOGIN_TIMING.try_with(Clone::clone).ok()
+}
+
+tokio::task_local! {
     /// The bound a brokered Git read is given, for the daemon being started in this task.
     static GIT_READ_BOUND: Duration;
 }

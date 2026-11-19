@@ -1329,6 +1329,7 @@ fn a_document_that_spells_out_a_default_it_left_unsaid_selects_nothing_new() {
     let running = Running {
         network: None,
         names_a_broker: false,
+        proxy: ProxyReading::default(),
     };
 
     // The same choices, said out loud: off, no relay, no anchor, no discovery.
@@ -1452,13 +1453,15 @@ fn the_network_check_says_what_is_in_force_and_what_waits_for_the_next_start() {
         configuration::load(Some(configuration::contents(document).as_bytes()))
     };
     let started = Started::of(&read(&document));
-    let endpoint = crate::service::net::config::NetworkSettings::from_selection(&document.network)
-        .expect("a usable selection")
-        .expect("this host joins")
-        .endpoint;
+    let endpoint =
+        crate::service::net::config::NetworkSettings::from_selection(&document.network, None)
+            .expect("a usable selection")
+            .expect("this host joins")
+            .endpoint;
     let running = Running {
         network: Some(RunningNetwork::of(&endpoint, 2)),
         names_a_broker: false,
+        proxy: ProxyReading::default(),
     };
 
     let check = network_check(&started, &read(&document), running);
@@ -1745,4 +1748,250 @@ fn the_directories_the_daemon_makes_for_its_configuration_document_are_owner_onl
         .mode()
         & 0o777;
     assert_eq!(mode, 0o600, "the document");
+}
+
+/// What the network row says when `reading` is what the running host reads of its proxy, for a
+/// document that selects `network` and a host that holds a login or none.
+fn proxy_row(
+    network: kr_protocol::hostinfo::configuration::NetworkSelection,
+    holds_a_login: bool,
+    reading: ProxyReading,
+) -> DoctorCheck {
+    let mut document = ConfigurationDocument::empty();
+    document.network = network;
+    let loaded = configuration::load(Some(configuration::contents(&document).as_bytes()));
+    let mut started = Started::of(&loaded);
+    started.proxy_login = holds_a_login.then(|| {
+        kr_transport::proxy::ProxyCredential::new(
+            kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+            kr_crypto::secret::SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login")
+    });
+    network_check(
+        &started,
+        &loaded,
+        Running {
+            network: None,
+            names_a_broker: false,
+            proxy: reading,
+        },
+    )
+}
+
+fn through(proxy: &str) -> kr_protocol::hostinfo::configuration::NetworkSelection {
+    kr_protocol::hostinfo::configuration::NetworkSelection {
+        enabled: Nullable::some(true),
+        proxy_url: Nullable::some(proxy.to_owned()),
+        ..Default::default()
+    }
+}
+
+/// KR-REQ-10.02: the network row says, in the approved words, what the proxy's login did, for each
+/// state and where the endpoint stands, and every state that stops a request warns with the
+/// remedy that ranks first.
+#[test]
+fn the_network_row_says_what_the_proxy_login_did_in_each_state_and_phase() {
+    const REFUSED: &str = "the proxy refused the login this host holds, so this host starts no new \
+                           request through the proxy";
+    const BASIC: &str = "the proxy asks for a sign-in method this host does not support; this \
+                         host can send only a user name and password (Basic)";
+    let reading = |start, stopped, phase: ProxyPhase| ProxyReading {
+        start,
+        stopped,
+        skipped: phase == ProxyPhase::Skipped,
+        registered: matches!(phase, ProxyPhase::Closing | ProxyPhase::Closed),
+        closed: phase == ProxyPhase::Closed,
+        ..ProxyReading::default()
+    };
+    let table = [
+        (
+            reading(ProxyStart::Unchecked, false, ProxyPhase::NoNetwork),
+            "the start check could not tell whether the proxy asks for a login".to_owned(),
+            false,
+        ),
+        (
+            reading(ProxyStart::NeedsLogin, false, ProxyPhase::NoNetwork),
+            "the proxy requires a sign-in, and this host holds no login for it".to_owned(),
+            true,
+        ),
+        (
+            reading(ProxyStart::NeedsLogin, false, ProxyPhase::Skipped),
+            "the proxy requires a sign-in, and this host holds no login for it, so this host \
+             did not start its network"
+                .to_owned(),
+            true,
+        ),
+        (
+            reading(ProxyStart::Open, true, ProxyPhase::NoNetwork),
+            REFUSED.to_owned(),
+            true,
+        ),
+        (
+            reading(ProxyStart::Open, true, ProxyPhase::Closing),
+            format!("{REFUSED}; it is closing its network endpoint"),
+            true,
+        ),
+        (
+            reading(ProxyStart::Open, true, ProxyPhase::Closed),
+            format!(
+                "{REFUSED}; it closed its network endpoint: its relay and direct connections \
+                 ended, and the local socket still serves"
+            ),
+            true,
+        ),
+        (
+            reading(ProxyStart::LoginRefused, true, ProxyPhase::Skipped),
+            format!("{REFUSED}; it did not start its network"),
+            true,
+        ),
+        (
+            reading(ProxyStart::SchemeUnsupported, false, ProxyPhase::NoNetwork),
+            BASIC.to_owned(),
+            true,
+        ),
+        (
+            reading(ProxyStart::SchemeUnsupported, false, ProxyPhase::Skipped),
+            format!("{BASIC}, and it did not start its network"),
+            true,
+        ),
+        (
+            reading(ProxyStart::SchemeUnsupported, false, ProxyPhase::Closing),
+            format!("{BASIC}, and it is closing its network endpoint"),
+            true,
+        ),
+        (
+            reading(ProxyStart::SchemeUnsupported, false, ProxyPhase::Closed),
+            format!(
+                "{BASIC}, and it closed its network endpoint: its relay and direct connections \
+                 ended, and the local socket still serves"
+            ),
+            true,
+        ),
+    ];
+    for (reading, sentence, warns) in table {
+        let check = proxy_row(through("https://proxy.example.com"), true, reading);
+        assert!(
+            check.detail().ends_with(&format!("; {sentence}")),
+            "{reading:?}: {check:?}"
+        );
+        assert_eq!(
+            check.status,
+            if warns {
+                DoctorStatus::Warning
+            } else {
+                DoctorStatus::Ok
+            },
+            "{reading:?}"
+        );
+    }
+    // A login held for an `http` proxy is said to go in clear, while nothing has stopped it.
+    let clear = proxy_row(
+        through("http://proxy.example.com:3128"),
+        true,
+        ProxyReading {
+            start: ProxyStart::Open,
+            ..ProxyReading::default()
+        },
+    );
+    assert!(
+        clear.detail().ends_with(
+            "; the login is sent in clear to the proxy, because the proxy's address is an http one"
+        ),
+        "{clear:?}"
+    );
+    // A scheme the host does not send outranks a refusal, as the state and as the remedy.
+    let both = ProxyReading {
+        stopped: true,
+        unsupported: true,
+        ..ProxyReading::default()
+    };
+    assert_eq!(both.state(), ProxyState::SchemeUnsupported);
+    let check = proxy_row(through("http://proxy.example.com:3128"), true, both);
+    assert!(
+        check
+            .remedy()
+            .is_some_and(|remedy| remedy.starts_with("Use a proxy that signs in by Basic")),
+        "{check:?}"
+    );
+}
+
+/// KR-REQ-10.02: the remedies rank R2, then the changed mark's, then R1, and each is whole.
+#[test]
+fn the_proxy_remedies_rank_and_say_how_to_apply_a_login() {
+    let proxy = through("https://proxy.example.com");
+    let stopped = ProxyReading {
+        stopped: true,
+        registered: true,
+        ..ProxyReading::default()
+    };
+    let check = proxy_row(proxy.clone(), true, stopped);
+    assert_eq!(
+        check.remedy(),
+        Some(
+            "Store a login the proxy accepts with `kr host network --proxy-login \
+             --proxy-credential-file <file>`, then run `kr host stop`; the daemon uses the login \
+             from its next start."
+        )
+    );
+    // A login stored since the start outranks R1: it is the one step left.
+    let stored = ProxyReading {
+        changed: ProxyChange::Stored,
+        ..stopped
+    };
+    let check = proxy_row(proxy.clone(), true, stored);
+    assert_eq!(
+        check.remedy(),
+        Some("Run `kr host stop`; the daemon uses the stored login from its next start.")
+    );
+    assert!(
+        check
+            .detail()
+            .ends_with("the proxy login stored on this host changed since this host started, and the change applies when the host restarts"),
+        "{check:?}"
+    );
+    // R2 outranks both.
+    let unsupported = ProxyReading {
+        unsupported: true,
+        ..stored
+    };
+    let check = proxy_row(proxy, true, unsupported);
+    assert_eq!(
+        check.remedy(),
+        Some(
+            "Use a proxy that signs in by Basic, or run a local proxy that signs in for this host \
+             and name it in `network.proxy_url`, then run `kr host stop`; the daemon uses that \
+             proxy from its next start."
+        )
+    );
+}
+
+/// KR-REQ-10.02: while a login is held, a selected `http` relay is said to get no latency probe and
+/// to be passed over as home relay, with a warning and the remedy to use an `https` relay; with no
+/// login held, or with `https` relays alone, the row is absent.
+#[test]
+fn an_http_relay_is_warned_about_only_while_a_login_is_held() {
+    let relay = |urls: &[&str]| kr_protocol::hostinfo::configuration::NetworkSelection {
+        relay_urls: Nullable::some(urls.iter().map(|url| (*url).to_owned()).collect()),
+        ..through("https://proxy.example.com")
+    };
+    let said = "while this host holds a login for the proxy, an http relay gets no latency probe; \
+                where no QUIC address probe answers, which is always so for a relay-only host, \
+                this host does not choose it as home relay and does not connect to it";
+    let check = proxy_row(
+        relay(&["http://relay.example.com"]),
+        true,
+        ProxyReading::default(),
+    );
+    assert!(check.detail().ends_with(&format!("; {said}")), "{check:?}");
+    assert_eq!(check.status, DoctorStatus::Warning);
+    assert_eq!(check.remedy(), Some("Use an https relay."));
+    for (network, held) in [
+        (relay(&["http://relay.example.com"]), false),
+        (relay(&["https://relay.example.com"]), true),
+    ] {
+        let check = proxy_row(network, held, ProxyReading::default());
+        assert!(!check.detail().contains("latency probe"), "{check:?}");
+        assert_eq!(check.status, DoctorStatus::Ok);
+    }
 }

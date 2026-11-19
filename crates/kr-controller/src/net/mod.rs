@@ -70,6 +70,7 @@ pub mod methods;
 pub mod owner;
 pub mod pairing;
 pub mod proxy;
+pub mod proxy_login;
 mod reconnects;
 pub mod rendezvous;
 pub mod rendezvous_https;
@@ -161,8 +162,9 @@ impl NetworkSetup {
     pub fn from_configuration(
         network: &kr_protocol::hostinfo::configuration::NetworkSelection,
         secrets: Arc<dyn SecretStore>,
+        proxy: Option<kr_transport::config::ProxyUrl>,
     ) -> Result<Option<Self>> {
-        let Some(settings) = NetworkSettings::from_selection(network)? else {
+        let Some(settings) = NetworkSettings::from_selection(network, proxy)? else {
             return Ok(None);
         };
         // A host whose platform cannot verify a service's certificate offers no code invitation,
@@ -200,6 +202,9 @@ pub struct NetworkGuard {
     tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
     /// The relays the endpoint is selected to use, which the relay leases the host holds decide.
     relays: std::sync::OnceLock<Arc<crate::relay_leases::endpoint::EndpointRelays>>,
+    /// The task that closes the endpoint when the proxy's login is refused, held beside the
+    /// endpoint it closes. A host whose proxy holds no login has none.
+    proxy_guard: std::sync::OnceLock<kr_transport::endpoint::ProxyGuard>,
 }
 
 /// The endpoint a value of this type holds prints the address its network library was given,
@@ -213,6 +218,16 @@ impl std::fmt::Debug for NetworkGuard {
 }
 
 impl NetworkGuard {
+    /// Whether the endpoint's end is complete, after the proxy refused its login: the close the
+    /// network library owns has returned and its front is gone. False while the close is under
+    /// way and for a host whose proxy holds no login.
+    #[must_use]
+    pub fn proxy_closed(&self) -> bool {
+        self.proxy_guard
+            .get()
+            .is_some_and(kr_transport::endpoint::ProxyGuard::proxy_closed)
+    }
+
     /// Returns the host's pairing service.
     #[must_use]
     pub fn pairing(&self) -> &Arc<PairingHost> {
@@ -2084,6 +2099,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         listener: std::sync::Mutex::new(None),
         tasks: std::sync::Mutex::new(vec![marking.abort_handle()]),
         relays: std::sync::OnceLock::new(),
+        proxy_guard: std::sync::OnceLock::new(),
     });
     // Before the listener serves anything. The daemon reaches these connections through this
     // handle when it withdraws their registrations, and a connection admitted before the handle
@@ -2166,6 +2182,20 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     ));
     // Set once: the daemon's network is registered once, and a second registration was refused above.
     let _ = guard.relays.set(Arc::clone(&relays));
+    // A refusal of the proxy's login ends the endpoint. The guard starts after the listener, so a
+    // verdict that was set while the endpoint bound closes it at once; the front refused every
+    // tunnel from the bind on.
+    if let Some(login) = host
+        .endpoint
+        .proxy_url
+        .as_ref()
+        .and_then(|proxy| proxy.login())
+    {
+        let _ = guard.proxy_guard.set(kr_transport::endpoint::guard_proxy(
+            listener.closer(),
+            login,
+        ));
+    }
     *guard
         .listener
         .lock()
@@ -3003,8 +3033,35 @@ impl Controller {
 
     /// Returns what this daemon owns of its network, when its environment selected one.
     #[must_use]
+    ///
+    /// It is `None` from the moment the proxy refuses this host's login, not only once the close has
+    /// ended: the endpoint's own end comes later, and a pairing or a clock request that reached a
+    /// closing endpoint would wait on a network that no longer serves.
     pub fn network_guard(&self) -> Option<&Arc<NetworkGuard>> {
+        if self.proxy_login_stopped() {
+            return None;
+        }
         self.network.get()
+    }
+
+    /// The clause that says why the proxy's login stopped this host's requests, when it did.
+    #[must_use]
+    pub fn proxy_login_stop_clause(&self) -> Option<&'static str> {
+        self.started
+            .proxy_login
+            .as_ref()
+            .and_then(kr_transport::proxy::ProxyCredential::stopped)
+            .map(|stop| stop.as_login_kind().clause())
+    }
+
+    /// Whether the proxy refused this host's login, or asked for a sign-in method this host does
+    /// not send, so that nothing is sent through the proxy until the host starts again.
+    #[must_use]
+    pub fn proxy_login_stopped(&self) -> bool {
+        self.started
+            .proxy_login
+            .as_ref()
+            .is_some_and(|login| login.stopped().is_some())
     }
 }
 

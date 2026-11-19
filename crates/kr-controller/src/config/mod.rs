@@ -23,6 +23,9 @@
 
 pub mod catalogue;
 pub mod ceilings;
+pub mod proxy_login;
+
+pub use proxy_login::{ProxyChange, ProxyItem, ProxyPhase, ProxyReading, ProxyStart, ProxyState};
 
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::desktop::{CapabilityInvalidation, SleepInhibitionSetting};
@@ -465,6 +468,12 @@ pub struct Started {
     pub relay: configuration::RelaySelection,
     /// Why every outbound route the proxy governs is closed, when the document could not be used.
     pub unusable: Option<Unusable>,
+    /// The login the stored item holds for the proxy the document names, read once at the start.
+    /// Every client that goes through the proxy holds a clone, so they share one verdict. It is
+    /// no selection: the written equality below does not compare it.
+    pub proxy_login: Option<kr_transport::proxy::ProxyCredential>,
+    /// What reading the stored login at the start found, kept after any state of the check.
+    pub proxy_item: ProxyItem,
 }
 
 impl PartialEq for Started {
@@ -538,6 +547,8 @@ impl Started {
                 mailbox: document.mailbox.clone(),
                 relay: document.relay.clone(),
                 unusable: None,
+                proxy_login: None,
+                proxy_item: ProxyItem::Absent,
             },
         )
     }
@@ -1345,6 +1356,8 @@ pub struct Running {
     pub network: Option<RunningNetwork>,
     /// Whether the voice service names a managed broker to paired devices.
     pub names_a_broker: bool,
+    /// What this host reads of the login its proxy asks for.
+    pub proxy: ProxyReading,
 }
 
 /// What the endpoint a running host built holds and selects.
@@ -1439,20 +1452,23 @@ pub fn network_check(
              host started with, which applies at the next start"
         });
     }
+    let proxy = proxy_login::words(detail, started, running.proxy);
     DoctorCheck::new(
         "configuration-network",
         "This host started with the network and voice broker its configuration selects",
-        if moved {
+        if moved || proxy.warns {
             DoctorStatus::Warning
         } else {
             DoctorStatus::Ok
         },
-        detail,
-        moved.then_some(if unusable_now {
-            "Put the configuration document right before this host next starts; the check of that \
-             document says how."
-        } else {
-            "Restart this host to put what the document now selects into force."
+        proxy.detail,
+        proxy.remedy.or_else(|| {
+            moved.then_some(if unusable_now {
+                "Put the configuration document right before this host next starts; the check of \
+                 that document says how."
+            } else {
+                "Restart this host to put what the document now selects into force."
+            })
         }),
     )
 }
