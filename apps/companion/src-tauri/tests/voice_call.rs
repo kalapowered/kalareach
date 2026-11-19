@@ -5382,14 +5382,16 @@ async fn a_start_that_reaches_the_host_after_the_next_launch_passed_is_still_nam
     // that start for "Start again" although a later start of its own passed.
     let prepared = scene.prepared().await;
     let asked = scene.stand_in.count("/api/voice/sessions");
-    let held = launched
+    let Err(held) = launched
         .start(
             request_of(&scene, &prepared),
             reach(),
             Arc::clone(&scene.tokens),
         )
         .await
-        .expect_err("the host holds the device for the late start");
+    else {
+        panic!("the host holds the device for the late start, and the start is refused");
+    };
     assert_eq!(
         held.code,
         kr_protocol::error::ErrorCode::DraftConflict,
