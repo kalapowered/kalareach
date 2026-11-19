@@ -469,6 +469,9 @@ impl WorkerSupervisor for NamesNoProcess {
 /// definition goes with it while what the worker wrote to its diagnostics stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_closed_session_leaves_no_loaded_job() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let host = Host::create();
     let daemon = host.start().await;
     let mut client = host.client().await;
@@ -506,6 +509,9 @@ async fn a_closed_session_leaves_no_loaded_job() {
 /// reaches exactly the process launchd started for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_ended_outright_has_its_job_removed() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let host = Host::create();
     let daemon = host.start().await;
     let mut client = host.client().await;
@@ -544,6 +550,9 @@ async fn a_worker_ended_outright_has_its_job_removed() {
 /// it is left alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_launch_that_named_no_process_has_its_job_removed_once_it_ends() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let host = Host::create();
     let started = Arc::new(std::sync::Mutex::new(Vec::new()));
     let release = host.temp.root().join("release");
@@ -623,6 +632,9 @@ async fn a_launch_that_named_no_process_has_its_job_removed_once_it_ends() {
 /// session keeps its job, its worker and its answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_starting_host_removes_ended_jobs_and_leaves_live_ones() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let host = Host::create();
     let first = host.start().await;
     let mut client = host.client().await;

@@ -4192,6 +4192,9 @@ async fn a_crashed_workers_tree_is_stopped_by_the_daemon_that_starts_after_it() 
               has one"
 )]
 async fn a_crashed_workers_tree_is_stopped_under_the_platforms_service_manager() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(Start::Service, false)
         .await;
 }

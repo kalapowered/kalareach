@@ -768,6 +768,9 @@ async fn a_desktop_bound_session_closes_with_desktop_lost_when_its_login_ends() 
 #[cfg(target_os = "macos")]
 #[test]
 fn a_graphical_job_torn_down_by_the_service_manager_ends_the_processes_in_it() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let host = kr_ipc::testing::TempHost::create();
     let uid = kr_ipc::paths::current_uid();
     let domain = format!("gui/{uid}");
@@ -1249,6 +1252,9 @@ async fn the_desktop_a_session_was_created_on_is_readable_after_its_worker_has_g
 /// logout rather than assuming it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_per_platform() {
+    if kr_ipc::testing::account_launchd::stands_down("a service check through launchd") {
+        return;
+    }
     let host = Host::create();
     let daemon = host.start().await;
     let mut client = host.client().await;

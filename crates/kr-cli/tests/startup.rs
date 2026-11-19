@@ -461,12 +461,8 @@ impl Standalone {
     /// cases run there only where a run sets `KR_ALLOW_ACCOUNT_LAUNCHD`.
     fn create() -> Option<Self> {
         #[cfg(target_os = "macos")]
-        {
-            let asked = std::env::var_os(ALLOW_ACCOUNT_LAUNCHD);
-            if let Err(why) = account_launchd(asked.as_deref()) {
-                eprintln!("the daemon start is not tested here: {why}");
-                return None;
-            }
+        if kr_ipc::testing::account_launchd::stands_down("the daemon start") {
+            return None;
         }
         Some(Self::make())
     }
@@ -3246,30 +3242,12 @@ fn bus_address(path: &Path) -> String {
     address
 }
 
-/// Set to `1` by a run that has the service-start cases load jobs into the account's own launchd
-/// on macOS: a hosted runner's account is for the run alone, and a person's own is not.
-const ALLOW_ACCOUNT_LAUNCHD: &str = "KR_ALLOW_ACCOUNT_LAUNCHD";
-
-/// Whether a run asked, by the value of [`ALLOW_ACCOUNT_LAUNCHD`], for the account's own launchd,
-/// and where it did not, why the cases that need it do not run. Only `1` asks.
-fn account_launchd(asked: Option<&std::ffi::OsStr>) -> Result<(), String> {
-    if asked == Some(std::ffi::OsStr::new("1")) {
-        Ok(())
-    } else {
-        Err(format!(
-            "this run did not ask for the account's own launchd, which the daemons these cases start \
-             load jobs into and remove them from; set {ALLOW_ACCOUNT_LAUNCHD}=1 where that account \
-             is a test account or a hosted runner's"
-        ))
-    }
-}
-
 /// A host tree of a test's own where the service start is chosen: a home of the test's own that
 /// the definition is written in, and the user service manager that starts the daemon.
 ///
 /// On macOS that manager is launchd, and the definition is loaded into this user's own domain under
 /// a label that names the tree's own environment, so no other test has it. A run loads into the
-/// account's own launchd only where it sets [`ALLOW_ACCOUNT_LAUNCHD`]. On Linux the manager is a
+/// account's own launchd only where it sets `KR_ALLOW_ACCOUNT_LAUNCHD`. On Linux the manager is a
 /// [`UserManager`] of the test's own.
 ///
 /// However a test ends, the daemon the manager started is ended through the manager first. On
@@ -3300,13 +3278,20 @@ impl ServiceHost {
     fn create() -> Option<Self> {
         #[cfg(target_os = "macos")]
         {
-            let asked = std::env::var_os(ALLOW_ACCOUNT_LAUNCHD);
+            let asked = std::env::var_os(kr_ipc::testing::account_launchd::VARIABLE);
             match Self::in_launchd(
                 asked.as_deref(),
                 Path::new(kr_ipc::testing::account_launchd::LAUNCHCTL),
             ) {
                 Ok(host) => Some(host),
-                Err(why) => Self::not_here(&why),
+                Err(why) => {
+                    // Only a run that did not ask stands down with a notice: the other reasons
+                    // (no domain, no user manager) are not about asking.
+                    if kr_ipc::testing::account_launchd::stands_down_given(asked.as_deref(), true) {
+                        kr_ipc::testing::account_launchd::announce("the service start");
+                    }
+                    Self::not_here(&why)
+                }
             }
         }
         #[cfg(target_os = "linux")]
@@ -3341,7 +3326,7 @@ impl ServiceHost {
     /// to read.
     #[cfg(target_os = "macos")]
     fn in_launchd(asked: Option<&std::ffi::OsStr>, launchctl: &Path) -> Result<Self, String> {
-        account_launchd(asked)?;
+        kr_ipc::testing::account_launchd::require_given(asked, true, "the service start")?;
         let (tree, home) = Self::tree_and_home();
         let domain = format!("user/{}", kr_ipc::paths::current_uid());
         let mut print = Command::new(launchctl);
@@ -3662,26 +3647,6 @@ impl ServiceHost {
         {
             Ok(())
         }
-    }
-}
-
-/// Only a run that sets `KR_ALLOW_ACCOUNT_LAUNCHD` to `1` asks for the account's own launchd: the
-/// variable absent, empty, or set to anything else does not.
-#[test]
-fn only_a_run_that_sets_the_account_launchd_variable_to_one_asks_for_the_accounts_launchd() {
-    use std::ffi::OsStr;
-
-    assert!(account_launchd(Some(OsStr::new("1"))).is_ok());
-    for refused in [
-        None,
-        Some(""),
-        Some("0"),
-        Some("true"),
-        Some("11"),
-        Some(" 1"),
-    ] {
-        let why = account_launchd(refused.map(OsStr::new)).expect_err("does not ask");
-        assert!(why.contains(ALLOW_ACCOUNT_LAUNCHD), "{why}");
     }
 }
 
