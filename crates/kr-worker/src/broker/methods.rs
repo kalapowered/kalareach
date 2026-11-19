@@ -467,6 +467,8 @@ pub struct AdmittedAgainst {
 /// A component that stops being answerable, and a capability whose evidence lapses, say whether
 /// rich work would work from now on. A revocation or a fault ends them without ending what the
 /// broker already admitted, which finishes: so the first admission asks them and no later ask does.
+/// An image refusal also withdraws evidence, but it holds the instance as well, and every later
+/// ask refuses a held instance.
 /// A package grant is authority, which a narrower installation removes at once: from the token's
 /// spend on, every ask asks the grants a plugin action's admission required (the first ask has no
 /// set yet, and the spend asks the action's grant), and an action whose grant is gone is refused
@@ -2552,6 +2554,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::PreconditionFailed`] while rich work is fenced or suspended,
+    /// [`BrokerError::UnsupportedCapability`] for an instance that holds an image refusal,
     /// [`BrokerError::StaleBinding`] when the binding moved, [`BrokerError::UnknownSubject`] for an
     /// instance this broker no longer holds, and whatever the transport refuses.
     fn recheck_permit(
@@ -2639,12 +2642,13 @@ impl Broker {
 impl crate::broker::BrokerState {
     /// The checks an admission of a mutation depends on, on the state the caller holds the lock of,
     /// against what the admission is made for (see [`AdmittedAgainst`]): that rich work is not
-    /// fenced, that the instance exists and its mutations are not suspended, that its binding is
-    /// the one named, that the turn still fits the operation, that the component answerable for
-    /// the dispatch and the capability the operation depends on are still working (the first
-    /// admission's ask alone: see [`Ask`]), that an answer's decoder still holds its authority,
-    /// that the binding of a plugin action still holds the package grants its admission required,
-    /// and that no deadline that bounds the operation has passed at `wall_now`.
+    /// fenced, that the instance exists and its mutations are not suspended, that it holds no image
+    /// refusal (every later ask), that its binding is the one named, that the turn still fits the
+    /// operation, that the component answerable for the dispatch and the capability the operation
+    /// depends on are still working (the first admission's ask alone: see [`Ask`]), that an
+    /// answer's decoder still holds its authority, that the binding of a plugin action still holds
+    /// the package grants its admission required, and that no deadline that bounds the operation
+    /// has passed at `wall_now`.
     ///
     /// The first admission asks it, and every later ask of the same admission asks it again, so
     /// that one list stands in both places. It makes no change: what the first admission does
@@ -2653,6 +2657,7 @@ impl crate::broker::BrokerState {
     /// # Errors
     ///
     /// Returns [`BrokerError::PreconditionFailed`] while rich work is fenced or suspended,
+    /// [`BrokerError::UnsupportedCapability`] for an instance that holds an image refusal,
     /// [`BrokerError::StaleBinding`] when the binding moved, [`BrokerError::UnknownSubject`] for an
     /// instance this broker no longer holds or, for a plugin action, a binding that is gone,
     /// [`BrokerError::Grant`] for a package grant that was removed, and the refusal of the
@@ -2672,6 +2677,15 @@ impl crate::broker::BrokerState {
             .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))?;
         if let Some(reason) = instance.suspension_reason() {
             return Err(BrokerError::mutations_suspended(reason));
+        }
+        // An image refusal withdrew this instance's evidence after the admission, so a permit
+        // admitted before it is stopped here, with nothing sent. The first admission does not ask
+        // it: an operation that names a capability is refused there for that evidence, and the
+        // take refuses every other one.
+        if matches!(ask, Ask::Again) && self.capabilities.is_held(application_instance_id) {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: "the host cannot confirm that this installation's program still runs the code it checked, so nothing is sent for it".to_owned(),
+            });
         }
         if instance.binding_revision != against.binding_revision() {
             return Err(BrokerError::StaleBinding {

@@ -1979,8 +1979,9 @@ async fn admit(
             // Off the runtime's threads: an executable whose metadata changed is hashed again.
             let verdict = {
                 let backend = Arc::clone(&backend);
+                let broker = Arc::clone(&broker);
                 let registration = Arc::clone(&registration);
-                tokio::task::spawn_blocking(move || verify(&backend, &registration)).await
+                tokio::task::spawn_blocking(move || verify(&backend, &broker, &registration)).await
             };
             match verdict {
                 Ok(Ok(())) => {}
@@ -2060,7 +2061,16 @@ async fn committed(
 /// Only an authenticated bridge asks: it descends from the registered process, which starts no child
 /// before its exec, so the check is never taken before the exec. It is taken again for every bridge,
 /// because the program can exec another in its place; one refusal refuses every later bridge.
-fn verify(backend: &Backend, registration: &Registration) -> std::result::Result<(), String> {
+///
+/// The refusal is first recorded here, and here the broker withdraws what it holds about the
+/// instance, before either caller announces it, so a view that hears of the refusal reads the
+/// evidence as it now stands. The refusal lock is held across that call, so no other bridge is
+/// refused with a reason the broker has not yet been told.
+fn verify(
+    backend: &Backend,
+    broker: &Broker,
+    registration: &Registration,
+) -> std::result::Result<(), String> {
     let mut refused = backend
         .image_refused
         .lock()
@@ -2083,6 +2093,7 @@ fn verify(backend: &Backend, registration: &Registration) -> std::result::Result
     });
     if let Err(why) = &verified {
         *refused = Some(why.clone());
+        broker.image_refused(backend.application_instance_id, why);
     }
     verified
 }

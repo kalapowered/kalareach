@@ -99,7 +99,8 @@ use kr_protocol::agent::AgentBindingState;
 use kr_protocol::broker::{
     ActionName, ActionProvenance, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants,
     CapabilityMap, DecodedProjection, DecoderLedgerEntry, DecodingTrust, InstanceCapabilityRecord,
-    InstanceInvalidation, IntegrationMode, LaunchProfile, MAX_RETAINED_SOURCE_BYTES,
+    InstanceInvalidation, IntegrationMode, LaunchProfile, MAX_BROKER_REASON_LEN,
+    MAX_RETAINED_SOURCE_BYTES,
 };
 use kr_protocol::gateway::{DownstreamRequestId, PendingKind, PendingResource, PendingState};
 use kr_protocol::identity::ProcessStartIdentity;
@@ -1416,6 +1417,41 @@ impl Broker {
     ) -> Result<AgentBindingRevision> {
         self.state()
             .advance_binding(application_instance_id, thread_id, now)
+    }
+
+    /// Withdraws what this broker holds about an instance whose program the host cannot confirm
+    /// still runs the code it checked, and holds the instance so that nothing is recorded for it
+    /// again.
+    ///
+    /// The image check refuses a program that is not the one that was hashed, and also one whose
+    /// image could not be read or kept changing while it was read, so `why` is the check's own
+    /// account. Every usable record is made `NotTested` with a reason that carries it, cut to
+    /// [`MAX_BROKER_REASON_LEN`]; a record that was not usable keeps its earlier reason. The
+    /// permit's final check refuses a held instance, so a mutation admitted before the refusal is
+    /// not sent after it. No token is withdrawn and no binding revision moves.
+    ///
+    /// The check runs at the next authenticated bridge of the instance and at a gateway's one
+    /// accept, not at the exec itself, and an exec that keeps a gateway's socket open and makes no
+    /// later bridge is not seen. One that closes the socket ends the connection and so the
+    /// transport its mutations used; the application instance ends when its process does. A
+    /// gateway's server image is checked once, when the server starts, and an exec of the server
+    /// is not seen either. An instance that is not registered is left alone: a refusal that
+    /// arrives after the end must not set a hold that nothing will clear.
+    pub fn image_refused(&self, application_instance_id: ApplicationInstanceId, why: &str) {
+        let mut state = self.state();
+        if !state.instances.contains_key(&application_instance_id) {
+            return;
+        }
+        let mut reason = format!(
+            "the host cannot confirm that the program still runs the code it checked: {why}"
+        );
+        reason.truncate(reason.floor_char_boundary(MAX_BROKER_REASON_LEN));
+        state.capabilities.invalidate_instance(
+            application_instance_id,
+            InstanceInvalidation::BinaryChanged,
+            &reason,
+            kr_ipc::now_ms(),
+        );
     }
 
     /// Records the turn the upstream says is running.
@@ -3079,7 +3115,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::Capability`] when the record breaks a rule or is not newer than the
-    /// one held.
+    /// one held, and [`BrokerError::InvalidArgument`] when the instance holds an image refusal.
     pub fn record_capability(&self, record: InstanceCapabilityRecord) -> Result<()> {
         let mut state = self.state();
         state.check_evidence_identity(&record)?;
@@ -3090,7 +3126,8 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::InvalidArgument`] when the probe was not one the host would run.
+    /// Returns [`BrokerError::InvalidArgument`] when the probe was not one the host would run or
+    /// the instance holds an image refusal.
     pub fn record_probe(&self, probe: &Probe, record: InstanceCapabilityRecord) -> Result<()> {
         let mut state = self.state();
         state.check_evidence_identity(&record)?;
@@ -3101,16 +3138,6 @@ impl Broker {
     #[must_use]
     pub fn capabilities(&self, application_instance_id: ApplicationInstanceId) -> CapabilityMap {
         self.state().capabilities.map(application_instance_id)
-    }
-
-    /// Invalidates every record one change makes stale.
-    pub fn invalidate_capabilities(
-        &self,
-        change: InstanceInvalidation,
-        reason: &str,
-        now: TimestampMs,
-    ) -> usize {
-        self.state().capabilities.invalidate(change, reason, now)
     }
 
     // -- arbitration --------------------------------------------------------------------------

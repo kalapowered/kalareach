@@ -351,18 +351,31 @@ fn agent_broker_on(health: std::sync::Arc<JournalHealth>) -> Broker {
             "1",
         )
         .expect("the native connection is authenticated");
-    for name in [
-        "agent.prompt",
-        "agent.prompt.queue",
-        "agent.steer",
-        "agent.cancel",
-        "agent.approval",
-    ] {
+    for name in RECORDED_CAPABILITIES {
         broker
             .record_capability(evidence(name, InstanceCapabilityState::QualifiedAvailable))
             .expect("recorded");
     }
     broker
+}
+
+/// The capabilities [`agent_broker_with`] records as available.
+const RECORDED_CAPABILITIES: [&str; 5] = [
+    "agent.prompt",
+    "agent.prompt.queue",
+    "agent.steer",
+    "agent.cancel",
+    "agent.approval",
+];
+
+/// Records every capability [`agent_broker_with`] recorded as not usable, at the next revision, so
+/// that an action which names one is refused by the record's own recheck.
+fn make_every_capability_unusable(broker: &Broker) {
+    for name in RECORDED_CAPABILITIES {
+        let mut withdrawn = evidence(name, InstanceCapabilityState::NotTested);
+        withdrawn.revision = CapabilityRevision::new(2);
+        broker.record_capability(withdrawn).expect("recorded");
+    }
 }
 
 /// KR-REQ-23.39: an agent read names the exact instance, carries the capability evidence it was
@@ -1249,11 +1262,7 @@ async fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_prec
     broker
         .register_actions(binding(), &[declared("prompt.submit", "upstream.prompt")])
         .expect("the actions are registered");
-    broker.invalidate_capabilities(
-        InstanceInvalidation::BindingChanged,
-        "the selected thread changed",
-        TimestampMs::new(5),
-    );
+    make_every_capability_unusable(&broker);
     assert!(
         invoke_prepared(
             &broker,
@@ -1483,11 +1492,7 @@ fn kr_req_11_22_one_admission_carries_every_check_and_the_transport_it_will_use(
         .expect_err("a turn that is not running is refused at the admission");
     assert_eq!(wrong_turn.code(), ErrorCode::DraftConflict);
 
-    broker.invalidate_capabilities(
-        InstanceInvalidation::BindingChanged,
-        "the binary changed",
-        TimestampMs::new(6),
-    );
+    make_every_capability_unusable(&broker);
     let unusable = broker
         .admit_prompt(&caller(), &prompt, false, TimestampMs::new(7))
         .expect_err("an invalidated capability is refused at the admission");

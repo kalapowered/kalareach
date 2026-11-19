@@ -285,6 +285,7 @@ allow crates/kr-worker/src/attachments.rs get get
 allow crates/kr-worker/src/broker/arbitration.rs get get
 allow crates/kr-worker/src/broker/binder.rs admitted_open any get load
 allow crates/kr-worker/src/broker/bridge.rs attested_thread all clone get iter next
+allow crates/kr-worker/src/broker/capability.rs is_held contains
 allow crates/kr-worker/src/broker/capability.rs is_usable get record
 allow crates/kr-worker/src/broker/capability.rs map get
 allow crates/kr-worker/src/broker/capability.rs recheck get record
