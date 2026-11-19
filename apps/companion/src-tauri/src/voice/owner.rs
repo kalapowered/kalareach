@@ -2383,11 +2383,13 @@ impl Owner {
         }
         let due = Instant::now() + self.shared.timings.delegation_wait;
         // On a call the host controls there is no voice service to announce the delegation: the host
-        // is asked whether its own side channel heard it, and where.
+        // is asked whether its own side channel heard it, and where. The data channel can deliver the
+        // delegation before the host's side channel has it, so a host that has not heard it is asked
+        // again, as a new question, until the delegation's wait has run out.
         if let Some(CallControl::Host(control)) = self.control.clone() {
             let (internal, asked) = (self.internal_tx.clone(), id.clone());
             tokio::spawn(async move {
-                let offset_ms = control.heard(&asked).await.ok().flatten();
+                let offset_ms = ask_until_heard(&control, &asked, due).await;
                 let _ = internal.send(Internal::HostHeard {
                     id: asked,
                     offset_ms,
@@ -3109,6 +3111,32 @@ fn cause_word(why: &Why, host_controls: bool) -> &'static str {
 /// no voice service holds.
 fn is_host_controlled(descriptor: &VoiceSessionDescriptor) -> bool {
     provider_for(&descriptor.control) == CallProvider::OwnKey
+}
+
+/// How long a phone waits before it asks the host again whether its side channel heard a delegation.
+const HEARD_RETRY: Duration = Duration::from_millis(250);
+
+/// Asks the host whether its own side channel heard the delegation `id`, and where, and asks again
+/// while it has not and `due` has not come. Each ask is a new request under a new identity: an
+/// answer that the host has not heard it is not repeated.
+async fn ask_until_heard(
+    control: &super::host_control::HostControl,
+    id: &str,
+    due: Instant,
+) -> Option<u64> {
+    loop {
+        match control.heard(id).await {
+            Ok(Some(offset_ms)) => return Some(offset_ms),
+            Ok(None) => {
+                let now = Instant::now();
+                if now >= due {
+                    return None;
+                }
+                tokio::time::sleep(HEARD_RETRY.min(due - now)).await;
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// The provider a call runs on, by the control its descriptor names.

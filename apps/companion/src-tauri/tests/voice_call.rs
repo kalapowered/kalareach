@@ -9043,6 +9043,56 @@ async fn an_own_key_start_asks_a_time_to_live_of_at_least_45_seconds() {
     scene.stop_host().await;
 }
 
+/// A delegation the data channel delivers before the host's side channel has heard it is not lost:
+/// the host is asked again, as a new question, and the delegation is judged once the host has heard
+/// it. A phone that asked once would have the delegation refused as one the host did not confirm.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_the_host_has_not_yet_heard_is_asked_about_again_within_its_wait() {
+    let timings = Timings {
+        host_beat: Some(Duration::from_secs(20)),
+        delegation_wait: Duration::from_secs(10),
+        ..delegating_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .accept_host_delegations(true);
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    scene.platform.show_progress_age(Some(10));
+    speak(&scene, 0, "hello there");
+
+    // The device's data channel delivers the delegation first, and the host has not heard it: the
+    // first question is answered "not heard".
+    scene.platform.tell_provider(&delegation_event("d-0", 200));
+    assert!(
+        until_more_heartbeats(&scene, 1).await,
+        "the host was asked whether it heard the delegation"
+    );
+    // The host's side channel hears it afterwards, and the second question is answered.
+    scene
+        .openai
+        .clone()
+        .expect("an own-key scene")
+        .event(&provider_delegation("d-0", 200));
+    let row = row_reaching(&scene, "d-0", "refused").await;
+    assert_eq!(
+        row["cause"], "first_fragment",
+        "the delegation was judged as any is, not refused as one the host did not confirm: {row}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
 /// A call on the host's own key whose spoken delegation the host's own side channel heard: the phone
 /// asks the host whether it heard it, the host answers with the offset, the delegation is judged as
 /// any is, and when this device would not hand it over the model is told by a note the host writes
