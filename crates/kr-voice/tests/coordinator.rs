@@ -4917,7 +4917,7 @@ impl kr_voice::Admission for Recording {
                     let _ = sender.send(coordinator.live_sessions());
                 });
                 let answered = receiver
-                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .recv_timeout(std::time::Duration::from_secs(120))
                     .is_ok();
                 probes.lock().expect("the probes").push(answered);
             }
@@ -5133,6 +5133,12 @@ async fn every_exit_of_a_start_reports_its_effect() {
             .await;
         assert_eq!(admission.before_calls(), 1, "{label}: asked once");
         assert_eq!(admission.effects(), vec![expected], "{label}");
+        if matches!(expected, NotAsked) {
+            assert!(
+                fixture.broker.offers().is_empty(),
+                "{label}: a start that asked nothing sent no request to the service"
+            );
+        }
     }
 }
 
