@@ -1197,6 +1197,10 @@ struct OwnKeyFake {
     answer: Mutex<Option<VoiceStart>>,
     /// The side channel it shows for a call it started, when it has one.
     control: Mutex<Option<Arc<dyn kr_client::services::host_call::HostCallControl>>>,
+    /// When set, `dispatch` waits for this before it answers.
+    hold_dispatch: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// When set, `close` waits for this before it answers.
+    hold_close: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl OwnKeyFake {
@@ -1206,6 +1210,8 @@ impl OwnKeyFake {
             closed: Mutex::new(Vec::new()),
             answer: Mutex::new(None),
             control: Mutex::new(None),
+            hold_dispatch: Mutex::new(None),
+            hold_close: Mutex::new(None),
         }
     }
 
@@ -1272,7 +1278,11 @@ impl VoiceProviderService for OwnKeyFake {
     ) -> ServiceFuture<'a, VoiceStart> {
         self.halves.lock().expect("the halves").push("dispatch");
         let answer = self.answer.lock().expect("the answer").take();
+        let hold = self.hold_dispatch.lock().expect("the hold").clone();
         Box::pin(async move {
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
             Ok(answer.unwrap_or_else(|| {
                 VoiceStart::Refused(Box::new(kr_client::services::voice::VoiceRefusal {
                     reason: kr_client::services::voice::VoiceRefusalReason::ServiceCapacity,
@@ -1291,7 +1301,11 @@ impl VoiceProviderService for OwnKeyFake {
             .expect("what was closed")
             .push(call_id.to_owned());
         let call_id = call_id.to_owned();
+        let hold = self.hold_close.lock().expect("the hold").clone();
         Box::pin(async move {
+            if let Some(hold) = hold {
+                hold.notified().await;
+            }
             Ok(VoiceClosure {
                 call_id,
                 state: "finalised".to_owned(),
@@ -1525,11 +1539,11 @@ impl kr_client::services::host_call::HostCallControl for StillSideband {
 }
 
 /// Starts one call on the owner's key whose provider shows a side channel, as device `PHONE`.
-async fn own_call_started() -> (
+async fn own_call_ready() -> (
     Coordinator,
     Arc<Authority>,
     Arc<OwnKeyFake>,
-    kr_protocol::voice::VoiceSessionDescriptor,
+    VoiceStartParams,
 ) {
     let (coordinator, authority, provider) = own_key_fixture();
     coordinator
@@ -1558,6 +1572,16 @@ async fn own_call_started() -> (
             disclosure: vec!["This call runs on the OpenAI key set on this host.".to_owned()],
         },
     )));
+    (coordinator, authority, provider, params)
+}
+
+async fn own_call_started() -> (
+    Coordinator,
+    Arc<Authority>,
+    Arc<OwnKeyFake>,
+    kr_protocol::voice::VoiceSessionDescriptor,
+) {
+    let (coordinator, authority, provider, params) = own_call_ready().await;
     let started = coordinator
         .start(
             device(PHONE),
@@ -1781,6 +1805,90 @@ async fn an_own_key_call_does_not_hold_an_account_change_and_the_general_sweep_s
         fixture.coordinator.account_calls_open(),
         "a managed call holds the account"
     );
+}
+
+/// The account's own sweep ends the calls bound to the account and leaves a call on the owner's key
+/// to the general sweep, which ends it at its provider.
+#[tokio::test]
+async fn the_account_sweep_ends_the_calls_bound_to_the_account_and_leaves_the_owners_key_alone() {
+    let (coordinator, _authority, provider, _session) = own_call_started().await;
+    assert_eq!(
+        coordinator.end_account_calls_that_are_over(610_000).await,
+        0,
+        "a call on the owner's key is not the account's"
+    );
+    assert_eq!(coordinator.live_sessions(), 1, "the call stands");
+    assert!(provider.closed.lock().expect("what was closed").is_empty());
+    assert_eq!(coordinator.end_calls_that_are_over(610_000).await, 1);
+    assert_eq!(coordinator.live_sessions(), 0);
+    assert_eq!(provider.closed.lock().expect("what was closed").len(), 1);
+
+    let fixture = fixture();
+    let _ = started(&fixture, None).await;
+    assert_eq!(
+        fixture
+            .coordinator
+            .end_account_calls_that_are_over(610_000)
+            .await,
+        1,
+        "a managed call that is over is ended by the account's sweep"
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+}
+
+/// Of the four parts that hold an account change (the live call, the start waiting on its
+/// provider, the close still going on, and a replayed call owed a close), a call on the owner's key
+/// reaches three: a start that waits on OpenAI and a close that is still going on hold nothing. A
+/// replayed call is a managed service's answer, which the owner's key never gives.
+#[tokio::test]
+async fn a_start_and_a_close_on_the_owners_key_hold_no_account_change() {
+    let (coordinator, _authority, provider, params) = own_call_ready().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    *provider.hold_dispatch.lock().expect("the hold") = Some(Arc::clone(&release));
+    let starting = coordinator.start(
+        device(PHONE),
+        action(0x43),
+        &params,
+        AuthorityRevision::new(1),
+        10_000,
+        &kr_voice::Unbounded,
+    );
+    let watching = async {
+        while !provider.halves().contains(&"dispatch") {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !coordinator.account_calls_open(),
+            "a start on the owner's key that waits on OpenAI holds no account change"
+        );
+        release.notify_one();
+    };
+    let (started, ()) = tokio::join!(starting, watching);
+    let VoiceStartOutcome::Started { session } = started.expect("answered").outcome else {
+        panic!("the call runs");
+    };
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    *provider.hold_close.lock().expect("the hold") = Some(Arc::clone(&release));
+    let ending = coordinator.end_call(
+        session.voice_session_id,
+        kr_protocol::voice_host::VoiceEndReason::Silence,
+        131_000,
+    );
+    let watching = async {
+        while provider.closed.lock().expect("what was closed").is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !coordinator.account_calls_open(),
+            "a close on the owner's key that is still going on holds no account change"
+        );
+        release.notify_one();
+    };
+    let (ended, ()) = tokio::join!(ending, watching);
+    assert!(ended);
+    assert!(!coordinator.account_calls_open());
 }
 
 // ---------------------------------------------------------------------------------------------

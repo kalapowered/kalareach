@@ -649,9 +649,30 @@ impl Coordinator {
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
     pub async fn end_calls_that_are_over(&self, now_ms: u64) -> usize {
+        self.end_over(now_ms, false).await
+    }
+
+    /// The account's own sweep: [`Self::end_calls_that_are_over`] for the calls bound to the
+    /// account alone. A call on the owner's own key is not bound to it, so a change of account
+    /// neither ends it nor waits for it; the general sweep, which the voice tick runs, ends it at
+    /// its own deadline.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    pub async fn end_account_calls_that_are_over(&self, now_ms: u64) -> usize {
+        self.end_over(now_ms, true).await
+    }
+
+    async fn end_over(&self, now_ms: u64, account_only: bool) -> usize {
         let live: Vec<VoiceSessionRecord> = {
             let state = self.state.lock().expect("the coordinator's state");
-            state.sessions.iter().cloned().collect()
+            state
+                .sessions
+                .iter()
+                .filter(|record| !account_only || is_account_bound(record.provider.as_ref()))
+                .cloned()
+                .collect()
         };
         let mut over = Vec::new();
         for record in live {

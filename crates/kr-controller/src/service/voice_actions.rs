@@ -60,10 +60,11 @@ impl crate::account::Calls for VoiceCalls {
             else {
                 return;
             };
-            // The time every voice deadline is decided on.
+            // The time every voice deadline is decided on. Only the calls bound to the account:
+            // a call on the owner's own key is the voice tick's.
             module
                 .coordinator()
-                .end_calls_that_are_over(daemon.settled_now_ms())
+                .end_account_calls_that_are_over(daemon.settled_now_ms())
                 .await;
         })
     }
