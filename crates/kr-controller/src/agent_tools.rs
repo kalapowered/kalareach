@@ -74,10 +74,14 @@ const HOST_FOLDER: &str = "{place} is inside a folder this host keeps for its ow
 /// The refusal of a selected root that is not a folder where a write needs one.
 const NOT_A_FOLDER_TO_WRITE: &str = "{path} is not a folder an installation can write into";
 
-/// The refusal of a moved place. Its words are approved: the record, then the package.
-const MOVED_PLACE: &str = "the record of {word} at {scope} scope names {recorded place}, and the \
-     package now declares {declared place}; run kr skill remove --agent {word} --scope {scope}, \
-     with --project-dir for a project, and then install again";
+/// The refusal of a moved place. Its words are approved: the record, then where the place is now.
+const MOVED_PLACE: &str = "the record of {word} at {scope} scope names {recorded place}, and {now} \
+     {declared place}; run kr skill remove --agent {word} --scope {scope}, with --project-dir for a \
+     project, and then install again";
+
+/// Who says where the place is now, for a declared word and for a compiled one.
+const NOW_DECLARED: &str = "the package now declares";
+const NOW_COMPILED: &str = "this host now installs {word} at";
 
 /// The refusal of an installation for a word that only a record of this host holds.
 const ONLY_BY_RECORD: &str = "no package this host admits declares {word} now, so this host cannot \
@@ -790,17 +794,30 @@ impl Installer {
         )
     }
 
-    /// Refuses an installation of a declared word whose recorded place is not the place the package
-    /// declares now: the skills folder, the document, the entry's key or the entry it wrote.
+    /// Refuses an installation whose recorded place is not the place now: the skills folder, the
+    /// document, the entry's key and, for a declared word, the entry it wrote. One rule for every
+    /// word. A compiled word's entry follows this host's own executable, so its digest is not part
+    /// of its place.
     fn moved_place(
         &self,
         params: &AgentToolsParams,
         layout: &Layout,
         recorded: Option<&InstallationRecord>,
     ) -> Result<()> {
-        let Some(record) = recorded.filter(|_| params.agent.compiled().is_none()) else {
-            return Ok(());
-        };
+        match recorded.and_then(|record| self.moved_text(params, layout, record)) {
+            Some(refusal) => Err(ControllerError::InvalidArgument(refusal)),
+            None => Ok(()),
+        }
+    }
+
+    /// The sentence that says the record's place is not the place now, or none where it is.
+    fn moved_text(
+        &self,
+        params: &AgentToolsParams,
+        layout: &Layout,
+        record: &InstallationRecord,
+    ) -> Option<String> {
+        let declared_word = params.agent.compiled().is_none();
         let declared_root = display(&layout.skills);
         let declared_document = layout.configuration.as_ref().map(|document| {
             (
@@ -835,34 +852,43 @@ impl Installer {
         // that now names one moved.
         let before_its_entry =
             !record.is_complete() && recorded_document.is_none() && declared_document.is_some();
-        let same = declared_root == record.manifest.root
-            && (declared_document == recorded_document || before_its_entry);
-        if same {
-            return Ok(());
+        let same_document = match (&declared_document, &recorded_document) {
+            (None, None) => true,
+            (Some(_), None) => before_its_entry,
+            (None, Some(_)) => false,
+            (Some(now), Some(then)) => {
+                same_place(Path::new(&now.0), Path::new(&then.0))
+                    && now.1 == then.1
+                    && (!declared_word || now.2 == then.2)
+            }
+        };
+        if same_document && same_place(Path::new(&declared_root), Path::new(&record.manifest.root))
+        {
+            return None;
         }
-        let place = |root: &str, document: Option<&str>| match document {
-            Some(document) => format!("{root} and {document}"),
+        let place = |root: &str, document: Option<&(String, String, Digest256)>| match document {
+            Some((path, entry, _)) => format!("{root} and {path}, entry {entry}"),
             None => root.to_owned(),
         };
-        Err(ControllerError::InvalidArgument(
+        let recorded_place = place(&record.manifest.root, recorded_document.as_ref());
+        let mut declared_place = place(&declared_root, declared_document.as_ref());
+        // Where the two read the same, the entry itself is what changed.
+        if declared_place == recorded_place {
+            declared_place.push_str(", with an entry of other contents");
+        }
+        let now = if declared_word {
+            NOW_DECLARED.to_owned()
+        } else {
+            NOW_COMPILED.replace("{word}", params.agent.as_str())
+        };
+        Some(
             MOVED_PLACE
+                .replace("{now}", &now)
                 .replace("{word}", params.agent.as_str())
                 .replace("{scope}", &params.scope.to_string())
-                .replace(
-                    "{recorded place}",
-                    &place(
-                        &record.manifest.root,
-                        recorded_document.as_ref().map(|found| found.0.as_str()),
-                    ),
-                )
-                .replace(
-                    "{declared place}",
-                    &place(
-                        &declared_root,
-                        declared_document.as_ref().map(|found| found.0.as_str()),
-                    ),
-                ),
-        ))
+                .replace("{recorded place}", &recorded_place)
+                .replace("{declared place}", &declared_place),
+        )
     }
 
     /// Refuses the places a package declared that this host must not write: a place inside the
@@ -965,6 +991,14 @@ impl Installer {
             }
         }
         let mut drift = self.drift(manifest)?;
+        // Where the record is no longer where this host would install now, by the layout it has
+        // for this word: the package's declaration where the service resolved one, and the
+        // compiled layout otherwise.
+        if let Ok(layout) = self.layout(params)
+            && let Some(moved) = self.moved_text(params, &layout, &record)
+        {
+            drift.push(moved);
+        }
         if !record.is_complete() {
             drift.push(format!(
                 "an installation of {} at {} scope was begun and did not finish; `kr skill \
@@ -2734,7 +2768,11 @@ fn names_path(recorded: &str, path: &Path) -> bool {
     same_place(Path::new(recorded), path)
 }
 
-/// Whether two paths are one place: the same components, ASCII case ignored.
+/// Whether two paths are one place: the same components, ASCII case ignored, for the six compiled
+/// words and the declared ones alike. On a file system that tells `Mcp.json` from `mcp.json` this
+/// takes two places for one: the host then refuses more than it must (a document another record
+/// holds under the other spelling is not written into, a record under one spelling is a moved
+/// place under the other), and never writes where a record or a claim stands.
 fn same_place(first: &Path, second: &Path) -> bool {
     let folded = |path: &Path| -> Vec<String> {
         path.components()
@@ -4120,6 +4158,84 @@ mod tests {
         assert!(declared_scope.is_ok(), "{declared_scope:?}");
     }
 
+    /// KR-REQ-11.01 (E15): one rule for every word. A record of a compiled word whose place is not
+    /// the place this host installs it at now is a moved place, said in the words of a compiled word,
+    /// and `status` shows the same sentence as drift; a compiled word's entry follows the host's own
+    /// executable, so a changed command is not a moved place.
+    #[cfg(unix)]
+    #[test]
+    fn a_compiled_word_whose_recorded_place_moved_is_refused_and_status_shows_it() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let request = params(AgentTarget::CODEX, InstallScope::User);
+        installer.install(&request).expect("installs");
+        let path = installer.record_path(&request);
+        let mut record =
+            read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+        let recorded_root = record.manifest.root.clone();
+        let document = display(&tree.home().join(".codex").join("config.toml"));
+        let before = installer.status(&request).expect("reads");
+        assert!(before.drift.is_empty(), "{:?}", before.drift);
+
+        // The host now installs it at another skills folder than the record names.
+        record.manifest.root = display(&tree.home().join(".elsewhere").join("kalareach-contact"));
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("encodes"),
+        )
+        .expect("writes");
+        let expected = format!(
+            "the record of codex at user scope names {} and {document}, entry mcp_servers.kalareach, \
+             and this host now installs codex at {recorded_root} and {document}, entry \
+             mcp_servers.kalareach; run kr skill remove --agent codex --scope user, with \
+             --project-dir for a project, and then install again",
+            record.manifest.root
+        );
+        let refused = installer
+            .install(&request)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert_eq!(refused, Err(expected.clone()));
+        let status = installer.status(&request).expect("reads");
+        assert!(
+            status.drift.contains(&expected),
+            "status shows the drift: {:?}",
+            status.drift
+        );
+    }
+
+    /// KR-REQ-11.01 (E15): `status` of a declared word shows the same drift where the declaration
+    /// the service resolved names another place than the record does.
+    #[cfg(unix)]
+    #[test]
+    fn status_shows_the_drift_of_a_declared_word_whose_package_moved_its_place() {
+        let tree = Tree::create();
+        let configuration = |name: &str| {
+            Some(json!({ "path": [".amp", name], "format": "json_command_args", "shared": false }))
+        };
+        let first = tree.installer().with_declaration(
+            Some(declared(configuration("mcp.json"), &[".amp", "skills"])),
+            Vec::new(),
+        );
+        let request = params(amp(), InstallScope::User);
+        first.install(&request).expect("installs");
+        assert!(first.status(&request).expect("reads").drift.is_empty());
+        let moved = tree.installer().with_declaration(
+            Some(declared(configuration("other.json"), &[".amp", "skills"])),
+            Vec::new(),
+        );
+        let status = moved.status(&request).expect("reads");
+        assert!(
+            status.drift.iter().any(
+                |said| said.contains("the record of amp at user scope names")
+                    && said.contains("and the package now declares")
+                    && said.contains("other.json, entry mcpServers.kalareach")
+            ),
+            "{:?}",
+            status.drift
+        );
+    }
+
     /// A record of version 1 and one of version 2 are read through one reader, as the same shape.
     #[test]
     fn a_version_one_and_a_version_two_record_read_through_one_reader() {
@@ -4945,11 +5061,23 @@ mod tests {
             .install(&params(amp(), InstallScope::User))
             .expect("installs");
         let before = std::fs::read(tree.home().join(".amp/mcp.json")).expect("the document");
-        for moved in [
-            document("json_local_command_list", None),
-            document(
-                "json_command_args",
-                Some(json!({ "field": "timeout", "unit": "seconds" })),
+        for (moved, shown) in [
+            (
+                document("json_local_command_list", None),
+                [
+                    "entry mcpServers.kalareach, and the package now declares ",
+                    "entry mcp.kalareach; run kr skill remove",
+                ],
+            ),
+            (
+                document(
+                    "json_command_args",
+                    Some(json!({ "field": "timeout", "unit": "seconds" })),
+                ),
+                [
+                    "entry mcpServers.kalareach, and the package now declares ",
+                    ", entry mcpServers.kalareach, with an entry of other contents; run kr skill remove",
+                ],
             ),
         ] {
             let refused = tree
@@ -4963,6 +5091,9 @@ mod tests {
                     && message.contains("run kr skill remove --agent amp --scope user"),
                 "{message}"
             );
+            for part in shown {
+                assert!(message.contains(part), "{part}: {message}");
+            }
         }
         assert_eq!(
             std::fs::read(tree.home().join(".amp/mcp.json")).expect("the document"),
