@@ -232,3 +232,129 @@ async fn a_key_of_the_wrong_shape_is_refused_and_a_replaced_or_removed_key_leave
         "a removed key leaves none"
     );
 }
+
+/// P1-3: the key is taken on the owner's local socket and refused from a paired device that holds
+/// every right, with the refusal every other environment method gives it, and a refused call holds
+/// nothing. The control is the same call on the local socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_credential_is_refused_from_a_paired_device_with_the_ingress_refusal_and_taken_on_the_local_socket()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let device = net_support::Device::create().await;
+    let record = net_support::pair_with(
+        &host,
+        &device,
+        &owner,
+        net_support::proposal(kr_protocol::rights::ActionRight::ALL),
+    )
+    .await;
+    let session = net_support::RawDevice::connect(&host, &device, &record).await;
+    session.claim();
+
+    let refused = net_support::refusal(
+        session
+            .mutate(
+                Method::VoiceCredentialSet,
+                ActionId::new(kr_ipc::new_uuid()),
+                net_support::on_the_host(&host),
+                &params(SENTINEL),
+            )
+            .await,
+    );
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused:?}"
+    );
+    assert!(
+        !format!("{refused:?}").contains(&SENTINEL[..8]),
+        "the refusal repeats the key"
+    );
+    let removed = net_support::refusal(
+        session
+            .mutate(
+                Method::VoiceCredentialRemove,
+                ActionId::new(kr_ipc::new_uuid()),
+                net_support::on_the_host(&host),
+                &VoiceCredentialRemoveParams {
+                    kind: VoiceCredentialKind::OpenaiLive,
+                },
+            )
+            .await,
+    );
+    assert_eq!(
+        removed.code,
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(
+        credentials_of(&host)
+            .get(VoiceCredentialKind::OpenaiLive)
+            .expect("the store reads")
+            .is_none(),
+        "a refused call keeps nothing"
+    );
+
+    session.close();
+    let mut control = host.client().await;
+    set(&mut control, &host, &params(SENTINEL))
+        .await
+        .expect("the same call on the local socket is taken");
+    assert!(
+        credentials_of(&host)
+            .get(VoiceCredentialKind::OpenaiLive)
+            .expect("the store reads")
+            .is_some()
+    );
+}
+
+/// P1-12: the digest the host keeps of a claimed set is not the digest of its parameters alone, so
+/// it cannot be used to test a guess of the key, and a second call with the same key claims under
+/// a digest of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_stored_claim_digest_of_a_credential_set_is_not_the_digest_of_its_params_alone() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let mut control = host.client().await;
+
+    let value = params(SENTINEL);
+    let alone = kr_cbor::sha256(&kr_cbor::encode(
+        &kr_cbor::to_canonical_value(&value).expect("the parameters encode"),
+    ));
+    let on_the_key = kr_cbor::sha256(SENTINEL.as_bytes());
+
+    let mut stored = Vec::new();
+    for _ in 0..2 {
+        let action = ActionId::new(kr_ipc::new_uuid());
+        control
+            .mutate(
+                Method::VoiceCredentialSet,
+                action,
+                ActionTarget::environment(host.environment_id),
+                &value,
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("the key is kept");
+        let connection = rusqlite::Connection::open_with_flags(
+            host.registry_database(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("the registry opens");
+        let digest: Vec<u8> = connection
+            .query_row(
+                "SELECT payload_digest FROM authority_receipts WHERE action_id = ?1",
+                [action.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("the set was claimed");
+        assert_eq!(digest.len(), 32, "a digest");
+        assert_ne!(digest, alone.to_vec(), "the digest of the parameters alone");
+        assert_ne!(digest, on_the_key.to_vec(), "the digest of the key alone");
+        stored.push(digest);
+    }
+    assert_ne!(
+        stored[0], stored[1],
+        "a second claim of the same key has its own digest"
+    );
+}

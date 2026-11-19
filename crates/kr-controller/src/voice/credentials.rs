@@ -13,6 +13,8 @@ use std::sync::Arc;
 use kr_crypto::secret::SecretVec;
 use kr_crypto::store::{SecretName, SecretStore};
 use kr_protocol::delivery::SecretText;
+use kr_protocol::hostinfo::export::Sentence;
+use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::voice_credential::VoiceCredentialKind;
 use serde::{Deserialize, Serialize};
@@ -119,6 +121,30 @@ impl VoiceCredentials {
         self.get(kind).map(|held| held.is_some())
     }
 
+    /// What `kr doctor` says of the key: whether the host holds one, holds none, or could not tell.
+    ///
+    /// A store that refuses the read is "unreadable" and never "none", so a host whose store is
+    /// broken does not read as one with no key. The words are literals: nothing a store returns
+    /// reaches the report.
+    #[must_use]
+    pub fn doctor_check(&self) -> DoctorCheck {
+        let (status, detail) = match self.held(VoiceCredentialKind::OpenaiLive) {
+            Ok(true) => (DoctorStatus::Ok, "held for openai-live"),
+            Ok(false) => (DoctorStatus::NotApplicable, "none"),
+            Err(_) => (
+                DoctorStatus::Warning,
+                "unreadable (the secret store refused)",
+            ),
+        };
+        DoctorCheck::new(
+            "voice-credential",
+            "The voice key this host holds",
+            status,
+            Sentence::new().stated(detail),
+            None,
+        )
+    }
+
     /// Deletes the key for `kind` and says whether one was held.
     ///
     /// # Errors
@@ -136,5 +162,190 @@ fn unavailable(error: kr_crypto::CryptoError) -> ControllerError {
     ControllerError::Storage {
         operation: "use this host's secret store",
         detail: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use kr_crypto::store::MemoryStore;
+    use kr_protocol::scalars::Uuid;
+    use kr_protocol::voice_credential::VoiceCredentialSetParams;
+
+    use super::*;
+
+    /// A value no real key has, so finding any part of it in text is a leak.
+    const SENTINEL: &str = "kr-test-voice-key-0123456789abcdef";
+
+    /// A store that takes writes, deletions and reads only when it is let.
+    #[derive(Debug, Default)]
+    struct Flaky {
+        inner: MemoryStore,
+        refusing_writes: AtomicBool,
+        refusing_reads: AtomicBool,
+        refusing_deletes: AtomicBool,
+    }
+
+    impl SecretStore for Flaky {
+        fn set(&self, name: &SecretName, secret: &[u8]) -> kr_crypto::Result<()> {
+            if self.refusing_writes.load(Ordering::SeqCst) {
+                return Err(kr_crypto::CryptoError::SecretStore {
+                    message: "the store refuses writes".to_owned(),
+                });
+            }
+            self.inner.set(name, secret)
+        }
+
+        fn get(&self, name: &SecretName) -> kr_crypto::Result<Option<SecretVec>> {
+            if self.refusing_reads.load(Ordering::SeqCst) {
+                return Err(kr_crypto::CryptoError::SecretStore {
+                    message: "the store cannot be read".to_owned(),
+                });
+            }
+            self.inner.get(name)
+        }
+
+        fn delete(&self, name: &SecretName) -> kr_crypto::Result<()> {
+            if self.refusing_deletes.load(Ordering::SeqCst) {
+                return Err(kr_crypto::CryptoError::SecretStore {
+                    message: "the store refuses deletions".to_owned(),
+                });
+            }
+            self.inner.delete(name)
+        }
+
+        fn describe(&self) -> String {
+            "a flaky store".to_owned()
+        }
+    }
+
+    fn credentials(store: &Arc<Flaky>) -> VoiceCredentials {
+        VoiceCredentials::new(
+            Arc::clone(store) as Arc<dyn SecretStore>,
+            EnvironmentId::new(Uuid::from_bytes([7; 16])),
+        )
+    }
+
+    fn key() -> SecretText {
+        SecretText::new(SENTINEL).expect("a key")
+    }
+
+    /// P1-7: a store that refuses a write, a read or a deletion answers with its own reason and
+    /// never the key, and a store that cannot be read is never taken for an empty one.
+    #[test]
+    fn a_store_that_refuses_the_write_answers_with_its_reason_and_never_the_key() {
+        let store = Arc::new(Flaky::default());
+        let held = credentials(&store);
+
+        // The control: the same call with a store that takes it.
+        held.put(VoiceCredentialKind::OpenaiLive, &key())
+            .expect("a store that takes writes keeps the key");
+        assert_eq!(
+            held.get(VoiceCredentialKind::OpenaiLive)
+                .expect("reads")
+                .expect("held")
+                .expose(),
+            SENTINEL
+        );
+
+        store.refusing_writes.store(true, Ordering::SeqCst);
+        let refused = held
+            .put(VoiceCredentialKind::OpenaiLive, &key())
+            .expect_err("a refusing store refuses");
+        let text = format!("{refused} {refused:?}");
+        assert!(text.contains("the store refuses writes"), "{text}");
+        assert!(
+            !text.contains("sentinel") && !text.contains(SENTINEL),
+            "{text}"
+        );
+        // The key held before is the key held after: a refused write replaced nothing.
+        store.refusing_writes.store(false, Ordering::SeqCst);
+        assert_eq!(
+            held.get(VoiceCredentialKind::OpenaiLive)
+                .expect("reads")
+                .expect("held")
+                .expose(),
+            SENTINEL
+        );
+
+        store.refusing_reads.store(true, Ordering::SeqCst);
+        let unreadable = held
+            .held(VoiceCredentialKind::OpenaiLive)
+            .expect_err("an unreadable store is not an empty one");
+        assert!(unreadable.to_string().contains("the store cannot be read"));
+        store.refusing_reads.store(false, Ordering::SeqCst);
+
+        store.refusing_deletes.store(true, Ordering::SeqCst);
+        let kept = held
+            .delete(VoiceCredentialKind::OpenaiLive)
+            .expect_err("a refusing store keeps the item");
+        assert!(kept.to_string().contains("the store refuses deletions"));
+        store.refusing_deletes.store(false, Ordering::SeqCst);
+        assert!(
+            held.held(VoiceCredentialKind::OpenaiLive).expect("reads"),
+            "a refused deletion left the key held"
+        );
+    }
+
+    /// An item this build cannot read is refused with a fixed sentence that carries none of what
+    /// the item holds.
+    #[test]
+    fn an_item_this_build_cannot_read_is_refused_without_repeating_it() {
+        let store = Arc::new(Flaky::default());
+        let held = credentials(&store);
+        let name = held.name(VoiceCredentialKind::OpenaiLive).expect("a name");
+        store
+            .inner
+            .set(&name, SENTINEL.as_bytes())
+            .expect("a store takes an item");
+        let refused = held
+            .get(VoiceCredentialKind::OpenaiLive)
+            .expect_err("an item that is not a stored key is refused");
+        let text = format!("{refused} {refused:?}");
+        assert!(!text.contains("sentinel"), "{text}");
+        assert!(held.held(VoiceCredentialKind::OpenaiLive).is_err());
+    }
+
+    /// P1-10: no type that carries the key prints it in its debug or display form, whatever the
+    /// form: the key's own type, the set method's parameters, the value they become before they are
+    /// encoded, the credentials' own handle, and a refusal the store gave while the key was held.
+    #[test]
+    fn no_voice_credential_type_prints_its_key_in_debug_or_display() {
+        let store = Arc::new(Flaky::default());
+        let held = credentials(&store);
+        held.put(VoiceCredentialKind::OpenaiLive, &key())
+            .expect("kept");
+        let params = VoiceCredentialSetParams {
+            kind: VoiceCredentialKind::OpenaiLive,
+            key: key(),
+        };
+        let value = kr_protocol::envelope::ParamsValue::from_typed(&params).expect("a value");
+        store.refusing_writes.store(true, Ordering::SeqCst);
+        let refusal = held
+            .put(VoiceCredentialKind::OpenaiLive, &key())
+            .expect_err("refused");
+        let forms = [
+            format!("{:?}", key()),
+            format!("{:#?}", key()),
+            format!("{params:?}"),
+            format!("{params:#?}"),
+            format!("{value:?}"),
+            format!("{value:#?}"),
+            format!("{held:?}"),
+            format!("{held:#?}"),
+            format!("{refusal}"),
+            format!("{refusal:?}"),
+        ];
+        for form in forms {
+            for window in [
+                &SENTINEL[..8],
+                &SENTINEL[12..20],
+                &SENTINEL[SENTINEL.len() - 8..],
+                SENTINEL,
+            ] {
+                assert!(!form.contains(window), "a form prints {window:?}: {form}");
+            }
+        }
     }
 }
