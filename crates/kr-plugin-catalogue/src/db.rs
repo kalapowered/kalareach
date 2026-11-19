@@ -2044,7 +2044,7 @@ mod tests {
             plugin_id: PluginId::new("kalareach/example-declarative").expect("a plugin"),
             package_digest: PayloadDigest::of(b"package"),
             origin: ReleaseOrigin {
-                repository_id: RepositoryId::new("official").expect("a repository"),
+                repository_id: RepositoryId::new("example").expect("a repository"),
                 enrolment_key: EnrolmentKey::generate().expect("a key"),
             },
             cap: [capability].into_iter().collect(),
