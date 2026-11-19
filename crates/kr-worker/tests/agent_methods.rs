@@ -2901,3 +2901,75 @@ async fn kr_req_23_30_a_preparation_spends_one_bound_from_the_wait_for_a_place_t
     );
     assert_eq!(host.count(), 19, "the places were not given back");
 }
+
+/// A call names a pending request only for an action that answers one: the rule the worker's route
+/// applies once, before it chooses a route. A prompt, and a presentation action, that name a
+/// resource are refused with `INVALID_ARGUMENT`; an answer that names one passes this rule (the
+/// resource's own checks are the answer route's), and a call that names none passes it too.
+#[test]
+fn a_resource_is_named_only_by_an_action_that_answers_a_request() {
+    let broker = agent_broker_with(std::sync::Arc::new(RecordingUpstream::default()));
+    let answer: ActionDeclaration = serde_json::from_value(serde_json::json!({
+        "id": "request.answer",
+        "label": "Answer",
+        "effect": "approval.respond",
+        "implementation": { "type": "decision_destination", "decision": "decision" },
+        "parameters": { "parameters": [{
+            "name": "decision",
+            "kind": { "type": "choice", "choices": [
+                { "id": "allow", "label": "Allow" },
+                { "id": "deny", "label": "Deny" },
+            ] },
+            "label": "Decision",
+            "required": true,
+        }] },
+        "description": "an answer, as the package declares it",
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads");
+    let refused = broker
+        .register_actions(
+            binding(),
+            &[
+                declared("prompt.submit", "upstream.prompt"),
+                declared("view.refresh", "observe"),
+                answer,
+            ],
+        )
+        .expect("the actions are registered");
+    assert!(refused.is_empty(), "{refused:?}");
+    let resource =
+        kr_protocol::ids::PendingResourceId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+    let call = |action: &str, resource_id: Nullable<kr_protocol::ids::PendingResourceId>| {
+        let name = ActionName::new(action).expect("valid");
+        let registered = broker
+            .registered_action(binding(), &name)
+            .expect("the binding is known")
+            .expect("the action is registered");
+        let params = PluginActionInvokeParams {
+            target: target(1),
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            action: name,
+            draft_id: Nullable::null(),
+            resource_id,
+            parameters: Bytes::from(b"{}".to_vec()),
+        };
+        Broker::check_resource_named(&registered, &params)
+    };
+    for action in ["prompt.submit", "view.refresh"] {
+        let refusal = call(action, Nullable::some(resource))
+            .expect_err("an action that answers nothing names no resource");
+        assert!(
+            matches!(refusal, BrokerError::InvalidArgument(_)),
+            "{action}: {refusal}"
+        );
+        assert!(
+            refusal.to_string().contains(&format!(
+                "{action} answers no pending request, and this call names one"
+            )),
+            "{refusal}"
+        );
+        call(action, Nullable::null()).expect("and naming none passes");
+    }
+    call("request.answer", Nullable::some(resource)).expect("an answer names its resource");
+}
