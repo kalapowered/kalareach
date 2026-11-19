@@ -1518,7 +1518,9 @@ pub async fn question_dismiss_kept(state: State<'_, AppState>, params: Value) ->
 /// it is read on the session's own worker link; the control daemon refuses a live session's
 /// receipt. The daemon serves the receipts of a session whose worker has ended and of the effects
 /// the host performed itself, which name no session. Which it is follows from the session the
-/// request names and from whether that session's worker has a descriptor on this machine.
+/// request names and from whether that session's worker has a descriptor on this machine. Over a
+/// paired host the session's own link reads it: the screen's opening when the call names one, and
+/// otherwise the session's ambient link.
 #[tauri::command]
 pub async fn action_read(
     state: State<'_, AppState>,
@@ -1528,18 +1530,21 @@ pub async fn action_read(
 ) -> Result<Value> {
     let typed: kr_protocol::receipt::ActionReadParams = decode(params)?;
     // Over a host this device is paired with, a receipt is read on the session's own link: the
-    // connection for the host alone resolves no session. A read that names no session or no
-    // opening is refused here, because the host would otherwise resolve the session itself from
-    // the route it recorded, under whichever grant that connection holds.
+    // connection for the host alone resolves no session. The read names its session, and the link
+    // is the one an answer to that session uses: the opening's when the call names one, and
+    // otherwise the session's ambient link, as `agent_approval_inspect` finds it, so a receipt is
+    // read where the action was sent and a screen holds no opening only to read it. A read that
+    // names no session is refused here, because the host would otherwise resolve the session
+    // itself from the route it recorded, under whichever grant that connection holds.
     if state.paired_context().is_some() {
-        let (Some(session_id), Some(opening)) = (typed.session_id, opening.as_deref()) else {
+        let Some(session_id) = typed.session_id else {
             return Err(CommandError::invalid(
-                "over a host this device is paired with, a receipt is read from the session's own \
-                 screen, naming the session",
+                "a receipt read on a host this device is paired with names the session the \
+                 receipt belongs to",
             ));
         };
         let answer = links
-            .read_receipt(&state, session_id, Some(opening), &typed)
+            .read_receipt(&state, session_id, opening.as_deref(), &typed)
             .await?;
         return encode(&answer);
     }

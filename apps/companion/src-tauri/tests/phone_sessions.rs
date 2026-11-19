@@ -779,6 +779,105 @@ async fn kr_req_19_08_a_prompt_the_host_cannot_establish_reaches_the_page_with_i
     adopted.stop().await;
 }
 
+/// KR-REQ-12.18 and section 9: over a paired host an action is read and released on the link it was
+/// sent on. A prompt the host cannot establish is sent with no opening, so on the session's ambient
+/// link; its receipt is read there with the session named and no opening, and the release of the
+/// action goes to the same link's book. A receipt the worker does not hold is the worker's own
+/// refusal, which releases nothing, and a read that names no session is the application's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_12_18_a_paired_host_reads_and_releases_an_action_on_the_ambient_link_it_was_sent_on()
+ {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(net_support::worker::HeldUpstream::default());
+    let instance = worker.register_agent_on(Arc::clone(&upstream) as _);
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let companion = &phone.companion;
+    // The pairing's own opening of the session is the session's ambient link.
+    open(companion, session, None, "screen").expect("the session opens");
+
+    let sent = companion
+        .call(
+            "agent_prompt_submit",
+            json!({ "params": prompt(session, instance, "never answered") }),
+        )
+        .expect("an outcome nobody can establish is an answer with its action");
+    let action_id = sent["action_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the answer names the action: {sent}"))
+        .to_owned();
+    use tauri::Manager as _;
+    let state = companion.app.state::<companion_tauri::AppState>();
+    assert_eq!(
+        state.paired_links().unresolved(session, "screen").await,
+        Some(1),
+        "the prompt is in the ambient link's book"
+    );
+
+    // The receipt is read with the session named and no opening: on the link the prompt used.
+    let read = companion
+        .call(
+            "action_read",
+            json!({ "params": { "action_id": action_id, "session_id": session.to_string() } }),
+        )
+        .expect("a paired host's receipt is read on the session's ambient link");
+    assert_eq!(read["receipt"]["state"], "unknown", "{read}");
+
+    // The release goes to the same link, and lets go of that action alone.
+    companion
+        .call(
+            "agent_action_settle",
+            json!({ "params": { "session_id": session.to_string(), "action_id": action_id } }),
+        )
+        .expect("the ambient link lets the action go");
+    assert_eq!(
+        state.paired_links().unresolved(session, "screen").await,
+        Some(0),
+        "the release emptied the link's book"
+    );
+
+    // A receipt the worker holds none of is the worker's own refusal, on the same link.
+    let missing = companion
+        .call(
+            "action_read",
+            json!({ "params": {
+                "action_id": ActionId::new(kr_ipc::new_uuid()).to_string(),
+                "session_id": session.to_string(),
+            } }),
+        )
+        .expect_err("the worker holds no such receipt");
+    assert_eq!(code(&missing), "INVALID_ARGUMENT", "{missing}");
+    assert!(
+        missing["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("no receipt")),
+        "the worker says it holds no receipt: {missing}"
+    );
+
+    // A read that names no session is refused before any link: nothing resolves the session.
+    let unnamed = companion
+        .call(
+            "action_read",
+            json!({ "params": { "action_id": action_id, "session_id": null } }),
+        )
+        .expect_err("a paired host's receipt is read for a session");
+    assert_eq!(code(&unnamed), "INVALID_ARGUMENT", "{unnamed}");
+    assert!(
+        !unnamed["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("no receipt")),
+        "the application refused it, not the worker: {unnamed}"
+    );
+
+    upstream.release();
+    adopted.stop().await;
+}
+
 /// KR-REQ-23.24: a prompt whose outcome the host cannot establish is an uncertain outcome, and a
 /// later prompt for the same conversation is admitted only as an explicit later request that names
 /// that action and the revision of its record the phone read. The command sends the quote it is
@@ -2085,11 +2184,13 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
             .is_some_and(|words| words.contains("no receipt")),
         "the worker says it holds no receipt: {unknown}"
     );
+    // A read that names no session is the application's refusal: the host would otherwise resolve
+    // the session itself, under whichever grant the main connection holds.
     let unnamed = call(
         "action_read",
-        json!({ "params": { "action_id": unheld, "session_id": session } }),
+        json!({ "params": { "action_id": unheld, "session_id": null } }),
     )
-    .expect_err("a receipt is not read without the screen it belongs to");
+    .expect_err("a receipt is read for the session it belongs to");
     assert_eq!(code(&unnamed), "INVALID_ARGUMENT", "{unnamed}");
     refused_by_the_worker(
         "action_cancel",
