@@ -1543,6 +1543,9 @@ impl DeliveryModule {
                 Detail::Missing(detail)
             }
             mailbox::Placement::Later { detail, after, .. } => Detail::Later { detail, after },
+            // The pending detail stays: nothing was sent, and nothing schedules another attempt
+            // for it before the host restarts.
+            mailbox::Placement::Held { detail } => Detail::Held(detail),
         };
         Ok(Placing {
             detail,
@@ -1900,7 +1903,7 @@ impl DeliveryModule {
                 })?;
             match placing.detail {
                 Detail::Ready => sender.send(&credential, &request),
-                Detail::Missing(why) => {
+                Detail::Missing(why) | Detail::Held(why) => {
                     detail_missing = Some(why);
                     sender.send(&credential, &request)
                 }
@@ -2111,6 +2114,9 @@ enum Detail {
     /// read, or the notification has too little life left to ask. The push is presented without
     /// it, and its record says why.
     Missing(String),
+    /// Nothing was sent, because the proxy's login stops the mailbox's requests until the host
+    /// restarts. The push is presented without the detail, and the pending detail is kept.
+    Held(String),
     /// Nothing is known to be placed. Whether the push waits for the mailbox is judged by the
     /// caller, at the reading it decides on, with the time the service asked for; when it does
     /// not wait, the detail is given up and the push goes without it.

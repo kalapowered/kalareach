@@ -138,6 +138,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
 use kr_protocol::scalars::{Digest256, TimestampMs};
 use kr_protocol::service::SERVICE_REQUEST_FRESHNESS_MS;
+use kr_transport::proxy::ProxyLoginKind;
 use kr_worker::privacy::PrivacyGeneration;
 
 use crate::backup::BackupService;
@@ -442,6 +443,9 @@ pub struct Hold {
     /// The alternatives the service named when it had no managed capacity for a new name. They
     /// decide what a check says and nothing the carrier does.
     pub offered: Offered,
+    /// The proxy-login kind that stopped the request, when it is one that no request survives
+    /// until the host restarts. The request was not sent, and no timer helps.
+    pub login: Option<ProxyLoginKind>,
 }
 
 impl Hold {
@@ -465,6 +469,7 @@ impl Hold {
             code,
             retry_after,
             offered,
+            login: error.stopped_by_proxy_login(),
         }
     }
 
@@ -489,7 +494,15 @@ impl Hold {
             code,
             retry_after: self.retry_after.max(other.retry_after),
             offered,
+            login: self.login.or(other.login),
         }
+    }
+
+    /// Whether the cause lasts until the host restarts: the proxy's login stopped the request
+    /// before it was sent, and no wait changes that.
+    #[must_use]
+    pub const fn waits_for_restart(&self) -> bool {
+        self.login.is_some()
     }
 
     /// Whether only a person can clear the cause: an account that is not signed in, an allowance
@@ -1493,6 +1506,7 @@ impl Uploader {
                 code: ErrorCode::ServiceCapacity,
                 retry_after: None,
                 offered: Offered::default(),
+                login: None,
             });
             turn.deferred = Some(turn.deferred.map_or(hold, |earlier| earlier.and(hold)));
         }
@@ -2691,4 +2705,41 @@ fn read_staged(object: &ObjectRecord) -> std::result::Result<Vec<u8>, Unstaged> 
         return Err(not_admitted());
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_protocol::error::ProtocolError;
+
+    use super::*;
+
+    /// KR-REQ-10.02: a hold keeps the proxy-login kind that stopped the request, through the
+    /// combination of two holds in either order, and says it waits for the host to restart;
+    /// `Needed` and a host answer with the same words hold nothing of the kind.
+    #[test]
+    fn kr_req_10_02_a_hold_keeps_the_proxy_login_kind_when_holds_combine() {
+        let other = Hold::of(&ClientError::Host(ProtocolError::new(
+            ErrorCode::UpstreamUnavailable,
+            "the service did not answer",
+        )));
+        assert!(!other.waits_for_restart());
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            let hold = Hold::of(&ClientError::ProxyLogin(kind));
+            assert_eq!(hold.login, Some(kind));
+            assert!(hold.waits_for_restart());
+            assert_eq!(hold.retry_after, None, "no timer is named");
+            assert_eq!(hold.and(other).login, Some(kind));
+            assert_eq!(other.and(hold).login, Some(kind));
+        }
+        assert!(!Hold::of(&ClientError::ProxyLogin(ProxyLoginKind::Needed)).waits_for_restart());
+        let same_words = ClientError::Host(ProtocolError::new(
+            ErrorCode::UpstreamUnavailable,
+            ProxyLoginKind::Refused.sentence(),
+        ));
+        assert!(!Hold::of(&same_words).waits_for_restart());
+    }
 }

@@ -95,6 +95,16 @@ pub(super) enum Current {
     Failed(ClientError),
 }
 
+/// Whether a failed question may pass by itself. A request the proxy's login stopped is not one
+/// that passes before the host restarts.
+fn is_transient(error: &ClientError) -> bool {
+    error.stopped_by_proxy_login().is_none()
+        && !matches!(
+            error.code(),
+            ErrorCode::PermissionDenied | ErrorCode::HostNotConfigured | ErrorCode::InvalidArgument
+        )
+}
+
 /// Why no authorisation was obtained.
 enum Fault {
     SignIn,
@@ -194,12 +204,7 @@ impl HostPayer {
             Err(Fault::Failed(error)) => {
                 // A question the service did not answer, about an authorisation that still stands,
                 // does not stop the leases the host holds from being refilled under it.
-                let transient = !matches!(
-                    error.code(),
-                    ErrorCode::PermissionDenied
-                        | ErrorCode::HostNotConfigured
-                        | ErrorCode::InvalidArgument
-                );
+                let transient = is_transient(&error);
                 match &state.held {
                     Some((held_for, authorised))
                         if transient
@@ -289,5 +294,34 @@ impl HostPayer {
                 Err(error) => return Err(Fault::Failed(error)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_protocol::error::ProtocolError;
+    use kr_transport::proxy::ProxyLoginKind;
+
+    use super::*;
+
+    /// KR-REQ-10.02: a question the proxy's login stopped does not pass by itself, so the payer
+    /// does not refill under the lease it holds and does not ask again before the host restarts;
+    /// `Needed` and a host answer with the same words pass as they did.
+    #[test]
+    fn kr_req_10_02_the_payer_does_not_treat_a_proxy_login_stop_as_passing() {
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            assert!(!is_transient(&ClientError::ProxyLogin(kind)), "{kind:?}");
+        }
+        assert!(is_transient(&ClientError::ProxyLogin(
+            ProxyLoginKind::Needed
+        )));
+        assert!(is_transient(&ClientError::Host(ProtocolError::new(
+            ErrorCode::UpstreamUnavailable,
+            ProxyLoginKind::Refused.sentence(),
+        ))));
     }
 }

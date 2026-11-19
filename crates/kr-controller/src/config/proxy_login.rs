@@ -157,6 +157,15 @@ const R2: &str = "Use a proxy that signs in by Basic, or run a local proxy that 
 const R3: &str = "Run `kr host stop`; the daemon uses the stored login from its next start.";
 /// A login cleared after the start.
 const R4: &str = "Run `kr host stop`; the daemon uses no login from its next start.";
+/// What a person does when a service's request was stopped by the proxy's login: the kind decides
+/// whether a login is missing or the proxy asks for a method this host does not send.
+#[must_use]
+pub(crate) const fn remedy_for_kind(kind: kr_transport::proxy::ProxyLoginKind) -> &'static str {
+    match kind {
+        kr_transport::proxy::ProxyLoginKind::Unsupported => R2,
+        _ => R1,
+    }
+}
 /// An `http` relay while a login is held.
 const R_HTTP_RELAY: &str = "Use an https relay.";
 

@@ -389,6 +389,11 @@ impl Shared {
     /// What to wait on after the service held work back. Any delay it named was recorded where
     /// the answer arrived.
     fn after(&self, hold: Hold, backoff: &mut Backoff) -> Wait {
+        if hold.waits_for_restart() {
+            // The proxy's login stopped the request before it was sent, and no wait mends that: the
+            // carrier waits for work, a fence or a person, and sets no timer.
+            return Wait::Signals;
+        }
         let owed = self.quiet.owed();
         if hold.needs_a_person() {
             // Waiting does not clear the cause, so the host asks again after five minutes or when
@@ -461,11 +466,13 @@ impl Shared {
                             code: ErrorCode::ServiceCapacity,
                             retry_after: Some(retry_after),
                             offered: report.hold.map(|hold| hold.offered).unwrap_or_default(),
+                            login: None,
                         }),
                         (None, Some(owed)) if report.hold.is_some() => Some(Hold {
                             code: ErrorCode::ServiceCapacity,
                             retry_after: Some(owed.left),
                             offered: report.hold.map(|hold| hold.offered).unwrap_or_default(),
+                            login: None,
                         }),
                         (None, Some(_)) => observed.pass_hold,
                         (None, None) => None,
@@ -1187,6 +1194,11 @@ async fn drive(
 /// Says what a hold is, in words this build wrote. The writer's key identifier is named where the
 /// remedy is to enrol it.
 fn hold_sentence(detail: Sentence, hold: Hold, writer: KeyId) -> Sentence {
+    if let Some(kind) = hold.login {
+        return detail
+            .stated(kind.clause())
+            .stated("; backup waits until the host restarts");
+    }
     match hold.code {
         ErrorCode::QuotaExceeded => {
             detail.stated("the service reports no backup allowance for the account, or no account")
@@ -1225,6 +1237,9 @@ fn capacity_named(hold: Hold) -> Offered {
 
 /// What a person does about a hold.
 const fn remedy_for(hold: Hold) -> &'static str {
+    if let Some(kind) = hold.login {
+        return crate::config::proxy_login::remedy_for_kind(kind);
+    }
     match hold.code {
         ErrorCode::QuotaExceeded => {
             "Sign the host in to an account with a backup allowance, or raise the allowance."
@@ -1336,5 +1351,32 @@ mod tests {
             !*settled.borrow(),
             "the signal ended the wait and lowered it"
         );
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_client::error::ClientError;
+    use kr_transport::proxy::ProxyLoginKind;
+
+    use super::*;
+    use crate::config::proxy_login::remedy_for_kind;
+
+    /// KR-REQ-10.02: the doctor's remedy for a backup hold that a proxy login stopped says how to
+    /// apply a login, not that the host asks again by itself; a hold with the same code and no
+    /// kind keeps the automatic-retry remedy.
+    #[test]
+    fn kr_req_10_02_the_backup_remedy_for_a_proxy_login_stop_is_not_an_automatic_retry() {
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            let hold = Hold::of(&ClientError::ProxyLogin(kind));
+            assert_eq!(remedy_for(hold), remedy_for_kind(kind));
+            assert!(!remedy_for(hold).contains("asks again"), "{kind:?}");
+        }
+        let automatic = Hold::of(&ClientError::ProxyLogin(ProxyLoginKind::Needed));
+        assert!(remedy_for(automatic).contains("asks again by itself"));
     }
 }
