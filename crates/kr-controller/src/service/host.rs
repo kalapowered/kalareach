@@ -237,14 +237,18 @@ impl Controller {
         // registration under the revision it was admitted at, then the deadline.
         // The admissions are read once more here, after the checks that read the file system, so a
         // package or a grant that changed while they ran refuses the request before the marker.
-        crate::agent_tools::declared::admissions_held_until_registration(read_at, async {
-            self.catalogue
-                .admission_revision_within(tokio::time::Instant::now() + DOCTOR_READS)
-                .await
-                .ok()
-        })
+        crate::agent_tools::declared::admissions_held_until_registration(
+            read_at,
+            DOCTOR_READS.as_secs(),
+            async {
+                self.catalogue
+                    .admission_revision_within(tokio::time::Instant::now() + DOCTOR_READS)
+                    .await
+                    .ok()
+            },
+        )
         .await
-        .map_err(|refusal| ControllerError::InvalidArgument(refusal.to_owned()))?;
+        .map_err(ControllerError::InvalidArgument)?;
         self.under_registration(&carried, || {
             installer.mark_dispatching(actor_id, mutation.action_id, digest)
         })??;
@@ -350,8 +354,8 @@ impl Controller {
             .admission_revision_within(tokio::time::Instant::now() + DOCTOR_READS)
             .await
             .ok();
-        admissions_held(snapshot.revision, now)
-            .map_err(|refusal| ControllerError::InvalidArgument(refusal.to_owned()))?;
+        admissions_held(snapshot.revision, now, DOCTOR_READS.as_secs())
+            .map_err(ControllerError::InvalidArgument)?;
         Ok((
             installer
                 .with_declaration(declared, known)

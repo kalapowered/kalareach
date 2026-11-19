@@ -79,27 +79,34 @@ pub(crate) fn holding_the_capability(
 const ADMISSIONS_MOVED: &str =
     "the packages this host admits changed while this request was read; ask again";
 
+/// The refusal when the admissions could not be read again in time.
+const ADMISSIONS_UNREAD: &str = "this host could not check again within {seconds} seconds whether \
+     the packages it admits changed while this request was read; ask again";
+
 /// Whether the admissions are the ones the packages were read under: `now` is the revision read
-/// again just before the registration of the action, none where it could not be read in time. A
-/// request whose admissions moved is refused before the marker; what is left is the time between
-/// this read and the registration.
-pub(crate) fn admissions_held(read_at: u64, now: Option<u64>) -> Result<(), &'static str> {
+/// again just before the registration of the action, none where it could not be read within
+/// `seconds`. A request whose admissions moved, or whose admissions could not be checked again, is
+/// refused before the marker, each with its own words; what is left is the time between this read
+/// and the registration.
+pub(crate) fn admissions_held(read_at: u64, now: Option<u64>, seconds: u64) -> Result<(), String> {
     match now {
         Some(revision) if revision == read_at => Ok(()),
-        _ => Err(ADMISSIONS_MOVED),
+        Some(_) => Err(ADMISSIONS_MOVED.to_owned()),
+        None => Err(ADMISSIONS_UNREAD.replace("{seconds}", &seconds.to_string())),
     }
 }
 
 /// The last check of a declared word's request, run after every check that reads the file system
 /// and immediately before the action is registered: the revision the packages were read under,
-/// `read_at`, against the revision `reread` reads now. A word the host compiles in was read under
-/// none, so `reread` is not asked for it.
+/// `read_at`, against the revision `reread` reads now within `seconds`. A word the host compiles in
+/// was read under none, so `reread` is not asked for it.
 pub(crate) async fn admissions_held_until_registration(
     read_at: Option<u64>,
+    seconds: u64,
     reread: impl std::future::Future<Output = Option<u64>>,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     match read_at {
-        Some(read_at) => admissions_held(read_at, reread.await),
+        Some(read_at) => admissions_held(read_at, reread.await, seconds),
         None => Ok(()),
     }
 }

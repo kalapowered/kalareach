@@ -287,11 +287,9 @@ impl Fs {
     fn make_directory(&self, path: &Path) -> Result<bool> {
         match self {
             Self::Paths => create_directory_durably(path),
-            Self::Walk(walk) => {
-                let there = walk.is_directory(path)?;
-                walk.make_folders(path)?;
-                Ok(!there)
-            }
+            // True only where this call made the folder: one that another process made first is
+            // not the host's to claim, or to remove.
+            Self::Walk(walk) => walk.make_folders(path),
             Self::Absent(root) => Err(no_folder_to_write(root)),
         }
     }
@@ -300,7 +298,7 @@ impl Fs {
     fn make_folders(&self, path: &Path) -> Result<()> {
         match self {
             Self::Paths => std::fs::create_dir_all(path).map_err(storage),
-            Self::Walk(walk) => walk.make_folders(path),
+            Self::Walk(walk) => walk.make_folders(path).map(|_| ()),
             Self::Absent(root) => Err(no_folder_to_write(root)),
         }
     }
@@ -4849,6 +4847,30 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.01: a folder that another process makes after the host looked and before it made
+    /// it is not the host's: the making says it did not make it, so no record claims it and no
+    /// removal takes it. The control is a folder nothing else made.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_made_between_the_look_and_the_making_is_not_claimed() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let fs = Fs::Walk(std::sync::Arc::new(walk));
+        anchor::make_pause::once(|path| {
+            std::fs::create_dir_all(path).expect("another process makes the folder");
+        });
+        let first = fs.make_directory(&tree.home().join(".amp"));
+        assert_eq!(
+            first.as_ref().ok(),
+            Some(&false),
+            "a folder another process made first is not claimed: {first:?}"
+        );
+        let second = fs.make_directory(&tree.home().join(".bmp"));
+        assert_eq!(second.as_ref().ok(), Some(&true), "{second:?}");
+    }
+
     /// KR-REQ-11.01: an entry that another record of this host claims with other contents is not
     /// replaced, though the package that declared the other record's word is gone; nothing is
     /// written, and the document keeps the first installation's entry.
@@ -4951,11 +4973,23 @@ mod tests {
     /// not be read again, refuse the request before the dispatch marker; the same revision passes.
     #[test]
     fn a_changed_admission_revision_refuses_before_the_marker() {
-        assert_eq!(declared::admissions_held(7, Some(7)), Ok(()));
-        let refusal =
-            "the packages this host admits changed while this request was read; ask again";
-        assert_eq!(declared::admissions_held(7, Some(8)), Err(refusal));
-        assert_eq!(declared::admissions_held(7, None), Err(refusal));
+        assert_eq!(declared::admissions_held(7, Some(7), 30), Ok(()));
+        assert_eq!(
+            declared::admissions_held(7, Some(8), 30),
+            Err(
+                "the packages this host admits changed while this request was read; ask again"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            declared::admissions_held(7, None, 30),
+            Err(
+                "this host could not check again within 30 seconds whether the packages it \
+                 admits changed while this request was read; ask again"
+                    .to_owned()
+            ),
+            "a read that did not come back is not a change"
+        );
     }
 
     /// KR-REQ-11.01: the last read of the admissions, which comes after every check that reads the
@@ -4965,30 +4999,36 @@ mod tests {
     #[tokio::test]
     async fn admissions_that_change_during_the_file_system_checks_refuse_the_request() {
         let refusal =
-            "the packages this host admits changed while this request was read; ask again";
+            "the packages this host admits changed while this request was read; ask again"
+                .to_owned();
+        let unread = "this host could not check again within 30 seconds whether the packages it \
+                      admits changed while this request was read; ask again"
+            .to_owned();
         let live = std::cell::Cell::new(7_u64);
         let read_at = Some(live.get());
         // The checks that read the file system run, and the admissions change while they do.
         let checks = || live.set(8);
         checks();
         assert_eq!(
-            declared::admissions_held_until_registration(read_at, async { Some(live.get()) }).await,
+            declared::admissions_held_until_registration(read_at, 30, async { Some(live.get()) })
+                .await,
             Err(refusal),
             "a revision that moved during the checks"
         );
         live.set(7);
         assert_eq!(
-            declared::admissions_held_until_registration(read_at, async { Some(live.get()) }).await,
+            declared::admissions_held_until_registration(read_at, 30, async { Some(live.get()) })
+                .await,
             Ok(()),
             "admissions that stood still"
         );
         assert_eq!(
-            declared::admissions_held_until_registration(read_at, async { None }).await,
-            Err(refusal),
+            declared::admissions_held_until_registration(read_at, 30, async { None }).await,
+            Err(unread),
             "a revision that cannot be read in time"
         );
         assert_eq!(
-            declared::admissions_held_until_registration(None, async {
+            declared::admissions_held_until_registration(None, 30, async {
                 panic!("a word read under no revision asks for none")
             })
             .await,

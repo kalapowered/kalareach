@@ -392,7 +392,9 @@ fn components_problems(scope: &str, what: &str, components: &[String], found: &m
     {
         found.push(Problem::new(
             "skill_target.not_hidden_first",
-            format!("in the {scope} location the first component of the {what} starts with a dot"),
+            format!(
+                "in the {scope} location the first component of the {what} does not start with a dot"
+            ),
         ));
     }
 }
@@ -471,7 +473,7 @@ impl SkillTarget {
                     self.word,
                     location.skills.join("/")
                 ),
-                "under that home folder",
+                "under that folder",
             ));
         }
         if let Some(location) = &self.project {
@@ -549,7 +551,7 @@ impl SkillLocation {
 /// three components of the longest length in each scope, the longest field name and the longest
 /// format phrase, for the shared form, which is the longest. The statement carries it with the
 /// publisher's and the other readings in the room an owner is shown whole.
-pub const MAX_SKILL_TARGET_STATEMENT_CHARS: usize = 3_422;
+pub const MAX_SKILL_TARGET_STATEMENT_CHARS: usize = 3_417;
 
 /// The skill target a connector table declares, or `None` for a table that declares none.
 ///

@@ -281,20 +281,26 @@ impl Anchor {
         Ok(missing)
     }
 
-    /// Makes the folder at `path` and the missing ones before it, each flushed.
-    pub(crate) fn make_folders(&self, folder: &Path) -> Result<()> {
+    /// Makes the folder at `path` and the missing ones before it, each flushed. True where this
+    /// call made `folder` itself, and false where it was there, which includes a folder that
+    /// another process made after this call looked and before it made it.
+    pub(crate) fn make_folders(&self, folder: &Path) -> Result<bool> {
         if self.is_root(folder) {
-            return Ok(());
+            return Ok(false);
         }
         let place = self.place(folder)?;
         let mut names = place.folders.clone();
         names.push(place.name);
         let mut held: Option<Dir> = None;
+        let mut made = false;
         for name in names {
             let from = held.as_ref().unwrap_or(&self.root);
             let mut child = from.child(name).map_err(storage)?;
+            made = false;
             if matches!(child, Child::Absent) {
-                from.make_child(name).map_err(storage)?;
+                #[cfg(test)]
+                make_pause::run(folder);
+                made = from.make_child(name).map_err(storage)?;
                 from.flush().map_err(storage)?;
                 child = from.child(name).map_err(storage)?;
             }
@@ -308,7 +314,7 @@ impl Anchor {
                 }
             }
         }
-        Ok(())
+        Ok(made)
     }
 
     /// Writes `bytes` to the file at `path`: under a temporary name beside it, flushed, and
@@ -435,6 +441,31 @@ pub(crate) mod publish_pause {
 
     pub(crate) fn run(path: &Path) {
         if let Some(then) = BEFORE_PUBLISH.with(|before| before.borrow_mut().take()) {
+            then(path);
+        }
+    }
+}
+
+/// Lets a test make the folder another process would make between a look and the making.
+#[cfg(test)]
+pub(crate) mod make_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE_MAKE: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a folder on this thread is about to be made.
+    #[cfg(unix)]
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE_MAKE.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(path: &Path) {
+        if let Some(then) = BEFORE_MAKE.with(|before| before.borrow_mut().take()) {
             then(path);
         }
     }

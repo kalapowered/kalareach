@@ -515,3 +515,27 @@ fn the_skill_target_reading_at_its_longest_is_its_maximum() {
     }
     assert_eq!(longest, MAX_SKILL_TARGET_STATEMENT_CHARS);
 }
+
+/// K9: the texts about a place say what is true of it: a first component that does not start with a
+/// dot is refused as one that does not, and the reading the owner confirms puts the configuration
+/// of the user scope "under that folder", as it does the project's.
+#[test]
+fn the_texts_about_a_place_say_what_is_true_of_it() {
+    let target = with(|target| target["user"]["skills"] = json!(["amp", "skills"]));
+    let found = findings(target, true);
+    assert!(
+        found
+            .iter()
+            .any(|detail| detail
+                .contains("the first component of the skills does not start with a dot")),
+        "{found:?}"
+    );
+    let reading = serde_json::from_value::<SkillTarget>(amp())
+        .expect("a target")
+        .statement();
+    assert!(
+        reading.contains("to .amp/settings.json under that folder, "),
+        "{reading}"
+    );
+    assert!(!reading.contains("under that home folder"), "{reading}");
+}
