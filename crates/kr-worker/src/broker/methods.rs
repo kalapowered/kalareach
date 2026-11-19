@@ -175,6 +175,9 @@ pub struct PendingTransmission {
     /// What an operation that was given up on claims the upstream's answer with, where the
     /// transport can say one came late.
     late: Option<crate::broker::duplex::LateHandle>,
+    /// What the operation ends as when its caller stops waiting for it, where the transport has
+    /// already queued it for a channel: a channel's end is the same whenever the caller stops.
+    channel_end: Option<String>,
 }
 
 enum Flight {
@@ -203,6 +206,7 @@ impl PendingTransmission {
         Self {
             flight: Flight::Settled(outcome),
             late: None,
+            channel_end: None,
         }
     }
 
@@ -214,6 +218,7 @@ impl PendingTransmission {
         Self {
             flight: Flight::Carried(Box::pin(work)),
             late: None,
+            channel_end: None,
         }
     }
 
@@ -222,6 +227,24 @@ impl PendingTransmission {
     pub fn with_late(mut self, late: crate::broker::duplex::LateHandle) -> Self {
         self.late = Some(late);
         self
+    }
+
+    /// Says that the operation is queued for a channel, which confirms nothing: whoever stops
+    /// waiting for it, it ends as [`BrokerError::ChannelEnd`] with `detail`, and not as a typed
+    /// upstream's answer that never came.
+    #[must_use]
+    pub fn with_channel_end(mut self, detail: String) -> Self {
+        self.channel_end = Some(detail);
+        self
+    }
+
+    /// Returns the channel end the operation has when its caller stops waiting for it, where the
+    /// transport queued it for a channel.
+    #[must_use]
+    pub fn channel_end(&self) -> Option<BrokerError> {
+        self.channel_end
+            .clone()
+            .map(|detail| BrokerError::ChannelEnd { detail })
     }
 
     /// Returns what an operation that is given up on claims the upstream's late answer with,

@@ -13503,10 +13503,16 @@ async fn answer_within(
             return Err(error);
         }
     };
+    // Read before the wait: a channel's answer that is still queued at the deadline is a channel's
+    // end, which the receipt records as one, and not an upstream that never answered.
+    let at_the_deadline = pending.channel_end();
     let flight = marked.submitted(pending);
     // At the deadline the answer in flight is dropped with the timeout, which settles it the
     // same way.
-    Ok(within(deadline, flight.settled(now)).await??)
+    match within(deadline, flight.settled(now)).await {
+        Ok(settled) => Ok(settled?),
+        Err(unanswered) => Err(at_the_deadline.map_or(unanswered, WorkerError::Broker)),
+    }
 }
 
 /// Makes the transport's own call that takes an operation on a thread of its own, and waits for

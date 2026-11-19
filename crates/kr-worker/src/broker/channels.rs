@@ -408,7 +408,9 @@ impl UpstreamDispatch for ChannelDispatch {
         // Every end past the queue is a channel end. A completed write is the host's own fact and
         // not the application's acknowledgement, which a channel never gives, so it ends unknown;
         // a failed write, or a channel that closed first, ends the same way, because the frame may
-        // have gone in part.
+        // have gone in part. The worker's own bound on the wait ends the same way: a queued answer
+        // the channel's writer has not reached by then is still a channel's, and the caller is not
+        // told it was a typed upstream that never answered.
         Ok(detached(async move {
             let refusal = match outcome.await {
                 Ok(Ok(())) => {
@@ -427,7 +429,8 @@ impl UpstreamDispatch for ChannelDispatch {
             Err(BrokerError::ChannelEnd {
                 detail: refusal.to_string(),
             })
-        }))
+        })
+        .with_channel_end(ANSWER_NOT_CONFIRMED.to_owned()))
     }
 }
 

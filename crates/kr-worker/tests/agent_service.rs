@@ -3582,8 +3582,14 @@ impl ServedChannel {
                 TimestampMs::new(1),
             )
             .expect("the package is bound");
+        // The package's own actions, and one the host carries out itself by redrawing the package's
+        // document, which takes no part in an answer: it is what a person presses beside one.
+        let refresh = refresh_declaration();
         broker
-            .register_actions(package_binding, &connector.manifest().actions)
+            .register_actions(
+                package_binding,
+                connector.manifest().actions.iter().chain([&refresh]),
+            )
             .expect("its actions are registered");
         let (ours, theirs) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(theirs);
@@ -3683,6 +3689,21 @@ impl Drop for ServedChannel {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.root);
     }
+}
+
+/// The package's action that redraws its own document, as a declaration reads: the host carries it
+/// out itself and nothing leaves it.
+fn refresh_declaration() -> kr_plugin_sdk::effect::ActionDeclaration {
+    serde_json::from_value(serde_json::json!({
+        "id": "status.refresh",
+        "label": "Refresh status",
+        "effect": "observe",
+        "implementation": { "type": "presentation" },
+        "parameters": { "parameters": [] },
+        "description": "Redraw the package's status",
+        "confirmation_required": false,
+    }))
+    .expect("a declaration the manifest format reads")
 }
 
 /// One `plugin.action.invoke` of the channel package's answer action.
@@ -5090,6 +5111,37 @@ fn channel_action(
     mutation
 }
 
+/// One `plugin.action.invoke` of the channel package's `status.refresh`, which names no request and
+/// takes no parameter.
+fn channel_refresh(
+    client: &LocalClient,
+    host: &Host,
+    connector: &kr_worker::broker::connectors::InstalledConnector,
+    request_id: u64,
+) -> MutationRequest {
+    let mut mutation = plugin_invocation(
+        host,
+        request_id,
+        client.action_window().action_window_id.clone(),
+        "status.refresh",
+        Nullable::null(),
+        b"{}",
+    );
+    mutation.params = ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+        target: AgentMutationTarget {
+            subject: subject(host.session_id, instance()),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        plugin_id: connector.plugin_id(),
+        action: kr_protocol::broker::ActionName::new("status.refresh").expect("valid"),
+        draft_id: Nullable::null(),
+        resource_id: Nullable::null(),
+        parameters: kr_protocol::scalars::Bytes::from(b"{}".to_vec()),
+    })
+    .expect("encodes");
+    mutation
+}
+
 /// What the broker holds of a pending resource.
 fn resource_state(
     host: &Host,
@@ -5208,6 +5260,81 @@ async fn kr_req_12_18_a_plugin_answer_to_a_second_request_is_admitted_after_the_
         error.code,
         ErrorCode::DraftConflict,
         "a channel end does not hold the next action of its subject"
+    );
+}
+
+/// KR-REQ-12.18: an answer the channel's writer has not written when the worker's own bound passes
+/// is still a channel's end. The receipt says unknown and records that nothing will say more, so
+/// the next answer on the channel and the package's refresh are admitted, as they are after an
+/// answer the writer wrote in time. The writer is held before its write, so the bound passes first
+/// and what decides is the pause, not a delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_end() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let first = channel.relay(&host, "abcde").await;
+    let second = channel.relay(&host, "fghij").await;
+    let mut client = cli(&host).await;
+    host.service
+        .set_upstream_deadline_for_tests(std::time::Duration::from_secs(1));
+    let (arrived, release) = host.service.broker().pause_before_channel_write();
+
+    let mutation = approval_mutation(&client, &host, 60, first);
+    let action_id = mutation.action_id;
+    let Outcome::Error(error) = send(&mut client, mutation).await else {
+        panic!("an answer nobody wrote in time ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    tokio::time::timeout(LIVENESS_DEADLINE, arrived)
+        .await
+        .expect("the writer reached the answer")
+        .expect("the pause is armed");
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+    let _ = release.send(());
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "abcde", "behavior": "allow" }
+        }),
+        "the answer the worker stopped waiting for is written all the same"
+    );
+
+    let next = approval_mutation(&client, &host, 61, second);
+    let next_id = next.action_id;
+    let Outcome::Error(error) = send(&mut client, next).await else {
+        panic!("the next answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::OutcomeUnknown,
+        "the answer that passed the bound does not hold the next one: {error:?}"
+    );
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "fghij", "behavior": "allow" }
+        })
+    );
+    assert_eq!(
+        receipt(&mut client, next_id).await.state,
+        ReceiptState::Unknown
+    );
+
+    let refresh = channel_refresh(&client, &host, &channel.connector, 62);
+    let refresh_id = refresh.action_id;
+    let outcome = send(&mut client, refresh).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the package's refresh is admitted after a channel end: {outcome:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, refresh_id).await.state,
+        ReceiptState::Applied
     );
 }
 
