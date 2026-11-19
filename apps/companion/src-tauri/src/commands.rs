@@ -124,6 +124,9 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("agent_approval_respond", Some(Method::AgentApprovalRespond)),
     ("plugin_action_invoke", Some(Method::PluginActionInvoke)),
     ("session_agents", None),
+    // The release of an action the host's own word ended for good: native code lets the session's
+    // link stop counting it, and sends nothing. The page names a session and an action.
+    ("agent_action_settle", None),
     // Attention and review.
     ("attention_read", Some(Method::AttentionRead)),
     ("attention_acknowledge", Some(Method::AttentionAcknowledge)),
@@ -296,6 +299,7 @@ pub const SESSION_BOUND_COMMANDS: &[&str] = &[
     "agent_turn_cancel",
     "agent_approval_respond",
     "plugin_action_invoke",
+    "agent_action_settle",
     "question_read",
     "question_answer",
     "question_settle",
@@ -660,6 +664,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         agent_turn_cancel,
         agent_approval_respond,
         plugin_action_invoke,
+        agent_action_settle,
         session_agents,
         attention_read,
         attention_acknowledge,
@@ -848,6 +853,14 @@ pub struct Settled {
     pub value: Option<Value>,
     /// The action identifier, which exists from the moment the request is submitted.
     pub action_id: Option<String>,
+    /// Whether the answer to the request was lost: the connection ended after the request was
+    /// sent, so the worker may hold no receipt for it, or one that can still become a refusal.
+    ///
+    /// It is false for every answer the worker itself gave, an outcome it could not establish
+    /// included: then its journal holds the receipt, and what the receipt says is the host's own
+    /// word. The page treats an unknown outcome as final, for a transport that confirms nothing,
+    /// only on that word.
+    pub answer_lost: bool,
 }
 
 fn settled(answer: &kr_client::Settled) -> Result<Settled> {
@@ -856,11 +869,13 @@ fn settled(answer: &kr_client::Settled) -> Result<Settled> {
             action_id: Some(receipt.action_id.to_string()),
             receipt: Some((**receipt).clone()),
             value: None,
+            answer_lost: false,
         },
         kr_client::Settled::Result(value) => Settled {
             receipt: None,
             value: Some(encode(value)?),
             action_id: None,
+            answer_lost: false,
         },
     })
 }
@@ -875,16 +890,29 @@ fn submitted(
     match answer {
         Ok(value) => settled(&value),
         // The connection ended after the request was sent, or the host said it cannot establish
-        // whether it happened: either way the action exists, and is what the page asks about.
-        Err(
-            kr_client::ClientError::SubmissionUncertain { action_id }
-            | kr_client::ClientError::OutcomeUnknown { action_id, .. },
-        ) => Ok(Settled {
-            receipt: None,
-            value: None,
-            action_id: Some(action_id.to_string()),
-        }),
+        // whether it happened: either way the action exists, and is what the page asks about. Only
+        // the first is a lost answer; the second is the worker's own word.
+        Err(error @ kr_client::ClientError::SubmissionUncertain { .. }) => {
+            Ok(unestablished(&error))
+        }
+        Err(error @ kr_client::ClientError::OutcomeUnknown { .. }) => Ok(unestablished(&error)),
         Err(error) => Err(CommandError::from(error)),
+    }
+}
+
+/// What the page is told of an action whose outcome could not be established: its identity, and
+/// whether the answer to it was lost.
+fn unestablished(error: &kr_client::ClientError) -> Settled {
+    let (action_id, answer_lost) = match error {
+        kr_client::ClientError::SubmissionUncertain { action_id } => (action_id, true),
+        kr_client::ClientError::OutcomeUnknown { action_id, .. } => (action_id, false),
+        _ => unreachable!("only an unestablished outcome is told as one"),
+    };
+    Settled {
+        receipt: None,
+        value: None,
+        action_id: Some(action_id.to_string()),
+        answer_lost,
     }
 }
 
@@ -909,6 +937,7 @@ where
                 receipt: None,
                 value: Some(encode(&own)?),
                 action_id: None,
+                answer_lost: false,
             })
         }
         kr_client::Settled::Receipt(_) => settled(answer),
@@ -924,14 +953,10 @@ where
 {
     match answer {
         Ok(value) => settled_as::<R>(&value),
-        Err(
-            kr_client::ClientError::SubmissionUncertain { action_id }
-            | kr_client::ClientError::OutcomeUnknown { action_id, .. },
-        ) => Ok(Settled {
-            receipt: None,
-            value: None,
-            action_id: Some(action_id.to_string()),
-        }),
+        Err(error @ kr_client::ClientError::SubmissionUncertain { .. }) => {
+            Ok(unestablished(&error))
+        }
+        Err(error @ kr_client::ClientError::OutcomeUnknown { .. }) => Ok(unestablished(&error)),
         Err(error) => Err(CommandError::from(error)),
     }
 }
@@ -1525,6 +1550,42 @@ pub async fn action_read(
         _ => state.session()?.read_receipt(&typed).await?,
     };
     encode(&answer)
+}
+
+/// What the page names to release an action: the session whose link counts it, and the action.
+#[derive(Debug, serde::Deserialize)]
+pub struct ActionSettleParams {
+    /// The session whose link holds the action.
+    pub session_id: kr_protocol::ids::SessionId,
+    /// The action the page knows the host's own word ended for good.
+    pub action_id: kr_protocol::ids::ActionId,
+}
+
+/// Lets a session's link stop counting an action whose outcome is final.
+///
+/// An outcome the host could not establish stays on the link's book until a receipt says what
+/// became of it, and past the book's bound the link refuses every new mutation. A transport that
+/// confirms nothing and says nothing later leaves no receipt that ever will, so the page, which
+/// knows the host's own word ended the action, asks for the release. The worker's journal still
+/// holds the receipt as it was and still answers a repeat of the identifier with it; only this
+/// link's book lets go. The page passes the opening its call used, as every agent command does.
+#[tauri::command]
+pub async fn agent_action_settle(
+    state: State<'_, AppState>,
+    links: State<'_, crate::agent::WorkerLinks>,
+    params: Value,
+    opening: Option<String>,
+) -> Result<Value> {
+    let typed: ActionSettleParams = decode(params)?;
+    links
+        .settle_action(
+            &state,
+            typed.session_id,
+            opening.as_deref(),
+            typed.action_id,
+        )
+        .await?;
+    encode(&())
 }
 
 /// Reads one page of a session's retained output, from the cursor and within the byte bound the
@@ -4478,6 +4539,7 @@ mod tests {
             agent_turn_cancel,
             agent_approval_respond,
             plugin_action_invoke,
+            agent_action_settle,
             attention_read,
             attention_acknowledge,
             review_read,
