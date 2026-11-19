@@ -306,6 +306,11 @@ pub struct OwedView {
     /// Kept with the entry from one launch to the next, and never sent to the page.
     #[serde(skip)]
     pub host: Option<(DeviceId, EnvironmentId)>,
+    /// The identity the host gave this device in the pairing the entry was made under. A host that
+    /// is paired again gives the device another, so an entry of the pairing before is told from
+    /// one of the pairing now. Kept with the entry, and never sent to the page.
+    #[serde(skip)]
+    pub pairing: Option<DeviceId>,
 }
 
 /// What a person is told of a start whose answer never came.
@@ -457,6 +462,7 @@ impl OwedView {
                 .clone()
                 .unwrap_or_else(|| UNNAMED_HOST.to_owned()),
             host: Some((host.paired.host_device_id, host.environment_id)),
+            pairing: Some(host.paired.device_id),
         }
     }
 }
@@ -557,6 +563,7 @@ mod tests {
             host_reference: "a-host".to_owned(),
             host_name: "A host".to_owned(),
             host: None,
+            pairing: None,
         }
     }
 
@@ -573,6 +580,7 @@ mod tests {
             action_id: Some(action.to_owned()),
             until_ms: NO_LAPSE_MS,
             host: Some(host),
+            pairing: Some(host.0),
             ..owed(NO_LAPSE_MS)
         }
     }

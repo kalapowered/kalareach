@@ -49,6 +49,9 @@ struct Entry {
     host_name: String,
     host_device_id: Option<DeviceId>,
     environment_id: Option<EnvironmentId>,
+    /// The identity the host gave this device in the pairing the entry was made under.
+    #[serde(default)]
+    pairing_device_id: Option<DeviceId>,
 }
 
 /// The file as a whole.
@@ -150,6 +153,7 @@ impl Kept {
                     host_reference: entry.host_reference,
                     host_name: entry.host_name,
                     host: entry.host_device_id.zip(entry.environment_id),
+                    pairing: entry.pairing_device_id,
                 })
                 .collect(),
             note: document.note,
@@ -188,6 +192,7 @@ impl Kept {
                     host_name: owed.host_name.clone(),
                     host_device_id: owed.host.map(|(host, _)| host),
                     environment_id: owed.host.map(|(_, environment)| environment),
+                    pairing_device_id: owed.pairing,
                 })
                 .collect(),
             note: kept.note.clone(),
