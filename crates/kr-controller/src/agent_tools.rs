@@ -39,6 +39,7 @@ use crate::catalogue::files::{
     sync_directory, write_atomically,
 };
 use crate::catalogue::native_bridge::json;
+mod anchor;
 pub(crate) mod declared;
 use crate::error::{ControllerError, Result};
 use crate::given::Recorded;
@@ -65,6 +66,13 @@ pub const ENTRY_ARGS: &[&str] = &["agent-tools", "--stdio"];
 /// writes the deadline into the agent's configuration, so it writes the same number into the
 /// environment the agent launches the server with.
 pub const DEADLINE_VARIABLE: &str = "KR_TOOL_DEADLINE_MS";
+
+/// The refusal of a place inside a folder of this host's own.
+const HOST_FOLDER: &str = "{place} is inside a folder this host keeps for its own files, so an installation does not \
+     write there";
+
+/// The refusal of a selected root that is not a folder where a write needs one.
+const NOT_A_FOLDER_TO_WRITE: &str = "{path} is not a folder an installation can write into";
 
 /// The refusal of a moved place. Its words are approved: the record, then the package.
 const MOVED_PLACE: &str = "the record of {word} at {scope} scope names {recorded place}, and the \
@@ -153,6 +161,113 @@ impl Format {
     }
 }
 
+/// How an installation reaches the places a layout names.
+///
+/// The six compiled words go by path, as they always did. A word a package declares is reached
+/// from one handle on the selected root, one component at a time and never through a link, so a
+/// place that was swapped for a link after the check is refused rather than followed. A path
+/// outside the selected root is refused by the walk.
+#[derive(Clone, Debug)]
+enum Fs {
+    /// By path.
+    Paths,
+    /// From one handle on the selected root.
+    Walk(std::sync::Arc<anchor::Anchor>),
+}
+
+impl Fs {
+    fn read_digest(&self, path: &Path) -> Result<Option<Digest256>> {
+        match self {
+            Self::Paths => read_digest(path),
+            Self::Walk(walk) => walk.digest(path),
+        }
+    }
+
+    fn read_text(&self, path: &Path) -> Result<Option<String>> {
+        match self {
+            Self::Paths => read_to_string(path),
+            Self::Walk(walk) => walk.read_text(path),
+        }
+    }
+
+    fn write(&self, path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
+        match self {
+            Self::Paths => write_atomically(path, bytes, default_mode),
+            Self::Walk(walk) => walk.write(path, bytes, default_mode),
+        }
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Paths => {
+                std::fs::remove_file(path).map_err(storage)?;
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent, NameKind::File)?;
+                }
+                Ok(())
+            }
+            Self::Walk(walk) => walk.remove_file(path),
+        }
+    }
+
+    /// Removes the folder at `path` when it is empty; false for one that could not be removed.
+    fn remove_directory(&self, path: &Path) -> Result<bool> {
+        match self {
+            Self::Paths => match std::fs::remove_dir(path) {
+                Ok(()) => {
+                    if let Some(parent) = path.parent() {
+                        sync_directory(parent, NameKind::Directory)?;
+                    }
+                    Ok(true)
+                }
+                Err(_) => Ok(false),
+            },
+            Self::Walk(walk) => Ok(walk.remove_directory(path).is_ok()),
+        }
+    }
+
+    fn is_directory(&self, path: &Path) -> Result<bool> {
+        match self {
+            Self::Paths => Ok(path.is_dir()),
+            Self::Walk(walk) => walk.is_directory(path),
+        }
+    }
+
+    fn exists(&self, path: &Path) -> Result<bool> {
+        match self {
+            Self::Paths => Ok(path.exists()),
+            Self::Walk(walk) => walk.exists(path),
+        }
+    }
+
+    fn missing_ancestors(&self, path: &Path) -> Result<Vec<PathBuf>> {
+        match self {
+            Self::Paths => Ok(missing_ancestors(path)),
+            Self::Walk(walk) => walk.missing_folders(path),
+        }
+    }
+
+    /// Makes the folder at `path`; true when it was made, false when it was already there.
+    fn make_directory(&self, path: &Path) -> Result<bool> {
+        match self {
+            Self::Paths => create_directory_durably(path),
+            Self::Walk(walk) => {
+                let there = walk.is_directory(path)?;
+                walk.make_folders(path)?;
+                Ok(!there)
+            }
+        }
+    }
+
+    /// Makes the folder at `path` and the ones missing before it.
+    fn make_folders(&self, path: &Path) -> Result<()> {
+        match self {
+            Self::Paths => std::fs::create_dir_all(path).map_err(storage),
+            Self::Walk(walk) => walk.make_folders(path),
+        }
+    }
+}
+
 /// Installs, inspects and removes the contact skill for one agent.
 #[derive(Clone, Debug)]
 pub struct Installer {
@@ -168,6 +283,8 @@ pub struct Installer {
     /// The words an admitted package declares or a record of this host holds, for the sentence that
     /// lists what the host knows.
     known: Vec<String>,
+    /// How this installer reaches the places a layout names: by path, or from one handle.
+    fs: Fs,
 }
 
 impl Installer {
@@ -180,6 +297,7 @@ impl Installer {
             executable,
             declared: None,
             known: Vec::new(),
+            fs: Fs::Paths,
         }
     }
 
@@ -221,6 +339,44 @@ impl Installer {
         Ok(self.recorded(params)?.is_some())
     }
 
+    /// This installer with its places reached the way the request's word needs: by path for one of
+    /// the six compiled words, and from one handle on the selected root for a declared one. A root
+    /// that is not there is no handle for a read, which then finds every place gone, and a refusal
+    /// for a write.
+    fn on_handle(&self, params: &AgentToolsParams, writing: bool) -> Result<Self> {
+        use kr_protocol::skill::InstallScope;
+
+        if params.agent.compiled().is_some() {
+            return Ok(self.clone());
+        }
+        if let Some(refusal) = declared::platform_refusal(cfg!(windows)) {
+            return Err(ControllerError::InvalidArgument(refusal.to_owned()));
+        }
+        let root = match params.scope {
+            InstallScope::User => self.home.clone(),
+            InstallScope::Project => params
+                .project_dir
+                .as_ref()
+                .map(|directory| PathBuf::from(directory.as_str()))
+                .ok_or_else(|| {
+                    ControllerError::InvalidArgument(
+                        "a project-scope installation needs the project directory".to_owned(),
+                    )
+                })?,
+        };
+        let mut walking = self.clone();
+        walking.fs = match anchor::Anchor::open(&root)? {
+            Some(anchor) => Fs::Walk(std::sync::Arc::new(anchor)),
+            None if writing => {
+                return Err(ControllerError::InvalidArgument(
+                    NOT_A_FOLDER_TO_WRITE.replace("{path}", &display(&root)),
+                ));
+            }
+            None => Fs::Paths,
+        };
+        Ok(walking)
+    }
+
     /// Builds an installer from this process's own surroundings.
     ///
     /// # Errors
@@ -249,8 +405,12 @@ impl Installer {
     /// was not given, and [`ControllerError::PermissionDenied`] when a server entry under this
     /// name exists and was not written by this host.
     pub fn install(&self, params: &AgentToolsParams) -> Result<AgentToolsInstallResult> {
+        self.on_handle(params, true)?.install_on(params)
+    }
+
+    fn install_on(&self, params: &AgentToolsParams) -> Result<AgentToolsInstallResult> {
         let layout = self.layout(params)?;
-        self.check(params)?;
+        self.check_on(params)?;
         // A record an earlier build named differently is carried onto the name this one gives it,
         // here rather than in a read, so it happens once and under this mutation's own lock.
         self.migrate_records(params)?;
@@ -302,7 +462,7 @@ impl Installer {
         // Each change is noted before it happens and recorded after it. A crash between the two
         // leaves the note, which says the change may or may not have happened: a removal reports
         // it rather than undoing something this host may never have written.
-        for directory in missing_ancestors(&root) {
+        for directory in self.fs.missing_ancestors(&root)? {
             let operation = ChangeOperation::CreateDirectory {
                 path: display(&directory),
             };
@@ -314,11 +474,11 @@ impl Installer {
             let operation = ChangeOperation::WriteFile {
                 path: display(&path),
                 digest: digest_of(contents.as_bytes()),
-                replaced_digest: Nullable(read_digest(&path)?),
+                replaced_digest: Nullable(self.fs.read_digest(&path)?),
             };
             self.confirm_existing(params, &mut record, &operation)?;
             self.begin(params, &mut record, operation.clone())?;
-            write_atomically(&path, contents.as_bytes(), READABLE)?;
+            self.fs.write(&path, contents.as_bytes(), READABLE)?;
             self.finish(params, &mut record, operation)?;
         }
         // A note about a directory this run did not create resolves to nothing: the directory is
@@ -333,7 +493,7 @@ impl Installer {
             // The directory the document lives in is part of the installation when this host has
             // to create it, so it is recorded like any other change.
             if let Some(parent) = configuration.path.parent() {
-                for directory in missing_ancestors(parent) {
+                for directory in self.fs.missing_ancestors(parent)? {
                     let operation = ChangeOperation::CreateDirectory {
                         path: display(&directory),
                     };
@@ -348,7 +508,7 @@ impl Installer {
                 // Whether this host created the document is a fact about the first installation
                 // that wrote it, not about this one. A repair keeps what was recorded.
                 created_document: self.created_document(&record, &configuration.path)
-                    || !configuration.path.exists(),
+                    || !self.fs.exists(&configuration.path)?,
             };
             self.confirm_existing(params, &mut record, &planned)?;
             self.begin(params, &mut record, planned)?;
@@ -395,7 +555,7 @@ impl Installer {
         directory: &Path,
         operation: ChangeOperation,
     ) -> Result<()> {
-        if create_directory_durably(directory)? {
+        if self.fs.make_directory(directory)? {
             self.finish(params, record, operation)
         } else {
             record
@@ -429,7 +589,7 @@ impl Installer {
         };
         let holds = match &noted {
             ChangeOperation::WriteFile { path, digest, .. } => {
-                read_digest(Path::new(path))? == Some(*digest)
+                self.fs.read_digest(Path::new(path))? == Some(*digest)
             }
             ChangeOperation::AddConfigurationEntry {
                 path,
@@ -609,12 +769,65 @@ impl Installer {
         ))
     }
 
+    /// Refuses the places a package declared that this host must not write: a place inside the
+    /// host's own folders, and, from the handle, a link or a file at any component below the
+    /// selected root and a folder where a file is to be written. Every place is checked before the
+    /// first write.
+    fn check_declared_places(&self, params: &AgentToolsParams, layout: &Layout) -> Result<()> {
+        if params.agent.compiled().is_some() {
+            return Ok(());
+        }
+        let documents: Vec<&Path> = layout
+            .configuration
+            .iter()
+            .map(|document| document.path.as_path())
+            .collect();
+        let files: Vec<PathBuf> = files()
+            .iter()
+            .map(|(name, _)| layout.skills.join(name))
+            .collect();
+        for place in std::iter::once(layout.skills.as_path())
+            .chain(files.iter().map(PathBuf::as_path))
+            .chain(documents.iter().copied())
+        {
+            if declared::inside_host_folders(&self.home, &self.records, place) {
+                return Err(ControllerError::PermissionDenied {
+                    detail: HOST_FOLDER.replace("{place}", &display(place)),
+                });
+            }
+        }
+        let Fs::Walk(walk) = &self.fs else {
+            return Ok(());
+        };
+        walk.missing_folders(&layout.skills)?;
+        walk.refuse_links(&layout.skills, anchor::Expect::Folder)?;
+        for place in files
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(documents.iter().copied())
+        {
+            walk.refuse_links(place, anchor::Expect::File)?;
+        }
+        if let Some(parent) = layout
+            .configuration
+            .as_ref()
+            .and_then(|document| document.path.parent())
+        {
+            walk.missing_folders(parent)?;
+        }
+        Ok(())
+    }
+
     /// Reports what is installed, and what no longer matches what was written.
     ///
     /// # Errors
     ///
     /// Returns an error when the record cannot be read.
     pub fn status(&self, params: &AgentToolsParams) -> Result<AgentToolsStatusResult> {
+        self.on_handle(params, false)?.status_on(params)
+    }
+
+    fn status_on(&self, params: &AgentToolsParams) -> Result<AgentToolsStatusResult> {
         let Some(record) = self.recorded(params)? else {
             let layout = self.layout(params)?;
             return Ok(AgentToolsStatusResult {
@@ -635,7 +848,7 @@ impl Installer {
                 files.push(InstalledFile {
                     path: path.clone(),
                     expected_digest: *digest,
-                    actual_digest: Nullable(read_digest(Path::new(path))?),
+                    actual_digest: Nullable(self.fs.read_digest(Path::new(path))?),
                 });
             }
         }
@@ -676,6 +889,10 @@ impl Installer {
     ///
     /// Returns an error when the record cannot be read or a file cannot be removed.
     pub fn remove(&self, params: &AgentToolsParams) -> Result<AgentToolsRemoveResult> {
+        self.on_handle(params, false)?.remove_on(params)
+    }
+
+    fn remove_on(&self, params: &AgentToolsParams) -> Result<AgentToolsRemoveResult> {
         // The record is read, and read as valid, before anything is moved: a record this build
         // does not understand must not change its name on the way to being refused.
         let read = self.removable(params)?;
@@ -711,7 +928,7 @@ impl Installer {
         for operation in removal_order(&record.manifest.operations) {
             match operation {
                 ChangeOperation::WriteFile { path, digest, .. } => {
-                    let present = read_digest(Path::new(path))?;
+                    let present = self.fs.read_digest(Path::new(path))?;
                     match present {
                         None => retained.push(format!("{path} is already gone")),
                         // Somebody edited it after this host wrote it. That edit is theirs, and a
@@ -720,10 +937,7 @@ impl Installer {
                             retained.push(format!("{path} has changed since it was installed"));
                         }
                         Some(_) => {
-                            std::fs::remove_file(path).map_err(storage)?;
-                            if let Some(parent) = Path::new(path).parent() {
-                                sync_directory(parent, NameKind::File)?;
-                            }
+                            self.fs.remove_file(Path::new(path))?;
                             removed.push(operation.clone());
                         }
                     }
@@ -750,14 +964,10 @@ impl Installer {
                 ChangeOperation::CreateDirectory { path } => {
                     // Only when it is empty. A directory that holds anything else holds somebody
                     // else's file.
-                    match std::fs::remove_dir(path) {
-                        Ok(()) => {
-                            if let Some(parent) = Path::new(path).parent() {
-                                sync_directory(parent, NameKind::Directory)?;
-                            }
-                            removed.push(operation.clone());
-                        }
-                        Err(_) => retained.push(format!("{path} is not empty")),
+                    if self.fs.remove_directory(Path::new(path))? {
+                        removed.push(operation.clone());
+                    } else {
+                        retained.push(format!("{path} is not empty"));
                     }
                 }
             }
@@ -781,7 +991,7 @@ impl Installer {
         for operation in &manifest.operations {
             match operation {
                 ChangeOperation::WriteFile { path, digest, .. } => {
-                    match read_digest(Path::new(path))? {
+                    match self.fs.read_digest(Path::new(path))? {
                         None => drift.push(format!("{path} is missing")),
                         Some(found) if found != *digest => {
                             drift.push(format!("{path} has changed since it was installed"));
@@ -802,7 +1012,7 @@ impl Installer {
                     Some(_) => {}
                 },
                 ChangeOperation::CreateDirectory { path } => {
-                    if !Path::new(path).is_dir() {
+                    if !self.fs.is_directory(Path::new(path))? {
                         drift.push(format!("{path} is missing"));
                     }
                 }
@@ -826,11 +1036,11 @@ impl Installer {
 
     /// Adds the server entry to an agent's configuration, leaving its other settings alone.
     fn write_entry(&self, configuration: &Configuration) -> Result<ChangeOperation> {
-        let created_document = !configuration.path.exists();
+        let created_document = !self.fs.exists(&configuration.path)?;
         if let Some(parent) = configuration.path.parent()
-            && !parent.exists()
+            && !self.fs.exists(parent)?
         {
-            std::fs::create_dir_all(parent).map_err(storage)?;
+            self.fs.make_folders(parent)?;
         }
         // A shared document gets the same entry whichever agent's installation writes it, so it
         // holds no deadline: the configuration of one carries none.
@@ -848,7 +1058,7 @@ impl Installer {
     }
 
     fn write_toml_entry(&self, path: &Path, deadline: Option<&Deadline>) -> Result<Digest256> {
-        let text = read_to_string(path)?.unwrap_or_default();
+        let text = self.fs.read_text(path)?.unwrap_or_default();
         let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
             ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
         })?;
@@ -882,7 +1092,8 @@ impl Installer {
             entry["env"] = toml_edit::value(environment);
         }
         table.insert(SERVER_NAME, toml_edit::Item::Table(entry));
-        write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
+        self.fs
+            .write(path, document.to_string().as_bytes(), PRIVATE)?;
         self.entry_digest_under(path, Format::CodexToml.key())?
             .ok_or_else(|| {
                 ControllerError::InvalidArgument(format!(
@@ -907,7 +1118,7 @@ impl Installer {
         let members = [key, SERVER_NAME];
         let value = self.entry_value(format, deadline);
         let entry = value.to_string();
-        let edited = match read_exact(path)? {
+        let edited = match read_exact(&self.fs, path)? {
             // A document this host creates holds the entry and the container on the way to it.
             None => {
                 let text = serde_json::to_string_pretty(&json!({ key: { SERVER_NAME: value } }))
@@ -937,7 +1148,7 @@ impl Installer {
             }
         };
         if let Some(edited) = edited {
-            write_atomically(path, edited.as_bytes(), PRIVATE)?;
+            self.fs.write(path, edited.as_bytes(), PRIVATE)?;
         }
         self.entry_digest_under(path, key)?.ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
@@ -990,6 +1201,10 @@ impl Installer {
     /// there and this host did not write it, and [`ControllerError::InvalidArgument`] when the
     /// scope needs a project directory that was not given.
     pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
+        self.on_handle(params, false)?.check_on(params)
+    }
+
+    fn check_on(&self, params: &AgentToolsParams) -> Result<()> {
         let layout = self.layout(params)?;
         let recorded = self.recorded(params)?;
         self.check_before_writing(params, &layout, recorded.as_ref())
@@ -1003,10 +1218,11 @@ impl Installer {
         layout: &Layout,
         recorded: Option<&InstallationRecord>,
     ) -> Result<()> {
+        self.check_declared_places(params, layout)?;
         let root = layout.skills.as_path();
         for (name, _) in files() {
             let path = root.join(name);
-            let Some(present) = read_digest(&path)? else {
+            let Some(present) = self.fs.read_digest(&path)? else {
                 continue;
             };
             // A file this host wrote, or one it was in the middle of writing when an installation
@@ -1080,7 +1296,7 @@ impl Installer {
 
     /// Refuses a configuration document this installation could not finish writing.
     fn check_container(&self, configuration: &Configuration) -> Result<()> {
-        let Some(text) = read_to_string(&configuration.path)? else {
+        let Some(text) = self.fs.read_text(&configuration.path)? else {
             return Ok(());
         };
         let path = &configuration.path;
@@ -1223,7 +1439,7 @@ impl Installer {
     /// document that happens to hold two server containers must not have one of them answer for
     /// the other.
     fn entry_digest_under(&self, path: &Path, key: &str) -> Result<Option<Digest256>> {
-        let Some(text) = read_to_string(path)? else {
+        let Some(text) = self.fs.read_text(path)? else {
             return Ok(None);
         };
         // The format is the one the recorded key names, whatever the document's file name says: a
@@ -1281,7 +1497,7 @@ impl Installer {
             )));
         }
         if key == Format::CodexToml.key() {
-            let text = read_to_string(path)?.unwrap_or_default();
+            let text = self.fs.read_text(path)?.unwrap_or_default();
             let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
                 ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
             })?;
@@ -1296,9 +1512,10 @@ impl Installer {
             // nobody's business but the author's, and an empty-looking table is not evidence the
             // file holds nothing of theirs. The JSON branch below can delete one because it reads
             // the document exactly and can see that it holds nothing at all.
-            write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
+            self.fs
+                .write(path, document.to_string().as_bytes(), PRIVATE)?;
         } else {
-            let text = read_to_string(path)?.unwrap_or_default();
+            let text = self.fs.read_text(path)?.unwrap_or_default();
             // Only the entry the record names, the one member it spliced in. In a document this
             // host created, whose container it made too, the container goes with the entry when
             // nothing else is left in it; in anybody else's the container stays, as the TOML table
@@ -1315,13 +1532,10 @@ impl Installer {
             let empty = json::Document::read(&edited).is_ok_and(|document| document.is_empty());
             if created_document && empty {
                 // This host created the document and nothing else was ever added to it.
-                std::fs::remove_file(path).map_err(storage)?;
-                if let Some(parent) = path.parent() {
-                    sync_directory(parent, NameKind::File)?;
-                }
+                self.fs.remove_file(path)?;
                 return Ok(Removal::Removed);
             }
-            write_atomically(path, edited.as_bytes(), PRIVATE)?;
+            self.fs.write(path, edited.as_bytes(), PRIVATE)?;
         }
         Ok(Removal::Removed)
     }
@@ -1914,23 +2128,27 @@ impl Installer {
         params: &AgentToolsParams,
         removal: bool,
     ) -> std::result::Result<(), Declined> {
-        let recorded = self
+        let this = self
+            .on_handle(params, !removal)
+            .map_err(Declined::ByTheRequest)?;
+        let this = &this;
+        let recorded = this
             .recorded(params)
             .map_err(|error| Declined::ByARecord(Recorded::read(error)))?;
         if removal {
             // A record decides alone: a package that is gone, disabled or no longer declares the
             // word blocks nothing.
             if recorded.is_none() {
-                self.layout(params).map_err(Declined::ByTheRequest)?;
+                this.layout(params).map_err(Declined::ByTheRequest)?;
             }
-            return self
+            return this
                 .removable_from(recorded)
                 .map(|_| ())
                 .map_err(Declined::ByTheRequest);
         }
-        let layout = self.layout(params).map_err(Declined::ByTheRequest)?;
-        self.moved_place(params, &layout, recorded.as_ref())
-            .and_then(|()| self.check_before_writing(params, &layout, recorded.as_ref()))
+        let layout = this.layout(params).map_err(Declined::ByTheRequest)?;
+        this.moved_place(params, &layout, recorded.as_ref())
+            .and_then(|()| this.check_before_writing(params, &layout, recorded.as_ref()))
             .map_err(Declined::ByTheRequest)
     }
 
@@ -2351,8 +2569,8 @@ fn read_to_string(path: &Path) -> Result<Option<String>> {
 /// A document this reader cannot read exactly is refused, naming it and why: one that names a
 /// member twice in any object among them, because which of the two a reader keeps is the reader's
 /// choice.
-fn read_exact(path: &Path) -> Result<Option<(String, json::Document)>> {
-    let Some(text) = read_to_string(path)? else {
+fn read_exact(fs: &Fs, path: &Path) -> Result<Option<(String, json::Document)>> {
+    let Some(text) = fs.read_text(path)? else {
         return Ok(None);
     };
     let document = json::Document::read(&text).map_err(|reason| not_exact(path, &reason))?;
@@ -3555,6 +3773,7 @@ mod tests {
     }
 
     /// A skill target as a package declares it, for the cases of a declared word.
+    #[cfg(unix)]
     fn declared(
         configuration: Option<Value>,
         skills: &[&str],
@@ -3566,6 +3785,7 @@ mod tests {
         serde_json::from_value(json!({ "word": "amp", "user": user })).expect("a target")
     }
 
+    #[cfg(unix)]
     fn amp() -> AgentTarget {
         AgentTarget::parse("amp").expect("a word")
     }
@@ -3573,6 +3793,7 @@ mod tests {
     /// KR-REQ-11.01: an installation for a declared word writes the core's three files with the
     /// digests this binary carries and one entry whose command and arguments are the host's, in each
     /// of the three formats, whatever the package says.
+    #[cfg(unix)]
     #[test]
     fn an_installation_for_a_declared_word_writes_the_cores_files_and_one_entry() {
         for (format, document, found) in [
@@ -3632,6 +3853,7 @@ mod tests {
     /// KR-REQ-11.01: a declared deadline writes the field and the environment value, in either
     /// unit, and a configuration with none, a shared document and the command-list form write
     /// neither.
+    #[cfg(unix)]
     #[test]
     fn a_declared_deadline_writes_the_field_and_the_environment_value_and_none_without_one() {
         let installed = |configuration: Value| -> String {
@@ -3678,6 +3900,7 @@ mod tests {
     /// KR-REQ-11.01: status and a removal read the record, so a package that is gone or no longer
     /// declares the word blocks neither; an installation for a place the package no longer declares
     /// is refused by name, and the removal by the record still works.
+    #[cfg(unix)]
     #[test]
     fn a_record_for_another_place_is_refused_by_name_and_removed_by_its_record() {
         let tree = Tree::create();
@@ -3747,7 +3970,13 @@ mod tests {
         );
         let compiled = [declaration("codex")];
         assert!(matches!(pick("codex", &compiled), Pick::Compiled));
+    }
 
+    /// KR-REQ-11.01: a word no package declares is refused with the words the host knows, which
+    /// include a word a record holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_word_no_package_declares_is_refused_with_the_words_the_host_knows() {
         let tree = Tree::create();
         let refused = tree
             .installer()
@@ -3767,6 +3996,7 @@ mod tests {
     /// KR-REQ-11.01: an entry that another record of this host claims with other contents is not
     /// replaced, though the package that declared the other record's word is gone; nothing is
     /// written, and the document keeps the first installation's entry.
+    #[cfg(unix)]
     #[test]
     fn an_entry_another_record_claims_differently_is_not_replaced_when_its_package_is_gone() {
         let tree = Tree::create();
@@ -3823,6 +4053,7 @@ mod tests {
 
     /// KR-REQ-11.01: the entry is read back and removed by the key the record names, whatever the
     /// document's file name says, in each of the three formats.
+    #[cfg(unix)]
     #[test]
     fn an_entry_is_read_back_by_its_recorded_key_whatever_the_file_name() {
         for (format, name) in [
@@ -3868,6 +4099,7 @@ mod tests {
 
     /// KR-REQ-11.01: a package that now declares another entry key or another entry for the same
     /// place moves the place, so the installation is refused by name and nothing is written.
+    #[cfg(unix)]
     #[test]
     fn a_moved_entry_key_or_digest_is_a_moved_place() {
         let tree = Tree::create();
@@ -3912,6 +4144,291 @@ mod tests {
         assert_eq!(
             std::fs::read(tree.home().join(".amp/mcp.json")).expect("the document"),
             before
+        );
+    }
+
+    #[cfg(unix)]
+    fn project_params(word: AgentTarget, project: &Path) -> AgentToolsParams {
+        AgentToolsParams {
+            agent: word,
+            scope: InstallScope::Project,
+            project_dir: Nullable::some(project.display().to_string()),
+        }
+    }
+
+    /// KR-REQ-11.01: the host refuses a declared word on Windows by name, in a pure function that
+    /// takes the platform as a value.
+    #[test]
+    fn a_declared_word_is_refused_on_windows_by_name_and_not_elsewhere() {
+        assert!(declared::platform_refusal(false).is_none());
+        let refusal = declared::platform_refusal(true).expect("a refusal");
+        assert_eq!(
+            refusal,
+            "this host installs the contact skill for an agent that a package names on macOS and \
+             Linux only; on Windows it installs it for codex, claude-code, opencode, gemini-cli, \
+             kimi-code-cli and qoder-cli"
+        );
+    }
+
+    /// KR-REQ-11.01: a place inside each of the four folders the host keeps for itself is refused
+    /// by name, whatever the case of its letters, and nothing is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_place_inside_each_of_the_hosts_own_folders_is_refused() {
+        let home = Path::new("/home/someone");
+        let records = Path::new("/home/someone/.local/state/kalareach/agent-tools");
+        for inside in [
+            "/home/someone/.local/state/kalareach/x",
+            "/home/someone/.cache/kalareach/run",
+            "/home/someone/.local/share/kalareach/host/x",
+            "/home/someone/.config/kalareach/x",
+            "/home/someone/.Config/KalaReach/x",
+        ] {
+            assert!(
+                declared::inside_host_folders(home, records, Path::new(inside)),
+                "{inside}"
+            );
+        }
+        for outside in ["/home/someone/.config/other/x", "/home/someone/.amp/skills"] {
+            assert!(
+                !declared::inside_host_folders(home, records, Path::new(outside)),
+                "{outside}"
+            );
+        }
+        for folder in [
+            [".local", "state", "kalareach"].as_slice(),
+            [".cache", "kalareach", "run"].as_slice(),
+            [".local", "share", "kalareach", "host"].as_slice(),
+            [".config", "KalaReach"].as_slice(),
+        ] {
+            let tree = Tree::create();
+            let refused = tree
+                .installer()
+                .with_declaration(Some(declared(None, folder)), Vec::new())
+                .install(&params(amp(), InstallScope::User))
+                .expect_err("a host folder");
+            let ControllerError::PermissionDenied { detail } = refused else {
+                panic!("a refusal by name: {refused}");
+            };
+            assert!(
+                detail.contains("is inside a folder this host keeps for its own files, so an installation does not write there"),
+                "{folder:?}: {detail}"
+            );
+            assert!(
+                !tree.home().join(folder[0]).exists(),
+                "{folder:?}: nothing is written"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: a link at any component of a declared place is refused before the first
+    /// write, at either scope and at the last name, and nothing is written where the link leads.
+    #[test]
+    fn a_declared_place_with_a_link_at_any_component_is_refused_before_the_first_write() {
+        use std::os::unix::fs::symlink;
+        let document = || json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false });
+        // The link is at the first component, at the skills folder's own name, and at the document.
+        for (link_at, scope) in [
+            (".amp", InstallScope::User),
+            (".amp/skills", InstallScope::User),
+            (".amp/mcp.json", InstallScope::User),
+            (".amp", InstallScope::Project),
+        ] {
+            let tree = Tree::create();
+            let elsewhere = tree.root.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).expect("a folder");
+            let project = tree.root.join("project");
+            std::fs::create_dir_all(&project).expect("a project");
+            let base = if scope == InstallScope::User {
+                tree.home()
+            } else {
+                project.clone()
+            };
+            let link = base.join(link_at);
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent).expect("a parent");
+            }
+            symlink(&elsewhere, &link).expect("a link");
+            let target = declared(Some(document()), &[".amp", "skills"]);
+            let installer = tree.installer().with_declaration(Some(target), Vec::new());
+            let request = if scope == InstallScope::User {
+                params(amp(), scope)
+            } else {
+                project_params(amp(), &project)
+            };
+            let refused = installer.install(&request).expect_err("a link is refused");
+            assert!(
+                matches!(refused, ControllerError::PermissionDenied { .. }),
+                "{link_at}: {refused}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&elsewhere).expect("the folder").count(),
+                0,
+                "{link_at}: nothing is written where the link leads"
+            );
+            assert!(
+                std::fs::read_dir(tree.root.join("state").join("agent-tools"))
+                    .map_or(true, |mut records| records.next().is_none()),
+                "{link_at}: the refusal comes before any record is written"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: a write or a removal through the handle follows no link that took a folder's
+    /// name after the check, so the check by path is not the only protection.
+    #[test]
+    fn a_write_through_the_handle_follows_no_link_made_after_the_check() {
+        use std::os::unix::fs::symlink;
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let fs = Fs::Walk(std::sync::Arc::new(walk));
+        let elsewhere = tree.root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("a folder");
+        symlink(&elsewhere, tree.home().join(".amp")).expect("a link");
+        let refused = fs
+            .write(&tree.home().join(".amp/mcp.json"), b"{}", PRIVATE)
+            .expect_err("a link is not followed");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&elsewhere).expect("the folder").count(),
+            0
+        );
+        std::fs::write(elsewhere.join("mcp.json"), b"x").expect("a file");
+        fs.remove_file(&tree.home().join(".amp/mcp.json"))
+            .expect_err("a link is not followed");
+        assert!(
+            elsewhere.join("mcp.json").exists(),
+            "what the link leads to is left whole"
+        );
+    }
+
+    /// KR-REQ-11.01: a removal follows no link either: a record whose place was replaced by a link
+    /// after the installation is refused by name, and what the link leads to is left whole.
+    #[test]
+    fn a_removal_follows_no_link_either() {
+        use std::os::unix::fs::symlink;
+        let tree = Tree::create();
+        let target = declared(
+            Some(
+                json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+            ),
+            &[".amp", "skills"],
+        );
+        let installer = tree.installer().with_declaration(Some(target), Vec::new());
+        installer
+            .install(&params(amp(), InstallScope::User))
+            .expect("installs");
+        let moved = tree.home().join(".amp-moved");
+        std::fs::rename(tree.home().join(".amp"), &moved).expect("moves the folder");
+        symlink(&moved, tree.home().join(".amp")).expect("a link");
+        let refused = installer
+            .remove(&params(amp(), InstallScope::User))
+            .expect_err("a link is refused");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused}"
+        );
+        assert!(
+            moved
+                .join("skills")
+                .join(SKILL_NAME)
+                .join("SKILL.md")
+                .exists(),
+            "what the link leads to is left whole"
+        );
+    }
+
+    /// KR-REQ-11.01: a file where a folder is needed and a folder where a file is to be written
+    /// stop the installation before anything is written, by the walk's approved words.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_and_a_directory_in_conflict_stop_the_installation_before_anything_is_written() {
+        let document = || json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false });
+        let target = || declared(Some(document()), &[".amp", "skills"]);
+        // A file where the first folder goes.
+        let tree = Tree::create();
+        std::fs::write(tree.home().join(".amp"), b"a file").expect("a file");
+        let refused = tree
+            .installer()
+            .with_declaration(Some(target()), Vec::new())
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a file where a folder goes");
+        let ControllerError::PermissionDenied { detail } = refused else {
+            panic!("a refusal by name: {refused}");
+        };
+        assert!(
+            detail.contains("is a link or a file, and an installation follows no link and writes nothing below a file"),
+            "{detail}"
+        );
+        // A folder where the document goes.
+        let tree = Tree::create();
+        std::fs::create_dir_all(tree.home().join(".amp/mcp.json")).expect("a folder");
+        let refused = tree
+            .installer()
+            .with_declaration(Some(target()), Vec::new())
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a folder where a file goes");
+        let ControllerError::PermissionDenied { detail } = refused else {
+            panic!("a refusal by name: {refused}");
+        };
+        assert!(
+            detail.contains("is not a regular file an installation can replace"),
+            "{detail}"
+        );
+        assert!(
+            !tree.home().join(".amp/skills").exists(),
+            "nothing is written"
+        );
+    }
+
+    /// KR-REQ-11.01: two spellings of one document that differ only in ASCII case are one document
+    /// for the claims of the records, so a second installation does not replace the first's entry
+    /// through the other spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_document_spelled_in_another_case_is_the_same_document_for_the_claims() {
+        let tree = Tree::create();
+        let document = |path: [&str; 2], deadline: Option<Value>| {
+            let mut found = json!({ "path": path, "format": "json_command_args", "shared": false });
+            if let Some(deadline) = deadline {
+                found["deadline"] = deadline;
+            }
+            found
+        };
+        tree.installer()
+            .with_declaration(
+                Some(declared(
+                    Some(document([".shared", "mcp.json"], None)),
+                    &[".amp", "skills"],
+                )),
+                Vec::new(),
+            )
+            .install(&params(amp(), InstallScope::User))
+            .expect("the first installs");
+        let mut other = declared(
+            Some(document(
+                [".Shared", "MCP.json"],
+                Some(json!({ "field": "timeout", "unit": "seconds" })),
+            )),
+            &[".bmp", "skills"],
+        );
+        other.word = "bmp".to_owned();
+        let refused = tree
+            .installer()
+            .with_declaration(Some(other), Vec::new())
+            .install(&params(
+                AgentTarget::parse("bmp").expect("a word"),
+                InstallScope::User,
+            ))
+            .expect_err("the same document under another spelling");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused}"
         );
     }
 

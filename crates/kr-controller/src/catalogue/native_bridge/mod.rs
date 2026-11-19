@@ -50,7 +50,7 @@
 mod check;
 mod journal;
 pub(crate) mod json;
-mod tree;
+pub(crate) mod tree;
 
 /// The shape a package's native-bridge journal is written in, recorded in it as `version`. A
 /// journal of any other shape is refused rather than read.

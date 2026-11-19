@@ -1,4 +1,7 @@
-//! Which package, if any, an agent word that the host does not compile in is declared by.
+//! Which package, if any, an agent word that the host does not compile in is declared by, and the
+//! places a declaration may not name.
+
+use std::path::{Component, Path};
 
 use kr_plugin_sdk::skill_target::{COMPILED_WORDS, SkillTarget};
 
@@ -69,4 +72,45 @@ pub(crate) fn admissions_held(read_at: u64, now: Option<u64>) -> Result<(), &'st
         Some(revision) if revision == read_at => Ok(()),
         _ => Err(ADMISSIONS_MOVED),
     }
+}
+
+/// The refusal of a declared word on a platform where the host does not walk the tree by handle.
+#[must_use]
+pub(crate) fn platform_refusal(on_windows: bool) -> Option<&'static str> {
+    on_windows.then_some(
+        "this host installs the contact skill for an agent that a package names on macOS and \
+         Linux only; on Windows it installs it for codex, claude-code, opencode, gemini-cli, \
+         kimi-code-cli and qoder-cli",
+    )
+}
+
+/// True when `place` is inside a folder this host keeps for itself: its state folder and the
+/// folders the host finds under the home folder. ASCII case is ignored, so a file system that
+/// does not tell `Kalareach` from `kalareach` is not a way round.
+#[must_use]
+pub(crate) fn inside_host_folders(home: &Path, records: &Path, place: &Path) -> bool {
+    let components = |path: &Path| -> Vec<String> {
+        path.components()
+            .filter_map(|component| match component {
+                Component::Normal(name) => Some(name.to_string_lossy().to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect()
+    };
+    let place = components(place);
+    let mut folders: Vec<Vec<String>> = [
+        ".local/state/kalareach",
+        ".cache/kalareach/run",
+        ".local/share/kalareach/host",
+        ".config/kalareach",
+    ]
+    .iter()
+    .map(|folder| components(&home.join(folder)))
+    .collect();
+    if let Some(state) = records.parent() {
+        folders.push(components(state));
+    }
+    folders
+        .iter()
+        .any(|folder| !folder.is_empty() && place.starts_with(folder))
 }
