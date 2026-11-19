@@ -642,3 +642,75 @@ async fn kr_req_11_44_a_package_with_no_native_bridge_is_admitted_under_its_plug
         assert_eq!(outcome.stdout, b"{}\n", "{named}");
     }
 }
+
+/// KR-REQ-11.01, KR-REQ-11.44: a package whose application names its events and the members of its
+/// hook payload another way declares them in its connector table, the worker publishes them for the
+/// launch, and the forwarder reads the application's payload by them: its session opening selects
+/// the thread, a continuation is the source the package names, its closing ends the thread, and
+/// nothing in the core names the application.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_vendor_hook_selects_the_thread_in_a_launch() {
+    let place = |names: &[&str]| {
+        serde_json::json!({"segments": names.iter()
+            .map(|name| serde_json::json!({"type": "member", "name": name}))
+            .collect::<Vec<_>>()})
+    };
+    let events: kr_plugin_sdk::hook_events::HookEvents = serde_json::from_value(serde_json::json!({
+        "event": place(&["event", "name"]),
+        "thread": place(&["thread", "id"]),
+        "events": [
+            {"name": "session_open", "report": "session_started", "continued_by": "resume"},
+            {"name": "session_close", "report": "session_ended"},
+        ],
+        "details": {"start_source": place(&["origin"]), "end_reason": place(&["cause"])},
+    }))
+    .expect("events");
+    assert_eq!(events.refusals(), Vec::new());
+    let placed = Placed::new();
+    let mut launch = Launch::start_with_events(
+        &placed,
+        &placed.forwarder,
+        "vendor-cli",
+        launched::installed_for("vendor-cli", &placed.forwarder, &[BridgeSurface::Hook]),
+        &events,
+    );
+    let cases = vec![
+        amp_case(
+            serde_json::json!({"event": {"name": "session_open"}, "thread": {"id": FIRST_THREAD},
+                "origin": "startup"}),
+            ObservedEvent::ThreadStarted,
+            Some("startup"),
+            None,
+            selected,
+        ),
+        amp_case(
+            serde_json::json!({"event": {"name": "session_close"}, "thread": {"id": FIRST_THREAD},
+                "cause": "logout"}),
+            ObservedEvent::ThreadEnded,
+            Some("logout"),
+            None,
+            ended,
+        ),
+    ];
+    let observed = match observe_on(&mut launch, cases).await {
+        Ok(observed) => observed,
+        Err(Missed::Ended(outcome)) => panic!(
+            "the hook ended with exit code {} before it was admitted: {}",
+            outcome.code, outcome.stderr
+        ),
+        Err(other) => panic!("the hook was not observed: {other:?}"),
+    };
+    for (case, (report, outcome)) in observed.cases.iter().zip(&observed.seen) {
+        let named = format!("vendor-cli {}", case.payload["event"]["name"]);
+        assert_eq!(report.observation.event, case.event, "{named}");
+        assert_eq!(report.observation.detail.as_deref(), case.detail, "{named}");
+        assert!(
+            (case.change)(&report.thread),
+            "{named}: {:?}",
+            report.thread
+        );
+        assert_eq!(outcome.code, 0, "{named}: {}", outcome.stderr);
+        assert_eq!(outcome.stdout, b"{}\n", "{named}");
+    }
+    assert!(!observed.thread_selected, "the session closing leaves no thread selected");
+}

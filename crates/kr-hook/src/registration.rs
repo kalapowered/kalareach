@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use kr_crypto::secret::SecretVec;
+use kr_plugin_sdk::hook_events::HookEvents;
 
 /// The variable that names the registration file.
 pub const REGISTRATION_VARIABLE: &str = "KR_REGISTRATION";
@@ -34,6 +35,10 @@ pub const MAX_REGISTRATION_BYTES: u64 = 4096;
 
 /// The longest credential file this forwarder reads.
 pub const MAX_CREDENTIAL_BYTES: u64 = 256;
+
+/// The longest file of hook events this forwarder reads. The worker writes at most what a package
+/// may declare, which is half of this.
+pub const MAX_EVENTS_BYTES: u64 = 16 * 1024;
 
 /// The length of a launch credential, in hexadecimal characters.
 pub const CREDENTIAL_HEX_LENGTH: usize = 64;
@@ -265,6 +270,9 @@ pub struct Registration {
     pub endpoint: Endpoint,
     /// How the connection frames.
     pub framing: FramingName,
+    /// The hook events of the launch's package: what the file the registration names holds, and
+    /// Claude Code's where it names none.
+    pub events: HookEvents,
     /// The launch credential, as the hexadecimal the credential file holds.
     credential: SecretVec,
 }
@@ -275,6 +283,7 @@ impl std::fmt::Debug for Registration {
             .debug_struct("Registration")
             .field("endpoint", &self.endpoint)
             .field("framing", &self.framing)
+            .field("events", &self.events)
             .field("credential", &"<redacted>")
             .finish()
     }
@@ -305,6 +314,7 @@ impl Registration {
         let mut endpoint = None;
         let mut framing = FramingName::JsonLines;
         let mut credential_path = None;
+        let mut events_path = None;
         for line in text.lines() {
             let Some((name, value)) = line.split_once('=') else {
                 continue;
@@ -313,6 +323,7 @@ impl Registration {
                 "endpoint" => endpoint = Some(Endpoint::parse(value.trim())?),
                 "framing" => framing = FramingName::parse(value.trim())?,
                 "credential" => credential_path = Some(PathBuf::from(value.trim())),
+                "events" => events_path = Some(PathBuf::from(value.trim())),
                 _ => {}
             }
         }
@@ -322,7 +333,7 @@ impl Registration {
         let credential_path = credential_path.ok_or_else(|| RegistrationError::Malformed {
             detail: "names no credential file".to_owned(),
         })?;
-        check_beside(&paths.registration, &credential_path)?;
+        check_beside(&paths.registration, &credential_path, "the credential file")?;
         let credential_name = credential_path.file_name().unwrap_or_default();
         let credential = wait_for(
             &directory,
@@ -340,9 +351,16 @@ impl Registration {
                 detail: format!("credential is not {CREDENTIAL_HEX_LENGTH} hexadecimal characters"),
             });
         }
+        // A registration that names a file of hook events is read by what it names, and never by
+        // Claude Code's events instead: those would mislabel another application's hooks.
+        let events = match events_path {
+            Some(path) => read_events(&directory, &paths.registration, &path, deadline, within)?,
+            None => HookEvents::claude_code(),
+        };
         Ok(Self {
             endpoint,
             framing,
+            events,
             credential,
         })
     }
@@ -624,15 +642,47 @@ fn read_bounded(
     Ok((content, standing))
 }
 
-/// Refuses a credential file that is not in the registration's own directory.
+/// Reads the file of hook events the registration names, and refuses one that is not in the
+/// registration's own directory, that cannot be read or that holds events the check refuses.
+fn read_events(
+    directory: &cap_std::fs::Dir,
+    registration: &Path,
+    path: &Path,
+    deadline: Instant,
+    within: Duration,
+) -> Result<HookEvents, RegistrationError> {
+    check_beside(registration, path, "the hook events file")?;
+    let name = path.file_name().unwrap_or_default();
+    let bytes = wait_for(directory, path, name, MAX_EVENTS_BYTES, deadline, within)?;
+    let events: HookEvents =
+        serde_json::from_slice(&bytes).map_err(|error| RegistrationError::Malformed {
+            detail: format!(
+                "names the hook events file {}, which does not hold hook events: {error}",
+                path.display()
+            ),
+        })?;
+    events.check().map_err(|error| RegistrationError::Malformed {
+        detail: format!(
+            "names the hook events file {}, which holds events that are refused: {error}",
+            path.display()
+        ),
+    })?;
+    Ok(events)
+}
+
+/// Refuses a file the registration names that is not in the registration's own directory.
 ///
-/// The worker writes the credential beside the registration, inside the launch's owner-only
-/// directory. A path that is relative, or leaves that directory, is not one it wrote, and the
-/// forwarder presents nothing from it.
-fn check_beside(registration: &Path, credential: &Path) -> Result<(), RegistrationError> {
-    let beside = credential.is_absolute()
-        && credential.file_name().is_some()
-        && credential
+/// The worker writes the credential and the hook events beside the registration, inside the
+/// launch's owner-only directory. A path that is relative, or leaves that directory, is not one it
+/// wrote, and the forwarder presents and reads nothing from it.
+fn check_beside(
+    registration: &Path,
+    named: &Path,
+    what: &str,
+) -> Result<(), RegistrationError> {
+    let beside = named.is_absolute()
+        && named.file_name().is_some()
+        && named
             .parent()
             .is_some_and(|directory| registration.parent().is_some_and(|own| own == directory));
     if beside {
@@ -640,8 +690,8 @@ fn check_beside(registration: &Path, credential: &Path) -> Result<(), Registrati
     } else {
         Err(RegistrationError::Malformed {
             detail: format!(
-                "names the credential file {}, which is not in the registration's own directory",
-                credential.display()
+                "names {what} {}, which is not in the registration's own directory",
+                named.display()
             ),
         })
     }
@@ -843,5 +893,149 @@ mod tests {
         let kept = trimmed(SecretVec::new(b"  ab12\n".to_vec()));
         assert_eq!(kept.expose(), b"ab12");
         assert!(trimmed(SecretVec::new(b" \n".to_vec())).is_empty());
+    }
+
+    /// What a registration beside a credential and, where `events` is `Some`, a file of hook
+    /// events holds.
+    #[cfg(unix)]
+    struct Launch {
+        folder: kr_ipc::testing::PrivateTempDir,
+    }
+
+    #[cfg(unix)]
+    impl Launch {
+        /// A launch whose registration names `events` on its `events` line, as written, or none.
+        fn new(events: Option<&dyn Fn(&Path) -> String>) -> Self {
+            let folder = kr_ipc::testing::PrivateTempDir::create();
+            let launch = Self { folder };
+            let directory = launch.directory();
+            kr_ipc::paths::write_owner_only_file(
+                &directory.join("credential"),
+                "ab".repeat(CREDENTIAL_HEX_LENGTH / 2).as_bytes(),
+            )
+            .expect("the credential is written");
+            let mut text = format!(
+                "endpoint=/run/kr/a-1.sock\nprofile=lp-1\ninstance=i-1\npid=1\nstart=2\ncredential={}\n",
+                directory.join("credential").display()
+            );
+            if let Some(line) = events {
+                text.push_str(&format!("events={}\n", line(&directory)));
+            }
+            text.push_str("framing=json_lines\n");
+            kr_ipc::paths::write_owner_only_file(&directory.join("registration"), text.as_bytes())
+                .expect("the registration is written");
+            launch
+        }
+
+        fn directory(&self) -> PathBuf {
+            self.folder.path().to_path_buf()
+        }
+
+        fn write(&self, name: &str, bytes: &[u8]) {
+            kr_ipc::paths::write_owner_only_file(&self.directory().join(name), bytes)
+                .expect("the file is written");
+        }
+
+        fn read(&self) -> Result<Registration, RegistrationError> {
+            Registration::read(
+                &Paths {
+                    registration: self.directory().join("registration"),
+                },
+                Duration::from_millis(200),
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    fn vendor_events() -> String {
+        serde_json::json!({
+            "event": {"segments": [{"type": "member", "name": "kind"}]},
+            "thread": {"segments": [{"type": "member", "name": "session"}]},
+            "events": [{"name": "opened", "report": "session_started"}],
+        })
+        .to_string()
+    }
+
+    /// A registration that names no file of hook events is read with Claude Code's.
+    #[cfg(unix)]
+    #[test]
+    fn a_registration_that_names_no_events_gets_the_claude_code_events() {
+        let read = Launch::new(None).read().expect("a registration");
+        assert_eq!(read.events, HookEvents::claude_code());
+    }
+
+    /// A registration that names a file of hook events beside it is read by what the file holds.
+    #[cfg(unix)]
+    #[test]
+    fn a_registration_that_names_its_events_is_read_by_them() {
+        let launch = Launch::new(Some(&|directory| {
+            directory.join("hook-events.json").display().to_string()
+        }));
+        launch.write("hook-events.json", vendor_events().as_bytes());
+        let read = launch.read().expect("a registration");
+        assert_eq!(read.events.events[0].name, "opened");
+        assert_ne!(read.events, HookEvents::claude_code());
+    }
+
+    /// The file of hook events is read from the registration's own directory and from nowhere
+    /// else, and a file that cannot be read, is too large, or holds events the check refuses is an
+    /// error: Claude Code's events are never read in its place.
+    #[cfg(unix)]
+    #[test]
+    fn the_events_file_is_read_only_beside_the_registration() {
+        let elsewhere = kr_ipc::testing::PrivateTempDir::create();
+        std::fs::write(elsewhere.path().join("hook-events.json"), vendor_events()).expect("writes");
+        let outside = elsewhere.path().join("hook-events.json").display().to_string();
+        for (what, named) in [
+            ("a relative path", "hook-events.json".to_owned()),
+            ("a path outside the folder", outside),
+            ("a path that leaves the folder", "/../hook-events.json".to_owned()),
+        ] {
+            let launch = Launch::new(Some(&|directory| match what {
+                "a path that leaves the folder" => {
+                    format!("{}/../hook-events.json", directory.display())
+                }
+                _ => named.clone(),
+            }));
+            launch.write("hook-events.json", vendor_events().as_bytes());
+            let error = launch.read().expect_err(what);
+            assert!(
+                error.to_string().contains("not in the registration's own directory"),
+                "{what}: {error}"
+            );
+        }
+        // A link in the file's place is not followed.
+        let launch = Launch::new(Some(&|directory| {
+            directory.join("hook-events.json").display().to_string()
+        }));
+        std::os::unix::fs::symlink(
+            elsewhere.path().join("hook-events.json"),
+            launch.directory().join("hook-events.json"),
+        )
+        .expect("a link");
+        launch.read().expect_err("a link is not followed");
+        // Too large, not events, events the check refuses, and no file at all.
+        let too_large = vec![b' '; usize::try_from(MAX_EVENTS_BYTES).expect("small") + 1];
+        for (what, bytes) in [
+            ("a file over the bound", Some(too_large)),
+            ("a file that is not events", Some(b"{}".to_vec())),
+            (
+                "events the check refuses",
+                Some(
+                    vendor_events()
+                        .replace(r#""events":[{"name":"opened","report":"session_started"}]"#, r#""events":[]"#)
+                        .into_bytes(),
+                ),
+            ),
+            ("no file", None),
+        ] {
+            let launch = Launch::new(Some(&|directory| {
+                directory.join("hook-events.json").display().to_string()
+            }));
+            if let Some(bytes) = bytes {
+                launch.write("hook-events.json", &bytes);
+            }
+            assert!(launch.read().is_err(), "{what}");
+        }
     }
 }

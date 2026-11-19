@@ -9,7 +9,7 @@
 //!
 //! | Item | What it owns |
 //! | --- | --- |
-//! | [`crate::hook::EVENTS`] | What each hook event reports, for every application; [`crate::hook`] runs every hook: prompt, neutral, and never a decision |
+//! | [`kr_plugin_sdk::hook_events::HookEvents::claude_code`] | What each hook event reports when a package declares no events of its own; [`crate::hook`] runs every hook: prompt, neutral, and never a decision |
 //! | [`channel`] | The Channels server: Claude Code's MCP session and the worker's exchange |
 
 pub mod channel;
@@ -22,10 +22,10 @@ mod tests {
     use super::*;
 
     fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
-        let input =
-            crate::hook::read_input(payload.to_string().as_bytes()).expect("a hook's input");
-        crate::hook::observation(&crate::hook::Application::for_word(APPLICATION), &input)
-            .map(|frame| frame["kr_observation"].clone())
+        let events = kr_plugin_sdk::hook_events::HookEvents::claude_code();
+        let input = crate::hook::read_input(payload.to_string().as_bytes(), &events)
+            .expect("a hook's input");
+        crate::hook::observation(&events, &input).map(|frame| frame["kr_observation"].clone())
     }
 
     #[test]
@@ -138,7 +138,11 @@ mod tests {
         ] {
             assert_eq!(translated(&payload), None, "{payload}");
         }
-        assert!(crate::hook::read_input(&b"not json"[..]).is_err());
-        assert!(crate::hook::read_input(&br#"{"hook_event_name":"SessionStart"}"#[..]).is_err());
+        let events = kr_plugin_sdk::hook_events::HookEvents::claude_code();
+        assert!(crate::hook::read_input(&b"not json"[..], &events).is_err());
+        assert!(
+            crate::hook::read_input(&br#"{"hook_event_name":"SessionStart"}"#[..], &events)
+                .is_err()
+        );
     }
 }
