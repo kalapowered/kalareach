@@ -1741,9 +1741,7 @@ impl LinkControl {
         }
         let (change, params) = {
             let mut state = self.state.lock().expect("the record");
-            if state.delegate_params.is_none() {
-                return None;
-            }
+            state.delegate_params.as_ref()?;
             (take(&mut state)?, state.delegate_params.clone()?)
         };
         change(&mut result, &params);
