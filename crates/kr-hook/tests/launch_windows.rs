@@ -744,9 +744,12 @@ fn kr_req_12_20_a_declared_variable_reaches_the_program_through_a_committed_laun
         "a package that declares its variable is installed"
     );
     for (own, name) in [(None, "declared-absent"), (Some("0"), "declared-zero")] {
-        let answer = shell
-            .try_establish()
-            .unwrap_or_else(|why| panic!("{name}: a backend is established: {why}"));
+        let result = shell.try_establish();
+        assert!(
+            result.is_ok(),
+            "{name}: a backend is established: {result:?}"
+        );
+        let answer = result.expect("a backend is established");
         let own: Vec<(&str, &str)> = own
             .map(|value| ("GEMINI_CLI_NO_RELAUNCH", value))
             .into_iter()
@@ -786,9 +789,9 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_varia
         shell.installed,
         "a package that declares its variable is installed"
     );
-    let answer = shell
-        .try_establish()
-        .unwrap_or_else(|why| panic!("a backend is established: {why}"));
+    let result = shell.try_establish();
+    assert!(result.is_ok(), "a backend is established: {result:?}");
+    let answer = result.expect("a backend is established");
     let mut typed = shell.typed();
     typed.push("another".to_owned());
     let mut launcher = shell.launcher(
@@ -816,9 +819,9 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_varia
 #[test]
 fn kr_req_12_20_a_launch_record_naming_a_reserved_variable_is_refused() {
     let shell = Shell::new();
-    let answer = shell
-        .try_establish()
-        .unwrap_or_else(|why| panic!("a backend is established: {why}"));
+    let result = shell.try_establish();
+    assert!(result.is_ok(), "a backend is established: {result:?}");
+    let answer = result.expect("a backend is established");
     let directory = Shell::registration(&answer)
         .parent()
         .expect("the backend's directory")
