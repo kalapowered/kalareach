@@ -2145,6 +2145,50 @@ async fn a_confirmation_that_fails_after_its_commitment_tells_only_the_proving_c
     host.stop().await;
 }
 
+/// KR-REQ-10.37: a device that was committed and asks about its invitation again on a fresh
+/// unpaired connection is refused in a frame it reads, as the answer to its question, and not
+/// answered with a frame it cannot decode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_committed_device_that_asks_again_unpaired_gets_an_answer_it_can_read() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    let device = Device::create().await;
+    let (proving, _proved, _value) = calls::redeem(&device.candidate(), &invited).await;
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+
+    let (fresh_connection, mut fresh) = open_unpaired(&host, &device).await;
+    match status_on(&mut fresh, invited.invitation_id).await {
+        Err(kr_transport::error::TransportError::Refused(error)) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            assert!(
+                error.message.contains("this endpoint is paired"),
+                "the refusal says why: {}",
+                error.message
+            );
+        }
+        other => {
+            panic!("a paired endpoint's question is refused in a frame it reads, not {other:?}")
+        }
+    }
+    proving.close(0u32.into(), b"done");
+    fresh_connection.close(0u32.into(), b"done");
+    host.stop().await;
+}
+
 /// A new candidate's first redemption step for `invitation_id`, dialled at this host as it runs
 /// now, and the host's refusal of it.
 async fn refused_challenge(
