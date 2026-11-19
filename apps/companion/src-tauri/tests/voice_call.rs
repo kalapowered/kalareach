@@ -2957,6 +2957,18 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
         .find(|owed| owed["action_id"] == action_id.as_str())
         .unwrap_or_else(|| panic!("the unanswered start is kept: {file}"));
     assert_eq!(kept["kind"], "start_unanswered", "{file}");
+    // A start the host never answered has no lapse: its entry is kept to the largest instant, and a
+    // read made at the instant before that still finds it.
+    assert_eq!(milliseconds(&kept["until_ms"]), u64::MAX, "{file}");
+    let read = Kept::at(scene.phone.data.path())
+        .read(u64::MAX - 1)
+        .expect("the file reads");
+    assert!(
+        read.owed.iter().any(|owed| {
+            owed.kind == "start_unanswered" && owed.action_id.as_deref() == Some(action_id.as_str())
+        }),
+        "the unanswered start outlives any clock reading"
+    );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }
@@ -5012,6 +5024,43 @@ async fn an_earlier_kept_start_survives_a_later_one_declined_before_the_hold() {
         .expect_err("the host still holds the device");
     assert_eq!(held["code"], "DRAFT_CONFLICT", "{held}");
     assert_eq!(held["start_again_for"], earlier.as_str(), "{held}");
+    scene.stop_host().await;
+}
+
+/// KR-REQ-23.24: a start the host refused for its hold, whose refusal the device never heard, is
+/// told that refusal when it asks again, and the refusal still names the earlier start: the hold's
+/// refusal is the host's answer to the start itself, so it is never read as an unknown start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_the_hold_refused_whose_answer_was_lost_is_told_the_holds_refusal_when_it_asks_again()
+ {
+    let mut scene = scene_with(asking_again(), Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.lose_creation_answers(true);
+    let first = scene.start().await;
+    let earlier = first["action_id"]
+        .as_str()
+        .expect("the start names its action")
+        .to_owned();
+    // The second start reaches the host, which refuses it for the hold; the refusal is lost on the
+    // way back, and the device asks again under the same action.
+    scene
+        .link
+        .lose_only_the_answer_after(1, HostMethod::VoiceStart);
+    let prepared = scene.prepared().await;
+    let held = scene
+        .call("voice_start", scene.start_request(&prepared))
+        .expect_err("the repeat is answered with the hold's refusal");
+    assert_eq!(held["code"], "DRAFT_CONFLICT", "{held}");
+    assert_eq!(held["start_again_for"], earlier.as_str(), "{held}");
+    assert_eq!(
+        scene.stand_in.count("/api/voice/sessions"),
+        1,
+        "the refused start asked the service for nothing"
+    );
+    let state = scene.state();
+    let owed = state["owed"].as_array().expect("the entries");
+    assert_eq!(owed.len(), 1, "no unknown start is added: {state}");
+    assert_eq!(owed[0]["action_id"], earlier.as_str(), "{state}");
+    assert_eq!(owed[0]["kind"], "start_unconfirmed", "{state}");
     scene.stop_host().await;
 }
 
