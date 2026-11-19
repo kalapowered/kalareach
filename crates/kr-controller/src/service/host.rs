@@ -338,6 +338,10 @@ impl Controller {
         });
         let declared = served(params.agent.as_str(), &declarations)
             .map_err(ControllerError::InvalidArgument)?;
+        let admitted: Vec<_> = declarations
+            .iter()
+            .map(|declaration| declaration.target.clone())
+            .collect();
         // Read again here, so a change while the packages were read is refused before the checks
         // that read the file system are spent on it; the same revision is read once more just
         // before the registration.
@@ -349,7 +353,9 @@ impl Controller {
         admissions_held(snapshot.revision, now)
             .map_err(|refusal| ControllerError::InvalidArgument(refusal.to_owned()))?;
         Ok((
-            installer.with_declaration(declared, known),
+            installer
+                .with_declaration(declared, known)
+                .with_admitted(admitted),
             Some(snapshot.revision),
         ))
     }

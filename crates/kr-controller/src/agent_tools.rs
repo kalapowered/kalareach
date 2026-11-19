@@ -83,6 +83,14 @@ const MOVED_PLACE: &str = "the record of {word} at {scope} scope names {recorded
 const ONLY_BY_RECORD: &str = "no package this host admits declares {word} now, so this host cannot \
      install it at {scope} scope; it can only remove what its own record of {word} names";
 
+/// The refusal of a document that another word names in another format.
+const DOCUMENT_FORMATS: &str = "{document} is named by {word} and by {other} at {scope} scope in \
+     different formats, so this host will not install {word}";
+
+/// The refusal of a document that the two words that name it do not both declare shared.
+const DOCUMENT_NOT_SHARED: &str = "{document} is named by {word} and by {other} at {scope} scope, \
+     and they do not both declare it shared, so this host will not install {word}";
+
 /// The refusal of an entry that another record of this host claims with other contents.
 const CLAIMED_DIFFERENTLY: &str = "{path} already holds a server named kalareach, written with \
      other contents by another installation this host made; remove that installation before \
@@ -316,6 +324,9 @@ pub struct Installer {
     /// The words an admitted package declares or a record of this host holds, for the sentence that
     /// lists what the host knows.
     known: Vec<String>,
+    /// Every skill target an admitted package declares, which the declared word's document is
+    /// compared with.
+    admitted: Vec<kr_plugin_sdk::skill_target::SkillTarget>,
     /// How this installer reaches the places a layout names: by path, or from one handle.
     fs: Fs,
 }
@@ -331,6 +342,7 @@ impl Installer {
             executable,
             declared: None,
             known: Vec::new(),
+            admitted: Vec::new(),
             fs: Fs::Paths,
         }
     }
@@ -354,6 +366,17 @@ impl Installer {
     ) -> Self {
         self.declared = declared;
         self.known = known;
+        self
+    }
+
+    /// Returns this installer comparing a declared word's document with the documents of every
+    /// skill target the admitted packages declare, and with the six compiled layouts.
+    #[must_use]
+    pub fn with_admitted(
+        mut self,
+        admitted: Vec<kr_plugin_sdk::skill_target::SkillTarget>,
+    ) -> Self {
+        self.admitted = admitted;
         self
     }
 
@@ -1298,6 +1321,7 @@ impl Installer {
         recorded: Option<&InstallationRecord>,
     ) -> Result<()> {
         self.check_declared_places(params, layout)?;
+        self.document_disagrees(params, layout)?;
         let root = layout.skills.as_path();
         for (name, _) in files() {
             let path = root.join(name);
@@ -1347,6 +1371,72 @@ impl Installer {
             // The document's own protection, before anything is written. This host's own files
             // carry no such risk: they are its records and the package it wrote.
             guard_access_controls(&configuration.path, CONFIGURATION_BY_HAND)?;
+        }
+        Ok(())
+    }
+
+    /// Refuses a declared word's document where another admitted word or a compiled word names the
+    /// same document at this scope, ASCII case ignored, and the two do not agree on it: they name
+    /// different formats, or they do not both declare it shared. Two words that write one entry
+    /// name into one document agree only when each writes the entry the same way, and a document
+    /// that is not shared holds one word's entry. This reads declarations only, so it runs before
+    /// the marker, and a word whose scope the other does not declare is not compared at that scope.
+    fn document_disagrees(&self, params: &AgentToolsParams, layout: &Layout) -> Result<()> {
+        let Some(mine) = layout
+            .configuration
+            .as_ref()
+            .filter(|_| params.agent.compiled().is_none())
+        else {
+            return Ok(());
+        };
+        let compiled = CompiledAgent::ALL
+            .iter()
+            .filter_map(|agent| AgentTarget::parse(agent.as_str()).ok())
+            .map(|word| (word, None));
+        let admitted = self
+            .admitted
+            .iter()
+            .filter(|target| target.word != params.agent.as_str())
+            .filter_map(|target| {
+                AgentTarget::parse(&target.word)
+                    .ok()
+                    .map(|word| (word, Some(target.clone())))
+            });
+        for (word, declaration) in compiled.chain(admitted) {
+            let other = Self {
+                declared: declaration,
+                ..self.clone()
+            };
+            let theirs = AgentToolsParams {
+                agent: word.clone(),
+                scope: params.scope,
+                project_dir: params.project_dir.clone(),
+            };
+            // A word that declares nothing at this scope names no document there.
+            let Some(theirs) = other
+                .layout(&theirs)
+                .ok()
+                .and_then(|layout| layout.configuration)
+            else {
+                continue;
+            };
+            if !same_place(&mine.path, &theirs.path) {
+                continue;
+            }
+            let text = if mine.format != theirs.format {
+                DOCUMENT_FORMATS
+            } else if !(mine.shared && theirs.shared) {
+                DOCUMENT_NOT_SHARED
+            } else {
+                continue;
+            };
+            return Err(ControllerError::PermissionDenied {
+                detail: text
+                    .replace("{document}", &display(&mine.path))
+                    .replace("{word}", params.agent.as_str())
+                    .replace("{other}", word.as_str())
+                    .replace("{scope}", &params.scope.to_string()),
+            });
         }
         Ok(())
     }
@@ -2627,12 +2717,17 @@ fn under(base: &Path, names: &[&str]) -> PathBuf {
 /// records it wrote spell some paths with both separators. ASCII case is ignored, because a file
 /// system that does not tell `Mcp.json` from `mcp.json` holds one document under both spellings.
 fn names_path(recorded: &str, path: &Path) -> bool {
+    same_place(Path::new(recorded), path)
+}
+
+/// Whether two paths are one place: the same components, ASCII case ignored.
+fn same_place(first: &Path, second: &Path) -> bool {
     let folded = |path: &Path| -> Vec<String> {
         path.components()
             .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
             .collect()
     };
-    folded(Path::new(recorded)) == folded(path)
+    folded(first) == folded(second)
 }
 
 /// The files an installation writes, in the order it writes them.
@@ -4142,6 +4237,156 @@ mod tests {
             matches!(declined, Err(Declined::ByARecord(_))),
             "an unreadable record is declined as a record: {declined:?}"
         );
+    }
+
+    /// A target for `word` whose user location has a document, as the tests of the agreement of
+    /// two words on one document name it.
+    #[cfg(unix)]
+    fn target_with_document(
+        word: &str,
+        path: &[&str],
+        format: &str,
+        shared: bool,
+    ) -> kr_plugin_sdk::skill_target::SkillTarget {
+        serde_json::from_value(json!({
+            "word": word,
+            "user": {
+                "skills": [format!(".{word}"), "skills"],
+                "configuration": { "path": path, "format": format, "shared": shared }
+            }
+        }))
+        .expect("a target")
+    }
+
+    /// KR-REQ-11.01 (I6): a declared word is not installed where another admitted word names the same
+    /// document in another format or without both declaring it shared, ASCII case ignored, and
+    /// nothing is written for it; two words that both declare a document shared in one format agree.
+    #[cfg(unix)]
+    #[test]
+    fn two_words_naming_one_document_agree_on_its_format_and_on_sharing_or_neither_installs() {
+        let for_amp = |path: &[&str], format: &str, shared: bool| {
+            target_with_document("amp", path, format, shared)
+        };
+        let for_bmp = |path: &[&str], format: &str, shared: bool| {
+            target_with_document("bmp", path, format, shared)
+        };
+        // What installing amp does where bmp is admitted too: the refusal, if any, the document's
+        // text, and whether anything of amp's was written.
+        let attempt = |mine: kr_plugin_sdk::skill_target::SkillTarget,
+                       other: kr_plugin_sdk::skill_target::SkillTarget| {
+            let tree = Tree::create();
+            let installer = tree
+                .installer()
+                .with_declaration(Some(mine.clone()), Vec::new())
+                .with_admitted(vec![mine, other]);
+            let outcome = installer
+                .install(&params(amp(), InstallScope::User))
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let document = display(&tree.home().join(".shared").join("mcp.json"));
+            (outcome, tree.home().join(".amp").exists(), document)
+        };
+        let formats = |document: &str| {
+            format!(
+                "{document} is named by amp and by bmp at user scope in different formats, so \
+                 this host will not install amp"
+            )
+        };
+        let sharing = |document: &str| {
+            format!(
+                "{document} is named by amp and by bmp at user scope, and they do not both \
+                 declare it shared, so this host will not install amp"
+            )
+        };
+        let shared = [".shared", "mcp.json"];
+
+        // Another format: refused by name, nothing written.
+        let (outcome, written, document) = attempt(
+            for_amp(&shared, "json_command_args", true),
+            for_bmp(&shared, "json_local_command_list", true),
+        );
+        assert_eq!(outcome, Err(formats(&document)));
+        assert!(!written, "nothing was written for the refused word");
+
+        // The same document spelled in another ASCII case is the same document.
+        let (outcome, written, document) = attempt(
+            for_amp(&shared, "json_command_args", true),
+            for_bmp(&[".shared", "MCP.json"], "json_local_command_list", true),
+        );
+        assert_eq!(
+            outcome,
+            Err(formats(&document)),
+            "the document's case is ignored"
+        );
+        assert!(!written);
+
+        // The same format where one does not declare it shared, or neither does.
+        for (mine, theirs) in [(false, true), (true, false), (false, false)] {
+            let (outcome, written, document) = attempt(
+                for_amp(&shared, "json_command_args", mine),
+                for_bmp(&shared, "json_command_args", theirs),
+            );
+            assert_eq!(outcome, Err(sharing(&document)), "{mine} {theirs}");
+            assert!(!written);
+        }
+
+        // Both declare it shared in one format: they agree and the word installs.
+        let (outcome, written, _) = attempt(
+            for_amp(&shared, "json_command_args", true),
+            for_bmp(&shared, "json_command_args", true),
+        );
+        assert_eq!(outcome, Ok(()));
+        assert!(written);
+
+        // Another document is no disagreement, whatever its format.
+        let (outcome, _, _) = attempt(
+            for_amp(&shared, "json_command_args", false),
+            for_bmp(&[".other", "mcp.json"], "json_local_command_list", false),
+        );
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// KR-REQ-11.01 (I6): a declared word's document is compared with the compiled layouts too: the
+    /// project's `.mcp.json` that Claude Code writes is shared in the command-and-arguments form,
+    /// so a declared word names it only in that form and shared.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_word_naming_a_compiled_document_agrees_with_the_compiled_layout() {
+        let project_of = |shared: bool, format: &str| {
+            let tree = Tree::create();
+            let project = tree.root.join("project");
+            std::fs::create_dir_all(&project).expect("a project");
+            let target: kr_plugin_sdk::skill_target::SkillTarget = serde_json::from_value(json!({
+                "word": "amp",
+                "project": {
+                    "skills": [".amp", "skills"],
+                    "configuration": { "path": [".mcp.json"], "format": format, "shared": shared }
+                }
+            }))
+            .expect("a target");
+            tree.installer()
+                .with_declaration(Some(target.clone()), Vec::new())
+                .with_admitted(vec![target])
+                .install(&AgentToolsParams {
+                    agent: amp(),
+                    scope: InstallScope::Project,
+                    project_dir: Nullable::some(display(&project)),
+                })
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(project_of(true, "json_command_args"), Ok(()));
+        let sharing = project_of(false, "json_command_args").expect_err("not shared");
+        assert!(
+            sharing.contains("is named by amp and by claude-code at project scope"),
+            "{sharing}"
+        );
+        assert!(
+            sharing.contains("do not both declare it shared"),
+            "{sharing}"
+        );
+        let formats = project_of(true, "json_local_command_list").expect_err("another format");
+        assert!(formats.contains("in different formats"), "{formats}");
     }
 
     /// KR-REQ-11.01: an entry that another record of this host claims with other contents is not
