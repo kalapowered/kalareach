@@ -5,9 +5,10 @@
 //! directory's connection. A check that runs inside a transaction on that connection must not wait
 //! for the policy's lock, so it reads the standing the policy in force published. These cases hold
 //! one lock on each side of the wait and show that neither side waits for the other. A case that
-//! waits does so on a channel with a failure bound, and a case that fails leaves its runtime and
-//! its daemon where they stand, so a thread stuck in a lock turns into a failed assertion and not
-//! into a hang in the runtime's drop.
+//! waits does so on a channel with a failure bound, and a case that waits owns its runtime and its
+//! daemon in a [`Rig`] that a failed case leaves where it stands, so a thread stuck in a lock
+//! turns into a failed assertion and not into a hang in the runtime's drop. The cases that only
+//! read what the policy published wait for no other thread and run on the test runtime.
 
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,17 +37,17 @@ const BOUND: Duration = Duration::from_secs(30);
 
 /// A runtime of four workers and the daemon on it, for a case that holds locks on threads of its
 /// own.
-struct Rig {
-    runtime: tokio::runtime::Runtime,
-    temp: kr_ipc::testing::TempHost,
-    controller: Arc<Controller>,
+pub(super) struct Rig {
+    pub(super) runtime: tokio::runtime::Runtime,
+    pub(super) temp: kr_ipc::testing::TempHost,
+    pub(super) controller: Arc<Controller>,
 }
 
 impl Rig {
     /// Starts the daemon `start` makes on a new runtime. A case wraps what it gets in
     /// [`ManuallyDrop`] and ends it with [`finish`], so that a case that panics at any wait leaves
     /// the runtime and the daemon where they stand.
-    fn new<F>(start: F) -> ManuallyDrop<Self>
+    pub(super) fn new<F>(start: F) -> ManuallyDrop<Self>
     where
         F: std::future::Future<Output = (kr_ipc::testing::TempHost, Arc<Controller>)>,
     {
@@ -65,7 +66,7 @@ impl Rig {
 }
 
 /// Ends a case that passed: only now are the daemon and the runtime dropped.
-fn finish(rig: ManuallyDrop<Rig>) {
+pub(super) fn finish(rig: ManuallyDrop<Rig>) {
     let Rig {
         runtime,
         temp,
@@ -580,12 +581,21 @@ async fn the_local_owner_standing_follows_every_change_the_policy_commits() {
 /// after it. The renewal is stopped inside the publication of the lease's cell, before the swap
 /// and after it, on the thread that presents it and with the policy's lock held; a reader on
 /// another thread asks at each stop. Both policies have a live lease, so the answer is not closed
-/// at either stop, and it comes without waiting for the policy's lock.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reader_sees_the_old_standing_or_the_new_one_while_the_host_lease_is_renewed() {
-    let temp = kr_ipc::testing::TempHost::create();
+/// at either stop, and it comes without waiting for the policy's lock. The case owns its runtime
+/// and daemon, and the renewal reports through a channel with a failure bound, so a renewal that
+/// is stuck fails the case where it waits.
+#[test]
+fn a_reader_sees_the_old_standing_or_the_new_one_while_the_host_lease_is_renewed() {
     let (continuous, wall, clocks) = manual_clocks();
-    let host = Arc::new(Leased::start(&temp, continuous, wall, clocks).await);
+    let mut leased = None;
+    let rig = Rig::new(async {
+        let temp = kr_ipc::testing::TempHost::create();
+        let host = Leased::start(&temp, continuous, wall, clocks).await;
+        let controller = Arc::clone(&host.controller);
+        leased = Some(host);
+        (temp, controller)
+    });
+    let host = Arc::new(leased.expect("the host started"));
     host.controller
         .update_policy(|policy| policy.set_exclusively_managed(true))
         .expect("exclusive management is set");
@@ -603,7 +613,8 @@ async fn a_reader_sees_the_old_standing_or_the_new_one_while_the_host_lease_is_r
     let (swap_tx, swapping) = mpsc::channel::<()>();
     let (swapped_tx, swapped) = mpsc::channel::<()>();
     let (finish_tx, finishing) = mpsc::channel::<()>();
-    let renewing = {
+    let (renewed_tx, renewed) = mpsc::channel();
+    {
         let host = Arc::clone(&host);
         std::thread::spawn(move || {
             // The stops are this thread's own, and each fires once.
@@ -615,15 +626,15 @@ async fn a_reader_sees_the_old_standing_or_the_new_one_while_the_host_lease_is_r
                 let _ = swapped_tx.send(());
                 let _ = finishing.recv_timeout(BOUND);
             });
-            host.controller.present_membership_lease(
+            let _ = renewed_tx.send(host.controller.present_membership_lease(
                 host.controller.local_owner_device(),
                 host.key.public(),
                 &lease,
                 None,
                 None,
-            )
-        })
-    };
+            ));
+        });
+    }
     let read = |when: &str| {
         let (answer_tx, answer) = mpsc::channel();
         let controller = Arc::clone(&host.controller);
@@ -651,12 +662,13 @@ async fn a_reader_sees_the_old_standing_or_the_new_one_while_the_host_lease_is_r
         "the owner is served under either policy"
     );
     finish_tx.send(()).expect("the renewal goes on");
-    renewing
-        .join()
-        .expect("the renewal ends")
+    renewed
+        .recv_timeout(BOUND)
+        .expect("the renewal ended inside its bound")
         .expect("the renewal is written down")
         .expect("the lease installs");
     assert!(!host.controller.local_owner_is_closed());
+    finish(rig);
 }
 
 /// KR-REQ-24.15: the standing is read on the continuous clock first and the wall clock after it,

@@ -18,6 +18,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::ActionId;
 use kr_protocol::method::Method;
 
+use super::a_policy_commit_and_an_owner_answer::{Rig, finish};
 use super::an_owner_establishes_the_clock::{
     Door, code, confirmed_at, distrusting, paired, proven, registry,
 };
@@ -489,16 +490,28 @@ async fn two_copies_of_one_action_establish_the_clock_once() {
 /// The commit's guard takes the hold and asks, and passes. The deadline the request was admitted
 /// under then passes while the directory's connection is held elsewhere, and the effect is refused
 /// when it gets the connection: nothing is written and the host still distrusts its clock. The
-/// control is the same confirmation, which the refusal left answered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_deadline_that_passes_after_the_guard_asked_stops_the_establishment_at_the_connection() {
+/// control is the same confirmation, which the refusal left answered. The case owns its runtime
+/// and daemon, and the establishment reports through a channel with a failure bound, so an
+/// establishment that is stuck fails the case where it waits.
+#[test]
+fn a_deadline_that_passes_after_the_guard_asked_stops_the_establishment_at_the_connection() {
     // The failure bound of each wait of this case, which no sleep decides.
     const BOUND: Duration = Duration::from_secs(60);
 
-    let (temp, controller, continuous, ..) = distrusting().await;
-    let door = Door::open(&temp, &controller).await;
-    let challenge = door.challenge().await;
-    door.answer(&challenge.request).await.expect("answered");
+    let mut clock = None;
+    let rig = Rig::new(async {
+        let (temp, controller, continuous, ..) = distrusting().await;
+        clock = Some(continuous);
+        (temp, controller)
+    });
+    let continuous = clock.expect("the daemon started");
+    let controller = Arc::clone(&rig.controller);
+    let door = rig.runtime.block_on(async {
+        let door = Door::open(&rig.temp, &controller).await;
+        let challenge = door.challenge().await;
+        door.answer(&challenge.request).await.expect("answered");
+        door
+    });
 
     let owner = Arc::clone(controller.owner_authority());
     let caller = Caller::local(door.actor_id().clone());
@@ -537,15 +550,16 @@ async fn a_deadline_that_passes_after_the_guard_asked_stops_the_establishment_at
     )
     .expect("a digest");
     let boot = controller.boot_epoch;
-    let attempt = tokio::task::spawn_blocking(move || {
-        owner.establish_clock(
+    let (ended_tx, ended) = std::sync::mpsc::channel();
+    rig.runtime.spawn_blocking(move || {
+        let _ = ended_tx.send(owner.establish_clock(
             &caller,
             (action_id, digest),
             boot,
             guard.as_ref(),
             admission.as_ref(),
             &AtomicBool::new(false),
-        )
+        ));
     });
 
     asked_rx
@@ -562,7 +576,9 @@ async fn a_deadline_that_passes_after_the_guard_asked_stops_the_establishment_at
         })
         .expect("the directory's connection is held");
 
-    let refused = attempt.await.expect("the effect ends");
+    let refused = ended
+        .recv_timeout(BOUND)
+        .expect("the establishment ended inside its bound");
     assert!(
         refused.is_err(),
         "the establishment is refused: the deadline passed after the guard asked and before the \
@@ -573,11 +589,14 @@ async fn a_deadline_that_passes_after_the_guard_asked_stops_the_establishment_at
         ErrorCode::PermissionDenied
     );
     assert!(!proven(&controller), "the host still distrusts its clock");
-    assert_eq!(confirmed_at(&temp), None, "nothing was written");
+    assert_eq!(confirmed_at(&rig.temp), None, "nothing was written");
 
-    let door = Door::open(&temp, &controller).await;
-    door.establish()
-        .await
-        .expect("the same confirmation establishes the clock");
+    rig.runtime.block_on(async {
+        let door = Door::open(&rig.temp, &controller).await;
+        door.establish()
+            .await
+            .expect("the same confirmation establishes the clock");
+    });
     assert!(proven(&controller));
+    finish(rig);
 }
