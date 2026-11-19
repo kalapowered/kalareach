@@ -17,15 +17,22 @@ import { endsAsChannelAnswer } from '../src/model/receipts'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
-function start(lostAnswers: number): ReturnType<typeof fakeHost>['controls'] {
+function start(lostAnswers: number, unrecordedAnswers = 0): ReturnType<typeof fakeHost>['controls'] {
   const { port, controls } = fakeHost()
-  controls.records.useChannel(SESSION_MAIN, lostAnswers)
+  controls.records.useChannel(SESSION_MAIN, lostAnswers, unrecordedAnswers)
   render(
     <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
       <App />
     </AppProvider>
   )
   return controls
+}
+
+/** Lets everything a settled promise has queued run, the way a macrotask does, without waiting for time. */
+async function settle(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  })
 }
 
 async function allow(): Promise<void> {
@@ -73,6 +80,55 @@ describe('an answer a channel took', () => {
       </AppProvider>
     )
     await allow()
+    await waitFor(() => {
+      expect(controls.releasedActions).toHaveLength(1)
+    })
+  })
+})
+
+describe('an answer the host cannot tell was taken, on a paired route', () => {
+  it('lets go of nothing when the host holds no receipt for the answer, and says the same words', async () => {
+    const controls = start(0, 1)
+    await allow()
+    expect(await screen.findByText(/does not confirm answers/)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(controls.readActions).toHaveLength(1)
+    })
+    await settle()
+    // The read answered NOT_FOUND: the worker never held the answer, so there is nothing to let go of.
+    expect(controls.releasedActions).toHaveLength(0)
+    expect(controls.releaseAttempts).toBe(0)
+  })
+
+  it('asks for the receipt before it lets go, and lets go of an answer whose receipt reads unknown', async () => {
+    const controls = start(0)
+    await allow()
+    await waitFor(() => {
+      expect(controls.releasedActions).toHaveLength(1)
+    })
+    expect(controls.readActions).toEqual(controls.releasedActions)
+  })
+})
+
+describe('a release that is still on its way', () => {
+  it('is not asked for a second time by the read that follows the answer', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.useChannel(SESSION_MAIN, 0)
+    const finish = controls.holdNextRelease()
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+        <App />
+      </AppProvider>
+    )
+    await allow()
+    // The request now stands as a line beside the others, which the read after the answer drew.
+    await screen.findByTestId('approval-unconfirmed')
+    await waitFor(() => {
+      expect(controls.releaseAttempts).toBe(1)
+    })
+    await settle()
+    expect(controls.releaseAttempts).toBe(1)
+    finish()
     await waitFor(() => {
       expect(controls.releasedActions).toHaveLength(1)
     })
