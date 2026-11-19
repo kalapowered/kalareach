@@ -421,10 +421,15 @@ describe('what is owed', () => {
       host_reference: 'ref-1',
       host_name: "Ric's Mac"
     })
-    const unknown = entry('start_unknown', 'a-1', 5)
-    const unconfirmed = entry('start_unconfirmed', 'a-2', 6)
+    // The device writes the largest 64-bit count for an entry no clock ends; a number holds it
+    // only approximately.
+    const noLapse = 18_446_744_073_709_552_000
+    const unknown = entry('start_unknown', 'a-1', noLapse)
+    const unconfirmed = entry('start_unconfirmed', 'a-2', noLapse)
     const revocation = entry('revocation', null, 4_000)
-    const kept = entry('start_kept', 'a-3', 7)
+    const kept = entry('start_kept', 'a-3', noLapse)
+    // An entry an earlier build wrote has a finite end and lapses as it did.
+    const old = entry('start_unknown', 'a-4', 3_000)
 
     expect(startNoticeOf(unknown)).toBe('a-1')
     expect(startNoticeOf(unconfirmed)).toBe('a-2')
@@ -432,6 +437,8 @@ describe('what is owed', () => {
     expect(startNoticeOf(revocation)).toBeNull()
     expect(nextLapseOf([unknown, unconfirmed])).toBeNull()
     expect(nextLapseOf([unknown, revocation, entry('revocation', null, 9_000)])).toBe(4_000)
+    expect(nextLapseOf([old])).toBe(3_000)
+    expect(nextLapseOf([unknown, old, revocation])).toBe(3_000)
   })
 })
 
