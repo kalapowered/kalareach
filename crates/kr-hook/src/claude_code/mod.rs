@@ -9,35 +9,13 @@
 //!
 //! | Item | What it owns |
 //! | --- | --- |
-//! | [`HOOKS`] | What each hook event reports; [`crate::hook`] runs every hook: prompt, neutral, and never a decision |
+//! | [`crate::hook::EVENTS`] | What each hook event reports, for every application; [`crate::hook`] runs every hook: prompt, neutral, and never a decision |
 //! | [`channel`] | The Channels server: Claude Code's MCP session and the worker's exchange |
 
 pub mod channel;
 
-use crate::hook::{Application, Report};
-
 /// The application name this bridge declares to the worker, as its registration invokes it.
 pub const APPLICATION: &str = "claude-code";
-
-/// Claude Code's hooks: the five events the package registers, whose exit codes refuse nothing.
-///
-/// A session starting after a compaction goes on in the same thread; every other start is a new
-/// selection.
-pub static HOOKS: Application = Application {
-    name: APPLICATION,
-    events: &[
-        (
-            "SessionStart",
-            Report::SessionStarted {
-                continued_by: Some("compact"),
-            },
-        ),
-        ("SessionEnd", Report::SessionEnded),
-        ("PostToolUse", Report::ToolFinished),
-        ("PostToolUseFailure", Report::ToolFailed),
-        ("Notification", Report::Notification),
-    ],
-};
 
 #[cfg(test)]
 mod tests {
@@ -46,7 +24,8 @@ mod tests {
     fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
         let input =
             crate::hook::read_input(payload.to_string().as_bytes()).expect("a hook's input");
-        crate::hook::observation(&HOOKS, &input).map(|frame| frame["kr_observation"].clone())
+        crate::hook::observation(&crate::hook::Application::for_word(APPLICATION), &input)
+            .map(|frame| frame["kr_observation"].clone())
     }
 
     #[test]

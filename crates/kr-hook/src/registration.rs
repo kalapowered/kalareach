@@ -251,10 +251,10 @@ impl FramingName {
 /// The worker validates the declaration against the installation it recorded for the launch: the
 /// application the installed registration invokes this forwarder for, and the surfaces it
 /// registered. A declaration is a claim for the worker to check, not a grant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bridge {
     /// The application whose registration started this process.
-    pub application: &'static str,
+    pub application: std::borrow::Cow<'static, str>,
     /// Which of its registrations it was.
     pub surface: &'static str,
 }
