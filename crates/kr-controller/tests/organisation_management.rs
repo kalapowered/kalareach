@@ -2612,6 +2612,42 @@ fn ending_the_run_where_it_stops(
     finished
 }
 
+/// Starts a policy commit that takes the policy's lock and stops there, lets it go on to the
+/// record, which a step of the case holds, and then lets that step go: the commit holds the
+/// policy's lock while it waits for the record, and the step leaves the record only when the
+/// commit has been let go on. Returns the commit, to be awaited with the step.
+async fn a_policy_commit_that_meets_a_step_in_the_record(
+    controller: &std::sync::Arc<kr_controller::service::Controller>,
+    let_the_step_go: std::sync::mpsc::Sender<()>,
+) -> tokio::task::JoinHandle<kr_controller::Result<()>> {
+    let (policy_is_held, held_rx) = std::sync::mpsc::channel();
+    let (let_the_commit_go, go_rx) = std::sync::mpsc::channel::<()>();
+    let committing = tokio::task::spawn_blocking({
+        let controller = std::sync::Arc::clone(controller);
+        move || {
+            controller.update_policy(|policy| {
+                policy_is_held
+                    .send(())
+                    .expect("the case waits for the commit");
+                go_rx.recv().expect("the case lets the commit go");
+                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
+                    last_synchronised_at_ms: Nullable::some(
+                        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                    ),
+                }));
+            })
+        }
+    });
+    tokio::task::spawn_blocking(move || held_rx.recv_timeout(THE_BOUND))
+        .await
+        .expect("the wait for the commit ends")
+        .expect("the commit takes the policy's lock");
+    let_the_commit_go.send(()).expect("the commit goes on");
+    let_the_step_go.send(()).expect("the step goes on");
+    committing
+}
+
 /// The refusal the local door gives the owner at the host for a subject outside the recovery set
 /// once the owner's lease has ended: asked of a request that arrives then.
 async fn the_door_refusal_after_the_lease_ended(
@@ -2761,31 +2797,8 @@ async fn a_policy_commit_that_takes_its_lock_while_a_confirmation_request_is_in_
     arrives(in_the_record, "the request reaches the record").await;
 
     // The commit takes the policy's lock and stops there, then goes on to the record.
-    let (policy_is_held, held_rx) = std::sync::mpsc::channel();
-    let (let_the_commit_go, go_rx) = std::sync::mpsc::channel::<()>();
-    let committing = tokio::task::spawn_blocking({
-        let controller = Arc::clone(&controller);
-        move || {
-            controller.update_policy(|policy| {
-                policy_is_held
-                    .send(())
-                    .expect("the case waits for the commit");
-                go_rx.recv().expect("the case lets the commit go");
-                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
-                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
-                    last_synchronised_at_ms: Nullable::some(
-                        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
-                    ),
-                }));
-            })
-        }
-    });
-    tokio::task::spawn_blocking(move || held_rx.recv_timeout(THE_BOUND))
-        .await
-        .expect("the wait for the commit ends")
-        .expect("the commit takes the policy's lock");
-    let_the_commit_go.send(()).expect("the commit goes on");
-    let_the_request_go.send(()).expect("the request goes on");
+    let committing =
+        a_policy_commit_that_meets_a_step_in_the_record(&controller, let_the_request_go).await;
 
     tokio::time::timeout(THE_BOUND, asking)
         .await
@@ -2795,6 +2808,53 @@ async fn a_policy_commit_that_takes_its_lock_while_a_confirmation_request_is_in_
     tokio::time::timeout(THE_BOUND, committing)
         .await
         .expect("the commit is made once the request has left the record")
+        .expect("the commit ends")
+        .expect("the policy is written");
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
+    fixture.host.stop().await;
+}
+
+/// The answer to an owner confirmation is recorded in a transaction that holds the record's lock,
+/// as the request is, and a policy commit holds the policy's lock across its writes to the same
+/// record. A commit that takes the policy's lock while the owner at the host's answer, with an
+/// owner device's proof, is inside the record neither waits for the answer nor holds it up: both
+/// are finished. A watchdog ends the process where one waits for the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_policy_commit_that_takes_its_lock_while_a_confirmation_answer_is_in_the_record_neither_waits_for_the_other()
+ {
+    let fixture = Fixture::start().await;
+    let environment = fixture.host.environment_id;
+    let controller = std::sync::Arc::clone(fixture.host.controller());
+    let finished = ending_the_run_where_it_stops(
+        "a confirmation answer that holds the record and a policy commit that holds the policy \
+         wait for each other",
+    );
+
+    let mut client = fixture.host.client().await;
+    let challenge = calls::request(environment, &mut client, an_invitation())
+        .await
+        .expect("the owner at the host asks for the confirmation of an invitation");
+    let (proof, presented) = calls::sign(&challenge.request, &Signer::OwnerDevice(&fixture.owner));
+
+    // The answer stops inside the record, which it holds.
+    let (in_the_record, let_the_answer_go) = controller.pause_inside_the_record_of_a_confirmation();
+    let answering =
+        tokio::spawn(
+            async move { calls::complete(environment, &mut client, proof, presented).await },
+        );
+    arrives(in_the_record, "the answer reaches the record").await;
+
+    let committing =
+        a_policy_commit_that_meets_a_step_in_the_record(&controller, let_the_answer_go).await;
+
+    tokio::time::timeout(THE_BOUND, answering)
+        .await
+        .expect("the answer is recorded while the commit holds the policy's lock")
+        .expect("the answer ends")
+        .expect("the answer is recorded");
+    tokio::time::timeout(THE_BOUND, committing)
+        .await
+        .expect("the commit is made once the answer has left the record")
         .expect("the commit ends")
         .expect("the policy is written");
     finished.store(true, std::sync::atomic::Ordering::SeqCst);
