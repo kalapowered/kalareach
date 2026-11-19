@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::TryStreamExt;
+use futures::future::BoxFuture;
 use tough::{Transport, TransportError, TransportErrorKind, TransportStream};
 use url::Url;
 
@@ -40,18 +41,63 @@ const FIRST_WAIT: Duration = Duration::from_millis(100);
 /// The longest wait between two tries.
 const LONGEST_WAIT: Duration = Duration::from_secs(1);
 
+/// Why one request of the repository client did not give an answer.
+#[derive(Debug)]
+pub enum EgressError {
+    /// The request was sent or tried, and the client failed: a deadline, a connection, or the
+    /// answer's own fault. A deadline or a request that could not be sent is tried again.
+    Send(reqwest::Error),
+    /// The host did not send the request, for a reason of its own that another try does not change.
+    /// It is never tried again.
+    Refused(String),
+}
+
+/// What sends the repository client's requests, so that the host decides what may leave and how a
+/// redirect is followed.
+///
+/// A host with nothing to hold back sends each request with the client's own policy
+/// ([`DirectEgress`]); a host whose proxy holds a login sends it through its own redirect loop,
+/// which stops a request the proxy's login does not allow.
+pub trait Egress: Send + Sync + std::fmt::Debug {
+    /// Sends `request` with `client`, the client built from the host's builder with this module's
+    /// deadlines. A client the host built for a login follows no redirect by itself, and its
+    /// egress follows them.
+    fn execute<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        request: reqwest::Request,
+    ) -> BoxFuture<'a, Result<reqwest::Response, EgressError>>;
+}
+
+/// Sends each request with the client's own redirect policy.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DirectEgress;
+
+impl Egress for DirectEgress {
+    fn execute<'a>(
+        &'a self,
+        client: &'a reqwest::Client,
+        request: reqwest::Request,
+    ) -> BoxFuture<'a, Result<reqwest::Response, EgressError>> {
+        Box::pin(async move { client.execute(request).await.map_err(EgressError::Send) })
+    }
+}
+
 /// Reads a repository from a local directory, or fetches it with the client its host built.
 #[derive(Clone, Debug)]
 pub struct RepositoryTransport {
     /// The client that fetches `http` and `https` addresses, or why this host has none.
     client: Result<reqwest::Client, String>,
+    /// What sends its requests.
+    egress: Arc<dyn Egress>,
 }
 
 impl RepositoryTransport {
     /// Reads `file` URLs from disk, and fetches `http` and `https` ones with a client built from
-    /// `builder`, which carries its host's trust and proxy. This adds the deadlines.
+    /// `builder`, which carries its host's trust and proxy, sending each request through `egress`.
+    /// This adds the deadlines.
     #[must_use]
-    pub fn over(builder: reqwest::ClientBuilder) -> Self {
+    pub fn over(builder: reqwest::ClientBuilder, egress: Arc<dyn Egress>) -> Self {
         let client = builder
             .timeout(FETCH_DEADLINE)
             .connect_timeout(CONNECT_DEADLINE)
@@ -59,7 +105,7 @@ impl RepositoryTransport {
             .map_err(|error| {
                 format!("this host could not configure its repository client: {error}")
             });
-        Self { client }
+        Self { client, egress }
     }
 
     /// Reads `file` URLs from disk and fetches nothing: every `http` and `https` fetch fails with
@@ -68,6 +114,7 @@ impl RepositoryTransport {
     pub fn local_only(reason: impl Into<String>) -> Self {
         Self {
             client: Err(reason.into()),
+            egress: Arc::new(DirectEgress),
         }
     }
 }
@@ -78,7 +125,7 @@ impl Transport for RepositoryTransport {
         let opened = match url.scheme() {
             "file" => tough::FilesystemTransport.fetch(url).await,
             "http" | "https" => match &self.client {
-                Ok(client) => answer(client, url).await,
+                Ok(client) => answer(client, self.egress.as_ref(), url).await,
                 Err(reason) => Err(TransportError::new_with_cause(
                     TransportErrorKind::Other,
                     url,
@@ -96,11 +143,18 @@ impl Transport for RepositoryTransport {
 }
 
 /// Asks for one address: its answer as a stream, or why there is none.
-async fn answer(client: &reqwest::Client, url: Url) -> Result<TransportStream, TransportError> {
+async fn answer(
+    client: &reqwest::Client,
+    egress: &dyn Egress,
+    url: Url,
+) -> Result<TransportStream, TransportError> {
     let mut wait = FIRST_WAIT;
     let mut tried = 1;
     loop {
-        let failed = match client.get(url.clone()).send().await {
+        let request = client.get(url.clone()).build().map_err(|error| {
+            TransportError::new_with_cause(TransportErrorKind::Other, url.clone(), error)
+        })?;
+        let failed = match egress.execute(client, request).await {
             Ok(answer) if answer.status().is_success() => {
                 let url = url.clone();
                 return Ok(Box::pin(answer.bytes_stream().map_err(move |error| {
@@ -127,8 +181,18 @@ async fn answer(client: &reqwest::Client, url: Url) -> Result<TransportStream, T
                 why
             }
             // A deadline or a request that could not be sent: nothing of an answer arrived.
-            Err(error) if error.is_timeout() || error.is_request() => error.to_string(),
-            Err(error) => {
+            Err(EgressError::Send(error)) if error.is_timeout() || error.is_request() => {
+                error.to_string()
+            }
+            // The host did not send it, and another try would not change that.
+            Err(EgressError::Refused(why)) => {
+                return Err(TransportError::new_with_cause(
+                    TransportErrorKind::Other,
+                    url,
+                    why,
+                ));
+            }
+            Err(EgressError::Send(error)) => {
                 return Err(TransportError::new_with_cause(
                     TransportErrorKind::Other,
                     url,

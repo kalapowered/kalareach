@@ -55,17 +55,36 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 /// # Errors
 ///
 /// Returns [`ControllerError::Refused`] when the client cannot be built.
-pub(crate) fn client(proxy: Option<&kr_transport::config::ProxyUrl>) -> Result<reqwest::Client> {
+pub(crate) fn client(proxy: Option<&kr_transport::config::ProxyUrl>) -> Result<FileClient> {
     let refused = |why: String| ControllerError::Refused {
         code: kr_protocol::error::ErrorCode::ResourceUnavailable,
         detail: format!("this host cannot fetch the model's files: {why}"),
     };
-    kr_client::services::http::client_builder(proxy)
+    let builder = kr_client::services::http::client_builder(proxy)
         .map_err(|error| refused(error.to_string()))?
-        .connect_timeout(CONNECT)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(CONNECT);
+    // A proxy that holds a login gets a client that follows no redirect by itself: `send`
+    // follows them, gating each hop.
+    let login = proxy.filter(|proxy| proxy.login().is_some()).cloned();
+    let builder = if login.is_some() {
+        builder
+    } else {
+        builder.redirect(reqwest::redirect::Policy::limited(REDIRECTS))
+    };
+    let client = builder
         .build()
-        .map_err(|error| refused(error.to_string()))
+        .map_err(|error| refused(error.to_string()))?;
+    Ok(FileClient { client, login })
+}
+
+/// How many redirects a model file's address may send a fetch through.
+const REDIRECTS: usize = 5;
+
+/// The client a fetch uses, with the proxy whose login it follows redirects for.
+pub(crate) struct FileClient {
+    client: reqwest::Client,
+    /// The proxy, when it holds a login.
+    login: Option<kr_transport::config::ProxyUrl>,
 }
 
 /// The directory a profile's files are kept in.
@@ -158,7 +177,7 @@ impl Fetches {
         &self,
         host: Arc<DescribeHost>,
         profile: ModelProfile,
-        client: reqwest::Client,
+        client: FileClient,
     ) -> Option<tokio::sync::oneshot::Receiver<()>> {
         let mut running = self.running();
         if running
@@ -217,7 +236,7 @@ async fn until_cancelled(cancel: &mut watch::Receiver<bool>) {
 async fn fetch(
     host: &Arc<DescribeHost>,
     profile: &ModelProfile,
-    client: &reqwest::Client,
+    client: &FileClient,
     cancel: watch::Receiver<bool>,
 ) -> Ended {
     let mut placed = Vec::new();
@@ -235,7 +254,7 @@ async fn fetch(
 async fn fetch_all(
     host: &Arc<DescribeHost>,
     profile: &ModelProfile,
-    client: &reqwest::Client,
+    client: &FileClient,
     mut cancel: watch::Receiver<bool>,
     placed: &mut Vec<PathBuf>,
 ) -> Ended {
@@ -345,7 +364,7 @@ async fn fetch_one(
     host: &Arc<DescribeHost>,
     profile: &ModelProfile,
     asset: &Asset,
-    client: &reqwest::Client,
+    client: &FileClient,
     partial: &Path,
     fetched_before: u64,
     total: u64,
@@ -369,11 +388,59 @@ async fn fetch_one(
     ended
 }
 
+impl FileClient {
+    /// Asks for `url`. A client whose proxy holds a login follows the redirects here, gating each
+    /// hop, and a hop that fails is named by its own address in the failure's words.
+    async fn send(&self, url: &str) -> std::result::Result<reqwest::Response, Ended> {
+        use kr_transport::proxy::{self, FollowFailure, Following};
+
+        let unreached = |source: &str, why: &dyn std::fmt::Display| {
+            Ended::Failed(format!("{source} could not be reached: {why}"))
+        };
+        let source = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split('/').next())
+            .unwrap_or("the model's source");
+        let Some(login) = &self.login else {
+            return self
+                .client
+                .get(url)
+                .send()
+                .await
+                .map_err(|error| unreached(source, &error.without_url()));
+        };
+        let request = self
+            .client
+            .get(url)
+            .build()
+            .map_err(|error| unreached(source, &error.without_url()))?;
+        // The caller bounds how long the answer takes to begin, and the body has no total time.
+        let following = Following {
+            limit: REDIRECTS,
+            deadline: None,
+        };
+        proxy::follow(&self.client, request, following, |hop| {
+            proxy::admit(Some(login), hop)
+        })
+        .await
+        .map_err(|error| {
+            proxy::note_failure(login, &error.url, &error);
+            if let Some(kind) = proxy::proxy_login_kind(&error) {
+                return Ended::Failed(format!("{source} could not be reached: {}", kind.clause()));
+            }
+            match error.failure {
+                FollowFailure::Send(error) => unreached(source, &error.without_url()),
+                other => unreached(source, &other),
+            }
+        })
+    }
+}
+
 /// Writes the body of `asset` to `partial`, and returns how many bytes it was.
 async fn receive(
     host: &Arc<DescribeHost>,
     asset: &Asset,
-    client: &reqwest::Client,
+    client: &FileClient,
     partial: &Path,
     fetched_before: u64,
     total: u64,
@@ -387,13 +454,11 @@ async fn receive(
         .to_owned();
     let stall = host.stall();
     let mut response = tokio::select! {
-        sent = tokio::time::timeout(stall, client.get(&asset.url).send()) => match sent {
+        sent = tokio::time::timeout(stall, client.send(&asset.url)) => match sent {
             Err(_) => return Err(Ended::Failed(format!(
                 "{source} did not answer within {} seconds", stall.as_secs()
             ))),
-            Ok(sent) => sent.map_err(|error| {
-                Ended::Failed(format!("{source} could not be reached: {}", error.without_url()))
-            })?,
+            Ok(sent) => sent?,
         },
         () = until_cancelled(cancel) => return Err(Ended::Cancelled),
     };

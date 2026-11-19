@@ -341,7 +341,7 @@ async fn send(
     };
     let following = Following {
         limit: REDIRECT_LIMIT,
-        deadline: REQUEST_TIMEOUT,
+        deadline: Some(REQUEST_TIMEOUT),
     };
     proxy::follow(client, request, following, |url| {
         proxy::admit(Some(proxy), url)

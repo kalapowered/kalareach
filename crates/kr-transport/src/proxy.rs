@@ -640,8 +640,9 @@ pub fn note_failure(proxy: &ProxyUrl, url: &Url, error: &(dyn Error + 'static)) 
 pub struct Following {
     /// How many redirects are followed: the next one is refused.
     pub limit: usize,
-    /// The one deadline of every hop and of the final body together.
-    pub deadline: Duration,
+    /// The one deadline of every hop and of the final body together, or none when the caller
+    /// bounds the hops itself and reads a body that has no total time.
+    pub deadline: Option<Duration>,
 }
 
 /// Why [`follow`] gave no response.
@@ -743,7 +744,7 @@ fn referer_of(next: &Url, previous: &Url) -> Option<HeaderValue> {
 /// and the next is [`FollowFailure::TooManyRedirects`].
 ///
 /// One deadline, `following.deadline`, bounds every hop and the body of the last response: each hop
-/// is given the time that is left.
+/// is given the time that is left. With none, the client's own timeout applies to each hop.
 ///
 /// `gate` runs before every send, the first included.
 ///
@@ -756,7 +757,9 @@ pub async fn follow(
     following: Following,
     gate: impl Fn(&Url) -> Result<(), ProxyLoginKind>,
 ) -> Result<reqwest::Response, FollowError> {
-    let deadline = tokio::time::Instant::now() + following.deadline;
+    let deadline = following
+        .deadline
+        .map(|deadline| tokio::time::Instant::now() + deadline);
     let mut method = request.method().clone();
     let mut headers = request.headers().clone();
     let version = request.version();
@@ -777,8 +780,10 @@ pub async fn follow(
             });
         }
         // A deadline that has passed is a timeout the library raises before it writes anything.
-        *request.timeout_mut() =
-            Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        if let Some(deadline) = deadline {
+            *request.timeout_mut() =
+                Some(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        }
         let response = client.execute(request).await.map_err(|error| FollowError {
             url: url.clone(),
             failure: FollowFailure::Send(error),

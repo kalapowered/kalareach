@@ -10446,7 +10446,10 @@ async fn a_service_that_fails_to_answer_for_the_next_root_fails_the_synchronisat
         let service = Answering::start(status);
         catalogue.set_transport(Arc::new(LaterRootsElsewhere {
             base: format!("{}/", service.origin).parse().expect("an address"),
-            transport: RepositoryTransport::over(reqwest::Client::builder().no_proxy()),
+            transport: RepositoryTransport::over(
+                reqwest::Client::builder().no_proxy(),
+                Arc::new(kr_plugin_catalogue::transport::DirectEgress),
+            ),
         }));
         let synchronised = catalogue.sync(&repository()).await;
         assert_eq!(
