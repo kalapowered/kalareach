@@ -2133,7 +2133,13 @@ mod tests {
                 .expect("no wait");
             *raising.borrow_mut() = Some(other.pragma_update(None, "user_version", SCHEMA_VERSION));
         });
-        drop(Db::open(root.path()).expect("an unstamped database opens"));
+        let opened = Db::open(root.path());
+        assert!(
+            opened.is_ok(),
+            "an unstamped database opens while another connection waits: {:?}",
+            opened.err()
+        );
+        drop(opened);
         assert!(
             raised
                 .borrow()
