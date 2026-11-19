@@ -3855,11 +3855,9 @@ mod proxy_login_gate {
         let get = || client.get(&address).build().expect("a request");
 
         for _ in 0..2 {
-            let answered = egress
-                .execute(&client, get())
-                .await
-                .ok()
-                .expect("the origin answers");
+            let Ok(answered) = egress.execute(&client, get()).await else {
+                panic!("the origin answers");
+            };
             assert_eq!(answered.status().as_u16(), 200);
         }
         assert_eq!(origin.requests(), 2);
