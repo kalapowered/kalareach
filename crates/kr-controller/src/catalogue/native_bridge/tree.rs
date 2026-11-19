@@ -369,6 +369,24 @@ mod platform {
             .map_err(Into::into)
         }
 
+        /// Makes `from` and `to` trade places in one step: both names stay in use, and no instant
+        /// has either of them absent. It fails where `to` is not there, and where the file system
+        /// has no such exchange (`InvalidInput` on Linux, `Unsupported` on macOS).
+        pub(in crate::catalogue::native_bridge) fn exchange(
+            &self,
+            from: &str,
+            to: &str,
+        ) -> std::io::Result<()> {
+            rustix::fs::renameat_with(
+                self.handle.as_fd(),
+                from,
+                self.handle.as_fd(),
+                to,
+                RenameFlags::EXCHANGE,
+            )
+            .map_err(Into::into)
+        }
+
         /// Renames `from` over whatever is at `to`.
         pub(in crate::catalogue::native_bridge) fn rename_over(
             &self,
@@ -606,6 +624,14 @@ mod platform {
         }
 
         pub(in crate::catalogue::native_bridge) fn rename_new(
+            &self,
+            _from: &str,
+            _to: &str,
+        ) -> std::io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub(in crate::catalogue::native_bridge) fn exchange(
             &self,
             _from: &str,
             _to: &str,

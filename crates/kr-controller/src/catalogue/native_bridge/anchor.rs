@@ -10,11 +10,12 @@
 //! published under a temporary name beside its destination and renamed into place; the folder is
 //! flushed after.
 
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use kr_protocol::scalars::Digest256;
 
-use super::tree::{Child, Dir, Entry, Fetched};
+use super::tree::{Child, Dir, Entry, Fetched, Identity};
 use crate::catalogue::files::{digest_of, storage};
 use crate::error::{ControllerError, Result};
 
@@ -322,9 +323,15 @@ impl Anchor {
     /// one gets `default_mode`. A folder, a link or a special file at the name is refused.
     ///
     /// `replaces` is the digest of the file the caller checked at `path`, or `None` where it found
-    /// nothing. Nothing is replaced that is not that file: where nothing stood, the file is
-    /// published only if the name is still free, and where a file stood, it is published over a
-    /// file whose contents are still the ones the caller checked.
+    /// nothing. Nothing is replaced that is not that file. Where nothing stood, the file is
+    /// published only if the name is still free. Where a file stood, the staged file and the place
+    /// trade names in one step, and the file that came out of the place is read: it must hold the
+    /// checked contents. Anything else, a file another process put there after the last read, a
+    /// link or a folder, is traded back and the write is refused.
+    ///
+    /// Between the two trades the place holds the new contents and the displaced file is under
+    /// the temporary name. It is removed only where it is the checked file. Where it cannot be put
+    /// back it is kept, and the refusal names where.
     pub(crate) fn write(
         &self,
         path: &Path,
@@ -339,12 +346,7 @@ impl Anchor {
                 path.display()
             )));
         };
-        let changed = || {
-            refused(format!(
-                "{} is not what it was when this installation checked it, and an installation                  replaces only the file it checked",
-                path.display()
-            ))
-        };
+        let changed = || changed_since_checked(path);
         let mode = match parent.fetch(place.name, MAX_FILE_BYTES).map_err(storage)? {
             Fetched::Absent if replaces.is_none() => default_mode,
             Fetched::File(read) if replaces == Some(digest_of(&read.bytes)) => read.mode,
@@ -361,33 +363,31 @@ impl Anchor {
             place.name,
             crate::catalogue::files::hex(&kr_cbor::sha256(kr_ipc::new_uuid().as_bytes())[..6])
         );
-        if let Err(unstaged) = parent.stage(&temporary, bytes, mode) {
-            if unstaged.made.is_some() {
-                let _ = parent.remove_file(&temporary);
+        let staged = match parent.stage(&temporary, bytes, mode) {
+            Ok(staged) => staged,
+            Err(unstaged) => {
+                if unstaged.made.is_some() {
+                    let _ = parent.remove_file(&temporary);
+                }
+                return Err(storage(unstaged.error));
             }
-            return Err(storage(unstaged.error));
-        }
+        };
         #[cfg(test)]
         publish_pause::run(path);
-        let published = match replaces {
-            None => parent.rename_new(&temporary, place.name).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    changed()
-                } else {
-                    storage(error)
+        match replaces {
+            None => {
+                if let Err(error) = parent.rename_new(&temporary, place.name) {
+                    let _ = parent.remove_file(&temporary);
+                    return Err(if error.kind() == ErrorKind::AlreadyExists {
+                        changed()
+                    } else {
+                        storage(error)
+                    });
                 }
-            }),
-            Some(expected) => match parent.fetch(place.name, MAX_FILE_BYTES) {
-                Ok(Fetched::File(read)) if digest_of(&read.bytes) == expected => {
-                    parent.rename_over(&temporary, place.name).map_err(storage)
-                }
-                Ok(_) => Err(changed()),
-                Err(error) => Err(storage(error)),
-            },
-        };
-        if let Err(error) = published {
-            let _ = parent.remove_file(&temporary);
-            return Err(error);
+            }
+            Some(expected) => {
+                replace_checked(&parent, &temporary, place.name, &staged, expected, path)?;
+            }
         }
         parent.flush().map_err(storage)
     }
@@ -417,6 +417,93 @@ impl Anchor {
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
         parent.remove_directory(place.name)?;
         parent.flush()
+    }
+}
+
+/// The refusal of a write over a file that is not the one the caller checked.
+fn changed_since_checked(path: &Path) -> ControllerError {
+    refused(format!(
+        "{} is not what it was when this installation checked it, and an installation \
+         replaces only the file it checked",
+        path.display()
+    ))
+}
+
+/// The refusal where the file system cannot trade two names in one step.
+fn no_exchange(path: &Path) -> ControllerError {
+    refused(format!(
+        "{} is on a file system that cannot swap two names in one step, which an installation \
+         needs to replace a file safely, so nothing is written there",
+        path.display()
+    ))
+}
+
+/// The refusal where a file another process put at the place could not be put back, so it is kept
+/// under the temporary name `kept`.
+fn kept_aside(path: &Path, kept: &Path) -> ControllerError {
+    refused(format!(
+        "{} was replaced by another process while this installation wrote it, and that file \
+         could not be put back, so it is kept as {}",
+        path.display(),
+        kept.display()
+    ))
+}
+
+/// Replaces the file at `name` with the staged file at `temporary` when the file at `name` holds
+/// the `expected` contents. The two names trade places in one step, so the place is never absent
+/// and no check stands between a read and the replacement; the file that came out of the place is
+/// then read, and anything but the expected file is put back.
+fn replace_checked(
+    parent: &Dir,
+    temporary: &str,
+    name: &str,
+    staged: &Identity,
+    expected: Digest256,
+    path: &Path,
+) -> Result<()> {
+    if let Err(error) = parent.exchange(temporary, name) {
+        // The names did not trade, so the staged file is still under its own name.
+        let _ = parent.remove_file(temporary);
+        return Err(match error.kind() {
+            ErrorKind::NotFound => changed_since_checked(path),
+            ErrorKind::InvalidInput | ErrorKind::Unsupported => no_exchange(path),
+            _ => storage(error),
+        });
+    }
+    match parent.fetch(temporary, MAX_FILE_BYTES) {
+        Ok(Fetched::File(read)) if digest_of(&read.bytes) == expected => {
+            parent.remove_file(temporary).map_err(storage)
+        }
+        _ => Err(put_back(parent, temporary, name, staged, path)),
+    }
+}
+
+/// Undoes a trade that took a file other than the checked one out of the place. The staged file is
+/// removed only where it is the one this write made; a file that is not, and the file taken out of
+/// the place where it cannot go back, are kept.
+fn put_back(
+    parent: &Dir,
+    temporary: &str,
+    name: &str,
+    staged: &Identity,
+    path: &Path,
+) -> ControllerError {
+    let back = match parent.exchange(temporary, name) {
+        Ok(()) => true,
+        // Something took the staged file from the place: the file taken out of it goes back to
+        // the free name.
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            parent.rename_new(temporary, name).is_ok()
+        }
+        Err(_) => false,
+    };
+    match parent.fetch(temporary, MAX_FILE_BYTES) {
+        Ok(Fetched::Absent) if back => changed_since_checked(path),
+        Ok(Fetched::File(read)) if back && read.identity.same_object(staged) => {
+            let _ = parent.remove_file(temporary);
+            changed_since_checked(path)
+        }
+        _ => kept_aside(path, &parent.join(temporary)),
     }
 }
 

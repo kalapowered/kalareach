@@ -492,7 +492,7 @@ impl Installer {
 
     fn install_on(&self, params: &AgentToolsParams) -> Result<AgentToolsInstallResult> {
         let layout = self.layout(params)?;
-        self.check_on(params)?;
+        let checked = self.check_on(params)?;
         // A record an earlier build named differently is carried onto the name this one gives it,
         // here rather than in a read, so it happens once and under this mutation's own lock.
         self.migrate_records(params)?;
@@ -551,9 +551,11 @@ impl Installer {
             self.begin(params, &mut record, operation.clone())?;
             self.settle_directory(params, &mut record, &directory, operation)?;
         }
-        for (name, contents) in files() {
+        // What each file was when it was checked is what it is replaced over: a file made at a
+        // name after the check, while the folders were made, is not read as the file that stood
+        // there, and is not overwritten.
+        for ((name, contents), replaced) in files().into_iter().zip(checked) {
             let path = root.join(name);
-            let replaced = self.fs.read_digest(&path)?;
             let operation = ChangeOperation::WriteFile {
                 path: display(&path),
                 digest: digest_of(contents.as_bytes()),
@@ -1349,27 +1351,30 @@ impl Installer {
     /// there and this host did not write it, and [`ControllerError::InvalidArgument`] when the
     /// scope needs a project directory that was not given.
     pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
-        self.on_handle(params, false)?.check_on(params)
+        self.on_handle(params, false)?.check_on(params).map(|_| ())
     }
 
-    fn check_on(&self, params: &AgentToolsParams) -> Result<()> {
+    fn check_on(&self, params: &AgentToolsParams) -> Result<Checked> {
         let layout = self.layout(params)?;
         let recorded = self.recorded(params)?;
         self.check_before_writing(params, &layout, recorded.as_ref())
     }
 
     /// What an installation that `recorded` describes would not do to the agent's tree, read
-    /// from the tree.
+    /// from the tree. It answers with what each skill file was when it was read: the digest of a
+    /// file this host owns, or `None` for a name that was free. The installation replaces only
+    /// that.
     fn check_before_writing(
         &self,
         params: &AgentToolsParams,
         layout: &Layout,
         recorded: Option<&InstallationRecord>,
-    ) -> Result<()> {
+    ) -> Result<Checked> {
         self.check_declared_places(params, layout)?;
         self.document_disagrees(params, layout)?;
         let root = layout.skills.as_path();
-        for (name, _) in files() {
+        let mut checked: Checked = [None; FILE_COUNT];
+        for ((name, _), state) in files().into_iter().zip(checked.iter_mut()) {
             let path = root.join(name);
             let Some(present) = self.fs.read_digest(&path)? else {
                 continue;
@@ -1406,6 +1411,7 @@ impl Installer {
                     ),
                 });
             }
+            *state = Some(present);
         }
         if let Some(configuration) = layout.configuration.as_ref() {
             self.guard_existing(&configuration.path, configuration.format)?;
@@ -1418,7 +1424,7 @@ impl Installer {
             // carry no such risk: they are its records and the package it wrote.
             guard_access_controls(&configuration.path, CONFIGURATION_BY_HAND)?;
         }
-        Ok(())
+        Ok(checked)
     }
 
     /// Refuses a declared word's document where another admitted word or a compiled word names the
@@ -2375,6 +2381,7 @@ impl Installer {
         let layout = this.layout(params).map_err(Declined::ByTheRequest)?;
         this.moved_place(params, &layout, recorded.as_ref())
             .and_then(|()| this.check_before_writing(params, &layout, recorded.as_ref()))
+            .map(|_| ())
             .map_err(Declined::ByTheRequest)
     }
 
@@ -2780,8 +2787,15 @@ fn same_place(first: &Path, second: &Path) -> bool {
     folded(first) == folded(second)
 }
 
+/// How many files an installation writes.
+const FILE_COUNT: usize = 3;
+
+/// What each of the files was when the installation checked it, in the order it writes them: the
+/// digest of a file this host owns, or `None` for a name that was free.
+type Checked = [Option<Digest256>; FILE_COUNT];
+
 /// The files an installation writes, in the order it writes them.
-fn files() -> [(&'static str, &'static str); 3] {
+fn files() -> [(&'static str, &'static str); FILE_COUNT] {
     [
         ("SKILL.md", SKILL_MD),
         ("TOOLS.md", TOOLS_MD),
@@ -5688,6 +5702,104 @@ mod tests {
             "{}",
             made.display()
         );
+    }
+
+    /// KR-REQ-11.01: a file another process makes at one of a declared word's names while the
+    /// installation makes its folders is kept. The check found the name free, and what the check
+    /// found is what the publication is held to, so no later read of the name stands in for it.
+    #[cfg(unix)]
+    #[test]
+    fn an_installation_does_not_replace_a_file_made_while_it_makes_its_folders() {
+        let tree = Tree::create();
+        let target = declared(
+            Some(
+                json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+            ),
+            &[".amp", "skills"],
+        );
+        let installer = tree.installer().with_declaration(Some(target), Vec::new());
+        let theirs = tree.home().join(".amp/skills/kalareach-contact/SKILL.md");
+        let made = theirs.clone();
+        anchor::make_pause::once(move |_| {
+            std::fs::create_dir_all(made.parent().expect("a folder")).expect("the folder");
+            std::fs::write(&made, b"not written by this host").expect("another process writes it");
+        });
+        let refused = installer
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a file that was not there at the check is not replaced");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused}"
+        );
+        assert_eq!(
+            std::fs::read(&theirs).expect("the file"),
+            b"not written by this host",
+            "the file another process made is kept"
+        );
+        assert!(
+            !tree.home().join(".amp/mcp.json").exists(),
+            "nothing else is written"
+        );
+    }
+
+    /// KR-REQ-11.01: a file that stood at the check is replaced only if the file at its place when
+    /// the two change places is the checked one. Whatever another process put there after the last
+    /// read, a file under the same name, a link or a folder, is at its place again afterwards, the
+    /// publication is refused, and no temporary file is left.
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_put_in_the_place_after_the_last_read_is_kept() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["a file", "a link", "a folder"] {
+            let tree = Tree::create();
+            let walk = anchor::Anchor::open(&tree.home())
+                .expect("opens")
+                .expect("a root");
+            let place = tree.home().join("doc.json");
+            walk.write(&place, b"one", 0o600, None).expect("a new file");
+            let (other, home) = (tree.home().join("elsewhere.json"), tree.home());
+            let at = place.clone();
+            let elsewhere = other.clone();
+            anchor::publish_pause::once(move |_| {
+                std::fs::remove_file(&at).expect("another process removes the file");
+                match kind {
+                    "a file" => {
+                        std::fs::write(&elsewhere, b"theirs").expect("a file");
+                        std::fs::rename(&elsewhere, &at).expect("put in its place");
+                    }
+                    "a link" => symlink(&elsewhere, &at).expect("a link"),
+                    _ => std::fs::create_dir(&at).expect("a folder"),
+                }
+            });
+            let refused = walk
+                .write(&place, b"two", 0o600, Some(digest_of(b"one")))
+                .expect_err(kind);
+            assert!(
+                matches!(&refused, ControllerError::PermissionDenied { detail }
+                    if detail.contains("replaces only the file it checked")),
+                "{kind}: {refused}"
+            );
+            match kind {
+                "a file" => assert_eq!(std::fs::read(&place).expect("a file"), b"theirs", "{kind}"),
+                "a link" => {
+                    assert_eq!(std::fs::read_link(&place).expect("a link"), other, "{kind}")
+                }
+                _ => assert!(place.is_dir(), "{kind}: the folder is at its place"),
+            }
+            let mut left: Vec<String> = std::fs::read_dir(&home)
+                .expect("the folder")
+                .map(|entry| {
+                    entry
+                        .expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            left.sort();
+            assert_eq!(left, ["doc.json"], "{kind}: nothing else is left");
+        }
     }
 
     /// KR-REQ-11.01: a file where a folder is needed and a folder where a file is to be written
