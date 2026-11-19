@@ -2052,7 +2052,9 @@ read_command!(
 /// asks the host to create it, applies the provider's answer, permits it and opens its control
 /// at the voice service. A start is refused before the host is asked for anything when this
 /// device cannot control the call afterwards, which is when it has no account token for the voice
-/// scope: the service closes a call nobody controls, and a person pays for the seconds it ran.
+/// scope: the service closes a call nobody controls, and a person pays for the seconds it ran. A
+/// call on the host owner's own key is controlled through the host, so the provider the person was
+/// shown is named in the request and no account is asked for before the host answers.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn voice_start<R: tauri::Runtime>(
@@ -2060,6 +2062,7 @@ pub async fn voice_start<R: tauri::Runtime>(
     calls: State<'_, crate::voice::Calls>,
     account: State<'_, crate::account::AccountSlot>,
     subject: Subject,
+    provider: crate::voice::CallProvider,
     session_ids: Vec<String>,
     duration_seconds: u32,
     reasoning_budget_minor: Option<String>,
@@ -2084,6 +2087,7 @@ pub async fn voice_start<R: tauri::Runtime>(
     let started = calls
         .start(
             crate::voice::StartRequest {
+                provider,
                 session_ids,
                 duration_seconds,
                 reasoning_budget_minor,

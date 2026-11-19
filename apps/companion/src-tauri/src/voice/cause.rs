@@ -1,6 +1,16 @@
 //! Why a call ends, and what a person is told about it.
 
 use kr_client::services::voice_control::ControlEnd;
+use kr_protocol::voice_host::VoiceEndReason;
+
+use super::host_control::HostEnding;
+
+/// What a person is told when a call on the host's own key has ended on this phone and the host has
+/// not confirmed that it closed the call at the provider: the host's own absence rule decides
+/// when, and the call may be charged until then.
+pub(super) const LEFT_TO_HOST: &str = "The call has ended on this phone. This host starts closing \
+    the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm \
+    that, the call may keep running on your OpenAI account until OpenAI ends it.";
 
 /// Why a call is ending.
 #[derive(Clone, Debug)]
@@ -16,8 +26,10 @@ pub enum Cause {
     NativeGone,
     /// Native code stopped answering.
     NativeSilent,
-    /// The control ended.
+    /// The voice service's control ended.
     Control(ControlEnd),
+    /// The host's control of a call on its own key ended.
+    Host(HostEnding),
     /// The call reached the moment the host said it closes.
     Deadline,
     /// The account on this device was signed out or replaced.
@@ -49,6 +61,17 @@ impl Cause {
                 ControlEnd::Refused(_) => "service_refused",
                 ControlEnd::Misconfigured => "service_misconfigured",
                 ControlEnd::Unreachable => "service_unreachable",
+            },
+            Self::Host(end) => match end {
+                HostEnding::Reason(VoiceEndReason::Deadline) => "deadline",
+                HostEnding::Reason(VoiceEndReason::Stop) => "host_stopped",
+                HostEnding::Reason(VoiceEndReason::Revocation) => "host_revoked",
+                HostEnding::Reason(VoiceEndReason::ProviderClosed) => "provider_closed",
+                HostEnding::Reason(VoiceEndReason::Silence) => "host_silence",
+                HostEnding::Reason(VoiceEndReason::CredentialRemoved) => "key_removed",
+                HostEnding::Reason(VoiceEndReason::SidebandLost) => "host_sideband_lost",
+                HostEnding::NotKnown(_) => "host_lost_call",
+                HostEnding::Silent => "host_silent",
             },
             Self::Deadline => "deadline",
             Self::AccountChanged => "account_changed",
@@ -102,6 +125,33 @@ impl Cause {
                      ended."
                         .to_owned()
                 }
+            },
+            Self::Host(end) => match end {
+                HostEnding::Reason(VoiceEndReason::Deadline) => {
+                    "The call reached its time limit.".to_owned()
+                }
+                HostEnding::Reason(VoiceEndReason::Stop) => "The host ended the call.".to_owned(),
+                HostEnding::Reason(VoiceEndReason::Revocation) => {
+                    "The host ended the call because this device's grant for it was revoked."
+                        .to_owned()
+                }
+                HostEnding::Reason(VoiceEndReason::ProviderClosed) => {
+                    "OpenAI closed the call.".to_owned()
+                }
+                HostEnding::Reason(VoiceEndReason::Silence) => {
+                    "The host ended the call because it had not heard from this device for two \
+                     minutes."
+                        .to_owned()
+                }
+                HostEnding::Reason(VoiceEndReason::CredentialRemoved) => {
+                    "The OpenAI key on the host was removed, so the call was ended.".to_owned()
+                }
+                HostEnding::Reason(VoiceEndReason::SidebandLost) => {
+                    "The host lost its connection to OpenAI and could not restore it, so the call \
+                     was ended."
+                        .to_owned()
+                }
+                HostEnding::NotKnown(_) | HostEnding::Silent => LEFT_TO_HOST.to_owned(),
             },
             Self::Deadline => "The call reached its time limit.".to_owned(),
             Self::AccountChanged => {

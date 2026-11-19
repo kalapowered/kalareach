@@ -473,11 +473,12 @@ async fn start<R: Runtime>(
         app.state(),
         app.state(),
         Subject::default(),
+        crate::voice::CallProvider::Managed,
         vec![session],
         600,
         None,
         digest,
-        prepared["managed"]["rate"]["version"]
+        prepared["provider"]["managed"]["terms"]["rate"]["version"]
             .as_str()
             .map(str::to_owned),
     )

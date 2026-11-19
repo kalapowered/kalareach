@@ -43,10 +43,10 @@ use kr_client::Settled;
 use kr_client::pairing::owner::CeremonyOutcome;
 use kr_client::services::AccountTokenSource;
 use kr_client::services::account::{AccountStatus, SignedInAccount};
-use kr_client::services::voice::{VOICE_SCOPE, VoiceCommand, same_origin};
+use kr_client::services::voice::{VOICE_SCOPE, VoiceControlEvent, same_origin};
 use kr_client::services::voice_control::{
-    AttemptFailure, ControlEnd, ControlEvents, ControlNews, ControlTarget, OpeningContextSent,
-    SendError, VoiceControl,
+    AttemptFailure, ControlEnd, ControlNews, ControlTarget, OpeningContextSent, SendError,
+    VoiceControl,
 };
 use kr_client::session::ComposedMutation;
 use kr_protocol::ids::{ActionId, VoiceSessionId};
@@ -57,14 +57,16 @@ use kr_protocol::voice::{
     VoiceDelegationId, VoiceDelegationOutcome, VoiceSessionControl, VoiceSessionDescriptor,
     VoiceStartOutcome, VoiceStartParams, VoiceStartResult,
 };
-use kr_protocol::voice_host::VoiceNote;
+use kr_protocol::voice_host::{VoiceContextState, VoiceNote};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 mod ceremony;
+pub(super) mod control;
 #[cfg(test)]
 mod note_tests;
 
+use self::control::{CallControl, CallNews, ControlFeed, Said};
 use super::advice::MuteAdvice;
 use super::cause::Cause;
 use super::delegation::{Cause as Why, Frozen, Gate, Record, Told};
@@ -72,9 +74,14 @@ use super::host::{
     CallHost, Delivered, Exchange, Handover, HostReach, Pairing, ask_again, hand_over, has_ended,
     revoke,
 };
+use super::host_control::{
+    ContextQueued, HostControl, HostEnding, HostLimits, HostNews, HostSendError, SessionLink,
+};
 use super::provider;
 use super::view::{DelegationRow, EndedView, HostEnd, OwedView, ProblemKind, VoiceCallState};
-use super::{Closed, Cmd, NoteKey, ServiceCall, Shared, StartRequest, Started, now_ms};
+use super::{
+    CallProvider, Closed, Cmd, NoteKey, ServiceCall, Shared, StartRequest, Started, now_ms,
+};
 use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::connection::Unopened;
 use crate::error::{CommandError, Result};
@@ -140,6 +147,9 @@ enum Internal {
     Told { delegation_id: String, told: bool },
     /// What came of giving the call the host's default context.
     Opened(Opened),
+    /// What the host answered when asked whether its own side channel heard the delegation `id`: the
+    /// offset it heard it at, and none when it had not.
+    HostHeard { id: String, offset_ms: Option<u64> },
 }
 
 /// How giving a call the host's default context came out.
@@ -158,6 +168,20 @@ enum Opened {
     },
     /// The call ended before it was all given.
     Cut,
+    /// The host's sender took the selection and will write `appends` appends; how it goes arrives
+    /// as the host's news.
+    Queued(ContextQueued),
+    /// The host's sender did not take the selection.
+    HostRefused,
+    /// The host did not say whether its sender took the selection.
+    HostUnanswered,
+    /// The host's sender stopped after `appended` of its `of` appends, and when `unconfirmed` the
+    /// provider did not say whether it took the next.
+    HostStopped {
+        appended: u32,
+        of: u32,
+        unconfirmed: bool,
+    },
 }
 
 impl Opened {
@@ -210,6 +234,48 @@ impl Opened {
                 format!(
                     "This call was given part of the host's context for its session: the voice \
                      service took {accepted} of its {total} parts and not the next."
+                ),
+            )),
+            Self::Queued(_) => None,
+            Self::HostRefused => Some((
+                "the host did not take the selection",
+                "This call was not given the host's context for its session: the host did not \
+                 accept the request to send it."
+                    .to_owned(),
+            )),
+            Self::HostUnanswered => Some((
+                "the host did not say whether it took the selection",
+                "This call may not have been given the host's context for its session: the host \
+                 did not say whether it accepted the request to send it."
+                    .to_owned(),
+            )),
+            Self::HostStopped {
+                appended: 0,
+                unconfirmed: false,
+                ..
+            } => Some((
+                "the host stopped before it sent any of it",
+                "This call was not given the host's context for its session: the host stopped \
+                 before it sent any of it."
+                    .to_owned(),
+            )),
+            Self::HostStopped {
+                appended,
+                of,
+                unconfirmed: true,
+            } => Some((
+                "the provider did not say whether it took the next part",
+                format!(
+                    "This call may not have been given all of the host's context for its \
+                     session: the host sent {appended} of its {of} parts and did not learn \
+                     whether OpenAI took the next."
+                ),
+            )),
+            Self::HostStopped { appended, of, .. } => Some((
+                "the host stopped sending it",
+                format!(
+                    "This call was given part of the host's context for its session: the host \
+                     sent {appended} of its {of} parts and then stopped."
                 ),
             )),
             Self::Cut => Some((
@@ -293,6 +359,21 @@ pub(super) async fn drive(shared: Arc<Shared>, launch: Launch) {
     owner.shared.forget_emergency(owner.id);
 }
 
+/// How long a start stays acceptable to the host. A call on the host's own key is created at the
+/// provider after the host admits the start (the creation may take 30 seconds and a hang-up 15
+/// more), so its start is asked for no less than 45 seconds: an admission that lapses before the
+/// provider answers would leave a call nobody asked for.
+const OWN_KEY_START_TTL: kr_protocol::scalars::DurationMs =
+    kr_protocol::scalars::DurationMs::new(60_000);
+
+/// The time to live a start of this provider asks for.
+fn start_ttl(provider: CallProvider) -> kr_protocol::scalars::DurationMs {
+    match provider {
+        CallProvider::Managed => MUTATION_TTL,
+        CallProvider::OwnKey => OWN_KEY_START_TTL,
+    }
+}
+
 /// A failure's words without the protocol code that a host's message begins with: a person reads
 /// the words, and the code is for the page's own branching.
 fn plain_words(error: &CommandError) -> String {
@@ -350,8 +431,18 @@ pub(super) struct Owner {
     call: Option<CallId>,
     events: Option<CallEvents>,
     descriptor: Option<VoiceSessionDescriptor>,
-    control: Option<VoiceControl>,
-    control_events: Option<ControlEvents>,
+    /// The provider the page started the call for.
+    provider: CallProvider,
+    control: Option<CallControl>,
+    control_events: Option<ControlFeed>,
+    /// The context the host's sender is writing to the model, from the moment the host took it
+    /// until its news says it is done or stopped: one still here when the call ends was cut short.
+    context: Option<ContextSend>,
+    /// The host's connection a control on the host's methods writes over, which follows the call
+    /// when the connection is replaced.
+    link: Option<Arc<SessionLink>>,
+    /// Set when the host said its news queue overflowed: what the call did is not all known.
+    outcomes_uncertain: bool,
     /// Tells the voice service the person's mute, whichever control changed it.
     advice: Option<MuteAdvice>,
     attached_before: bool,
@@ -433,6 +524,12 @@ pub(super) struct Owner {
     taint_told: bool,
 }
 
+/// The context send a host's sender is running for this call.
+struct ContextSend {
+    /// The `voice.context.send` that began it, which the host's news about it names.
+    action_id: kr_protocol::ids::ActionId,
+}
+
 /// A delegation waiting for what was said before it to be read.
 struct Collection {
     id: String,
@@ -499,16 +596,16 @@ fn write_failed_attempt(why: AttemptFailure) {
 
 /// What the end of a call makes of one piece of the control's news while the control closes: the
 /// end is kept, a failed attempt is written down as it is while the call runs, and the rest is let go.
-fn note_while_closing(news: ControlNews, last: &mut Option<ControlEnd>) {
+fn note_while_closing(news: CallNews, last: &mut Option<ControlEnd>) {
     match news {
-        ControlNews::Ended(end) => *last = Some(end),
-        ControlNews::AttemptFailed(why) => write_failed_attempt(why),
-        _ => {}
+        CallNews::Service(ControlNews::Ended(end)) => *last = Some(end),
+        CallNews::Service(ControlNews::AttemptFailed(why)) => write_failed_attempt(why),
+        CallNews::Service(_) | CallNews::Host(_) => {}
     }
 }
 
 /// Waits for the control's next news, or for ever when there is no control.
-async fn next_news(events: &mut Option<ControlEvents>) -> Option<ControlNews> {
+async fn next_news(events: &mut Option<ControlFeed>) -> Option<CallNews> {
     match events {
         Some(events) => events.next().await,
         None => std::future::pending().await,
@@ -564,8 +661,12 @@ impl Owner {
             call: None,
             events: None,
             descriptor: None,
+            provider: CallProvider::Managed,
             control: None,
             control_events: None,
+            context: None,
+            link: None,
+            outcomes_uncertain: false,
             advice: None,
             attached_before: false,
             answered: VecDeque::new(),
@@ -779,9 +880,10 @@ impl Owner {
     pub(super) async fn start(&mut self, request: StartRequest) -> Result<Outcome> {
         self.started = Instant::now();
         self.requested = request.duration_seconds;
+        self.provider = request.provider;
         let host = self.reach.in_use()?;
         self.host = Some(host.clone());
-        self.generation = Some(self.pre_check().await?);
+        self.generation = self.pre_check().await?;
         // A stop that came while the token was checked gives the call up before anything is made.
         if self.pending_cause().is_some() {
             self.stop_native(HostEnd::NotNeeded).await;
@@ -805,6 +907,7 @@ impl Owner {
             Some(call.clone()),
             Some(&host),
             None,
+            self.provider,
             &self.reach,
             &self.tokens,
         );
@@ -858,7 +961,7 @@ impl Owner {
                 None,
                 &NoPreconditions {},
                 &params,
-                MUTATION_TTL,
+                start_ttl(self.provider),
             )
             .await
         {
@@ -880,6 +983,10 @@ impl Owner {
         // the last moment the host could still first admit the request: the end of the action
         // window it carries, on the host's own clock. A repeat can only be answered from the
         // host's record and is never an admission, so nothing later than that can create one.
+        #[cfg(any(test, feature = "testing"))]
+        self.shared
+            .handled
+            .start_ttl(composed.request().requested_ttl_ms.get());
         let until_ms = composed
             .window_issued_at_ms()
             .saturating_add(composed.window_valid_for_ms())
@@ -888,8 +995,10 @@ impl Owner {
         self.shared.keep_start_pending(self.id, action_id, until_ms);
         // From here the host may make a call, and a process that ends before the host answers
         // leaves it owed: the start, under the action it was sent under.
-        self.shared
-            .stand_open(self.id, OwedView::start_unknown(action_id, until_ms, &host));
+        self.shared.stand_open(
+            self.id,
+            OwedView::start_unknown(action_id, until_ms, &host, self.provider),
+        );
         let start_within = self.shared.timings.start_within;
         let sent = match self
             .wait_through(tokio::time::timeout(
@@ -964,7 +1073,12 @@ impl Owner {
                             broker: "unknown".to_owned(),
                         });
                     },
-                    vec![OwedView::start_unknown(action_id, until_ms, &host)],
+                    vec![OwedView::start_unknown(
+                        action_id,
+                        until_ms,
+                        &host,
+                        self.provider,
+                    )],
                 );
                 self.shared.start_was_answered(self.id);
                 return Ok(Outcome::Over(Started::Unknown { action_id }));
@@ -983,6 +1097,7 @@ impl Owner {
             Some(call.clone()),
             self.host.as_ref(),
             Some(&descriptor),
+            self.provider,
             &self.reach,
             &self.tokens,
         );
@@ -1022,39 +1137,49 @@ impl Owner {
         let call = self.call.clone().expect("a call is held");
         let service = self.shared.service.clone();
 
-        // A call the host controls has no socket for this device to open here: the device's half of
-        // that control arrives with the host control, and until it does the call is not followed.
-        let VoiceSessionControl::Broker {
-            origin: broker_origin,
-            control_path,
-            ..
-        } = &descriptor.control
-        else {
-            return self
-                .abandon(Cause::Step(
-                    "the host controls this call itself, and this version of the app cannot \
-                     follow such a call yet, so the call was ended"
-                        .to_owned(),
-                ))
-                .await;
-        };
-        // The service the control is opened at is the one the account is signed in at, whatever
-        // the host said.
-        let target = match ControlTarget::at(
-            &service.origin,
-            broker_origin,
-            control_path,
-            &descriptor.call_id,
-        ) {
-            Ok(target) => target,
-            Err(_) if !same_origin(&service.origin, broker_origin) => {
-                return self.abandon(Cause::ForeignService).await;
+        // The call must run on the provider the person was shown: a person who was shown a managed
+        // call has not read what an own-key call discloses, and the other way round.
+        let (target, heartbeat_seconds) = match (&descriptor.control, self.provider) {
+            (
+                VoiceSessionControl::Broker {
+                    origin: broker_origin,
+                    control_path,
+                    ..
+                },
+                CallProvider::Managed,
+            ) => {
+                // The service the control is opened at is the one the account is signed in at,
+                // whatever the host said.
+                let target = match ControlTarget::at(
+                    &service.origin,
+                    broker_origin,
+                    control_path,
+                    &descriptor.call_id,
+                ) {
+                    Ok(target) => target,
+                    Err(_) if !same_origin(&service.origin, broker_origin) => {
+                        return self.abandon(Cause::ForeignService).await;
+                    }
+                    Err(_) => {
+                        return self
+                            .abandon(Cause::Step(
+                                "the host named a control address that is not the voice \
+                                 service's for this call"
+                                    .to_owned(),
+                            ))
+                            .await;
+                    }
+                };
+                (Some(target), 0)
             }
-            Err(_) => {
+            (VoiceSessionControl::Host { heartbeat_seconds }, CallProvider::OwnKey) => {
+                (None, *heartbeat_seconds)
+            }
+            _ => {
                 return self
                     .abandon(Cause::Step(
-                        "the host named a control address that is not the voice service's for this \
-                         call"
+                        "the host started the call on another provider than the one this device \
+                         showed, so the call was ended"
                             .to_owned(),
                     ))
                     .await;
@@ -1124,11 +1249,35 @@ impl Owner {
             Err(cause) => return self.abandon(cause).await,
         }
 
-        let (control, control_events) = VoiceControl::open(
-            &service.connector,
-            target,
-            Arc::clone(&self.tokens) as Arc<dyn AccountTokenSource>,
-        );
+        let (control, control_events) = if let Some(target) = target {
+            let (control, events) = VoiceControl::open(
+                &service.connector,
+                target,
+                Arc::clone(&self.tokens) as Arc<dyn AccountTokenSource>,
+            );
+            (CallControl::Managed(control), ControlFeed::Managed(events))
+        } else {
+            let timings = self.shared.timings;
+            let host = self.host.clone().expect("a host is held");
+            let link = Arc::new(SessionLink::new(
+                Arc::clone(&host.session),
+                host.environment_id,
+            ));
+            self.link = Some(Arc::clone(&link));
+            let (control, events) = HostControl::open(
+                link,
+                descriptor.voice_session_id,
+                HostLimits {
+                    beat: timings.host_beat.unwrap_or_else(|| {
+                        Duration::from_secs(u64::from(heartbeat_seconds.max(1)))
+                    }),
+                    miss_after: timings.host_miss,
+                    silent_after: timings.host_silent,
+                    within: timings.host_within,
+                },
+            );
+            (CallControl::Host(control), ControlFeed::Host(events))
+        };
         self.advice = Some(MuteAdvice::start(self.platform(), control.clone()));
         self.control = Some(control);
         self.control_events = Some(control_events);
@@ -1161,8 +1310,13 @@ impl Owner {
     }
 
     /// Checks that the account can give the voice token the control will present, before anything
-    /// is created or asked, and returns which grant that is.
-    async fn pre_check(&self) -> Result<String> {
+    /// is created or asked, and returns which grant that is. A call on the host owner's own key is
+    /// controlled through the host, so no account is asked for before the provider is known to be
+    /// the managed one, and such a call holds no account grant.
+    async fn pre_check(&self) -> Result<Option<String>> {
+        if self.provider == CallProvider::OwnKey {
+            return Ok(None);
+        }
         let tokens = Arc::clone(&self.tokens);
         // On a task of its own: a refresh that the caller going away interrupted could lose the
         // token it rotated.
@@ -1192,7 +1346,7 @@ impl Owner {
             }
         }
         match self.tokens.status() {
-            Ok(AccountStatus::SignedIn { generation, .. }) => Ok(generation),
+            Ok(AccountStatus::SignedIn { generation, .. }) => Ok(Some(generation)),
             _ => Err(CommandError::refused(
                 "No account is signed in on this device, so no call was started.",
             )),
@@ -1503,7 +1657,9 @@ impl Owner {
     }
 
     fn on_account(&mut self, open: bool) -> Option<Cause> {
-        if !open {
+        // A call on the host's own key holds nothing of the account: no token pays for it or
+        // controls it, so a change of account changes nothing about it.
+        if !open || self.provider == CallProvider::OwnKey {
             return None;
         }
         match self.tokens.status() {
@@ -1518,63 +1674,172 @@ impl Owner {
         }
     }
 
-    fn on_news(&mut self, news: Option<ControlNews>) -> Option<Cause> {
+    fn on_news(&mut self, news: Option<CallNews>) -> Option<Cause> {
         match news {
-            None => Some(Cause::Control(ControlEnd::Unreachable)),
-            Some(ControlNews::Ended(end)) => Some(Cause::Control(end)),
-            Some(ControlNews::Detached) => {
+            None => Some(match self.control {
+                // A host control that is gone without an end is a host nothing more is heard from.
+                Some(CallControl::Host(_)) => Cause::Host(HostEnding::Silent),
+                _ => Cause::Control(ControlEnd::Unreachable),
+            }),
+            Some(CallNews::Service(news)) => self.on_service_news(news),
+            Some(CallNews::Host(news)) => self.on_host_news(news),
+        }
+    }
+
+    /// What the voice service's socket told.
+    fn on_service_news(&mut self, news: ControlNews) -> Option<Cause> {
+        match news {
+            ControlNews::Ended(end) => Some(Cause::Control(end)),
+            ControlNews::Detached => {
                 self.view(|state| state.control = "unreachable".to_owned());
                 None
             }
             // One line for each failed attempt, by its kind alone: a recorded call can then say
             // which of them stood between the phone and the voice service.
-            Some(ControlNews::AttemptFailed(why)) => {
+            ControlNews::AttemptFailed(why) => {
                 write_failed_attempt(why);
                 None
             }
-            Some(ControlNews::Attached { delegations, .. }) => {
-                self.view(|state| state.control = "connected".to_owned());
-                // A mute told while no socket was open was lost, and the service starts unmuted.
-                if let Some(advice) = &self.advice {
-                    advice.changed();
-                }
-                self.shared.clear_note();
-                if !self.attached_before {
-                    self.attached_before = true;
-                    self.tell_model(
-                        VoiceCommand::Instructions,
-                        None,
-                        if self.accepting {
-                            VoiceNote::HostActionsAvailable.words()
-                        } else {
-                            VoiceNote::HostActionsUnavailable.words()
-                        },
-                    );
-                    self.give_the_host_context();
-                    // A call that was tainted before its control attached tells the model now.
-                    if self.taint_told {
-                        self.tell_model(
-                            VoiceCommand::Instructions,
-                            None,
-                            VoiceNote::SpeechTainted.words(),
-                        );
-                    }
-                }
-                for delegation_id in delegations {
-                    self.answer_delegation(delegation_id, None);
-                }
+            ControlNews::Attached { delegations, .. } => {
+                self.attached(delegations);
                 None
             }
-            Some(ControlNews::Event(
-                kr_client::services::voice::VoiceControlEvent::Delegation {
+            ControlNews::Event(event) => match event {
+                VoiceControlEvent::Delegation {
                     delegation_id,
                     offset_ms,
-                },
-            )) => {
+                } => {
+                    self.answer_delegation(delegation_id, Some(offset_ms));
+                    None
+                }
+                VoiceControlEvent::Ready { .. }
+                | VoiceControlEvent::HeartbeatAcknowledged { .. }
+                | VoiceControlEvent::ContextAccepted { .. }
+                | VoiceControlEvent::ContextAdmitted { .. }
+                | VoiceControlEvent::ContextRefused { .. }
+                | VoiceControlEvent::Usage { .. }
+                | VoiceControlEvent::Closed { .. }
+                | VoiceControlEvent::Notice { .. }
+                | VoiceControlEvent::Unknown { .. } => None,
+            },
+        }
+    }
+
+    /// What the host's heartbeat told.
+    fn on_host_news(&mut self, news: HostNews) -> Option<Cause> {
+        match news {
+            HostNews::Attached { reattached } => {
+                if reattached {
+                    // The notice of two beats unanswered is over with the answer.
+                    self.view(|state| state.pass(ProblemKind::HostPath));
+                }
+                self.attached(Vec::new());
+                None
+            }
+            HostNews::Detached => {
+                self.view(|state| {
+                    state.control = "unreachable".to_owned();
+                    state.meet(ProblemKind::HostPath, HOST_NOT_REACHED.to_owned());
+                });
+                None
+            }
+            HostNews::Delegation {
+                delegation_id,
+                offset_ms,
+            } => {
                 self.answer_delegation(delegation_id, Some(offset_ms));
                 None
             }
-            Some(ControlNews::Event(_)) => None,
+            // By its reason alone: the host's words and the provider's are not this device's to
+            // repeat.
+            HostNews::LateRefusal { reason, .. } => {
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    "the provider refused a write the host had admitted"
+                );
+                None
+            }
+            HostNews::Context {
+                action_id,
+                appended,
+                of,
+                unconfirmed,
+                state,
+            } => {
+                self.on_context_progress(action_id, appended, of, unconfirmed, state);
+                None
+            }
+            // What the call did is not all known: the end says so, and a request spoken is not
+            // taken for one that was not carried out.
+            HostNews::Dropped => {
+                self.outcomes_uncertain = true;
+                None
+            }
+            HostNews::Ended(end) => Some(Cause::Host(end)),
+        }
+    }
+
+    /// The control is attached: the service said `ready`, or the host answered a heartbeat.
+    fn attached(&mut self, delegations: Vec<String>) {
+        self.view(|state| state.control = "connected".to_owned());
+        // A mute told while no socket was open was lost, and the service starts unmuted.
+        if let Some(advice) = &self.advice {
+            advice.changed();
+        }
+        self.shared.clear_note();
+        if !self.attached_before {
+            self.attached_before = true;
+            self.tell_model(
+                if self.accepting {
+                    VoiceNote::HostActionsAvailable
+                } else {
+                    VoiceNote::HostActionsUnavailable
+                },
+                None,
+            );
+            self.give_the_host_context();
+            // A call that was tainted before its control attached tells the model now.
+            if self.taint_told {
+                self.tell_model(VoiceNote::SpeechTainted, None);
+            }
+        }
+        for delegation_id in delegations {
+            self.answer_delegation(delegation_id, None);
+        }
+    }
+
+    /// How the host's sender is getting on with the context it was asked to write, as its news
+    /// tells it. News about another send is not about this one.
+    fn on_context_progress(
+        &mut self,
+        action_id: kr_protocol::ids::ActionId,
+        appended: u32,
+        of: u32,
+        unconfirmed: u32,
+        state: VoiceContextState,
+    ) {
+        if self
+            .context
+            .as_ref()
+            .is_none_or(|send| send.action_id != action_id)
+        {
+            return;
+        }
+        match state {
+            VoiceContextState::Sending => {}
+            VoiceContextState::Done => self.context = None,
+            VoiceContextState::Stopped { stopped_by } => {
+                self.context = None;
+                tracing::warn!(
+                    stopped_by = ?stopped_by,
+                    "the host stopped sending the call's opening context"
+                );
+                self.note_the_opening(&Opened::HostStopped {
+                    appended,
+                    of,
+                    unconfirmed: unconfirmed > 0,
+                });
+            }
         }
     }
 
@@ -1616,13 +1881,8 @@ impl Owner {
         let internal = self.internal_tx.clone();
         tokio::spawn(async move {
             let told = control
-                .send(
-                    VoiceCommand::Commentary,
-                    Some(&delegation_id),
-                    Some(VoiceNote::NothingWasDone.words()),
-                )
-                .await
-                .is_ok();
+                .tell(&Said::from(VoiceNote::NothingWasDone), Some(&delegation_id))
+                .await;
             let _ = internal.send(Internal::Told {
                 delegation_id,
                 told,
@@ -1648,28 +1908,42 @@ impl Owner {
             return;
         };
         let (internal, within) = (self.internal_tx.clone(), self.shared.timings.host_within);
-        self.opening = Some(tokio::spawn(async move {
-            let params = VoiceContextParams {
-                voice_session_id: descriptor.voice_session_id,
-                session_id,
-                selected: kr_protocol::scalars::CanonicalSet::new(),
-                delegation_id: Nullable::null(),
-            };
-            let opened = match tokio::time::timeout(
-                within,
-                host.session
-                    .read::<_, kr_protocol::voice::VoiceContextResult>(
-                        Method::VoiceContext,
-                        &params,
-                    ),
-            )
-            .await
-            {
-                Ok(Ok(read)) => Opened::of(&control.send_call_start_context(&read.selection).await),
-                _ => Opened::NotRead,
-            };
-            let _ = internal.send(Internal::Opened(opened));
-        }));
+        self.opening = Some(match control {
+            CallControl::Managed(control) => tokio::spawn(async move {
+                let params = VoiceContextParams {
+                    voice_session_id: descriptor.voice_session_id,
+                    session_id,
+                    selected: kr_protocol::scalars::CanonicalSet::new(),
+                    delegation_id: Nullable::null(),
+                };
+                let opened = match tokio::time::timeout(
+                    within,
+                    host.session
+                        .read::<_, kr_protocol::voice::VoiceContextResult>(
+                            Method::VoiceContext,
+                            &params,
+                        ),
+                )
+                .await
+                {
+                    Ok(Ok(read)) => {
+                        Opened::of(&control.send_call_start_context(&read.selection).await)
+                    }
+                    _ => Opened::NotRead,
+                };
+                let _ = internal.send(Internal::Opened(opened));
+            }),
+            // The host selects the context and writes it to the provider at its own pace: this
+            // device asks, and the host's news says how far it got.
+            CallControl::Host(control) => tokio::spawn(async move {
+                let opened = match control.send_context(session_id, None).await {
+                    Ok(queued) => Opened::Queued(queued),
+                    Err(HostSendError::Unanswered) => Opened::HostUnanswered,
+                    Err(HostSendError::NotSent | HostSendError::Refused(_)) => Opened::HostRefused,
+                };
+                let _ = internal.send(Internal::Opened(opened));
+            }),
+        });
     }
 
     /// Takes what giving the call the host's context came to: it goes on without what it was not
@@ -1677,6 +1951,11 @@ impl Owner {
     /// after it.
     fn note_the_opening(&mut self, opened: &Opened) {
         self.opening = None;
+        if let Opened::Queued(queued) = opened {
+            self.context = Some(ContextSend {
+                action_id: queued.action_id,
+            });
+        }
         if let Some((why, words)) = opened.problem() {
             tracing::warn!("the call was not given its opening context: {why}");
             self.view(|state| state.meet(ProblemKind::OpeningContext, words));
@@ -1693,14 +1972,12 @@ impl Owner {
     }
 
     /// Tells the model a fixed sentence, on a task of its own so that nothing waits for it.
-    fn tell_model(&self, command: VoiceCommand, delegation: Option<String>, text: &'static str) {
+    fn tell_model(&self, note: VoiceNote, delegation: Option<String>) {
         let Some(control) = self.control.clone() else {
             return;
         };
         tokio::spawn(async move {
-            let _ = control
-                .send(command, delegation.as_deref(), Some(text))
-                .await;
+            let _ = control.tell(&Said::from(note), delegation.as_deref()).await;
         });
     }
 
@@ -1738,6 +2015,14 @@ impl Owner {
                         row.told = told;
                     }
                 });
+                None
+            }
+            // The host's own side channel heard the delegation, and where: that is what the voice
+            // service's announcement is for a call it controls.
+            Internal::HostHeard { id, offset_ms } => {
+                if let Some(offset_ms) = offset_ms {
+                    self.announce(id, Some(offset_ms));
+                }
                 None
             }
             Internal::Opened(opened) => {
@@ -1829,6 +2114,10 @@ impl Owner {
         if let Some(host) = self.host.as_mut() {
             host.session = Arc::clone(session);
         }
+        // A control on the host's methods writes on the connection that reaches the host now.
+        if let Some(link) = &self.link {
+            link.use_session(Arc::clone(session));
+        }
         let watched = Arc::clone(session);
         self.host_closed = Box::pin(async move { watched.closed().await });
         self.host_lost = false;
@@ -1842,18 +2131,10 @@ impl Owner {
             // What was not written before the loss stays unwritten; what may have been is asked
             // about again, now that there is a connection to ask on.
             self.unsent = Arc::new(AtomicBool::new(false));
-            self.tell_model(
-                VoiceCommand::Instructions,
-                None,
-                VoiceNote::HostBackAccepting.words(),
-            );
+            self.tell_model(VoiceNote::HostBackAccepting, None);
             self.ask_after_attempts();
         } else {
-            self.tell_model(
-                VoiceCommand::Instructions,
-                None,
-                VoiceNote::HostBack.words(),
-            );
+            self.tell_model(VoiceNote::HostBack, None);
         }
     }
 
@@ -1862,11 +2143,7 @@ impl Owner {
         if !self.host_lost {
             self.host_lost = true;
             self.view(|state| state.host = "lost".to_owned());
-            self.tell_model(
-                VoiceCommand::Instructions,
-                None,
-                VoiceNote::HostLost.words(),
-            );
+            self.tell_model(VoiceNote::HostLost, None);
             if self.accepting {
                 self.host_path_lost();
             }
@@ -1946,11 +2223,7 @@ impl Owner {
                 SPEECH_TAINTED_PERSON.to_owned(),
             )
         });
-        self.tell_model(
-            VoiceCommand::Instructions,
-            None,
-            VoiceNote::SpeechTainted.words(),
-        );
+        self.tell_model(VoiceNote::SpeechTainted, None);
     }
 
     /// Changes the row of the delegation `id`: what became of it, and why.
@@ -1970,16 +2243,14 @@ impl Owner {
     }
 
     /// Tells the model what became of the delegation `id`, by a request of its own.
-    fn tell_delegation(&self, id: &str, text: String) {
+    fn tell_delegation(&self, id: &str, said: impl Into<Said>) {
+        let said = said.into();
         let Some(control) = self.control.clone() else {
             return;
         };
         let (id, internal) = (id.to_owned(), self.internal_tx.clone());
         tokio::spawn(async move {
-            let told = control
-                .send(VoiceCommand::Commentary, Some(&id), Some(&text))
-                .await
-                .is_ok();
+            let told = control.tell(&said, Some(&id)).await;
             let _ = internal.send(Internal::Told {
                 delegation_id: id,
                 told,
@@ -1993,11 +2264,10 @@ impl Owner {
         self.tell_delegation(
             id,
             if why.taints() {
-                VoiceNote::SpeechTainted.words()
+                VoiceNote::SpeechTainted
             } else {
-                VoiceNote::DelegationRefused.words()
-            }
-            .to_owned(),
+                VoiceNote::DelegationRefused
+            },
         );
     }
 
@@ -2007,11 +2277,10 @@ impl Owner {
         self.tell_delegation(
             id,
             if why.taints() {
-                VoiceNote::SpeechTainted.words()
+                VoiceNote::SpeechTainted
             } else {
-                VoiceNote::DelegationNotSent.words()
-            }
-            .to_owned(),
+                VoiceNote::DelegationNotSent
+            },
         );
     }
 
@@ -2071,6 +2340,18 @@ impl Owner {
             return;
         }
         let due = Instant::now() + self.shared.timings.delegation_wait;
+        // On a call the host controls there is no voice service to announce the delegation: the host
+        // is asked whether its own side channel heard it, and where.
+        if let Some(CallControl::Host(control)) = self.control.clone() {
+            let (internal, asked) = (self.internal_tx.clone(), id.clone());
+            tokio::spawn(async move {
+                let offset_ms = control.heard(&asked).await.ok().flatten();
+                let _ = internal.send(Internal::HostHeard {
+                    id: asked,
+                    offset_ms,
+                });
+            });
+        }
         self.collections.push_back(Collection {
             id,
             offset_ms,
@@ -2297,13 +2578,13 @@ impl Owner {
             Delivered::Refused => {
                 self.unsettled.remove(id);
                 self.set_row(id, "host_refused", Some("host_answer"));
-                self.tell_delegation(id, VoiceNote::DelegationHostRefused.words().to_owned());
+                self.tell_delegation(id, VoiceNote::DelegationHostRefused);
             }
             // A receipt shows that the host holds the action and never what became of it, so it is
             // no decision: the person and the model are told it is not known.
             Delivered::Receipt => {
                 self.set_row(id, "unknown", Some("receipt"));
-                self.tell_delegation(id, VoiceNote::DelegationUnknown.words().to_owned());
+                self.tell_delegation(id, VoiceNote::DelegationUnknown);
             }
             Delivered::Withheld(why) => {
                 self.unsettled.remove(id);
@@ -2318,7 +2599,7 @@ impl Owner {
             }
             Delivered::Unknown => {
                 self.set_row(id, "unknown", None);
-                self.tell_delegation(id, VoiceNote::DelegationUnknown.words().to_owned());
+                self.tell_delegation(id, VoiceNote::DelegationUnknown);
                 if let Some(composed) = composed {
                     self.attempts.insert(
                         id.to_owned(),
@@ -2441,7 +2722,7 @@ impl Owner {
 
     /// Whether a request was written to the host and has no answer: it may have been carried out.
     fn requests_unsettled(&self) -> bool {
-        !self.unsettled.is_empty()
+        !self.unsettled.is_empty() || self.outcomes_uncertain
     }
 
     /* ------------------------------------------------------------------------------------- */
@@ -2478,6 +2759,10 @@ impl Owner {
         // What the opening context came to is in the record before the call is said to have ended,
         // so that a person who reads the end reads it too.
         self.settle_the_opening().await;
+        // A context send the host had not finished when the call ended was cut short by the end.
+        if self.context.take().is_some() {
+            self.note_the_opening(&Opened::Cut);
+        }
         self.view(|state| {
             state.running = false;
             state.begin_ending(id);
@@ -2487,10 +2772,11 @@ impl Owner {
         // The control closes the call at the service while the media and the host are dealt with,
         // and its news is read meanwhile: a control that nobody reads stops reading its socket.
         let closing = match (&self.control, cause.service_closed()) {
-            (Some(control), false) => {
+            (Some(CallControl::Managed(control)), false) => {
                 let control = control.clone();
                 Some(tokio::spawn(async move { control.close().await }))
             }
+            // A call the host controls is closed by the host when the grant is revoked.
             _ => None,
         };
         let draining = self.control_events.take().map(|mut events| {
@@ -2539,14 +2825,18 @@ impl Owner {
             host: host_end.clone(),
         };
 
-        let needs_broker = self.descriptor.is_some();
+        // The voice service finalises only a call it controls. A call the host controls is closed
+        // by the host when the grant is revoked, and a host that did not confirm it is left to.
+        let own_key_call = self.provider == CallProvider::OwnKey && self.descriptor.is_some();
+        let needs_broker = self.descriptor.is_some() && !own_key_call;
+        let left_to_host = own_key_call && !matches!(host_end, HostEnd::Revoked { .. });
         // A request written to the host and not answered may have been carried out, and the aftermath
         // never says nothing was done.
         let unsettled = self.accepting && self.requests_unsettled();
         // What the end owes is recorded with the end and with the host being told, in one step.
         // The grant may be live at the host until the moment the call was to close, by the host's
         // reading of the clock.
-        let owed = match (host_end.owed_reason(), &self.descriptor, &self.host) {
+        let mut owed = match (host_end.owed_reason(), &self.descriptor, &self.host) {
             (Some(words), Some(descriptor), Some(host)) => vec![OwedView::revocation(
                 words,
                 descriptor.voice_session_id,
@@ -2555,6 +2845,13 @@ impl Owner {
             )],
             _ => Vec::new(),
         };
+        if let (true, Some(descriptor), Some(host)) = (left_to_host, &self.descriptor, &self.host) {
+            owed.push(OwedView::left_to_host(
+                descriptor.voice_session_id,
+                owed_until(descriptor.closes_at_ms.get()),
+                host,
+            ));
+        }
         // A call that the service has no record of is noted in the end's own update, so that the
         // end is never shown without the warning that stands before the next start.
         let no_such_call =
@@ -2573,15 +2870,31 @@ impl Owner {
                 state.ended = Some(EndedView {
                     owner: id,
                     cause: cause.word().to_owned(),
-                    words: if unsettled {
-                        format!("{} {REQUESTS_UNSETTLED}", cause.words())
-                    } else {
-                        cause.words()
+                    words: {
+                        let said = match &cause {
+                            // These causes are already the closing sentence.
+                            Cause::Host(HostEnding::Silent | HostEnding::NotKnown(_)) => {
+                                cause.words()
+                            }
+                            _ if left_to_host => {
+                                format!("{} {}", cause.words(), super::cause::LEFT_TO_HOST)
+                            }
+                            _ => cause.words(),
+                        };
+                        if unsettled {
+                            format!("{said} {REQUESTS_UNSETTLED}")
+                        } else {
+                            said
+                        }
                     },
                     closed_locally,
                     host: host_end.clone(),
                     broker: if needs_broker {
                         "pending"
+                    } else if left_to_host {
+                        "left_to_host"
+                    } else if own_key_call {
+                        "closed_by_host"
                     } else {
                         "not_needed"
                     }
@@ -2622,6 +2935,7 @@ impl Owner {
         if let Some(control) = self.control.take() {
             control.stop();
         }
+        self.link = None;
         if let Some(draining) = draining {
             draining.abort();
         }
@@ -2697,27 +3011,28 @@ fn may_have_been_carried_out(state: &str) -> bool {
 /// What the host's result says of a delegation: the state its row takes, the cause when the host
 /// gave one, and what the model is told. A request the host only accepted is told as accepted and
 /// never as done: an acknowledgement proves admission, not execution.
-fn answered_as(outcome: &VoiceDelegationOutcome) -> (&'static str, Option<&'static str>, String) {
+fn answered_as(outcome: &VoiceDelegationOutcome) -> (&'static str, Option<&'static str>, Said) {
     match outcome {
         VoiceDelegationOutcome::Performed { summary, .. } => (
             "performed",
             None,
-            format!("{} {summary}", VoiceNote::DelegationPerformed.words()),
+            Said {
+                note: VoiceNote::DelegationPerformed,
+                summary: Some(summary.to_string()),
+            },
         ),
-        VoiceDelegationOutcome::Admitted { .. } => (
-            "admitted",
-            None,
-            VoiceNote::DelegationAdmitted.words().to_owned(),
-        ),
+        VoiceDelegationOutcome::Admitted { .. } => {
+            ("admitted", None, VoiceNote::DelegationAdmitted.into())
+        }
         VoiceDelegationOutcome::ConfirmationRequired { .. } => (
             "confirmation_required",
             None,
-            VoiceNote::DelegationConfirmation.words().to_owned(),
+            VoiceNote::DelegationConfirmation.into(),
         ),
         VoiceDelegationOutcome::Refused { reason, .. } => (
             "host_refused",
             Some(reason.as_str()),
-            VoiceNote::DelegationHostRefused.words().to_owned(),
+            VoiceNote::DelegationHostRefused.into(),
         ),
     }
 }
@@ -3065,11 +3380,14 @@ mod tests {
         tracing::subscriber::with_default(written.clone(), || {
             super::write_failed_attempt(AttemptFailure::TokenService);
             super::note_while_closing(
-                ControlNews::AttemptFailed(AttemptFailure::ServerError),
+                CallNews::Service(ControlNews::AttemptFailed(AttemptFailure::ServerError)),
                 &mut last,
             );
-            super::note_while_closing(ControlNews::Detached, &mut last);
-            super::note_while_closing(ControlNews::Ended(ControlEnd::Unreachable), &mut last);
+            super::note_while_closing(CallNews::Service(ControlNews::Detached), &mut last);
+            super::note_while_closing(
+                CallNews::Service(ControlNews::Ended(ControlEnd::Unreachable)),
+                &mut last,
+            );
         });
         assert_eq!(last, Some(ControlEnd::Unreachable));
         let lines = written.0.lock().expect("the record").clone();

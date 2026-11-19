@@ -264,16 +264,47 @@ impl OwedView {
     }
 
     /// A start `host` never said it answered, which may have made a call whose grant stands until
-    /// `until_ms`.
+    /// `until_ms`. A call on the host's own key is charged to the owner's account at the provider
+    /// until the host closes it, and the notice says so.
     #[must_use]
-    pub fn start_unknown(action_id: ActionId, until_ms: u64, host: &CallHost) -> Self {
+    pub fn start_unknown(
+        action_id: ActionId,
+        until_ms: u64,
+        host: &CallHost,
+        provider: super::CallProvider,
+    ) -> Self {
         Self {
             kind: "start_unknown".to_owned(),
-            words: "The host never said whether it created the call. If it did, its grant ends by \
-                    itself when the call was to close."
-                .to_owned(),
+            words: match provider {
+                super::CallProvider::Managed => {
+                    "The host never said whether it created the call. If it did, its grant ends \
+                     by itself when the call was to close."
+                }
+                super::CallProvider::OwnKey => {
+                    "The host never said whether it created the call. If it did, the call runs on \
+                     your OpenAI account and OpenAI may charge you until the host closes it; this \
+                     host tries to close any call it finds when it restarts."
+                }
+            }
+            .to_owned(),
             action_id: Some(action_id.to_string()),
             voice_session_id: None,
+            until_ms,
+            ..Self::of(host)
+        }
+    }
+
+    /// A call on the host's own key that this phone left to the host: the host closes it at the
+    /// provider two minutes after it last heard from this phone, and this device cannot learn
+    /// whether it did. It stands until the call's grant has ended, and no later than the host's
+    /// answer or the person's next start shows it closed.
+    #[must_use]
+    pub fn left_to_host(voice_session_id: VoiceSessionId, until_ms: u64, host: &CallHost) -> Self {
+        Self {
+            kind: "host_close".to_owned(),
+            words: super::cause::LEFT_TO_HOST.to_owned(),
+            action_id: None,
+            voice_session_id: Some(voice_session_id.to_string()),
             until_ms,
             ..Self::of(host)
         }

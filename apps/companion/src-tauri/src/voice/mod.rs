@@ -20,6 +20,7 @@ mod cause;
 mod confirm;
 mod delegation;
 mod host;
+mod host_control;
 mod kept;
 mod owner;
 mod provider;
@@ -50,6 +51,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use cause::Cause;
 pub use host::{AppReach, CallHost, HostReach, Pairing, Reaching};
+pub use host_control::HostEnding;
 pub use kept::{Kept, KeptVoice};
 pub use view::{
     CallProblem, DelegationRow, EndedView, HostEnd, OwedView, ProblemKind, VoiceCallState,
@@ -97,6 +99,14 @@ pub struct Timings {
     /// name it. Without the number nobody is asked, so this is also how long a person waits for the
     /// dialog. A parameter of the cases.
     pub session_name_within: Duration,
+    /// Between heartbeats to a host that controls a call, when a case shortens them: none takes the
+    /// host's own figure.
+    pub host_beat: Option<Duration>,
+    /// How long a heartbeat is given before it counts as a miss. Two in a row are told to the person.
+    pub host_miss: Duration,
+    /// How long a host that controls a call may go without answering before the device ends its
+    /// media: the host begins to close the call when it has not heard from the device for this long.
+    pub host_silent: Duration,
 }
 
 impl Default for Timings {
@@ -118,6 +128,9 @@ impl Default for Timings {
             drain_within: Duration::from_secs(5),
             proof_age: Duration::from_millis(500),
             session_name_within: Duration::from_secs(3),
+            host_beat: None,
+            host_miss: Duration::from_secs(10),
+            host_silent: Duration::from_secs(120),
         }
     }
 }
@@ -209,8 +222,25 @@ impl Service {
     }
 }
 
+/// Which provider the page showed the person, and so which the call it asks for must run on.
+///
+/// The page learns it from the host's preparation. The owner uses it before the host has answered
+/// the start: a call on the host owner's own key needs no account on this device, so none is asked
+/// for, and a call that the host then puts on the other provider is ended, because what the person
+/// was shown is not what the host made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallProvider {
+    /// The managed voice service, which an account on this device pays for and controls.
+    Managed,
+    /// The host owner's own account at the provider, which the host controls.
+    OwnKey,
+}
+
 /// What the page asks of a start.
 pub struct StartRequest {
+    /// The provider the person was shown.
+    pub provider: CallProvider,
     /// The sessions the call may reach.
     pub session_ids: Vec<SessionId>,
     /// Seconds of call to ask the service to authorise.
@@ -286,7 +316,14 @@ struct Emergency {
     call: Option<CallId>,
     host: Option<CallHost>,
     voice_session_id: Option<VoiceSessionId>,
+    /// The provider the call runs on.
+    provider: CallProvider,
+    /// The moment the call's grant ends by itself, from the host's closing time for the call and
+    /// the clock allowance, once the host has named the call. It states when the grant ends, not
+    /// when a provider closes the call.
+    grant_until_ms: Option<u64>,
     /// The call at the voice service, and what is owed if the service does not confirm it closed.
+    /// Kept only for a call the voice service controls: a call the host controls has none.
     service_call: Option<ServiceCall>,
     /// A start the host has not been heard to answer: the action it was sent under, and the
     /// moment a call it made would end by itself.
@@ -367,6 +404,9 @@ struct Handled {
     seals: Mutex<Vec<String>>,
     /// The delegations whose ceremony's answer the owner has read, acted on or dropped.
     ceremonies: Mutex<Vec<String>>,
+    /// The time to live each start was asked for, in milliseconds, in the order the starts were
+    /// composed.
+    start_ttls: Mutex<Vec<u64>>,
 }
 
 /// Where a case's hold on the answer to a delegation stands.
@@ -427,6 +467,14 @@ impl DeliveryHold {
 
 #[cfg(any(test, feature = "testing"))]
 impl Handled {
+    /// A start was composed asking to stay acceptable for `ttl_ms`.
+    fn start_ttl(&self, ttl_ms: u64) {
+        self.start_ttls
+            .lock()
+            .expect("the record is not poisoned")
+            .push(ttl_ms);
+    }
+
     /// The owner read the voice service's announcement of the delegation `id`.
     fn announcement(&self, id: String, offset_ms: Option<u64>) {
         self.announcements
@@ -735,6 +783,7 @@ impl Shared {
         call: Option<CallId>,
         host: Option<&CallHost>,
         descriptor: Option<&kr_protocol::voice::VoiceSessionDescriptor>,
+        provider: CallProvider,
         reach: &Arc<dyn HostReach>,
         tokens: &Arc<SignedInAccount>,
     ) {
@@ -753,12 +802,23 @@ impl Shared {
                 call,
                 host: host.cloned(),
                 voice_session_id: descriptor.map(|descriptor| descriptor.voice_session_id),
-                service_call: descriptor.zip(host).map(|(descriptor, host)| ServiceCall {
-                    call_id: descriptor.call_id.clone(),
-                    voice_session_id: descriptor.voice_session_id,
-                    until_ms: owner::owed_until(descriptor.closes_at_ms.get()),
-                    host: host.clone(),
-                }),
+                provider,
+                grant_until_ms: descriptor
+                    .map(|descriptor| owner::owed_until(descriptor.closes_at_ms.get())),
+                service_call: descriptor
+                    .filter(|descriptor| {
+                        matches!(
+                            descriptor.control,
+                            kr_protocol::voice::VoiceSessionControl::Broker { .. }
+                        )
+                    })
+                    .zip(host)
+                    .map(|(descriptor, host)| ServiceCall {
+                        call_id: descriptor.call_id.clone(),
+                        voice_session_id: descriptor.voice_session_id,
+                        until_ms: owner::owed_until(descriptor.closes_at_ms.get()),
+                        host: host.clone(),
+                    }),
                 pending_start,
                 reach: Arc::clone(reach),
                 tokens: Arc::clone(tokens),
@@ -957,21 +1017,45 @@ impl Shared {
                     "not_confirmed"
                 }
             }
+            // A call the host controls is closed by the host. This device asks no voice service and
+            // holds no token for one: what the host did not confirm is left to it.
+            (None, end)
+                if kept.provider == CallProvider::OwnKey && kept.grant_until_ms.is_some() =>
+            {
+                if matches!(end, HostEnd::Revoked { .. }) {
+                    "closed_by_host"
+                } else {
+                    "left_to_host"
+                }
+            }
             // A start the host may have answered made a call this device cannot name.
             (None, _) if kept.pending_start.is_some() => "unknown",
             (None, _) => "not_needed",
         };
-        if let (Some(words), Some(service), Some(id), Some(host), true) = (
+        if let (Some(words), Some(until_ms), Some(id), Some(host), true) = (
             host_end.owed_reason(),
-            &kept.service_call,
+            kept.grant_until_ms,
             kept.voice_session_id,
             &kept.host,
             toward_host_asked,
         ) {
-            owed.push(OwedView::revocation(words, id, service.until_ms, host));
+            owed.push(OwedView::revocation(words, id, until_ms, host));
+        }
+        if let (true, Some(until_ms), Some(id), Some(host)) = (
+            broker == "left_to_host",
+            kept.grant_until_ms,
+            kept.voice_session_id,
+            &kept.host,
+        ) {
+            owed.push(OwedView::left_to_host(id, until_ms, host));
         }
         if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
-            owed.push(OwedView::start_unknown(action_id, until_ms, host));
+            owed.push(OwedView::start_unknown(
+                action_id,
+                until_ms,
+                host,
+                kept.provider,
+            ));
         }
         // The end and what it owes are shown in one update.
         let accepts = self.accepts_host_delegations();
@@ -993,14 +1077,19 @@ impl Shared {
                             cause: "owner_failed".to_owned(),
                             // A call that may have acted cannot say that nothing was done: what
                             // the owner had written to the host went with the owner.
-                            words: if accepts {
-                                format!(
+                            words: match (broker == "left_to_host", accepts) {
+                                (true, true) => {
+                                    format!("{} {}", cause::LEFT_TO_HOST, owner::REQUESTS_UNSETTLED)
+                                }
+                                (true, false) => cause::LEFT_TO_HOST.to_owned(),
+                                (false, true) => format!(
                                     "This device's call stopped working, so the call was ended. {}",
                                     owner::REQUESTS_UNSETTLED
-                                )
-                            } else {
-                                "This device's call stopped working, so the call was ended."
-                                    .to_owned()
+                                ),
+                                (false, false) => {
+                                    "This device's call stopped working, so the call was ended."
+                                        .to_owned()
+                                }
                             },
                             closed_locally,
                             host: host_end.clone(),
@@ -1182,6 +1271,21 @@ impl Calls {
         self.shared
             .as_ref()
             .is_some_and(|shared| shared.accepts_host_delegations())
+    }
+
+    /// The time to live, in milliseconds, each start composed by this device's calls asked for, in
+    /// order. For cases that read what a start asked.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn start_ttls_asked(&self) -> Vec<u64> {
+        self.shared.as_ref().map_or_else(Vec::new, |shared| {
+            shared
+                .handled
+                .start_ttls
+                .lock()
+                .expect("the record is not poisoned")
+                .clone()
+        })
     }
 
     /// Whether an owner has read the voice service's announcement of the delegation `id` at
