@@ -2235,8 +2235,8 @@ export function fakeHost(
       requireConnection()
       checkOpening('actionRead', params.session_id ?? '', opening)
       // Over a host this device is paired with a receipt is read for a session, which the read
-      // names; the link is the session's own, the opening's or the ambient one.
-      if (pairedDevice && params.session_id === undefined) {
+      // names; the link is the one the action was answered on, the opening's or the ambient one.
+      if (pairedDevice && params.session_id == null) {
         refuse(
           'INVALID_ARGUMENT',
           'a receipt read on a host this device is paired with names the session the receipt belongs to'
