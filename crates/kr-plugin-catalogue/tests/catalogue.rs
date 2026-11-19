@@ -2625,6 +2625,24 @@ async fn placed_statement_edited(
     edit_manifest: impl FnOnce(&mut serde_json::Value),
     withhold_table: bool,
 ) -> CatalogueResult<Option<String>> {
+    placed_statement_granted(
+        name,
+        edit,
+        edit_manifest,
+        withhold_table,
+        [PluginCapability::NativeBridgeInstall],
+    )
+    .await
+}
+
+/// [`placed_statement_edited`] for a grant that holds `grant`.
+async fn placed_statement_granted(
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+    edit_manifest: impl FnOnce(&mut serde_json::Value),
+    withhold_table: bool,
+    grant: impl IntoIterator<Item = PluginCapability>,
+) -> CatalogueResult<Option<String>> {
     let home = tempfile::tempdir().expect("a temporary directory");
     let packages = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(
@@ -2650,7 +2668,7 @@ async fn placed_statement_edited(
             &PluginId::new(format!("kalareach/{name}")).expect("a plugin identifier"),
             &PackageVersion::parse("0.5.0").expect("a valid version"),
             generation.manifest_digest(),
-            &InstallationGrant::with([PluginCapability::NativeBridgeInstall]),
+            &InstallationGrant::with(grant),
         )
         .await
 }
@@ -2806,6 +2824,45 @@ async fn kr_req_11_44_a_release_whose_table_cannot_be_fetched_or_read_gets_a_ref
             "{what}: {refusal:?}"
         );
     }
+}
+
+/// KR-REQ-11.44: a release whose whole statement, the publisher's words, the host's reading of the
+/// placement and its reading of the command integration, is longer than an owner is shown whole is
+/// refused, though each part is within its own limit; the same release with a shorter integration
+/// is shown its statement.
+#[tokio::test]
+async fn a_whole_statement_longer_than_the_bound_is_refused() {
+    use kr_plugin_sdk::placement::Placement;
+    let claude = |table: &mut serde_json::Value| {
+        table["placement"] = serde_json::to_value(Placement::claude_code()).expect("a placement");
+    };
+    let both = [
+        PluginCapability::NativeBridgeInstall,
+        PluginCapability::CommandIntegrationLaunch,
+    ];
+    let with_filler = |length: usize| {
+        move |manifest: &mut serde_json::Value| {
+            manifest["command_integration"]["flags"]
+                .as_array_mut()
+                .expect("flags")
+                .push(serde_json::json!("x".repeat(length)));
+        }
+    };
+    let shown = placed_statement_granted("claude-code", claude, with_filler(1), false, both)
+        .await
+        .expect("the release is read")
+        .expect("a statement");
+    assert!(
+        shown.chars().count() <= kr_protocol::confirmation::STATEMENT_CHARS,
+        "the control is within the bound: {}",
+        shown.chars().count()
+    );
+    let refusal = placed_statement_granted("claude-code", claude, with_filler(3500), false, both).await;
+    assert!(
+        matches!(&refusal, Err(CatalogueError::UnsafePackage { detail })
+            if detail.contains("whole statement is longer")),
+        "{refusal:?}"
+    );
 }
 
 /// KR-REQ-11.44: the publisher's words never hold the host's label for its reading of a placement,
