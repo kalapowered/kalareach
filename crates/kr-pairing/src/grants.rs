@@ -180,7 +180,7 @@ pub fn validate_proposal(proposal: &ProposedGrant, kind: GrantKind, now_ms: u64)
     }
 }
 
-/// Issues the grant a proposal describes, enforcing the delegation rule.
+/// Issues the grant a proposal describes to `recipient`, enforcing the delegation rule.
 ///
 /// `parent` is the grant the issuer is delegating from, when it is delegating. A child that asks
 /// for more rights, more resources, more history or a longer life than its parent is refused: the
@@ -196,6 +196,7 @@ pub fn issue_grant(
     kind: GrantKind,
     now_ms: u64,
     identities: &GrantIdentities,
+    recipient: DeviceId,
     parent: Option<&Grant>,
 ) -> Result<Grant> {
     validate_proposal(&proposal, kind, now_ms)?;
@@ -203,7 +204,7 @@ pub fn issue_grant(
     let grant = proposal.into_grant(
         identities.grant_id,
         identities.issuer_device_id,
-        identities.recipient_device_id,
+        recipient,
         identities.authority_revision,
     );
     match (parent, declared_parent.0) {
@@ -233,15 +234,15 @@ pub fn issue_grant(
 /// The identities only the host can assign to a grant.
 ///
 /// They travel together because they are assigned together, in the transition that commits the
-/// device record and the grant.
+/// device record and the grant. The device the grant is issued to is not one of them: it is
+/// derived from the invitation and the candidate's key (`identity::committed_device_id`), so it
+/// cannot be assigned independently of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GrantIdentities {
     /// The grant's own identity.
     pub grant_id: GrantId,
     /// The device that issued it.
     pub issuer_device_id: DeviceId,
-    /// The device it is issued to.
-    pub recipient_device_id: DeviceId,
     /// The host authority revision it is issued under.
     pub authority_revision: AuthorityRevision,
 }
@@ -516,7 +517,7 @@ mod tests {
                 );
                 assert!(
                     matches!(
-                        issue_grant(proposal, kind, 0, &identities(7, 1, 2), None),
+                        issue_grant(proposal, kind, 0, &identities(7, 1), device(2), None),
                         Err(PairingError::GrantNotPermitted { .. })
                     ),
                     "no grant is issued from it either ({kind:?}, {named})"
@@ -546,11 +547,10 @@ mod tests {
         ));
     }
 
-    fn identities(grant: u8, issuer: u8, recipient: u8) -> GrantIdentities {
+    fn identities(grant: u8, issuer: u8) -> GrantIdentities {
         GrantIdentities {
             grant_id: GrantId::new(Uuid::from_bytes([grant; 16])),
             issuer_device_id: device(issuer),
-            recipient_device_id: device(recipient),
             authority_revision: AuthorityRevision::new(3),
         }
     }
@@ -560,7 +560,8 @@ mod tests {
             proposal,
             GrantKind::SessionInvitation,
             0,
-            &identities(7, 1, 2),
+            &identities(7, 1),
+            device(2),
             parent,
         )
     }
@@ -577,7 +578,8 @@ mod tests {
             child.clone(),
             GrantKind::SessionInvitation,
             0,
-            &identities(8, 2, 3),
+            &identities(8, 2),
+            device(3),
             Some(&parent),
         )
         .expect("a narrower grant");
@@ -591,7 +593,8 @@ mod tests {
                 longer,
                 GrantKind::PersonalOwner,
                 0,
-                &identities(9, 2, 3),
+                &identities(9, 2),
+                device(3),
                 Some(&parent),
             ),
             Err(PairingError::GrantNotPermitted { .. })

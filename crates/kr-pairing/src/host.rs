@@ -51,6 +51,7 @@ use crate::code::{CodeSecret, GeneratedCode, generate_code};
 use crate::confirm::{self, ConfirmationExpectation, ConfirmationLedger, HostEnrolment};
 use crate::error::{PairingError, Result};
 use crate::grants::{self, GrantIdentities, GrantKind};
+use crate::identity::committed_device_id;
 use crate::platform::{
     InvitationRecord, InvitationState, InvitationStore, LivePeer, LocatorReservation, PairingClock,
     PairingCommitment, RendezvousHost, TransitionOutcome, require_completed_handshake,
@@ -1002,18 +1003,23 @@ impl<S: InvitationStore, C: PairingClock> HostInvitation<S, C> {
             &self.proposal.proposed_grant,
             approved.action_digest(),
         )?;
+        let device_id = committed_device_id(
+            self.record.invitation_id,
+            &client_bundle.bundle.keys.authorisation,
+        )?;
         let grant = grants::issue_grant(
             self.proposal.proposed_grant.clone(),
             self.proposal.grant_kind,
             self.clock.wall_clock_ms(),
             identities,
+            device_id,
             parent,
         )?;
 
         let commitment = PairingCommitment {
             invitation_id: self.record.invitation_id,
             attempt_id,
-            device_id: identities.recipient_device_id,
+            device_id,
             grant,
             client_keys: client_bundle.bundle.keys,
             client_bundle: Some(client_bundle.bundle.clone()),

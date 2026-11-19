@@ -15,6 +15,7 @@ pub mod direct;
 mod error;
 pub mod grants;
 pub mod host;
+pub mod identity;
 pub mod platform;
 pub mod spake;
 pub mod transcript;

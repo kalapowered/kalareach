@@ -27,6 +27,7 @@ use kr_pairing::host::{
     ApprovedCandidate, HostIdentity, HostInvitation, InvitationProposal, OwnerApproval,
     OwnerContext, cancel_unfinished_invitations,
 };
+use kr_pairing::identity::committed_device_id;
 use kr_pairing::platform::{
     InvitationState, InvitationStore, LocatorRecord, PairingCommitment, TestClient,
     TestClientBudgetStore, TestClock, TestLivePeer, TestRendezvousHost,
@@ -397,9 +398,14 @@ impl Harness {
         GrantIdentities {
             grant_id: GrantId::new(Uuid::from_bytes([8; 16])),
             issuer_device_id: self.host_device(),
-            recipient_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
             authority_revision: AuthorityRevision::new(1),
         }
+    }
+
+    /// The identity the candidate is committed under: derived from the invitation and its key.
+    fn committed_device(&self, invitation_id: InvitationId) -> DeviceId {
+        committed_device_id(invitation_id, &self.client_keys.public_keys().authorisation)
+            .expect("an identity")
     }
 }
 
@@ -1374,7 +1380,7 @@ fn an_answer_whose_owner_device_was_revoked_commits_nothing() {
     assert!(rows.events_after(None, 10).expect("readable").is_empty());
     assert!(
         directory
-            .record_for_device(harness.identities().recipient_device_id)
+            .record_for_device(harness.committed_device(invitation_id))
             .expect("readable")
             .is_none()
     );
@@ -1422,10 +1428,98 @@ fn a_candidate_holding_the_signers_key_does_not_vouch_for_it() {
     assert!(rows.events_after(None, 10).expect("readable").is_empty());
     assert!(
         directory
-            .record_for_device(harness.identities().recipient_device_id)
+            .record_for_device(harness.committed_device(invitation_id))
             .expect("readable")
             .is_none()
     );
+}
+
+/// Commits one device, then offers the store a second commitment for another invitation that
+/// repeats one identity of the first: its device identity, or its endpoint. Nothing is written
+/// for the second, and the first is as it was.
+fn a_second_commitment_that_repeats_a_device_is_refused(same_device: bool) {
+    let temp = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let path = temp.path().join("registry.sqlite3");
+    let (directory, rows) = open(&path);
+    let first_harness = Harness::new(rows.clone());
+    let mut first_host = first_harness.issue();
+    bind(&first_harness, &mut first_host);
+    let first = approve(&first_harness, &mut first_host).expect("a commitment");
+
+    let harness = Harness::new(rows.clone());
+    let mut host = harness.issue();
+    let approved = bind(&harness, &mut host);
+    let invitation_id = host.invitation_id();
+    let before = rows
+        .load(invitation_id)
+        .expect("readable")
+        .expect("a record");
+    let mut next = before.clone();
+    next.state = InvitationState::Committed;
+    let approval = harness.approval(
+        SensitiveAction::ConfirmDevice,
+        approved.action_digest(),
+        Some(harness.client_keys.public_keys()),
+    );
+    let device_id = if same_device {
+        first.device_id
+    } else {
+        harness.committed_device(invitation_id)
+    };
+    let client_keys = if same_device {
+        harness.client_keys.public_keys()
+    } else {
+        first.client_keys
+    };
+    let mut grant = first.grant.clone();
+    grant.recipient_device_id = device_id;
+    let repeated = PairingCommitment {
+        invitation_id,
+        attempt_id: before.state.locked_attempt().expect("a locked attempt"),
+        device_id,
+        grant,
+        client_keys,
+        client_bundle: Some(client_bundle(&harness.client_keys)),
+        proposed_grant: harness.grant.clone(),
+        verification_value: approved.verification_value(),
+        owner_confirmation: approval.proof.clone(),
+        committed_at_ms: TimestampMs::new(harness.clock_wall()),
+    };
+
+    assert!(
+        rows.commit(&before, &next, &repeated).is_err(),
+        "a commitment that repeats a device is refused"
+    );
+    assert_eq!(
+        rows.load(invitation_id).expect("readable"),
+        Some(before),
+        "the second invitation did not move"
+    );
+    assert!(rows.commitment(invitation_id).expect("readable").is_none());
+    let kept = directory
+        .record_for_device(first.device_id)
+        .expect("readable")
+        .expect("the first device's record");
+    assert_eq!(kept.endpoint_id, first.client_keys.transport);
+    assert_eq!(
+        rows.commitment(first.invitation_id).expect("readable"),
+        Some(first),
+        "the first commitment is as it was"
+    );
+}
+
+/// KR-REQ-10.29: a device identity names one device. A commitment that repeats the identity of a
+/// device on record, from another endpoint, is refused and writes nothing.
+#[test]
+fn a_commitment_whose_device_identity_is_on_record_is_refused() {
+    a_second_commitment_that_repeats_a_device_is_refused(true);
+}
+
+/// KR-REQ-10.29: an endpoint belongs to one device. A commitment from the endpoint of a device on
+/// record, under another device identity, is refused and writes nothing.
+#[test]
+fn a_commitment_from_an_endpoint_on_record_is_refused() {
+    a_second_commitment_that_repeats_a_device_is_refused(false);
 }
 
 /// KR-REQ-10.05, KR-REQ-10.06: an owner device's grant is judged inside the transaction that

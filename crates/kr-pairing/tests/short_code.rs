@@ -19,9 +19,11 @@ use kr_pairing::host::{
     OwnerApproval, OwnerContext, StatusViewer, cancel_unfinished_invitations,
     recover_candidate_status, recover_commitment,
 };
+use kr_pairing::identity::committed_device_id;
+use kr_pairing::platform::InvitationStore as _;
 use kr_pairing::platform::{
-    InvitationState, LocatorRecord, TestClient, TestClientBudgetStore, TestClock,
-    TestInvitationStore, TestLivePeer, TestRendezvousHost,
+    InvitationState, LocatorRecord, PairingCommitment, TestClient, TestClientBudgetStore,
+    TestClock, TestInvitationStore, TestLivePeer, TestRendezvousHost,
 };
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
@@ -210,7 +212,6 @@ impl Harness {
         GrantIdentities {
             grant_id: GrantId::new(Uuid::from_bytes([8; 16])),
             issuer_device_id: self.host_device_id,
-            recipient_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
             authority_revision: AuthorityRevision::new(1),
         }
     }
@@ -355,6 +356,15 @@ fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
     assert_eq!(committed.grant.actions, proposal().actions);
     assert_eq!(committed.grant.issuer_device_id, harness.host_device_id);
     assert_eq!(committed.grant.recipient_device_id, committed.device_id);
+    assert_eq!(
+        committed.device_id,
+        committed_device_id(
+            committed.invitation_id,
+            &harness.client_keys.public_keys().authorisation
+        )
+        .expect("an identity"),
+        "the device identity is derived from the invitation and the candidate's key"
+    );
     assert_eq!(
         committed.owner_confirmation.request.action,
         SensitiveAction::ConfirmDevice,
@@ -1384,6 +1394,54 @@ fn the_host_checks_the_candidate_it_is_talking_to_and_refuses_early_data() {
     host.finish(&request, &client_peer).expect("a pairing");
 }
 
+/// KR-REQ-10.29: a device identity is a key of the store. A commitment whose device identity is
+/// already on record is refused before either record is touched, so the identity a device derives
+/// for itself names one device.
+#[test]
+fn a_commit_whose_device_identity_is_on_record_is_refused() {
+    let harness = Harness::new();
+    let mut first = harness.issue();
+    let entered = EnteredCode::parse(&first.code().display_text()).expect("the code");
+    run_exchange(&harness, &mut first, &entered).expect("a pairing");
+    let committed = approve(&harness, &mut first).expect("a commitment");
+
+    let second = harness.issue();
+    let second_id = second.record().invitation_id;
+    let before = harness
+        .store
+        .load(second_id)
+        .expect("a read")
+        .expect("the second invitation's record");
+    let mut next = before.clone();
+    next.state = InvitationState::Committed;
+    let same_device = PairingCommitment {
+        invitation_id: second_id,
+        ..committed.clone()
+    };
+    assert!(matches!(
+        harness.store.commit(&before, &next, &same_device),
+        Err(PairingError::Store { .. })
+    ));
+    assert_eq!(
+        harness.store.load(second_id).expect("a read"),
+        Some(before),
+        "the second invitation's record did not move"
+    );
+    assert_eq!(
+        harness.store.commitment(second_id).expect("a read"),
+        None,
+        "nothing was committed for it"
+    );
+    assert_eq!(
+        harness
+            .store
+            .commitment(committed.invitation_id)
+            .expect("a read"),
+        Some(committed),
+        "the first commitment is as it was"
+    );
+}
+
 /// KR-REQ-10.26: a device name is display text and never authority. A candidate whose validly
 /// signed bundle names it after the issuing owner, or after the host itself, is committed like any
 /// other: under the device identity the host assigns, with the invitation's grant and nothing
@@ -1410,12 +1468,20 @@ fn a_device_name_confers_no_authority() {
         );
         assert_eq!(
             committed.device_id,
-            harness.grant_identities().recipient_device_id,
-            "{name}: the device identity is the one the host assigned"
+            committed_device_id(
+                committed.invitation_id,
+                &harness.client_keys.public_keys().authorisation
+            )
+            .expect("an identity"),
+            "{name}: the device identity is the one derived from its invitation and key"
         );
         assert_ne!(committed.device_id, harness.host_device_id);
         assert_eq!(committed.grant.actions, proposal().actions, "{name}");
-        grants.push(committed.grant);
+        let mut grant = committed.grant;
+        // Each name has fresh keys, so each device has its own derived identity; the rest of the
+        // grant is what is compared.
+        grant.recipient_device_id = harness.host_device_id;
+        grants.push(grant);
     }
     assert!(
         grants.windows(2).all(|pair| pair[0] == pair[1]),
@@ -1655,7 +1721,6 @@ fn a_transport_retry_retrieves_the_committed_result() {
             &approved,
             &GrantIdentities {
                 grant_id: GrantId::new(Uuid::from_bytes([0xee; 16])),
-                recipient_device_id: DeviceId::new(Uuid::from_bytes([0xdd; 16])),
                 ..harness.grant_identities()
             },
             None,

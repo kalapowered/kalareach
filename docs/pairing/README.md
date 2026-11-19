@@ -204,6 +204,16 @@ invitation somebody can answer; and the grant itself is issued through `issue_gr
 committing transaction, so what is written is a grant that passed both rules rather than one a
 caller handed in.
 
+### The device's identity
+
+The identity a committed device is given is derived, not drawn: the first 16 bytes of
+`SHA-256(CBOR(["kr-pair/device-id/1", invitation identifier, authorisation key]))`, with both
+identifiers as byte strings, under KR-CBOR-1. The invitation is the one that was redeemed and the
+key is the candidate's authorisation key in the bundle it signed, so a device that holds both
+computes the identity it was given, whether or not it heard the answer. A store treats a device
+identity as a key: a commitment whose identity is already on record is refused before anything is
+written. A device paired before this derivation keeps the identity its record already has.
+
 A pairing proposal of either kind names no current approval or question. A grant may name exact
 current decisions only where they are previewed to the person issuing it, and a pairing invitation
 shows its issuer the rights it proposes and no preview of any named resource. So the host gives no

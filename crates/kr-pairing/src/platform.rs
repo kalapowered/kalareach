@@ -313,9 +313,14 @@ pub trait InvitationStore {
     /// checks the authority the commit is made under, the owner confirmation's included, reports a
     /// failed check as [`TransitionOutcome::Refused`], having written nothing.
     ///
+    /// A device identity is a key of the store: a commitment whose device identity is already on
+    /// record is refused with [`PairingError::Store`] before either record is touched, so the
+    /// identity a device derives for itself (`identity::committed_device_id`) names one device.
+    ///
     /// # Errors
     ///
-    /// Returns [`PairingError::Store`] when the transaction does not commit.
+    /// Returns [`PairingError::Store`] when the transaction does not commit, or when the device
+    /// identity is already on record.
     fn commit(
         &self,
         expected: &InvitationRecord,
@@ -873,6 +878,14 @@ impl InvitationStore for TestInvitationStore {
         self.interleave_now(&mut state);
         match state.records.get(&expected.invitation_id) {
             Some(current) if current == expected => {
+                if state.commitments.values().any(|held| {
+                    held.device_id == commitment.device_id
+                        && held.invitation_id != commitment.invitation_id
+                }) {
+                    return Err(PairingError::Store {
+                        reason: "that device identity is already on record".to_owned(),
+                    });
+                }
                 state.records.insert(next.invitation_id, next.clone());
                 state
                     .commitments
