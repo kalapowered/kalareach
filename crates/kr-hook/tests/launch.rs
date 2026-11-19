@@ -546,31 +546,49 @@ impl Shell {
         added: &[String],
         cwd: &Path,
     ) -> CommandBackend {
+        self.try_establish_exactly(integration, executable, typed, answered, added, cwd)
+            .expect("a backend is established")
+    }
+
+    /// [`Self::establish_exactly`], returning why no backend is established where none is, for a
+    /// case that asserts the establishment in its own body.
+    fn try_establish_exactly(
+        &self,
+        integration: &CommandIntegration,
+        executable: &Path,
+        typed: &[String],
+        answered: &[String],
+        added: &[String],
+        cwd: &Path,
+    ) -> Result<CommandBackend, String> {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _entered = self.runtime.enter();
-        self.backends
-            .establish(&EstablishRequest {
-                prompt_generation: PromptGeneration::new(generation),
-                typed,
-                arguments: answered,
-                added,
-                integration,
-                executable: executable.to_str().expect("a text path"),
-                cwd: cwd.to_str().expect("a text path"),
-                cwd_revision: CwdRevision::new(1),
-                root_shell: kr_ipc::identity::current_process_start_identity()
-                    .expect("this process"),
-            })
-            .expect("a backend is established")
+        self.backends.establish(&EstablishRequest {
+            prompt_generation: PromptGeneration::new(generation),
+            typed,
+            arguments: answered,
+            added,
+            integration,
+            executable: executable.to_str().expect("a text path"),
+            cwd: cwd.to_str().expect("a text path"),
+            cwd_revision: CwdRevision::new(1),
+            root_shell: kr_ipc::identity::current_process_start_identity().expect("this process"),
+        })
     }
 
     /// Establishes a backend for `gemini` typed with the script, which its integration answers
     /// with nothing added.
     fn establish_gemini(&self) -> CommandBackend {
+        self.try_establish_gemini()
+            .expect("a backend is established")
+    }
+
+    /// [`Self::establish_gemini`], returning why no backend is established where none is.
+    fn try_establish_gemini(&self) -> Result<CommandBackend, String> {
         let typed = gemini_typed();
-        self.establish_exactly(
+        self.try_establish_exactly(
             &gemini_integration(),
             &self.executable,
             &typed,
@@ -1471,7 +1489,9 @@ fn kr_req_12_20_a_declared_variable_reaches_the_program_through_a_committed_laun
         "a package that declares its variable is installed"
     );
     for (own, name) in [(None, "declared-absent"), (Some("0"), "declared-zero")] {
-        let answer = shell.establish_gemini();
+        let answer = shell
+            .try_establish_gemini()
+            .unwrap_or_else(|why| panic!("{name}: a backend is established: {why}"));
         let exported: Vec<&str> = answer
             .environment
             .iter()
@@ -1502,7 +1522,9 @@ fn kr_req_12_20_a_declared_variable_reaches_the_program_through_a_committed_laun
 }
 
 /// KR-REQ-12.20: a launch that runs as typed keeps the person's own value of a variable the package
-/// declares, or its absence, whether the backend refused the launch or the record was refused.
+/// declares, or its absence, when the backend refuses the launch. A launch the backend never
+/// answers takes the same route, which
+/// `kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_variable` holds.
 #[test]
 fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_variable() {
     let shell = Shell::gemini_declaring();
@@ -1515,7 +1537,9 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_varia
         (None, "declared-refused-absent", "unset"),
     ] {
         // Another credential: the backend refuses the launch.
-        let answer = shell.establish_gemini();
+        let answer = shell
+            .try_establish_gemini()
+            .unwrap_or_else(|why| panic!("{name}: a backend is established: {why}"));
         std::fs::write(
             Shell::directory(&answer).join("credential"),
             "05".repeat(32),

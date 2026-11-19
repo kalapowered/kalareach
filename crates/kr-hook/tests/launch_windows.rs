@@ -327,28 +327,44 @@ impl Shell {
         added: &[String],
         cwd: &Path,
     ) -> CommandBackend {
+        self.try_establish_answered(typed, arguments, added, cwd)
+            .expect("a backend is established")
+    }
+
+    /// [`Self::establish_answered`], returning why no backend is established where none is, for a
+    /// case that asserts the establishment in its own body.
+    fn try_establish_answered(
+        &self,
+        typed: &[String],
+        arguments: &[String],
+        added: &[String],
+        cwd: &Path,
+    ) -> Result<CommandBackend, String> {
         let generation = self
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let _entered = self.runtime.enter();
-        self.backends
-            .establish(&EstablishRequest {
-                prompt_generation: PromptGeneration::new(generation),
-                typed,
-                arguments,
-                added,
-                integration: &self.integration(),
-                executable: self.executable.to_str().expect("a text path"),
-                cwd: cwd.to_str().expect("a text path"),
-                cwd_revision: CwdRevision::new(1),
-                root_shell: kr_ipc::identity::current_process_start_identity()
-                    .expect("this process"),
-            })
-            .expect("a backend is established")
+        self.backends.establish(&EstablishRequest {
+            prompt_generation: PromptGeneration::new(generation),
+            typed,
+            arguments,
+            added,
+            integration: &self.integration(),
+            executable: self.executable.to_str().expect("a text path"),
+            cwd: cwd.to_str().expect("a text path"),
+            cwd_revision: CwdRevision::new(1),
+            root_shell: kr_ipc::identity::current_process_start_identity().expect("this process"),
+        })
     }
 
     fn establish(&self) -> CommandBackend {
         self.establish_in(self.placed.host.root())
+    }
+
+    /// [`Self::establish`], returning why no backend is established where none is.
+    fn try_establish(&self) -> Result<CommandBackend, String> {
+        let typed = self.typed();
+        self.try_establish_answered(&typed, &typed, &[], self.placed.host.root())
     }
 
     /// Starts the launcher for `vector` as the shell's executor does: with the answer's variable, a
@@ -427,6 +443,31 @@ impl Shell {
             env,
             self.placed.host.root(),
         )
+    }
+
+    /// Runs the launcher as [`Self::launch`] does, except that it is a plain child of this test,
+    /// outside the shell's jobs, so that its standard error can be read, which a launch in the
+    /// jobs gives to the null device. Waits for it to end and returns what it said. The program
+    /// must end by itself (`EXIT_WITH`), since no job here holds it.
+    fn launch_heard(&self, answer: &CommandBackend, name: &str, env: &[(&str, &str)]) -> String {
+        let mut command = std::process::Command::new(&self.placed.forwarder);
+        command
+            .arg("launch")
+            .arg("--")
+            .arg(&self.executable)
+            .args(self.typed())
+            .current_dir(self.placed.host.root())
+            .env("REPORT", self.reports.join(name))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null());
+        for variable in &answer.environment {
+            command.env(&variable.name, &variable.value);
+        }
+        for (variable, value) in env {
+            command.env(variable, value);
+        }
+        let output = command.output().expect("the launcher runs");
+        String::from_utf8_lossy(&output.stderr).into_owned()
     }
 
     /// Waits for the report a launched program writes, and says what became of the launcher when
@@ -703,7 +744,9 @@ fn kr_req_12_20_a_declared_variable_reaches_the_program_through_a_committed_laun
         "a package that declares its variable is installed"
     );
     for (own, name) in [(None, "declared-absent"), (Some("0"), "declared-zero")] {
-        let answer = shell.establish();
+        let answer = shell
+            .try_establish()
+            .unwrap_or_else(|why| panic!("{name}: a backend is established: {why}"));
         let own: Vec<(&str, &str)> = own
             .map(|value| ("GEMINI_CLI_NO_RELAUNCH", value))
             .into_iter()
@@ -717,6 +760,17 @@ fn kr_req_12_20_a_declared_variable_reaches_the_program_through_a_committed_laun
         assert_eq!(
             PathBuf::from(&report["variable"]),
             Shell::registration(&answer),
+            "{name}: and the registration the shell exported is the launch's"
+        );
+        assert!(
+            Shell::registration(&answer).exists(),
+            "{name}: the launch published its registration"
+        );
+        assert!(
+            matches!(
+                shell.state_of(Shell::instance_of(&answer)),
+                Some(BackendState::Committed(_))
+            ),
             "{name}: and the launch was committed"
         );
     }
@@ -732,7 +786,9 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_varia
         shell.installed,
         "a package that declares its variable is installed"
     );
-    let answer = shell.establish();
+    let answer = shell
+        .try_establish()
+        .unwrap_or_else(|why| panic!("a backend is established: {why}"));
     let mut typed = shell.typed();
     typed.push("another".to_owned());
     let mut launcher = shell.launcher(
@@ -760,7 +816,9 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_varia
 #[test]
 fn kr_req_12_20_a_launch_record_naming_a_reserved_variable_is_refused() {
     let shell = Shell::new();
-    let answer = shell.establish();
+    let answer = shell
+        .try_establish()
+        .unwrap_or_else(|why| panic!("a backend is established: {why}"));
     let directory = Shell::registration(&answer)
         .parent()
         .expect("the backend's directory")
@@ -778,8 +836,17 @@ fn kr_req_12_20_a_launch_record_naming_a_reserved_variable_is_refused() {
         serde_json::to_vec(&record).expect("a record encodes"),
     )
     .expect("the record is replaced");
-    let mut launcher = shell.launch(&answer, "reserved", &[]);
-    let report = shell.report_from("reserved", &mut launcher);
+    let said = shell.launch_heard(&answer, "reserved", &[("EXIT_WITH", "0")]);
+    assert!(
+        said.contains(
+            "the backend's launch record cannot be read (the launch record names \"KR_SESSION\", \
+             which is not a variable a launch sets), so the program runs as typed"
+        ),
+        "{said}"
+    );
+    let report = parsed(&String::from_utf8_lossy(
+        &std::fs::read(shell.reports.join("reserved")).expect("the program reported"),
+    ));
     assert_ne!(
         report["relaunch"], "1",
         "no variable the record names reaches the program: {report:?}"
