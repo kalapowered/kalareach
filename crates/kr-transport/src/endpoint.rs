@@ -2107,6 +2107,22 @@ mod tests {
         endpoint.close().await;
     }
 
+    /// An opener that opens nothing: the front is up, and no tunnel is made.
+    struct NoTunnels;
+
+    impl crate::front::TunnelOpener for NoTunnels {
+        fn open<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+        ) -> futures::future::BoxFuture<
+            'a,
+            std::result::Result<crate::front::Tunnel, crate::front::TunnelRefusal>,
+        > {
+            Box::pin(async { Err(crate::front::TunnelRefusal::Failed) })
+        }
+    }
+
     /// A closer whose close waits on a gate and counts its calls.
     fn held_closer() -> (
         EndpointCloser,
@@ -2235,19 +2251,6 @@ mod tests {
     /// port is refused by the system, and the steps ran in order.
     #[tokio::test]
     async fn the_closer_ends_the_front_after_iroh_closes() {
-        struct NoTunnels;
-        impl crate::front::TunnelOpener for NoTunnels {
-            fn open<'a>(
-                &'a self,
-                _host: &'a str,
-                _port: u16,
-            ) -> futures::future::BoxFuture<
-                'a,
-                std::result::Result<crate::front::Tunnel, crate::front::TunnelRefusal>,
-            > {
-                Box::pin(async { Err(crate::front::TunnelRefusal::Failed) })
-            }
-        }
         let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
         let login = crate::proxy::ProxyCredential::new(
             kr_crypto::secret::SecretVec::new(b"user".to_vec()),
@@ -2305,19 +2308,6 @@ mod tests {
     /// complete and the front is gone.
     #[tokio::test]
     async fn a_login_the_proxy_stops_taking_closes_the_endpoint_and_nothing_is_sent_after() {
-        struct NoTunnels;
-        impl crate::front::TunnelOpener for NoTunnels {
-            fn open<'a>(
-                &'a self,
-                _host: &'a str,
-                _port: u16,
-            ) -> futures::future::BoxFuture<
-                'a,
-                std::result::Result<crate::front::Tunnel, crate::front::TunnelRefusal>,
-            > {
-                Box::pin(async { Err(crate::front::TunnelRefusal::Failed) })
-            }
-        }
         let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
         let login = crate::proxy::ProxyCredential::new(
             kr_crypto::secret::SecretVec::new(b"user".to_vec()),
@@ -2373,5 +2363,56 @@ mod tests {
             "the front is gone once the end is complete"
         );
         assert_eq!(closer.steps(), ["gate", "close", "front"]);
+    }
+
+    /// KR-REQ-10.02: the login is printed nowhere: not the user name, not the password, not their
+    /// Basic form, in no `Debug` or `Display` of the credential, the proxy address that holds it,
+    /// the endpoint's configuration, the closer, the guard or the errors a refused bind gives.
+    #[tokio::test]
+    async fn a_login_is_printed_nowhere() {
+        use base64::Engine as _;
+
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let login = crate::proxy::ProxyCredential::new(
+            kr_crypto::secret::SecretVec::new(b"us3r-planted".to_vec()),
+            kr_crypto::secret::SecretVec::new(b"pw0rd-planted".to_vec()),
+        )
+        .expect("a login");
+        let needles = [
+            "us3r-planted".to_owned(),
+            "pw0rd-planted".to_owned(),
+            base64::engine::general_purpose::STANDARD.encode("us3r-planted:pw0rd-planted"),
+        ];
+        let proxy: crate::config::ProxyUrl = "https://proxy.example:3128".parse().expect("a proxy");
+        let proxy = proxy.with_login(login.clone());
+        let config = EndpointConfig {
+            relay_urls: vec!["https://relay.example./".parse().expect("a relay")],
+            proxy_url: Some(proxy.clone()),
+            login_front: Some(crate::front::FrontOpener(std::sync::Arc::new(NoTunnels))),
+            ..EndpointConfig::default()
+        };
+        let refused = bind_listener(&config, &identity)
+            .await
+            .err()
+            .expect("a listener takes no proxy that holds a login");
+        let (endpoint, closer) = bind_network(&config, &identity)
+            .await
+            .expect("a network endpoint");
+        let guard = guard_proxy(&closer, &login);
+        let printed = [
+            format!("{login:?}"),
+            format!("{proxy:?} {proxy}"),
+            format!("{config:?}"),
+            format!("{closer:?}"),
+            format!("{guard:?}"),
+            format!("{refused} {refused:?}"),
+        ];
+        for text in &printed {
+            for needle in &needles {
+                assert!(!text.contains(needle.as_str()), "{text}");
+            }
+        }
+        closer.close().await;
+        assert!(endpoint.is_closed());
     }
 }

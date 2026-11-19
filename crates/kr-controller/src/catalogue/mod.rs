@@ -3748,3 +3748,60 @@ mod tests {
         );
     }
 }
+
+// The stand-in proxy of the suites that run it from `tests/`.
+#[cfg(test)]
+#[path = "../../../kr-client/tests/support/connect_proxy.rs"]
+#[allow(dead_code)]
+mod connect_proxy;
+
+#[cfg(test)]
+mod proxy_login_gate {
+    use kr_crypto::secret::SecretVec;
+    use kr_transport::proxy::{ProxyCredential, ProxyLoginKind, StopKind};
+
+    use super::connect_proxy::ConnectProxy;
+    use super::*;
+
+    /// KR-REQ-10.02: the catalogue's requests, when the proxy holds a login, are gated by the
+    /// egress: a plain `http` address is refused, and every address after the verdict, with the
+    /// kind's words and with nothing sent to the proxy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_catalogues_egress_refuses_a_plain_http_address_and_every_address_after_the_verdict()
+     {
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let login = ProxyCredential::new(
+            SecretVec::new(b"user".to_vec()),
+            SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login");
+        let url = proxy
+            .url
+            .parse::<kr_transport::config::ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let client = kr_client::services::http::client_builder(Some(&url))
+            .expect("a client builder")
+            .build()
+            .expect("a client");
+        let egress = LoginEgress { proxy: url };
+        let get = |address: &str| client.get(address).build().expect("a request");
+
+        let Err(EgressError::Refused(said)) = egress
+            .execute(&client, get("http://repo.example/index"))
+            .await
+        else {
+            panic!("a plain http address is refused");
+        };
+        assert_eq!(said, ProxyLoginKind::ClearTextTarget.clause());
+        login.refuse(StopKind::Refused);
+        let Err(EgressError::Refused(said)) = egress
+            .execute(&client, get("https://repo.example/index"))
+            .await
+        else {
+            panic!("an address after the verdict is refused");
+        };
+        assert_eq!(said, ProxyLoginKind::Refused.clause());
+        assert_eq!(proxy.accepted(), 0, "nothing reached the proxy");
+    }
+}
