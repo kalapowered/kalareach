@@ -6063,9 +6063,9 @@ async fn a_device_whose_only_row_is_damaged_is_revoked_through_the_device_revoke
             key_literal(held.grant_id)
         ),
     );
-    device_revoke_method(&host, 0x71, device)
-        .await
-        .expect("a row that cannot be read does not stop the revocation");
+    if let Err(error) = device_revoke_method(&host, 0x71, device).await {
+        panic!("a row that cannot be read does not stop the revocation: {error:?}");
+    }
     let record = host
         .controller
         .devices()
@@ -6214,8 +6214,9 @@ async fn an_owners_grant_revoke_beside_a_row_with_no_name_is_answered() {
             key_literal(other.grant_id)
         ),
     );
-    let answer = grant_revoke_method(&host, 0x74, held.grant_id)
-        .await
-        .expect("the revocation is answered, not left unknown");
+    let answer = match grant_revoke_method(&host, 0x74, held.grant_id).await {
+        Ok(answer) => answer,
+        Err(error) => panic!("the revocation is answered, not left unknown: {error:?}"),
+    };
     assert!(answer.revoked_grants.contains(&held.grant_id));
 }

@@ -184,6 +184,71 @@ mod tests {
         );
     }
 
+    /// A store with a row of each class, written by raw SQL, a malformed key among them, and a live
+    /// grant below a deleted row: the check reads the places and the classes from the store, and
+    /// its detail holds no key and no decoded identifier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_doctor_check_of_a_damaged_store_names_each_row_by_place_and_class_and_no_key() {
+        use crate::service::a_revocation_beside_a_row_that_cannot_be_read::{
+            device_id, grant_id, issue, key,
+        };
+        use crate::service::a_transfer_left_unanswered::daemon;
+        use crate::service::one_barrier_for_every_restriction::beside;
+
+        let (temp, controller) = daemon().await;
+        let holder = device_id(0xe5);
+        for byte in 0x41..=0x47 {
+            issue(&controller, byte, None, holder);
+        }
+        issue(&controller, 0x49, None, holder);
+        issue(&controller, 0x48, Some(0x49), holder);
+        let damage = |grant: u8, set: &str| {
+            format!(
+                "UPDATE grants SET {set} WHERE grant_id = {};",
+                key(grant_id(grant))
+            )
+        };
+        beside(&temp)
+            .execute_batch(&format!(
+                "{}{}{}{}{}DELETE FROM grants WHERE grant_id = {};",
+                damage(0x41, "grant_id = 'not a blob'"),
+                damage(0x43, "grant = X'00'"),
+                damage(0x44, "grant_id = X'0102'"),
+                damage(
+                    0x46,
+                    "recipient_device_id = X'abababababababababababababababab'"
+                ),
+                damage(0x47, "parent_grant_id = X'00'"),
+                key(grant_id(0x49)),
+            ))
+            .expect("the rows are damaged");
+
+        let check = controller.grants_check();
+        assert_eq!(check.status, DoctorStatus::Failed);
+        assert_eq!(
+            check.detail(),
+            "Some grants rows cannot be read: row 1 (a column holds a value of the wrong type), \
+             row 3 (its record does not decode), row 4 (its key does not name the grant it \
+             holds), row 6 (its recipient column does not match its record), row 7 (its parent \
+             column does not match its record). 1 live grant traces to no root: it sits below a \
+             row that cannot be read or is missing, or its chain of parents forms a loop. A row \
+             that cannot be read gives no new access, though a connection opened before the \
+             damage keeps what it held until the owner's next revocation. Until it is repaired \
+             this host can refuse to list, transfer, share, offer or redeem grants where such a \
+             row is involved. The owner's revocation of a device still withdraws every grant of \
+             the device and every grant that traces to no root, and marks each row that cannot \
+             be read as revoked."
+        );
+        for byte in 0x41..=0x49_u8 {
+            let hex = format!("{byte:02x}").repeat(16);
+            assert!(
+                !check.detail().to_lowercase().contains(&hex),
+                "no grant identifier is in the detail"
+            );
+        }
+        assert!(!check.detail().contains("0102") && !check.detail().contains("abab"));
+    }
+
     /// A store whose rows all decode, with live grants that sit below a missing row or in a loop,
     /// counts them and says nothing of a row that cannot be read, nor of grants refusing to list.
     #[test]

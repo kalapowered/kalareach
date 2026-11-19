@@ -456,3 +456,69 @@ fn the_undo_refuses_when_the_registrys_log_cannot_be_taken_in() {
         "the registry is as the repair left it"
     );
 }
+
+/// A row whose key is not an identifier is named by its place, with the words "malformed key" where
+/// the key goes, and nothing of the row's payload.
+#[test]
+fn the_preview_names_a_row_whose_key_is_not_an_identifier_by_its_place() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = damaged_registry(&temp);
+    rusqlite::Connection::open(&path)
+        .expect("opens")
+        .execute_batch(&format!(
+            "UPDATE grants SET grant_id = X'0102' WHERE grant_id = {};",
+            key(0x41)
+        ))
+        .expect("a key that is not an identifier");
+    let preview = run_kr(&temp, &["host", "repair-grants"]);
+    assert!(preview.status.success(), "{}", said(&preview));
+    assert_eq!(
+        said(&preview),
+        format!(
+            "Grants rows that cannot be read: 1.\n  row 1: its record does not decode; key malformed key\n\
+             Live grants that would be withdrawn: 1.\n  grant {}\n\
+             Nothing is changed. Run with --apply to change it.\n",
+            id(0x42)
+        )
+    );
+    assert_eq!(grants_rows(&path), 2, "the preview changes nothing");
+}
+
+/// A copy that holds another schema is refused by both modes of the undo, with the one sentence for
+/// a copy that is not a registry of this build, and the registry is as the repair left it.
+#[test]
+fn the_undo_refuses_a_copy_of_another_schema() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = damaged_registry(&temp);
+    let applied = document_of(&run_kr(
+        &temp,
+        &["--json", "host", "repair-grants", "--apply"],
+    ));
+    let copy = applied["copy"]
+        .as_str()
+        .expect("the copy is named")
+        .to_owned();
+    rusqlite::Connection::open(&copy)
+        .expect("the copy opens")
+        .execute_batch("UPDATE schema_version SET version = 14;")
+        .expect("another schema");
+    for line in [
+        &["host", "repair-grants", "--undo", &copy][..],
+        &["host", "repair-grants", "--undo", &copy, "--apply"],
+    ] {
+        let refused = run_kr(&temp, line);
+        assert!(!refused.status.success(), "{}", said(&refused));
+        assert!(
+            said(&refused).contains(
+                "This copy could not be read as a registry of this build. Nothing is changed."
+            ),
+            "{}",
+            said(&refused)
+        );
+    }
+    assert_eq!(
+        grants_rows(&path),
+        1,
+        "the registry is as the repair left it"
+    );
+}
