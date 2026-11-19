@@ -212,6 +212,35 @@ fn daemon_script(daemon: &Path, supervisor: &Path) -> String {
     )
 }
 
+/// The daemon script, placed in a folder whose name holds a quote and a space, hands over to the
+/// supervisor: the shell that reads the script gets each path as one word, the supervisor is given
+/// the daemon's path and the script's arguments, and the arguments it runs with are its own.
+#[test]
+fn the_daemon_script_hands_over_in_a_folder_whose_name_holds_a_quote_and_a_space() {
+    let tree = teardown::Tree::create();
+    let folder = tree.root().join("it's a folder");
+    std::fs::create_dir(&folder).expect("a folder whose name holds a quote and a space");
+    let daemon = folder.join("the daemon");
+    let supervisor = folder.join("the supervisor");
+    kr_ipc::testing::place_script(
+        &supervisor,
+        format!("#!/bin/sh\nprintf '%s\\n' \"${SUPERVISE}\" \"${SUPERVISED_ARGUMENTS}\" \"$@\"\n"),
+    );
+    let script = folder.join("kr-controller");
+    kr_ipc::testing::place_script(&script, daemon_script(&daemon, &supervisor));
+    let mut command = Command::new(&script);
+    command.args(["--flag", "two words"]);
+    let run = bounded(command, STREAMS_DEADLINE).expect("the script runs");
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        format!(
+            "{}\n--flag\ntwo words\n{SUPERVISOR_TEST}\n--exact\n--quiet\n",
+            daemon.display()
+        )
+    );
+}
+
 /// Not a check of its own: the entry point the daemon script runs this binary's copy through, with
 /// [`SUPERVISE`] set, to supervise one daemon. The test harness running it without that variable
 /// finds nothing to supervise.
@@ -1137,6 +1166,28 @@ fn recording_tools(tools: &Path, calls: &Path, passes: &[&str]) {
         .expect("writes a recording tool");
         kr_ipc::testing::place_program(&text, &tools.join(tool));
     }
+}
+
+/// A recording tool in a folder whose name holds a quote and a space records the call it is given
+/// into the file the test names: the shell that reads the tool's text gets the path as one word.
+#[test]
+fn a_recording_tool_records_into_a_folder_whose_name_holds_a_quote_and_a_space() {
+    let tree = teardown::Tree::create();
+    let folder = tree.root().join("it's a folder");
+    let tools = folder.join("the tools");
+    let calls = folder.join("the calls");
+    recording_tools(&tools, &calls, &[]);
+    let tool = RECORDING_TOOLS[0];
+    let mut command = Command::new(tools.join(tool));
+    command
+        .args(["--user", "a word"])
+        .env("PATH", "/usr/bin:/bin");
+    let run = bounded(command, STREAMS_DEADLINE).expect("the tool runs");
+    assert_eq!(run.status.code(), Some(1), "{run:?}");
+    let recorded = recorded_calls(&calls);
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].tool, tool, "{recorded:?}");
+    assert_eq!(recorded[0].arguments, ["--user", "a word"], "{recorded:?}");
 }
 
 /// The calls recorded in `calls`, in the order they were made.
@@ -3168,28 +3219,51 @@ fn service_installation() -> &'static Path {
         kr_ipc::testing::place_and_start_once(&worker, &real.join("kr-worker"), &["--version"]);
         let daemon = real.join("kr-controller");
         kr_ipc::testing::place_and_start_once(&controller, &daemon, &["--version"]);
-        // What `kr` starts: a script that hands over, with `exec`, to the daemon. A test that sets
-        // the hold variable has the daemon wait, as a process of the command that started it,
-        // until the file `go` is in the directory it names; it records its number there first, and
-        // the number stays the daemon's.
         let source = directory.join("kr-controller.sh");
-        std::fs::write(
-            &source,
-            format!(
-                "#!/bin/sh\n\
-                 if [ -n \"$KR_TEST_HOLD_DIR\" ]; then\n\
-                 \x20 echo $$ > \"$KR_TEST_HOLD_DIR/daemon.pid.tmp\"\n\
-                 \x20 mv \"$KR_TEST_HOLD_DIR/daemon.pid.tmp\" \"$KR_TEST_HOLD_DIR/daemon.pid\"\n\
-                 \x20 while [ ! -e \"$KR_TEST_HOLD_DIR/go\" ]; do sleep 0.05; done\n\
-                 fi\n\
-                 exec '{}' --secret-store file \"$@\"\n",
-                daemon.display()
-            ),
-        )
-        .expect("writes the daemon script");
+        std::fs::write(&source, the_service_daemon_script(&daemon))
+            .expect("writes the daemon script");
         kr_ipc::testing::place_program(&source, &directory.join("kr-controller"));
         directory
     })
+}
+
+/// What `kr` starts in the service installation: a script that hands over, with `exec`, to the
+/// daemon. A test that sets the hold variable has the daemon wait, as a process of the command that
+/// started it, until the file `go` is in the directory it names; it records its number there first,
+/// and the number stays the daemon's.
+fn the_service_daemon_script(daemon: &Path) -> String {
+    format!(
+        "#!/bin/sh\n\
+         if [ -n \"$KR_TEST_HOLD_DIR\" ]; then\n\
+         \x20 echo $$ > \"$KR_TEST_HOLD_DIR/daemon.pid.tmp\"\n\
+         \x20 mv \"$KR_TEST_HOLD_DIR/daemon.pid.tmp\" \"$KR_TEST_HOLD_DIR/daemon.pid\"\n\
+         \x20 while [ ! -e \"$KR_TEST_HOLD_DIR/go\" ]; do sleep 0.05; done\n\
+         fi\n\
+         exec '{}' --secret-store file \"$@\"\n",
+        daemon.display()
+    )
+}
+
+/// The service installation's daemon script, placed in a folder whose name holds a quote and a
+/// space, hands over to the daemon with the arguments it was given: the shell that reads the
+/// script gets the daemon's path as one word.
+#[test]
+fn the_service_daemon_script_hands_over_in_a_folder_whose_name_holds_a_quote_and_a_space() {
+    let tree = teardown::Tree::create();
+    let folder = tree.root().join("it's a folder");
+    std::fs::create_dir(&folder).expect("a folder whose name holds a quote and a space");
+    let daemon = folder.join("the daemon");
+    kr_ipc::testing::place_script(&daemon, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n");
+    let script = folder.join("kr-controller");
+    kr_ipc::testing::place_script(&script, the_service_daemon_script(&daemon));
+    let mut command = Command::new(&script);
+    command.arg("two words").env_remove("KR_TEST_HOLD_DIR");
+    let run = bounded(command, STREAMS_DEADLINE).expect("the script runs");
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "--secret-store\nfile\ntwo words\n"
+    );
 }
 
 /// The parent of a process of this user's, and the parent's name.
@@ -4787,6 +4861,161 @@ struct Started {
     _ended: EndedWithTheTest,
 }
 
+/// The file named after `said`: its name with `suffix` added.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn named_after(said: &Path, suffix: &str) -> PathBuf {
+    let mut name = said.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The text of the root shell of the session that runs the second `kr new`. When `setup` gates it,
+/// it waits for the file `start` in `hold`. It then runs the second environment's `kr` in the
+/// background, in `cwd` and with `environment` as its whole environment, and records what the
+/// command said and how it ended in the files named after `said`. When `setup` holds the daemon, it
+/// waits for the file `go` in `hold`, and then it is an ordinary shell.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn the_root_shell_that_runs_the_second_new(
+    environment: &[(String, String)],
+    kr: &Path,
+    cwd: &Path,
+    hold: &Path,
+    said: &Path,
+    setup: Setup<'_>,
+) -> String {
+    let environment: String = environment
+        .iter()
+        .map(|(name, value)| format!("{name}='{value}' "))
+        .collect();
+    let waiting = if setup.hold {
+        format!(
+            "while [ ! -e '{}/go' ]; do echo .; sleep 0.2; done\n",
+            hold.display()
+        )
+    } else {
+        String::new()
+    };
+    let gate = if setup.gate {
+        format!(
+            "while [ ! -e '{}/start' ]; do sleep 0.05; done\n",
+            hold.display()
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "#!/bin/sh\n\
+         {gate}\
+         ( env -i {environment}'{kr}' new --invisible --headless --cwd '{cwd}' \
+         --shell /bin/sh --shell-mode native_compat --startup interactive \
+         < /dev/null > '{said}.out' 2> '{said}.err'; \
+         echo $? > '{said}.tmp' && mv '{said}.tmp' '{said}.status' ) &\n\
+         {waiting}\
+         exec /bin/sh \"$@\"\n",
+        kr = kr.display(),
+        cwd = cwd.display(),
+        said = said.display(),
+    )
+}
+
+/// Runs the root shell the second `kr new` is run by, from a folder whose name holds a quote and a
+/// space, and returns the file that holds what the command it ran said, as `said` names them.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn run_the_root_shell_in_a_folder_whose_name_holds_a_quote_and_a_space(
+    tree: &teardown::Tree,
+    setup: Setup<'_>,
+) -> PathBuf {
+    let folder = tree.root().join("it's a folder");
+    let hold = folder.join("the hold");
+    std::fs::create_dir_all(&hold).expect("a folder whose name holds a quote and a space");
+    for name in ["go", "start"] {
+        std::fs::write(hold.join(name), "").expect("a file the shell waits for");
+    }
+    let kr = folder.join("the kr");
+    kr_ipc::testing::place_script(
+        &kr,
+        "#!/bin/sh\nprintf '%s\\n' \"$HOME\" \"$PATH\" \"$@\"\nprintf 'said on stderr\\n' >&2\n",
+    );
+    let environment = [
+        ("HOME".to_owned(), "/it's a home".to_owned()),
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+    ];
+    let said = folder.join("said");
+    let shell = folder.join("the shell");
+    kr_ipc::testing::place_script(
+        &shell,
+        the_root_shell_that_runs_the_second_new(
+            &environment,
+            &kr,
+            &folder.join("a cwd"),
+            &hold,
+            &said,
+            setup,
+        ),
+    );
+    let mut command = Command::new(&shell);
+    command.args(["-c", "exit 0"]);
+    let run = bounded(command, STREAMS_DEADLINE).expect("the shell runs");
+    assert!(run.status.success(), "{run:?}");
+    let deadline = Instant::now() + STREAMS_DEADLINE;
+    while !named_after(&said, ".status").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the shell did not run the second kr new: {run:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    said
+}
+
+/// The root shell the second `kr new` is run by reads the paths it is given as one word each when
+/// they hold a quote and a space: the second `kr` is run with the environment it was given, in the
+/// directory it was given, and what it said and how it ended are recorded where they were asked.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_root_shell_of_the_second_new_runs_it_in_a_folder_whose_name_holds_a_quote_and_a_space() {
+    let tree = teardown::Tree::create();
+    let said = run_the_root_shell_in_a_folder_whose_name_holds_a_quote_and_a_space(
+        &tree,
+        Setup::default(),
+    );
+    let read = |suffix: &str| {
+        std::fs::read_to_string(named_after(&said, suffix)).expect("the shell recorded it")
+    };
+    assert_eq!(
+        read(".out"),
+        format!(
+            "/it's a home\n/usr/bin:/bin\nnew\n--invisible\n--headless\n--cwd\n{}\n--shell\n/bin/sh\n\
+             --shell-mode\nnative_compat\n--startup\ninteractive\n",
+            said.with_file_name("a cwd").display()
+        )
+    );
+    assert_eq!(read(".err"), "said on stderr\n");
+    assert_eq!(read(".status"), "0\n");
+    assert!(!named_after(&said, ".tmp").exists());
+}
+
+/// The same shell, made to wait for the file `start` before it runs the second `kr new` and for the
+/// file `go` before it is an ordinary shell, reads a folder whose name holds a quote and a space
+/// as one word, finds both files and goes on.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_root_shell_of_the_second_new_waits_in_a_folder_whose_name_holds_a_quote_and_a_space() {
+    let tree = teardown::Tree::create();
+    let said = run_the_root_shell_in_a_folder_whose_name_holds_a_quote_and_a_space(
+        &tree,
+        Setup {
+            hold: true,
+            gate: true,
+            ..Setup::default()
+        },
+    );
+    assert_eq!(
+        std::fs::read_to_string(named_after(&said, ".status")).expect("the shell recorded it"),
+        "0\n"
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Inside {
     /// Creates the session. Its shell runs the second `kr new` meanwhile.
@@ -4794,41 +5023,16 @@ impl Inside {
         let said = host.tree.root().join("inner-new");
         let shell = host.tree.root().join("session-shell");
         let text = host.tree.root().join("session-shell.text");
-        let environment: String = second
-            .variables(host, setup)
-            .iter()
-            .map(|(name, value)| format!("{name}='{value}' "))
-            .collect();
-        let waiting = if setup.hold {
-            format!(
-                "while [ ! -e '{}/go' ]; do echo .; sleep 0.2; done\n",
-                second.hold.display()
-            )
-        } else {
-            String::new()
-        };
-        let gate = if setup.gate {
-            format!(
-                "while [ ! -e '{}/start' ]; do sleep 0.05; done\n",
-                second.hold.display()
-            )
-        } else {
-            String::new()
-        };
+        let environment = second.variables(host, setup);
         std::fs::write(
             &text,
-            format!(
-                "#!/bin/sh\n\
-                 {gate}\
-                 ( env -i {environment}'{kr}' new --invisible --headless --cwd '{cwd}' \
-                 --shell /bin/sh --shell-mode native_compat --startup interactive \
-                 < /dev/null > '{said}.out' 2> '{said}.err'; \
-                 echo $? > '{said}.tmp' && mv '{said}.tmp' '{said}.status' ) &\n\
-                 {waiting}\
-                 exec /bin/sh \"$@\"\n",
-                kr = service_installation().join("kr").display(),
-                cwd = second.tree.root().display(),
-                said = said.display(),
+            the_root_shell_that_runs_the_second_new(
+                &environment,
+                &service_installation().join("kr"),
+                second.tree.root(),
+                &second.hold,
+                &said,
+                setup,
             ),
         )
         .expect("writes the session's root shell");
