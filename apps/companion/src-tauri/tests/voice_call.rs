@@ -3092,6 +3092,101 @@ async fn the_reply_to_a_mute_shows_no_start_that_is_only_kept() {
     scene.stop_host().await;
 }
 
+/// A start whose answer is lost leaves its entry in the kept file. The person forgets the host
+/// while the file cannot be written, and the process ends before it can be: a device launched over
+/// that file shows no notice for the host and removes the entry, because the application's own
+/// records of the pairings say the device is no longer paired with it. A launch that asks nothing
+/// shows the notice.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_forgotten_while_the_kept_file_cannot_be_written_has_no_start_notice_after_a_relaunch()
+ {
+    let timings = Timings {
+        host_within: Duration::from_millis(300),
+        ..asking_again()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.hold_creations();
+    let started = scene.start().await;
+    let action_id = started["action_id"]
+        .as_str()
+        .expect("the start names its action")
+        .to_owned();
+    let holds_the_start = |file: &serde_json::Value| {
+        file["owed"].as_array().is_some_and(|owed| {
+            owed.iter()
+                .any(|owed| owed["action_id"] == action_id.as_str())
+        })
+    };
+    kept_file_where(scene.phone.data.path(), holds_the_start).await;
+    scene.stand_in.release_creations();
+    let reference = scene
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen")["hosts"][0]["reference"]
+        .clone();
+
+    // A directory stands where the file goes, so no write can replace it.
+    let file = scene.phone.data.path().join("voice-kept.json");
+    let held = scene.phone.data.path().join("voice-kept.held");
+    std::fs::rename(&file, &held).expect("the file is put aside");
+    std::fs::create_dir(&file).expect("a directory where the file goes");
+    scene
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the host is forgotten");
+    assert!(file.is_dir(), "the cleanup could not be written");
+    // The process ends here: the file the next launch reads is the one this one left.
+    std::fs::remove_dir(&file).expect("the directory goes");
+    std::fs::rename(&held, &file).expect("the file is back");
+
+    let relaunch = |name: &str| {
+        calls_on_phone(
+            ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+            service_at(scene.stand_in.origin()),
+            quick(),
+            Kept::at(copy_of_the_kept_file(scene.phone.data.path(), name)),
+        )
+    };
+    let unasked = relaunch("relaunch-unasked");
+    assert!(
+        as_read(&unasked.state(None))["owed"]
+            .as_array()
+            .expect("the entries")
+            .iter()
+            .any(|owed| owed["action_id"] == action_id.as_str()),
+        "the file still holds the start, so a launch that asks nothing shows it"
+    );
+    let asked = relaunch("relaunch-asked");
+    asked.know_pairings(companion_tauri::hosts::pairing_known(
+        scene.phone.companion.app.handle().clone(),
+    ));
+    let state = as_read(&asked.state(None));
+    assert!(
+        state["owed"]
+            .as_array()
+            .expect("the entries")
+            .iter()
+            .all(|owed| owed["action_id"] != action_id.as_str()),
+        "the host is no longer paired, so its start is not shown: {state}"
+    );
+    let kept: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            scene
+                .phone
+                .data
+                .path()
+                .join("relaunch-asked")
+                .join("voice-kept.json"),
+        )
+        .expect("the file"),
+    )
+    .expect("a file");
+    assert!(
+        !holds_the_start(&kept),
+        "and its removal is written: {kept}"
+    );
+    scene.stop_host().await;
+}
+
 /// The person presses stop while the device is still asking the host what became of its start. The
 /// media stops at once and the stop is answered, and the device goes on asking: when the host turns
 /// out to have made the call, the call is ended in full and the host's grant is revoked.

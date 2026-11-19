@@ -846,6 +846,13 @@ impl Companion {
         )
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .expect("an application");
+        // The calls ask the application how this device is paired, as the application's own start
+        // tells them.
+        {
+            use tauri::Manager as _;
+            app.state::<companion_tauri::voice::Calls>()
+                .know_pairings(companion_tauri::hosts::pairing_known(app.handle().clone()));
+        }
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("a window");
