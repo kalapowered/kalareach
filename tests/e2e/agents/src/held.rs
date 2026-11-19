@@ -13,7 +13,7 @@
 //! - the count of the turns the agent's own record holds ([`turns_recorded`]), against the turns
 //!   charged to the ledger.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use kr_e2e_m1b::run::{Removal, Run, remove_run_directory};
@@ -1711,15 +1711,13 @@ impl Identities {
 }
 
 /// The turns of `found` that are not turns of `baseline`: a turn that names itself counts where its
-/// identity is not among the baseline's, whatever turns the baseline held that `found` lacks, and
-/// the turns of a line that names none count by occurrence above the baseline's. A record that
-/// lost one turn and gained another therefore shows the new one, though its total is the same.
+/// identity is not among the baseline's, whatever turns the baseline held that `found` lacks; a
+/// line that names none has an identity of its place, its bytes and its order among the equal lines
+/// of its file. A record that lost one turn and gained another therefore shows the new one, though
+/// its total is the same.
 #[must_use]
 pub fn new_turns(baseline: &Recorded, found: &Recorded) -> u64 {
-    found
-        .identities
-        .not_in(&baseline.identities)
-        .saturating_add(found.unnamed.saturating_sub(baseline.unnamed))
+    found.identities.not_in(&baseline.identities)
 }
 
 /// The turns the agent's own record holds.
@@ -1727,7 +1725,7 @@ pub fn new_turns(baseline: &Recorded, found: &Recorded) -> u64 {
 pub struct Recorded {
     /// How many turns the model ran, as the record counts them.
     pub turns: u64,
-    /// How many of them are counted by occurrence of their line, because the line names no turn.
+    /// How many of them are known by their line alone, because the line names no turn.
     pub unnamed: u64,
     /// How many files of the record were read: none where the record's directory is not there.
     pub files: u64,
@@ -1779,12 +1777,13 @@ fn is_uuid(name: &str) -> bool {
 /// once whichever of the agent's files, a copy of a conversation among them, holds it; any other
 /// name is only known to be unique within its thread, a file of the record, so it counts once for
 /// each file that holds it. A line that names none (no name, an empty one) counts once for each
-/// time it occurs, in any file. A conversation written again, a fork's copy of the one it forked
-/// from where the names are not UUIDs, or unnamed lines in a copy, count their turns twice: the
-/// count is then too high. It is too low only where the record lost lines (an agent that was ended
-/// before it wrote them, or that marks no turn this way), which no count of the lines can show; the
-/// audit stops a case that passed with a charge and finds none. [`Recorded::unnamed`] says how many
-/// turns stand on an occurrence.
+/// time it occurs, in any file, and is told apart from others by its place, its bytes and its order
+/// among the equal lines of its file. A conversation written again, a fork's copy of the one it
+/// forked from where the names are not UUIDs, or unnamed lines in a copy, count their turns twice:
+/// the count is then too high. It is too low only where the record lost lines (an agent that was
+/// ended before it wrote them, or that marks no turn this way), which no count of the lines can
+/// show; the audit stops a case that passed with a charge and finds none. [`Recorded::unnamed`]
+/// says how many turns stand on their line alone.
 ///
 /// The record is read below `relative` in `within`, the run's directory, through directory handles
 /// with no link followed at any step ([`read_record`]).
@@ -1830,13 +1829,16 @@ fn turns_recorded_within(
         relative,
         limits,
         &mut |place, content| {
+            // How many lines of this file are equal to each line that names no turn, in order: two
+            // equal lines of one file are two turns.
+            let mut equal: BTreeMap<String, u64> = BTreeMap::new();
             for line in String::from_utf8_lossy(content).lines() {
                 if line.contains(marker) {
                     let named = serde_json::from_str::<Value>(line)
                         .ok()
                         .as_ref()
                         .and_then(turn_identifier);
-                    match named {
+                    let (own, name) = match named {
                         Some(named) => {
                             let uuid = is_uuid(&named);
                             let own = if uuid {
@@ -1844,27 +1846,48 @@ fn turns_recorded_within(
                             } else {
                                 format!("{}\0{named}", String::from_utf8_lossy(place))
                             };
-                            // The names kept in all are bound, in number and in bytes: past
-                            // either bound no name that is new is kept.
-                            if !turns.contains(&own) {
-                                if turns.len() >= limits.names
-                                    || kept_bytes.saturating_add(own.len()) > limits.name_bytes
-                                {
-                                    too_many_names = true;
-                                    return;
-                                }
-                                kept_bytes += own.len();
-                            }
-                            if uuid {
-                                by_uuid.insert(own.clone());
-                            } else {
-                                by_other_name.insert(own.clone());
-                                forms.insert(form_of(&named));
-                            }
-                            turns.insert(own);
+                            (own, Some((named, uuid)))
+                        }
+                        // A line that names no turn is a turn by its place, its bytes and its
+                        // order among the equal lines of its file.
+                        None => {
+                            let digest = kr_cbor::sha256(line.as_bytes())
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>();
+                            let nth = equal.entry(digest.clone()).or_insert(0);
+                            *nth += 1;
+                            (
+                                format!(
+                                    "{}\0unnamed\0{digest}\0{nth}",
+                                    String::from_utf8_lossy(place)
+                                ),
+                                None,
+                            )
+                        }
+                    };
+                    // The identities kept in all are bound, in number and in bytes: past either
+                    // bound no identity that is new is kept.
+                    if !turns.contains(&own) {
+                        if turns.len() >= limits.names
+                            || kept_bytes.saturating_add(own.len()) > limits.name_bytes
+                        {
+                            too_many_names = true;
+                            return;
+                        }
+                        kept_bytes += own.len();
+                    }
+                    match name {
+                        Some((_, true)) => {
+                            by_uuid.insert(own.clone());
+                        }
+                        Some((named, false)) => {
+                            by_other_name.insert(own.clone());
+                            forms.insert(form_of(&named));
                         }
                         None => unnamed += 1,
                     }
+                    turns.insert(own);
                 }
             }
         },
@@ -1878,11 +1901,8 @@ fn turns_recorded_within(
             limits.names, limits.name_bytes
         ));
     }
-    // A name and an occurrence cannot be the same turn: they are kept apart, and counted together.
     Ok(Recorded {
-        turns: u64::try_from(turns.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(unnamed),
+        turns: u64::try_from(turns.len()).unwrap_or(u64::MAX),
         unnamed,
         files,
         by_uuid: u64::try_from(by_uuid.len()).unwrap_or(u64::MAX),
@@ -2308,8 +2328,8 @@ mod tests {
         .expect("lines with an empty name");
         let found =
             turns_recorded(&account(), &root, &pinned(&root), Path::new("")).expect("a count");
-        // The turns that name themselves have an identity each; the others count by occurrence.
-        assert_eq!(found.identities.len(), 3 + 2);
+        // Every turn has an identity: a name, or the place and the bytes of its line.
+        assert_eq!(found.identities.len(), 3 + 2 + 6);
         assert_eq!(
             Recorded {
                 identities: Identities::default(),
