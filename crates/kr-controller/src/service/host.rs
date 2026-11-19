@@ -229,9 +229,14 @@ impl Controller {
         params: &kr_protocol::skill::AgentToolsParams,
         method: Method,
     ) -> Result<crate::agent_tools::Installer> {
-        use crate::agent_tools::declared::{Declaration, admissions_held, served};
+        use crate::agent_tools::declared::{
+            Declaration, admissions_held, platform_refusal, served,
+        };
         if params.agent.compiled().is_some() {
             return Ok(installer);
+        }
+        if let Some(refusal) = platform_refusal(cfg!(windows)) {
+            return Err(ControllerError::InvalidArgument(refusal.to_owned()));
         }
         if method == Method::AgentToolsRemove && installer.holds_record(params)? {
             return Ok(installer);
