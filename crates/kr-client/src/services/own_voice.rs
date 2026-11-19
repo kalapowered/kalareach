@@ -192,6 +192,10 @@ pub mod words {
     pub const SETTLING: &str =
         "This host is still closing its earlier OpenAI key calls, so it starts no new call now.";
 
+    /// A removal or a forget-calls while the host is already closing its calls: the command
+    /// changes nothing, and the owner runs it again.
+    pub const STILL_CLOSING: &str = "This host is still closing its earlier calls on this OpenAI key, so it does not change the key or its record now; run the command again after they have closed.";
+
     /// The creation answered 401.
     #[must_use]
     pub fn refused_with_this_key(status: u16) -> String {

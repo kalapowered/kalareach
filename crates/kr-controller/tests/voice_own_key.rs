@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::services::own_voice::stand_in::{CreateScript, StandIn, created_body};
+use kr_client::services::own_voice::words;
 use kr_client::services::{OwnCallLedger, RegistryState};
 use kr_controller::voice::own_key_calls::OwnKeyCalls;
 use kr_crypto::keys::DeviceKeys;
@@ -29,7 +30,8 @@ use kr_protocol::voice::{
 };
 use kr_protocol::voice_credential::{
     VoiceCredentialForgetCallsParams, VoiceCredentialForgetCallsResult, VoiceCredentialKind,
-    VoiceCredentialSetParams, VoiceLateStart,
+    VoiceCredentialRemoveParams, VoiceCredentialRemoveResult, VoiceCredentialSetParams,
+    VoiceLateStart,
 };
 
 const HELD_KEY: &str = "kr-test-voice-key-held-01234567890";
@@ -104,6 +106,24 @@ async fn forget_calls(
             ActionId::new(kr_ipc::new_uuid()),
             ActionTarget::environment(host.environment_id),
             &VoiceCredentialForgetCallsParams {
+                kind: VoiceCredentialKind::OpenaiLive,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|answer| answer.to_typed().expect("the result decodes"))
+}
+
+async fn remove_key(
+    control: &mut LocalClient,
+    host: &net_support::Host,
+) -> Result<VoiceCredentialRemoveResult, ProtocolError> {
+    control
+        .mutate(
+            Method::VoiceCredentialRemove,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &VoiceCredentialRemoveParams {
                 kind: VoiceCredentialKind::OpenaiLive,
             },
         )
@@ -557,6 +577,181 @@ async fn forget_calls_during_a_creation_settles_the_start_task_before_the_item_g
         .await
         .expect("forgetting again is answered");
     assert_eq!(again.late_start, VoiceLateStart::None);
+    let _ = &daemon.placed;
+    daemon.host.stop().await;
+}
+
+/// A creation held at the stand-in, and a forget-calls that holds the host's fence while it waits
+/// for that creation: the host is settling.
+struct Settling {
+    release: Arc<tokio::sync::Notify>,
+    starting: tokio::task::JoinHandle<Result<VoiceStartResult, ProtocolError>>,
+    forgetting: tokio::task::JoinHandle<Result<VoiceCredentialForgetCallsResult, ProtocolError>>,
+}
+
+async fn settling(daemon: &Daemon, phone: &Arc<Phone>) -> Settling {
+    let release = Arc::new(tokio::sync::Notify::new());
+    daemon.stand_in.script_create(CreateScript::Held(
+        Arc::clone(&release),
+        Box::new(CreateScript::Answer(
+            201,
+            Some(created_body("live_late_session")),
+        )),
+    ));
+    let starting = {
+        let phone = Arc::clone(phone);
+        tokio::spawn(async move { phone.start().await })
+    };
+    until("the creation reached the stand-in", || {
+        daemon.stand_in.recorded().creates.len() == 1
+    })
+    .await;
+    let forgetting = {
+        let mut client = daemon.host.client().await;
+        let environment = daemon.host.environment_id;
+        tokio::spawn(async move { forget_calls_of(&mut client, environment).await })
+    };
+    until("the registry is settling", || {
+        daemon.host.controller().own_key_registry_state() == RegistryState::Settling
+    })
+    .await;
+    Settling {
+        release,
+        starting,
+        forgetting,
+    }
+}
+
+async fn forget_calls_of(
+    control: &mut LocalClient,
+    environment: kr_protocol::ids::EnvironmentId,
+) -> Result<VoiceCredentialForgetCallsResult, ProtocolError> {
+    control
+        .mutate(
+            Method::VoiceCredentialForgetCalls,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment),
+            &VoiceCredentialForgetCallsParams {
+                kind: VoiceCredentialKind::OpenaiLive,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|answer| answer.to_typed().expect("the result decodes"))
+}
+
+/// A removal that meets the fence another removal or forget-calls holds is told, in its own
+/// words and not the start's, that the host changes neither the key nor its record now; it
+/// changes nothing, and run again after the earlier command has finished it removes the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_that_meets_the_held_fence_changes_neither_the_key_nor_the_record_and_says_so() {
+    let mut daemon = daemon().await;
+    let phone = Arc::new(phone(&daemon, &MANAGER).await);
+    let held = settling(&daemon, &phone).await;
+    let rows_before = rows_of(&daemon);
+    assert_eq!(rows_before.len(), 1, "the held creation has its row");
+
+    let refused = remove_key(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("a removal does not pass the held fence");
+    assert_eq!(refused.message, words::STILL_CLOSING);
+    assert_ne!(refused.message, words::SETTLING, "not the start's sentence");
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+    assert!(rows_of(&daemon) == rows_before, "the record is as it was");
+    assert!(daemon.stand_in.recorded().hangups.is_empty());
+
+    held.release.notify_one();
+    let forgotten = held
+        .forgetting
+        .await
+        .expect("the task ends")
+        .expect("forgetting is answered");
+    assert_eq!(forgotten.late_start, VoiceLateStart::Closed);
+    let _ = held.starting.await.expect("the task ends");
+    let removed = remove_key(&mut daemon.control, &daemon.host)
+        .await
+        .expect("after the earlier command the removal is answered");
+    assert!(removed.removed);
+    assert_eq!(
+        held_key(&daemon.host),
+        None,
+        "the removal then removes the key"
+    );
+    let _ = &daemon.placed;
+    daemon.host.stop().await;
+}
+
+/// The same for a forget-calls: it changes nothing while the fence is held, and its words are the
+/// ones of the command, not the start's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forget_calls_that_meets_the_held_fence_changes_neither_the_key_nor_the_record_and_says_so()
+ {
+    let mut daemon = daemon().await;
+    let phone = Arc::new(phone(&daemon, &MANAGER).await);
+    let held = settling(&daemon, &phone).await;
+    let rows_before = rows_of(&daemon);
+    assert_eq!(rows_before.len(), 1, "the held creation has its row");
+
+    let refused = forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("a forget-calls does not pass the held fence");
+    assert_eq!(refused.message, words::STILL_CLOSING);
+    assert_ne!(refused.message, words::SETTLING, "not the start's sentence");
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+    assert!(rows_of(&daemon) == rows_before, "the record is as it was");
+
+    held.release.notify_one();
+    held.forgetting
+        .await
+        .expect("the task ends")
+        .expect("forgetting is answered");
+    let _ = held.starting.await.expect("the task ends");
+    let again = forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect("after the earlier command it is answered");
+    assert_eq!(again.late_start, VoiceLateStart::None);
+    let _ = &daemon.placed;
+    daemon.host.stop().await;
+}
+
+/// The record of calls refuses a forget part of the way through (a trigger that another
+/// connection added to the daemon's own file): the host says it could not forget, in the approved
+/// words, and every row is as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forget_calls_the_record_refuses_leaves_the_record_as_it_was_and_says_so() {
+    let mut daemon = daemon().await;
+    let state_dir = daemon.host.tree().environment().state_dir().to_path_buf();
+    let record = OwnKeyCalls::open(&state_dir).expect("the record opens beside the daemon");
+    for byte in [1_u8, 2] {
+        record
+            .begin(&kr_client::services::NewCall {
+                call_id: format!("call-{byte}"),
+                attempt_id: format!("attempt-{byte}"),
+                action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16])),
+                device_id: "device".to_owned(),
+                asked_ms: 1_000,
+                closes_at_ms: 2_000,
+            })
+            .expect("a row is written");
+    }
+    rusqlite::Connection::open(
+        state_dir.join(kr_controller::voice::own_key_calls::OWN_KEY_CALLS_RECORD),
+    )
+    .expect("a second connection to the daemon's record")
+    .execute_batch(
+        "CREATE TRIGGER refuse_the_last BEFORE DELETE ON own_key_calls
+             WHEN old.call_id = 'call-2'
+             BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+    )
+    .expect("the record is made to refuse");
+    let before = rows_of(&daemon);
+
+    let refused = forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("the forget is refused");
+    assert_eq!(refused.message, words::NOT_FORGOTTEN);
+    assert!(rows_of(&daemon) == before, "the record stays as it was");
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
     let _ = &daemon.placed;
     daemon.host.stop().await;
 }

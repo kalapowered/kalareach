@@ -479,6 +479,41 @@ mod tests {
         assert!(record.rows().expect("the rows read").is_empty());
     }
 
+    /// A forget is one statement in one transaction: when the store refuses it part of the way
+    /// through, no row is gone and no row has changed, and a forget after the refusal goes through.
+    /// (A guard: the statement was one transaction before this case.)
+    #[test]
+    fn a_forget_the_store_refuses_part_of_the_way_leaves_every_row_as_it_was() {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let record = open(&directory);
+        for byte in 1..=3 {
+            record.begin(&call(byte)).expect("the call is written");
+        }
+        record.record_closed("call-2", 1).expect("closed");
+        let before = record.rows().expect("the rows read");
+        record
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_last BEFORE DELETE ON own_key_calls
+                 WHEN old.call_id = 'call-3'
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .expect("the store is made to refuse the last row");
+
+        assert!(record.forget_all().is_err(), "the store refused the forget");
+        let after = record.rows().expect("the rows read");
+        assert!(
+            after.len() == 3 && after.iter().zip(&before).all(|(now, was)| now == was),
+            "every row is as it was, the first two too"
+        );
+
+        record
+            .connection()
+            .execute_batch("DROP TRIGGER refuse_the_last;")
+            .expect("the store accepts again");
+        assert_eq!(record.forget_all().expect("forgotten"), 3);
+    }
+
     /// Rows are read oldest first, and they are still there when the record is opened again.
     #[test]
     fn rows_come_back_oldest_first_after_the_record_is_opened_again() {

@@ -1486,7 +1486,7 @@ impl Controller {
         // flight is waited for, and each stored call is closed with the key still in the store.
         let provider = &self.own_voice;
         if provider.registry().fence().is_none() {
-            return Err(refused_voice(words::SETTLING));
+            return Err(refused_voice(words::STILL_CLOSING));
         }
         // A start in flight is waited for first, through the publication of its call, so that the
         // call it gives out is one the next step finds and ends.
@@ -1547,7 +1547,7 @@ impl Controller {
         }
         let provider = &self.own_voice;
         if provider.registry().fence().is_none() {
-            return Err(refused_voice(words::SETTLING));
+            return Err(refused_voice(words::STILL_CLOSING));
         }
         let settled = provider.settle().await;
         self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
