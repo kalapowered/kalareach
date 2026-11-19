@@ -532,6 +532,8 @@ struct WatchedLink {
     /// Status questions that got no answer from the host: the connection had ended, or the answer
     /// was a refusal.
     failed_statuses: Arc<AtomicUsize>,
+    /// Status questions the host refused in a frame the device read, as a refusal.
+    refused_statuses: Arc<AtomicUsize>,
     dials: AtomicUsize,
     opened: AtomicUsize,
     paired_connects: AtomicUsize,
@@ -565,6 +567,7 @@ impl WatchedLink {
             statuses: Arc::new(AtomicUsize::new(0)),
             answered: Arc::new(AtomicUsize::new(0)),
             failed_statuses: Arc::new(AtomicUsize::new(0)),
+            refused_statuses: Arc::new(AtomicUsize::new(0)),
             dials: AtomicUsize::new(0),
             opened: AtomicUsize::new(0),
             paired_connects: AtomicUsize::new(0),
@@ -749,6 +752,7 @@ impl HostLink for WatchedLink {
                 statuses: Arc::clone(&self.statuses),
                 answered: Arc::clone(&self.answered),
                 failed_statuses: Arc::clone(&self.failed_statuses),
+                refused_statuses: Arc::clone(&self.refused_statuses),
             }) as Box<dyn Preauth>)
         })
     }
@@ -806,6 +810,7 @@ struct Watched {
     statuses: Arc<AtomicUsize>,
     answered: Arc<AtomicUsize>,
     failed_statuses: Arc<AtomicUsize>,
+    refused_statuses: Arc<AtomicUsize>,
 }
 
 fn altered(value: &str) -> String {
@@ -897,6 +902,9 @@ impl Preauth for Watched {
             let answer = self.inner.status(params).await;
             if answer.is_err() {
                 self.failed_statuses.fetch_add(1, Ordering::SeqCst);
+            }
+            if matches!(answer, Err(LinkError::Refused(_))) {
+                self.refused_statuses.fetch_add(1, Ordering::SeqCst);
             }
             tokio::time::sleep(back).await;
             if answer.is_ok() {
@@ -3202,6 +3210,17 @@ async fn a_device_committed_while_its_connection_is_silent_recovers_as_the_devic
     // The first connection answers nothing more. The device asks on a fresh one, is refused, and
     // connects as the device it was committed as: that connection waits at the gate.
     tokio::time::timeout(WATCHDOG, async {
+        while link.failed_statuses.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device asks on a fresh connection after the approval");
+    assert!(
+        link.refused_statuses.load(Ordering::SeqCst) >= 1,
+        "the host's refusal of the question reached the device as a refusal"
+    );
+    tokio::time::timeout(WATCHDOG, async {
         while link.paired_connects.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3258,6 +3277,17 @@ async fn a_code_device_committed_while_its_connection_is_silent_recovers_as_the_
         calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
             .await
             .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, async {
+        while link.failed_statuses.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device asks on a fresh connection after the approval");
+    assert!(
+        link.refused_statuses.load(Ordering::SeqCst) >= 1,
+        "the host's refusal of the question reached the device as a refusal"
+    );
     tokio::time::timeout(WATCHDOG, async {
         while link.paired_connects.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3367,6 +3397,17 @@ async fn a_recovery_that_proves_another_authorisation_key_is_refused_at_the_bind
         .await
         .expect("the owner approves");
     tokio::time::timeout(WATCHDOG, async {
+        while link.failed_statuses.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device asks on a fresh connection after the approval");
+    assert!(
+        link.refused_statuses.load(Ordering::SeqCst) >= 1,
+        "the host's refusal of the question reached the device as a refusal"
+    );
+    tokio::time::timeout(WATCHDOG, async {
         while link.paired_connects.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3420,6 +3461,17 @@ async fn a_device_committed_before_the_host_restarted_recovers_as_the_device_it_
     let _restarted = host.restart().await;
 
     tokio::time::timeout(WATCHDOG, async {
+        while link.failed_statuses.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device asks on a fresh connection after the approval");
+    assert!(
+        link.refused_statuses.load(Ordering::SeqCst) >= 1,
+        "the host's refusal of the question reached the device as a refusal"
+    );
+    tokio::time::timeout(WATCHDOG, async {
         while link.paired_connects.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -3465,6 +3517,17 @@ async fn a_recovery_that_reaches_no_connection_is_followed_by_another() {
         calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
             .await
             .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, async {
+        while link.failed_statuses.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device asks on a fresh connection after the approval");
+    assert!(
+        link.refused_statuses.load(Ordering::SeqCst) >= 1,
+        "the host's refusal of the question reached the device as a refusal"
+    );
     tokio::time::timeout(WATCHDOG, async {
         while link.paired_connects.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3521,6 +3584,17 @@ async fn a_recovery_whose_connection_never_answers_ends_by_the_attempts_deadline
     calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
         .await
         .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, async {
+        while link.failed_statuses.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device asks on a fresh connection after the approval");
+    assert!(
+        link.refused_statuses.load(Ordering::SeqCst) >= 1,
+        "the host's refusal of the question reached the device as a refusal"
+    );
     tokio::time::timeout(WATCHDOG, async {
         while link.paired_connects.load(Ordering::SeqCst) == 0 {
             tokio::time::sleep(Duration::from_millis(20)).await;

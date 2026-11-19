@@ -972,11 +972,10 @@ async fn a_paired_endpoints_request_before_its_proof_is_refused_in_a_frame_it_re
         .write_message(&request(Method::PairStatus, 1))
         .await
         .expect("sent");
-    let response = reader
-        .read_message::<Response>()
-        .await
-        .expect("the host answers a request in a frame the peer reads")
-        .expect("the host sent a frame");
+    let read = reader.read_message::<Response>().await;
+    let Ok(Some(response)) = read else {
+        panic!("the host answers a request in a frame the peer reads, not {read:?}");
+    };
     assert_eq!(
         response.request_id.get(),
         1,

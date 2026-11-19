@@ -2189,6 +2189,48 @@ async fn a_committed_device_that_asks_again_unpaired_gets_an_answer_it_can_read(
     host.stop().await;
 }
 
+/// KR-REQ-10.37: a device whose authority the owner revoked after it was committed is no longer
+/// paired, and a fresh connection of its endpoint that asks about its invitation is refused: the
+/// commitment is told only to the connection that proved the candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_device_is_not_told_its_commitment_on_a_fresh_connection() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    let device = Device::create().await;
+    let (proving, _proved, _value) = calls::redeem(&device.candidate(), &invited).await;
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    host.controller()
+        .revoke_device_authority(confirmed.device_id, None, None)
+        .await
+        .expect("the device's authority is withdrawn");
+
+    let (fresh_connection, mut fresh) = open_unpaired(&host, &device).await;
+    match status_on(&mut fresh, invited.invitation_id).await {
+        Err(kr_transport::error::TransportError::Refused(error)) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("a fresh connection of a revoked device is refused, not {other:?}"),
+    }
+    proving.close(0u32.into(), b"done");
+    fresh_connection.close(0u32.into(), b"done");
+    host.stop().await;
+}
+
 /// A new candidate's first redemption step for `invitation_id`, dialled at this host as it runs
 /// now, and the host's refusal of it.
 async fn refused_challenge(

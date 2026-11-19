@@ -850,6 +850,19 @@ impl<'a> CodeCandidate<'a> {
         CandidateConnection,
         PairFinishResult,
     ) {
+        self.finish_with(|_| {}).await
+    }
+
+    /// As [`Self::finish`], with `alter` applied to the finish request before it is sent: a repeat
+    /// of the finish on a connection of its own, or one that carries a binding tag that is wrong.
+    pub async fn finish_with(
+        &mut self,
+        alter: impl FnOnce(&mut kr_protocol::pairing::PairFinishRequest),
+    ) -> (
+        iroh::endpoint::Connection,
+        CandidateConnection,
+        PairFinishResult,
+    ) {
         let host = self
             .host_bundle
             .as_ref()
@@ -868,7 +881,7 @@ impl<'a> CodeCandidate<'a> {
         let mut session = handshake::connect_unpaired(&connection, self.device.identity)
             .await
             .expect("an unpaired connection");
-        let request = self
+        let mut request = self
             .client
             .finish_request(
                 &HostPeer(*host.endpoint_id.as_bytes()),
@@ -876,6 +889,7 @@ impl<'a> CodeCandidate<'a> {
                 &self.clock,
             )
             .expect("a finish request");
+        alter(&mut request);
         let finished: PairFinishResult = session
             .call(Method::PairFinish, &request)
             .await

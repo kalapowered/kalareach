@@ -1130,6 +1130,47 @@ pub async fn pair_under(
     owner: &DeviceKeys,
     proposed: kr_protocol::pairing::ProposedGrant,
 ) {
+    let awaiting = awaiting_under(phone, host, owner, proposed).await;
+    awaiting.approved(phone, host, owner).await;
+}
+
+/// A device that waits for the owner's approval of a direct invitation, and the invitation.
+pub struct Awaiting {
+    invitation_id: kr_protocol::ids::InvitationId,
+}
+
+impl Awaiting {
+    /// The owner approves, and the device ends paired.
+    pub async fn approved(self, phone: &Phone, host: &Host, owner: &DeviceKeys) {
+        self.approved_without_waiting(host, owner).await;
+        phone
+            .companion
+            .reached(|state| state["state"] == "paired")
+            .await;
+    }
+
+    /// The owner approves, and nothing more is waited for.
+    pub async fn approved_without_waiting(self, host: &Host, owner: &DeviceKeys) {
+        let mut client = host.client().await;
+        calls::confirm_candidate(
+            host.environment_id,
+            &mut client,
+            self.invitation_id,
+            &Signer::OwnerDevice(owner),
+        )
+        .await
+        .expect("the owner approves");
+    }
+}
+
+/// `phone` pasted a direct invitation for `host` under the grant `proposed` and waits for the
+/// owner, who has not decided.
+pub async fn awaiting_under(
+    phone: &Phone,
+    host: &Host,
+    owner: &DeviceKeys,
+    proposed: kr_protocol::pairing::ProposedGrant,
+) -> Awaiting {
     let mut client = host.client().await;
     let signer = Signer::OwnerDevice(owner);
     let invited = calls::invite_direct(
@@ -1155,15 +1196,9 @@ pub async fn pair_under(
     companion
         .reached(|state| state["state"] == "awaiting_approval")
         .await;
-    calls::confirm_candidate(
-        host.environment_id,
-        &mut client,
-        invited.invitation_id,
-        &signer,
-    )
-    .await
-    .expect("the owner approves");
-    companion.reached(|state| state["state"] == "paired").await;
+    Awaiting {
+        invitation_id: invited.invitation_id,
+    }
 }
 
 /// A phone paired with `host` as a device holding `rights`.
@@ -1196,6 +1231,14 @@ pub struct LinkControl {
     /// How many times a connection was asked whether this device ended it, and told each time.
     ended_asked: std::sync::atomic::AtomicUsize,
     ended_asks: tokio::sync::Notify,
+    /// How many pre-authorisation surfaces the device opened.
+    surfaces: std::sync::atomic::AtomicUsize,
+    /// Whether the first surface answers nothing more: an answer it has not given is withheld, and
+    /// so is one that has been read.
+    first_surface_silent: std::sync::atomic::AtomicBool,
+    /// How many status questions the host did not answer, and how many of those it refused.
+    statuses_failed: std::sync::atomic::AtomicUsize,
+    statuses_refused: std::sync::atomic::AtomicUsize,
 }
 
 /// A change a case makes to the voice result that carries a challenge.
@@ -1275,6 +1318,30 @@ impl LinkControl {
     /// A control that lets every connection through.
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// From now on the first pre-authorisation surface answers no question, as a connection that
+    /// went quiet would, whatever the host says to it.
+    pub fn silence_the_first_surface(&self) {
+        self.first_surface_silent
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many pre-authorisation surfaces the device has opened.
+    pub fn surfaces_opened(&self) -> usize {
+        self.surfaces.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many status questions the host did not answer.
+    pub fn statuses_failed(&self) -> usize {
+        self.statuses_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many status questions the host refused in a frame the device read.
+    pub fn statuses_refused(&self) -> usize {
+        self.statuses_refused
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Holds each connection asked for from now on until the test releases it.
@@ -1825,6 +1892,76 @@ impl LinkControl {
     }
 }
 
+/// A pre-authorisation surface that counts the questions the host did not answer, and that answers
+/// nothing once its test says so when it is the first surface the device opened.
+struct Silenceable {
+    inner: Box<dyn kr_client::pairing::link::Preauth>,
+    control: Arc<LinkControl>,
+    first: bool,
+}
+
+impl Silenceable {
+    fn silent(&self) -> bool {
+        self.first
+            && self
+                .control
+                .first_surface_silent
+                .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl kr_client::pairing::link::Preauth for Silenceable {
+    fn selection(&self) -> &kr_protocol::hello::HostSelection {
+        self.inner.selection()
+    }
+
+    fn finish<'a>(
+        &'a mut self,
+        request: &'a kr_protocol::pairing::PairFinishRequest,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_protocol::preauth::PairFinishResult, kr_client::pairing::link::LinkError>,
+    > {
+        self.inner.finish(request)
+    }
+
+    fn redeem<'a>(
+        &'a mut self,
+        params: &'a kr_protocol::preauth::PairRedeemParams,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_protocol::preauth::PairRedeemResult, kr_client::pairing::link::LinkError>,
+    > {
+        self.inner.redeem(params)
+    }
+
+    fn status<'a>(
+        &'a mut self,
+        params: &'a kr_protocol::preauth::PairStatusParams,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_protocol::preauth::PairStatusResult, kr_client::pairing::link::LinkError>,
+    > {
+        Box::pin(async move {
+            if self.silent() {
+                std::future::pending::<()>().await;
+            }
+            let answer = self.inner.status(params).await;
+            if self.silent() {
+                std::future::pending::<()>().await;
+            }
+            if let Err(error) = &answer {
+                let counted = std::sync::atomic::Ordering::SeqCst;
+                self.control.statuses_failed.fetch_add(1, counted);
+                if matches!(error, kr_client::pairing::link::LinkError::Refused(_)) {
+                    self.control.statuses_refused.fetch_add(1, counted);
+                }
+            }
+            answer
+        })
+    }
+}
+
 /// The phone's way to its host, with a test's control over the connections to a paired host.
 struct ControlledLink {
     own: Arc<dyn kr_client::pairing::link::HostLink>,
@@ -2286,7 +2423,20 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
         'a,
         Result<Box<dyn kr_client::pairing::link::Preauth>, kr_client::pairing::link::LinkError>,
     > {
-        self.own.open_unpaired(connection, identity)
+        let first = self
+            .control
+            .surfaces
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0;
+        let control = Arc::clone(&self.control);
+        Box::pin(async move {
+            let inner = self.own.open_unpaired(connection, identity).await?;
+            Ok(Box::new(Silenceable {
+                inner,
+                control,
+                first,
+            }) as Box<dyn kr_client::pairing::link::Preauth>)
+        })
     }
 
     fn connect_paired_transport<'a>(
