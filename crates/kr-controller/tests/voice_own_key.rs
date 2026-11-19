@@ -488,6 +488,46 @@ async fn the_doctor_names_each_call_that_is_not_confirmed_closed_and_the_command
     daemon.host.stop().await;
 }
 
+/// A record of calls that cannot be read leaves no call to name, and the doctor says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_doctor_says_so_when_the_record_of_calls_cannot_be_read() {
+    let daemon = daemon().await;
+    rusqlite::Connection::open(
+        daemon
+            .host
+            .tree()
+            .environment()
+            .state_dir()
+            .join(kr_controller::voice::own_key_calls::OWN_KEY_CALLS_RECORD),
+    )
+    .expect("a second connection to the daemon's record")
+    .execute_batch("DROP TABLE own_key_calls;")
+    .expect("the record loses its calls");
+    let mut client = daemon.host.client().await;
+    let doctor: kr_protocol::hostinfo::HostDoctorResult = client
+        .request(Method::HostDoctor, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("host.doctor is served on the local socket")
+        .to_typed()
+        .expect("a doctor result");
+    let lines: Vec<&str> = doctor
+        .checks
+        .iter()
+        .filter(|check| check.id() == "voice-own-key-calls")
+        .map(kr_protocol::hostinfo::DoctorCheck::detail)
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "the record of own-key voice calls cannot be read, so a call that is not confirmed \
+             closed would not be shown here"
+        ],
+        "one line for the record that cannot be read"
+    );
+    daemon.host.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forget_calls_during_a_creation_settles_the_start_task_before_the_item_goes_and_a_late_creation_reply_is_hung_up_with_the_original_key_and_not_adopted()
  {

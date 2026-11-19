@@ -1076,10 +1076,19 @@ impl Controller {
     }
 
     /// One line for each call on the owner's own key that is not confirmed closed, with the
-    /// command that clears it.
+    /// command that clears it, or one line when the record of calls cannot be read.
     fn own_key_call_checks(&self) -> Vec<DoctorCheck> {
         let Ok(rows) = self.own_voice.ledger().rows() else {
-            return Vec::new();
+            return vec![DoctorCheck::new(
+                "voice-own-key-calls",
+                "The record of calls on the owner's own key",
+                DoctorStatus::Warning,
+                Sentence::new().stated(
+                    "the record of own-key voice calls cannot be read, so a call that is not \
+                     confirmed closed would not be shown here",
+                ),
+                None,
+            )];
         };
         rows.iter()
             .filter(|row| row.state.blocks_a_start())
