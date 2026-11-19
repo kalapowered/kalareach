@@ -316,13 +316,6 @@ struct Kept {
     ended_ms: u64,
 }
 
-/// What a call answers to a heartbeat, and whether the answer took the last of its final status.
-struct Answer {
-    result: VoiceControlResult,
-    /// Whether the call is settled and the device has acknowledged its last item.
-    final_acknowledged: bool,
-}
-
 #[derive(Default)]
 struct Registry {
     calls: BTreeMap<VoiceSessionId, Arc<HostCall>>,
@@ -485,15 +478,7 @@ impl HostCalls {
                 let call = Arc::clone(call);
                 drop(registry);
                 call.settle_if_due(now_ms);
-                let answer = call.heartbeat(after_seq, now_ms);
-                if answer.final_acknowledged {
-                    // The status may not be in the registry yet, when the settling thread has not
-                    // handed it over: it is then kept until its time is up.
-                    self.registry()
-                        .finals
-                        .retain(|kept| kept.status.voice_session_id != voice_session_id);
-                }
-                return answer.result;
+                return call.heartbeat(after_seq, now_ms);
             }
             let Some(at) = registry
                 .finals
@@ -805,27 +790,24 @@ impl HostCall {
     /// other call answers its state and its news from one look at its record: it stamps the
     /// phone's liveness while the call is open or recovering and its end is not recorded, drops
     /// the news the device acknowledged and returns the rest.
-    fn heartbeat(&self, after_seq: u64, now_ms: u64) -> Answer {
+    fn heartbeat(&self, after_seq: u64, now_ms: u64) -> VoiceControlResult {
         let channel = self.control.state();
         let mut state = self.state();
         if let Some(kept) = &state.settled {
             let status = &kept.status;
-            return Answer {
-                result: VoiceControlResult::Heartbeat {
-                    state: VoiceHostCallState::Closed {
-                        reason: status.reason,
-                        provider_close: status.provider_close,
-                    },
-                    remaining_seconds: 0,
-                    news: status
-                        .news
-                        .iter()
-                        .filter(|item| item.seq.get() > after_seq)
-                        .cloned()
-                        .collect(),
-                    dropped: false,
+            return VoiceControlResult::Heartbeat {
+                state: VoiceHostCallState::Closed {
+                    reason: status.reason,
+                    provider_close: status.provider_close,
                 },
-                final_acknowledged: after_seq >= status.last_seq,
+                remaining_seconds: 0,
+                news: status
+                    .news
+                    .iter()
+                    .filter(|item| item.seq.get() > after_seq)
+                    .cloned()
+                    .collect(),
+                dropped: false,
             };
         }
         let call_state = self.state_of(state.ended.is_some(), channel, now_ms);
@@ -844,15 +826,12 @@ impl HostCall {
         }
         let news: Vec<VoiceNews> = state.news.iter().cloned().collect();
         let dropped = after_seq < state.dropped_through;
-        Answer {
-            result: VoiceControlResult::Heartbeat {
-                state: call_state,
-                remaining_seconds: u32::try_from(self.closes_at_ms.saturating_sub(now_ms) / 1_000)
-                    .unwrap_or(u32::MAX),
-                news,
-                dropped,
-            },
-            final_acknowledged: false,
+        VoiceControlResult::Heartbeat {
+            state: call_state,
+            remaining_seconds: u32::try_from(self.closes_at_ms.saturating_sub(now_ms) / 1_000)
+                .unwrap_or(u32::MAX),
+            news,
+            dropped,
         }
     }
 
@@ -3704,7 +3683,7 @@ mod tests {
         drop(calls);
         close(&sideband, SidebandEnd::Lost);
         assert_eq!(
-            call.heartbeat(0, OPENED + 2_000).result,
+            call.heartbeat(0, OPENED + 2_000),
             VoiceControlResult::Heartbeat {
                 state: VoiceHostCallState::Closed {
                     reason: VoiceEndReason::SidebandLost,
@@ -3764,18 +3743,6 @@ mod tests {
         found
     }
 
-    /// Both places that carry the word, the `ended` item and the `closed` state, carry the same.
-    fn the_word_of(result: &VoiceControlResult) -> String {
-        let words = provider_closes(result);
-        assert_eq!(
-            words.len(),
-            2,
-            "the ended item and the closed state: {words:?}"
-        );
-        assert_eq!(words[0], words[1]);
-        words[0].clone()
-    }
-
     #[test]
     fn every_end_reason_is_told_with_the_confirmation_of_the_close() {
         for reason in [
@@ -3801,7 +3768,11 @@ mod tests {
                     matches!(state, VoiceHostCallState::Closed { reason: told, .. } if told == reason),
                     "{reason:?} {end:?}: {state:?}"
                 );
-                assert_eq!(the_word_of(&answer), word, "{reason:?} {end:?}");
+                assert_eq!(
+                    provider_closes(&answer),
+                    [word, word],
+                    "the ended item and the closed state: {reason:?} {end:?}"
+                );
             }
         }
     }
@@ -3828,7 +3799,11 @@ mod tests {
                 matches!(&answer, VoiceControlResult::Heartbeat { state: VoiceHostCallState::Closed { reason: told, .. }, .. } if *told == reason),
                 "{end:?}: {answer:?}"
             );
-            assert_eq!(the_word_of(&answer), word, "{end:?}");
+            assert_eq!(
+                provider_closes(&answer),
+                [word, word],
+                "the ended item and the closed state: {end:?}"
+            );
         }
         // An end the coordinator recorded as the provider's close takes the channel's word.
         let (calls, _call, sideband) = held();
@@ -3839,7 +3814,7 @@ mod tests {
             OPENED + 3_000,
         );
         let answer = calls.heartbeat(voice_session(1), device(7), 0, OPENED + 4_000);
-        assert_eq!(the_word_of(&answer), "unconfirmed");
+        assert_eq!(provider_closes(&answer), ["unconfirmed", "unconfirmed"]);
     }
 
     /// A close that is never reported is told as not confirmed, whatever the reason.
@@ -3855,7 +3830,11 @@ mod tests {
                 matches!(&answer, VoiceControlResult::Heartbeat { state: VoiceHostCallState::Closed { reason: told, .. }, .. } if *told == reason),
                 "{answer:?}"
             );
-            assert_eq!(the_word_of(&answer), "unconfirmed", "{reason:?}");
+            assert_eq!(
+                provider_closes(&answer),
+                ["unconfirmed", "unconfirmed"],
+                "{reason:?}"
+            );
         }
     }
 }
