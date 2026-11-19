@@ -15,6 +15,15 @@ path = "src/bin/kr-controller.rs"
 # The description process with no model, which this crate's own tests start in place of
 # `kr-describe-inference`. It is built only with the `testing` feature and is not part of any
 # release: no installation names it.
+# The control daemon as the test suites start it: the same program, built with the `testing`
+# feature, so that a run which did not ask for the account's own launchd chooses the detached
+# process and starts no launchd job. Built only with that feature, and not part of any release: a
+# suite that starts the daemon takes this file, and a build without the feature has none to take.
+[[bin]]
+name = "kr-controller-held"
+path = "src/bin/kr-controller-held.rs"
+required-features = ["testing"]
+
 [[bin]]
 name = "kr-stub-inference"
 path = "src/bin/kr-stub-inference.rs"

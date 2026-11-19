@@ -1,4 +1,4 @@
-//! `kr`, the control daemon, the worker, the plugin host and the release tool reserve as much stack
+//! `kr`, the control daemon (and its build for the suites), the worker, the plugin host and the release tool reserve as much stack
 //! for the main thread on Windows as Linux and macOS give it.
 //!
 //! Each of the five blocks the main thread on the future it runs, so that future lives on a stack
@@ -62,6 +62,7 @@ fn each_program_that_blocks_its_main_thread_on_a_future_reserves_the_stack_unix_
     let programs = [
         ("kr", PathBuf::from(env!("CARGO_BIN_EXE_kr"))),
         ("kr-controller", built("kr-controller")),
+        ("kr-controller-held", built("kr-controller-held")),
         ("kr-worker", built("kr-worker")),
         ("kr-plugin-host", built("kr-plugin-host")),
         ("kr-release", built("kr-release")),

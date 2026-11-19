@@ -768,6 +768,23 @@ fn windows() -> Vec<Step> {
             reading: Reading::Build,
             ..Step::cargo(
                 Group::Rust,
+                "the control daemon the suites start, built with the testing feature",
+                &[
+                    "build",
+                    "--locked",
+                    "-p",
+                    "kr-controller",
+                    "--features",
+                    "testing",
+                    "--bin",
+                    "kr-controller-held",
+                ],
+            )
+        },
+        Step {
+            reading: Reading::Build,
+            ..Step::cargo(
+                Group::Rust,
                 "the description process the update suite assembles into releases",
                 &[
                     "build",

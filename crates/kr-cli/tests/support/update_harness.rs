@@ -264,6 +264,17 @@ fn repository() -> PathBuf {
 fn crate_of(program: &str) -> &str {
     match program {
         "kr-describe-inference" => "kr-describe-model",
+        "kr-controller-held" => "kr-controller",
+        other => other,
+    }
+}
+
+/// The file of this workspace that a release's program is taken from: the control daemon is the
+/// build that refuses a launchd command the run did not ask for, which a release carries under the
+/// daemon's own name.
+fn built_as(program: &str) -> &str {
+    match program {
+        "kr-controller" => "kr-controller-held",
         other => other,
     }
 }
@@ -392,11 +403,13 @@ fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
                 .parent()
                 .and_then(Path::parent)
                 .expect("inside a target directory");
+            let name = built_as(name);
             let candidate = profile.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
             assert!(
                 candidate.is_file(),
                 "{} is not built beside this test, so this suite cannot assemble a release; a \
-                 workspace test run builds it, and so do `cargo build -p kr-controller -p \
+                 workspace test run builds it, and so do `cargo build -p kr-controller \
+                 --features testing --bin kr-controller-held`, `cargo build -p kr-controller -p \
                  kr-worker -p kr-hook -p kr-plugin-host` and `cargo build -p kr-describe-model \
                  --bin kr-describe-inference`",
                 candidate.display()
@@ -404,8 +417,10 @@ fn programs() -> &'static [(&'static str, PathBuf, Digest256, u64)] {
             if let Some(why) = built_from_another_tree(&candidate, name, &repository()) {
                 panic!(
                     "{} was not built from this tree: {why}; build the programs again with `cargo \
-                     build --locked -p kr-controller -p kr-worker -p kr-hook -p kr-plugin-host` and \
-                     `cargo build --locked -p kr-describe-model --bin kr-describe-inference`",
+                     build --locked -p kr-controller --features testing --bin kr-controller-held`, \
+                     `cargo build --locked -p kr-controller -p kr-worker -p kr-hook -p \
+                     kr-plugin-host` and `cargo build --locked -p kr-describe-model --bin \
+                     kr-describe-inference`",
                     candidate.display()
                 );
             }

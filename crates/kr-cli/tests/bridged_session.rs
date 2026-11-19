@@ -56,7 +56,8 @@ fn beside_this_test(name: &str) -> PathBuf {
     candidate.unwrap_or_else(|| {
         panic!(
             "the {name} executable is not built beside this test, so this check cannot run; a \
-             workspace test run builds it, and so does `cargo build -p kr-controller -p kr-worker`"
+             workspace test run builds it, and so do `cargo build -p kr-controller --features \
+             testing --bin kr-controller-held` and `cargo build -p kr-worker`"
         )
     })
 }
@@ -77,7 +78,7 @@ fn installation() -> &'static Path {
         );
         let real = directory.join("kr-controller-under-test");
         kr_ipc::testing::place_and_start_once(
-            &beside_this_test("kr-controller"),
+            &beside_this_test("kr-controller-held"),
             &real,
             &["--version"],
         );
@@ -3415,7 +3416,10 @@ fn programs_for_a_container() -> &'static Path {
             };
             place(&support::kr(), "kr");
             place(&beside_this_test("kr-worker"), "kr-worker");
-            place(&beside_this_test("kr-controller"), "kr-controller-real");
+            place(
+                &beside_this_test("kr-controller-held"),
+                "kr-controller-real",
+            );
             let script = directory.path().join("kr-controller.text");
             std::fs::write(
                 &script,

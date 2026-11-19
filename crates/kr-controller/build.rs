@@ -28,4 +28,8 @@ fn main() {
         }
     };
     println!("cargo:rustc-link-arg-bin=kr-controller={argument}");
+    // The same program, built for the test suites, is given the same stack.
+    if std::env::var_os("CARGO_FEATURE_TESTING").is_some() {
+        println!("cargo:rustc-link-arg-bin=kr-controller-held={argument}");
+    }
 }
