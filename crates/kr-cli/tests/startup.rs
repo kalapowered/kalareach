@@ -3677,6 +3677,37 @@ fn only_a_run_that_sets_the_account_launchd_variable_to_one_asks_for_the_account
     }
 }
 
+/// The text of a program in the place of `launchctl` that appends each call it is given to the
+/// file `calls`. The path is quoted for the shell that reads the text, whatever it holds.
+#[cfg(unix)]
+fn a_launchctl_that_records(calls: &Path) -> String {
+    format!(
+        "#!/bin/sh\necho \"$@\" >> {}\n",
+        kr_worker::testing::shell_quoted(calls)
+    )
+}
+
+/// A program in the place of `launchctl` that records into a folder whose name holds a quote and a
+/// space records the call it is given: the shell that reads its text gets the path as one word.
+#[cfg(unix)]
+#[test]
+fn a_launchctl_stand_in_records_into_a_folder_whose_name_holds_a_quote_and_a_space() {
+    let tree = teardown::Tree::create();
+    let folder = tree.root().join("it's a folder");
+    std::fs::create_dir(&folder).expect("a folder whose name holds a quote and a space");
+    let calls = folder.join("launchctl calls");
+    let stand_in = folder.join("launchctl");
+    kr_ipc::testing::place_script(&stand_in, a_launchctl_that_records(&calls));
+    let mut command = Command::new(&stand_in);
+    command.args(["print", "gui/501/a label"]);
+    let run = bounded(command, STREAMS_DEADLINE).expect("the stand-in runs");
+    assert!(run.status.success(), "{run:?}");
+    assert_eq!(
+        std::fs::read_to_string(&calls).expect("the stand-in records the call"),
+        "print gui/501/a label\n"
+    );
+}
+
 /// A Mac run that did not ask for the account's own launchd gets no host from the service-start
 /// cases and runs no `launchctl`, not to load a job and not to read one. A program in the place of
 /// `launchctl` records each call it is given, and it is shown to record before it is trusted to
@@ -3689,10 +3720,7 @@ fn a_run_that_did_not_ask_for_the_accounts_launchd_gets_no_host_and_runs_no_laun
     let tree = teardown::Tree::create();
     let calls = tree.root().join("launchctl-calls");
     let stand_in = tree.root().join("launchctl");
-    kr_ipc::testing::place_script(
-        &stand_in,
-        format!("#!/bin/sh\necho \"$@\" >> '{}'\n", calls.display()),
-    );
+    kr_ipc::testing::place_script(&stand_in, a_launchctl_that_records(&calls));
     let control = bounded(Command::new(&stand_in), STREAMS_DEADLINE).expect("the stand-in runs");
     assert!(control.status.success(), "{control:?}");
     assert!(calls.exists(), "the stand-in does not record a call");
