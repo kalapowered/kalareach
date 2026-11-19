@@ -900,6 +900,91 @@ async fn a_restart_keeps_a_hold_written_before_the_answer() {
     world.serving.abort();
 }
 
+/// KR-REQ-23.24: a start the service could not answer with an outcome leaves its hold, and a
+/// restart of the host keeps it, so the device's next unnamed start is refused in the hold's words
+/// and the service is not asked; a start the service refused with an error of another category
+/// leaves no hold, and the start after a restart reaches the service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_keeps_the_hold_of_an_unknown_outcome_and_not_the_refusal_of_another_category() {
+    for (error, holds, seed) in [
+        (ErrorCode::OutcomeUnknown, true, 81),
+        (ErrorCode::PermissionDenied, false, 82),
+    ] {
+        let (world, service, device_id, actor_id, params) =
+            with_service(vec![Answer::Fails(error)], true, seed).await;
+        let first = starting(
+            &world.controller,
+            world.environment_id,
+            actor_id.clone(),
+            device_id,
+            &params,
+        )
+        .await
+        .expect("the first start ran")
+        .into_answer_for_test()
+        .expect_err("the service did not make a call");
+        service.a_start_arrives().await;
+        assert_ne!(
+            first.code(),
+            ErrorCode::DraftConflict,
+            "{error:?}: the first start was not held: {first}"
+        );
+        let standing = hold_of(&world.controller, &actor_id).map(|row| row.action);
+        assert_eq!(standing.is_some(), holds, "{error:?}: {standing:?}");
+
+        let world = restarted(world).await;
+        let controller = Arc::clone(&world.controller);
+        let after = ServiceScript::new(
+            vec![Answer::Call {
+                call: "call-2",
+                replayed: false,
+                gate: None,
+            }],
+            true,
+        );
+        controller
+            .voice()
+            .attach_provider(Some(Arc::clone(&after) as Arc<dyn ManagedVoiceService>));
+        let params = ready(&controller, device_id, world.session_id).await;
+        assert_eq!(
+            hold_of(&controller, &actor_id).map(|row| row.action),
+            standing,
+            "{error:?}: the restart left the row as it was"
+        );
+        let next = starting(
+            &controller,
+            world.environment_id,
+            actor_id.clone(),
+            device_id,
+            &params,
+        )
+        .await
+        .expect("the next start ran")
+        .into_answer_for_test();
+        if holds {
+            let refused = next.expect_err("the device is held after the restart");
+            assert_eq!(refused.code(), ErrorCode::DraftConflict, "{refused}");
+            assert!(
+                standing.is_some_and(|action| refused.to_string().contains(&action.to_string())),
+                "the refusal names the start that holds the device: {refused}"
+            );
+            assert_eq!(
+                after.arrived.available_permits(),
+                0,
+                "the service was not asked"
+            );
+        } else {
+            next.expect("a device with no hold is admitted after the restart");
+            after.a_start_arrives().await;
+            assert!(
+                hold_of(&controller, &actor_id).is_none(),
+                "the start that made its call left no hold"
+            );
+        }
+        world.serving.abort();
+    }
+}
+
 /// What a start whose admission ended after the service answered saw: the calls the host asked the
 /// service to close, the action of the row that stands, and what the next start found.
 struct AfterTheAdmissionEnded {

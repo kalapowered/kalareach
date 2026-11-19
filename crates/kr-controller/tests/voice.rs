@@ -3781,6 +3781,15 @@ impl HoldWorld {
         &self,
         earlier: Option<ActionId>,
     ) -> std::result::Result<kr_client::session::Settled, kr_client::error::ClientError> {
+        self.start_within(earlier, NETWORK_LIFETIME).await
+    }
+
+    /// A start under a fresh action that asks the host to hold its admission for `lifetime`.
+    async fn start_within(
+        &self,
+        earlier: Option<ActionId>,
+        lifetime: kr_protocol::scalars::DurationMs,
+    ) -> std::result::Result<kr_client::session::Settled, kr_client::error::ClientError> {
         let expected = match earlier {
             Some(action) => {
                 kr_protocol::envelope::ParamsValue::from_typed(&std::collections::BTreeMap::from([
@@ -3797,7 +3806,7 @@ impl HoldWorld {
                 None,
                 &expected,
                 &self.params,
-                NETWORK_LIFETIME,
+                lifetime,
             )
             .await
     }
@@ -4425,6 +4434,50 @@ async fn a_start_whose_token_step_passes_the_send_limit_sends_nothing() {
             assert_eq!(world.calls_asked(), 1);
         } else {
             let sent = answered.expect("a start inside its send time is sent");
+            assert!(matches!(
+                outcome_of(&sent),
+                VoiceStartOutcome::Started { .. }
+            ));
+        }
+    }
+}
+
+/// KR-REQ-23.24: a start whose admission ends before the thirty seconds of its send limit are out
+/// sends nothing when its token step runs past the admission's end, and sends its request once when
+/// the step ends before it. The limit is the sooner of the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_whose_token_step_passes_the_admissions_deadline_sends_nothing() {
+    for (moves_by, posts) in [(15, 0_usize), (8, 1)] {
+        let (moved, clocks) = net_support::Moved::standing();
+        let world = HoldWorld::on_clocks(vec![a_start_that_made_a_call("call-1")], clocks).await;
+        world.token.arm();
+        let (answered, ()) = tokio::join!(
+            world.start_within(None, kr_protocol::scalars::DurationMs::new(10_000)),
+            async {
+                world.token.began().await;
+                moved.advance(std::time::Duration::from_secs(moves_by));
+                world.token.release();
+            }
+        );
+        assert_eq!(
+            world.calls_asked(),
+            posts,
+            "{moves_by} s into the token step of an admission of ten seconds"
+        );
+        if posts == 0 {
+            let refused = answered.expect_err("a start whose admission ended is refused");
+            assert_eq!(
+                refused.code(),
+                kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                "{refused}"
+            );
+            assert_eq!(
+                world.hold(),
+                None,
+                "a start that sent nothing leaves no hold"
+            );
+        } else {
+            let sent = answered.expect("a start inside its admission is sent");
             assert!(matches!(
                 outcome_of(&sent),
                 VoiceStartOutcome::Started { .. }
