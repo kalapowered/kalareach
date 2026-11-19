@@ -153,6 +153,12 @@ mod generations;
 /// The variable naming the build list entry of a real agent; without it the agent is the stand-in.
 const BUILD_VARIABLE: &str = "KR_AGENTS_GATEWAY_BUILD";
 
+/// Set (to anything) on the upgrade case's run, beside [`BUILD_VARIABLE`], to run the one mode that
+/// stops after the newer build's probes: no login, no model, no turn, no charge, and no start of
+/// the agent. It records the newer build's answers to the pinned entry's isolation probes, from
+/// which the entry's set for the newer build is written.
+const PROBE_ONLY_VARIABLE: &str = "KR_AGENTS_GATEWAY_PROBE_ONLY";
+
 /// What the session's shell prompts with, so a case knows it is reading.
 const PROMPT: &str = "kr-session$ ";
 
@@ -290,6 +296,9 @@ struct Real {
     /// The session variables of the second person's shell in a case that upgrades: the newer
     /// build's own configuration directory, which has no provider, and no login.
     prepared_newer: std::sync::Mutex<Option<Vec<(String, String)>>>,
+    /// Whether this is the probe-only run of the upgrade case: it records the newer build's probes
+    /// and starts no agent.
+    probe_only: bool,
 }
 
 impl Route {
@@ -307,7 +316,7 @@ impl Route {
     /// Panics when the entry names no login, the run's `HOME` is not the person's home as the
     /// system's account database names it, the values of the keys cannot be read, or the person's
     /// files cannot be looked at: nothing has started, and no turn is spent.
-    fn from_environment(case: &str, login: bool) -> Self {
+    fn from_environment(case: &str, login: bool, probe_only: bool) -> Self {
         let Some(path) = std::env::var_os(BUILD_VARIABLE)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -357,6 +366,7 @@ impl Route {
             configured: std::sync::Mutex::new(Vec::new()),
             prepared: std::sync::Mutex::new(None),
             prepared_newer: std::sync::Mutex::new(None),
+            probe_only,
         }))
     }
 }
@@ -690,6 +700,19 @@ impl Real {
         variables: &[(String, String)],
         probe: &Probe,
     ) -> Result<(), String> {
+        let answer = self.answer(run, program, as_recorded, variables, probe)?;
+        judged(probe, &answer)
+    }
+
+    /// Runs one probe of `program` and returns what it answered, judging nothing.
+    fn answer(
+        &self,
+        run: &Run,
+        program: &PlacedProgram,
+        as_recorded: bool,
+        variables: &[(String, String)],
+        probe: &Probe,
+    ) -> Result<Answer, String> {
         let stub = probe
             .arguments
             .iter()
@@ -719,38 +742,54 @@ impl Real {
         // that nothing it started outlives it with the environment it was given, when the run's
         // directory is searched for the keys.
         let output = grouped_output(command, LIVENESS)?;
-        match stub {
+        Ok(match stub {
             // The stub refuses the request on purpose, so how the command ended says nothing: what
             // the request offered is the answer.
-            Some(stub) => {
-                let text = stub.finish()?.join("\n");
-                probe.check(&text, &[], None)?;
-                let lacking = probe
-                    .lacks
-                    .iter()
-                    .find(|lack| lack.as_str() != "{servers}")
-                    .cloned()
-                    .unwrap_or_default();
-                if !lacking.is_empty()
-                    && probe
-                        .check(&format!("{text}\nnested control/{lacking}"), &[], None)
-                        .is_ok()
-                {
-                    return Err(format!(
-                        "its check did not refuse a tool named for {lacking:?}, added on purpose"
-                    ));
-                }
-                Ok(())
-            }
-            None => {
-                if !output.status.success() {
-                    return Err(format!("it ended with {}", output.status));
-                }
-                let text = String::from_utf8_lossy(&output.stdout).into_owned()
-                    + &String::from_utf8_lossy(&output.stderr);
-                probe.check(&text, &[], None)
-            }
-        }
+            Some(stub) => Answer {
+                text: stub.finish()?.join("\n"),
+                stubbed: true,
+                ended: Ok(()),
+            },
+            None => Answer {
+                text: String::from_utf8_lossy(&output.stdout).into_owned()
+                    + &String::from_utf8_lossy(&output.stderr),
+                stubbed: false,
+                ended: if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("it ended with {}", output.status))
+                },
+            },
+        })
+    }
+
+    /// What the probe-only run records: each of the pinned entry's isolation probes run against the
+    /// newer build, with its own configuration directory and no login, by the file recorded for it,
+    /// and for each the answer's lines and whether it holds what the pinned entry expects of the
+    /// pinned build. Nothing is judged here: the lines are what the entry's set for the newer build
+    /// is written from, after both reviewers read them against the isolation criteria.
+    fn records_the_newer_probes(
+        &self,
+        run: &Run,
+        newer: &PlacedProgram,
+        variables: &[(String, String)],
+    ) -> serde_json::Value {
+        let probes: Vec<serde_json::Value> = self
+            .account
+            .isolated
+            .iter()
+            .map(
+                |probe| match self.answer(run, newer, true, variables, probe) {
+                    Ok(answer) => probe_record(probe, &answer),
+                    Err(why) => serde_json::json!({
+                        "arguments": probe.arguments,
+                        "answered": false,
+                        "why": why,
+                    }),
+                },
+            )
+            .collect();
+        serde_json::json!({ "probe_only": true, "probes": probes })
     }
 
     /// The agent's program as the run placed it.
@@ -861,6 +900,73 @@ const STAND_IN_PLACE: &str = "t/codex";
 
 /// How many reads of the host's list of application instances a failure's text keeps.
 const POLLS_KEPT: usize = 20;
+
+/// What one probe answered.
+struct Answer {
+    /// What it printed, or, for a probe against the request stub, the names of the tools the
+    /// request offered, one per line.
+    text: String,
+    /// Whether the probe was answered by the request stub: how the command ended then says nothing.
+    stubbed: bool,
+    /// Whether the command ended as a probe's must, with why not.
+    ended: Result<(), String>,
+}
+
+/// Whether `answer` is what `probe` expects of the build it was written for.
+fn judged(probe: &Probe, answer: &Answer) -> Result<(), String> {
+    if answer.stubbed {
+        probe.check(&answer.text, &[], None)?;
+        let lacking = probe
+            .lacks
+            .iter()
+            .find(|lack| lack.as_str() != "{servers}")
+            .cloned()
+            .unwrap_or_default();
+        if !lacking.is_empty()
+            && probe
+                .check(
+                    &format!("{}\nnested control/{lacking}", answer.text),
+                    &[],
+                    None,
+                )
+                .is_ok()
+        {
+            return Err(format!(
+                "its check did not refuse a tool named for {lacking:?}, added on purpose"
+            ));
+        }
+        Ok(())
+    } else {
+        answer.ended.clone()?;
+        probe.check(&answer.text, &[], None)
+    }
+}
+
+/// The most lines of one answer the probe-only run records, and the most characters of each.
+const RECORDED_LINES: usize = 80;
+const RECORDED_LINE_CHARS: usize = 240;
+
+/// One probe of the probe-only run: its arguments, how it ended, whether the answer holds what the
+/// probe expects of the pinned build, which expectation it misses where it does not, and the
+/// answer's own lines, bounded.
+fn probe_record(probe: &Probe, answer: &Answer) -> serde_json::Value {
+    let verdict = judged(probe, answer);
+    let lines: Vec<String> = answer
+        .text
+        .lines()
+        .take(RECORDED_LINES)
+        .map(|line| line.chars().take(RECORDED_LINE_CHARS).collect())
+        .collect();
+    serde_json::json!({
+        "arguments": probe.arguments,
+        "answered": true,
+        "ended": answer.ended.clone().err().unwrap_or_else(|| "as a probe must".to_owned()),
+        "holds_the_pinned_entrys_expectations": verdict.is_ok(),
+        "misses": verdict.err(),
+        "line_count": answer.text.lines().count(),
+        "lines": lines,
+    })
+}
 
 /// The last reads of the host's list of application instances, as the device read them, each with
 /// the time it was read after the case began and what it listed.
@@ -2660,6 +2766,41 @@ impl<'a> Session<'a> {
         instance
     }
 
+    /// The probe-only run of the upgrade case: the shell's environment is read at its prompt, the
+    /// harness stops running `kr`, the files that would load the person's own settings are known
+    /// absent, the newer build's probes are recorded, and the files are known absent again. No
+    /// agent is started, no prompt is typed and no login is given, so nothing is charged.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a stand-in route, which has no newer build to probe.
+    fn records_the_newer_probes(&self) -> serde_json::Value {
+        let Route::Real(real) = &self.ctx.route else {
+            panic!("a probe-only run probes the newer build of a build list entry");
+        };
+        let newer = self
+            .ctx
+            .newer_placed
+            .as_ref()
+            .expect("the newer build was placed");
+        if !self.environment_read.replace(true) {
+            match self.person.reads_the_environment(&self.person.expected) {
+                Ok(compared) => eprintln!("{compared}"),
+                Err(why) => panic!("{why}"),
+            }
+        }
+        self.host.agent_starts();
+        let absent = real.newer_absent_list(&self.ctx.run);
+        real.checks_absent(&self.ctx.run, &absent);
+        let recorded = real.records_the_newer_probes(
+            &self.ctx.run,
+            newer,
+            &self.ctx.newer_variables(&self.host),
+        );
+        real.checks_absent(&self.ctx.run, &absent);
+        recorded
+    }
+
     /// What a failure at the instance wait or at the device's prompt adds to its text: one more read
     /// of the host's list of instances through the device, the last reads of it, and the terminal's
     /// screen ([`diagnosis_text`]).
@@ -2986,7 +3127,19 @@ fn ends(
         .iter()
         .map(|(class, why)| format!("{class}: {why}"))
         .collect();
+    let probe_only = matches!(&route, Route::Real(real) if real.probe_only);
     match result {
+        // A probe-only run starts no agent, so it says nothing of the case itself: it is a run
+        // that was not made, with what it recorded.
+        Ok(shows) if stops.is_empty() && probe_only => {
+            evidence["shows"] = shows;
+            record(Outcome::not_run(
+                case,
+                test,
+                "a probe-only run: the newer build's probes were recorded and no agent was started",
+                evidence,
+            ));
+        }
         Ok(shows) if stops.is_empty() => {
             evidence["shows"] = shows;
             record(Outcome::passed(case, test, evidence));
@@ -3115,6 +3268,31 @@ struct Setup {
     no_login: bool,
 }
 
+/// Whether the run is the probe-only run: asked for by [`PROBE_ONLY_VARIABLE`], which only the
+/// upgrade case on a real build takes.
+///
+/// # Errors
+///
+/// Returns why the run cannot be a probe-only run where it was asked to be one.
+fn probe_only_mode(setup: Setup, asked: bool, real_asked: bool) -> Result<bool, String> {
+    if !asked {
+        return Ok(false);
+    }
+    if !setup.upgrade {
+        return Err(format!(
+            "{PROBE_ONLY_VARIABLE} is set, and only the case that upgrades the agent has a newer \
+             build to probe"
+        ));
+    }
+    if !real_asked {
+        return Err(format!(
+            "{PROBE_ONLY_VARIABLE} is set, and {BUILD_VARIABLE} names no build list entry whose \
+             newer build it could probe"
+        ));
+    }
+    Ok(true)
+}
+
 /// [`run_case`], with the run `setup` asks for.
 fn run_case_in(
     setup: Setup,
@@ -3137,7 +3315,13 @@ fn run_case_in(
             return;
         }
     };
-    let route = match std::panic::catch_unwind(|| Route::from_environment(case, !setup.no_login)) {
+    let route = match std::panic::catch_unwind(|| {
+        let asked = std::env::var_os(PROBE_ONLY_VARIABLE).is_some_and(|value| !value.is_empty());
+        let probe_only =
+            probe_only_mode(setup, asked, real_asked).unwrap_or_else(|why| panic!("{why}"));
+        // A probe-only run has no login, whatever the case's own mode is.
+        Route::from_environment(case, !setup.no_login && !probe_only, probe_only)
+    }) {
         Ok(route) => route,
         Err(panic) => {
             records_failure(case, test, &kept_panic_text(&panic_text(&*panic)), &[]);
@@ -3389,6 +3573,11 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
         TEST,
         "leave-unanswered,two-approvals,stay",
         |ctx, session| {
+            if let Route::Real(real) = &ctx.route
+                && real.probe_only
+            {
+                return session.records_the_newer_probes();
+            }
             let second = session.second.as_ref().expect("two sessions");
             let first_session = session.session_id();
             let second_session = second.person.session_id;
@@ -5966,4 +6155,84 @@ fn a_thread_other_than_the_one_the_wait_is_for_fails_even_where_rich_work_is_ava
             Verdict::Failed(_)
         ));
     }
+}
+
+/// A probe the way a build list entry gives it.
+fn a_probe(value: serde_json::Value) -> Probe {
+    serde_json::from_value(value).expect("a probe")
+}
+
+/// The probe-only run is the upgrade case's, on a real build: asked for anywhere else it is refused,
+/// and not asked for it is not a probe-only run.
+#[test]
+fn a_probe_only_run_is_the_upgrade_cases_on_a_real_build_alone() {
+    let upgrade = Setup {
+        upgrade: true,
+        ..Setup::default()
+    };
+    assert_eq!(probe_only_mode(upgrade, true, true), Ok(true));
+    assert_eq!(probe_only_mode(upgrade, false, true), Ok(false));
+    assert_eq!(probe_only_mode(Setup::default(), false, false), Ok(false));
+    let other = probe_only_mode(Setup::default(), true, true).expect_err("not the upgrade case");
+    assert!(other.contains(PROBE_ONLY_VARIABLE), "{other}");
+    let stand_in = probe_only_mode(upgrade, true, false).expect_err("no build list entry");
+    assert!(stand_in.contains(BUILD_VARIABLE), "{stand_in}");
+}
+
+/// What a probe-only run records of a probe says whether the answer holds what the pinned entry
+/// expects, which expectation it misses, and keeps the answer's lines within the bound.
+#[test]
+fn a_probe_only_record_names_the_expectation_of_the_pinned_entry_the_answer_misses() {
+    let probe = a_probe(serde_json::json!({
+        "arguments": ["features", "list"],
+        "lines": ["apps stable false", "hooks stable false"],
+    }));
+    let holding = Answer {
+        text: "apps  stable  false\nhooks stable false\n".to_owned(),
+        stubbed: false,
+        ended: Ok(()),
+    };
+    let record = probe_record(&probe, &holding);
+    assert_eq!(record["holds_the_pinned_entrys_expectations"], true);
+    assert_eq!(record["misses"], serde_json::Value::Null);
+    assert_eq!(record["line_count"], 2);
+
+    let missing = Answer {
+        text: "apps stable false\nhooks stable true\n".to_owned(),
+        stubbed: false,
+        ended: Ok(()),
+    };
+    let record = probe_record(&probe, &missing);
+    assert_eq!(record["holds_the_pinned_entrys_expectations"], false);
+    assert!(
+        record["misses"]
+            .as_str()
+            .is_some_and(|why| why.contains("hooks stable false")),
+        "{record}"
+    );
+
+    // A command that ended badly does not hold, whatever it printed.
+    let failed = Answer {
+        text: "apps stable false\nhooks stable false\n".to_owned(),
+        stubbed: false,
+        ended: Err("it ended with exit status: 2".to_owned()),
+    };
+    let record = probe_record(&probe, &failed);
+    assert_eq!(record["holds_the_pinned_entrys_expectations"], false);
+    assert_eq!(record["ended"], "it ended with exit status: 2");
+
+    // The lines kept are bounded in number and in length; the count is the answer's own.
+    let long = Answer {
+        text: format!("{}\n", "x".repeat(RECORDED_LINE_CHARS * 2)).repeat(RECORDED_LINES * 2),
+        stubbed: false,
+        ended: Ok(()),
+    };
+    let record = probe_record(&probe, &long);
+    let kept = record["lines"].as_array().expect("lines");
+    assert_eq!(kept.len(), RECORDED_LINES);
+    assert!(kept.iter().all(|line| {
+        line.as_str()
+            .is_some_and(|text| text.len() == RECORDED_LINE_CHARS)
+    }));
+    assert_eq!(record["line_count"], RECORDED_LINES * 2);
 }
