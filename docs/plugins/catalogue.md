@@ -469,6 +469,11 @@ prompts. Past the default, each decision is somebody's and they are not intercha
 | A native bridge, which runs under the application's own permissions, a command integration, which changes how the application runs, or a skill target, which names the agent the contact skill is installed for | An installation grant the owner confirms, on every release |
 | Anything the installation it replaces could not do, or, for a first installation, anything past the ceiling | The owner's confirmation, because an increase is a new decision |
 
+An older host cannot read the new capability in a catalogue index or package manifest. It can
+refuse a whole index generation before the SDK range test, and then stops reading that repository's
+later revocations. A range test that it reaches can also refuse the release. Without hello
+evidence, the device gives no host caption to the skill-target text.
+
 A grant names only capabilities the package asks for. An installation that may do anything the
 installation it replaces could not, or, with nothing to replace, anything its repository's ceiling
 does not permit by itself, carries the owner's confirmation of that exact installation, and so does

@@ -1424,6 +1424,13 @@ installation that began and did not finish. `kr skill remove` undoes exactly wha
 recorded, and leaves alone anything that changed after it was written. Both print the change
 manifest: every directory created, every file written, and the configuration entry added.
 
+After a host has installed or removed the skill for an agent that a package declares, it cannot go
+back to a release that predates declared agents. The record of that action is in a format those
+releases do not read, and it stays after the removal. A host also cannot go back while its catalogue
+holds state that needs `skill_target.install`, such as a grant, a ceiling, a retired release or an
+activated index that names it. A host with neither goes back as before. `kr host rollback` refuses
+the switch and names the record in the way.
+
 What cannot be done safely is refused before anything changes: a file or a server entry this host
 did not write, a JSON configuration document that names a member twice in one object, and a
 configuration document whose access controls a replacement could not carry. On macOS and Linux that

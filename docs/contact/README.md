@@ -229,7 +229,7 @@ exactly what the installation recorded, through `agent_tools.remove`.
 
 The agents are `codex`, `claude-code`, `opencode`, `gemini-cli`, `kimi-code-cli` and `qoder-cli`.
 A package that this host admits, and whose grant holds `skill_target.install`, can name another agent. The host accepts that word while that package is the only one that names it, at the places the owner confirmed, and adds a tool-server entry only where the package names a configuration file; on Windows it refuses such a word. A word that no admitted package names and no record of this host holds is refused, with the list of the words this host knows.
-`manifest.json` in the skill package lists, for each one, where the skill goes at each scope, which
+`manifest.json` in the skill package lists, for each of the six compiled agents, where the skill goes at each scope, which
 configuration document the server entry is added to, and whether that layout was verified against an
 installed executable or taken from published documentation.
 
