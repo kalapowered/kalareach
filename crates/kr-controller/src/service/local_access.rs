@@ -262,23 +262,21 @@ impl Controller {
         self.local_access.draw(bound, || self.protocol_bound(bound))
     }
 
-    /// What the host's local owner may do now.
-    pub(crate) fn local_owner_bound_now(&self) -> LocalOwnerBound {
-        // The clocks are read after the policy lock is taken, which a policy commit holds across
-        // its storage writes.
-        let policy = self
-            .policy
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let now = self.clock.now();
-        let now_ms = self.settled_utc_now();
-        policy.local_owner_bound(self.local_owner_device(), now, now_ms)
-    }
-
     /// Whether the host is exclusively organisation-managed and its local owner has no live
     /// lease: what a local caller may then ask for is the recovery set and nothing else.
+    ///
+    /// Answered from the published standing, with no lock: a check that runs inside a transaction
+    /// on the device directory's connection asks this, and the policy's lock is held across the
+    /// policy's storage writes, which wait for that connection. The standing is loaded before
+    /// either clock is read, so a standing older than the clocks gives the answer a reader who
+    /// came a moment earlier would have given: both clocks only move forward, so an end found at
+    /// an older reading is found at a later one too. The continuous clock is read first and the
+    /// wall clock after it.
     pub(crate) fn local_owner_is_closed(&self) -> bool {
-        self.local_owner_bound_now() == LocalOwnerBound::Closed
+        let standing = self.local_owner_standing.load();
+        let now = self.clock.now();
+        let now_ms = self.settled_utc_now();
+        standing.bound(now, now_ms) == LocalOwnerBound::Closed
     }
 
     /// Whether a lease that [`Self::local_hold`] found live until `end` still is, on the clock now:

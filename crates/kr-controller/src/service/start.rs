@@ -639,6 +639,11 @@ impl Controller {
             startup_policy.or(accepted_policy),
             policy.adapter_allowlist(),
         )?);
+        // What the host's local owner may do, as the policy loaded states it: the first value of
+        // the standing that every policy put in force after it replaces.
+        let local_owner_standing = arc_swap::ArcSwap::from_pointee(
+            policy.local_owner_standing(kr_protocol::ids::DeviceId::new(setup.environment_id.get())),
+        );
         let policy = Arc::new(std::sync::Mutex::new(policy));
         let mut feed = match sharing.grants().stored_feed()? {
             Some(stored) => {
@@ -1398,6 +1403,7 @@ impl Controller {
             lifetimes,
             owner,
             policy,
+            local_owner_standing,
             authority_epoch: std::sync::atomic::AtomicU64::new(0),
             feed_refusal,
             restored_policy: tokio::sync::Mutex::new(restored_policy),
