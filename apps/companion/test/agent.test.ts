@@ -532,10 +532,13 @@ describe('a control says why it asks nothing of an agent no package is bound to 
     action_id: 'thread.refresh',
     parameters: { parameters: [] }
   }
-  // What the host writes in an instance's refusal when two packages recognise a program equally
-  // well, and when it adopts a program that a package is bound to.
+  // What the host writes in an instance's refusal when two or three packages recognise a program
+  // equally well (no package is bound then), and when it adopts a program that a package is bound
+  // to (the package is named then).
   const TIE =
     'it was not launched through the integration, and openai.codex and acme.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+  const TIE_OF_THREE =
+    'it was not launched through the integration, and openai.codex, acme.codex and other.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
   const ADOPTED =
     'it was not launched through the integration, so no registration names it and none of its bridges is admitted'
   const adopted = (over: Partial<AgentInstanceSummary>): AgentInstanceSummary => ({
@@ -554,9 +557,9 @@ describe('a control says why it asks nothing of an agent no package is bound to 
     )
   })
 
-  it("tells an agent no package recognised in the host's own words", () => {
-    expect(because(pressed(adopted({ plugin_id: null, refusal: ADOPTED })))).toBe(
-      `No package is bound to this agent. The host says ${ADOPTED}.`
+  it("tells a tie of three packages in the host's own words, which name all three", () => {
+    expect(because(pressed(adopted({ plugin_id: null, refusal: TIE_OF_THREE })))).toBe(
+      `No package is bound to this agent. The host says ${TIE_OF_THREE}.`
     )
   })
 
