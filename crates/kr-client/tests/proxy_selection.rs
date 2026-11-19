@@ -20,7 +20,7 @@ use kr_transport::config::ProxyUrl;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-#[path = "support/connect_proxy.rs"]
+#[path = "../src/services/http/connect_proxy.rs"]
 mod connect_proxy;
 
 use connect_proxy::ConnectProxy;

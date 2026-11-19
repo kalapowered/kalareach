@@ -3806,7 +3806,7 @@ mod declared_placement_tests;
 
 // The stand-in proxy of the suites that run it from `tests/`; the model files' tests use it too.
 #[cfg(test)]
-#[path = "../../../kr-client/tests/support/connect_proxy.rs"]
+#[path = "../../../kr-client/src/services/http/connect_proxy.rs"]
 pub(crate) mod connect_proxy;
 
 // A certificate authority and a TLS origin that keeps its connections open, for the case of a

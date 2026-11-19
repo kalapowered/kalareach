@@ -32,7 +32,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_websockets::{Message, ServerBuilder, WebSocketStream};
 
-#[path = "support/connect_proxy.rs"]
+#[path = "../src/services/http/connect_proxy.rs"]
 mod connect_proxy;
 
 use connect_proxy::ConnectProxy;

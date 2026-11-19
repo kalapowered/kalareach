@@ -17,7 +17,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-#[path = "support/connect_proxy.rs"]
+#[path = "../src/services/http/connect_proxy.rs"]
 mod connect_proxy;
 
 use connect_proxy::{ConnectProxy, Login};

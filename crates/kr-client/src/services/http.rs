@@ -1026,7 +1026,6 @@ impl HttpService {
 
 /// The stand-in proxy the suites of this crate share, included once for the cases of this module.
 #[cfg(test)]
-#[path = "../../tests/support/connect_proxy.rs"]
 mod connect_proxy;
 
 #[cfg(test)]
