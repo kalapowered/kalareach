@@ -2779,6 +2779,38 @@ mod tests {
             .filter(|(_, _, words)| words.as_deref() == Some(HostNote::PhoneBack.words()))
             .count();
         assert_eq!(backs, 1, "the owed note is written once");
+
+        // The same on a fresh call, with the request first: it is the request that claims the
+        // owed note, and the pass that finds it claimed.
+        let (calls, call, sideband) = held();
+        assert!(calls.tick(OPENED + 45_000).await.is_empty());
+        assert_eq!(sideband.written().len(), 1, "the silent note");
+        sideband.rate_refuses.store(true, Ordering::SeqCst);
+        call.phone_is_back(OPENED + 70_000).await;
+        assert_eq!(
+            sideband.written().len(),
+            1,
+            "the pace refused the back note"
+        );
+        sideband.rate_refuses.store(false, Ordering::SeqCst);
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *sideband.gate.lock().expect("the gate") = Some(Arc::clone(&gate));
+        let request = call.phone_is_back(OPENED + 76_000);
+        let pass = calls.tick(OPENED + 75_000);
+        let open = async {
+            settle().await;
+            gate.notify_waiters();
+        };
+        let ((), _, ()) = tokio::join!(request, pass, open);
+        let backs = sideband
+            .written()
+            .iter()
+            .filter(|(_, _, words)| words.as_deref() == Some(HostNote::PhoneBack.words()))
+            .count();
+        assert_eq!(
+            backs, 1,
+            "the owed note is written once when the request is first"
+        );
     }
 
     #[tokio::test]
