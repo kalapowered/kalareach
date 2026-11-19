@@ -4266,6 +4266,116 @@ async fn a_stored_apply_node_is_admitted_across_an_update_and_a_rollback() {
     drop(owner);
 }
 
+/// KR-REQ-23.24: the hold a voice start leaves is a store of its own that the release before does
+/// not name. A rollback to the release before is not refused, and it leaves the store as it was,
+/// unread: the release before serves the same device. An update again opens the store, finds the
+/// row as it was left, and the host holds the device under the same action until the same moment.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_voice_start_hold_the_release_before_ignores_is_kept_across_a_rollback_and_an_update() {
+    use kr_controller::voice_start_holds::{Decision, Record, VOICE_START_HOLDS_RECORD};
+
+    let mut updated = Updated::on_the_network().await;
+    let environment = updated.host.tree.environment();
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let door =
+        door::Door::pair_the_first_owner(&endpoint, updated.host.tree.environment_id()).await;
+    door.is_served_again()
+        .await
+        .expect("the control: this release serves the owner device");
+    let actor = kr_transport::listener::device_principal(&door.device_id);
+
+    // The daemon stops, and a start's row is written in the store the way the start writes it:
+    // under an action of its own, to end a day from now.
+    assert!(updated.host.stop_the_daemon().await, "the daemon stops");
+    bind_the_network_at(&updated.host, &door.host_socket().to_string());
+    let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+    let asked = kr_ipc::now_ms().get();
+    let ends = asked + 86_400_000;
+    {
+        let record = Record::open(environment.state_dir()).expect("the store opens");
+        let decided = record
+            .begin(
+                actor.clone(),
+                action,
+                None,
+                &|| (asked, ends),
+                &|_, _| Ok(false),
+                &|_| true,
+            )
+            .expect("the row is written");
+        assert_eq!(decided, Decision::Admitted);
+    }
+    let controller = updated.host.store.stable(Program::Controller);
+    updated.host.start_daemon(&controller).await;
+    let host = &updated.host;
+    let file = environment.state_dir().join(VOICE_START_HOLDS_RECORD);
+    let standing = |why: &str| {
+        let row = Record::open(environment.state_dir())
+            .expect("the store opens")
+            .standing(actor.clone())
+            .expect("the store reads")
+            .unwrap_or_else(|| panic!("{why}: the row stands"));
+        (row.action, row.asked_ms, row.ends_ms)
+    };
+    assert_eq!(
+        standing("this release holds the row it started on"),
+        (action, asked, ends)
+    );
+
+    // The rollback is not refused, and the release before serves the device and leaves the store.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a store of holds does not refuse a rollback: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.one.name()),
+        "the daemon is the release before's again"
+    );
+    let left = std::fs::read(&file).expect("the store is still there");
+    door.is_served_again()
+        .await
+        .expect("the release before does not read the store, and serves the device");
+    assert_eq!(
+        std::fs::read(&file).expect("the store is still there"),
+        left,
+        "the release before leaves the store byte for byte"
+    );
+
+    // The update again finds the row where it was left.
+    let archive = host.scratch("archives").join("two-again.tar.gz");
+    updated.two.archive(&archive);
+    let (output, said) = host.kr_json(&[
+        "host",
+        "update",
+        "--archive",
+        &archive.display().to_string(),
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "the update again goes ahead: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.two.name()),
+        "the daemon is this build's again"
+    );
+    door.is_served_again()
+        .await
+        .expect("this release serves the device again");
+    assert_eq!(
+        standing("the update again"),
+        (action, asked, ends),
+        "the host holds the device under the same action until the same moment"
+    );
+}
+
 /// KR-REQ-26.10, KR-REQ-26.08, KR-REQ-24.15: the record that a restored policy waits for the person
 /// at the machine is a store of its own that the release before does not name. A host that reads it
 /// refuses an owner device for the wait. A rollback to the release before is not refused, and it
