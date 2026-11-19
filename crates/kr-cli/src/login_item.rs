@@ -1068,7 +1068,12 @@ mod writer {
             lines.extend(event_lines(&run.events, &derived.file, &recorded, &said));
             return Err(carried(json, &lines, &derived, &read, error));
         }
-        if let Some(earlier) = earlier {
+        // A file left in place, or an aside that stays, is not what the earlier run began taking out.
+        let left = run
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::LeftFile | Event::AsideStays(_)));
+        if let Some(earlier) = earlier.filter(|_| !left) {
             lines.push(settled_said(Mode::Remove, earlier, false));
         }
         lines.extend(event_lines(&run.events, &derived.file, &recorded, &said));

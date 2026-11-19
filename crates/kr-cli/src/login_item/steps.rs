@@ -211,7 +211,8 @@ fn io(doing: Doing) -> impl Fn(std::io::Error) -> StepError {
 
 fn flush(directory: &Path, doing: Doing) -> Result<()> {
     match kr_flush::flush_directory(directory, NameKind::File) {
-        // A directory that is not there, or that is not a directory, has no name in it to lose.
+        // A directory that is not there, or that stands under a file, has no name in it to lose. A
+        // directory that became a file opens and syncs, so it gives no error.
         Err(error) if missing(&error) => Ok(()),
         other => other.map_err(io(doing)),
     }
