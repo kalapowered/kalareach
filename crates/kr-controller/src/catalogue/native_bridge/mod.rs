@@ -2483,27 +2483,31 @@ fn registration(
 ) -> std::result::Result<Option<RecordedFacts>, String> {
     let mut pairs = BTreeSet::new();
     for (destination, bytes) in sources {
-        // Every file a recipe installs is JSON this host reads, whatever its name says: an
-        // application may read a file more leniently than this host does, or run it as a script,
-        // and what is not read is not checked.
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        // Every file a recipe installs is one JSON object this host reads, whatever its name says:
+        // an application may read a file more leniently than this host does, or run it as a
+        // script, and what is not read is not checked. A name repeated in any object is a member
+        // one reader takes and another does not: a value keeps the last of two, and an application
+        // may read the first. So the file is read exactly, whole, before any value is made of it
+        // and before anything of it is believed; a root that is not an object is refused there.
+        if serde_json::from_slice::<serde::de::IgnoredAny>(bytes).is_err() {
             return Err(format!(
                 "{destination} cannot be read as JSON, so what it registers cannot be checked"
             ));
-        };
-        // A name repeated in any object is a member one reader takes and another does not: the
-        // value above keeps the last of two, and an application may read the first. The file is
-        // read again, exactly, before anything of it is believed.
-        if value.is_object()
-            && let Err(why) = std::str::from_utf8(bytes)
-                .map_err(|error| error.to_string())
-                .and_then(|text| json::Document::read(text).map(|_| ()))
+        }
+        if let Err(why) = std::str::from_utf8(bytes)
+            .map_err(|error| error.to_string())
+            .and_then(|text| json::Document::read(text).map(|_| ()))
         {
             return Err(format!(
                 "{destination} is not one JSON object with no repeated member, so what it \
                  registers cannot be checked: {why}"
             ));
         }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            return Err(format!(
+                "{destination} cannot be read as JSON, so what it registers cannot be checked"
+            ));
+        };
         // The commands first, whatever shape the placement declares for the file: a declared
         // member named `command` cannot hide one. The bare forwarder name is read only for the
         // two compiled layouts, which the installed packages were written for.

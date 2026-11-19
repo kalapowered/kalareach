@@ -66,6 +66,15 @@ fn gemini_package(sdk_range: &str, table: impl FnOnce(&mut Value)) -> Validated 
     validate_package_directory(&directory)
 }
 
+/// The bundled Gemini CLI package under a fresh directory with the file `relative` holding `bytes`.
+fn gemini_package_with_file(relative: &str, bytes: &[u8]) -> Validated {
+    let home = tempfile::tempdir().expect("a directory");
+    let directory = home.path().join("package");
+    copy_tree(&bundled("gemini-cli"), &directory);
+    std::fs::write(directory.join(relative), bytes).expect("writes");
+    validate_package_directory(&directory)
+}
+
 fn claude() -> Value {
     serde_json::from_str(CLAUDE_FIXTURE).expect("the fixture is JSON")
 }
@@ -464,6 +473,123 @@ fn a_placement_that_declares_an_enabling_key_a_last_file_or_a_path_prefix_is_ref
     prefix["files"][0]["shape"]["members"][1]["shape"] =
         json!({ "kind": "record_path", "prefix": "/dev/null/" });
     assert!(serde_json::from_value::<Placement>(prefix).is_err());
+}
+
+/// The root of a placed file is one JSON object: a shape whose root is any other kind is refused
+/// by name, and the two kinds of root a file may have are accepted.
+#[test]
+fn a_placement_file_whose_root_is_not_an_object_or_a_map_is_refused_by_name() {
+    for (what, root) in [
+        (
+            "an array",
+            json!({ "kind": "array", "items": { "kind": "command_handler" } }),
+        ),
+        ("text", json!({ "kind": "text", "max_bytes": 64 })),
+        ("a boolean", json!({ "kind": "boolean" })),
+        ("a number", json!({ "kind": "number" })),
+        ("exact text", json!({ "kind": "exact", "value": "local" })),
+        ("a command handler", json!({ "kind": "command_handler" })),
+        ("a directory name", json!({ "kind": "directory_name" })),
+        ("a record path", json!({ "kind": "record_path" })),
+        ("a server", json!({ "kind": "stdio_server" })),
+    ] {
+        let mut table = claude();
+        table["files"][2]["shape"] = root;
+        let found = placement(&table).refusals();
+        assert!(
+            found
+                .iter()
+                .any(|error| error.refusal == PlacementRefusal::FileNotAnObject
+                    && error.to_string().contains("hooks/hooks.json")),
+            "{what}: {found:?}"
+        );
+    }
+    for (what, root) in [
+        (
+            "an object",
+            json!({ "kind": "object", "members": [] }),
+        ),
+        (
+            "a map",
+            json!({ "kind": "map", "values": { "kind": "boolean" } }),
+        ),
+    ] {
+        let mut table = claude();
+        table["files"][2]["shape"] = root;
+        assert!(
+            !placement(&table)
+                .refusals()
+                .iter()
+                .any(|error| error.refusal == PlacementRefusal::FileNotAnObject),
+            "{what} is a root a file may have"
+        );
+    }
+}
+
+/// The package check reads each file a bridge installs for a repeated member name before any value
+/// is made of it, in either order, when the repeat is spelt with an escape and under an object and
+/// an array root: a value keeps the last of two, and the host places the bytes.
+#[test]
+fn a_bridge_file_that_repeats_a_member_name_is_refused_by_the_package_check() {
+    let handler = |command: &str, repeat: &str| {
+        format!(r#"{{"type": "command", {repeat} "command": "{command}", "timeout": 5}}"#)
+    };
+    for (what, hooks) in [
+        (
+            "an object root, the forwarder last",
+            format!(
+                r#"{{"hooks": {{"SessionStart": [{{"hooks": [{}]}}]}}}}"#,
+                handler("{kr_hook} gemini-cli hook", r#""command": "other","#)
+            ),
+        ),
+        (
+            "an object root, the forwarder first",
+            format!(
+                r#"{{"hooks": {{"SessionStart": [{{"hooks": [{}]}}]}}}}"#,
+                handler("other", r#""command": "{kr_hook} gemini-cli hook","#)
+            ),
+        ),
+        (
+            "an object root, an escaped repeat",
+            format!(
+                r#"{{"hooks": {{"SessionStart": [{{"hooks": [{}]}}]}}}}"#,
+                handler("{kr_hook} gemini-cli hook", r#""comm\u0061nd": "other","#)
+            ),
+        ),
+        (
+            "an array root, the forwarder last",
+            format!(
+                "[{}]",
+                handler("{kr_hook} gemini-cli hook", r#""command": "other","#)
+            ),
+        ),
+        (
+            "an array root, the forwarder first",
+            format!(
+                "[{}]",
+                handler("other", r#""command": "{kr_hook} gemini-cli hook","#)
+            ),
+        ),
+        (
+            "an array root, an escaped repeat",
+            format!(
+                "[{}]",
+                handler("{kr_hook} gemini-cli hook", r#""comm\u0061nd": "other","#)
+            ),
+        ),
+    ] {
+        let validated = gemini_package_with_file("bridge/hooks.json", hooks.as_bytes());
+        assert!(
+            validated.report.findings.iter().any(|finding| {
+                finding.code == FindingCode::DuplicateMember
+                    && finding.path.as_deref() == Some("bridge/hooks.json")
+                    && finding.detail.contains("\"command\"")
+            }),
+            "{what}: {:?}",
+            validated.report.findings
+        );
+        assert!(!validated.report.is_valid(), "{what}");
+    }
 }
 
 #[test]
