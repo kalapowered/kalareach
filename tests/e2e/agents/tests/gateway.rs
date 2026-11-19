@@ -3052,9 +3052,32 @@ struct Session<'a> {
     paired: PairedHost,
     /// Whether the shell's environment was read before the agent's first start.
     environment_read: std::cell::Cell<bool>,
+    /// Whether the stand-in leaves the run's tree as the harness made it, so that a daemon may be
+    /// started again after it started ([`the_stand_in_leaves_the_runs_tree`]).
+    stand_in_leaves_the_tree: bool,
     /// A second person on the same host and device, in a second session, with a connection of
     /// the device's of its own (a connection is fixed to one session by the host).
     second: Option<Second>,
+}
+
+/// Whether the stand-in that `variants` select leaves the run's tree as the harness made it. The
+/// variant `leave-a-host` rewrites the environment's identity in the run's state and links
+/// another host's socket there, so a daemon is never started again over that tree.
+fn the_stand_in_leaves_the_runs_tree(variants: &str) -> bool {
+    !variants.split(',').any(|variant| variant == "leave-a-host")
+}
+
+/// Only the variants that change nothing of the run's tree allow a daemon to be started again.
+#[test]
+fn a_stand_in_that_rewrites_the_runs_state_is_not_one_that_leaves_the_tree_as_it_was() {
+    assert!(the_stand_in_leaves_the_runs_tree(""));
+    assert!(the_stand_in_leaves_the_runs_tree(
+        "leave-unanswered,tick,ping-when-released,stay"
+    ));
+    assert!(!the_stand_in_leaves_the_runs_tree(
+        "answer-when-released,keep-reading,stay,leave-a-host"
+    ));
+    assert!(!the_stand_in_leaves_the_runs_tree("leave-a-host"));
 }
 
 /// The second person of a [`Session::open_two`], with the device's second connection.
@@ -3083,6 +3106,7 @@ impl<'a> Session<'a> {
             device,
             paired,
             environment_read: std::cell::Cell::new(false),
+            stand_in_leaves_the_tree: the_stand_in_leaves_the_runs_tree(variants),
             second: None,
         }
     }
@@ -3117,6 +3141,7 @@ impl<'a> Session<'a> {
             device,
             paired,
             environment_read: std::cell::Cell::new(false),
+            stand_in_leaves_the_tree: the_stand_in_leaves_the_runs_tree(variants),
             second: Some(Second {
                 person: second,
                 remote: second_remote,
@@ -3166,9 +3191,9 @@ impl<'a> Session<'a> {
         }
         // From here the harness runs no `kr` and ends the host's processes by the identities it
         // recorded: the agent runs in the same account and may leave anything in the run's state.
-        // The stand-in is the harness's own program and leaves nothing: a case on it may start the
-        // daemon again.
-        if matches!(self.ctx.route, Route::StandIn) {
+        // The stand-in is the harness's own program and, but for the variant that leaves for
+        // another host, leaves nothing: a case on it may start the daemon again.
+        if matches!(self.ctx.route, Route::StandIn) && self.stand_in_leaves_the_tree {
             self.host.agent_is_a_stand_in();
         }
         self.host.agent_starts();
