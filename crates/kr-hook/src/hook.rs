@@ -2155,6 +2155,12 @@ mod tests {
     /// twice, and a named object that is not one are refused; a null optional member is absent; a
     /// member nothing names may repeat; the request identifier takes the last of its repeats and
     /// nothing from a value that is not a string.
+    ///
+    /// Two things differ from that reader, and are meant to. It read a JSON array in place of the
+    /// input object, of `mcp_server` or of `mcp_context`, by the order of its struct's fields, which
+    /// no application writes; the places refuse an array there. And a launch whose registration
+    /// cannot be read says why for every event, where that reader said it only for an event it
+    /// would have reported.
     #[test]
     fn the_default_map_reads_missing_null_wrong_type_and_repeated_members_as_before() {
         let events = HookEvents::claude_code();
