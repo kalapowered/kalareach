@@ -377,7 +377,7 @@ impl Controller {
     /// The cell's snapshot is copied out before either clock is read
     /// ([`crate::grants::policy::HeldBound::published`]): loading a cell can allocate and lets go
     /// of a reference, and a clock read before that would be older than the answer it decides.
-    /// After the copy the question only compares.
+    /// After the copy it reads the two clocks, raises the floor with the wall reading, and compares.
     pub(crate) fn lease_stands(&self, lease: &LeaseHeld) -> bool {
         let published = lease.bound.as_ref().map(|bound| (bound, bound.published()));
         if self.lease_is_live_until(lease.end).is_err() {
