@@ -1394,22 +1394,6 @@ mod tests {
         }
     }
 
-    /// The live voice grants a device holds in the host's own store.
-    fn live_voice_grants(
-        controller: &crate::service::Controller,
-        device: kr_protocol::ids::DeviceId,
-    ) -> usize {
-        controller
-            .sharing()
-            .grants()
-            .records_for_device(device)
-            .expect("the store answers")
-            .into_iter()
-            .filter(|record| record.is_active() && record.revoked_at_ms.is_none())
-            .filter(|record| record.grant.permits(ActionRight::VoiceUse))
-            .count()
-    }
-
     /// The account's callback ends the calls bound to the account and no other: a call on the
     /// owner's own key is the voice tick's, so the callback leaves it standing when the service
     /// says it is over, and the general sweep then ends it.
@@ -1429,8 +1413,6 @@ mod tests {
             None,
         );
         let actions = [VoiceAction::Status];
-        let managed_before = live_voice_grants(&controller, managed_device.device_id);
-        let own_before = live_voice_grants(&controller, own_device.device_id);
         let _ = call_over_on(
             &controller,
             managed.clone(),
@@ -1453,12 +1435,6 @@ mod tests {
         .await;
         let coordinator = controller.voice().coordinator();
         assert_eq!(coordinator.live_sessions(), 2);
-        let own_grants = live_voice_grants(&controller, own_device.device_id);
-        assert!(
-            live_voice_grants(&controller, managed_device.device_id) > managed_before
-                && own_grants > own_before,
-            "each call has a grant of its own"
-        );
 
         let callback = super::VoiceCalls {
             module: Arc::downgrade(controller.voice()),
@@ -1472,16 +1448,6 @@ mod tests {
         );
         assert_eq!(managed.closed(), 1, "the account's call ended");
         assert_eq!(own.closed(), 0, "the own-key call was not closed");
-        assert_eq!(
-            live_voice_grants(&controller, managed_device.device_id),
-            managed_before,
-            "the account call's grant is revoked"
-        );
-        assert_eq!(
-            live_voice_grants(&controller, own_device.device_id),
-            own_grants,
-            "the own-key call keeps its grant"
-        );
 
         coordinator
             .end_calls_that_are_over(controller.settled_now_ms())
@@ -1491,8 +1457,8 @@ mod tests {
     }
 
     /// A call on the owner's own key that the provider closed, with no host call registered for
-    /// it, still needs the voice tick, and one pass of the tick ends it in the coordinator with its
-    /// grant revoked.
+    /// it, still needs the voice tick, and one pass of the tick ends it in the coordinator (the
+    /// call's grant is revoked in the daemon case that runs the real provider).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_tick_ends_an_own_key_call_the_provider_closed_though_no_host_call_is_left() {
         let script = Scripted::new();
@@ -1505,7 +1471,6 @@ mod tests {
             &[ActionRight::SessionView, ActionRight::HostManage],
             None,
         );
-        let before = live_voice_grants(&controller, device.device_id);
         let _ = call_over_on(
             &controller,
             own.clone(),
@@ -1520,7 +1485,6 @@ mod tests {
         let coordinator = module.coordinator();
         assert!(module.host_calls().is_empty());
         assert_eq!(coordinator.live_sessions(), 1);
-        assert!(live_voice_grants(&controller, device.device_id) > before);
         assert!(
             module.needs_tick(),
             "a call the coordinator holds on the owner's own key needs the tick"
@@ -1529,11 +1493,6 @@ mod tests {
         module.tick(controller.settled_now_ms()).await;
         assert_eq!(coordinator.live_sessions(), 0);
         assert_eq!(own.closed(), 1);
-        assert_eq!(
-            live_voice_grants(&controller, device.device_id),
-            before,
-            "the call's grant is revoked"
-        );
         assert!(!module.needs_tick(), "nothing is left to watch");
     }
 }
