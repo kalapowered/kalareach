@@ -10,9 +10,10 @@
 //! attached. Nothing but a reading of the sources sees it, so this one reads them.
 //!
 //! In every Rust file the repository tracks under a `tests` folder that names `hdiutil` in a
-//! literal, a literal that is `detach`, or that holds `hdiutil` and `detach` in one piece, is the
-//! command run. The sources are read as Rust is: a comment, a raw string and a character are
-//! passed over, and a literal that wraps over lines is joined as the compiler joins it.
+//! literal, a literal that is `detach`, or that holds `hdiutil`, or a path that ends in it, and
+//! `detach` in one piece, is the command run. The sources are read as Rust is: a comment, a raw
+//! string and a character are passed over, and a literal that wraps over lines is joined as the
+//! compiler joins it.
 //!
 //! The limits: a command line made in a variable or a helper, and a file that does not name
 //! `hdiutil` in a literal, are not seen.
@@ -27,10 +28,13 @@ use kr_conformance::rust_lex::{Tok, lex};
 const TOOL: &str = concat!("hdiu", "til");
 const VERB: &str = concat!("de", "tach");
 
-/// Whether `text` holds the tool's name and the verb as two words in a row, as a shell line does.
+/// Whether `text` holds the tool and the verb as two words in a row, as a shell line does. The tool
+/// may be named by its path: the file name of the word is the tool's name.
 fn runs_it_in_words(text: &str) -> bool {
     let words: Vec<&str> = text.split_whitespace().collect();
-    words.windows(2).any(|pair| pair == [TOOL, VERB])
+    words
+        .windows(2)
+        .any(|pair| pair[1] == VERB && pair[0].rsplit('/').next().is_some_and(|name| name == TOOL))
 }
 
 /// A file under a `tests` folder that runs `hdiutil detach` on purpose, with the number of
@@ -222,4 +226,29 @@ fn the_reading_names_each_form_of_the_detach_command_and_passes_what_is_not_it()
     // A comment holds the words and runs nothing.
     let comment = format!("// {tool} {verb}\nfn f() {{ let said = \"{tool} create\"; }}");
     assert!(lines(target, &comment).is_empty());
+}
+
+/// The control: a shell line that names the tool by its path runs the same command, and a word
+/// that only ends like the tool's name does not.
+#[test]
+fn the_reading_names_the_tool_by_its_file_name_in_a_shell_line() {
+    let (tool, verb) = (TOOL, VERB);
+    let target = "crates/x/tests/a.rs";
+
+    let by_path = format!(
+        "fn f() {{ Command::new(\"sh\").args([\"-c\", \"/usr/bin/{tool} {verb} -force /dev/disk4\"]); }}"
+    );
+    assert_eq!(lines(target, &by_path), [1]);
+    let after_another = format!("fn f() {{ sh(\"sudo /usr/bin/{tool} {verb} /dev/disk4\"); }}");
+    assert_eq!(lines(target, &after_another), [1]);
+    let relative = format!("fn f() {{ sh(\"./bin/{tool} {verb} /dev/disk4\"); }}");
+    assert_eq!(lines(target, &relative), [1]);
+
+    // Another tool whose name only ends like this one, and the tool's other verbs by its path.
+    let other_tool = format!("fn f() {{ sh(\"/usr/bin/not-{tool} {verb} /dev/disk4\"); }}");
+    assert!(lines(target, &other_tool).is_empty());
+    let other_verb = format!("fn f() {{ sh(\"/usr/bin/{tool} info\"); }}");
+    assert!(lines(target, &other_verb).is_empty());
+    let named_after = format!("fn f() {{ sh(\"{verb} /usr/bin/{tool}\"); }}");
+    assert!(lines(target, &named_after).is_empty());
 }
