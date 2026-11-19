@@ -308,7 +308,8 @@ export const OWN_KEY_CALL_SECONDS = CALL_SECONDS
  */
 export function startable(choice: ProviderChoice): boolean {
   if (choice.managed) return choice.managed.enabled && requestedSeconds(choice.managed) !== null
-  return choice.ownKey?.held === true
+  // A host that sent no disclosure has said nothing the person could read before the call.
+  return choice.ownKey?.held === true && choice.ownKey.disclosure.length > 0
 }
 
 /** A rate as a person reads it, in their own locale's spelling of the service's currency. */
@@ -482,6 +483,11 @@ export interface RunningCall {
    * device keeps each one, and the screen shows each while the call runs.
    */
   readonly problems: readonly string[]
+  /**
+   * How the host's sender is getting on with the call's opening context, in the device's words, or
+   * null before the call has asked for it.
+   */
+  readonly context?: string | null
 }
 
 /**
@@ -518,7 +524,8 @@ export function runningCallFrom(
     delegations: delegationsFrom(state.delegations),
     requests: [],
     admissionMeans,
-    problems: problemWords(state.problems)
+    problems: problemWords(state.problems),
+    context: state.context?.words ?? null
   }
 }
 
@@ -534,7 +541,8 @@ export function callAsReported(call: RunningCall, state: VoiceCallState): Runnin
     brokerReachable: state.control !== 'unreachable',
     callHost: state.host === 'lost' ? 'lost' : 'reachable',
     delegations: delegationsFrom(state.delegations),
-    problems: problemWords(state.problems)
+    problems: problemWords(state.problems),
+    context: state.context?.words ?? null
   }
 }
 

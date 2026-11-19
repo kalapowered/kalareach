@@ -1189,6 +1189,11 @@ export interface VoiceCallState {
   /** The delegations the provider announced, and what this version did with each. */
   readonly delegations: readonly VoiceDelegationRow[]
   /**
+   * How the host's sender is getting on with the call's opening context, once the call has asked
+   * for it: sending, done or stopped, with the counts and what stopped it, in words for a person.
+   */
+  readonly context?: VoiceContextView | null
+  /**
    * What the call met that a person is told, each problem once, from the moment it was met until
    * another call begins: the screen shows them on the running call, and after it for the person who
    * starts the next. This is native code's own state for the screen, not a kept type.
@@ -1253,9 +1258,28 @@ export interface VoiceEnded {
    * What the voice service did: `pending` while its closure is awaited, then `closed`,
    * `closed_by_service`, `closed_by_host`, `closed_over_http` or `not_confirmed`; `unknown` when
    * the host never said whether it made a call, so the service may hold one this device cannot
-   * name; `not_needed` when the host never created a call.
+   * name; `not_needed` when the host never created a call. A call the host controls on its owner's
+   * own key has no voice service: its end is `closed_by_host`, `left_to_host` when the host did not
+   * confirm the provider's closure, and `host_unknown` when the host never said whether it made
+   * the call.
    */
   readonly broker: string
+}
+
+/** Where the host's sender stands with a call's opening context, as native code words it. */
+export interface VoiceContextView {
+  /** `sending`, `done` or `stopped`. */
+  readonly state: string
+  /** How many parts the host has sent. */
+  readonly appended: number
+  /** How many parts it has to send, or 0 while it has not said. */
+  readonly of: number
+  /** How many parts the host sent and did not learn whether the provider took. */
+  readonly unconfirmed: number
+  /** What stopped it, for `stopped`. */
+  readonly stopped_by: string | null
+  /** What a person is told. */
+  readonly words: string
 }
 
 /** A delegation the provider announced, and the answer this version gives it. */

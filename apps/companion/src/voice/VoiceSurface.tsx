@@ -738,6 +738,13 @@ function CallScreen({
         </p>
       )}
 
+      {/* How far the host has got with the context it gives the call to open with. */}
+      {typeof call.context === 'string' && (
+        <p className="kr-voice__context" role="status" data-testid="voice-context">
+          {call.context}
+        </p>
+      )}
+
       {/* What the call has met, each problem on its own line: the context the host or the voice
           service did not give in full, the host not vouching for the call. They are the call's, so
           they are here while it runs and not only once it has ended. */}
@@ -909,6 +916,7 @@ const DELEGATION_CAUSES: Readonly<Record<string, string>> = {
   stale_proof: 'The microphone could not be shown to be working. Say it again.',
   host_lost: 'The computer was out of reach.',
   broker_disagrees: 'The voice service did not confirm it. Say it again.',
+  host_disagrees: 'The host did not confirm it. Say it again.',
   not_drained: 'Part of what was said could not be read in time. Say it again.',
   no_proof: 'The microphone could not be shown to be working. Say it again.',
   not_confirmed: 'You did not confirm it. Say it again to be asked again.',

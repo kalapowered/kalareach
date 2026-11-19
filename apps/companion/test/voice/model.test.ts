@@ -25,6 +25,7 @@ import {
   runningCallFrom,
   serviceWords,
   speechCouldHaveBeenHeard,
+  startable,
   type CaptureState,
   type ProviderChoice,
   type RunningCall,
@@ -234,6 +235,17 @@ describe('the provider choice', () => {
     })
   })
 
+  // A host that sends no disclosure has said nothing the person could read before the call, so the
+  // choice offers no start.
+  it('offers no start on the owner’s own key for a host that sent no disclosure', () => {
+    const made = (disclosure: string[]) =>
+      choiceFromPreparation(
+        preparation({ provider: { own_key: { model: 'gpt-live-1', disclosure, held: true } } })
+      )
+    expect(startable(made(['This call runs on the OpenAI key.']))).toBe(true)
+    expect(startable(made([]))).toBe(false)
+  })
+
   // A refused start moves only the rate, and the rate the person read before stays beside it.
   it('replaces the rate after a refusal and keeps the one read before', () => {
     const before = choice()
@@ -305,6 +317,20 @@ describe('what the device reports of its call', () => {
   // The call is the application's, so the screen takes its microphone, its speaker, the voice
   // service, the host the call belongs to and the delegations from the device's report, whoever
   // started the call.
+  // The host's sender writes the opening context at its own pace: the device words how far it has
+  // got, and the screen carries those words as they are and drops them when the device reports none.
+  it('carries the words the device gives for the opening context, and none when it gives none', () => {
+    const words = 'The host is giving this call the context of its session: 2 of 5 parts so far.'
+    const reported = callAsReported(
+      call(),
+      callState({
+        context: { state: 'sending', appended: 2, of: 5, unconfirmed: 0, stopped_by: null, words }
+      })
+    )
+    expect(reported.context).toBe(words)
+    expect(callAsReported(reported, callState({ context: null })).context).toBeNull()
+  })
+
   // A call that hands spoken requests to the host reports what became of each, and why.
   it('keeps the state and the cause of each delegation the device reports', () => {
     const reported = callAsReported(
@@ -452,7 +478,17 @@ describe('what the voice service did about a call that ended', () => {
   // The service is asked last and the screen does not wait for it, so what it did is said apart
   // from the rest of the end, once it is known.
   it('says nothing while the service has still to answer, or when it closed the call', () => {
-    for (const broker of ['pending', 'closed', 'closed_by_host', 'closed_by_service', 'closed_over_http', 'not_needed']) {
+    for (const broker of [
+      'pending',
+      'closed',
+      'closed_by_host',
+      'closed_by_service',
+      'closed_over_http',
+      'not_needed',
+      // A call on the host's own key never involved the voice service, whatever the host said.
+      'host_unknown',
+      'left_to_host'
+    ]) {
       expect(serviceWords({ ...endedFor(), broker })).toBeNull()
     }
   })

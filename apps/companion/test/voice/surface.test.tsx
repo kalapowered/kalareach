@@ -759,6 +759,48 @@ describe('while a call is running', () => {
     expect(screen.queryByText(NOT_ACTED_ON_WORDS)).not.toBeInTheDocument()
   })
 
+  // How far the host has got with the opening context is shown beside the call, in the device's own
+  // words, and nothing is shown before the call has asked for it.
+  it('shows how far the host has got with the call’s opening context', () => {
+    const words = 'The host stopped giving this call the context of its session after 2 of 5 parts, because OpenAI refused part of it.'
+    const { rerender } = render(
+      <VoiceSurface choice={choice()} call={call()} currentTurn={null} busy={false} notice={null} actions={actions()} />
+    )
+    expect(screen.queryByTestId('voice-context')).not.toBeInTheDocument()
+    rerender(
+      <VoiceSurface
+        choice={choice()}
+        call={call({ context: words })}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    expect(screen.getByTestId('voice-context')).toHaveTextContent(words)
+  })
+
+  // On a call the host controls, the announcement that was not confirmed is the host's to confirm:
+  // the row names the host and never the voice service, which takes no part in the call.
+  it('says the host did not confirm a delegation on a call the host controls, and never the voice service', () => {
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={call({
+          delegations: [
+            { delegationId: 'd-1', offsetMs: 1000, state: 'refused', cause: 'host_disagrees', told: true }
+          ]
+        })}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    expect(screen.getByText(/The host did not confirm it\. Say it again\./)).toBeInTheDocument()
+    expect(screen.queryByText(/voice service/i)).not.toBeInTheDocument()
+  })
+
   // A confirmation dropped because the call ended is not said to have waited for the person, who may
   // have confirmed it already, and is not said to leave the voice to be told: the voice goes with
   // the call. One whose session could not be read is not said to have run out of time.
