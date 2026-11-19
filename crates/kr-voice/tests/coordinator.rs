@@ -84,6 +84,9 @@ struct Store {
 struct Authority {
     store: Mutex<Store>,
     device_grant: Mutex<Option<Grant>>,
+    /// Other devices that hold a copy of the device grant, for a test that starts calls from more
+    /// than one device.
+    also_for: Mutex<Vec<DeviceId>>,
     identity: AuthorisationKey,
     lookups: Lookups,
     /// Whether the next write of a replacement grant fails.
@@ -176,6 +179,7 @@ impl Authority {
                 ..Store::default()
             }),
             device_grant: Mutex::new(Some(device_grant)),
+            also_for: Mutex::new(Vec::new()),
             identity,
             lookups: Lookups::default(),
             write_fails: std::sync::atomic::AtomicBool::new(false),
@@ -373,7 +377,22 @@ impl VoiceAuthority for Authority {
         session_id: Option<SessionId>,
     ) -> kr_voice::Result<Option<Grant>> {
         self.refusal_for(Seam::DeviceGrant)?;
-        let held = self.device_grant.lock().expect("the device grant").clone();
+        let also = self
+            .also_for
+            .lock()
+            .expect("the other devices")
+            .contains(&device_id);
+        let held = self
+            .device_grant
+            .lock()
+            .expect("the device grant")
+            .clone()
+            .map(|mut grant| {
+                if also {
+                    grant.recipient_device_id = device_id;
+                }
+                grant
+            });
         Ok(held.filter(|grant| {
             grant.recipient_device_id == device_id
                 && session_id.is_none_or(|id| grant.session_selector.admits(id))
@@ -4752,5 +4771,423 @@ async fn a_start_is_bound_to_the_preparation_the_person_was_shown() {
         matches!(started.outcome, VoiceStartOutcome::Started { .. }),
         "{:?}",
         started.outcome
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// What a voice start reports to its host
+// ---------------------------------------------------------------------------------------------
+
+/// An admission that records what the start tells it: how often `before_the_broker` was called,
+/// the effect the start came to, and the effect each deferred closure was run with. It can refuse
+/// the Nth check made after `before_the_broker`, which is how each exit that follows the broker is
+/// reached.
+struct Recording {
+    before: std::sync::atomic::AtomicUsize,
+    checks: std::sync::atomic::AtomicUsize,
+    refuse_at: Option<usize>,
+    effects: Mutex<Vec<kr_voice::BrokerEffect>>,
+    resolved: Arc<Mutex<Vec<kr_voice::BrokerEffect>>>,
+    /// What a deferred closure asks the coordinator for before it records: a closure that ran under
+    /// the coordinator's lock would wait for the lock it runs under.
+    coordinator: Mutex<Option<Arc<Coordinator>>>,
+}
+
+impl std::fmt::Debug for Recording {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Recording").finish_non_exhaustive()
+    }
+}
+
+impl Recording {
+    fn new(refuse_at: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            before: std::sync::atomic::AtomicUsize::new(0),
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            refuse_at,
+            effects: Mutex::new(Vec::new()),
+            resolved: Arc::new(Mutex::new(Vec::new())),
+            coordinator: Mutex::new(None),
+        })
+    }
+
+    fn effects(&self) -> Vec<kr_voice::BrokerEffect> {
+        self.effects.lock().expect("the effects").clone()
+    }
+
+    fn resolved(&self) -> Vec<kr_voice::BrokerEffect> {
+        self.resolved.lock().expect("the resolutions").clone()
+    }
+
+    fn before_calls(&self) -> usize {
+        self.before.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl kr_voice::Admission for Recording {
+    fn still_admitted(&self) -> Result<(), kr_protocol::error::ProtocolError> {
+        if self.before_calls() == 0 {
+            return Ok(());
+        }
+        let number = self
+            .checks
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if self.refuse_at == Some(number) {
+            Err(host_refusal())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn before_the_broker(
+        &self,
+        _duration_seconds: u32,
+    ) -> Result<(), kr_protocol::error::ProtocolError> {
+        self.before
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn after_the_broker(&self, effect: kr_voice::BrokerEffect) {
+        self.effects.lock().expect("the effects").push(effect);
+    }
+
+    fn deferred(&self) -> Option<kr_voice::AfterDeferred> {
+        let resolved = Arc::clone(&self.resolved);
+        let coordinator = self.coordinator.lock().expect("the coordinator").clone();
+        Some(Box::new(move |effect| {
+            if let Some(coordinator) = &coordinator {
+                let _ = coordinator.live_sessions();
+            }
+            resolved.lock().expect("the resolutions").push(effect);
+        }))
+    }
+}
+
+/// A start for `who` under the preparation this coordinator answers now.
+async fn params_for(coordinator: &Coordinator, who: DeviceId) -> VoiceStartParams {
+    let prepared = coordinator
+        .prepare(
+            who,
+            &VoicePrepareParams {
+                session_ids: [session(SESSION_A)].into_iter().collect(),
+                selected: CanonicalSet::from_iter([]),
+            },
+        )
+        .await
+        .map_or(Digest256::from_bytes([0; 32]), |answer| answer.prepared);
+    VoiceStartParams {
+        prepared,
+        ..start_params()
+    }
+}
+
+/// What a start that came to each of these things tells its admission it came to.
+enum Before {
+    /// Nothing stands for the device.
+    Nothing,
+    /// A live voice session holds the call the service will name again.
+    ALiveCall,
+    /// The call the service will name again was started and stopped.
+    AStoppedCall,
+}
+
+/// KR-REQ-23.24: every exit of a start that called `before_the_broker` reports one effect, and the
+/// host ends its hold only for the effects that say no call can still be running unreconciled.
+#[tokio::test]
+async fn every_exit_of_a_start_reports_its_effect() {
+    use kr_voice::BrokerEffect::{Bound, Closed, Handed, NotAsked, Open, Refused, Unknown};
+    let rows = [
+        (
+            "the check before the broker refuses",
+            Answer::Started,
+            Before::Nothing,
+            Some(1),
+            false,
+            NotAsked,
+        ),
+        (
+            "an unknown creation",
+            Answer::CreationUnknown,
+            Before::Nothing,
+            None,
+            false,
+            Unknown,
+        ),
+        (
+            "a refusal for capacity",
+            Answer::Capacity,
+            Before::Nothing,
+            None,
+            false,
+            Refused,
+        ),
+        (
+            "a refusal on the account's allowance",
+            Answer::AccountAllowance,
+            Before::Nothing,
+            None,
+            false,
+            Refused,
+        ),
+        (
+            "a refusal of the account",
+            Answer::Unauthorised,
+            Before::Nothing,
+            None,
+            false,
+            Refused,
+        ),
+        (
+            "a rate that changed",
+            Answer::RateChanged,
+            Before::Nothing,
+            None,
+            false,
+            Refused,
+        ),
+        (
+            "a call that is bound",
+            Answer::Started,
+            Before::Nothing,
+            None,
+            false,
+            Bound,
+        ),
+        (
+            "the check after the answer refuses and the close is confirmed",
+            Answer::Started,
+            Before::Nothing,
+            Some(2),
+            false,
+            Closed,
+        ),
+        (
+            "the check after the answer refuses and the close is not",
+            Answer::Started,
+            Before::Nothing,
+            Some(2),
+            true,
+            Open,
+        ),
+        (
+            "the check after the lookup refuses and the close is confirmed",
+            Answer::Started,
+            Before::Nothing,
+            Some(3),
+            false,
+            Closed,
+        ),
+        (
+            "the check after the lookup refuses and the close is not",
+            Answer::Started,
+            Before::Nothing,
+            Some(3),
+            true,
+            Open,
+        ),
+        (
+            "a replayed call a live session holds",
+            Answer::Replayed,
+            Before::ALiveCall,
+            None,
+            false,
+            Handed,
+        ),
+        (
+            "a replayed call nothing holds, closed",
+            Answer::Replayed,
+            Before::AStoppedCall,
+            None,
+            false,
+            Closed,
+        ),
+        (
+            "a replayed call nothing holds, not closed",
+            Answer::Replayed,
+            Before::AStoppedCall,
+            None,
+            true,
+            Open,
+        ),
+    ];
+    for (label, answer, before, refuse_at, cannot_close, expected) in rows {
+        let fixture = fixture();
+        match before {
+            Before::Nothing => {
+                fixture
+                    .coordinator
+                    .grant(
+                        &grant_params(None),
+                        AuthorityRevision::new(1),
+                        10_000,
+                        &kr_voice::Unbounded,
+                    )
+                    .await
+                    .expect("a standing voice grant");
+            }
+            Before::ALiveCall => {
+                started(&fixture, None).await;
+            }
+            Before::AStoppedCall => {
+                let voice_session_id = started(&fixture, None).await;
+                fixture
+                    .coordinator
+                    .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 10_050)
+                    .await
+                    .expect("the call stops");
+            }
+        }
+        *fixture.broker.answer.lock().expect("the answer") = answer;
+        if cannot_close {
+            fixture.broker.cannot_close();
+        }
+        let admission = Recording::new(refuse_at);
+        let _ = fixture
+            .coordinator
+            .start(
+                device(PHONE),
+                &start_params_for(&fixture.coordinator).await,
+                AuthorityRevision::new(1),
+                10_100,
+                admission.as_ref(),
+            )
+            .await;
+        assert_eq!(admission.before_calls(), 1, "{label}: asked once");
+        assert_eq!(admission.effects(), vec![expected], "{label}");
+    }
+}
+
+/// Starts `devices` starts, one after the other, each held in the broker, and lets them answer in
+/// the order they began, with a service that answers every one with the call an earlier attempt
+/// made. Returns each start's admission once all have finished.
+async fn replays_resolved_after_one_another(
+    devices: u8,
+    closure_asks_the_coordinator: bool,
+) -> Vec<Arc<Recording>> {
+    let fixture = fixture();
+    let who = |index: u8| device(PHONE + index);
+    for index in 0..devices {
+        fixture
+            .authority
+            .also_for
+            .lock()
+            .expect("the other devices")
+            .push(who(index));
+        fixture
+            .coordinator
+            .grant(
+                &VoiceGrantParams {
+                    device_id: who(index),
+                    ..grant_params(None)
+                },
+                AuthorityRevision::new(1),
+                10_000,
+                &kr_voice::Unbounded,
+            )
+            .await
+            .expect("a standing voice grant");
+    }
+    *fixture.broker.answer.lock().expect("the answer") = Answer::Replayed;
+    fixture.broker.hold_creations();
+    let broker = Arc::clone(&fixture.broker);
+    let coordinator = Arc::new(fixture.coordinator);
+    let mut started = Vec::new();
+    for index in 0..devices {
+        let admission = Recording::new(None);
+        if closure_asks_the_coordinator {
+            *admission.coordinator.lock().expect("the coordinator") =
+                Some(Arc::clone(&coordinator));
+        }
+        let params = params_for(&coordinator, who(index)).await;
+        let handle = tokio::spawn({
+            let coordinator = Arc::clone(&coordinator);
+            let admission = Arc::clone(&admission);
+            async move {
+                coordinator
+                    .start(
+                        who(index),
+                        &params,
+                        AuthorityRevision::new(1),
+                        10_100,
+                        admission.as_ref(),
+                    )
+                    .await
+            }
+        });
+        while broker.offers().len() <= usize::from(index) {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Inside the semaphore's queue, so the answers come in the order the starts began.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        started.push((admission, handle));
+    }
+    let mut admissions = Vec::new();
+    for (index, (admission, handle)) in started.into_iter().enumerate() {
+        broker.release();
+        tokio::time::timeout(std::time::Duration::from_secs(20), handle)
+            .await
+            .expect("the start finishes")
+            .expect("the start's task")
+            .expect("an answer");
+        if usize::from(devices) > index + 1 {
+            assert!(
+                admission.resolved().is_empty(),
+                "a start that is deferred resolves only after the last one has finished"
+            );
+        }
+        admissions.push(admission);
+    }
+    admissions
+}
+
+/// KR-REQ-23.24: a replayed call another start may be about to bind is resolved later, and the
+/// start that left it runs its closure then, with what the resolution came to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_entry_runs_its_closure_when_resolved() {
+    let admissions = replays_resolved_after_one_another(2, false).await;
+    assert_eq!(
+        admissions[0].effects(),
+        vec![kr_voice::BrokerEffect::Deferred]
+    );
+    assert_eq!(
+        admissions[0].resolved(),
+        vec![kr_voice::BrokerEffect::Closed]
+    );
+    assert_eq!(
+        admissions[1].effects(),
+        vec![kr_voice::BrokerEffect::Closed]
+    );
+    assert!(admissions[1].resolved().is_empty());
+}
+
+/// KR-REQ-23.24: a closure runs after the coordinator's lock is released, so it can ask the
+/// coordinator for anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closures_run_after_the_coordinators_lock_is_released() {
+    let admissions = replays_resolved_after_one_another(2, true).await;
+    assert_eq!(
+        admissions[0].resolved(),
+        vec![kr_voice::BrokerEffect::Closed]
+    );
+}
+
+/// KR-REQ-23.24: a second start that defers the same call keeps its closure beside the first, and
+/// the call is closed once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_closure_on_one_entry_is_kept() {
+    let admissions = replays_resolved_after_one_another(3, false).await;
+    assert_eq!(
+        admissions[0].resolved(),
+        vec![kr_voice::BrokerEffect::Closed]
+    );
+    assert_eq!(
+        admissions[1].resolved(),
+        vec![kr_voice::BrokerEffect::Closed]
+    );
+    assert_eq!(
+        admissions[2].effects(),
+        vec![kr_voice::BrokerEffect::Closed]
     );
 }
