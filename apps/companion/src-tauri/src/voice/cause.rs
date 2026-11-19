@@ -186,6 +186,18 @@ impl Cause {
         }
     }
 
+    /// What a person is told where another sentence follows these words. Each cause is a sentence of
+    /// its own but a setup clause: that clause stands inside the sentence "The call could not be set
+    /// up on this device: ..." and has no full stop of its own, so one is added where a sentence
+    /// follows it.
+    pub fn sentence(&self) -> String {
+        let words = self.words();
+        match self {
+            Self::Step(_) if !words.ends_with(['.', '!', '?']) => format!("{words}."),
+            _ => words,
+        }
+    }
+
     /// Whether the voice service closed the call itself, so asking it to again is not needed.
     pub const fn service_closed(&self) -> bool {
         matches!(self, Self::Control(ControlEnd::Closed { .. }))

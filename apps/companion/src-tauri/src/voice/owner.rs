@@ -2921,25 +2921,7 @@ impl Owner {
                 state.ended = Some(EndedView {
                     owner: id,
                     cause: cause.word().to_owned(),
-                    words: {
-                        let said = match &cause {
-                            // These causes are already the closing sentence.
-                            Cause::Host(HostEnding::NotKnown(_)) => cause.words(),
-                            Cause::Host(HostEnding::Silent) if !left_to_host => {
-                                super::cause::HOST_SILENT_SETTLED.to_owned()
-                            }
-                            Cause::Host(HostEnding::Silent) => cause.words(),
-                            _ if left_to_host => {
-                                format!("{} {}", cause.words(), super::cause::LEFT_TO_HOST)
-                            }
-                            _ => cause.words(),
-                        };
-                        if unsettled {
-                            format!("{said} {REQUESTS_UNSETTLED}")
-                        } else {
-                            said
-                        }
-                    },
+                    words: ended_words(&cause, left_to_host, unsettled),
                     closed_locally,
                     host: host_end.clone(),
                     broker: if needs_broker {
@@ -3157,6 +3139,31 @@ fn provider_for(control: &VoiceSessionControl) -> CallProvider {
 /// host that overflowed, on any call, because what the call did is then not all known.
 fn shows_requests_unsettled(accepting: bool, unanswered: bool, news_lost: bool) -> bool {
     (accepting && unanswered) || news_lost
+}
+
+/// What an end says: the cause's words, then what it leaves to the host when the call is left to
+/// it, then what it leaves unsettled when a request may have been carried out. A cause whose words
+/// another sentence follows is given as a sentence, so that a setup clause is ended by a full stop
+/// there and nowhere else.
+fn ended_words(cause: &Cause, left_to_host: bool, unsettled: bool) -> String {
+    let said = match cause {
+        // These causes are already the closing sentence.
+        Cause::Host(HostEnding::NotKnown(_)) => cause.words(),
+        Cause::Host(HostEnding::Silent) if !left_to_host => {
+            super::cause::HOST_SILENT_SETTLED.to_owned()
+        }
+        Cause::Host(HostEnding::Silent) => cause.words(),
+        _ if left_to_host => {
+            format!("{} {}", cause.sentence(), super::cause::LEFT_TO_HOST)
+        }
+        _ if unsettled => cause.sentence(),
+        _ => cause.words(),
+    };
+    if unsettled {
+        format!("{said} {REQUESTS_UNSETTLED}")
+    } else {
+        said
+    }
 }
 
 fn hold_until(host_closes_ms: u64, requested_seconds: u32, now_ms: u64) -> Option<u64> {
@@ -3799,6 +3806,49 @@ mod tests {
         assert!(
             commands.send(Cmd::Stop(late)).await.is_err(),
             "a command sent after the end is turned away"
+        );
+    }
+
+    /// A setup clause is ended by a full stop where another sentence follows it, and only there:
+    /// alone it has none, a clause that already ends in one gets no second, and the causes that are
+    /// sentences are joined as they stand.
+    #[test]
+    fn a_step_clause_is_ended_by_a_full_stop_where_another_sentence_follows_it() {
+        let mismatch = "the host started the call on another provider than the one this device showed, so the call was ended";
+        let clause = format!("The call could not be set up on this device: {mismatch}");
+        let step = Cause::Step(mismatch.to_owned());
+        let left = crate::voice::cause::LEFT_TO_HOST;
+        // Alone: nothing is added.
+        assert_eq!(ended_words(&step, false, false), clause);
+        // Before the sentence that leaves the call to the host.
+        assert_eq!(
+            ended_words(&step, true, false),
+            "The call could not be set up on this device: the host started the call on another provider than the one this device showed, so the call was ended. The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it."
+        );
+        // Before the sentence for a request that may have been carried out.
+        assert_eq!(
+            ended_words(&step, false, true),
+            format!("{clause}. {REQUESTS_UNSETTLED}")
+        );
+        // Before both.
+        assert_eq!(
+            ended_words(&step, true, true),
+            format!("{clause}. {left} {REQUESTS_UNSETTLED}")
+        );
+        // A clause that ends in a full stop already gets no second one.
+        let stopped = Cause::Step("the service said no.".to_owned());
+        assert_eq!(
+            ended_words(&stopped, true, false),
+            format!("The call could not be set up on this device: the service said no. {left}")
+        );
+        // A cause that is a sentence is joined as it stands.
+        assert_eq!(
+            ended_words(&Cause::NativeFailed, true, true),
+            format!("The connection to the voice provider failed. {left} {REQUESTS_UNSETTLED}")
+        );
+        assert_eq!(
+            ended_words(&Cause::NativeFailed, false, false),
+            "The connection to the voice provider failed."
         );
     }
 }

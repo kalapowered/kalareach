@@ -8776,9 +8776,11 @@ async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_throu
         if stop_answered {
             assert_eq!(words, mismatch, "{ended}");
         } else {
-            // A stop the host did not answer leaves the call to it, and the sentence says so.
-            assert!(
-                words.starts_with(mismatch) && words.ends_with(LEFT_TO_HOST_WORDS),
+            // A stop the host did not answer leaves the call to it, and the sentence says so: the
+            // clause that ends the setup is ended by a full stop where the next sentence follows.
+            assert_eq!(
+                words,
+                format!("{mismatch}. {LEFT_TO_HOST_WORDS}"),
                 "{ended}"
             );
         }
