@@ -599,6 +599,8 @@ mod tests {
         Stopped,
         /// Refuses for another reason.
         Failed,
+        /// Sets the verdict as it is called, and opens a tunnel at once.
+        OpenAsTheVerdictLands,
     }
 
     /// An opener that counts its calls and records each host and port. It never stores a header.
@@ -607,6 +609,8 @@ mod tests {
         calls: AtomicUsize,
         seen: Mutex<Vec<(String, u16)>>,
         ends: mpsc::UnboundedSender<tokio::io::DuplexStream>,
+        /// The login whose verdict `Mode::OpenAsTheVerdictLands` sets.
+        landing: Mutex<Option<ProxyCredential>>,
     }
 
     impl TunnelOpener for Double {
@@ -621,9 +625,15 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((host.to_owned(), port));
             let mode = *self.mode.lock().unwrap_or_else(PoisonError::into_inner);
+            if matches!(mode, Mode::OpenAsTheVerdictLands) {
+                // Set as the call is made, which is before the front first polls the race.
+                if let Some(login) = &*self.landing.lock().unwrap_or_else(PoisonError::into_inner) {
+                    login.refuse(StopKind::Refused);
+                }
+            }
             Box::pin(async move {
                 match mode {
-                    Mode::Open => {
+                    Mode::Open | Mode::OpenAsTheVerdictLands => {
                         let (near, far) = tokio::io::duplex(64 * 1024);
                         let _ = self.ends.send(far);
                         Ok(Tunnel::new(near))
@@ -655,6 +665,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
             ends: ends_in,
+            landing: Mutex::new(None),
         });
         let relays = RelayMap::from(relay("https://relay.example./"));
         let login = ProxyCredential::parse_line(&SecretVec::new(b"user:pw0rd-secret".to_vec()))
@@ -813,6 +824,26 @@ mod tests {
         open.read_exact(&mut bytes).await.expect("read");
         assert_eq!(&bytes, b"pong", "the open tunnel still carries bytes");
         rig.front.shutdown().await;
+    }
+
+    /// An opener that finishes in the poll in which the verdict is set loses to the verdict,
+    /// because the front polls the verdict first: the answer is 503 and no tunnel is carried. In 32
+    /// runs, a race that is not biased lets a tunnel through with a chance of 1 - 2^-32.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test]
+    async fn a_tunnel_that_opens_as_the_verdict_lands_is_refused() {
+        for run in 0..32 {
+            let rig = rig(Mode::OpenAsTheVerdictLands).await;
+            *rig.double
+                .landing
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(rig.login.clone());
+            let (_, status) = rig.ask(&rig.good("relay.example.:443")).await;
+            assert!(status.contains(" 503 "), "run {run}: {status}");
+            assert_eq!(rig.calls(), 1, "run {run}: the opener was called");
+            rig.front.shutdown().await;
+        }
     }
 
     /// A verdict set while the opener is still working is answered at once, and the opener's call
