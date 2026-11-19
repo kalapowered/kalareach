@@ -2594,6 +2594,237 @@ export type StreamKind =
  */
 export type VoiceContextClass = 'environment_variables' | 'terminal_scrollback'
 /**
+ * The answer to `voice.context.send`, given at once: progress arrives as news.
+ */
+export type VoiceContextSendResult =
+  | {
+      queued: {
+        /**
+         * How many appends the sender will write.
+         */
+        appends: number
+        /**
+         * How many appends the selection was split into.
+         */
+        of: number
+      }
+    }
+  | {
+      refused: {
+        /**
+         * Why.
+         */
+        reason:
+          | 'unknown_call'
+          | 'not_this_device'
+          | 'closing'
+          | 'not_ready'
+          | 'rate'
+          | 'too_large'
+          | 'unknown_delegation'
+          | 'already_told'
+          | 'not_supported_by_record'
+          | 'outside_grant'
+          | 'provider_refused'
+          | 'sideband_lost'
+          | 'privacy'
+          | 'busy'
+      }
+    }
+/**
+ * Where a context send stands.
+ */
+export type VoiceContextState =
+  | 'sending'
+  | 'done'
+  | {
+      stopped: {
+        /**
+         * What stopped it.
+         */
+        stopped_by:
+          'stop' | 'revocation' | 'grant' | 'history' | 'privacy' | 'deadline' | 'sideband_lost'
+      }
+    }
+/**
+ * What stopped a context send.
+ */
+export type VoiceContextStop =
+  'stop' | 'revocation' | 'grant' | 'history' | 'privacy' | 'deadline' | 'sideband_lost'
+/**
+ * What a `voice.control` asks for.
+ *
+ * Named by the arm, as every variant union in this protocol is.
+ */
+export type VoiceControlArm =
+  | {
+      heartbeat: {
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        after_seq: string
+      }
+    }
+  | {
+      mute: {
+        /**
+         * Whether the microphone is muted.
+         */
+        muted: boolean
+      }
+    }
+  | {
+      note: {
+        /**
+         * The delegation it is about, for a note about a delegation.
+         */
+        delegation_id: VoiceDelegationId | null
+        /**
+         * Which sentence.
+         */
+        note:
+          | 'host_actions_available'
+          | 'host_actions_unavailable'
+          | 'speech_tainted'
+          | 'delegation_refused'
+          | 'delegation_not_sent'
+          | 'delegation_unknown'
+          | 'delegation_admitted'
+          | 'delegation_confirmation'
+          | 'delegation_not_confirmed'
+          | 'delegation_no_ceremony'
+          | 'delegation_challenge_mismatch'
+          | 'delegation_confirmation_expired'
+          | 'delegation_session_not_named'
+          | 'delegation_confirmation_dropped'
+          | 'delegation_host_refused'
+          | 'delegation_late'
+          | 'delegation_performed'
+          | 'nothing_was_done'
+          | 'host_lost'
+          | 'host_back'
+          | 'host_back_accepting'
+      }
+    }
+  | {
+      heard: {
+        /**
+         * An opaque provider delegation identifier. Correlation data, never authority.
+         */
+        delegation_id: string
+      }
+    }
+/**
+ * The answer to `voice.control`.
+ */
+export type VoiceControlResult =
+  | {
+      heartbeat: {
+        /**
+         * The news queue overflowed since the device last heard: the call's outcomes are not
+         * all known.
+         */
+        dropped: boolean
+        /**
+         * News since `after_seq`, oldest first.
+         */
+        news: VoiceNews[]
+        /**
+         * Seconds until the call's own deadline, or zero.
+         */
+        remaining_seconds: number
+        /**
+         * Where the call stands.
+         */
+        state:
+          | 'open'
+          | 'recovering'
+          | 'closing'
+          | {
+              closed: {
+                /**
+                 * What ended it.
+                 */
+                reason:
+                  | 'stop'
+                  | 'deadline'
+                  | 'revocation'
+                  | 'provider_closed'
+                  | 'silence'
+                  | 'credential_removed'
+                  | 'sideband_lost'
+              }
+            }
+      }
+    }
+  | {
+      admitted: {
+        /**
+         * The note the host took, for a note.
+         */
+        note: VoiceNote | null
+      }
+    }
+  | {
+      heard: {
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        offset_ms: string
+      }
+    }
+  | 'not_heard'
+  | {
+      refused: {
+        /**
+         * Why.
+         */
+        reason:
+          | 'unknown_call'
+          | 'not_this_device'
+          | 'closing'
+          | 'not_ready'
+          | 'rate'
+          | 'too_large'
+          | 'unknown_delegation'
+          | 'already_told'
+          | 'not_supported_by_record'
+          | 'outside_grant'
+          | 'provider_refused'
+          | 'sideband_lost'
+          | 'privacy'
+          | 'busy'
+      }
+    }
+/**
+ * A sentence the device owes the model, by name.
+ *
+ * One variant for each fixed sentence the device tells the model today. The words are the host's:
+ * a device that names a variant cannot change what the model is told.
+ */
+export type VoiceNote =
+  | 'host_actions_available'
+  | 'host_actions_unavailable'
+  | 'speech_tainted'
+  | 'delegation_refused'
+  | 'delegation_not_sent'
+  | 'delegation_unknown'
+  | 'delegation_admitted'
+  | 'delegation_confirmation'
+  | 'delegation_not_confirmed'
+  | 'delegation_no_ceremony'
+  | 'delegation_challenge_mismatch'
+  | 'delegation_confirmation_expired'
+  | 'delegation_session_not_named'
+  | 'delegation_confirmation_dropped'
+  | 'delegation_host_refused'
+  | 'delegation_late'
+  | 'delegation_performed'
+  | 'nothing_was_done'
+  | 'host_lost'
+  | 'host_back'
+  | 'host_back_accepting'
+/**
  * The providers a key can be kept for.
  */
 export type VoiceCredentialKind = 'openai_live'
@@ -2628,6 +2859,156 @@ export type VoiceAction =
   | 'shell_input'
   | 'apply_diff'
   | 'deliver_externally'
+/**
+ * What ended a call on the host's own key.
+ */
+export type VoiceEndReason =
+  | 'stop'
+  | 'deadline'
+  | 'revocation'
+  | 'provider_closed'
+  | 'silence'
+  | 'credential_removed'
+  | 'sideband_lost'
+/**
+ * Where a call on the host's own key stands.
+ */
+export type VoiceHostCallState =
+  | 'open'
+  | 'recovering'
+  | 'closing'
+  | {
+      closed: {
+        /**
+         * What ended it.
+         */
+        reason:
+          | 'stop'
+          | 'deadline'
+          | 'revocation'
+          | 'provider_closed'
+          | 'silence'
+          | 'credential_removed'
+          | 'sideband_lost'
+      }
+    }
+/**
+ * Why the host did not take a control or a context send. Closed.
+ */
+export type VoiceHostRefusal =
+  | 'unknown_call'
+  | 'not_this_device'
+  | 'closing'
+  | 'not_ready'
+  | 'rate'
+  | 'too_large'
+  | 'unknown_delegation'
+  | 'already_told'
+  | 'not_supported_by_record'
+  | 'outside_grant'
+  | 'provider_refused'
+  | 'sideband_lost'
+  | 'privacy'
+  | 'busy'
+/**
+ * What happened on the host that the device needs to know. Carries states, offsets and counts
+ * and no content.
+ */
+export type VoiceNewsItem =
+  | {
+      delegation: {
+        /**
+         * An opaque provider delegation identifier. Correlation data, never authority.
+         */
+        delegation_id: string
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        offset_ms: string
+      }
+    }
+  | {
+      late_refusal: {
+        /**
+         * One submitted intent and its receipt, generated as a UUIDv4.
+         */
+        action_id: string
+        /**
+         * Why.
+         */
+        reason:
+          | 'unknown_call'
+          | 'not_this_device'
+          | 'closing'
+          | 'not_ready'
+          | 'rate'
+          | 'too_large'
+          | 'unknown_delegation'
+          | 'already_told'
+          | 'not_supported_by_record'
+          | 'outside_grant'
+          | 'provider_refused'
+          | 'sideband_lost'
+          | 'privacy'
+          | 'busy'
+      }
+    }
+  | {
+      context: {
+        /**
+         * One submitted intent and its receipt, generated as a UUIDv4.
+         */
+        action_id: string
+        /**
+         * Appends the provider acknowledged.
+         */
+        appended: number
+        /**
+         * Appends the send holds.
+         */
+        of: number
+        /**
+         * Where the send stands.
+         */
+        state:
+          | 'sending'
+          | 'done'
+          | {
+              stopped: {
+                /**
+                 * What stopped it.
+                 */
+                stopped_by:
+                  | 'stop'
+                  | 'revocation'
+                  | 'grant'
+                  | 'history'
+                  | 'privacy'
+                  | 'deadline'
+                  | 'sideband_lost'
+              }
+            }
+        /**
+         * Appends written whose acknowledgement never came: never sent again.
+         */
+        unconfirmed: number
+      }
+    }
+  | {
+      ended: {
+        /**
+         * What ended it.
+         */
+        reason:
+          | 'stop'
+          | 'deadline'
+          | 'revocation'
+          | 'provider_closed'
+          | 'silence'
+          | 'credential_removed'
+          | 'sideband_lost'
+      }
+    }
 /**
  * Which provider would carry a call, as a preparation says it.
  *
@@ -3407,6 +3788,13 @@ export interface KalaReachProtocol {
   voice_context_params?: VoiceContextParams
   voice_context_result?: VoiceContextResult
   voice_context_selection?: VoiceContextSelection1
+  voice_context_send_params?: VoiceContextSendParams
+  voice_context_send_result?: VoiceContextSendResult
+  voice_context_state?: VoiceContextState
+  voice_context_stop?: VoiceContextStop
+  voice_control_arm?: VoiceControlArm
+  voice_control_params?: VoiceControlParams
+  voice_control_result?: VoiceControlResult
   voice_credential_kind?: VoiceCredentialKind
   voice_credential_remove_params?: VoiceCredentialRemoveParams
   voice_credential_remove_result?: VoiceCredentialRemoveResult
@@ -3414,11 +3802,17 @@ export interface KalaReachProtocol {
   voice_credential_set_result?: VoiceCredentialSetResult
   voice_delegate_params?: VoiceDelegateParams
   voice_delegate_result?: VoiceDelegateResult
+  voice_end_reason?: VoiceEndReason
   voice_grant_params?: VoiceGrantParams
   voice_grant_result?: VoiceGrantResult
   voice_grant_statement?: VoiceGrantStatement1
+  voice_host_call_state?: VoiceHostCallState
+  voice_host_refusal?: VoiceHostRefusal
   voice_instructions?: VoiceInstructions
   voice_managed_terms?: VoiceManagedTerms
+  voice_news?: VoiceNews
+  voice_news_item?: VoiceNewsItem
+  voice_note?: VoiceNote
   voice_prepare_params?: VoicePrepareParams
   voice_prepare_provider?: VoicePrepareProvider
   voice_prepare_result?: VoicePrepareResult
@@ -19665,6 +20059,8 @@ export interface MethodEntry {
     | 'voice.grant'
     | 'voice.delegate'
     | 'voice.context'
+    | 'voice.control'
+    | 'voice.context.send'
     | 'workflow.install'
     | 'workflow.enable'
     | 'workflow.pause'
@@ -28799,6 +29195,8 @@ export interface ServiceRequestPayload {
     | 'voice.grant'
     | 'voice.delegate'
     | 'voice.context'
+    | 'voice.control'
+    | 'voice.context.send'
     | 'workflow.install'
     | 'workflow.enable'
     | 'workflow.pause'
@@ -32026,6 +32424,204 @@ export interface VoiceContextSelection1 {
    * The current working directory.
    */
   working_directory: string
+}
+/**
+ * Parameters of `voice.context.send`.
+ */
+export interface VoiceContextSendParams {
+  /**
+   * The delegation the context belongs to, or null for the call's own opening context.
+   */
+  delegation_id: VoiceDelegationId | null
+  /**
+   * Content classes the person selected on top of the default.
+   */
+  selected: VoiceContextClass[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The voice session the context is for.
+   */
+  voice_session_id: string
+}
+/**
+ * Parameters of `voice.control`.
+ */
+export interface VoiceControlParams {
+  /**
+   * What the device asks.
+   */
+  arm:
+    | {
+        heartbeat: {
+          /**
+           * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+           */
+          after_seq: string
+        }
+      }
+    | {
+        mute: {
+          /**
+           * Whether the microphone is muted.
+           */
+          muted: boolean
+        }
+      }
+    | {
+        note: {
+          /**
+           * The delegation it is about, for a note about a delegation.
+           */
+          delegation_id: VoiceDelegationId | null
+          /**
+           * Which sentence.
+           */
+          note:
+            | 'host_actions_available'
+            | 'host_actions_unavailable'
+            | 'speech_tainted'
+            | 'delegation_refused'
+            | 'delegation_not_sent'
+            | 'delegation_unknown'
+            | 'delegation_admitted'
+            | 'delegation_confirmation'
+            | 'delegation_not_confirmed'
+            | 'delegation_no_ceremony'
+            | 'delegation_challenge_mismatch'
+            | 'delegation_confirmation_expired'
+            | 'delegation_session_not_named'
+            | 'delegation_confirmation_dropped'
+            | 'delegation_host_refused'
+            | 'delegation_late'
+            | 'delegation_performed'
+            | 'nothing_was_done'
+            | 'host_lost'
+            | 'host_back'
+            | 'host_back_accepting'
+        }
+      }
+    | {
+        heard: {
+          /**
+           * An opaque provider delegation identifier. Correlation data, never authority.
+           */
+          delegation_id: string
+        }
+      }
+  /**
+   * The voice session the device is controlling. It is bound to the device that started it.
+   */
+  voice_session_id: string
+}
+/**
+ * One item of the news a heartbeat carries.
+ */
+export interface VoiceNews {
+  /**
+   * What happened.
+   */
+  item:
+    | {
+        delegation: {
+          /**
+           * An opaque provider delegation identifier. Correlation data, never authority.
+           */
+          delegation_id: string
+          /**
+           * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+           */
+          offset_ms: string
+        }
+      }
+    | {
+        late_refusal: {
+          /**
+           * One submitted intent and its receipt, generated as a UUIDv4.
+           */
+          action_id: string
+          /**
+           * Why.
+           */
+          reason:
+            | 'unknown_call'
+            | 'not_this_device'
+            | 'closing'
+            | 'not_ready'
+            | 'rate'
+            | 'too_large'
+            | 'unknown_delegation'
+            | 'already_told'
+            | 'not_supported_by_record'
+            | 'outside_grant'
+            | 'provider_refused'
+            | 'sideband_lost'
+            | 'privacy'
+            | 'busy'
+        }
+      }
+    | {
+        context: {
+          /**
+           * One submitted intent and its receipt, generated as a UUIDv4.
+           */
+          action_id: string
+          /**
+           * Appends the provider acknowledged.
+           */
+          appended: number
+          /**
+           * Appends the send holds.
+           */
+          of: number
+          /**
+           * Where the send stands.
+           */
+          state:
+            | 'sending'
+            | 'done'
+            | {
+                stopped: {
+                  /**
+                   * What stopped it.
+                   */
+                  stopped_by:
+                    | 'stop'
+                    | 'revocation'
+                    | 'grant'
+                    | 'history'
+                    | 'privacy'
+                    | 'deadline'
+                    | 'sideband_lost'
+                }
+              }
+          /**
+           * Appends written whose acknowledgement never came: never sent again.
+           */
+          unconfirmed: number
+        }
+      }
+    | {
+        ended: {
+          /**
+           * What ended it.
+           */
+          reason:
+            | 'stop'
+            | 'deadline'
+            | 'revocation'
+            | 'provider_closed'
+            | 'silence'
+            | 'credential_removed'
+            | 'sideband_lost'
+        }
+      }
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  seq: string
 }
 /**
  * Parameters of `voice.credential.remove`.

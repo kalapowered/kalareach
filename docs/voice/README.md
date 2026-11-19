@@ -103,6 +103,28 @@ A key is 20 to 256 printable ASCII characters with no space. The host checks tha
 OpenAI nothing, so a key that OpenAI would refuse is kept as it is. Neither command prints the key,
 and neither needs an account with the managed service.
 
+## A call on the host's own key
+
+A call on the host owner's own OpenAI key has no managed service between the phone and the call: the
+host holds the provider's side channel itself, and the phone reaches it with two methods on the
+ordinary write path. Neither is served to a caller that is not a paired device holding a live voice
+grant.
+
+`voice.control` carries four things. A heartbeat says the phone is still there; it is sent every 20
+seconds under a fresh action identifier, the host answers it with where the call stands and the
+news since the phone last heard, and the answer is never kept. A mute and a note are written to the
+model by the host: a note names one of a fixed list of sentences, and the host writes the words, so
+the phone cannot make the model say anything else. `heard` asks whether the host's own side channel
+heard a delegation, and waits at most five seconds for it.
+
+`voice.context.send` hands the host a selection of context to write to the model. The host answers
+at once that the selection is queued, and writes it in paced appends from a task of its own; the
+progress of the send arrives with the heartbeat's news. A call has one send at a time.
+
+A host that hears nothing from the phone for two minutes begins to close the call. The host keeps
+what a heartbeat needs of a call that has ended for ten minutes, so a phone that was away learns why
+it ended; the record holds states and counts and no content.
+
 ## What the managed operator can see
 
 Managed voice gives KalaReach technical access to the conversation. The service's own channel to

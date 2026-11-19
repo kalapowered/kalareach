@@ -275,6 +275,11 @@ use crate::voice_credential::{
     VoiceCredentialKind, VoiceCredentialRemoveParams, VoiceCredentialRemoveResult,
     VoiceCredentialSetParams, VoiceCredentialSetResult,
 };
+use crate::voice_host::{
+    VoiceContextSendParams, VoiceContextSendResult, VoiceContextState, VoiceContextStop,
+    VoiceControlArm, VoiceControlParams, VoiceControlResult, VoiceEndReason, VoiceHostCallState,
+    VoiceHostRefusal, VoiceNews, VoiceNewsItem, VoiceNote,
+};
 use crate::worker::{
     AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
     GenerationChallenge, WorkerDescriptor, WorkerLaunchSpec, WorkerReady, WorkerRendezvous,
@@ -797,6 +802,19 @@ pub fn protocol_schema() -> Value {
         "voice_context_params" => VoiceContextParams,
         "voice_context_result" => VoiceContextResult,
         "voice_context_selection" => VoiceContextSelection,
+        "voice_context_send_params" => VoiceContextSendParams,
+        "voice_context_send_result" => VoiceContextSendResult,
+        "voice_context_state" => VoiceContextState,
+        "voice_context_stop" => VoiceContextStop,
+        "voice_control_arm" => VoiceControlArm,
+        "voice_control_params" => VoiceControlParams,
+        "voice_control_result" => VoiceControlResult,
+        "voice_end_reason" => VoiceEndReason,
+        "voice_host_call_state" => VoiceHostCallState,
+        "voice_host_refusal" => VoiceHostRefusal,
+        "voice_news" => VoiceNews,
+        "voice_news_item" => VoiceNewsItem,
+        "voice_note" => VoiceNote,
         "voice_delegate_params" => VoiceDelegateParams,
         "voice_delegate_result" => VoiceDelegateResult,
         "voice_grant_params" => VoiceGrantParams,

@@ -774,7 +774,17 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
     // a voice session, and by the time `voice.start` answers, the metered provider session exists.
     // So this build adds one read that precedes both. It creates nothing, which is the whole point
     // of it, and it intersects the same voice grant every other voice method does.
-    let voice = [("voice.prepare", EffectClass::Read)];
+    //
+    // A call on the host owner's own provider key has no managed service for the phone to hold a
+    // control socket to, so the host holds the provider's side channel and the phone reaches it
+    // through two writes on the ordinary path: one for the heartbeat, the mute, the fixed sentences
+    // for the model and the question whether a delegation was heard, and one that has the host
+    // write the selected context. Both intersect the voice grant, as every voice method does.
+    let voice = [
+        ("voice.prepare", EffectClass::Read),
+        ("voice.control", EffectClass::Write),
+        ("voice.context.send", EffectClass::Write),
+    ];
     for (name, effect) in voice {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
         assert_eq!(entry.effect, effect, "{name} carries its own effect class");
@@ -1672,6 +1682,8 @@ fn voice_methods_require_a_voice_grant() {
         "voice.stop",
         "voice.delegate",
         "voice.context",
+        "voice.control",
+        "voice.context.send",
     ] {
         let entry = lookup(name).expect("listed");
         assert!(

@@ -542,6 +542,7 @@ pub fn table() -> Vec<Store> {
         action, archive, attention, automation, catalogue, changeset, delivery, describe, desktop,
         grant, hostinfo, identity, invitation, machine, mailbox, organisation, pairing, privacy,
         project, push, session, sharing, skill, test_report, transfer, voice, voice_credential,
+        voice_host,
     };
 
     let mut stores = vec![
@@ -664,6 +665,8 @@ pub fn table() -> Vec<Store> {
                 protocol::<voice::VoiceDelegateResult>("VoiceDelegateResult"),
                 protocol::<voice::VoiceStartResult>("VoiceStartResult"),
                 protocol::<voice::VoiceStopResult>("VoiceStopResult"),
+                protocol::<voice_host::VoiceControlResult>("VoiceControlResult"),
+                protocol::<voice_host::VoiceContextSendResult>("VoiceContextSendResult"),
                 // What the registry keeps for an action it claimed, beside the claim. Each is the
                 // answer a repeat of that action is given.
                 protocol::<organisation::OrganisationEnrolResult>("OrganisationEnrolResult"),

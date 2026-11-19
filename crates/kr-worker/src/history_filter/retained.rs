@@ -273,6 +273,8 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::VoiceStart
         | Method::VoiceStop
         | Method::VoiceGrant
+        | Method::VoiceControl
+        | Method::VoiceContextSend
         | Method::WorkflowInstall
         | Method::WorkflowEnable
         | Method::WorkflowPause

@@ -341,6 +341,8 @@ document.
 | `voice.grant` | write | `local_ipc`, `paired_device` | Create or change a voice grant, stating exactly which actions it permits. A device may broaden its own; changing another device's needs host-management authority. | [Voice: The voice grant](../voice/README.md) |
 | `voice.delegate` | write | `paired_device` | Submit a delegation from the paired device: its identifier and offset, and the fragments of what the person said, which the host reads itself. A provider delegation identifier is correlation data, never authority. | [Voice: What a delegation carries, and who reads it](../voice/README.md) |
 | `voice.context` | read | `paired_device` | Read the selected voice context. Selection intersects this device's scope and never uses the host owner's broader history. | [Voice: What the coordinator may read](../voice/README.md) |
+| `voice.control` | write | `paired_device` | Control a call that runs on the host's own provider key: a heartbeat that says the phone is still there, a mute, a fixed sentence for the model, or the question whether the host heard a delegation. Only the host writes words to the model. | [Voice: A call on the host's own key](../voice/README.md) |
+| `voice.context.send` | write | `paired_device` | Have the host write the selected voice context to a call on the host's own provider key. Selection is the one `voice.context` makes; the host sends it in paced appends and reports progress with the call's news. | [Voice: A call on the host's own key](../voice/README.md) |
 
 ## Automation
 

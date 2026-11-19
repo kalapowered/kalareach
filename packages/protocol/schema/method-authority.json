@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 201,
+  "method_count": 203,
   "methods": [
     {
       "capability": "none",
@@ -6129,6 +6129,81 @@
         "voice_session"
       ],
       "summary": "Read the selected voice context. Selection intersects this device's scope and never uses the host owner's broader history.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "voice",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "voice.control",
+      "name": "voice.control",
+      "required_rights": [
+        {
+          "authority": "voice_grant",
+          "when": "always"
+        },
+        {
+          "authority": {
+            "right": {
+              "right": "voice.use"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "voice_session"
+      ],
+      "summary": "Control a call that runs on the host's own provider key: a heartbeat that says the phone is still there, a mute, a fixed sentence for the model, or the question whether the host heard a delegation. Only the host writes words to the model.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "voice",
+      "history_filter": "grant_lower_bound",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "voice.context.send",
+      "name": "voice.context.send",
+      "required_rights": [
+        {
+          "authority": "voice_grant",
+          "when": "always"
+        },
+        {
+          "authority": {
+            "right": {
+              "right": "voice.use"
+            }
+          },
+          "when": "always"
+        },
+        {
+          "authority": {
+            "right": {
+              "right": "session.view"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session",
+        "voice_session"
+      ],
+      "summary": "Have the host write the selected voice context to a call on the host's own provider key. Selection is the one `voice.context` makes; the host sends it in paced appends and reports progress with the call's news.",
       "version": 1
     },
     {

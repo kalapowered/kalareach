@@ -23597,6 +23597,16 @@
           "type": "string"
         },
         {
+          "const": "voice.control",
+          "description": "Control a call that runs on the host's own provider key: a heartbeat that says the phone is still there, a mute, a fixed sentence for the model, or the question whether the host heard a delegation. Only the host writes words to the model.",
+          "type": "string"
+        },
+        {
+          "const": "voice.context.send",
+          "description": "Have the host write the selected voice context to a call on the host's own provider key. Selection is the one `voice.context` makes; the host sends it in paced appends and reports progress with the call's news.",
+          "type": "string"
+        },
+        {
           "const": "workflow.install",
           "description": "Install a versioned automation definition under an explicit workflow grant.",
           "type": "string"
@@ -41271,6 +41281,441 @@
       ],
       "type": "object"
     },
+    "VoiceContextSendParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.context.send`.",
+      "properties": {
+        "delegation_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceDelegationId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The delegation the context belongs to, or null for the call's own opening context."
+        },
+        "selected": {
+          "description": "Content classes the person selected on top of the default.",
+          "items": {
+            "$ref": "#/$defs/VoiceContextClass"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the context is about."
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session the context is for."
+        }
+      },
+      "required": [
+        "voice_session_id",
+        "session_id",
+        "selected",
+        "delegation_id"
+      ],
+      "type": "object"
+    },
+    "VoiceContextSendResult": {
+      "description": "The answer to `voice.context.send`, given at once: progress arrives as news.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host's sender took the selection. Proves admission to the sender, not provider\nexecution.",
+          "properties": {
+            "queued": {
+              "additionalProperties": false,
+              "properties": {
+                "appends": {
+                  "description": "How many appends the sender will write.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "of": {
+                  "description": "How many appends the selection was split into.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "appends",
+                "of"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "queued"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host did not take it.",
+          "properties": {
+            "refused": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/VoiceHostRefusal",
+                  "description": "Why."
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "refused"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceContextState": {
+      "description": "Where a context send stands.",
+      "oneOf": [
+        {
+          "const": "sending",
+          "description": "More appends are to come.",
+          "type": "string"
+        },
+        {
+          "const": "done",
+          "description": "Every append was acknowledged.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The send stopped and is not resumed.",
+          "properties": {
+            "stopped": {
+              "additionalProperties": false,
+              "properties": {
+                "stopped_by": {
+                  "$ref": "#/$defs/VoiceContextStop",
+                  "description": "What stopped it."
+                }
+              },
+              "required": [
+                "stopped_by"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "stopped"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceContextStop": {
+      "description": "What stopped a context send.",
+      "oneOf": [
+        {
+          "const": "stop",
+          "description": "The call was stopped.",
+          "type": "string"
+        },
+        {
+          "const": "revocation",
+          "description": "The device or the call's grant was revoked.",
+          "type": "string"
+        },
+        {
+          "const": "grant",
+          "description": "A grant no longer reaches the session.",
+          "type": "string"
+        },
+        {
+          "const": "history",
+          "description": "The history bound narrowed.",
+          "type": "string"
+        },
+        {
+          "const": "privacy",
+          "description": "Privacy mode moved.",
+          "type": "string"
+        },
+        {
+          "const": "deadline",
+          "description": "The call's deadline passed.",
+          "type": "string"
+        },
+        {
+          "const": "sideband_lost",
+          "description": "The host's side channel was lost.",
+          "type": "string"
+        }
+      ]
+    },
+    "VoiceControlArm": {
+      "description": "What a `voice.control` asks for.\n\nNamed by the arm, as every variant union in this protocol is.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The phone is still there. Sent every [`HOST_HEARTBEAT_SECONDS`] under a fresh action\nidentifier; answered with the call's state and the news since `after_seq`, and never kept.",
+          "properties": {
+            "heartbeat": {
+              "additionalProperties": false,
+              "properties": {
+                "after_seq": {
+                  "$ref": "#/$defs/U64",
+                  "description": "The last news item this device received, or zero."
+                }
+              },
+              "required": [
+                "after_seq"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "heartbeat"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The person muted or unmuted the microphone.",
+          "properties": {
+            "mute": {
+              "additionalProperties": false,
+              "properties": {
+                "muted": {
+                  "description": "Whether the microphone is muted.",
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "muted"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "mute"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A fixed sentence is owed to the model.",
+          "properties": {
+            "note": {
+              "additionalProperties": false,
+              "properties": {
+                "delegation_id": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/VoiceDelegationId"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The delegation it is about, for a note about a delegation."
+                },
+                "note": {
+                  "$ref": "#/$defs/VoiceNote",
+                  "description": "Which sentence."
+                }
+              },
+              "required": [
+                "note",
+                "delegation_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "note"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The data channel delivered a delegation: has the host's own side channel heard it?",
+          "properties": {
+            "heard": {
+              "additionalProperties": false,
+              "properties": {
+                "delegation_id": {
+                  "$ref": "#/$defs/VoiceDelegationId",
+                  "description": "The provider's identifier for the delegation."
+                }
+              },
+              "required": [
+                "delegation_id"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "heard"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceControlParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.control`.",
+      "properties": {
+        "arm": {
+          "$ref": "#/$defs/VoiceControlArm",
+          "description": "What the device asks."
+        },
+        "voice_session_id": {
+          "$ref": "#/$defs/VoiceSessionId",
+          "description": "The voice session the device is controlling. It is bound to the device that started it."
+        }
+      },
+      "required": [
+        "voice_session_id",
+        "arm"
+      ],
+      "type": "object"
+    },
+    "VoiceControlResult": {
+      "description": "The answer to `voice.control`.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The answer to a heartbeat. Never kept.",
+          "properties": {
+            "heartbeat": {
+              "additionalProperties": false,
+              "properties": {
+                "dropped": {
+                  "description": "The news queue overflowed since the device last heard: the call's outcomes are not\nall known.",
+                  "type": "boolean"
+                },
+                "news": {
+                  "description": "News since `after_seq`, oldest first.",
+                  "items": {
+                    "$ref": "#/$defs/VoiceNews"
+                  },
+                  "type": "array"
+                },
+                "remaining_seconds": {
+                  "description": "Seconds until the call's own deadline, or zero.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "state": {
+                  "$ref": "#/$defs/VoiceHostCallState",
+                  "description": "Where the call stands."
+                }
+              },
+              "required": [
+                "state",
+                "remaining_seconds",
+                "news",
+                "dropped"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "heartbeat"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host took the mute or the note. A note names itself in the answer so a repeat can be\nread without the request. Proves admission to the host's writer, not provider execution.",
+          "properties": {
+            "admitted": {
+              "additionalProperties": false,
+              "properties": {
+                "note": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/VoiceNote"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "The note the host took, for a note."
+                }
+              },
+              "required": [
+                "note"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "admitted"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host's own side channel heard the delegation.",
+          "properties": {
+            "heard": {
+              "additionalProperties": false,
+              "properties": {
+                "offset_ms": {
+                  "$ref": "#/$defs/U64",
+                  "description": "Where in the call it was heard, in milliseconds."
+                }
+              },
+              "required": [
+                "offset_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "heard"
+          ],
+          "type": "object"
+        },
+        {
+          "const": "not_heard",
+          "description": "The host's own side channel has not heard the delegation. Ask again under a new action.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host did not take it.",
+          "properties": {
+            "refused": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/VoiceHostRefusal",
+                  "description": "Why."
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "refused"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "VoiceCredentialKind": {
       "description": "The providers a key can be kept for.",
       "oneOf": [
@@ -41562,6 +42007,46 @@
         }
       ]
     },
+    "VoiceEndReason": {
+      "description": "What ended a call on the host's own key.",
+      "oneOf": [
+        {
+          "const": "stop",
+          "description": "The device or the owner stopped it.",
+          "type": "string"
+        },
+        {
+          "const": "deadline",
+          "description": "The call reached its deadline.",
+          "type": "string"
+        },
+        {
+          "const": "revocation",
+          "description": "The call's grant, or the device, was revoked.",
+          "type": "string"
+        },
+        {
+          "const": "provider_closed",
+          "description": "The provider said the session was closed.",
+          "type": "string"
+        },
+        {
+          "const": "silence",
+          "description": "The phone was not heard from for two minutes.",
+          "type": "string"
+        },
+        {
+          "const": "credential_removed",
+          "description": "The owner removed the key.",
+          "type": "string"
+        },
+        {
+          "const": "sideband_lost",
+          "description": "The host lost the provider's side channel and could not get it back.",
+          "type": "string"
+        }
+      ]
+    },
     "VoiceGrantParams": {
       "additionalProperties": false,
       "description": "Parameters of `voice.grant`.",
@@ -41682,6 +42167,124 @@
       ],
       "type": "object"
     },
+    "VoiceHostCallState": {
+      "description": "Where a call on the host's own key stands.",
+      "oneOf": [
+        {
+          "const": "open",
+          "description": "The host's side channel is ready and the call is within its deadline.",
+          "type": "string"
+        },
+        {
+          "const": "recovering",
+          "description": "The host lost its side channel and is attaching again. Control writes wait.",
+          "type": "string"
+        },
+        {
+          "const": "closing",
+          "description": "The host began to close the call.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The call is over, and why.",
+          "properties": {
+            "closed": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/VoiceEndReason",
+                  "description": "What ended it."
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "closed"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceHostRefusal": {
+      "description": "Why the host did not take a control or a context send. Closed.",
+      "oneOf": [
+        {
+          "const": "unknown_call",
+          "description": "The host holds no such call, or no longer holds it.",
+          "type": "string"
+        },
+        {
+          "const": "not_this_device",
+          "description": "The call is another device's.",
+          "type": "string"
+        },
+        {
+          "const": "closing",
+          "description": "The call is closing.",
+          "type": "string"
+        },
+        {
+          "const": "not_ready",
+          "description": "The host's side channel is not ready, or its deadline has passed.",
+          "type": "string"
+        },
+        {
+          "const": "rate",
+          "description": "The call's rate limit.",
+          "type": "string"
+        },
+        {
+          "const": "too_large",
+          "description": "The words or the selection are larger than a call carries.",
+          "type": "string"
+        },
+        {
+          "const": "unknown_delegation",
+          "description": "The host holds no record of this delegation.",
+          "type": "string"
+        },
+        {
+          "const": "already_told",
+          "description": "The host already told the model this.",
+          "type": "string"
+        },
+        {
+          "const": "not_supported_by_record",
+          "description": "The host's record of the delegation does not support this note.",
+          "type": "string"
+        },
+        {
+          "const": "outside_grant",
+          "description": "The grant, or the history bound, no longer allows it.",
+          "type": "string"
+        },
+        {
+          "const": "provider_refused",
+          "description": "The provider refused the write.",
+          "type": "string"
+        },
+        {
+          "const": "sideband_lost",
+          "description": "The host's side channel was lost.",
+          "type": "string"
+        },
+        {
+          "const": "privacy",
+          "description": "Privacy mode moved.",
+          "type": "string"
+        },
+        {
+          "const": "busy",
+          "description": "A context send is already running.",
+          "type": "string"
+        }
+      ]
+    },
     "VoiceInstructions": {
       "additionalProperties": false,
       "description": "Application-authored instructions, which are never project text.\n\nSection 15 ¶9 and ¶12 both ask for this separation. It is a separate type with a separate field\non the wire so a coordinator cannot accidentally put a session's text where its own\ninstructions go, and a reader can tell which is which without knowing where the value came\nfrom.",
@@ -41773,6 +42376,268 @@
         "context_bytes"
       ],
       "type": "object"
+    },
+    "VoiceNews": {
+      "additionalProperties": false,
+      "description": "One item of the news a heartbeat carries.",
+      "properties": {
+        "item": {
+          "$ref": "#/$defs/VoiceNewsItem",
+          "description": "What happened."
+        },
+        "seq": {
+          "$ref": "#/$defs/U64",
+          "description": "Its place in the call's news; the device acknowledges it with `after_seq`."
+        }
+      },
+      "required": [
+        "seq",
+        "item"
+      ],
+      "type": "object"
+    },
+    "VoiceNewsItem": {
+      "description": "What happened on the host that the device needs to know. Carries states, offsets and counts\nand no content.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host's side channel heard a delegation.",
+          "properties": {
+            "delegation": {
+              "additionalProperties": false,
+              "properties": {
+                "delegation_id": {
+                  "$ref": "#/$defs/VoiceDelegationId",
+                  "description": "The provider's identifier for it."
+                },
+                "offset_ms": {
+                  "$ref": "#/$defs/U64",
+                  "description": "Where in the call."
+                }
+              },
+              "required": [
+                "delegation_id",
+                "offset_ms"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "delegation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The provider refused a write the host had already admitted.",
+          "properties": {
+            "late_refusal": {
+              "additionalProperties": false,
+              "properties": {
+                "action_id": {
+                  "$ref": "#/$defs/ActionId",
+                  "description": "The action the write came from."
+                },
+                "reason": {
+                  "$ref": "#/$defs/VoiceHostRefusal",
+                  "description": "Why."
+                }
+              },
+              "required": [
+                "action_id",
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "late_refusal"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Progress of a context send.",
+          "properties": {
+            "context": {
+              "additionalProperties": false,
+              "properties": {
+                "action_id": {
+                  "$ref": "#/$defs/ActionId",
+                  "description": "The `voice.context.send` that began the send, so two sends are never confused."
+                },
+                "appended": {
+                  "description": "Appends the provider acknowledged.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "of": {
+                  "description": "Appends the send holds.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "state": {
+                  "$ref": "#/$defs/VoiceContextState",
+                  "description": "Where the send stands."
+                },
+                "unconfirmed": {
+                  "description": "Appends written whose acknowledgement never came: never sent again.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "action_id",
+                "appended",
+                "of",
+                "unconfirmed",
+                "state"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "context"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The call ended.",
+          "properties": {
+            "ended": {
+              "additionalProperties": false,
+              "properties": {
+                "reason": {
+                  "$ref": "#/$defs/VoiceEndReason",
+                  "description": "What ended it."
+                }
+              },
+              "required": [
+                "reason"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "ended"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "VoiceNote": {
+      "description": "A sentence the device owes the model, by name.\n\nOne variant for each fixed sentence the device tells the model today. The words are the host's:\na device that names a variant cannot change what the model is told.",
+      "oneOf": [
+        {
+          "const": "host_actions_available",
+          "description": "host actions available.",
+          "type": "string"
+        },
+        {
+          "const": "host_actions_unavailable",
+          "description": "host actions unavailable.",
+          "type": "string"
+        },
+        {
+          "const": "speech_tainted",
+          "description": "speech tainted.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_refused",
+          "description": "delegation refused.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_not_sent",
+          "description": "delegation not sent.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_unknown",
+          "description": "delegation unknown.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_admitted",
+          "description": "delegation admitted.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_confirmation",
+          "description": "delegation confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_not_confirmed",
+          "description": "delegation not confirmed.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_no_ceremony",
+          "description": "delegation no ceremony.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_challenge_mismatch",
+          "description": "delegation challenge mismatch.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_confirmation_expired",
+          "description": "delegation confirmation expired.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_session_not_named",
+          "description": "delegation session not named.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_confirmation_dropped",
+          "description": "delegation confirmation dropped.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_host_refused",
+          "description": "delegation host refused.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_late",
+          "description": "delegation late.",
+          "type": "string"
+        },
+        {
+          "const": "delegation_performed",
+          "description": "delegation performed.",
+          "type": "string"
+        },
+        {
+          "const": "nothing_was_done",
+          "description": "nothing was done.",
+          "type": "string"
+        },
+        {
+          "const": "host_lost",
+          "description": "host lost.",
+          "type": "string"
+        },
+        {
+          "const": "host_back",
+          "description": "host back.",
+          "type": "string"
+        },
+        {
+          "const": "host_back_accepting",
+          "description": "host back accepting.",
+          "type": "string"
+        }
+      ]
     },
     "VoicePrepareParams": {
       "additionalProperties": false,
@@ -46490,6 +47355,27 @@
     "voice_context_selection": {
       "$ref": "#/$defs/VoiceContextSelection"
     },
+    "voice_context_send_params": {
+      "$ref": "#/$defs/VoiceContextSendParams"
+    },
+    "voice_context_send_result": {
+      "$ref": "#/$defs/VoiceContextSendResult"
+    },
+    "voice_context_state": {
+      "$ref": "#/$defs/VoiceContextState"
+    },
+    "voice_context_stop": {
+      "$ref": "#/$defs/VoiceContextStop"
+    },
+    "voice_control_arm": {
+      "$ref": "#/$defs/VoiceControlArm"
+    },
+    "voice_control_params": {
+      "$ref": "#/$defs/VoiceControlParams"
+    },
+    "voice_control_result": {
+      "$ref": "#/$defs/VoiceControlResult"
+    },
     "voice_credential_kind": {
       "$ref": "#/$defs/VoiceCredentialKind"
     },
@@ -46511,6 +47397,9 @@
     "voice_delegate_result": {
       "$ref": "#/$defs/VoiceDelegateResult"
     },
+    "voice_end_reason": {
+      "$ref": "#/$defs/VoiceEndReason"
+    },
     "voice_grant_params": {
       "$ref": "#/$defs/VoiceGrantParams"
     },
@@ -46520,11 +47409,26 @@
     "voice_grant_statement": {
       "$ref": "#/$defs/VoiceGrantStatement"
     },
+    "voice_host_call_state": {
+      "$ref": "#/$defs/VoiceHostCallState"
+    },
+    "voice_host_refusal": {
+      "$ref": "#/$defs/VoiceHostRefusal"
+    },
     "voice_instructions": {
       "$ref": "#/$defs/VoiceInstructions"
     },
     "voice_managed_terms": {
       "$ref": "#/$defs/VoiceManagedTerms"
+    },
+    "voice_news": {
+      "$ref": "#/$defs/VoiceNews"
+    },
+    "voice_news_item": {
+      "$ref": "#/$defs/VoiceNewsItem"
+    },
+    "voice_note": {
+      "$ref": "#/$defs/VoiceNote"
     },
     "voice_prepare_params": {
       "$ref": "#/$defs/VoicePrepareParams"

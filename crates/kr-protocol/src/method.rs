@@ -1924,6 +1924,25 @@ methods! {
     doc: "Read the selected voice context. Selection intersects this device's scope and never \
           uses the host owner's broader history.";
 
+    VoiceControl = "voice.control", Voice,
+    effect: Write, ingress: [PairedDevice], rights: [basis(VoiceGrant), req(VoiceUse)],
+    selectors: [VoiceSession],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Control a call that runs on the host's own provider key: a heartbeat that says the phone \
+          is still there, a mute, a fixed sentence for the model, or the question whether the host \
+          heard a delegation. Only the host writes words to the model.";
+
+    VoiceContextSend = "voice.context.send", Voice,
+    effect: Write, ingress: [PairedDevice],
+    rights: [basis(VoiceGrant), req(VoiceUse), req(SessionView)],
+    selectors: [Session, VoiceSession],
+    history: GrantLowerBound, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Have the host write the selected voice context to a call on the host's own provider key. \
+          Selection is the one `voice.context` makes; the host sends it in paced appends and \
+          reports progress with the call's news.";
+
     // ----- Automation -----------------------------------------------------------------------
     WorkflowInstall = "workflow.install", Automation,
     effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(AutomationManage)],
