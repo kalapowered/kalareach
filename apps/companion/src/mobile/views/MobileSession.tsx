@@ -947,10 +947,11 @@ export function MobileSession({
   // The composer is its line, the field with Send beside it, while the terminal shows and on a
   // session too short for the whole composer under the conversation's floor.
   const asLine = pane === 'terminal' || short
-  // While the composer is its line, a draft that is only empty needs no words: Send stands disabled
-  // beside the field. Every other reason stays, except while the field is the program's keyboard,
-  // when the draft waits for control to end.
-  const hint = typingToProgram || (asLine && waiting.length === 0 && draft.state === 'bound') ? null : blocked
+  // While the composer is its line, an empty draft needs no words: Send stands disabled beside the
+  // field. Every other reason stays, a tied agent's notice with it, except while the field is the
+  // program's keyboard, when the draft waits for control to end.
+  const emptyDraft = draft.state === 'bound' && draft.text.trim().length === 0 && draft.attachments.length === 0
+  const hint = typingToProgram || (asLine && waiting.length === 0 && emptyDraft) ? null : blocked
   const reason = hint ? (
     <p className="m-hint" id={`composer-why-${sessionId}`}>
       {hint}
