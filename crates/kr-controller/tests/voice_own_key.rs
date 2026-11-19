@@ -1929,3 +1929,150 @@ async fn a_credential_removal_tells_the_phone_whether_the_providers_close_was_co
         daemon.host.stop().await;
     }
 }
+
+/// The phone's heartbeat for a call, asked until the call answers `closed`.
+async fn closed_beat(
+    phone: &Phone,
+    voice_session_id: kr_protocol::ids::VoiceSessionId,
+) -> kr_protocol::voice_host::VoiceControlResult {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let answer = phone.beat(voice_session_id).await;
+            if matches!(
+                answer,
+                kr_protocol::voice_host::VoiceControlResult::Heartbeat {
+                    state: kr_protocol::voice_host::VoiceHostCallState::Closed { .. },
+                    ..
+                }
+            ) {
+                return answer;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the phone's heartbeat answers closed"))
+}
+
+/// A grant replaced for a paired device ends the call that ran under it, as a revocation. The first
+/// reply of the phone that carries the `ended` item says so, with the word for the provider's
+/// close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_replaced_for_a_paired_device_ends_its_call_as_a_revocation_and_tells_the_close() {
+    let daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let call = started(phone.start().await).voice_session_id;
+    daemon.stand_in.answer_close(true);
+    phone
+        .raw
+        .mutate(
+            Method::VoiceGrant,
+            ActionId::new(kr_ipc::new_uuid()),
+            phone.target.clone(),
+            &VoiceGrantParams {
+                device_id: phone.device_id,
+                session_ids: [phone.session_id].into_iter().collect(),
+                actions: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the grant is replaced");
+
+    let answer = closed_beat(&phone, call).await;
+    let kr_protocol::voice_host::VoiceControlResult::Heartbeat { state, news, .. } = &answer else {
+        panic!("a heartbeat answer: {answer:?}");
+    };
+    assert_eq!(
+        *state,
+        kr_protocol::voice_host::VoiceHostCallState::Closed {
+            reason: kr_protocol::voice_host::VoiceEndReason::Revocation,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed,
+        }
+    );
+    assert_eq!(
+        news.last().map(|item| &item.item),
+        Some(&kr_protocol::voice_host::VoiceNewsItem::Ended {
+            reason: kr_protocol::voice_host::VoiceEndReason::Revocation,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed,
+        })
+    );
+    daemon.host.stop().await;
+}
+
+/// A device the host revokes holds no call: the host's own record of the call's final status,
+/// read in the daemon, says the call ended as a revocation with the close confirmed, and the
+/// revoked device's own `voice.control` is not answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revoked_device_has_its_call_ended_as_a_revocation_and_its_own_control_is_refused() {
+    let daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let call = started(phone.start().await).voice_session_id;
+    daemon.stand_in.answer_close(true);
+    let mut local = daemon.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        daemon.host.environment_id,
+        &mut local,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: phone.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the device");
+
+    let host_calls = daemon.host.controller().voice().host_calls().clone();
+    let device_id = phone.device_id;
+    let read = move || host_calls.heartbeat(call, device_id, 0, kr_ipc::now_ms().get());
+    until(
+        "the host holds the final status of the revoked device's call",
+        || {
+            matches!(
+                read(),
+                kr_protocol::voice_host::VoiceControlResult::Heartbeat {
+                    state: kr_protocol::voice_host::VoiceHostCallState::Closed { .. },
+                    ..
+                }
+            )
+        },
+    )
+    .await;
+    let kr_protocol::voice_host::VoiceControlResult::Heartbeat { state, news, .. } = read() else {
+        panic!("the status is kept");
+    };
+    assert_eq!(
+        state,
+        kr_protocol::voice_host::VoiceHostCallState::Closed {
+            reason: kr_protocol::voice_host::VoiceEndReason::Revocation,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed,
+        }
+    );
+    assert_eq!(
+        news.last().map(|item| &item.item),
+        Some(&kr_protocol::voice_host::VoiceNewsItem::Ended {
+            reason: kr_protocol::voice_host::VoiceEndReason::Revocation,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed,
+        })
+    );
+
+    let refused = phone
+        .raw
+        .try_mutate(
+            Method::VoiceControl,
+            ActionId::new(kr_ipc::new_uuid()),
+            phone.target.clone(),
+            &kr_protocol::voice_host::VoiceControlParams {
+                voice_session_id: call,
+                arm: kr_protocol::voice_host::VoiceControlArm::Heartbeat {
+                    after_seq: kr_protocol::scalars::U64::new(0),
+                },
+            },
+        )
+        .await;
+    // The host withdraws the connection of a device it revoked: its request is not answered with
+    // a heartbeat, whether the stream ends first or the request is refused.
+    assert!(
+        matches!(refused, None | Some(Err(_))),
+        "the revoked device is answered no heartbeat: {refused:?}"
+    );
+    daemon.host.stop().await;
+}
