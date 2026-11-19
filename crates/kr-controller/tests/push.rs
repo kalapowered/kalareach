@@ -10246,7 +10246,7 @@ fn a_detail_the_proxy_login_stopped_is_not_waited_for_and_no_later_pass_asks_for
 fn a_held_detail_stays_owed_while_the_push_retries_and_is_given_up_with_it() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
     let now = real_now();
-    let (service, _transport) = mailbox_behind_a_stopped_login(&environment);
+    let (service, transport) = mailbox_behind_a_stopped_login(&environment);
     let object = queue_an_oversized_notification(&environment, &service, now);
     let gateway = WatchedGateway::over_answering(
         &service,
@@ -10275,6 +10275,11 @@ fn a_held_detail_stays_owed_while_the_push_retries_and_is_given_up_with_it() {
         "nothing is owed once the push is taken"
     );
     assert_eq!(service.asked(), 0, "the mailbox service was never reached");
+    assert_eq!(
+        transport.asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the retry did not ask the placer again: the transport was asked once, by the first pass"
+    );
 }
 
 /// A recipient authority that moves the clock on when it is asked for the `nth` time, as an
