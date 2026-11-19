@@ -1931,7 +1931,8 @@ pub enum SkillCommand {
 /// `kr skill install`, `kr skill status` and `kr skill remove`.
 #[derive(Args)]
 pub struct SkillArguments {
-    /// The agent: codex, claude-code, opencode, gemini-cli, kimi-code-cli or qoder-cli.
+    /// The agent: codex, claude-code, opencode, gemini-cli, kimi-code-cli or qoder-cli, or the
+    /// word an admitted package declares.
     #[arg(long)]
     pub agent: String,
     /// user or project.

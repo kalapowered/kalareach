@@ -1413,10 +1413,11 @@ nothing.
 
 ## `kr skill`
 
-`kr skill install --agent <agent> --scope <user|project> [--project-dir <path>]` writes the
-`kalareach-contact` package and registers `kr agent-tools --stdio` as a tool server for that agent.
-The agents are `codex`, `claude-code`, `opencode`, `gemini-cli`, `kimi-code-cli` and `qoder-cli`. A
-project scope with no `--project-dir` means this directory.
+`kr skill install --agent <agent> --scope <user|project> [--project-dir <path>]` installs the
+contact skill for the selected agent and scope. Where that scope has a configuration document, it
+also registers `kr agent-tools --stdio`. The agents are `codex`, `claude-code`, `opencode`,
+`gemini-cli`, `kimi-code-cli` and `qoder-cli`. A package that this host admits, and whose grant holds `skill_target.install`, can name another agent. The host accepts that word while that package is the only one that names it, at the places the owner confirmed, and adds a tool-server entry only where the package names a configuration file; on Windows it refuses such a word. A word that no admitted package names and no record of this host holds is refused, with the list of the words this host knows. A project scope with no
+`--project-dir` means this directory.
 
 `kr skill status` reports what is installed and lists anything that has changed since, including an
 installation that began and did not finish. `kr skill remove` undoes exactly what the installation

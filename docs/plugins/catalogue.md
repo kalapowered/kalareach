@@ -466,19 +466,19 @@ prompts. Past the default, each decision is somebody's and they are not intercha
 | Metadata matching, declarative presentation, authorised broker events | Nobody; the enrolment already did |
 | Raw terminal streams, transcript tails, process observation, upstream actions | An explicit package or repository grant |
 | Terminal input, filesystem, network, approval decoding and answering | An explicit installation grant, which a repository ceiling cannot reach |
-| A native bridge, which runs under the application's own permissions, or a command integration, which changes how the application runs | An installation grant the owner confirms, on every release |
+| A native bridge, which runs under the application's own permissions, a command integration, which changes how the application runs, or a skill target, which names the agent the contact skill is installed for | An installation grant the owner confirms, on every release |
 | Anything the installation it replaces could not do, or, for a first installation, anything past the ceiling | The owner's confirmation, because an increase is a new decision |
 
 A grant names only capabilities the package asks for. An installation that may do anything the
 installation it replaces could not, or, with nothing to replace, anything its repository's ceiling
 does not permit by itself, carries the owner's confirmation of that exact installation, and so does
-every release that installs a native bridge, declares a command integration or asks for
-`launch.probe`, which runs the application's own executable. What the replaced
+every release that installs a native bridge, declares a command integration, asks for
+`skill_target.install` or asks for `launch.probe`, which runs the application's own executable. What the replaced
 installation could do is read under the ceiling it was installed under, so a move to a repository
 that permits more is an increase too. The confirmation names the repository and its ceiling, as
 `catalogue.list` reports them, the release, the package hash, the grant and, where the grant holds a
-native bridge, the publisher's statement and, where it holds a command integration, the host's
-reading of it; it is accepted and consumed the way `plugin.grant`'s is, and asked again when the
+native bridge, the publisher's statement and, where it holds a command integration or a skill
+target, the host's reading of it; it is accepted and consumed the way `plugin.grant`'s is, and asked again when the
 installation is recorded. The installation is held to the ceiling the owner was shown: a repository
 whose ceiling changed after the confirmation, before the installation holds it or before the
 installation is recorded, refuses it, and a new confirmation is needed. An installation that widens
