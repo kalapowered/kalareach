@@ -1681,6 +1681,257 @@ async fn a_closure_on_the_retained_channel_is_read_before_the_next_attachment_re
     assert!(world.ledger.rows().expect("rows").is_empty());
 }
 
+/// Lets the other tasks run, without moving the clock, until the stand-in has seen `count`
+/// hangups. The case asserts what it saw.
+async fn until_hung_up(world: &World, count: usize) {
+    for _ in 0..1_000 {
+        if world.stand_in.recorded().hangups.len() >= count {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Lets the other tasks run, without moving the clock, until the stand-in has seen a command of
+/// this type. The case asserts what it saw.
+async fn until_written(world: &World, kind: &str) {
+    for _ in 0..1_000 {
+        let written = world
+            .stand_in
+            .recorded()
+            .commands
+            .iter()
+            .any(|command| command["type"] == json!(kind));
+        if written {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A hangup that waits for the test to let it go and then answers with an empty 404.
+fn held_hangup(world: &World) -> Arc<tokio::sync::Notify> {
+    let release = Arc::new(tokio::sync::Notify::new());
+    world.stand_in.script_hangup(HangupScript::Held(
+        Arc::clone(&release),
+        Box::new(HangupScript::Answer(404, None)),
+    ));
+    release
+}
+
+/// A close whose drain ran out hangs the call up, and a closure that comes while the hangup waits
+/// is read after its answer: the empty 404 does not leave the call unresolved, the provider's word
+/// is the confirmed end, and the call is hung up once.
+#[tokio::test(start_paused = true)]
+async fn a_closure_that_comes_while_the_hangup_of_a_close_waits_is_read_after_its_answer() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world.stand_in.answer_close(false);
+    let release = held_hangup(&world);
+    let closing = world.provider.close(&own.call_id);
+    let steering = async {
+        // The close is written and nothing answers it: the drain runs out, and the hangup starts
+        // and is held.
+        until_written(&world, "session.close").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(DRAIN_BOUND).await;
+        until_hung_up(&world, 1).await;
+        assert_eq!(
+            world.stand_in.recorded().hangups.len(),
+            1,
+            "the hangup is held"
+        );
+        // The provider's closure comes while the hangup waits, and then the hangup is answered.
+        world.stand_in.event(&closed_event("close_requested", None));
+        release.notify_one();
+    };
+    let (closed, ()) = tokio::join!(closing, steering);
+    assert!(
+        closed.is_ok(),
+        "the closure behind an unconfirmed hangup is the confirmed end"
+    );
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed)
+    );
+    assert_eq!(
+        world.stand_in.recorded().hangups.len(),
+        1,
+        "the call is hung up once"
+    );
+    assert!(
+        world.ledger.rows().expect("rows").is_empty(),
+        "no row stands for a call the provider closed"
+    );
+}
+
+/// A start whose readiness failed hangs the call up, and a closure that comes while the hangup
+/// waits is read after its answer: the empty 404 does not leave the row unresolved, the late
+/// session counts as closed, and the call is hung up once.
+#[tokio::test(start_paused = true)]
+async fn a_closure_that_comes_while_the_hangup_of_a_failed_readiness_waits_is_read_after_its_answer()
+ {
+    let world = fresh();
+    world.stand_in.acknowledge(false);
+    let release = held_hangup(&world);
+    let request = request(1);
+    let attempt = world.provider.begin(&request).await.expect("begin");
+    let provider = &world.provider;
+    let dispatch = provider.dispatch(attempt, &request);
+    let steering = async {
+        // The probe is written and never answered: the readiness bound passes, and the hangup
+        // starts and is held.
+        until_written(&world, "session.input_audio.unmute").await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(READINESS_BOUND).await;
+        until_hung_up(&world, 1).await;
+        assert_eq!(
+            world.stand_in.recorded().hangups.len(),
+            1,
+            "the hangup is held"
+        );
+        // A removal fences the start while the hangup waits, and the provider's closure comes.
+        let _fence = provider.registry().fence().expect("a fence");
+        world.stand_in.event(&closed_event("close_requested", None));
+        release.notify_one();
+        provider.settle().await
+    };
+    let (outcome, settled) = tokio::join!(dispatch, steering);
+    assert!(matches!(
+        outcome.expect("an answer"),
+        VoiceStart::Refused(_)
+    ));
+    assert_eq!(
+        settled,
+        Settled::LateSessionClosed,
+        "the closure behind an unconfirmed hangup is the confirmed end"
+    );
+    assert_eq!(
+        world.stand_in.recorded().hangups.len(),
+        1,
+        "the call is hung up once"
+    );
+    assert!(
+        world.ledger.rows().expect("rows").is_empty(),
+        "no row stands for a call the provider closed"
+    );
+}
+
+/// A start whose registry slot a fence took after a passed readiness hangs the call up, and a
+/// closure that comes while the hangup waits is read after its answer: the empty 404 does not
+/// leave the row unresolved, the late session counts as closed, and the call is hung up once.
+#[tokio::test(start_paused = true)]
+async fn a_closure_that_comes_while_the_hangup_of_a_fenced_start_waits_is_read_after_its_answer() {
+    let world = fresh();
+    world.stand_in.acknowledge(false);
+    let release = held_hangup(&world);
+    let request = request(1);
+    let attempt = world.provider.begin(&request).await.expect("begin");
+    let provider = &world.provider;
+    let dispatch = provider.dispatch(attempt, &request);
+    let steering = async {
+        // The probe is written and waits for its answer.
+        until_written(&world, "session.input_audio.unmute").await;
+        let probe = world
+            .stand_in
+            .recorded()
+            .commands
+            .last()
+            .cloned()
+            .expect("the probe was written");
+        // A fence comes, and then the answer: the readiness passes and the slot is not the
+        // registry's, so the call is hung up, and the hangup is held.
+        let _fence = provider.registry().fence().expect("a fence");
+        world.stand_in.event(&json!({
+            "type": "session.input_audio.unmuted",
+            "event_id": "e",
+            "client_event_id": probe["event_id"],
+        }));
+        until_hung_up(&world, 1).await;
+        assert_eq!(
+            world.stand_in.recorded().hangups.len(),
+            1,
+            "the hangup is held"
+        );
+        // The provider's closure comes while the hangup waits, and then the hangup is answered.
+        world.stand_in.event(&closed_event("close_requested", None));
+        release.notify_one();
+        provider.settle().await
+    };
+    let (outcome, settled) = tokio::join!(dispatch, steering);
+    assert!(matches!(
+        outcome.expect("an answer"),
+        VoiceStart::Refused(_)
+    ));
+    assert_eq!(
+        settled,
+        Settled::LateSessionClosed,
+        "the closure behind an unconfirmed hangup is the confirmed end"
+    );
+    assert_eq!(
+        world.stand_in.recorded().hangups.len(),
+        1,
+        "the call is hung up once"
+    );
+    assert!(
+        world.ledger.rows().expect("rows").is_empty(),
+        "no row stands for a call the provider closed"
+    );
+}
+
+/// A recovery that gives up hangs the call up on the channel it still holds, and a closure that
+/// comes while the hangup waits is read after its answer: the empty 404 does not leave the call
+/// unresolved, and the call is hung up once.
+#[tokio::test(start_paused = true)]
+async fn a_closure_that_comes_while_the_hangup_of_a_failed_recovery_waits_is_read_after_its_answer()
+{
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    // The channel is lost, and the reattachment's probe is never answered.
+    world.stand_in.acknowledge(false);
+    let release = held_hangup(&world);
+    world.stand_in.drop_socket();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Recovering);
+    // The recovery bound passes, and the hangup starts and is held.
+    tokio::time::advance(RECOVERY_BOUND).await;
+    until_hung_up(&world, 1).await;
+    assert_eq!(
+        world.stand_in.recorded().hangups.len(),
+        1,
+        "the hangup is held"
+    );
+    // The provider's closure comes on the channel the recovery holds, and then the hangup is
+    // answered.
+    world.stand_in.event(&closed_event("close_requested", None));
+    release.notify_one();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed),
+        "the closure behind an unconfirmed hangup is the confirmed end"
+    );
+    assert_eq!(
+        world.stand_in.recorded().hangups.len(),
+        1,
+        "the call is hung up once"
+    );
+    assert!(
+        world.ledger.rows().expect("rows").is_empty(),
+        "no row stands for a call the provider closed"
+    );
+}
+
 /// A mute the provider refused took no effect: the recovery's probe does not restate it.
 #[tokio::test(start_paused = true)]
 async fn a_mute_the_provider_refused_is_not_restated_by_the_recovery() {
