@@ -5131,6 +5131,15 @@ async fn a_refusal_that_names_the_kept_start_offers_start_again_and_a_pass_close
         state["owed"][0]["kind"], "start_unconfirmed",
         "the notice stands: {state}"
     );
+    // The page's state drops hidden entries, so the file is read as well: the held start left no
+    // entry of its own, and the earlier one is the only entry the file holds.
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the file"),
+    )
+    .expect("a file");
+    let kept = file["owed"].as_array().expect("the entries");
+    assert_eq!(kept.len(), 1, "{file}");
+    assert_eq!(kept[0]["action_id"], earlier.as_str(), "{file}");
 
     // "Start again" names the kept start, passes the hold, and closes its notice.
     scene.stand_in.lose_creation_answers(false);
