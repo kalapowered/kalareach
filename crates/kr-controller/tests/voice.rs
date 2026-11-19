@@ -4456,6 +4456,8 @@ async fn a_start_whose_token_step_passes_the_admissions_deadline_sends_nothing()
             async {
                 world.token.began().await;
                 moved.advance(std::time::Duration::from_secs(moves_by));
+                // A later token step, such as the close of a call the start made, is let through.
+                world.token.disarm();
                 world.token.release();
             }
         );
