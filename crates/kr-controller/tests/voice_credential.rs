@@ -358,3 +358,155 @@ async fn the_stored_claim_digest_of_a_credential_set_is_not_the_digest_of_its_pa
         "a second claim of the same key has its own digest"
     );
 }
+
+fn stored_call(state_dir: &Path, byte: u8, session: Option<&str>) {
+    use kr_client::services::{NewCall, OwnCallLedger};
+    let calls = kr_controller::voice::own_key_calls::OwnKeyCalls::open(state_dir)
+        .expect("the record of calls opens beside the daemon");
+    let call = NewCall {
+        call_id: format!("call-{byte}"),
+        attempt_id: format!("attempt-{byte}"),
+        action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16])),
+        device_id: "device-1".to_owned(),
+        asked_ms: 1_700_000_000_000,
+        closes_at_ms: 1_700_000_300_000,
+    };
+    calls.begin(&call).expect("a row is written");
+    if let Some(session) = session {
+        calls
+            .record_id(&call.call_id, session, None)
+            .expect("its id is written");
+    }
+}
+
+fn rows_of(state_dir: &Path) -> usize {
+    use kr_client::services::OwnCallLedger;
+    kr_controller::voice::own_key_calls::OwnKeyCalls::open(state_dir)
+        .expect("the record opens")
+        .rows()
+        .expect("rows")
+        .len()
+}
+
+async fn remove_key(
+    control: &mut LocalClient,
+    host: &net_support::Host,
+) -> Result<ParamsValue, ProtocolError> {
+    control
+        .mutate(
+            Method::VoiceCredentialRemove,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &VoiceCredentialRemoveParams {
+                kind: VoiceCredentialKind::OpenaiLive,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+}
+
+/// A call the host cannot show is closed keeps the key: `set` and `remove` refuse with the
+/// approved sentences, and `forget_calls` forgets every row and keeps the key. The test daemon
+/// reaches no provider, so no hangup is ever confirmed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forget_calls_forgets_every_row_and_keeps_the_key_while_set_and_remove_refuse_over_a_standing_call()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let mut control = host.client().await;
+    let state_dir = host.tree().environment().state_dir().to_path_buf();
+    let held = "kr-test-voice-key-held-01234567890";
+    set(&mut control, &host, &params(held)).await.expect("held");
+    let credentials = credentials_of(&host);
+
+    // A call with a session id that cannot be confirmed closed.
+    stored_call(&state_dir, 1, Some("live_unconfirmed"));
+    let replaced = set(
+        &mut control,
+        &host,
+        &params("kr-test-voice-key-other-0123456789"),
+    )
+    .await;
+    assert!(
+        replaced
+            .expect_err("a key in use is not replaced")
+            .message
+            .contains("A call is using this key; replace it after the call has ended"),
+    );
+    let refused = remove_key(&mut control, &host)
+        .await
+        .expect_err("a call that is not confirmed closed keeps the key");
+    assert!(refused.message.contains("could not be confirmed closed"));
+    assert!(
+        refused
+            .message
+            .contains("run kr voice credential forget-calls, then remove the key again")
+    );
+    assert_eq!(
+        credentials
+            .get(VoiceCredentialKind::OpenaiLive)
+            .expect("reads")
+            .expect("kept")
+            .expose(),
+        held
+    );
+    assert_eq!(rows_of(&state_dir), 1, "the row stays");
+
+    // A creation that never learned its id.
+    stored_call(&state_dir, 2, None);
+    let forgotten: kr_protocol::voice_credential::VoiceCredentialForgetCallsResult = control
+        .mutate(
+            Method::VoiceCredentialForgetCalls,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &kr_protocol::voice_credential::VoiceCredentialForgetCallsParams {
+                kind: VoiceCredentialKind::OpenaiLive,
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("forgetting is answered")
+        .to_typed()
+        .expect("the result decodes");
+    assert_eq!(forgotten.calls_forgotten, 2);
+    assert_eq!(
+        forgotten.late_start,
+        kr_protocol::voice_credential::VoiceLateStart::None
+    );
+    assert_eq!(rows_of(&state_dir), 0);
+    assert_eq!(
+        credentials
+            .get(VoiceCredentialKind::OpenaiLive)
+            .expect("reads")
+            .expect("kept")
+            .expose(),
+        held
+    );
+
+    // With no row, the key is replaced and then removed.
+    set(
+        &mut control,
+        &host,
+        &params("kr-test-voice-key-other-0123456789"),
+    )
+    .await
+    .expect("replaced");
+    let creating_only = {
+        stored_call(&state_dir, 3, None);
+        remove_key(&mut control, &host)
+            .await
+            .expect_err("a creation never learned keeps the key")
+    };
+    assert!(
+        creating_only
+            .message
+            .contains("did not learn whether OpenAI created it")
+    );
+    assert!(
+        credentials
+            .get(VoiceCredentialKind::OpenaiLive)
+            .expect("reads")
+            .is_some()
+    );
+    let _ = forgotten;
+}
