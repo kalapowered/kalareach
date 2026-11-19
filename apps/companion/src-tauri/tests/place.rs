@@ -81,9 +81,7 @@ async fn a_real_worker_gives_back_a_kept_row_and_says_when_it_is_gone() {
         .open_at(hosted.session_id, SECOND, 80, 24, &kept)
         .await
         .expect("the view opens");
-    let back = page
-        .newest(SECOND, |state| state["state"] == "showing")
-        .await;
+    let back = page.first_showing(SECOND).await;
     assert_eq!(back["note"], Value::Null, "{back}");
     assert_eq!(Page::lines(&back)[0], first, "the same first row");
     assert_eq!(back["anchor"]["row"], kept["row"]);
@@ -96,9 +94,7 @@ async fn a_real_worker_gives_back_a_kept_row_and_says_when_it_is_gone() {
         .open_at(hosted.session_id, THIRD, 80, 24, &kept)
         .await
         .expect("the view opens");
-    let after = page
-        .newest(THIRD, |state| state["state"] == "showing")
-        .await;
+    let after = page.first_showing(THIRD).await;
     assert_eq!(after["note"], "gone", "{after}");
     assert_ne!(Page::lines(&after)[0], first, "not the row it was");
     hosted.close().await;
@@ -176,9 +172,7 @@ async fn a_real_worker_never_shows_other_text_after_a_width_change_without_sayin
         .open_at(hosted.session_id, SECOND, 80, 24, &kept)
         .await
         .expect("the view opens");
-    let shown = page
-        .newest(SECOND, |state| state["state"] == "showing")
-        .await;
+    let shown = page.first_showing(SECOND).await;
     let same = Page::lines(&shown)[0] == first;
     match shown["note"].as_str() {
         None => assert!(
