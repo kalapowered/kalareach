@@ -684,7 +684,7 @@ impl NativeBridges {
             let resolved = match wanted {
                 Some(target) => match &target.placement {
                     Declared::Placement(placement) => Some(placement.directory_path()),
-                    Declared::Nothing => Placement::for_label(&target.recipe.application)
+                    Declared::Nothing => Placement::for_label(target.recipe.application.as_str())
                         .map(|layout| layout.directory_path()),
                     Declared::Refused(_) => None,
                 },
@@ -2708,12 +2708,12 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
         .map(|placed| placed.tail.as_str())
         .collect();
     // Only the key of the label that has one: a placement for another label adds no key.
-    let enabling = (recipe.application == "Claude Code").then_some((
+    let enabling = (recipe.application.as_str() == "Claude Code").then_some((
         "settings.json",
         "enabledPlugins.",
         "@skills-dir",
     ));
-    let last = record_kept_last(&recipe.application, area);
+    let last = record_kept_last(recipe.application.as_str(), area);
     let application = &recipe.application;
     let mut name: Option<&str> = None;
     let mut placed_tails: Vec<&str> = Vec::new();
