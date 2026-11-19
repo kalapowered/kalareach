@@ -838,7 +838,6 @@ mod written {
         assert!(String::from_utf8_lossy(&bad.stderr).contains("cannot be used"));
     }
 
-    #[cfg(target_os = "macos")]
     /// The name a path left beside the login item's file has, as a record names it.
     fn beside(item: &Path, extension: &str) -> PathBuf {
         let name = item.file_name().and_then(|n| n.to_str()).expect("a name");
@@ -1129,6 +1128,7 @@ mod written {
         assert!(before == setup.snapshot(), "nothing was made: {said}");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_path_a_property_list_must_escape_reads_back_whole() {
         for name in ["a&b", "a<b>", "a'b", "a\"b"] {
