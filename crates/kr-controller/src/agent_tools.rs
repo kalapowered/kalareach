@@ -2546,7 +2546,10 @@ mod tests {
         let server = &written["mcpServers"]["kalareach"];
         assert_eq!(
             *server,
-            installer.entry_value(Format::JsonCommandArgs, compiled_deadline(CompiledAgent::ClaudeCode).as_ref())
+            installer.entry_value(
+                Format::JsonCommandArgs,
+                compiled_deadline(CompiledAgent::ClaudeCode).as_ref()
+            )
         );
         assert_eq!(server["args"], json!(ENTRY_ARGS));
         assert_eq!(
@@ -4100,7 +4103,10 @@ mod tests {
             let written: Value = serde_json::from_str(&installed).expect("json");
             assert_eq!(
                 written["mcpServers"]["kalareach"],
-                installer.entry_value(Format::JsonCommandArgs, compiled_deadline(CompiledAgent::ClaudeCode).as_ref())
+                installer.entry_value(
+                    Format::JsonCommandArgs,
+                    compiled_deadline(CompiledAgent::ClaudeCode).as_ref()
+                )
             );
             installer.remove(&params).expect("removes");
             assert_eq!(

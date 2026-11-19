@@ -29,7 +29,7 @@ use crate::stdout_line;
 /// Returns [`CliError::Usage`] when the agent or the scope is not one this host supports, or when
 /// a project scope names no directory and none can be resolved.
 pub fn parse(agent: &str, scope: &str, project_dir: Option<&str>) -> Result<AgentToolsParams> {
-    let agent: AgentTarget = agent.parse().map_err(|refusal| {
+    let agent = agent.parse::<AgentTarget>().map_err(|refusal| {
         CliError::Usage(shown!(
             "the agent given is not a valid agent word: {}",
             Shown::said(refusal.reason())
@@ -106,7 +106,7 @@ fn asked_path(path: &str) -> Asked {
 #[must_use]
 pub fn installed(result: &AgentToolsInstallResult) -> Document {
     Document::new()
-        .with("agent", result.manifest.agent.as_str())
+        .with("agent", asked(result.manifest.agent.as_str()))
         .with("scope", result.manifest.scope.as_str())
         .with("root", asked_path(&result.manifest.root))
         .with("skill_version", asked(&result.manifest.skill_version))
@@ -144,7 +144,7 @@ pub fn installed(result: &AgentToolsInstallResult) -> Document {
 #[must_use]
 pub fn reported(result: &AgentToolsStatusResult) -> Document {
     Document::new()
-        .with("agent", result.agent.as_str())
+        .with("agent", asked(result.agent.as_str()))
         .with("scope", result.scope.as_str())
         .with("root", asked_path(&result.root))
         .with("installed", result.installed)
@@ -182,7 +182,7 @@ pub fn reported(result: &AgentToolsStatusResult) -> Document {
 #[must_use]
 pub fn removed(result: &AgentToolsRemoveResult) -> Document {
     Document::new()
-        .with("agent", result.agent.as_str())
+        .with("agent", asked(result.agent.as_str()))
         .with("scope", result.scope.as_str())
         .with(
             "removed",
@@ -207,7 +207,7 @@ pub fn install_lines(result: &AgentToolsInstallResult) -> Vec<Line> {
             "{} {} is already installed for {} at {} scope",
             kr_protocol::skill::SKILL_NAME,
             asked(&manifest.skill_version),
-            manifest.agent.as_str(),
+            asked(manifest.agent.as_str()),
             manifest.scope.as_str()
         )
     } else {
@@ -215,7 +215,7 @@ pub fn install_lines(result: &AgentToolsInstallResult) -> Vec<Line> {
             "installed {} {} for {} at {} scope",
             kr_protocol::skill::SKILL_NAME,
             asked(&manifest.skill_version),
-            manifest.agent.as_str(),
+            asked(manifest.agent.as_str()),
             manifest.scope.as_str()
         )
     }];
@@ -252,7 +252,7 @@ pub fn status_lines(result: &AgentToolsStatusResult) -> Vec<Line> {
         let mut lines = vec![stdout_line!(
             "{} is not installed for {} at {} scope",
             kr_protocol::skill::SKILL_NAME,
-            result.agent.as_str(),
+            asked(result.agent.as_str()),
             result.scope.as_str()
         )];
         // What this host knows about the place it is not installed in. An installation that began
@@ -269,7 +269,7 @@ pub fn status_lines(result: &AgentToolsStatusResult) -> Vec<Line> {
             .skill_version
             .as_ref()
             .map_or_else(|| asked("an unknown version"), |version| asked(version)),
-        result.agent.as_str(),
+        asked(result.agent.as_str()),
         result.scope.as_str(),
         asked_path(&result.root)
     )];
@@ -299,7 +299,7 @@ pub fn remove_lines(result: &AgentToolsRemoveResult) -> Vec<Line> {
     let mut lines = vec![stdout_line!(
         "removed {} for {} at {} scope",
         kr_protocol::skill::SKILL_NAME,
-        result.agent.as_str(),
+        asked(result.agent.as_str()),
         result.scope.as_str()
     )];
     for change in &result.removed {
@@ -443,12 +443,15 @@ mod tests {
         }
     }
 
+    /// A word in the grammar is left to the host, which knows the words its packages declare; one
+    /// outside it is refused here.
     #[test]
-    fn an_unknown_agent_names_the_ones_that_are_supported() {
-        let error = parse("some-agent", "user", None).expect_err("refused");
+    fn a_word_in_the_grammar_is_left_to_the_host_and_one_outside_it_is_refused() {
+        let params = parse("some-agent", "user", None).expect("the host decides");
+        assert_eq!(params.agent.as_str(), "some-agent");
+        let error = parse("Some Agent", "user", None).expect_err("refused");
         assert_eq!(error.exit_code(), 2);
-        assert!(error.to_string().contains("claude-code"));
-        assert!(error.to_string().contains("qoder-cli"));
+        assert!(error.to_string().contains("not a valid agent word"), "{error}");
     }
 
     /// KR-REQ-23.33: an agent-tools change names its scope, user or project.
