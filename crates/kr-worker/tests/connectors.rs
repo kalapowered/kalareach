@@ -916,10 +916,9 @@ fn an_installed_connector_holds_the_hook_events_its_package_declares() {
         ..fixture::Shape::claude_code()
     });
     let connector = InstalledConnector::read(source).expect("the package is read");
-    assert_eq!(
-        serde_json::to_value(connector.hook_events().expect("declared events")).expect("writes"),
-        declared
-    );
+    let expected: kr_plugin_sdk::hook_events::HookEvents =
+        serde_json::from_value(declared).expect("the declared events read");
+    assert_eq!(connector.hook_events(), Some(&expected));
     let plain = InstalledConnector::read(Store::new("events-none").package()).expect("read");
     assert!(plain.hook_events().is_none());
 }
@@ -950,4 +949,3 @@ fn an_installed_connector_refuses_a_map_the_package_check_would_refuse() {
         refusal.detail
     );
 }
-

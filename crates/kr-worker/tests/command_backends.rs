@@ -401,23 +401,40 @@ async fn kr_req_11_44_a_launch_publishes_the_hook_events_its_package_declares() 
     );
     let answer = setup
         .backends
-        .establish(&request(&setup, &invocation(&["claude", "--resume"]), &Setup::integration(), 5))
+        .establish(&request(
+            &setup,
+            &invocation(&["claude", "--resume"]),
+            &Setup::integration(),
+            5,
+        ))
         .expect("a backend is established");
     let registration = PathBuf::from(&answer.environment[0].value);
     let directory = registration.parent().expect("the backend's directory");
-    let written = kr_ipc::paths::read_owner_only_file(&directory.join("hook-events.json"), 16 * 1024)
-        .expect("the events are owner-only")
-        .expect("the events are there");
+    let written =
+        kr_ipc::paths::read_owner_only_file(&directory.join("hook-events.json"), 16 * 1024)
+            .expect("the events are owner-only")
+            .expect("the events are there");
+    let expected: kr_plugin_sdk::hook_events::HookEvents =
+        serde_json::from_value(declared).expect("the declared events read");
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&written).expect("JSON"),
-        declared
+        serde_json::from_slice::<kr_plugin_sdk::hook_events::HookEvents>(&written)
+            .expect("the file holds hook events"),
+        expected
     );
-    assert!(!registration.exists(), "the events come before any registration");
+    assert!(
+        !registration.exists(),
+        "the events come before any registration"
+    );
 
     let plain = Setup::new();
     let answer = plain
         .backends
-        .establish(&request(&plain, &invocation(&["claude", "--resume"]), &Setup::integration(), 5))
+        .establish(&request(
+            &plain,
+            &invocation(&["claude", "--resume"]),
+            &Setup::integration(),
+            5,
+        ))
         .expect("a backend is established");
     let directory = PathBuf::from(&answer.environment[0].value)
         .parent()

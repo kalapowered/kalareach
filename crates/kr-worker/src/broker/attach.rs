@@ -489,7 +489,9 @@ impl NativeGateway {
     #[must_use]
     pub fn with_events(mut self, events: std::path::PathBuf) -> Self {
         if let Some(registration) = self.registration.take() {
-            let _ = self.registration.set(registration.with_events(Some(events)));
+            let _ = self
+                .registration
+                .set(registration.with_events(Some(events)));
         }
         self
     }

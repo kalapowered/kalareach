@@ -333,7 +333,7 @@ impl Registration {
         let credential_path = credential_path.ok_or_else(|| RegistrationError::Malformed {
             detail: "names no credential file".to_owned(),
         })?;
-        check_beside(&paths.registration, &credential_path, "the credential file")?;
+        check_beside(&paths.registration, &credential_path)?;
         let credential_name = credential_path.file_name().unwrap_or_default();
         let credential = wait_for(
             &directory,
@@ -651,7 +651,7 @@ fn read_events(
     deadline: Instant,
     within: Duration,
 ) -> Result<HookEvents, RegistrationError> {
-    check_beside(registration, path, "the hook events file")?;
+    check_named_beside(registration, path, "the hook events file")?;
     let name = path.file_name().unwrap_or_default();
     let bytes = wait_for(directory, path, name, MAX_EVENTS_BYTES, deadline, within)?;
     let events: HookEvents =
@@ -661,12 +661,14 @@ fn read_events(
                 path.display()
             ),
         })?;
-    events.check().map_err(|error| RegistrationError::Malformed {
-        detail: format!(
-            "names the hook events file {}, which holds events that are refused: {error}",
-            path.display()
-        ),
-    })?;
+    events
+        .check()
+        .map_err(|error| RegistrationError::Malformed {
+            detail: format!(
+                "names the hook events file {}, which holds events that are refused: {error}",
+                path.display()
+            ),
+        })?;
     Ok(events)
 }
 
@@ -675,7 +677,12 @@ fn read_events(
 /// The worker writes the credential and the hook events beside the registration, inside the
 /// launch's owner-only directory. A path that is relative, or leaves that directory, is not one it
 /// wrote, and the forwarder presents and reads nothing from it.
-fn check_beside(
+fn check_beside(registration: &Path, credential: &Path) -> Result<(), RegistrationError> {
+    check_named_beside(registration, credential, "the credential file")
+}
+
+/// As [`check_beside`], for the file `what` names.
+fn check_named_beside(
     registration: &Path,
     named: &Path,
     what: &str,
@@ -985,11 +992,18 @@ mod tests {
     fn the_events_file_is_read_only_beside_the_registration() {
         let elsewhere = kr_ipc::testing::PrivateTempDir::create();
         std::fs::write(elsewhere.path().join("hook-events.json"), vendor_events()).expect("writes");
-        let outside = elsewhere.path().join("hook-events.json").display().to_string();
+        let outside = elsewhere
+            .path()
+            .join("hook-events.json")
+            .display()
+            .to_string();
         for (what, named) in [
             ("a relative path", "hook-events.json".to_owned()),
             ("a path outside the folder", outside),
-            ("a path that leaves the folder", "/../hook-events.json".to_owned()),
+            (
+                "a path that leaves the folder",
+                "/../hook-events.json".to_owned(),
+            ),
         ] {
             let launch = Launch::new(Some(&|directory| match what {
                 "a path that leaves the folder" => {
@@ -1000,7 +1014,9 @@ mod tests {
             launch.write("hook-events.json", vendor_events().as_bytes());
             let error = launch.read().expect_err(what);
             assert!(
-                error.to_string().contains("not in the registration's own directory"),
+                error
+                    .to_string()
+                    .contains("not in the registration's own directory"),
                 "{what}: {error}"
             );
         }
@@ -1023,7 +1039,10 @@ mod tests {
                 "events the check refuses",
                 Some(
                     vendor_events()
-                        .replace(r#""events":[{"name":"opened","report":"session_started"}]"#, r#""events":[]"#)
+                        .replace(
+                            r#""events":[{"name":"opened","report":"session_started"}]"#,
+                            r#""events":[]"#,
+                        )
                         .into_bytes(),
                 ),
             ),
