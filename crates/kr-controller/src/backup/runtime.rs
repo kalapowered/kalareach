@@ -243,6 +243,81 @@ struct Observed {
     release_pending: bool,
 }
 
+impl Observed {
+    /// Notes what a pass met: the answer to its status question, the refusal of the question it
+    /// was turned back at, and what held its work back.
+    fn note_pass(&mut self, report: &PassReport, account_moved: bool, token_refused: bool) {
+        let by_login = report.hold.filter(Hold::waits_for_restart);
+        if let Some(status) = &report.status {
+            self.status = Some(status.clone());
+            self.status_refusal = None;
+            self.status_unanswered = false;
+        }
+        if matches!(report.idle, Some(Idle::Unavailable { .. })) && !account_moved {
+            self.status_refusal = report.hold;
+            self.status_unanswered = false;
+        }
+        // What the pass met while it carried work is what held the work back. When it met
+        // nothing, that stands cleared only if the pass ran its work to the end: one that
+        // stopped at a delay did not, and says nothing of what held the work before. A pass
+        // that was turned back at its first question carried no work, and what it met is the
+        // status refusal above.
+        if let Some(login) = by_login.filter(|_| account_moved) {
+            // The proxy's login is the host's and not an account's: it stopped every request
+            // of the pass, whichever account it was asked for, so the account's change does
+            // not clear it.
+            self.pass_hold = Some(login);
+        } else if account_moved {
+            // Only the service names a delay, so a delay the pass was given or stopped at
+            // stands whichever account it was asked for. A pass that stopped at a delay with
+            // no hold of its own says nothing of what held the work before. What else the
+            // pass met may have been the token of the account before the change or of the
+            // one after.
+            self.pass_hold = match (report.hold.and_then(|hold| hold.retry_after), report.quiet) {
+                (Some(retry_after), _) => Some(Hold {
+                    code: ErrorCode::ServiceCapacity,
+                    retry_after: Some(retry_after),
+                    offered: report.hold.map(|hold| hold.offered).unwrap_or_default(),
+                    login: None,
+                }),
+                (None, Some(owed)) if report.hold.is_some() => Some(Hold {
+                    code: ErrorCode::ServiceCapacity,
+                    retry_after: Some(owed.left),
+                    offered: report.hold.map(|hold| hold.offered).unwrap_or_default(),
+                    login: None,
+                }),
+                (None, Some(_)) => self.pass_hold,
+                (None, None) => None,
+            };
+        } else if token_refused {
+            self.pass_hold = None;
+            self.token_blocked = true;
+        } else if report.idle.is_none() && (report.hold.is_some() || report.quiet.is_none()) {
+            self.pass_hold = report.hold;
+        }
+        self.last_pass = Some(LastPass {
+            steps: report.steps.len() as u64,
+            idle: match &report.idle {
+                None => None,
+                Some(Idle::Unready { .. }) => Some("this host has not reconciled its backup store"),
+                Some(Idle::BackupOff) => Some("backup storage is off for the account"),
+                Some(Idle::Unavailable { .. }) => Some("the service could not be asked"),
+            },
+        });
+    }
+
+    /// Whether a hold the carrier remembers lasts until the host restarts. The hold of the last
+    /// pass's work and the refusal of the last status question are kept apart, and either may be
+    /// the one that the proxy's login stopped: an ordinary hold of one does not hide the stop of
+    /// the other.
+    fn waits_for_restart(&self) -> bool {
+        [self.pass_hold, self.status_refusal]
+            .into_iter()
+            .flatten()
+            .any(|hold| hold.waits_for_restart())
+    }
+}
+
 /// What one pass did, in the words `kr doctor` uses.
 #[derive(Clone, Copy, Debug)]
 struct LastPass {
@@ -439,68 +514,8 @@ impl Shared {
             .iter()
             .any(|step| matches!(step, Stepped::Waiting { .. }));
         let by_login = report.hold.filter(Hold::waits_for_restart);
-        {
-            let mut observed = self.observed();
-            if let Some(status) = &report.status {
-                observed.status = Some(status.clone());
-                observed.status_refusal = None;
-                observed.status_unanswered = false;
-            }
-            if matches!(report.idle, Some(Idle::Unavailable { .. })) && !account_moved {
-                observed.status_refusal = report.hold;
-                observed.status_unanswered = false;
-            }
-            // What the pass met while it carried work is what held the work back. When it met
-            // nothing, that stands cleared only if the pass ran its work to the end: one that
-            // stopped at a delay did not, and says nothing of what held the work before. A pass
-            // that was turned back at its first question carried no work, and what it met is the
-            // status refusal above.
-            if let Some(login) = by_login.filter(|_| account_moved) {
-                // The proxy's login is the host's and not an account's: it stopped every request
-                // of the pass, whichever account it was asked for, so the account's change does
-                // not clear it.
-                observed.pass_hold = Some(login);
-            } else if account_moved {
-                // Only the service names a delay, so a delay the pass was given or stopped at
-                // stands whichever account it was asked for. A pass that stopped at a delay with
-                // no hold of its own says nothing of what held the work before. What else the
-                // pass met may have been the token of the account before the change or of the
-                // one after.
-                observed.pass_hold =
-                    match (report.hold.and_then(|hold| hold.retry_after), report.quiet) {
-                        (Some(retry_after), _) => Some(Hold {
-                            code: ErrorCode::ServiceCapacity,
-                            retry_after: Some(retry_after),
-                            offered: report.hold.map(|hold| hold.offered).unwrap_or_default(),
-                            login: None,
-                        }),
-                        (None, Some(owed)) if report.hold.is_some() => Some(Hold {
-                            code: ErrorCode::ServiceCapacity,
-                            retry_after: Some(owed.left),
-                            offered: report.hold.map(|hold| hold.offered).unwrap_or_default(),
-                            login: None,
-                        }),
-                        (None, Some(_)) => observed.pass_hold,
-                        (None, None) => None,
-                    };
-            } else if token_refused {
-                observed.pass_hold = None;
-                observed.token_blocked = true;
-            } else if report.idle.is_none() && (report.hold.is_some() || report.quiet.is_none()) {
-                observed.pass_hold = report.hold;
-            }
-            observed.last_pass = Some(LastPass {
-                steps: report.steps.len() as u64,
-                idle: match &report.idle {
-                    None => None,
-                    Some(Idle::Unready { .. }) => {
-                        Some("this host has not reconciled its backup store")
-                    }
-                    Some(Idle::BackupOff) => Some("backup storage is off for the account"),
-                    Some(Idle::Unavailable { .. }) => Some("the service could not be asked"),
-                },
-            });
-        }
+        self.observed()
+            .note_pass(report, account_moved, token_refused);
         if progressed && report.hold.is_none() {
             backoff.reset();
         }
@@ -685,11 +700,7 @@ impl Shared {
         // A fence is answered whatever the service asked and whatever token the host holds: ending
         // work in flight is what the host owes, and a request that cannot be signed in is not sent.
         if !fenced {
-            let held = {
-                let observed = self.observed();
-                observed.pass_hold.or(observed.status_refusal)
-            };
-            if held.is_some_and(|hold| hold.waits_for_restart()) {
+            if self.observed().waits_for_restart() {
                 // The proxy's login stopped the last pass's request before it was sent, and it
                 // stops every other until the host restarts: no pass is made, so a release that
                 // is still pending is looked at again on its own timer and nothing else is tried.
@@ -1399,5 +1410,108 @@ mod proxy_login_readers {
         }
         let automatic = Hold::of(&ClientError::ProxyLogin(ProxyLoginKind::Needed));
         assert!(remedy_for(automatic).contains("asks again by itself"));
+    }
+
+    fn ordinary() -> Hold {
+        Hold {
+            code: ErrorCode::ServiceCapacity,
+            retry_after: None,
+            offered: Offered::default(),
+            login: None,
+        }
+    }
+
+    fn stopped() -> Hold {
+        Hold::of(&ClientError::ProxyLogin(ProxyLoginKind::Refused))
+    }
+
+    /// A pass that carried work and was held back by `hold`.
+    fn held_work(hold: Hold) -> PassReport {
+        PassReport {
+            hold: Some(hold),
+            ..PassReport::default()
+        }
+    }
+
+    /// A pass that was turned back at its first question by `hold`.
+    fn turned_back(hold: Hold) -> PassReport {
+        PassReport {
+            idle: Some(Idle::Unavailable {
+                reason: "the service could not be asked".to_owned(),
+            }),
+            hold: Some(hold),
+            ..PassReport::default()
+        }
+    }
+
+    /// KR-REQ-10.02: an ordinary hold of the last pass's work does not hide a later stop of the
+    /// proxy's login, in either order, so the carrier makes no pass when work or a freed disk wakes
+    /// it; two ordinary holds wait on their timers as before.
+    #[test]
+    fn kr_req_10_02_an_ordinary_hold_does_not_hide_a_login_stop_in_either_order() {
+        let mut observed = Observed::default();
+        observed.note_pass(&held_work(ordinary()), false, false);
+        assert!(
+            !observed.waits_for_restart(),
+            "an ordinary hold waits on a timer"
+        );
+        observed.note_pass(&turned_back(stopped()), false, false);
+        assert_eq!(
+            observed.pass_hold,
+            Some(ordinary()),
+            "the pass's hold stands"
+        );
+        assert_eq!(observed.status_refusal, Some(stopped()));
+        assert!(
+            observed.waits_for_restart(),
+            "the stop of the later question lasts until the host restarts"
+        );
+
+        let mut observed = Observed::default();
+        observed.note_pass(&held_work(stopped()), false, false);
+        observed.note_pass(&turned_back(ordinary()), false, false);
+        assert_eq!(observed.pass_hold, Some(stopped()));
+        assert_eq!(observed.status_refusal, Some(ordinary()));
+        assert!(
+            observed.waits_for_restart(),
+            "an ordinary refusal of a later question does not end the stop"
+        );
+
+        let mut observed = Observed::default();
+        observed.note_pass(&held_work(ordinary()), false, false);
+        observed.note_pass(&turned_back(ordinary()), false, false);
+        assert!(!observed.waits_for_restart());
+    }
+
+    /// KR-REQ-10.02: a pass that the proxy's login stopped while the host signed in again leaves
+    /// the stop standing, whatever held the work before, and the doctor says the backup waits until
+    /// the host restarts.
+    #[test]
+    fn kr_req_10_02_a_login_stop_in_a_pass_that_spans_a_sign_in_waits_until_the_restart() {
+        let mut observed = Observed::default();
+        observed.note_pass(&held_work(ordinary()), false, false);
+        observed.note_pass(&held_work(stopped()), true, false);
+        assert_eq!(observed.pass_hold, Some(stopped()));
+        assert!(
+            observed.waits_for_restart(),
+            "no timer and no pass until the restart"
+        );
+        let writer = AuthorisationKeyPair::generate()
+            .expect("a writer key")
+            .key_id();
+        let check = DoctorCheck::new(
+            "managed-storage",
+            "This host reaches its managed storage service",
+            DoctorStatus::Warning,
+            hold_sentence(Sentence::new(), observed.pass_hold.expect("a hold"), writer),
+            None,
+        );
+        assert!(
+            check
+                .detail()
+                .contains("backup waits until the host restarts"),
+            "{}",
+            check.detail()
+        );
     }
 }
