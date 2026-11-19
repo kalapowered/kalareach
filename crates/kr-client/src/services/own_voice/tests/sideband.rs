@@ -132,6 +132,11 @@ fn closure() -> String {
     closed_event("expired", None).to_string()
 }
 
+/// A usage event that is told from the others by its number.
+fn event(n: usize) -> String {
+    json!({ "type": "session.usage.updated", "n": n }).to_string()
+}
+
 /// The provider says each of these, one after the other, before the adapter reads any.
 async fn said(provider: &mut WebSocketStream<DuplexStream>, texts: &[String]) {
     for text in texts {
@@ -273,7 +278,7 @@ async fn a_closure_buffered_beside_an_event_is_read_after_a_write_is_cancelled()
 #[tokio::test]
 async fn a_closure_behind_more_messages_than_a_write_reads_ahead_is_not_read_after_it_fails() {
     let (mut sideband, mut provider, gate) = connected().await;
-    let mut texts = vec![usage(); 300];
+    let mut texts: Vec<String> = (0..300).map(event).collect();
     texts.push(closure());
     said(&mut provider, &texts).await;
     gate.set(Writes::Fail);
@@ -281,8 +286,8 @@ async fn a_closure_behind_more_messages_than_a_write_reads_ahead_is_not_read_aft
     for n in 0..256 {
         assert_eq!(
             sideband.next().await,
-            SocketRead::Text(usage()),
-            "message {n} was read ahead"
+            SocketRead::Text(event(n)),
+            "message {n} was read ahead, in the order it came"
         );
     }
     assert_eq!(
@@ -474,6 +479,54 @@ async fn a_ping_read_ahead_by_a_write_is_answered_with_the_write() {
         matches!(text, Some(Some(Ok(ref message))) if message.as_text() == Some("{}")),
         "the text came after it"
     );
+}
+
+/// The provider sends distinct events, a valid closure and a closing frame before the adapter
+/// writes: the write is refused, and what was read ahead is handed on in the order it came, with
+/// the end last.
+#[tokio::test]
+async fn events_a_closure_and_a_closing_frame_read_ahead_are_handed_on_in_order() {
+    let (mut sideband, mut provider, _gate) = connected().await;
+    let mut texts: Vec<String> = (0..3).map(event).collect();
+    texts.push(closure());
+    said(&mut provider, &texts).await;
+    provider
+        .send(Message::close(None, ""))
+        .await
+        .expect("the provider closes");
+    assert!(
+        !sideband.send("{}".to_owned()).await,
+        "a socket the provider closed takes no write"
+    );
+    for (n, text) in texts.iter().enumerate() {
+        assert_eq!(
+            sideband.next().await,
+            SocketRead::Text(text.clone()),
+            "message {n}, in the order it came"
+        );
+    }
+    assert_eq!(
+        sideband.next().await,
+        SocketRead::Closed,
+        "the closing frame is the last"
+    );
+}
+
+/// Events come before a write that passes, and others after it: all are handed on in the order
+/// they came.
+#[tokio::test]
+async fn events_before_and_after_a_write_that_passes_are_handed_on_in_order() {
+    let (mut sideband, mut provider, _gate) = connected().await;
+    said(&mut provider, &[event(0), event(1)]).await;
+    assert!(sideband.send("{}".to_owned()).await, "the write passed");
+    said(&mut provider, &[event(2), event(3)]).await;
+    for n in 0..4 {
+        assert_eq!(
+            sideband.next().await,
+            SocketRead::Text(event(n)),
+            "message {n}, in the order it came"
+        );
+    }
 }
 
 /// An event, a Ping and a valid closure are on the connection when a write fails before any is
