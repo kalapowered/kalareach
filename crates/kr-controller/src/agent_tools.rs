@@ -797,7 +797,9 @@ impl Installer {
     /// Refuses an installation whose recorded place is not the place now: the skills folder, the
     /// document, the entry's key and, for a declared word, the entry it wrote. One rule for every
     /// word. A compiled word's entry follows this host's own executable, so its digest is not part
-    /// of its place.
+    /// of its place. The two places are compared by their exact components: a spelling that
+    /// differs only in case is another place, because the record names the files it wrote under
+    /// one spelling, and a repair under the other would write files no record names.
     fn moved_place(
         &self,
         params: &AgentToolsParams,
@@ -857,13 +859,12 @@ impl Installer {
             (Some(_), None) => before_its_entry,
             (None, Some(_)) => false,
             (Some(now), Some(then)) => {
-                same_place(Path::new(&now.0), Path::new(&then.0))
+                Path::new(&now.0) == Path::new(&then.0)
                     && now.1 == then.1
                     && (!declared_word || now.2 == then.2)
             }
         };
-        if same_document && same_place(Path::new(&declared_root), Path::new(&record.manifest.root))
-        {
+        if same_document && Path::new(&declared_root) == Path::new(&record.manifest.root) {
             return None;
         }
         let place = |root: &str, document: Option<&(String, String, Digest256)>| match document {
@@ -2773,11 +2774,12 @@ fn names_path(recorded: &str, path: &Path) -> bool {
     same_place(Path::new(recorded), path)
 }
 
-/// Whether two paths are one place: the same components, ASCII case ignored, for the six compiled
-/// words and the declared ones alike. On a file system that tells `Mcp.json` from `mcp.json` this
-/// takes two places for one: the host then refuses more than it must (a document another record
-/// holds under the other spelling is not written into, a record under one spelling is a moved
-/// place under the other), and never writes where a record or a claim stands.
+/// Whether two paths are one place for a claim: the same components, ASCII case ignored, for the
+/// six compiled words and the declared ones alike. On a file system that tells `Mcp.json` from
+/// `mcp.json` this takes two places for one, and the host then refuses more than it must: a
+/// document another record holds under the other spelling is not written into. It decides
+/// refusals only, never what is written or whose a file is: the move check compares places by
+/// their exact components.
 fn same_place(first: &Path, second: &Path) -> bool {
     let folded = |path: &Path| -> Vec<String> {
         path.components()
@@ -4246,6 +4248,96 @@ mod tests {
             "{:?}",
             status.drift
         );
+    }
+
+    /// KR-REQ-11.01: a declaration whose place differs from the record's only in ASCII case is a
+    /// moved place, for the skills folder and for the document alike. The record names the files
+    /// under one spelling, and a repair under the other, on a file system that tells the
+    /// spellings apart, would write files no record names. The installation is refused by the
+    /// moved-place sentence before it writes anything, and the files and the record stay as they
+    /// were.
+    #[cfg(unix)]
+    #[test]
+    fn a_declaration_that_changes_only_the_case_of_a_place_is_a_moved_place() {
+        // Whether this file system tells `probe` from `PROBE`: where it does not, the other
+        // spelling is the same folder, and that nothing is made under it cannot be asserted.
+        let tells_case_apart = {
+            let probe = Tree::create();
+            std::fs::create_dir(probe.home().join("probe")).expect("a folder");
+            !probe.home().join("PROBE").exists()
+        };
+        if !tells_case_apart {
+            eprintln!(
+                "this file system does not tell ASCII case apart: the case asserts the refusal, \
+                 the files and the record, and not that the other spelling is left unmade"
+            );
+        }
+        let request = params(amp(), InstallScope::User);
+        for (what, folder, document, repairable) in [
+            (
+                "the skills folder, with a file to repair",
+                ".AMP",
+                "mcp.json",
+                true,
+            ),
+            (
+                "the skills folder, with nothing to repair",
+                ".AMP",
+                "mcp.json",
+                false,
+            ),
+            ("the document", ".amp", "MCP.json", false),
+        ] {
+            let tree = Tree::create();
+            let declaring = |folder: &str, document: &str| {
+                tree.installer().with_declaration(
+                    Some(declared(
+                        Some(json!({
+                            "path": [folder, document], "format": "json_command_args", "shared": false
+                        })),
+                        &[folder, "skills"],
+                    )),
+                    Vec::new(),
+                )
+            };
+            declaring(".amp", "mcp.json")
+                .install(&request)
+                .expect("installs");
+            if repairable {
+                std::fs::remove_file(tree.home().join(".amp/skills/kalareach-contact/TOOLS.md"))
+                    .expect("a file is missing");
+            }
+            let state = || {
+                (
+                    files_under(&tree.home()),
+                    format!(
+                        "{:?}",
+                        declaring(".amp", "mcp.json")
+                            .recorded(&request)
+                            .expect("reads")
+                    ),
+                )
+            };
+            let before = state();
+            let refused = declaring(folder, document)
+                .install(&request)
+                .expect_err(what);
+            let ControllerError::InvalidArgument(said) = &refused else {
+                panic!("{what}: a refusal by name: {refused}");
+            };
+            assert!(
+                said.contains("the record of amp at user scope names")
+                    && said.contains("and the package now declares"),
+                "{what}: {said}"
+            );
+            assert!(state() == before, "{what}: the files and the record stay");
+            if tells_case_apart && folder != ".amp" {
+                assert!(
+                    !tree.home().join(folder).exists(),
+                    "{what}: nothing is made under the other spelling"
+                );
+            }
+        }
     }
 
     /// A record of version 1 and one of version 2 are read through one reader, as the same shape.
