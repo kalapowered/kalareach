@@ -1524,6 +1524,61 @@ mod proxy_login_readers {
         );
     }
 
+    /// A carrier's shared state with nothing owed, over a host that is signed in to nothing.
+    fn shared() -> (Shared, tempfile::TempDir) {
+        let runtime = tempfile::tempdir().expect("a runtime directory");
+        let binding = crate::backup::binding::Binding::unbound();
+        let account = Arc::new(HostAccount::new(
+            Arc::new(kr_crypto::store::MemoryStore::default()),
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+            runtime.path(),
+            Err(kr_protocol::host_account::SignInUnavailable::NotUsable),
+            None,
+        ));
+        let origin = GatewayOrigin::new("https://storage.example").expect("an origin");
+        let shared = Shared {
+            storage: Arc::new(kr_client::services::NullService),
+            account: account.bound_tokens_for(origin.as_str(), Arc::clone(&binding)),
+            sign_in: account,
+            binding,
+            origin: origin.as_str().to_owned(),
+            writer_key_id: AuthorisationKeyPair::generate()
+                .expect("a writer key")
+                .key_id(),
+            signals: Arc::new(BackupSignals::default()),
+            observed: Mutex::default(),
+            quiet: Arc::new(Quiet::new(crate::testing::HeldTimer::automatic())),
+            passes: tokio::sync::watch::channel(0).0,
+            begun: tokio::sync::watch::channel(0).0,
+            #[cfg(feature = "testing")]
+            settled: tokio::sync::watch::channel(false).0,
+        };
+        (shared, runtime)
+    }
+
+    /// KR-REQ-10.02: a pass that the proxy's login stopped while the host signed in again waits for
+    /// work, a fence or a person and asks for no token check, and a pass held by an ordinary hold
+    /// over the same sign-in looks at the token again soon.
+    #[test]
+    fn kr_req_10_02_a_login_stop_in_a_pass_that_spans_a_sign_in_asks_for_no_token_check() {
+        let (shared, _runtime) = shared();
+        let mut backoff = Backoff::default();
+        assert_eq!(
+            shared.absorb(&held_work(stopped()), true, false, &mut backoff),
+            Wait::Signals,
+            "no timer mends the stop, whichever account it was asked for"
+        );
+        assert!(shared.observed().waits_for_restart());
+        assert_eq!(
+            shared.absorb(&held_work(ordinary()), true, false, &mut backoff),
+            Wait::Timed {
+                duration: TOKEN_CHECK,
+                wakeable: true
+            },
+            "an ordinary hold of a pass that spans a sign-in looks at the token again soon"
+        );
+    }
+
     /// KR-REQ-10.02: a hold that the proxy's login stopped and that a person would also have to
     /// mend is not the token to wait for: no token check is asked for, and the hold stands until
     /// the host restarts. A hold that only a person can mend is still the token's, as before.
