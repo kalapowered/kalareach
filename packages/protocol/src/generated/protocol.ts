@@ -12728,8 +12728,8 @@ export interface NetworkSelection {
   /**
    * The HTTP proxy this host's connections to services go through, as an absolute `http` or
    * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay
-   * connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous,
-   * delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail server), the
+   * connection, relay latency probe, captive-portal check (not sent while this host holds a
+   * login for the proxy) and Pkarr servers, the rendezvous, delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail server), the
    * managed voice broker and account service, uploads of backups to the managed storage
    * service, the authority feed, the model's files, and plugin repositories. Nothing on that
    * list goes around it, so an address it cannot reach fails, and a daemon that started over
@@ -12738,8 +12738,9 @@ export interface NetworkSelection {
    * address discovery (which connects directly to the relays over UDP to learn this host's
    * public address) and port mapper, local discovery and the Mainline DHT where those are
    * selected, and the Git operations an owner asks for do not use it. It is this machine's
-   * own choice: no invitation or host bundle carries it. It names no user and no password,
-   * because a proxy that needs credentials is not supported.
+   * own choice: no invitation or host bundle carries it. It names no user and no password: a
+   * login the proxy asks for is stored with `kr host network --proxy-login
+   * --proxy-credential-file <file>`.
    */
   proxy_url?: string | null
   /**

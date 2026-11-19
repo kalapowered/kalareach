@@ -2598,8 +2598,8 @@ pub mod configuration {
         pub mainline_dht: Nullable<bool>,
         /// The HTTP proxy this host's connections to services go through, as an absolute `http` or
         /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay
-        /// connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous,
-        /// delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail server), the
+        /// connection, relay latency probe, captive-portal check (not sent while this host holds a
+        /// login for the proxy) and Pkarr servers, the rendezvous, delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail server), the
         /// managed voice broker and account service, uploads of backups to the managed storage
         /// service, the authority feed, the model's files, and plugin repositories. Nothing on that
         /// list goes around it, so an address it cannot reach fails, and a daemon that started over
@@ -2608,8 +2608,9 @@ pub mod configuration {
         /// address discovery (which connects directly to the relays over UDP to learn this host's
         /// public address) and port mapper, local discovery and the Mainline DHT where those are
         /// selected, and the Git operations an owner asks for do not use it. It is this machine's
-        /// own choice: no invitation or host bundle carries it. It names no user and no password,
-        /// because a proxy that needs credentials is not supported.
+        /// own choice: no invitation or host bundle carries it. It names no user and no password: a
+        /// login the proxy asks for is stored with `kr host network --proxy-login
+        /// --proxy-credential-file <file>`.
         pub proxy_url: Nullable<String>,
     }
 
@@ -4027,8 +4028,9 @@ pub mod configuration {
          253 characters";
 
     /// What a proxy URL that names a user or a password is refused with.
-    const PROXY_CREDENTIALS: &str =
-        "names a user or a password, and a proxy that needs credentials is not supported";
+    const PROXY_CREDENTIALS: &str = "names a user name or a password, which a proxy address does not carry: remove them \
+         from the address, then store them with `kr host network --proxy-login \
+         --proxy-credential-file <file>`";
 
     /// Returns what is wrong with a network section, value by value.
     ///
@@ -5367,7 +5369,8 @@ pub mod configuration {
     pub const NETWORK_PROXY_URL: Selection = Selection {
         key: "network.proxy_url",
         about: "the HTTP proxy this host's connections to services go through: the network \
-                endpoint's relay connection, relay latency probe, captive-portal check and Pkarr \
+                endpoint's relay connection, relay latency probe, captive-portal check (not sent \
+                while this host holds a login for the proxy) and Pkarr \
                 servers, the rendezvous, delivery and mail, the managed voice broker and account \
                 service, backups, the authority feed, the mailbox service, the relay lease \
                 service, the model's files and plugin repositories",
@@ -10116,7 +10119,7 @@ mod tests {
     /// KR-REQ-10.02, KR-REQ-26.14: the endpoint's proxy is the document's to choose, and it is
     /// absent unless the document names it. It is an origin: an `https` or `http` scheme and a
     /// canonical authority with nothing after it. A proxy that names a user or a password is
-    /// refused as one that needs credentials, which is not supported, whatever else is wrong with
+    /// refused with the words that say to store the login apart, whatever else is wrong with
     /// it. Every refusal names the key and never repeats the value, and a document that names a
     /// proxy it refuses is not this host's to rewrite. The value is reported where the document
     /// wrote it, as a location.
@@ -10203,8 +10206,7 @@ mod tests {
             );
             assert_eq!(
                 said.iter()
-                    .any(|problem| problem
-                        .ends_with("a proxy that needs credentials is not supported")),
+                    .any(|problem| problem.ends_with("--proxy-credential-file <file>`")),
                 credential,
                 "{refused}: a credential is refused as one: {said:?}"
             );

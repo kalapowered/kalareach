@@ -345,10 +345,10 @@ push gateway, a webhook address or a chat service, a plugin repository, the mode
 managed account service, submits no mail, and uploads no backup, until it starts again over one it
 can use.
 
-The daemon installs no log subscriber, so it writes no iroh log. iroh's relay client logs the proxy
-address, and would log a credential in it, at debug level, from the module
-`iroh_relay::client::tls`. A build that installs a subscriber must hold that module at info or
-above, and a proxy that needs credentials waits for that filter and for a case that shows it.
+The daemon installs no log subscriber, so it writes no iroh log. iroh's relay client logs the
+request it sends to the daemon's loopback forwarder, which holds the forwarder's secret and never the
+login, at debug level, from the module `iroh_relay::client::tls`. A build that installs a subscriber or a
+`log` logger must hold that module at info or above and `iroh::address_lookup::pkarr` at error.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source

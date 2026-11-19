@@ -366,7 +366,7 @@ mod tests {
 
     /// KR-REQ-10.02: a proxy that names a user or a password, a path or another scheme is refused
     /// when the daemon starts, with the key named and the value not repeated. A credential is
-    /// refused as a proxy that needs credentials, which is not supported.
+    /// refused with the words that say to store the login apart.
     #[test]
     fn a_proxy_with_a_credential_a_path_or_another_scheme_is_refused_by_its_key() {
         let secret = "hunter2";
@@ -392,7 +392,7 @@ mod tests {
             assert!(said.contains("network.proxy_url"), "{value}: {said}");
             assert!(!said.contains(secret), "{value}: {said}");
             assert_eq!(
-                said.ends_with("a proxy that needs credentials is not supported"),
+                said.ends_with("--proxy-credential-file <file>`"),
                 credential,
                 "{value}: {said}"
             );
