@@ -5225,11 +5225,17 @@ async fn kr_req_12_18_the_same_request_answered_twice_is_refused_before_its_mark
         "refused before its marker"
     );
 
-    // The first identifier sent again is answered from the retained receipt and written nowhere.
-    let Outcome::Error(again) = send(&mut client, again_same_id).await else {
-        panic!("a retained unknown receipt is returned as the same outcome");
+    // The first identifier sent again is answered with its receipt as it stands, which still
+    // reads unknown, and is written nowhere.
+    let outcome = send(&mut client, again_same_id).await;
+    let Outcome::Ok(value) = outcome else {
+        panic!("the retained receipt answers a repeated identity: {outcome:?}");
     };
-    assert_eq!(again.code, ErrorCode::OutcomeUnknown);
+    let retained: kr_protocol::receipt::ReceiptResponse = value
+        .to_typed()
+        .expect("what answers a repeated identity is its receipt");
+    assert_eq!(retained.receipt.action_id, action_id);
+    assert_eq!(retained.receipt.state, ReceiptState::Unknown);
     assert_eq!(
         receipt(&mut client, action_id).await.state,
         ReceiptState::Unknown

@@ -231,9 +231,12 @@ async fn kr_req_12_18_an_answer_goes_out_on_the_channel_as_the_applications_verd
             TimestampMs::new(5),
         )
         .await
-        .expect("the answer is admitted and carried")
-        .0;
-    assert_eq!(answered.state, PendingState::Resolved);
+        .expect_err("the answer is carried, and a channel confirms nothing");
+    assert_eq!(answered.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        broker.pending(resource.resource_id).expect("held").state,
+        PendingState::Uncertain
+    );
     assert_eq!(
         channel.next().await,
         Some(recorded["permission"].clone()),
@@ -506,7 +509,7 @@ async fn kr_req_25_01_an_approval_reaches_the_attention_source_from_its_interpre
             TimestampMs::new(5),
         )
         .await
-        .expect("the answer is admitted and carried");
+        .expect_err("the answer is carried, and a channel confirms nothing");
     assert!(
         bound.next().await.is_some(),
         "the verdict reaches the channel"
@@ -527,7 +530,7 @@ async fn kr_req_25_01_an_approval_reaches_the_attention_source_from_its_interpre
     );
     assert_eq!(
         approval_later.last().map(|(state, _, _)| *state),
-        Some(PendingState::Resolved),
+        Some(PendingState::Uncertain),
         "its end is carried"
     );
     assert_eq!(
@@ -1109,7 +1112,7 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_before_its_marker_for_what_it_c
         .expect("the marker is written and the answer goes")
         .settled(TimestampMs::new(6))
         .await
-        .expect("the answer is written");
+        .expect_err("the answer is written, and a channel confirms nothing");
     assert_eq!(
         channel.next().await,
         Some(serde_json::json!({
@@ -1172,7 +1175,7 @@ async fn kr_req_12_18_an_answer_to_an_approval_whose_channel_closed_is_told_it_e
         .expect("the marker is written and the answer goes")
         .settled(TimestampMs::new(6))
         .await
-        .expect("the answer is written");
+        .expect_err("the answer is written, and a channel confirms nothing");
     assert!(channel.next().await.is_some(), "the answer went");
     channel.close().await;
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
@@ -1182,7 +1185,7 @@ async fn kr_req_12_18_an_answer_to_an_approval_whose_channel_closed_is_told_it_e
     );
     assert_eq!(
         settled_as(&broker, resource.resource_id),
-        Some(PendingState::Resolved)
+        Some(PendingState::Uncertain)
     );
 
     let target = respond(2, &resource, "deny").target;
@@ -1611,7 +1614,7 @@ async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_
         .expect("the first answer's marker is written and its verdict goes")
         .settled(TimestampMs::new(7))
         .await
-        .expect("the first verdict is written");
+        .expect_err("the first verdict is written, and a channel confirms nothing");
     let reserved = carried(&broker, reserved, 8).await;
 
     // A second answer after the marker, while the first's verdict is on its way.
@@ -1635,7 +1638,7 @@ async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_
         .submitted(pending)
         .settled(TimestampMs::new(12))
         .await
-        .expect("the first verdict is written");
+        .expect_err("the first verdict is written, and a channel confirms nothing");
     let marker_written = carried(&broker, marker_written, 13).await;
 
     // Eight answers at once, half of them one decision and half the other.
@@ -1651,10 +1654,11 @@ async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_
             let params = respond(2, &third, decision);
             tokio::spawn(async move {
                 start.wait().await;
-                broker
+                let outcome = broker
                     .agent_approval_respond(&caller(), &params, TimestampMs::new(14))
                     .await
-                    .map(|_| decision)
+                    .map(|_| ());
+                (decision, outcome)
             })
         })
         .collect();
@@ -1674,9 +1678,16 @@ async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_
         3,
         "the application read one verdict for each approval, and no second one for any: {written:?}"
     );
+    // The one that was carried ends as an outcome nobody can establish, as a channel's answer
+    // does; every other answer is refused as an answered approval.
     let winners: Vec<&str> = outcomes
         .iter()
-        .filter_map(|outcome| outcome.as_ref().ok().copied())
+        .filter(|(_, outcome)| {
+            outcome
+                .as_ref()
+                .is_err_and(|error| error.code() == ErrorCode::OutcomeUnknown)
+        })
+        .map(|(decision, _)| *decision)
         .collect();
     assert_eq!(
         winners.len(),
@@ -1698,7 +1709,12 @@ async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_
             late.as_ref()
                 .expect_err("an answer that came second is refused")
         })
-        .chain(outcomes.iter().filter_map(|outcome| outcome.as_ref().err()))
+        .chain(
+            outcomes
+                .iter()
+                .filter_map(|(_, outcome)| outcome.as_ref().err())
+                .filter(|error| error.code() != ErrorCode::OutcomeUnknown),
+        )
     {
         assert_eq!(
             refusal.code(),
@@ -1710,7 +1726,7 @@ async fn kr_req_12_18_answers_racing_for_one_relayed_approval_carry_one_verdict_
     for resource in [&first, &second, &third] {
         assert_eq!(
             settled_as(&broker, resource.resource_id),
-            Some(PendingState::Resolved)
+            Some(PendingState::Uncertain)
         );
     }
 }
@@ -1892,9 +1908,8 @@ async fn kr_req_12_18_closing_under_a_channels_identifier_leaves_the_channel_ser
             TimestampMs::new(5),
         )
         .await
-        .expect("the answer still goes out on the channel")
-        .0;
-    assert_eq!(answered.state, PendingState::Resolved);
+        .expect_err("the answer still goes out on the channel, which confirms nothing");
+    assert_eq!(answered.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(
         channel.next().await,
         Some(recorded["permission"].clone()),
@@ -1911,9 +1926,9 @@ async fn kr_req_12_18_closing_under_a_channels_identifier_leaves_the_channel_ser
 
 /// KR-REQ-12.09: an approval answered on a Channels channel records the provenance it reached the
 /// application by. The answer goes out through the host's own authenticated bridge, to a forwarder
-/// that nothing in the application acknowledges, so the result names a bridge response. The control
-/// is the typed route: an answer over a gateway connection is a typed result (kr-worker's gateway
-/// suite).
+/// that nothing in the application acknowledges, so the admission records a bridge response, and
+/// the answer ends as an outcome nobody can establish. The control is the typed route: an answer
+/// over a gateway connection is a typed result (kr-worker's gateway suite).
 #[tokio::test]
 async fn kr_req_12_09_a_channels_answer_records_the_authenticated_bridge_it_went_by() {
     let recorded: serde_json::Value =
@@ -1935,20 +1950,28 @@ async fn kr_req_12_09_a_channels_answer_records_the_authenticated_bridge_it_went
     .await;
     let resource = relayed(&broker, 2, "abcde").expect("recorded");
 
-    let answered = broker
-        .agent_approval_respond(
+    let admitted = broker
+        .admit_approval(
             &caller(),
             &respond(2, &resource, "allow"),
             TimestampMs::new(5),
         )
-        .await
-        .expect("the answer goes out on the channel")
-        .0;
-    assert_eq!(answered.state, PendingState::Resolved);
+        .expect("the answer is admitted");
     assert_eq!(
-        answered.mutation.provenance,
+        admitted.provenance(),
         ActionProvenance::AuthenticatedHookResponse,
-        "an answer written on a bridge's channel is a bridge response, whatever the application does with it"
+        "an answer written on a bridge's channel is recorded as a bridge response, whatever the application does with it"
+    );
+    let answered = broker
+        .record_approval(&admitted, TimestampMs::new(5))
+        .expect("the marker is written and the answer goes")
+        .settled(TimestampMs::new(5))
+        .await
+        .expect_err("the answer goes out on the channel, which confirms nothing");
+    assert_eq!(answered.code(), ErrorCode::OutcomeUnknown);
+    assert!(
+        channel.next().await.is_some(),
+        "the verdict reaches the channel"
     );
     channel.close().await;
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
@@ -2134,7 +2157,7 @@ async fn kr_req_12_26_an_answer_is_encoded_from_an_offered_decision_for_the_pend
         .into_iter()
         .filter(|event| {
             event.resource_id == resource.resource_id
-                && matches!(event.state, PendingState::Claimed | PendingState::Resolved)
+                && matches!(event.state, PendingState::Claimed | PendingState::Uncertain)
         })
         .map(|event| event.actor_id)
         .collect();
