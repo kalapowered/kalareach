@@ -9124,7 +9124,8 @@ impl WorkerService {
             Method::PluginActionInvoke => {
                 let params: kr_protocol::agent::PluginActionInvokeParams = parse(&mutation.params)?;
                 Self::check_session(session, params.target.subject.session_id)?;
-                // An action that names a pending request answers it, whatever else it is.
+                // A call that names a pending request is held to that request's reach, whatever
+                // the action is; that the action answers one is checked on its route.
                 match params.resource_id.as_ref() {
                     Some(resource_id) => self.check_decision_reached(caller, *resource_id),
                     None => Ok(()),
@@ -9416,6 +9417,13 @@ impl WorkerService {
                 // here, before the marker. An action nobody registered is refused below for that.
                 if let Some(registered) = registered.as_ref() {
                     Self::check_action_rights(caller, &params.action, &registered.rights)?;
+                    // A call names a pending request only when its action answers one. The rule
+                    // stands here, before a route is chosen, because the broker's own action
+                    // check is reached by every route but the presentation one: it runs on the
+                    // write path, and a presentation action is a read. One call here covers the
+                    // presentation, answer, host cancellation and component routes, on both passes
+                    // of a component action, before any of them reads the resource.
+                    crate::broker::Broker::check_resource_named(registered, &params)?;
                 }
                 // An action that answers a pending request through the connector table's decision
                 // destination is admitted as that answer: the transaction an approval answer
