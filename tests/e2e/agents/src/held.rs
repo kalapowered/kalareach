@@ -2143,6 +2143,75 @@ mod tests {
     use super::*;
     use crate::account::run_files_holding;
 
+    /// Calls `attempt` again, up to `attempts` calls in all with `pause` between them, while the
+    /// system refuses it because the program it runs is open for writing, and for no other error.
+    fn retried_while_busy<T>(
+        attempts: u32,
+        pause: std::time::Duration,
+        mut attempt: impl FnMut() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let mut tried = 1;
+        loop {
+            match attempt() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && tried < attempts =>
+                {
+                    tried += 1;
+                    std::thread::sleep(pause);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Starts a copy of this test program that was written a moment ago. Another test's `fork` can
+    /// still hold the copy open for writing until that child has run its own `exec`, and the
+    /// system then refuses the start as busy; it is tried again a bounded number of times.
+    fn starts_the_copy(
+        command: &mut std::process::Command,
+    ) -> std::io::Result<std::process::Child> {
+        retried_while_busy(100, std::time::Duration::from_millis(50), || {
+            command.spawn()
+        })
+    }
+
+    /// A refusal as busy is tried again and nothing else is, and the number of tries is bounded.
+    #[test]
+    fn a_start_refused_as_busy_is_tried_again_a_bounded_number_of_times_and_no_other_error_is() {
+        let pause = std::time::Duration::from_millis(1);
+        let mut calls = 0;
+        let started = retried_while_busy(5, pause, || {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::ErrorKind::ExecutableFileBusy.into())
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(started.expect("the third call starts it"), 3);
+        let mut calls = 0;
+        let refused: std::io::Result<()> = retried_while_busy(5, pause, || {
+            calls += 1;
+            Err(std::io::ErrorKind::ExecutableFileBusy.into())
+        });
+        assert_eq!(calls, 5, "the tries are bounded");
+        assert_eq!(
+            refused.expect_err("still busy").kind(),
+            std::io::ErrorKind::ExecutableFileBusy
+        );
+        let mut calls = 0;
+        let other: std::io::Result<()> = retried_while_busy(5, pause, || {
+            calls += 1;
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        });
+        assert_eq!(calls, 1, "another error is returned at once");
+        assert_eq!(
+            other.expect_err("denied").kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
     /// A directory of this test's own.
     fn scratch(name: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!("kr-held-{name}-{}", kr_ipc::new_uuid()));
@@ -2493,7 +2562,8 @@ mod tests {
         let start = |file: &str, name: &str| {
             let path = directory.join(file);
             std::fs::copy(&program, &path).expect("a copy");
-            std::process::Command::new(&path)
+            let mut command = std::process::Command::new(&path);
+            command
                 .arg0(name)
                 .args([
                     "--ignored",
@@ -2501,9 +2571,8 @@ mod tests {
                     "held::tests::a_process_that_waits_to_be_listed",
                 ])
                 .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("it starts")
+                .stderr(std::process::Stdio::null());
+            starts_the_copy(&mut command).expect("it starts")
         };
         let mut children = [
             start("codex", "unrelated-name"),
@@ -2560,16 +2629,16 @@ mod tests {
         let codex = directory.join("codex");
         std::fs::copy(std::env::current_exe().expect("this program"), &codex)
             .expect("a program called codex");
-        let mut running = std::process::Command::new(&codex)
+        let mut command = std::process::Command::new(&codex);
+        command
             .args([
                 "--ignored",
                 "--exact",
                 "held::tests::a_process_that_waits_to_be_listed",
             ])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("it starts");
+            .stderr(std::process::Stdio::null());
+        let mut running = starts_the_copy(&mut command).expect("it starts");
         let id = running.id();
         let started = std::time::Instant::now();
         let seen = loop {
