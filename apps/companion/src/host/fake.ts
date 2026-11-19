@@ -734,6 +734,8 @@ export interface FakeHostControls {
   refuseVoiceStart(reason: string | null): void
   /** Has the host answer the next start with a typed `creation_unknown`, which the device keeps as a notice. */
   makeVoiceStartUnconfirmed(): void
+  /** Removes the start notices the device keeps, as it does when the host's hold takes a start. */
+  removeOwedVoiceStarts(): void
   /**
    * Moves the managed rate on, as an operator deploying a new one does.
    *
@@ -3816,6 +3818,9 @@ export function fakeHost(
     },
     settleOwedVoice() {
       voice.owed = voice.owed.filter((owed) => owed.kind !== 'revocation')
+    },
+    removeOwedVoiceStarts() {
+      voice.owed = voice.owed.filter((owed) => !owed.kind.startsWith('start_'))
     },
     setPairing(change) {
       publishPairing(change)
