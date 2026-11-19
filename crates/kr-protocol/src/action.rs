@@ -198,26 +198,20 @@ pub const SUBJECT_DOMAIN: &str = "kr-action-subject/1";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SubjectSelectors {
     /// Parameter keys that name what the mutation acts on.
-    pub params: &'static [&'static str],
-    /// Precondition keys that name it.
     ///
     /// No method selects by a precondition. A precondition guards when a request may run, and the
     /// worker refuses any key it does not evaluate, so identity that a subject needs has to travel
     /// as a parameter: `agent.approval.respond` names the approval it answers by `resource_id`.
-    pub expected: &'static [&'static str],
+    pub params: &'static [&'static str],
 }
 
 impl SubjectSelectors {
     /// A method whose target is the whole of what it selects.
-    const TARGET_ONLY: Self = Self {
-        params: &[],
-        expected: &[],
-    };
+    const TARGET_ONLY: Self = Self { params: &[] };
 
     /// A method that acts on one attachment of the target session.
     const ATTACHMENT: Self = Self {
         params: &["attachment_id"],
-        expected: &[],
     };
 }
 
@@ -250,7 +244,6 @@ pub fn subject_selectors(method: Option<crate::method::Method>) -> SubjectSelect
         ) => SubjectSelectors::ATTACHMENT,
         Some(Method::ActionCancel) => SubjectSelectors {
             params: &["action_id"],
-            expected: &[],
         },
         // An answer is to one pending resource, and `resource_id` is the parameter that names it.
         // Two answers to two approvals of one session are two subjects, so an uncertain answer to
@@ -258,7 +251,6 @@ pub fn subject_selectors(method: Option<crate::method::Method>) -> SubjectSelect
         // whichever option they choose.
         Some(Method::AgentApprovalRespond) => SubjectSelectors {
             params: &["resource_id"],
-            expected: &[],
         },
         _ => SubjectSelectors::TARGET_ONLY,
     }
@@ -314,9 +306,12 @@ pub fn subject_digest(request: &MutationRequest) -> Result<Digest256, CborError>
 pub fn subject_signing_value(request: &MutationRequest) -> Result<CanonicalValue, CborError> {
     let selectors = subject_selectors(request.method.method());
     let mut covered = CanonicalMap::new();
+    // No method's subject reads a precondition, so this is always empty. The member stays in the
+    // signed input: it is part of what `SUBJECT_DOMAIN` covers, and an uncertain outcome stored
+    // under that input holds back its retry only while the input is the same.
     covered.insert(
         "expected".to_owned(),
-        selected(request.expected.as_value(), selectors.expected)?,
+        CanonicalValue::Map(CanonicalMap::new()),
     )?;
     covered.insert(
         "method".to_owned(),
@@ -1235,6 +1230,57 @@ mod tests {
         assert_ne!(
             subject_digest(&decision("deny")).expect("a digest"),
             subject_digest(&other_session).expect("a digest")
+        );
+    }
+
+    #[test]
+    fn the_subject_input_keeps_an_empty_preconditions_member() {
+        // An uncertain outcome is stored under the digest of this input and holds back its retry
+        // while a later request digests to the same bytes. No method's subject reads a
+        // precondition, but the member stays in the input, empty, whatever the request carries.
+        let mut request = mutation(Method::SessionClose, ParamsValue::empty());
+        let mut guard = kr_cbor::CanonicalMap::new();
+        guard
+            .insert(
+                "session_state".to_owned(),
+                kr_cbor::CanonicalValue::text("live"),
+            )
+            .expect("a guard");
+        request.expected = ParamsValue::new(kr_cbor::CanonicalValue::Map(guard));
+        let mut covered = kr_cbor::CanonicalMap::new();
+        covered
+            .insert(
+                "expected".to_owned(),
+                kr_cbor::CanonicalValue::Map(kr_cbor::CanonicalMap::new()),
+            )
+            .expect("a key");
+        covered
+            .insert(
+                "method".to_owned(),
+                kr_cbor::to_canonical_value(&request.method).expect("encodes"),
+            )
+            .expect("a key");
+        covered
+            .insert(
+                "method_version".to_owned(),
+                kr_cbor::to_canonical_value(&request.method_version).expect("encodes"),
+            )
+            .expect("a key");
+        covered
+            .insert(
+                "params".to_owned(),
+                kr_cbor::CanonicalValue::Map(kr_cbor::CanonicalMap::new()),
+            )
+            .expect("a key");
+        covered
+            .insert(
+                "target".to_owned(),
+                kr_cbor::to_canonical_value(&request.target).expect("encodes"),
+            )
+            .expect("a key");
+        assert_eq!(
+            subject_signing_value(&request).expect("a value"),
+            signing_value(SUBJECT_DOMAIN, vec![kr_cbor::CanonicalValue::Map(covered)]),
         );
     }
 
