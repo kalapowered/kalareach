@@ -241,15 +241,18 @@ fn thinking() -> VoiceContextFrame {
 async fn a_closure_buffered_beside_an_event_is_read_after_a_write_that_fails() {
     let (mut sideband, mut provider, gate) = connected().await;
     said(&mut provider, &[usage(), closure()]).await;
-    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(usage()))
+    );
     gate.set(Writes::Fail);
     assert!(!sideband.send("{}".to_owned()).await, "the write failed");
     assert_eq!(
-        sideband.next().await,
-        SocketRead::Text(closure()),
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
         "the closure that was buffered when the write began is read"
     );
-    assert_eq!(sideband.next().await, SocketRead::Closed);
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
 }
 
 /// A write that never finishes is cancelled with its frame queued in the library, and the
@@ -258,7 +261,10 @@ async fn a_closure_buffered_beside_an_event_is_read_after_a_write_that_fails() {
 async fn a_closure_buffered_beside_an_event_is_read_after_a_write_is_cancelled() {
     let (mut sideband, mut provider, gate) = connected().await;
     said(&mut provider, &[usage(), closure()]).await;
-    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(usage()))
+    );
     gate.set(Writes::Hold);
     assert!(
         sideband.send("{}".to_owned()).now_or_never().is_none(),
@@ -266,11 +272,57 @@ async fn a_closure_buffered_beside_an_event_is_read_after_a_write_is_cancelled()
     );
     gate.set(Writes::Fail);
     assert_eq!(
-        sideband.next().await,
-        SocketRead::Text(closure()),
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
         "the closure that was buffered when the write began is read"
     );
-    assert_eq!(sideband.next().await, SocketRead::Closed);
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
+}
+
+/// An event is read, and a valid closure then comes before a write that fails: the closure is
+/// read, and then the socket is closed.
+#[tokio::test]
+async fn a_closure_that_came_after_the_last_read_is_read_after_a_write_that_fails() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    said(&mut provider, &[usage()]).await;
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(usage()))
+    );
+    said(&mut provider, &[closure()]).await;
+    gate.set(Writes::Fail);
+    assert!(!sideband.send("{}".to_owned()).await, "the write failed");
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
+        "the closure that was on the socket when the write began is read"
+    );
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
+}
+
+/// The same for a write that never finishes and is cancelled with its frame queued, and a
+/// connection that then fails.
+#[tokio::test]
+async fn a_closure_that_came_after_the_last_read_is_read_after_a_write_is_cancelled() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    said(&mut provider, &[usage()]).await;
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(usage()))
+    );
+    said(&mut provider, &[closure()]).await;
+    gate.set(Writes::Hold);
+    assert!(
+        sideband.send("{}".to_owned()).now_or_never().is_none(),
+        "the write is held"
+    );
+    gate.set(Writes::Fail);
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
+        "the closure that was on the socket when the write began is read"
+    );
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
 }
 
 /// The read ahead stops after 256 messages: a closure behind more of them is not read after a
@@ -285,14 +337,14 @@ async fn a_closure_behind_more_messages_than_a_write_reads_ahead_is_not_read_aft
     assert!(!sideband.send("{}".to_owned()).await, "the write failed");
     for n in 0..256 {
         assert_eq!(
-            sideband.next().await,
-            SocketRead::Text(event(n)),
+            sideband.next().now_or_never(),
+            Some(SocketRead::Text(event(n))),
             "message {n} was read ahead, in the order it came"
         );
     }
     assert_eq!(
-        sideband.next().await,
-        SocketRead::Closed,
+        sideband.next().now_or_never(),
+        Some(SocketRead::Closed),
         "what is behind the messages read ahead went with the failed write"
     );
 }
@@ -375,17 +427,20 @@ async fn a_call_whose_write_is_cancelled_beside_a_closure_on_the_socket_ends_as_
 async fn a_closure_behind_a_ping_is_read_after_a_write_that_fails() {
     let (mut sideband, mut provider, gate) = connected().await;
     said(&mut provider, &[usage()]).await;
-    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(usage()))
+    );
     pinged(&mut provider).await;
     said(&mut provider, &[closure()]).await;
     gate.set(Writes::Fail);
     assert!(!sideband.send("{}".to_owned()).await, "the write failed");
     assert_eq!(
-        sideband.next().await,
-        SocketRead::Text(closure()),
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
         "the closure behind the Ping, which was on the connection when the write began, is read"
     );
-    assert_eq!(sideband.next().await, SocketRead::Closed);
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
 }
 
 /// The same, on a connection whose writes take several buffers at once.
@@ -393,17 +448,20 @@ async fn a_closure_behind_a_ping_is_read_after_a_write_that_fails() {
 async fn a_closure_behind_a_ping_is_read_after_a_write_that_fails_on_vectored_writes() {
     let (mut sideband, mut provider, gate) = connected_vectored().await;
     said(&mut provider, &[usage()]).await;
-    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(usage()))
+    );
     pinged(&mut provider).await;
     said(&mut provider, &[closure()]).await;
     gate.set(Writes::Fail);
     assert!(!sideband.send("{}".to_owned()).await, "the write failed");
     assert_eq!(
-        sideband.next().await,
-        SocketRead::Text(closure()),
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
         "the closure behind the Ping, which was on the connection when the write began, is read"
     );
-    assert_eq!(sideband.next().await, SocketRead::Closed);
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
 }
 
 /// A read that waits is cancelled with the Pong of a Ping queued in the library, and a closure
@@ -422,11 +480,11 @@ async fn a_closure_after_a_cancelled_read_that_left_a_pong_queued_is_read_after_
     gate.set(Writes::Fail);
     assert!(!sideband.send("{}".to_owned()).await, "the write failed");
     assert_eq!(
-        sideband.next().await,
-        SocketRead::Text(closure()),
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
         "the closure that came before the write is read"
     );
-    assert_eq!(sideband.next().await, SocketRead::Closed);
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
 }
 
 /// An event, a Ping and a valid closure are on the connection when writes already fail, and no
@@ -438,13 +496,16 @@ async fn a_closure_behind_a_ping_is_read_by_reads_alone_while_writes_fail() {
     pinged(&mut provider).await;
     said(&mut provider, &[closure()]).await;
     gate.set(Writes::Fail);
-    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
     assert_eq!(
-        sideband.next().await,
-        SocketRead::Text(closure()),
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(usage()))
+    );
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(closure())),
         "the closure behind the Ping is read"
     );
-    assert_eq!(sideband.next().await, SocketRead::Closed);
+    assert_eq!(sideband.next().now_or_never(), Some(SocketRead::Closed));
 }
 
 /// A read that finds a Ping and an event answers the Ping at once, with no write made.
@@ -453,7 +514,10 @@ async fn a_ping_read_with_an_event_is_answered_before_any_write() {
     let (mut sideband, mut provider, _gate) = connected().await;
     pinged(&mut provider).await;
     said(&mut provider, &[usage()]).await;
-    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    assert_eq!(
+        sideband.next().now_or_never(),
+        Some(SocketRead::Text(usage()))
+    );
     assert!(
         is_pong(provider.next().now_or_never()),
         "the Pong went out with the read"
@@ -500,14 +564,14 @@ async fn events_a_closure_and_a_closing_frame_read_ahead_are_handed_on_in_order(
     );
     for (n, text) in texts.iter().enumerate() {
         assert_eq!(
-            sideband.next().await,
-            SocketRead::Text(text.clone()),
+            sideband.next().now_or_never(),
+            Some(SocketRead::Text(text.clone())),
             "message {n}, in the order it came"
         );
     }
     assert_eq!(
-        sideband.next().await,
-        SocketRead::Closed,
+        sideband.next().now_or_never(),
+        Some(SocketRead::Closed),
         "the closing frame is the last"
     );
 }
@@ -522,8 +586,8 @@ async fn events_before_and_after_a_write_that_passes_are_handed_on_in_order() {
     said(&mut provider, &[event(2), event(3)]).await;
     for n in 0..4 {
         assert_eq!(
-            sideband.next().await,
-            SocketRead::Text(event(n)),
+            sideband.next().now_or_never(),
+            Some(SocketRead::Text(event(n))),
             "message {n}, in the order it came"
         );
     }
