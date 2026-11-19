@@ -640,8 +640,6 @@ mod tests {
         );
     }
 
-    /// A worker of an installed release names it in every registration, on a line of its own, and
-    /// one outside a store names none.
     /// A registration of a launch whose package declares hook events names the file the launch
     /// wrote, from what the launch gave it, and a launch of a package that declares none names no
     /// file.
@@ -661,6 +659,8 @@ mod tests {
         );
     }
 
+    /// A worker of an installed release names it in every registration, on a line of its own, and
+    /// one outside a store names none.
     #[test]
     fn a_registration_names_the_release_its_worker_runs() {
         let release =
