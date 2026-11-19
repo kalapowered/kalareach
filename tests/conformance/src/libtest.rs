@@ -210,7 +210,8 @@ struct Reading {
 }
 
 /// Whether `line` is a test saying it returned early.
-fn says_early_return(line: &str) -> bool {
+#[must_use]
+pub fn says_early_return(line: &str) -> bool {
     let line = line.trim_start();
     EARLY_RETURN.iter().any(|marker| line.starts_with(marker)) || line.contains(EARLY_RETURN_NAMED)
 }
