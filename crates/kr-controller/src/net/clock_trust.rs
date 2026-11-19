@@ -47,7 +47,7 @@ use kr_protocol::scalars::TimestampMs;
 use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 use kr_worker::action::time::DISCONTINUITY_TOLERANCE;
 
-use super::devices::{CommitFn, DeviceDirectory, ObservedUtc, establish_clock_in};
+use super::devices::{DeviceDirectory, ObservedUtc, establish_clock_in};
 use crate::error::{ControllerError, Result};
 use crate::grants::policy::UtcFloor;
 use crate::registry::end_clock_continuity;
@@ -808,13 +808,15 @@ impl ClockTrust {
     /// because it would have to take this boundary to be recorded at all, and success is reported
     /// only once the record says it.
     ///
-    /// The transaction is one immediate transaction on the device directory's connection, and it
-    /// commits inside `guarded` ([`DeviceDirectory::guarded_transaction`]). `during` runs in it,
-    /// after the trust and continuity rows: whatever must be written with the establishment
-    /// (the spending of the owner's confirmation, the action's record) goes there, and what it
-    /// refuses rolls the establishment back with it. Memory changes only after the commit: the
-    /// clock state here, the floor's continuity flag and the confirmation the floor shows the
-    /// workers.
+    /// The transaction is one immediate transaction on the device directory's connection. The
+    /// caller holds whatever must stay true to its commit (the connection's registration, taken
+    /// before this takes the state, [`Controller::pairing_guard`]), and `admission` asks that it
+    /// still does, inside the transaction after the waits for this state and the connection, before
+    /// anything is written. `during` runs in it, after the trust and continuity rows: whatever
+    /// must be written with the establishment (the spending of the owner's confirmation, the
+    /// action's record) goes there, and what it refuses rolls the establishment back with it.
+    /// Memory changes only after the commit: the clock state here, the floor's continuity flag and
+    /// the confirmation the floor shows the workers.
     ///
     /// `during` runs under this state's lock, which cannot be taken twice. It must not call
     /// [`Self::sample`], [`Self::observe`], [`Self::watch`] or anything that reads a grant's
@@ -824,13 +826,13 @@ impl ClockTrust {
     /// # Errors
     ///
     /// Returns an error when the record cannot be written, when no narrow bracket of the clocks
-    /// could be taken (before the transaction, so nothing is spent), and whatever `guarded` and
+    /// could be taken (before the transaction, so nothing is spent), and whatever `admission` and
     /// `during` refuse with. The decision stands, and so does every other record, if it does.
     pub(crate) fn establish_with(
         &self,
         devices: &DeviceDirectory,
         boot: BootEpoch,
-        guarded: &CommitFn,
+        admission: &dyn Fn() -> Result<()>,
         during: impl FnOnce(&rusqlite::Connection, TimestampMs) -> Result<()>,
     ) -> Result<TimestampMs> {
         let mut state = self.held();
@@ -850,7 +852,8 @@ impl ClockTrust {
             return Err(clocks_not_read(true));
         };
         let established = TimestampMs::new(wall_ms);
-        devices.guarded_transaction(guarded, |transaction| {
+        devices.transaction(|transaction| {
+            admission()?;
             establish_clock_in(transaction, established, &self.boot, boot_ms)?;
             end_clock_continuity(transaction, boot, established)?;
             during(transaction, established)
@@ -882,12 +885,7 @@ impl ClockTrust {
     /// Establishes the clock with no confirmation to spend, for a test of the record itself.
     #[cfg(test)]
     pub(crate) fn establish(&self, devices: &DeviceDirectory) -> Result<TimestampMs> {
-        self.establish_with(
-            devices,
-            BootEpoch::new(0),
-            &|commit| commit(),
-            |_, _| Ok(()),
-        )
+        self.establish_with(devices, BootEpoch::new(0), &|| Ok(()), |_, _| Ok(()))
     }
 }
 
@@ -2565,7 +2563,7 @@ mod tests {
         pause.arm(3);
         let error = run
             .trust
-            .establish_with(&devices, BootEpoch::new(0), &|commit| commit(), |_, _| {
+            .establish_with(&devices, BootEpoch::new(0), &|| Ok(()), |_, _| {
                 spent.store(true, Ordering::SeqCst);
                 Ok(())
             })
@@ -2578,7 +2576,7 @@ mod tests {
         assert_eq!(devices.clock_record().expect("the record"), record);
         assert!(!proven(&run, &devices), "the distrust stands");
         run.trust
-            .establish_with(&devices, BootEpoch::new(0), &|commit| commit(), |_, _| {
+            .establish_with(&devices, BootEpoch::new(0), &|| Ok(()), |_, _| {
                 spent.store(true, Ordering::SeqCst);
                 Ok(())
             })
@@ -2763,9 +2761,7 @@ mod tests {
         let peak = machine.wall() + 30_000;
         pause.arm(3);
         run.trust
-            .establish_with(&devices, BootEpoch::new(0), &|commit| commit(), |_, _| {
-                Ok(())
-            })
+            .establish_with(&devices, BootEpoch::new(0), &|| Ok(()), |_, _| Ok(()))
             .expect_err("no reading is taken");
         assert_eq!(floor.get(), peak);
     }
