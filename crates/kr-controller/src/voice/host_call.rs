@@ -191,6 +191,8 @@ struct SendProgress {
     of: u32,
     appended: u32,
     unconfirmed: u32,
+    /// Whether an append is written and not yet answered.
+    in_flight: bool,
 }
 
 /// The stop a call's end is for a send that was still running.
@@ -579,7 +581,12 @@ impl HostCall {
                 return;
             }
             state.ended = Some(reason);
-            if let Some(send) = state.sending.take() {
+            if let Some(mut send) = state.sending.take() {
+                // An append that was written and not answered when the call ended is counted as
+                // unconfirmed, as it is when the channel is lost, and never written again.
+                if send.in_flight {
+                    send.unconfirmed += 1;
+                }
                 Self::upsert_context(
                     &mut state,
                     send,
@@ -1002,6 +1009,7 @@ impl HostCall {
                 of: 0,
                 appended: 0,
                 unconfirmed: 0,
+                in_flight: false,
             });
         }
         let selected = match support.select(&params).await {
@@ -1168,6 +1176,14 @@ impl HostCall {
                 });
                 break;
             }
+            if let Some(send) = self
+                .state()
+                .sending
+                .as_mut()
+                .filter(|send| send.action_id == action_id)
+            {
+                send.in_flight = true;
+            }
             next += 1;
             let answer = self.acknowledged(&id, revision, &*support).await;
             let mut state = self.state();
@@ -1179,6 +1195,7 @@ impl HostCall {
             else {
                 return;
             };
+            send.in_flight = false;
             match answer {
                 Ok(()) => {
                     send.appended += 1;
@@ -1748,6 +1765,36 @@ mod tests {
                 unconfirmed: 1,
                 state: VoiceContextState::Stopped {
                     stopped_by: VoiceContextStop::SidebandLost
+                }
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_append_without_its_acknowledgement_when_the_provider_closes_the_call_is_unconfirmed()
+     {
+        let (calls, call, sideband) = held();
+        let support = Support::of(2);
+        let _ = call
+            .send_context(action(5), send_params(), support, OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(sideband.written().len(), 1);
+        // The provider closes the call before it answered the append.
+        sideband.set(SidebandState::Closed(SidebandEnd::ProviderClosed));
+        sideband.tell(HostCallEvent::State(SidebandState::Closed(
+            SidebandEnd::ProviderClosed,
+        )));
+        settle().await;
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 0,
+                of: 3,
+                unconfirmed: 1,
+                state: VoiceContextState::Stopped {
+                    stopped_by: stop_of(VoiceEndReason::ProviderClosed)
                 }
             }]
         );
