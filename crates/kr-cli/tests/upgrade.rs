@@ -4322,6 +4322,10 @@ async fn a_voice_start_hold_the_release_before_ignores_is_kept_across_a_rollback
         (action, asked, ends)
     );
 
+    // The row as it stands before the rollback starts the release before: what that release does
+    // while it starts is compared with this one, and not with what it left once it was running.
+    let before = standing("before the rollback");
+
     // The rollback is not refused, and the release before serves the device and leaves the store.
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
@@ -4343,6 +4347,11 @@ async fn a_voice_start_hold_the_release_before_ignores_is_kept_across_a_rollback
         std::fs::read(&file).expect("the store is still there"),
         left,
         "the release before leaves the store byte for byte"
+    );
+    assert_eq!(
+        standing("the release before, from its start to its service"),
+        before,
+        "and the row is the one that stood before the release before started"
     );
 
     // The update again finds the row where it was left.
