@@ -625,7 +625,7 @@ impl ClockTrust {
     ///
     /// The transaction is one immediate transaction on the device directory's connection. The
     /// caller holds whatever must stay true to its commit (the connection's registration, taken
-    /// before this takes the state, [`Controller::pairing_guard`]), and `admission` asks that it
+    /// before this takes the state, `Controller::pairing_guard`), and `admission` asks that it
     /// still does, inside the transaction after the waits for this state and the connection, before
     /// anything is written. `during` runs in it, after the trust and continuity rows: whatever
     /// must be written with the establishment (the spending of the owner's confirmation, the
