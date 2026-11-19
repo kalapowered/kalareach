@@ -82,6 +82,11 @@ pub enum PluginCapability {
     /// read the mode the application runs in from what it prints.
     #[serde(rename = "launch.probe")]
     LaunchProbe,
+    /// Name an agent and say where the host installs the KalaReach contact skill for it, and where
+    /// the tool server is registered for it, so that a person who manages the host can install the
+    /// skill for an agent the host does not compile in.
+    #[serde(rename = "skill_target.install")]
+    SkillTargetInstall,
 }
 
 impl PluginCapability {
@@ -102,6 +107,7 @@ impl PluginCapability {
         Self::NativeBridgeInstall,
         Self::CommandIntegrationLaunch,
         Self::LaunchProbe,
+        Self::SkillTargetInstall,
     ];
 
     /// The capabilities a newly enrolled repository permits without any further grant.
@@ -130,6 +136,7 @@ impl PluginCapability {
             Self::NativeBridgeInstall => "native_bridge.install",
             Self::CommandIntegrationLaunch => "command_integration.launch",
             Self::LaunchProbe => "launch.probe",
+            Self::SkillTargetInstall => "skill_target.install",
         }
     }
 
@@ -158,6 +165,7 @@ impl PluginCapability {
             Self::NativeBridgeInstall
                 | Self::CommandIntegrationLaunch
                 | Self::LaunchProbe
+                | Self::SkillTargetInstall
                 | Self::TerminalInput
                 | Self::FilesystemRead
                 | Self::NetworkOutbound
@@ -181,7 +189,8 @@ impl PluginCapability {
             | Self::ApprovalDecode
             | Self::NativeBridgeInstall
             | Self::CommandIntegrationLaunch
-            | Self::LaunchProbe => None,
+            | Self::LaunchProbe
+            | Self::SkillTargetInstall => None,
             Self::TerminalStream | Self::TranscriptTail => Some(ActionRight::SessionView),
             Self::TerminalInput => Some(ActionRight::TerminalInput),
             Self::FilesystemRead => Some(ActionRight::FilesRead),
@@ -195,16 +204,20 @@ impl PluginCapability {
     /// confirmation of that exact release, whatever an earlier release was granted.
     ///
     /// Section 10 makes granting an executable or native-bridge capability the owner's decision.
-    /// What these three do is carried by the release itself, so it can change with every release
+    /// What these four do is carried by the release itself, so it can change with every release
     /// while the capability's name stays the same: a native bridge's files run under the
     /// application's own permissions, a command integration's flags and variables change how the
-    /// application runs, and a launch probe's arguments are what the host runs the application's
-    /// own executable with. A grant held from an earlier release says nothing about this one.
+    /// application runs, a launch probe's arguments are what the host runs the application's own
+    /// executable with, and a skill target's places are where the host writes files and a server
+    /// entry for an agent. A grant held from an earlier release says nothing about this one.
     #[must_use]
     pub const fn confirmed_on_every_release(self) -> bool {
         matches!(
             self,
-            Self::NativeBridgeInstall | Self::CommandIntegrationLaunch | Self::LaunchProbe
+            Self::NativeBridgeInstall
+                | Self::CommandIntegrationLaunch
+                | Self::LaunchProbe
+                | Self::SkillTargetInstall
         )
     }
 }
@@ -641,7 +654,8 @@ mod tests {
     }
 
     #[test]
-    fn a_native_bridge_a_command_integration_and_a_launch_probe_are_confirmed_on_every_release() {
+    fn a_native_bridge_a_command_integration_a_launch_probe_and_a_skill_target_are_confirmed_on_every_release()
+     {
         let confirmed: Vec<PluginCapability> = PluginCapability::ALL
             .iter()
             .copied()
@@ -652,7 +666,8 @@ mod tests {
             [
                 PluginCapability::NativeBridgeInstall,
                 PluginCapability::CommandIntegrationLaunch,
-                PluginCapability::LaunchProbe
+                PluginCapability::LaunchProbe,
+                PluginCapability::SkillTargetInstall
             ]
         );
         for capability in confirmed {

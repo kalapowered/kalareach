@@ -126,6 +126,13 @@
       "required_right": null,
       "requires_installation_grant": true,
       "within_default_ceiling": false
+    },
+    {
+      "capability": "skill_target.install",
+      "confirmed_on_every_release": true,
+      "required_right": null,
+      "requires_installation_grant": true,
+      "within_default_ceiling": false
     }
   ],
   "command_integration": {

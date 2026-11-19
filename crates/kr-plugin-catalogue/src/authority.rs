@@ -374,6 +374,14 @@ pub(crate) struct Permit {
     _private: (),
 }
 
+#[cfg(test)]
+impl Permit {
+    /// A permit for a case that tests one change of the store without an authority.
+    pub(crate) const fn for_test() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Runs one durable change under the authority's commit, lending it a [`Permit`].
 ///
 /// `effect` names what the change makes durable. The change reports an error that follows a

@@ -1065,6 +1065,59 @@ mod tests {
         );
     }
 
+    /// The release a switch goes back to, as the catalogue's entry of a release before the
+    /// skill-target capability lists it: it writes the baseline format and reads from none.
+    fn catalogue_before_the_skill_target() -> ReleaseStore {
+        ReleaseStore {
+            store: "catalogue".to_owned(),
+            scope: StoreScope::StateRoot,
+            path: "catalogue/catalogue.sqlite3".to_owned(),
+            recording: Recording::SqliteUserVersion,
+            version: u32::try_from(kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION)
+                .expect("a small number"),
+            migrates_from: 0,
+            reads_through: None,
+        }
+    }
+
+    fn catalogue_recording(directory: &Path, version: i64) -> PathBuf {
+        let path = directory.join("catalogue.sqlite3");
+        rusqlite_open(&path)
+            .execute_batch(&format!("PRAGMA user_version = {version};"))
+            .expect("a catalogue");
+        path
+    }
+
+    /// A host that never stored state naming the skill-target capability has a catalogue at the
+    /// baseline format, which a release before the capability reads, so it rolls back.
+    #[test]
+    fn a_host_that_never_stored_the_skill_target_capability_still_switches_back() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = catalogue_recording(
+            directory.path(),
+            kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION,
+        );
+        assert!(
+            look(&catalogue_before_the_skill_target(), &path, false).is_none(),
+            "a catalogue at the baseline is read by the release switched back to"
+        );
+    }
+
+    /// A host that stored state naming the capability has a catalogue at the raised format, which a
+    /// release before the capability cannot read, so the switch to it is refused for the version.
+    #[test]
+    fn a_host_that_stored_the_skill_target_capability_is_refused_a_switch_back() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = catalogue_recording(directory.path(), kr_plugin_catalogue::db::SCHEMA_VERSION);
+        let refused = look(&catalogue_before_the_skill_target(), &path, false);
+        assert!(
+            matches!(refused, Some(Why::Version { found, highest, .. })
+                if i64::from(found) == kr_plugin_catalogue::db::SCHEMA_VERSION
+                    && i64::from(highest) == kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION),
+            "{refused:?}"
+        );
+    }
+
     /// A directory of records is listed, by the extension the store names, and one that cannot be
     /// listed is a store that cannot be read: only a directory that is not there holds no record.
     #[test]
