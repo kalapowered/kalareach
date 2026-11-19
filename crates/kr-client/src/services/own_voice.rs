@@ -1212,8 +1212,15 @@ impl OwnVoiceProvider {
         }
         let slot = ticket.slot();
         if !core.registry.running(ticket) {
-            // A fence came between: this call is not the registry's. It is closed at once.
-            let closed = core.hang_up_and_mark(&call.call_id, &session_id).await;
+            // A fence came between: this call is not the registry's. It is closed at once. The
+            // channel is read first: the provider's closure may have come after the probe's
+            // answer, and a closure that came needs no hangup.
+            let closed = if task.read_queued().await {
+                core.mark_closed(&call.call_id);
+                true
+            } else {
+                core.hang_up_and_mark(&call.call_id, &session_id).await
+            };
             core.registry.end_start(&slot, late_end(true, closed));
             return Ok(refused(
                 VoiceRefusalReason::ProviderRefused,
@@ -1686,6 +1693,12 @@ impl CallTask {
             Ok(Ok(socket)) => socket,
             Ok(Err(AttachFault::Unavailable)) | Err(_) => return Err(NotReady::Unavailable),
         };
+        // The channel a failed attempt kept is read right before the new one replaces it: the
+        // provider's closure may have come on it while this attachment waited, and the new
+        // channel is dropped unprobed when it did.
+        if self.read_queued().await {
+            return Err(NotReady::Closed);
+        }
         self.socket = Some(socket);
         self.shared.inner().revision = revision;
         if revision == 1 {
@@ -2094,7 +2107,7 @@ impl CallTask {
             // closure may have come while the write waited. Only a close that was written is
             // waited on for the answer.
             let drained = if sent {
-                tokio::time::timeout(DRAIN_BOUND, async {
+                let answered = tokio::time::timeout(DRAIN_BOUND, async {
                     loop {
                         match self.socket_next().await {
                             SocketRead::Closed => return false,
@@ -2106,8 +2119,13 @@ impl CallTask {
                         }
                     }
                 })
-                .await
-                .unwrap_or(false)
+                .await;
+                match answered {
+                    Ok(closed) => closed,
+                    // The wait ran out: what the channel holds in its last moment is read before
+                    // the call is hung up.
+                    Err(_) => self.read_queued().await,
+                }
             } else {
                 self.read_queued().await
             };

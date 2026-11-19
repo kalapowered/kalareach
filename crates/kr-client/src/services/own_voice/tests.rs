@@ -1515,6 +1515,172 @@ async fn a_closure_on_a_channel_a_fence_overtook_is_read_before_the_channel_is_l
     world.provider.registry().unfence();
 }
 
+/// A fence that comes while the probe waits for its answer is met after the answer, and the
+/// closure the provider sent behind the answer is read before the call is hung up: the creation
+/// ends by the provider's word and nothing is hung up, though a hangup would have been answered by
+/// an empty 404 and left the row unresolved.
+#[tokio::test(start_paused = true)]
+async fn a_closure_queued_behind_the_probes_answer_after_a_fence_is_read_before_the_call_is_hung_up()
+ {
+    let world = fresh();
+    world.stand_in.acknowledge(false);
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    let request = request(1);
+    let attempt = world.provider.begin(&request).await.expect("begin");
+    let provider = &world.provider;
+    let dispatch = provider.dispatch(attempt, &request);
+    let removal = async {
+        // The probe is written and waits for its answer.
+        for _ in 0..1_000 {
+            if !world.stand_in.recorded().commands.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let probe = world
+            .stand_in
+            .recorded()
+            .commands
+            .last()
+            .cloned()
+            .expect("the probe was written");
+        let _fence = provider.registry().fence().expect("a fence");
+        // The answer comes with the closure behind it.
+        world.stand_in.event(&json!({
+            "type": "session.input_audio.unmuted",
+            "event_id": "e",
+            "client_event_id": probe["event_id"],
+        }));
+        world.stand_in.event(&closed_event("expired", None));
+        provider.settle().await
+    };
+    let (outcome, settled) = tokio::join!(dispatch, removal);
+    assert!(matches!(
+        outcome.expect("an answer"),
+        VoiceStart::Refused(_)
+    ));
+    assert_eq!(
+        settled,
+        Settled::LateSessionClosed,
+        "the closure the provider told is the confirmed end"
+    );
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+/// A close that was written and whose drain ran out reads what the channel still holds: a closure
+/// that stands behind a long queue ends the call by the provider's word, and nothing is hung up,
+/// though a hangup would have been answered by an empty 404 and left the row unresolved.
+#[tokio::test(start_paused = true)]
+async fn a_close_whose_drain_runs_out_with_a_closure_still_queued_reads_it_and_hangs_nothing_up() {
+    let world = fresh();
+    let own = started(&world).await;
+    world.stand_in.answer_close(false);
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    let closing = world.provider.close(&own.call_id);
+    let steering = async {
+        // The close is written, and nothing answers it.
+        for _ in 0..1_000 {
+            let written = world
+                .stand_in
+                .recorded()
+                .commands
+                .iter()
+                .any(|command| command["type"] == json!("session.close"));
+            if written {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        // A long queue and the closure arrive as the drain bound passes.
+        for _ in 0..600 {
+            world
+                .stand_in
+                .event(&json!({ "type": "session.usage.updated" }));
+        }
+        world.stand_in.event(&closed_event("expired", None));
+        tokio::time::advance(Duration::from_secs(5)).await;
+    };
+    let (closed, ()) = tokio::join!(closing, steering);
+    assert!(closed.is_ok());
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+/// A closure that comes on the channel a failed attempt kept, while the next attachment is awaited,
+/// is read before the new channel replaces it: the call ends by the provider's word, the new
+/// channel is dropped unprobed, and nothing is hung up.
+#[tokio::test(start_paused = true)]
+async fn a_closure_on_the_retained_channel_is_read_before_the_next_attachment_replaces_it() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    // The first reattachment attaches, and its probe is never answered.
+    world.stand_in.acknowledge(false);
+    world.stand_in.drop_socket();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Recovering);
+    assert_eq!(
+        world.stand_in.recorded().attaches,
+        2,
+        "the first reattachment holds a channel"
+    );
+    // That channel is lost, and the retry's attachment is held.
+    let release = Arc::new(tokio::sync::Notify::new());
+    world.stand_in.hold_attach(Arc::clone(&release));
+    world.stand_in.drop_socket();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_millis(250)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        world.stand_in.recorded().attaches_asked,
+        3,
+        "the retry's attachment is held"
+    );
+    // The closure comes on the retained channel while the retry waits.
+    world.stand_in.event(&closed_event("expired", None));
+    world.stand_in.acknowledge(true);
+    let written = world.stand_in.recorded().commands.len();
+    release.notify_one();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed),
+        "the closure on the retained channel was read"
+    );
+    assert_eq!(
+        world.stand_in.recorded().commands.len(),
+        written,
+        "the new channel was dropped unprobed"
+    );
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
 /// A mute the provider refused took no effect: the recovery's probe does not restate it.
 #[tokio::test(start_paused = true)]
 async fn a_mute_the_provider_refused_is_not_restated_by_the_recovery() {
