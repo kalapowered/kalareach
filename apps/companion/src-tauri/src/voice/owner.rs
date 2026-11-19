@@ -93,6 +93,11 @@ const SPEECH_TAINTED_PERSON: &str = "This call can no longer act on spoken reque
     was said may not have been heard or read. Nothing more is asked of the computer by voice in \
     this call.";
 
+/// What an end says when the host's news of the call overflowed: what the call did, or how it ended,
+/// is then not all known.
+const NEWS_LOST: &str = "This phone did not receive all of the host's news about the call, so some of \
+    what the call did may not be shown.";
+
 /// What an end says of requests that may have been written and not answered.
 pub(super) const REQUESTS_UNSETTLED: &str = "A request you spoke may or may not have been carried out: look \
     at the session list.";
@@ -2895,6 +2900,7 @@ impl Owner {
             !self.unsettled.is_empty(),
             self.outcomes_uncertain,
         );
+        let news_lost = self.outcomes_uncertain;
         // What the end owes is recorded with the end and with the host being told, in one step.
         // The grant may be live at the host until the moment the call was to close, by the host's
         // reading of the clock.
@@ -2911,6 +2917,7 @@ impl Owner {
             owed.push(OwedView::left_to_host(
                 descriptor.voice_session_id,
                 owed_until(descriptor.closes_at_ms.get()),
+                cause.left_to_host_words(),
                 host,
             ));
         }
@@ -2932,7 +2939,7 @@ impl Owner {
                 state.ended = Some(EndedView {
                     owner: id,
                     cause: cause.word().to_owned(),
-                    words: ended_words(&cause, left_to_host, unsettled),
+                    words: ended_words(&cause, left_to_host, unsettled, news_lost),
                     closed_locally,
                     host: host_end.clone(),
                     broker: if needs_broker {
@@ -3083,14 +3090,6 @@ fn answered_as(outcome: &VoiceDelegationOutcome) -> (&'static str, Option<&'stat
     }
 }
 
-/// The moment this device holds a call to, in milliseconds since the epoch, or none when the call
-/// is not one to carry.
-///
-/// The host says when the call closes. This device holds the call to that, and to no more than it
-/// asked for, with room for a clock that is not its own: a closing time later than that is held
-/// down to what was asked for, and one that is long past (further than the clock may differ) is
-/// not a call to carry. A host whose clock is a little behind gives a time that is a little past,
-/// which native code ends the call at.
 /// The word the screen branches on for `why`: on a call the host controls, the announcement that was
 /// not confirmed is the host's to confirm, not the voice service's.
 fn cause_word(why: &Why, host_controls: bool) -> &'static str {
@@ -3118,16 +3117,21 @@ async fn ask_until_heard(
     due: Instant,
 ) -> Option<u64> {
     loop {
-        match control.heard(id).await {
-            Ok(Some(offset_ms)) => return Some(offset_ms),
-            Ok(None) => {
+        // No request starts at or after the moment the wait is over, and one that is under way is
+        // given up at that moment.
+        if Instant::now() >= due {
+            return None;
+        }
+        match tokio::time::timeout_at(due, control.heard(id)).await {
+            Ok(Ok(Some(offset_ms))) => return Some(offset_ms),
+            Ok(Ok(None)) => {
                 let now = Instant::now();
                 if now >= due {
                     return None;
                 }
                 tokio::time::sleep(HEARD_RETRY.min(due - now)).await;
             }
-            Err(_) => return None,
+            Ok(Err(_)) | Err(_) => return None,
         }
     }
 }
@@ -3149,7 +3153,9 @@ fn provider_for(control: &VoiceSessionControl) -> CallProvider {
 /// provider. A host that ended the call for a reason closed it, but not one that lost the provider's
 /// side channel and could not restore it: it could not confirm the closure either, and only its
 /// answer to the stop, with the provider's confirmation, says that it has since closed the call.
-/// Any other end is read by the host's answer to the stop.
+/// Any other end is read by the host's answer to the stop. This is the one place where an end is read
+/// as confirmed or unconfirmed: the reasons are recorded by the host before it closes the call at the
+/// provider, and the news carries no confirmation.
 fn host_closed_the_call(cause: &Cause, host_end: &HostEnd) -> bool {
     match cause {
         Cause::Host(HostEnding::Reason(VoiceEndReason::SidebandLost)) => {
@@ -3160,19 +3166,21 @@ fn host_closed_the_call(cause: &Cause, host_end: &HostEnd) -> bool {
     }
 }
 
-/// Whether the end says that a request that was spoken may or may not have been carried out: a
-/// request written to the host that has no answer, on a call that acts on speech, or news of the
-/// host that overflowed, on any call, because what the call did is then not all known.
+/// Whether the end says that a request that was spoken may or may not have been carried out: on a
+/// call that acts on speech, a request written to the host that has no answer, or news of the host
+/// that overflowed, because what the call did is then not all known. A call that does not act on
+/// speech has no request that was spoken.
 fn shows_requests_unsettled(accepting: bool, unanswered: bool, news_lost: bool) -> bool {
-    (accepting && unanswered) || news_lost
+    accepting && (unanswered || news_lost)
 }
 
 /// What an end says: the cause's words, then what it leaves to the host when the call is left to
-/// it, then what it leaves unsettled when a request may have been carried out. A cause whose words
-/// another sentence follows is given as a sentence, so that a setup clause is ended by a full stop
-/// there and nowhere else.
-fn ended_words(cause: &Cause, left_to_host: bool, unsettled: bool) -> String {
-    let said = match cause {
+/// it, then what it leaves unsettled when a request may have been carried out, then that the host's
+/// news overflowed when it did, on any call. A cause whose words another sentence follows is given
+/// as a sentence, so that a setup clause is ended by a full stop there and nowhere else.
+fn ended_words(cause: &Cause, left_to_host: bool, unsettled: bool, news_lost: bool) -> String {
+    let more = unsettled || news_lost;
+    let mut said = match cause {
         // These causes are already the closing sentence.
         Cause::Host(HostEnding::NotKnown(_)) => cause.words(),
         Cause::Host(HostEnding::Silent) if !left_to_host => {
@@ -3180,18 +3188,28 @@ fn ended_words(cause: &Cause, left_to_host: bool, unsettled: bool) -> String {
         }
         Cause::Host(HostEnding::Silent) => cause.words(),
         _ if left_to_host => {
-            format!("{} {}", cause.sentence(), super::cause::LEFT_TO_HOST)
+            format!("{} {}", cause.sentence(), cause.left_to_host_words())
         }
-        _ if unsettled => cause.sentence(),
+        _ if more => cause.sentence(),
         _ => cause.words(),
     };
     if unsettled {
-        format!("{said} {REQUESTS_UNSETTLED}")
-    } else {
-        said
+        said = format!("{said} {REQUESTS_UNSETTLED}");
     }
+    if news_lost {
+        said = format!("{said} {NEWS_LOST}");
+    }
+    said
 }
 
+/// The moment this device holds a call to, in milliseconds since the epoch, or none when the call
+/// is not one to carry.
+///
+/// The host says when the call closes. This device holds the call to that, and to no more than it
+/// asked for, with room for a clock that is not its own: a closing time later than that is held
+/// down to what was asked for, and one that is long past (further than the clock may differ) is
+/// not a call to carry. A host whose clock is a little behind gives a time that is a little past,
+/// which native code ends the call at.
 fn hold_until(host_closes_ms: u64, requested_seconds: u32, now_ms: u64) -> Option<u64> {
     if host_closes_ms.saturating_add(MAX_CLOCK_SKEW_MS) <= now_ms {
         return None;
@@ -3650,6 +3668,20 @@ mod tests {
 
     use super::*;
 
+    /// A delegation the host did not confirm is worded as the host's on a call the host controls,
+    /// and as the voice service's on a call it holds; every other cause is worded the same on both.
+    #[test]
+    fn an_announcement_that_was_not_confirmed_is_the_hosts_on_a_call_the_host_controls() {
+        assert_eq!(cause_word(&Why::BrokerDisagrees, true), "host_disagrees");
+        assert_eq!(cause_word(&Why::BrokerDisagrees, false), "broker_disagrees");
+        for host_controls in [true, false] {
+            assert_eq!(
+                cause_word(&Why::CallEnded, host_controls),
+                Why::CallEnded.word()
+            );
+        }
+    }
+
     /// A call is closed as the control its descriptor names, whichever provider was asked for.
     #[test]
     fn a_call_is_cleaned_up_as_the_control_its_descriptor_names_whichever_provider_was_asked_for() {
@@ -3669,14 +3701,13 @@ mod tests {
         );
     }
 
-    /// News of the host that overflowed is told whatever the call acts on, and a request with no
-    /// answer only on a call that acts on speech.
+    /// A request that was spoken is unsettled only on a call that acts on speech, and news of the host
+    /// that overflowed is told on every call, in a sentence of its own.
     #[test]
-    fn overflowed_news_is_told_on_a_call_that_does_not_act_on_speech_and_an_unanswered_request_is_not()
-     {
+    fn overflowed_news_is_told_on_a_call_that_does_not_act_on_speech_in_a_sentence_of_its_own() {
         assert!(
-            shows_requests_unsettled(false, false, true),
-            "news overflowed"
+            !shows_requests_unsettled(false, false, true),
+            "no request can be spoken on a call that does not act on speech"
         );
         assert!(shows_requests_unsettled(true, false, true));
         assert!(
@@ -3688,6 +3719,21 @@ mod tests {
             "no request can be spoken"
         );
         assert!(!shows_requests_unsettled(true, false, false));
+        let news = "This phone did not receive all of the host's news about the call, so some of what the call did may not be shown.";
+        // A call that does not act on speech: the sentence of its own, and none about a request.
+        assert_eq!(
+            ended_words(&Cause::Requested, false, false, true),
+            format!("You ended the call. {news}")
+        );
+        // A call that acts on speech: the sentence about a request, then the sentence of its own.
+        assert_eq!(
+            ended_words(&Cause::Requested, false, true, true),
+            format!("You ended the call. {REQUESTS_UNSETTLED} {news}")
+        );
+        assert_eq!(
+            ended_words(&Cause::Requested, false, false, false),
+            "You ended the call."
+        );
     }
 
     /// The closing time this device holds a call to is the host's, held down to what was asked
@@ -3941,35 +3987,46 @@ mod tests {
         let step = Cause::Step(mismatch.to_owned());
         let left = crate::voice::cause::LEFT_TO_HOST;
         // Alone: nothing is added.
-        assert_eq!(ended_words(&step, false, false), clause);
+        assert_eq!(ended_words(&step, false, false, false), clause);
         // Before the sentence that leaves the call to the host.
         assert_eq!(
-            ended_words(&step, true, false),
+            ended_words(&step, true, false, false),
             "The call could not be set up on this device: the host started the call on another provider than the one this device showed, so the call was ended. The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it."
         );
         // Before the sentence for a request that may have been carried out.
         assert_eq!(
-            ended_words(&step, false, true),
+            ended_words(&step, false, true, false),
             format!("{clause}. {REQUESTS_UNSETTLED}")
         );
         // Before both.
         assert_eq!(
-            ended_words(&step, true, true),
+            ended_words(&step, true, true, false),
             format!("{clause}. {left} {REQUESTS_UNSETTLED}")
         );
         // A clause that ends in a full stop already gets no second one.
         let stopped = Cause::Step("the service said no.".to_owned());
         assert_eq!(
-            ended_words(&stopped, true, false),
+            ended_words(&stopped, true, false, false),
             format!("The call could not be set up on this device: the service said no. {left}")
+        );
+        // A host that lost its connection to OpenAI has tried to close the call and does not try
+        // again: its end says only that it could not confirm the closure.
+        let lost = Cause::Host(HostEnding::Reason(VoiceEndReason::SidebandLost));
+        assert_eq!(
+            ended_words(&lost, true, false, false),
+            "The host lost its connection to OpenAI and could not restore it, so the call was ended. The call has ended on this phone. The host could not confirm that OpenAI closed the call, so the call may keep running on your OpenAI account until OpenAI ends it."
+        );
+        assert_eq!(
+            ended_words(&lost, false, false, false),
+            "The host lost its connection to OpenAI and could not restore it, so the call was ended."
         );
         // A cause that is a sentence is joined as it stands.
         assert_eq!(
-            ended_words(&Cause::NativeFailed, true, true),
+            ended_words(&Cause::NativeFailed, true, true, false),
             format!("The connection to the voice provider failed. {left} {REQUESTS_UNSETTLED}")
         );
         assert_eq!(
-            ended_words(&Cause::NativeFailed, false, false),
+            ended_words(&Cause::NativeFailed, false, false, false),
             "The connection to the voice provider failed."
         );
     }

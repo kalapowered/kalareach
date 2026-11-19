@@ -11,6 +11,7 @@ const SOURCES: [(&str, &str, &[&str]); 4] = [
         &[
             "SPEECH_TAINTED_PERSON",
             "REQUESTS_UNSETTLED",
+            "NEWS_LOST",
             "HOST_NOT_REACHED",
             "STANDING_WORDS",
         ],

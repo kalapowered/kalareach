@@ -777,7 +777,7 @@ describe('while a call is running', () => {
         actions={actions()}
       />
     )
-    expect(screen.getByTestId('voice-context')).toHaveTextContent(words)
+    expect(screen.queryByTestId('voice-context')).toHaveTextContent(words)
   })
 
   // On a call the host controls, the announcement that was not confirmed is the host's to confirm:

@@ -3930,6 +3930,45 @@ async fn an_owner_that_fails_while_asking_what_became_of_a_start_leaves_the_star
     scene.stop_host().await;
 }
 
+/// The owner fails while it asks the host what became of a start on the host's own key whose answer
+/// was lost. The host may have made a call on its owner's account, so the supervisor stops the media
+/// and keeps the start as owed, and the end says that the host may hold the call and not the voice
+/// service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_fails_while_asking_what_became_of_an_own_key_start_names_the_host_and_not_the_service()
+ {
+    let mut scene = own_scene(Timings {
+        start_within: Duration::ZERO,
+        repeat_delays: [Duration::from_millis(20); 3],
+        ..own_timings()
+    })
+    .await;
+    scene.link.lose_the_answer_to(Some(HostMethod::VoiceStart));
+    let prepared = scene.prepared().await;
+    let reach = failing_reach(&scene, FailsAt::Reaching, 1);
+    let calls = scene.phone.companion.app.state::<Calls>();
+
+    scene.open_a_window_at_the_next_end();
+    let refused = calls
+        .start(
+            own_request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await;
+
+    assert!(refused.is_err(), "the owner failed before it could answer");
+    let ended = scene
+        .end_with_what_it_owes("owner_failed", "start_unknown")
+        .await;
+    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    assert_eq!(
+        ended["ended"]["broker"], "host_unknown",
+        "the host may hold the call, not the voice service: {ended}"
+    );
+    scene.stop_host().await;
+}
+
 /// The owner fails before it has kept anything to finish: no call was named to it, and it wrote no
 /// end. The supervisor writes one, so that a screen that reads the device after the slot is free
 /// finds that the call stopped working, and that nothing is known of the media, and the next call
@@ -7858,6 +7897,9 @@ const MANAGER: [ActionRight; 3] = [
 
 /// What a person is told when a call on the host's key has ended on this phone and the host has not
 /// confirmed that it closed the call.
+/// What a person is told when the host lost its connection to OpenAI, could not restore it and did
+/// not confirm that it closed the call.
+const HOST_UNCONFIRMED_WORDS: &str = "The call has ended on this phone. The host could not confirm that OpenAI closed the call, so the call may keep running on your OpenAI account until OpenAI ends it.";
 const LEFT_TO_HOST_WORDS: &str = "The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it.";
 
 /// What a person is told when the host did not answer for two minutes and then said, in its answer to
@@ -8709,12 +8751,17 @@ async fn a_start_the_host_accepts_takes_back_the_notice_of_a_call_left_to_it() {
     let prepared = scene.prepared().await;
     let answer = scene.call("voice_start", scene.own_start_request(&prepared));
     assert!(answer.is_ok(), "the host accepts another start: {answer:?}");
+    // The call the host accepted runs: the host's word that it made it is what the notice of the call
+    // left to it answers to.
     let started = scene
-        .state_where("the notice taken back", |state| {
-            state["running"] == true && !owed_kinds_of(state).contains(&"host_close".to_owned())
+        .state_where("the accepted call running", |state| {
+            state["running"] == true
         })
         .await;
-    assert_eq!(started["running"], true, "{started}");
+    assert!(
+        !owed_kinds_of(&started).contains(&"host_close".to_owned()),
+        "the notice of a call left to the host is taken back: {started}"
+    );
     scene.stop_host().await;
 }
 
@@ -8750,22 +8797,23 @@ async fn the_hosts_news_of_a_context_send_applies_when_its_reply_was_lost() {
             })
             .unwrap_or_default()
     };
-    let done = scene
-        .state_where(
-            "the notice taken back by the news that the send is done",
-            |state| {
-                let problems = opening(state);
-                !problems.is_empty() && problems.iter().all(|(_, over)| *over)
-            },
-        )
-        .await;
+    // The host's news of the send comes on the heartbeats that follow the sender's last append.
+    assert!(
+        until_more_heartbeats(&scene, 3).await,
+        "the host's heartbeats go on"
+    );
+    let done = scene.state();
+    assert_eq!(
+        done["context"]["state"], "done",
+        "the news that the send is done is the phone's, whatever the reply said: {done}"
+    );
     assert_eq!(
         opening(&done),
         [(
             "This call may not have been given the host's context for its session: the host did not say whether it accepted the request to send it.".to_owned(),
             true
         )],
-        "{done}"
+        "the notice taken back by the news that the send is done: {done}"
     );
     scene
         .call("voice_stop", json!({ "voiceSessionId": null }))
@@ -8805,16 +8853,19 @@ async fn an_answer_after_two_misses_before_any_attachment_takes_back_the_notice(
         .await;
     scene.link.lose_the_answer_to(None);
     let back = scene
-        .state_where("the notice taken back", |state| {
+        .state_where("the control attached", |state| {
             state["control"] == "connected"
-                && state["problems"].as_array().is_some_and(|problems| {
-                    problems
-                        .iter()
-                        .filter(|each| each["kind"] == "host_path")
-                        .all(|each| each["over"] == true)
-                })
         })
         .await;
+    assert!(
+        back["problems"].as_array().is_some_and(|problems| {
+            problems
+                .iter()
+                .filter(|each| each["kind"] == "host_path")
+                .all(|each| each["over"] == true)
+        }),
+        "the notice of two beats unanswered is taken back: {back}"
+    );
     assert_eq!(back["running"], true, "{back}");
     scene.stop_host().await;
 }
@@ -8848,22 +8899,32 @@ async fn a_write_the_phone_gave_up_on_is_settled_in_the_connections_book() {
     // The next heartbeat is held, and the phone gives up on it after its bound.
     scene.link.hold_next_request(HostMethod::VoiceControl);
     scene.link.until_request_held().await;
+    let held: Vec<_> = session
+        .submitted_actions()
+        .await
+        .iter()
+        .map(|action| action.action_id)
+        .collect();
     assert!(
-        !session.submitted_actions().await.is_empty(),
+        !held.is_empty(),
         "the held write is on the connection's book"
     );
-    // The book is clear between the beats once the held write has been given up: a write the phone
-    // gave up on is not left on it.
-    tokio::time::timeout(WATCHDOG, async {
-        loop {
-            if session.submitted_actions().await.is_empty() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the write the phone gave up on was settled");
+    // The phone gives up on the held write and goes on with the next beat.
+    assert!(
+        until_more_heartbeats(&scene, 1).await,
+        "the phone goes on writing after it gave up on the held write"
+    );
+    // A write the phone gave up on is not left on the book.
+    let book: Vec<_> = session
+        .submitted_actions()
+        .await
+        .iter()
+        .map(|action| action.action_id)
+        .collect();
+    assert!(
+        held.iter().all(|action| !book.contains(action)),
+        "the write the phone gave up on is still on the book: {held:?} in {book:?}"
+    );
     scene.link.release_request();
     assert!(
         until_more_heartbeats(&scene, 2).await,
@@ -8889,11 +8950,14 @@ async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_throu
             scene.link.lose_the_answer_to(Some(HostMethod::VoiceStop));
         }
         let _ = scene.call("voice_start", request);
+        // The setup is over, with the call ended or running: what it came to is for the case to read.
         let ended = scene
-            .state_where("the end the mismatch brings", |state| {
-                state["ended"]["cause"] == "step_failed" && state["setting_up"] == false
+            .state_where("the setup over", |state| {
+                state["setting_up"] == false
+                    && (state["running"] == true || state["ended"].is_object())
             })
             .await;
+        assert_eq!(ended["ended"]["cause"], "step_failed", "{ended}");
         let mismatch = "The call could not be set up on this device: the host started the call on another provider than the one this device showed, so the call was ended";
         let words = ended["ended"]["words"].as_str().unwrap_or_default();
         if stop_answered {
@@ -8924,6 +8988,59 @@ async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_throu
         );
         scene.stop_host().await;
     }
+}
+
+/// A call the host swept out of its list before the person's stop reached it, when the phone had not
+/// heard the host's news of it, ends as the person ended it: a host that holds no such call at the end
+/// of a call has ended it itself, and nothing is left to the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_person_who_ends_a_call_the_host_swept_unheard_is_not_told_it_is_left_to_the_host() {
+    // The host's beats are far apart: its news of the sweep does not reach the phone before the stop.
+    let timings = Timings {
+        host_beat: Some(Duration::from_secs(60)),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    openai.event(&json!({
+        "type": "session.closed", "event_id": "e-1", "reason": "expired",
+        "session": { "id": "live_1", "model": "gpt-live-1", "status": "active", "expires_at": 1 },
+        "usage": { "seconds": 3 },
+    }));
+    // The host's sweep, run at once in place of at its tick, until the provider's closure is known to it.
+    let voice = scene.host().controller().voice();
+    tokio::time::timeout(WATCHDOG, async {
+        while voice.coordinator().live_sessions() != 0 {
+            voice.tick(now_ms()).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host's sweep took the call out of its list");
+
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("the end the person asked for", |state| {
+            state["ended"]["cause"] == "requested"
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "not_held", "{ended}");
+    assert_eq!(ended["ended"]["words"], "You ended the call.", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    assert!(
+        !owed_kinds_of(&ended).contains(&"host_close".to_owned()),
+        "nothing is left to the host: {ended}"
+    );
+    scene.stop_host().await;
 }
 
 /// A call the host ended and swept out of its list before this phone's stop reached it was closed by
@@ -9078,7 +9195,7 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
             // warning, and the call stays owed to the host.
             assert_eq!(
                 ended["ended"]["words"],
-                format!("{words} {LEFT_TO_HOST_WORDS}"),
+                format!("{words} {HOST_UNCONFIRMED_WORDS}"),
                 "({cause}) {ended}"
             );
         } else {
@@ -9093,6 +9210,14 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
             assert!(
                 owes_the_host,
                 "the call is left to the host ({cause}): {ended}"
+            );
+            assert_eq!(
+                ended["owed"]
+                    .as_array()
+                    .and_then(|owed| owed.iter().find(|each| each["kind"] == "host_close"))
+                    .map(|each| each["words"].clone()),
+                Some(json!(HOST_UNCONFIRMED_WORDS)),
+                "the notice of the call left to the host does not say the host closes it later ({cause})"
             );
             // The host takes the call out of its list when it is asked to stop, and what it answers
             // to a stop again is no word that the provider closed the call.
@@ -9118,7 +9243,7 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
                 );
                 assert_eq!(
                     after["ended"]["words"],
-                    format!("{words} {LEFT_TO_HOST_WORDS}"),
+                    format!("{words} {HOST_UNCONFIRMED_WORDS}"),
                     "the charge warning stands ({cause}): {after}"
                 );
             }
@@ -9274,11 +9399,12 @@ async fn a_delegation_the_host_has_not_yet_heard_is_asked_about_again_within_its
 
     // The device's data channel delivers the delegation first, and the host has not heard it: the
     // first question is answered "not heard".
+    let asked = scene.link.sent(HostMethod::VoiceControl);
     scene.platform.tell_provider(&delegation_event("d-0", 200));
-    assert!(
-        until_more_heartbeats(&scene, 1).await,
-        "the host was asked whether it heard the delegation"
-    );
+    scene
+        .link
+        .until_the_host_answers(asked + 1, HostMethod::VoiceControl)
+        .await;
     // The host's side channel hears it afterwards, and the second question is answered.
     scene
         .openai
@@ -9453,31 +9579,30 @@ fn wrote_for(scene: &Scene, id: &str) -> Vec<String> {
         .collect()
 }
 
-/// Waits until the host has written a command of `kind` that `wanted` accepts, and says whether it
-/// did within the watchdog: a case that decides on it asserts the answer itself.
-async fn host_wrote(
-    scene: &Scene,
-    kind: &str,
-    wanted: impl Fn(&(String, Option<String>)) -> bool,
-) -> bool {
+/// Waits until the host has written a sentence for the delegation `id` that is not the one that says
+/// the person is being asked, which comes first when a person is asked, and returns everything the
+/// host wrote to the model for it. What the host wrote is for the case to assert on: the wait is for
+/// an event that happens whatever the sentence of the delegation's end is.
+async fn what_the_host_wrote_once_told(scene: &Scene, id: &str) -> Vec<String> {
     tokio::time::timeout(WATCHDOG, async {
-        while !written_of(scene, kind).iter().any(&wanted) {
+        loop {
+            let wrote = wrote_for(scene, id);
+            if wrote
+                .iter()
+                .any(|words| words != VoiceNote::DelegationConfirmation.words())
+            {
+                return wrote;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .is_ok()
-}
-
-/// Waits until the host has written `note`'s sentence for the delegation `id`, and says whether it
-/// did within the watchdog.
-async fn host_noted(scene: &Scene, id: &str, note: VoiceNote) -> bool {
-    host_wrote(
-        scene,
-        "session.commentary.append",
-        |(content, delegation)| content == note.words() && delegation.as_deref() == Some(id),
-    )
-    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the host wrote no sentence for the end of {id}: {:?}",
+            wrote_for(scene, id)
+        )
+    })
 }
 
 /// A status asked for after a pause on a call on the host's own key is handed to the host as on a
@@ -9498,26 +9623,12 @@ async fn a_status_asked_for_on_an_own_key_call_is_performed_by_the_host_and_told
     assert_eq!(row["offset_ms"], end - 200);
     assert_eq!(at_the_host(&scene), 1, "the host was sent the one request");
     let performed = VoiceNote::DelegationPerformed.words();
+    let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
     assert!(
-        host_wrote(
-            &scene,
-            "session.commentary.append",
-            |(content, delegation)| {
-                delegation.as_deref() == Some("d-1")
-                    && content.starts_with(performed)
-                    && !content[performed.len()..].trim().is_empty()
-            },
-        )
-        .await,
-        "the host never wrote the performed sentence with its summary: {:?}",
-        wrote_for(&scene, "d-1")
+        wrote.iter().any(|content| content.starts_with(performed)
+            && !content[performed.len()..].trim().is_empty()),
+        "the host did not write the performed sentence with its summary: {wrote:?}"
     );
-    scene
-        .state_where("the model told", |state| {
-            row_of(state, "d-1").is_some_and(|row| row["told"] == true)
-        })
-        .await;
-    let wrote = wrote_for(&scene, "d-1");
     assert_eq!(wrote.len(), 1, "told once: {wrote:?}");
     assert!(!wrote[0].contains("Nothing was done"), "{wrote:?}");
     assert_eq!(
@@ -9543,10 +9654,12 @@ async fn a_request_the_host_refuses_on_an_own_key_call_is_told_to_the_model_as_t
 
     assert!(row["cause"].is_string(), "{row}");
     assert_eq!(at_the_host(&scene), 1);
+    let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
     assert!(
-        host_noted(&scene, "d-1", VoiceNote::DelegationHostRefused).await,
-        "the host never wrote DelegationHostRefused: {:?}",
-        wrote_for(&scene, "d-1")
+        wrote
+            .iter()
+            .any(|words| words == VoiceNote::DelegationHostRefused.words()),
+        "the host did not write the sentence of the delegation's end: {wrote:?}"
     );
     let wrote = wrote_for(&scene, "d-1");
     assert_eq!(
@@ -9602,18 +9715,7 @@ async fn a_close_said_aloud_on_an_own_key_call_is_confirmed_on_the_phone_and_the
         "about the session: {asked:?}"
     );
     let performed = VoiceNote::DelegationPerformed.words();
-    assert!(
-        host_wrote(
-            &scene,
-            "session.commentary.append",
-            |(content, delegation)| delegation.as_deref() == Some("d-1")
-                && content.starts_with(performed),
-        )
-        .await,
-        "the host never wrote the performed sentence: {:?}",
-        wrote_for(&scene, "d-1")
-    );
-    let wrote = wrote_for(&scene, "d-1");
+    let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
     assert_eq!(
         wrote.first().map(String::as_str),
         Some(VoiceNote::DelegationConfirmation.words()),
@@ -9664,10 +9766,10 @@ async fn a_person_who_does_not_confirm_on_an_own_key_call_signs_nothing_and_the_
         let row = row_reaching(&scene, "d-1", "cancelled").await;
 
         assert_eq!(row["cause"], cause, "{outcome:?}");
+        let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
         assert!(
-            host_noted(&scene, "d-1", note).await,
-            "the host never wrote {note}: {:?}",
-            wrote_for(&scene, "d-1")
+            wrote.iter().any(|words| words == note.words()),
+            "the host did not write the sentence of the delegation's end: {wrote:?}"
         );
         assert_eq!(scene.ceremony.asked().len(), 1, "{outcome:?}");
         assert_eq!(at_the_host(&scene), 1, "no signature was sent: {outcome:?}");
@@ -9704,10 +9806,12 @@ async fn a_challenge_that_does_not_agree_or_ran_out_on_an_own_key_call_is_not_si
     own_ask(&scene, "d-1", end - 200).await;
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "challenge_mismatch");
+    let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
     assert!(
-        host_noted(&scene, "d-1", VoiceNote::DelegationChallengeMismatch).await,
-        "the host never wrote DelegationChallengeMismatch: {:?}",
-        wrote_for(&scene, "d-1")
+        wrote
+            .iter()
+            .any(|words| words == VoiceNote::DelegationChallengeMismatch.words()),
+        "the host did not write the sentence of the delegation's end: {wrote:?}"
     );
     assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
     assert_eq!(at_the_host(&scene), 1);
@@ -9726,10 +9830,12 @@ async fn a_challenge_that_does_not_agree_or_ran_out_on_an_own_key_call_is_not_si
     own_closing_asked(&scene, "d-1").await;
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "confirmation_expired");
+    let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
     assert!(
-        host_noted(&scene, "d-1", VoiceNote::DelegationConfirmationExpired).await,
-        "the host never wrote DelegationConfirmationExpired: {:?}",
-        wrote_for(&scene, "d-1")
+        wrote
+            .iter()
+            .any(|words| words == VoiceNote::DelegationConfirmationExpired.words()),
+        "the host did not write the sentence of the delegation's end: {wrote:?}"
     );
     assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
     assert_eq!(at_the_host(&scene), 1);
@@ -9754,10 +9860,12 @@ async fn a_challenge_that_does_not_agree_or_ran_out_on_an_own_key_call_is_not_si
     scene.ceremony.release();
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "confirmation_expired");
+    let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
     assert!(
-        host_noted(&scene, "d-1", VoiceNote::DelegationConfirmationExpired).await,
-        "the host never wrote DelegationConfirmationExpired: {:?}",
-        wrote_for(&scene, "d-1")
+        wrote
+            .iter()
+            .any(|words| words == VoiceNote::DelegationConfirmationExpired.words()),
+        "the host did not write the sentence of the delegation's end: {wrote:?}"
     );
     assert_eq!(at_the_host(&scene), 1);
     assert!(!scene.is_closed().await);
@@ -9785,10 +9893,12 @@ async fn a_session_not_named_or_more_said_on_an_own_key_call_stops_the_confirmat
     scene.link.until_request_held().await;
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "session_not_named", "{row}");
+    let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
     assert!(
-        host_noted(&scene, "d-1", VoiceNote::DelegationSessionNotNamed).await,
-        "the host never wrote DelegationSessionNotNamed: {:?}",
-        wrote_for(&scene, "d-1")
+        wrote
+            .iter()
+            .any(|words| words == VoiceNote::DelegationSessionNotNamed.words()),
+        "the host did not write the sentence of the delegation's end: {wrote:?}"
     );
     assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
     assert_eq!(at_the_host(&scene), 1, "no signature was sent");
@@ -9810,10 +9920,12 @@ async fn a_session_not_named_or_more_said_on_an_own_key_call_stops_the_confirmat
         .tell_provider(&fragment(end, end + 200, " not"));
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "late_fragment");
+    let wrote = what_the_host_wrote_once_told(&scene, "d-1").await;
     assert!(
-        host_noted(&scene, "d-1", VoiceNote::DelegationLate).await,
-        "the host never wrote DelegationLate: {:?}",
-        wrote_for(&scene, "d-1")
+        wrote
+            .iter()
+            .any(|words| words == VoiceNote::DelegationLate.words()),
+        "the host did not write the sentence of the delegation's end: {wrote:?}"
     );
     scene.ceremony.release();
     until_the_ceremony_is_handled(&scene, "d-1").await;
@@ -9883,11 +9995,8 @@ async fn a_managed_control_writes_each_sentence_as_the_frame_it_wrote_before_the
     scene
         .stand_in
         .control()
-        .until("the service read the performed sentence", |report| {
-            report
-                .frames
-                .iter()
-                .any(|frame| frame.contains("session one is running"))
+        .until("the service read the frame for the delegation", |report| {
+            report.frames.iter().any(|frame| frame.contains("d-1"))
         })
         .await;
 
