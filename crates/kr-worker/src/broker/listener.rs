@@ -218,6 +218,13 @@ pub struct Registration {
     /// path, to find both: an application that scrubs its children's environment of anything
     /// named like a credential still passes that one on.
     pub credential: std::path::PathBuf,
+    /// The owner-only file beside the registration that holds the hook events the launch's package
+    /// declares, for a package that declares some.
+    ///
+    /// The registration names it when the launch wrote it, and a package that declares none has no
+    /// file and no name, so its forwarder reads a hook payload as Claude Code writes it. The
+    /// worker writes the file before it publishes the registration.
+    pub events: Option<std::path::PathBuf>,
 }
 
 /// What a connecting bridge presents.
@@ -268,7 +275,15 @@ impl Registration {
             application_instance_id,
             expected_process,
             credential,
+            events: None,
         }
+    }
+
+    /// Names the file of hook events a launch wrote beside this registration.
+    #[must_use]
+    pub fn with_events(mut self, events: Option<std::path::PathBuf>) -> Self {
+        self.events = events;
+        self
     }
 
     /// Authenticates the two halves a registration decides on its own: the owner and the process.
@@ -454,6 +469,9 @@ impl Registration {
             self.expected_process.start_value,
             self.credential.display(),
         );
+        if let Some(events) = &self.events {
+            file.push_str(&format!("events={}\n", events.display()));
+        }
         if let Some(release) = release {
             file.push_str(&format!("release={release}\n"));
         }
@@ -624,6 +642,25 @@ mod tests {
 
     /// A worker of an installed release names it in every registration, on a line of its own, and
     /// one outside a store names none.
+    /// A registration of a launch whose package declares hook events names the file the launch
+    /// wrote, from what the launch gave it, and a launch of a package that declares none names no
+    /// file.
+    #[test]
+    fn a_registration_names_the_events_file_its_launch_wrote() {
+        let named =
+            registration()
+            .with_events(Some(std::path::PathBuf::from("/run/kr/c/a/hook-events.json")));
+        let file = named.to_file_of(None);
+        assert!(
+            file.contains("\nevents=/run/kr/c/a/hook-events.json\n"),
+            "{file}"
+        );
+        assert!(
+            !registration().to_file_of(None).contains("events="),
+            "a launch of a package that declares no events publishes no line"
+        );
+    }
+
     #[test]
     fn a_registration_names_the_release_its_worker_runs() {
         let release =

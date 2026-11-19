@@ -247,6 +247,13 @@ impl InstalledConnector {
         let table = package.connector.ok_or_else(|| {
             ConnectorRefusal::new(format!("{plugin_id} carries no connector table"))
         })?;
+        // The package check has already refused a map the readers could not read. It is checked
+        // again here, as the forwarder checks it again when it reads the map this worker publishes.
+        if let Some(events) = &table.hook_events {
+            events.check().map_err(|error| {
+                ConnectorRefusal::new(format!("{plugin_id}'s hook events are refused: {error}"))
+            })?;
+        }
         if let Some(bridge) = source.bridge.as_ref() {
             if package.manifest.native_bridge.as_ref().is_none() {
                 return Err(ConnectorRefusal::new(format!(
@@ -356,6 +363,15 @@ impl InstalledConnector {
     #[must_use]
     pub const fn table(&self) -> &ConnectorManifest {
         &self.table
+    }
+
+    /// Returns the hook events the package's table declares, where it declares any.
+    ///
+    /// A package that declares none has its forwarder read the hook payload as Claude Code writes
+    /// it, and a launch of it publishes no map.
+    #[must_use]
+    pub const fn hook_events(&self) -> Option<&kr_plugin_sdk::hook_events::HookEvents> {
+        self.table.hook_events.as_ref()
     }
 
     /// Returns the command a person starts this agent with, where the package gives one.
@@ -1204,6 +1220,9 @@ pub mod fixture {
         /// the request and says where its stream names the conversation and the turn, and the
         /// package asks for the approval grants and declares the action that answers.
         pub answers: bool,
+        /// The hook events the package's connector table declares, as JSON, where it declares
+        /// any: the package then states an `sdk_range` from the SDK version the member arrived at.
+        pub hook_events: Option<serde_json::Value>,
     }
 
     impl Shape {
@@ -1223,6 +1242,7 @@ pub mod fixture {
                 gateway: false,
                 volatile_forwarding: false,
                 answers: false,
+                hook_events: None,
             }
         }
 
@@ -1245,6 +1265,7 @@ pub mod fixture {
                 gateway: false,
                 volatile_forwarding: false,
                 answers: false,
+                hook_events: None,
             }
         }
 
@@ -1274,6 +1295,7 @@ pub mod fixture {
                 gateway: true,
                 volatile_forwarding: true,
                 answers: false,
+                hook_events: None,
             }
         }
 
@@ -1283,6 +1305,7 @@ pub mod fixture {
         pub fn codex_backend_answering() -> Self {
             Self {
                 answers: true,
+                hook_events: None,
                 ..Self::codex_backend()
             }
         }
@@ -1303,6 +1326,7 @@ pub mod fixture {
                 gateway: false,
                 volatile_forwarding: false,
                 answers: false,
+                hook_events: None,
             }
         }
     }
@@ -1324,6 +1348,7 @@ pub mod fixture {
             gateway: false,
             volatile_forwarding: false,
             answers: false,
+            hook_events: None,
         }
     }
 
@@ -1878,6 +1903,10 @@ pub mod fixture {
             // The answering table states `hidden_when`, which arrived in 0.1.7.
             manifest["sdk_range"] = serde_json::json!(">=0.1.7, <0.2.0");
         }
+        if shape.hook_events.is_some() {
+            // `hook_events` arrived in 0.1.8.
+            manifest["sdk_range"] = serde_json::json!(">=0.1.8, <0.2.0");
+        }
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
 
@@ -1944,6 +1973,15 @@ pub mod fixture {
             gateway_connector_json_for(&plugin_id, shape.volatile_forwarding)
         } else {
             connector_json_for(&plugin_id)
+        };
+        let connector = match &shape.hook_events {
+            Some(events) => {
+                let mut table: serde_json::Value =
+                    serde_json::from_str(&connector).expect("a literal table decodes");
+                table["hook_events"] = events.clone();
+                serde_json::to_string_pretty(&table).expect("a literal table encodes")
+            }
+            None => connector,
         };
         package_with_connector(root, forwarder, shape, connector)
     }

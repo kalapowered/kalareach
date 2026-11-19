@@ -1468,6 +1468,13 @@ impl CommandBackends {
         let credential = Credential::generate()?;
         let credential_path = directory.join(crate::broker::attach::CREDENTIAL_FILE);
         credential.write_file(&credential_path)?;
+        // The hook events the package declares go beside the credential before any registration
+        // exists. A launch whose map cannot be written is not made: the registration would
+        // otherwise name no map, and the forwarder would read the application's hooks as Claude
+        // Code's.
+        if let Some(events) = connector.hook_events() {
+            publish_hook_events(&directory, events)?;
+        }
         // The variables the connector's verified manifest declares, in its order, which the
         // launcher sets only once the launch is committed.
         let variables: &[EnvironmentVariable] = connector
@@ -1831,6 +1838,7 @@ impl Backend {
             return;
         }
         let _ = std::fs::remove_file(self.directory.join(crate::broker::attach::CREDENTIAL_FILE));
+        let _ = std::fs::remove_file(self.directory.join(crate::broker::attach::EVENTS_FILE));
         let _ = std::fs::remove_file(&self.registration);
         let _ = std::fs::remove_file(self.directory.join(LAUNCH_RECORD_FILE));
         if let crate::broker::listener::ListenerAddress::PrivateSocket(socket) =
@@ -2856,6 +2864,33 @@ async fn continue_launch(
     }
 }
 
+/// Writes the hook events a package declares beside a launch's credential, owner-only.
+///
+/// # Errors
+///
+/// Returns [`BrokerError`] when the events cannot be encoded or the file cannot be written.
+fn publish_hook_events(
+    directory: &Path,
+    events: &kr_plugin_sdk::hook_events::HookEvents,
+) -> Result<()> {
+    let bytes = serde_json::to_vec(events).map_err(|error| {
+        BrokerError::ledger(format!("could not encode the hook events: {error}"))
+    })?;
+    kr_ipc::paths::write_owner_only_file(
+        &directory.join(crate::broker::attach::EVENTS_FILE),
+        &bytes,
+    )
+    .map_err(|error| BrokerError::ledger(format!("could not write the hook events: {error}")))
+}
+
+/// The file of hook events a backend's launch wrote, when its package declares some.
+fn events_of(backend: &Backend) -> Option<PathBuf> {
+    backend
+        .connector
+        .hook_events()
+        .map(|_| backend.directory.join(crate::broker::attach::EVENTS_FILE))
+}
+
 /// Binds the registered launch to its package, makes the directory's grant where one can be made,
 /// and publishes the registration, which names the program.
 #[cfg(windows)]
@@ -2893,7 +2928,8 @@ async fn finish_binding(
         backend
             .directory
             .join(crate::broker::attach::CREDENTIAL_FILE),
-    );
+    )
+    .with_events(events_of(backend));
     let published = format!("{}framing=json_lines\n", registration.to_file());
     kr_ipc::paths::write_owner_only_file(&backend.registration, published.as_bytes()).map_err(
         |error| BrokerError::ledger(format!("could not write the registration: {error}")),
@@ -3000,7 +3036,8 @@ async fn admit_claimed<'a>(
         backend
             .directory
             .join(crate::broker::attach::CREDENTIAL_FILE),
-    );
+    )
+    .with_events(events_of(backend));
     let published = format!("{}framing=json_lines\n", registration.to_file());
     let registration_path = &backend.registration;
     kr_ipc::paths::write_owner_only_file(registration_path, published.as_bytes()).map_err(

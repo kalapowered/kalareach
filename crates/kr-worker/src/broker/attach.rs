@@ -50,6 +50,10 @@ pub const REGISTRATION_FILE: &str = "registration";
 /// The owner-only file beside the registration that holds a launch's private exchange.
 pub const CREDENTIAL_FILE: &str = "credential";
 
+/// The owner-only file beside the registration that holds the hook events a launch's package
+/// declares, written before the registration is published and named by its `events` line.
+pub const EVENTS_FILE: &str = "hook-events.json";
+
 /// How long a connection's own writes are given to finish once both ends have stopped reading.
 pub const TEARDOWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -472,6 +476,21 @@ impl NativeGateway {
     #[must_use]
     pub const fn with_teardown_deadline(mut self, teardown: std::time::Duration) -> Self {
         self.teardown = teardown;
+        self
+    }
+
+    /// Names the file of hook events the launch wrote beside its registration, which the
+    /// registration this gateway renders then names.
+    ///
+    /// It exists so that this host's own tests can launch a stand-in application whose package
+    /// declares hook events through this gateway's registration. It is compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn with_events(mut self, events: std::path::PathBuf) -> Self {
+        if let Some(registration) = self.registration.take() {
+            let _ = self.registration.set(registration.with_events(Some(events)));
+        }
         self
     }
 

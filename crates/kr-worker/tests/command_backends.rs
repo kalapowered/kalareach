@@ -376,6 +376,59 @@ async fn kr_req_12_07_an_integrated_invocation_gets_a_backend_that_exists_before
     );
 }
 
+/// KR-REQ-11.44: a launch of a package that declares hook events writes them beside the credential,
+/// owner-only, before any registration exists, and a launch of one that declares none writes no
+/// file.
+#[tokio::test]
+async fn kr_req_11_44_a_launch_publishes_the_hook_events_its_package_declares() {
+    let place = |names: &[&str]| {
+        serde_json::json!({"segments": names.iter()
+            .map(|name| serde_json::json!({"type": "member", "name": name}))
+            .collect::<Vec<_>>()})
+    };
+    let declared = serde_json::json!({
+        "event": place(&["event", "name"]),
+        "thread": place(&["thread", "id"]),
+        "events": [{"name": "session_open", "report": "session_started"}],
+    });
+    let setup = Setup::shaped(
+        &fixture::Shape {
+            hook_events: Some(declared.clone()),
+            ..fixture::Shape::claude_code()
+        },
+        &["bin", "claude"],
+        |config| config,
+    );
+    let answer = setup
+        .backends
+        .establish(&request(&setup, &invocation(&["claude", "--resume"]), &Setup::integration(), 5))
+        .expect("a backend is established");
+    let registration = PathBuf::from(&answer.environment[0].value);
+    let directory = registration.parent().expect("the backend's directory");
+    let written = kr_ipc::paths::read_owner_only_file(&directory.join("hook-events.json"), 16 * 1024)
+        .expect("the events are owner-only")
+        .expect("the events are there");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&written).expect("JSON"),
+        declared
+    );
+    assert!(!registration.exists(), "the events come before any registration");
+
+    let plain = Setup::new();
+    let answer = plain
+        .backends
+        .establish(&request(&plain, &invocation(&["claude", "--resume"]), &Setup::integration(), 5))
+        .expect("a backend is established");
+    let directory = PathBuf::from(&answer.environment[0].value)
+        .parent()
+        .expect("the backend's directory")
+        .to_path_buf();
+    assert!(
+        !directory.join("hook-events.json").exists(),
+        "a package that declares none has no file"
+    );
+}
+
 /// KR-REQ-12.07: a backend is established where a Mac's default runtime directory puts it: the
 /// socket path its directories and endpoint add below that directory fits the 103 bytes a socket
 /// path may have on macOS, so the endpoint binds and the answer is not a bypass.
