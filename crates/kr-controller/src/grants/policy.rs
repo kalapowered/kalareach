@@ -1703,9 +1703,7 @@ impl HostPolicy {
             return (LocalOwnerBound::Open, None);
         }
         let live = self.enrolments.values().filter_map(|enrolment| {
-            let (_, held) = enrolment
-                .lease_for_device(host_device, now, now_ms)
-                .ok()?;
+            let (_, held) = enrolment.lease_for_device(host_device, now, now_ms).ok()?;
             let continuous = held.snapshot().continuous_deadline?;
             let utc_ms = held.snapshot().utc_deadline_ms?;
             Some((continuous, utc_ms, held))
@@ -2202,5 +2200,129 @@ mod one_snapshot_of_each_bound {
             "and the renewal's own signed expiry is its UTC end"
         );
         assert!(matches!(published.identity, BoundIdentity::Lease(_)));
+    }
+
+    /// A policy that is exclusively managed and enrolled in the organisations named by their
+    /// first byte, in order, holding for `host` a lease in each. Each lease is given as the first
+    /// byte of its organisation, the UTC time it was issued and the UTC reading it is presented
+    /// at, all at the continuous reading the clock gives now. Returns the policy, with its leases
+    /// published, and the ends each lease has as the case works them out: its signed expiry, and
+    /// the time it has left from the later of the reading and its issue, never more than the
+    /// longest a lease lives, less the margin installation takes off, laid over the continuous
+    /// clock.
+    fn host_holding(
+        clock: &ManualClock,
+        host: DeviceId,
+        leases: &[(u8, u64, u64)],
+    ) -> (
+        HostPolicy,
+        Vec<(kr_transport::clock::ContinuousInstant, u64)>,
+    ) {
+        use crate::grants::organisation::LEASE_CLOCK_MARGIN_MS;
+        use kr_protocol::account::MEMBERSHIP_LEASE_MAX_LIFETIME_MS as LIFETIME_MS;
+
+        let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+        let key = AuthorisationKeyPair::generate().expect("a key");
+        let account = AccountId::new("ada").expect("an account");
+        let mut ends = Vec::new();
+        for &(byte, issued_ms, reading_ms) in leases {
+            let organisation = TestOrganisation::new(byte, NOW_MS - 60 * 60 * 1000);
+            let verified = policy
+                .verify_enrolment(
+                    &organisation.authority(reading_ms),
+                    Some(&reading(reading_ms)),
+                )
+                .expect("the chain verifies");
+            let revision = policy.authority_revision();
+            policy.enrol(verified, revision).expect("the host enrols");
+            let lease = organisation.lease(
+                &account,
+                *key.public(),
+                issued_ms,
+                &[ActionRight::SessionView],
+            );
+            let before = policy.clone();
+            policy
+                .install_lease(LeasePresentation {
+                    lease: &lease,
+                    device_id: host,
+                    proven_key: key.public(),
+                    reading: Some(reading(reading_ms)),
+                    now: clock.now(),
+                    generation: ControllerGeneration::new(1),
+                })
+                .expect("the lease installs");
+            policy.publish_leases(&before);
+            let left_ms = (issued_ms + LIFETIME_MS)
+                .saturating_sub(reading_ms.max(issued_ms))
+                .min(LIFETIME_MS)
+                - LEASE_CLOCK_MARGIN_MS;
+            ends.push((
+                clock
+                    .now()
+                    .checked_add(Duration::from_millis(left_ms))
+                    .expect("an instant"),
+                issued_ms + LIFETIME_MS,
+            ));
+        }
+        policy.set_exclusively_managed(true);
+        (policy, ends)
+    }
+
+    /// KR-REQ-24.15: of the live leases of the host's own key, the one that ends last on the
+    /// continuous clock answers, and the later UTC end decides a tie; the two ends are the same
+    /// lease's, never combined from two. Both the cells' answer and the published standing's give
+    /// the whole value, with the enrolments' identifiers chosen so that the lease that ends first
+    /// on the continuous clock is visited first, and, in the tie, the one with the earlier UTC end.
+    #[test]
+    fn the_local_owner_bound_is_the_lease_that_ends_last() {
+        let clock = ManualClock::new();
+        let host = DeviceId::new(kr_ipc::new_uuid());
+        let now = clock.now();
+
+        // The first lease ends earlier on the continuous clock and later in UTC; the second ends
+        // last on the continuous clock.
+        let (policy, ends) = host_holding(
+            &clock,
+            host,
+            &[
+                (0x41, NOW_MS + 100_000, NOW_MS + 300_000),
+                (0x42, NOW_MS, NOW_MS),
+            ],
+        );
+        assert!(ends[0].0 < ends[1].0 && ends[0].1 > ends[1].1, "{ends:?}");
+        let expected = super::LocalOwnerBound::Until {
+            continuous: ends[1].0,
+            utc_ms: ends[1].1,
+        };
+        let now_ms = NOW_MS + 300_000;
+        assert_eq!(policy.local_owner_bound(host, now, now_ms), expected);
+        assert_eq!(
+            policy.local_owner_standing(host).bound(now, now_ms),
+            expected
+        );
+
+        // Both end together on the continuous clock; the one that ends later in UTC answers, and
+        // the lease that is visited first is the one with the earlier UTC end.
+        let (policy, ends) = host_holding(
+            &clock,
+            host,
+            &[
+                (0x41, NOW_MS, NOW_MS),
+                (0x42, NOW_MS + 200_000, NOW_MS + 200_000),
+            ],
+        );
+        assert_eq!(ends[0].0, ends[1].0, "{ends:?}");
+        assert!(ends[0].1 < ends[1].1, "{ends:?}");
+        let expected = super::LocalOwnerBound::Until {
+            continuous: ends[1].0,
+            utc_ms: ends[1].1,
+        };
+        let now_ms = NOW_MS + 200_000;
+        assert_eq!(policy.local_owner_bound(host, now, now_ms), expected);
+        assert_eq!(
+            policy.local_owner_standing(host).bound(now, now_ms),
+            expected
+        );
     }
 }
