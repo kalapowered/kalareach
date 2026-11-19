@@ -138,6 +138,7 @@ async fn the_network_setup_reaches_its_rendezvous_through_the_proxy_its_document
     let setup = NetworkSetup::from_configuration(
         &network,
         std::sync::Arc::new(kr_crypto::store::MemoryStore::new()),
+        Some(proxy.url.parse().expect("a proxy address")),
     )
     .expect("a usable selection")
     .expect("a host on the network");

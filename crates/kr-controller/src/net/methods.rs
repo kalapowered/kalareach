@@ -357,17 +357,23 @@ impl Controller {
                 if matches!(params.subject, ConfirmationSubject::EstablishClock) {
                     let owner = Arc::clone(&self.owner);
                     let on_the_network = self.network_guard().is_some();
+                    let stopped = self.proxy_login_stop_clause();
                     return blocking(move || {
                         // A host that has an owner is confirmed by an owner device, and a device
                         // reaches a host only over its network: asking would leave a challenge
                         // nobody can answer.
                         if !on_the_network && owner.enrolment()? == HostEnrolment::Enrolled {
-                            return Err(ControllerError::NotConfigured(
-                                "this host has an owner, whose device is the only thing that can \
-                                 confirm its clock, and it is not on the network; select a \
-                                 network and restart it"
+                            return Err(ControllerError::NotConfigured(match stopped {
+                                // The proxy stopped this host's network: the kind says why.
+                                Some(clause) => format!(
+                                    "this host has an owner, whose device is the only thing that \
+                                     can confirm its clock, and this host is not on the network: {clause}"
+                                ),
+                                None => "this host has an owner, whose device is the only thing \
+                                         that can confirm its clock, and it is not on the \
+                                         network; select a network and restart it"
                                     .to_owned(),
-                            ));
+                            }));
                         }
                         owner.request_clock(&caller, action, admission.as_ref(), &copied)
                     })

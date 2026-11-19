@@ -621,6 +621,17 @@ pub struct Controller {
     /// Both are built once, at startup, from the document on disk then, so these are what the
     /// daemon acts on until it next starts, and a later edit is reported as applying then.
     started: crate::config::Started,
+    /// What the check at the start found at the proxy. Set once, after the check; it stays unset
+    /// when the start made none, and then reads as no proxy.
+    proxy_start: std::sync::OnceLock<crate::config::ProxyStart>,
+    /// Whether the start skipped the network start for the proxy's sake.
+    proxy_skipped: std::sync::atomic::AtomicBool,
+    /// What changed in the stored login since the start, as a [`crate::config::ProxyChange`]
+    /// number. The last change stays until the next start.
+    proxy_changed: std::sync::atomic::AtomicU8,
+    /// The task that checks the proxy again when a request failed in a way that may be its
+    /// refusal. It ends with this daemon.
+    proxy_watch: std::sync::OnceLock<net::proxy_login::Watch>,
     /// The rights ceiling a paired device's every request is decided against, when one is in force.
     ///
     /// Seeded from the document this environment durably accepted, and replaced by every

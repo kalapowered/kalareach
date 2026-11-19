@@ -608,9 +608,10 @@ async fn an_address_the_document_chose_that_cannot_be_bound_is_named() {
         bind_address: Nullable::some(address.to_string()),
         ..kr_protocol::hostinfo::configuration::NetworkSelection::default()
     };
-    let settings = kr_controller::service::net::config::NetworkSettings::from_selection(&selection)
-        .expect("a usable selection")
-        .expect("this host joins");
+    let settings =
+        kr_controller::service::net::config::NetworkSettings::from_selection(&selection, None)
+            .expect("a usable selection")
+            .expect("this host joins");
     let refused = kr_controller::service::net::register(
         &controller,
         kr_controller::service::net::NetworkSetup {

@@ -594,7 +594,9 @@ impl Controller {
                 // device, and every method that needs the owner's confirmation (adopting a root, a
                 // grant, an installation that widens what a package may do) is then refused
                 // rather than performed under the identity of whoever asked.
-                let pairing = self.network.get().map(|guard| Arc::clone(guard.pairing()));
+                let pairing = self
+                    .network_guard()
+                    .map(|guard| Arc::clone(guard.pairing()));
                 let confirmations = pairing
                     .as_deref()
                     .map(|host| host as &dyn crate::sharing::OwnerConfirmations);

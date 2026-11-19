@@ -978,6 +978,7 @@ impl Controller {
                     crate::config::RunningNetwork::of(guard.endpoint(), guard.bound_sockets().len())
                 }),
                 names_a_broker: !self.voice().broker_origin().is_empty(),
+                proxy: self.proxy_reading(),
             },
         );
         drop(accepted);

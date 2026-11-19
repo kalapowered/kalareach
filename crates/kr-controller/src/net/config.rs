@@ -21,10 +21,15 @@ use kr_protocol::hostinfo::configuration::{
     self, NETWORK_BIND_ADDRESS, NETWORK_PKARR_PUBLISHER_URL, NETWORK_PKARR_RESOLVER_URL,
     NETWORK_PROXY_URL, NETWORK_RELAY_TRUST_ANCHORS, NETWORK_RELAY_URLS, NetworkSelection,
 };
+use std::sync::Arc;
+
+use kr_client::tunnel::ProxyTunnels;
 use kr_transport::config::{EndpointConfig, ProxyUrl, Url};
+use kr_transport::front::FrontOpener;
 use kr_transport::preauth::PreAuthLimits;
 use kr_transport::scheduler::SendLimits;
 
+use super::proxy_login;
 use crate::error::{ControllerError, Result};
 
 /// Everything this daemon's endpoint is built from.
@@ -58,7 +63,10 @@ impl NetworkSettings {
     /// # Errors
     ///
     /// Returns [`ControllerError::InvalidArgument`] naming the key whose value could not be used.
-    pub fn from_selection(selection: &NetworkSelection) -> Result<Option<Self>> {
+    pub fn from_selection(
+        selection: &NetworkSelection,
+        proxy: Option<ProxyUrl>,
+    ) -> Result<Option<Self>> {
         if !selection.joins() {
             return Ok(None);
         }
@@ -89,16 +97,38 @@ impl NetworkSettings {
         settings.endpoint.discovery.local_discovery = selection.local_discovery();
         settings.endpoint.discovery.mainline_dht = selection.mainline_dht();
         settings.endpoint.relay_ca_roots = read_trust_anchors(selection.relay_trust_anchors())?;
-        settings.endpoint.proxy_url = selection
-            .proxy_url()
-            .map(|value| {
-                value
-                    .parse::<ProxyUrl>()
-                    .map_err(|error| invalid(NETWORK_PROXY_URL.key, None, &error))
-            })
-            .transpose()?;
+        // A proxy that holds a login is never given to the network library: the endpoint starts a
+        // loopback front, and each tunnel the front opens is opened with the login by the one
+        // writer, over the same trust this host checks the proxy with.
+        if proxy.as_ref().is_some_and(|proxy| proxy.login().is_some()) {
+            let tls = proxy_login::proxy_tls(&settings.endpoint.relay_ca_roots)
+                .map_err(|error| invalid(NETWORK_PROXY_URL.key, None, &error))?;
+            if let Some(proxy) = proxy.clone() {
+                settings.endpoint.login_front =
+                    Some(FrontOpener(Arc::new(ProxyTunnels::new(proxy, tls))));
+            }
+        }
+        settings.endpoint.proxy_url = proxy;
         Ok(Some(settings))
     }
+}
+
+/// The proxy a configuration document's network section names, read once so that the endpoint and
+/// every other client of this host are built from the one address.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::InvalidArgument`] naming `network.proxy_url` when the address is not
+/// one this host can use as a proxy. The address itself is not repeated.
+pub(crate) fn proxy_of(selection: &NetworkSelection) -> Result<Option<ProxyUrl>> {
+    selection
+        .proxy_url()
+        .map(|value| {
+            value
+                .parse::<ProxyUrl>()
+                .map_err(|error| invalid(NETWORK_PROXY_URL.key, None, &error))
+        })
+        .transpose()
 }
 
 /// Reads the extra trust anchors a self-hosted relay's certificate is verified against.
@@ -109,7 +139,7 @@ impl NetworkSettings {
 /// cannot be read, or that is empty, is a configuration error rather than an anchor quietly left
 /// out: a relay the owner pinned and this host then failed to trust would look like a relay that
 /// is down.
-fn read_trust_anchors(paths: &[String]) -> Result<Vec<Vec<u8>>> {
+pub(crate) fn read_trust_anchors(paths: &[String]) -> Result<Vec<Vec<u8>>> {
     let mut anchors = Vec::with_capacity(paths.len());
     for (index, path) in paths.iter().enumerate() {
         let der = std::fs::read(path)
@@ -153,6 +183,12 @@ mod tests {
     use super::*;
     use kr_protocol::scalars::Nullable;
 
+    /// The settings a document's network section builds, with the proxy it names read as the
+    /// start reads it.
+    fn settings_of(selection: &NetworkSelection) -> Result<Option<NetworkSettings>> {
+        NetworkSettings::from_selection(selection, proxy_of(selection)?)
+    }
+
     fn joined(selection: NetworkSelection) -> NetworkSelection {
         NetworkSelection {
             enabled: Nullable::some(true),
@@ -162,7 +198,7 @@ mod tests {
 
     #[test]
     fn a_missing_trust_anchor_is_a_configuration_error_rather_than_no_anchor() {
-        let error = NetworkSettings::from_selection(&joined(NetworkSelection {
+        let error = settings_of(&joined(NetworkSelection {
             relay_trust_anchors: Nullable::some(vec!["/nonexistent/relay-ca.der".to_owned()]),
             ..NetworkSelection::default()
         }))
@@ -182,11 +218,7 @@ mod tests {
             relay_trust_anchors: Nullable::some(vec!["/nonexistent/relay-ca.der".to_owned()]),
             ..NetworkSelection::default()
         };
-        assert!(
-            NetworkSettings::from_selection(&selection)
-                .expect("nothing is read")
-                .is_none()
-        );
+        assert!(settings_of(&selection).expect("nothing is read").is_none());
     }
 
     /// KR-REQ-26.14: a document that validates never stops the daemon over an address's syntax.
@@ -242,7 +274,7 @@ mod tests {
                 continue;
             }
             accepted += 1;
-            let settings = NetworkSettings::from_selection(&document.network)
+            let settings = settings_of(&document.network)
                 .unwrap_or_else(|error| {
                     panic!("{address} validated and the endpoint refused it: {error}")
                 })
@@ -278,7 +310,7 @@ mod tests {
     /// KR-REQ-10.02: every selection reaches the endpoint it builds, the proxy included.
     #[test]
     fn every_selection_reaches_the_endpoint_it_builds() {
-        let settings = NetworkSettings::from_selection(&everything())
+        let settings = settings_of(&everything())
             .expect("a usable selection")
             .expect("this host joins");
         let endpoint = &settings.endpoint;
@@ -311,11 +343,11 @@ mod tests {
     /// and without it the endpoint has none.
     #[test]
     fn a_document_without_a_proxy_builds_the_endpoint_it_built_before() {
-        let with = NetworkSettings::from_selection(&everything())
+        let with = settings_of(&everything())
             .expect("a usable selection")
             .expect("this host joins")
             .endpoint;
-        let without = NetworkSettings::from_selection(&NetworkSelection {
+        let without = settings_of(&NetworkSelection {
             proxy_url: Nullable::null(),
             ..everything()
         })
@@ -351,7 +383,7 @@ mod tests {
             (format!("socks5://{secret}.example.com:1080"), false),
             (format!("{secret}.example.com:3128"), false),
         ] {
-            let error = NetworkSettings::from_selection(&joined(NetworkSelection {
+            let error = settings_of(&joined(NetworkSelection {
                 proxy_url: Nullable::some(value.clone()),
                 ..NetworkSelection::default()
             }))
@@ -407,7 +439,7 @@ mod tests {
                 continue;
             }
             accepted += 1;
-            let settings = NetworkSettings::from_selection(&document.network)
+            let settings = settings_of(&document.network)
                 .unwrap_or_else(|error| {
                     panic!("{address} validated and the endpoint refused it: {error}")
                 })

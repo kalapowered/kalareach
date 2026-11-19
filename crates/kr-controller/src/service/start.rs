@@ -447,7 +447,7 @@ impl Controller {
         // The network and the voice broker come from this same reading, and from nothing a
         // process inherited: section 26 keeps a provider origin out of reach of an environment
         // variable. They apply for as long as this daemon runs.
-        let started = crate::config::Started::of(startup_configuration.loaded());
+        let mut started = crate::config::Started::of(startup_configuration.loaded());
         drop(startup_configuration);
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
@@ -626,6 +626,25 @@ impl Controller {
         // opened once the policy is restored, because the adapters the organisations' policies
         // allow are in force from its first admission: a catalogue opened before them would admit
         // every adapter until something put the list in force.
+        let opened_store = setup
+            .secret_store
+            .open(
+                kr_ipc::verify::CONTROLLER_SECRET_SERVICE,
+                &setup.paths.secrets_dir(),
+                kr_crypto::store::KeyOwner::Host,
+            )
+            .map_err(ControllerError::registry)?;
+        let secret_store: Arc<dyn kr_crypto::store::SecretStore> = Arc::from(opened_store.store);
+        // The login the proxy is asked for is read now, with the store, before any client is built,
+        // so every client holds the one credential and the one verdict.
+        let document_proxy = net::config::proxy_of(&started.network).ok().flatten();
+        let (proxy_login, proxy_item) = net::proxy_login::read_item(
+            &*secret_store,
+            setup.environment_id,
+            document_proxy.as_ref(),
+        );
+        started.proxy_login = proxy_login;
+        started.proxy_item = proxy_item;
         let plugin_bridge = Arc::new(crate::catalogue::bridge::WorkerBridge::new(generation));
         // The budgets in force from the start, so the limits they set hold every package from
         // the catalogue's first check on, and the disable policy this reading decides, so the
@@ -743,15 +762,6 @@ impl Controller {
             .await?,
         );
         let (initial_desktop, initial_evidence) = resolved_desktop(in_force.worker_profile, &boot);
-        let opened_store = setup
-            .secret_store
-            .open(
-                kr_ipc::verify::CONTROLLER_SECRET_SERVICE,
-                &setup.paths.secrets_dir(),
-                kr_crypto::store::KeyOwner::Host,
-            )
-            .map_err(ControllerError::registry)?;
-        let secret_store: Arc<dyn kr_crypto::store::SecretStore> = Arc::from(opened_store.store);
         let device_keys = net::host_device_keys(&*secret_store, setup.environment_id)?;
         let host_authorisation_key = *device_keys.authorisation.public();
         // The owner authority is the host's, not the network's: the clock is established through
@@ -1203,6 +1213,10 @@ impl Controller {
                 }),
             )),
             started,
+            proxy_start: std::sync::OnceLock::new(),
+            proxy_skipped: std::sync::atomic::AtomicBool::new(false),
+            proxy_changed: std::sync::atomic::AtomicU8::new(0),
+            proxy_watch: std::sync::OnceLock::new(),
             account,
             storage_account,
             rights_ceiling,
@@ -1601,6 +1615,9 @@ impl Controller {
                 "this environment's configuration document could not be put into force: {problem}"
             )));
         }
+        // The proxy is asked once, here: after every refusal this start makes of its own document
+        // and before anything is sent through the proxy that this start does not own.
+        controller.check_proxy().await;
         controller.start_voice();
         // Every session the attention store reads: the live ones over their workers, and the ones
         // whose closure an earlier daemon recorded and which the store has not finished yet.
@@ -1726,9 +1743,34 @@ impl Controller {
         // What it joins is the configuration document's network section, read when this daemon
         // started: a selection that cannot be used stops the start with its key named, rather than
         // leaving a host that looks up and cannot be reached.
-        if let Some(setup) = net::NetworkSetup::from_configuration(
+        //
+        // A proxy that asked for a login this host does not hold, refused the one it holds or asks
+        // for a method this host does not send is not joined through: the daemon starts, serves its
+        // local socket and says why in the doctor.
+        let proxy = match Self::outbound_of(&controller.started)? {
+            crate::config::Outbound::Through(proxy) => Some(proxy),
+            _ => None,
+        };
+        let skipped = controller.started.network.joins()
+            && (matches!(
+                controller.proxy_start.get(),
+                Some(
+                    crate::config::ProxyStart::NeedsLogin
+                        | crate::config::ProxyStart::LoginRefused
+                        | crate::config::ProxyStart::SchemeUnsupported
+                )
+            ) || proxy
+                .as_ref()
+                .and_then(|proxy| proxy.login())
+                .is_some_and(|login| login.stopped().is_some()));
+        if skipped {
+            controller
+                .proxy_skipped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        } else if let Some(setup) = net::NetworkSetup::from_configuration(
             &controller.started.network,
             Arc::clone(controller.secret_store()),
+            proxy,
         )? {
             net::register(&controller, setup).await?;
         }
@@ -1744,6 +1786,66 @@ impl Controller {
         // fail.
         controller.start_backup_production();
         Ok(controller)
+    }
+
+    /// What this host reads of the login its proxy asks for, from live state: the start's check,
+    /// the verdict, whether the network endpoint finished closing and whether the stored login
+    /// changed since the start.
+    #[must_use]
+    pub(crate) fn proxy_reading(&self) -> crate::config::ProxyReading {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let login = self.started.proxy_login.as_ref();
+        crate::config::ProxyReading {
+            start: self.proxy_start.get().copied().unwrap_or_default(),
+            item: self.started.proxy_item,
+            stopped: login.is_some_and(|login| login.stopped().is_some()),
+            unsupported: login.is_some_and(kr_transport::proxy::ProxyCredential::unsupported),
+            closed: self
+                .network
+                .get()
+                .is_some_and(|network| network.proxy_closed()),
+            skipped: self.proxy_skipped.load(SeqCst),
+            registered: self.network.get().is_some(),
+            changed: match self.proxy_changed.load(SeqCst) {
+                1 => crate::config::ProxyChange::Stored,
+                2 => crate::config::ProxyChange::Cleared,
+                _ => crate::config::ProxyChange::None,
+            },
+        }
+    }
+
+    /// Asks the proxy once, with the login this host holds, and says what it answered.
+    ///
+    /// It runs only when the route goes through a proxy. The anchors are read only when the network
+    /// section joins, and a failed read, a deadline or an answer this host cannot read leaves the
+    /// state unchecked: the start then goes on as it would without the check, and a section that
+    /// joins still ends the start with the anchors' own error where the network starts. A host
+    /// that holds a login also starts the watch that checks again after a request fails in a way
+    /// that may be a refusal.
+    async fn check_proxy(self: &Arc<Self>) {
+        let Ok(crate::config::Outbound::Through(proxy)) = Self::outbound_of(&self.started) else {
+            return;
+        };
+        let timing = net::proxy_login::timing_of_the_start();
+        let anchors = net::proxy_login::read_anchors(&self.started.network);
+        let tls = anchors
+            .as_ref()
+            .ok()
+            .and_then(|anchors| net::proxy_login::proxy_tls(anchors).ok());
+        let state = match (net::proxy_login::start_target(&self.started), &tls) {
+            (None, _) => crate::config::ProxyStart::NoTarget,
+            (Some(_), None) => crate::config::ProxyStart::Unchecked,
+            (Some(target), Some(tls)) => {
+                net::proxy_login::check(&proxy, &target, tls, timing.deadline).await
+            }
+        };
+        let _ = self.proxy_start.set(state);
+        if let Some(tls) = tls
+            && let Some(watch) = net::proxy_login::Watch::start(proxy, tls, timing)
+        {
+            let _ = self.proxy_watch.set(watch);
+        }
     }
 
     /// Starts the watch that ends the push destination of every device that is no longer paired,
@@ -1924,27 +2026,13 @@ impl Controller {
         if let Some(unusable) = &started.unusable {
             return Ok(Outbound::Closed(unusable.outbound_refusal()));
         }
-        Ok(
-            match started
-                .network
-                .proxy_url()
-                .map(|value| {
-                    value
-                        .parse()
-                        .map_err(|error: kr_transport::config::ProxyUrlError| {
-                            ControllerError::InvalidArgument(format!(
-                                "network.proxy_url in this host's configuration document ({}) is \
-                                 not usable: {error}",
-                                kr_protocol::hostinfo::configuration::FILE_NAME
-                            ))
-                        })
-                })
-                .transpose()?
-            {
-                Some(proxy) => Outbound::Through(proxy),
-                None => Outbound::Direct,
-            },
-        )
+        Ok(match net::config::proxy_of(&started.network)? {
+            Some(proxy) => Outbound::Through(match &started.proxy_login {
+                Some(login) => proxy.with_login(login.clone()),
+                None => proxy,
+            }),
+            None => Outbound::Direct,
+        })
     }
 
     /// Closes every session recorded in an earlier boot.

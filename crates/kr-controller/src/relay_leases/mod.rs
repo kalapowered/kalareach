@@ -1097,6 +1097,17 @@ async fn reconcile(
     running: &Running,
     controller: &Arc<Controller>,
 ) -> Result<Report> {
+    // An ended endpoint, or one the proxy's refusal is ending, is asked nothing and asks the lease
+    // service nothing: no lease is paid for or asked of a relay that nothing can reach.
+    if running.relays.stopped() {
+        return Ok(Report {
+            next: Next::Due(POLL_INTERVAL),
+            asked: false,
+            refused_an_ending: false,
+            met_a_standing: false,
+            relay_look: None,
+        });
+    }
     let now = controller.wall_now_ms();
     let holds = *shared.holds();
     let timer_now = shared.timer.now();
