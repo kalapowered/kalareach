@@ -4251,14 +4251,6 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                 &mut servers,
             );
 
-            // The pinned program's file is given other bytes while the first process, which holds
-            // the file it started from, goes on: evidence of its binary that is read from the file at
-            // the path is not that of the program that runs. The file is put back after the
-            // evidence is read.
-            let swapped = matches!(ctx.route, Route::StandIn).then(|| {
-                SwappedProgram::swap(&ctx.executable)
-                    .unwrap_or_else(|why| panic!("the pinned program is swapped: {why}"))
-            });
             // The second instance, read right after its launch and before any turn is charged: what
             // the host announces for it, its capabilities, and the program the launch typed.
             let second_read = ctx.instances_within(
@@ -4432,15 +4424,37 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                 (Route::StandIn, None) => panic!("the stand-in route holds the first approval"),
             };
 
-            // Reads for the assertions.
-            let after = capability_identity(ctx, &session.remote, first_session, instance);
-            if let Some(swapped) = swapped {
-                let restored = swapped.restore();
+            // On the stand-in route nothing of step 8 makes the host renew its evidence of the first
+            // instance, and that evidence is what the capabilities read returns. The first terminal
+            // starts a new chat: the binding names another thread, which the host takes up by
+            // renewing its evidence of the program, as it does after the typed turn's reply on a
+            // real route. The path the profile names holds the newer program by now, so evidence
+            // renewed from the file at that path is not that of the program that runs.
+            if matches!(ctx.route, Route::StandIn) {
+                let named = ctx.read_binding(&session.remote, first_session, instance);
                 assert!(
-                    restored.is_ok(),
-                    "the pinned program is put back: {restored:?}"
+                    named.is_ok(),
+                    "the first binding before the new chat: {named:?}"
+                );
+                let thread = thread_of(&named.expect("asserted above"));
+                assert!(thread.is_some(), "the first binding names a thread");
+                session.person.types("/new");
+                let moved = session.binding_within(
+                    instance,
+                    "the first binding names the new chat's thread",
+                    |binding| {
+                        thread_of(binding).is_some_and(|now| Some(&now) != thread.as_ref())
+                            && unsuspended(binding)
+                    },
+                );
+                assert!(
+                    moved.is_ok(),
+                    "the first terminal's new chat is the binding's thread: {moved:?}"
                 );
             }
+
+            // Reads for the assertions.
+            let after = capability_identity(ctx, &session.remote, first_session, instance);
             let cancel = second_summary.as_ref().map(|summary| {
                 ctx.cancels(
                     &second.remote,
@@ -5285,62 +5299,6 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
 // Part 8b: a forged credential fails at the check where the host's own registration for the same
 // launch passes.
 // ---------------------------------------------------------------------------------------------
-
-/// The pinned program's file with other bytes at its path, and the file itself kept beside it: a
-/// process that started from the file goes on with the file it holds, and the path names other bytes
-/// until [`SwappedProgram::restore`] (or the end of this value) puts the file back.
-struct SwappedProgram {
-    path: PathBuf,
-    kept: PathBuf,
-    put_back: bool,
-}
-
-impl SwappedProgram {
-    /// Keeps `path`'s file under another name by a link, and renames a file of other bytes over `path`.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the file was not swapped.
-    fn swap(path: &Path) -> Result<Self, String> {
-        let name = path
-            .file_name()
-            .ok_or_else(|| "the program has no name".to_owned())?
-            .to_string_lossy()
-            .into_owned();
-        let kept = path.with_file_name(format!("{name}.kept"));
-        let other = path.with_file_name(format!("{name}.other"));
-        std::fs::hard_link(path, &kept)
-            .map_err(|error| format!("the file is not kept: {error}"))?;
-        std::fs::write(&other, b"another program")
-            .map_err(|error| format!("the other bytes are not written: {error}"))?;
-        std::fs::rename(&other, path)
-            .map_err(|error| format!("the other bytes are not put at the path: {error}"))?;
-        Ok(Self {
-            path: path.to_owned(),
-            kept,
-            put_back: false,
-        })
-    }
-
-    /// Puts the file back, as it was and by the same name.
-    ///
-    /// # Errors
-    ///
-    /// Returns why the file was not put back.
-    fn restore(mut self) -> Result<(), String> {
-        self.put_back = true;
-        std::fs::rename(&self.kept, &self.path)
-            .map_err(|error| format!("the file is not put back: {error}"))
-    }
-}
-
-impl Drop for SwappedProgram {
-    fn drop(&mut self) {
-        if !self.put_back {
-            let _ = std::fs::rename(&self.kept, &self.path);
-        }
-    }
-}
 
 /// What the launch typed in the 8b case showed.
 struct Presented {
