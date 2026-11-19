@@ -66,13 +66,18 @@ pub fn binding(number: u8) -> BrokerBindingId {
 
 /// Registers one launched instance on a broker, as the command backend's launch does.
 pub fn register(broker: &Broker, number: u8) {
+    register_with_digest(broker, number, Digest256::from_bytes([3; 32]));
+}
+
+/// The same, for a launch that hashed the executable to `executable_digest`.
+pub fn register_with_digest(broker: &Broker, number: u8, executable_digest: Digest256) {
     let managed = ManagedProcess::new(
         instance(number),
         launched(number),
         TransportHandle {
             transport: BrokerTransport::PrivateSocket,
             application_instance_id: instance(number),
-            executable_digest: Digest256::from_bytes([3; 32]),
+            executable_digest,
             process: launched(number),
         },
         Credential::from_bytes([9; 32]),

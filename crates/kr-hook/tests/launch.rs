@@ -35,6 +35,13 @@ use kr_worker::persistence::JournalHealth;
 /// What the program writes the moment it starts, whether it runs a hook, and whether it stays until
 /// its test writes the file `HOLD_UNTIL` names.
 ///
+/// With `CHANNEL_REQUEST` set the program plays Claude Code to the channel server it starts after
+/// its first hook: it sends the three lines of Claude Code's handshake and one relayed approval,
+/// the request once the server has declared the Channels capability, and keeps the server's input
+/// open until its test writes the file `CHANNEL_END` names. With `EXEC_AFTER` set it waits for that
+/// file before its second hook or its exec, and with `THEN_HOLD` set the program it execs stays
+/// until that file exists.
+///
 /// Each file it waits for is one its test writes, and it waits for one for at least as long as the
 /// launcher waits at a test's barrier (6000 polls, each at least 20 ms): a test that stops before
 /// it writes the file would otherwise leave its program polling for as long as the machine runs.
@@ -50,6 +57,14 @@ const SCRIPT: &str = r#"report="$REPORT"
 await_file() {
   polls=0
   while [ ! -f "$1" ]; do
+    polls=$((polls + 1))
+    [ "$polls" -le 6000 ] || exit 3
+    sleep 0.02
+  done
+}
+await_text() {
+  polls=0
+  until grep -q -F -e "$2" "$1" 2>/dev/null; do
     polls=$((polls + 1))
     [ "$polls" -le 6000 ] || exit 3
     sleep 0.02
@@ -78,13 +93,22 @@ if [ -n "$HOOK" ]; then
   fi
   run_hook "$HOOK_EVENT" "$report.hook"
   echo done > "$report.hooked"
+  if [ -n "$CHANNEL_REQUEST" ]; then
+    {
+      printf '%s\n' "$CHANNEL_INITIALIZE"
+      await_text "$report.channel" '"claude/channel"'
+      printf '%s\n' "$CHANNEL_INITIALIZED" "$CHANNEL_REQUEST"
+      await_file "$CHANNEL_END"
+    } 2> /dev/null | "$HOOK" claude-code channel > "$report.channel" 2> "$report.channel.err" &
+  fi
+  if [ -n "$EXEC_AFTER" ]; then await_file "$EXEC_AFTER"; fi
   if [ -n "$AGAIN_AFTER" ]; then
     await_file "$AGAIN_AFTER"
     run_hook "$HOOK_EVENT_2" "$report.hook2"
     echo done > "$report.hooked2"
   fi
   if [ -n "$THEN_EXEC" ]; then
-    exec "$THEN_EXEC" -c "$hook_loop"'; echo done > "$REPORT.hooked2"; sleep 1; exit 0' other "$HOOK_EVENT_2" "$REPORT.hook2"
+    exec "$THEN_EXEC" -c "$hook_loop"'; echo done > "$REPORT.hooked2"; polls=0; while [ -n "$THEN_HOLD" ] && [ ! -f "$THEN_HOLD" ] && [ "$polls" -le 6000 ]; do polls=$((polls + 1)); sleep 0.02; done; sleep 1; exit 0' other "$HOOK_EVENT_2" "$REPORT.hook2"
   fi
 fi
 if [ -n "$HOLD_UNTIL" ]; then await_file "$HOLD_UNTIL"; fi
@@ -204,6 +228,79 @@ fn wait_stopped(pid: u32) {
     });
 }
 
+/// The digest of the program's bytes, which a launch hashes.
+fn program_digest() -> kr_protocol::scalars::Digest256 {
+    use sha2::Digest as _;
+
+    let bytes = std::fs::read(shells().0).expect("the program's bytes");
+    kr_protocol::scalars::Digest256::from_bytes(sha2::Sha256::digest(bytes).into())
+}
+
+/// Adds to an installation the signed qualification record that names the program's digest.
+fn qualify_the_program(
+    mut source: kr_worker::broker::connectors::ConnectorSource,
+) -> kr_worker::broker::connectors::ConnectorSource {
+    source
+        .qualified
+        .push(kr_worker::broker::connectors::QualifiedExecutable {
+            digest: program_digest(),
+            version: fixture::QUALIFIED_VERSION.to_owned(),
+        });
+    source
+}
+
+/// The variables that make the program play Claude Code to its channel server: the three lines of
+/// the handshake and the approval it relays, which the channel's server reads from its input.
+fn channel_variables() -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "CHANNEL_INITIALIZE",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "claude-code", "version": fixture::QUALIFIED_VERSION},
+                },
+            })
+            .to_string(),
+        ),
+        (
+            "CHANNEL_INITIALIZED",
+            serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                .to_string(),
+        ),
+        (
+            "CHANNEL_REQUEST",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/claude/channel/permission_request",
+                "params": {
+                    "request_id": "abcde",
+                    "tool_name": "Bash",
+                    "description": "Run shell command",
+                    "input_preview": "ls -la",
+                },
+            })
+            .to_string(),
+        ),
+    ]
+}
+
+/// The record an instance holds about its approval capability, where it holds one.
+fn approval_record(
+    shell: &Shell,
+    instance: ApplicationInstanceId,
+) -> Option<kr_protocol::broker::InstanceCapabilityRecord> {
+    shell
+        .broker
+        .capabilities(instance)
+        .record(&kr_protocol::ids::CapabilityId::new("agent.approval").expect("valid"))
+        .cloned()
+}
+
 /// The instance a program's report names.
 fn instance_of(report: &BTreeMap<String, String>) -> ApplicationInstanceId {
     report["registration.instance"]
@@ -246,6 +343,17 @@ impl Shell {
     /// A shell whose session has an attached view, which the backends announce to.
     fn viewed() -> Self {
         Self::with_source(|source| source, true)
+    }
+
+    /// A shell whose connector's signed qualification record names the program every case here
+    /// launches, so that a channel of the launched program is served.
+    fn qualified() -> Self {
+        Self::with_source(qualify_the_program, false)
+    }
+
+    /// The same, with an attached view that hears the launches' announcements.
+    fn qualified_viewed() -> Self {
+        Self::with_source(qualify_the_program, true)
     }
 
     /// A shell whose connector is the released Gemini CLI package's: it adds no flag and declares
@@ -2799,6 +2907,189 @@ fn kr_req_12_07_a_refused_bridge_is_announced_with_its_reason() {
         ended.instance.refusal.as_ref(),
         Some(&why),
         "the refusal stands to the end"
+    );
+}
+
+/// KR-REQ-11.17: a program whose channel relayed an approval, and which then execs other code, has
+/// the evidence withdrawn when its next bridge is refused: the join from the refused bridge to the
+/// broker is the product's own.
+///
+/// The program's channel is served from the program's own launch, so the approval it relays is
+/// recorded as evidence by the product's writer. The record is read after the other program's
+/// hook has been refused, and the other program stays until the record has been read.
+#[test]
+fn kr_req_11_17_a_program_that_execs_other_code_has_its_evidence_withdrawn() {
+    let shell = Shell::qualified();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (_, another) = shells();
+    let second = SESSION_START.replace(THREAD, SECOND_THREAD);
+    let then_exec = another.display().to_string();
+    let root = shell.placed.host.root().to_path_buf();
+    let exec_after = root.join("go-exec").display().to_string();
+    let then_hold = root.join("hold-exec").display().to_string();
+    let channel_end = root.join("end-channel").display().to_string();
+    let mut env = vec![
+        ("HOOK", hook),
+        ("HOOK_EVENT", SESSION_START.to_owned()),
+        ("HOOK_EVENT_2", second),
+        ("THEN_EXEC", then_exec),
+        ("EXEC_AFTER", exec_after.clone()),
+        ("THEN_HOLD", then_hold.clone()),
+        ("CHANNEL_END", channel_end.clone()),
+    ];
+    env.extend(channel_variables());
+    let env: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    let answer = shell.establish();
+    let child = shell.launch(&answer, "withdrawn", &env);
+    let instance = instance_of(&shell.report("withdrawn"));
+    hooked(&shell, "withdrawn");
+    assert_eq!(
+        selected(&shell, instance).as_deref(),
+        Some(THREAD),
+        "the program's own hook is admitted"
+    );
+    eventually(
+        "the channel's relayed approval is recorded as evidence",
+        || approval_record(&shell, instance).is_some_and(|record| record.state.is_usable()),
+    );
+    let before = approval_record(&shell, instance).expect("the evidence is held");
+    assert_eq!(
+        before.state,
+        kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable
+    );
+    assert_eq!(
+        before.source,
+        kr_protocol::broker::InstanceEvidenceSource::LiveBinding
+    );
+    assert_eq!(before.identity.binary_digest.0, Some(program_digest()));
+
+    std::fs::write(&exec_after, "").expect("the program may exec");
+    eventually("the other program's hook has run", || {
+        shell.reports.join("withdrawn.hooked2").exists()
+    });
+    let after = approval_record(&shell, instance).expect("the record is still held");
+    assert_eq!(
+        after.state,
+        kr_protocol::broker::InstanceCapabilityState::NotTested,
+        "the evidence the program's channel gave is withdrawn when its next bridge is refused"
+    );
+    assert_eq!(
+        after.source,
+        kr_protocol::broker::InstanceEvidenceSource::HostProbe
+    );
+    assert!(
+        after
+            .disabled_reason
+            .0
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with(
+                "the host cannot confirm that the program still runs the code it checked"
+            )),
+        "the record says why: {:?}",
+        after.disabled_reason
+    );
+    assert_eq!(
+        after.revision.get(),
+        before.revision.get() + 1,
+        "the withdrawal is the next revision of the record"
+    );
+    std::fs::write(&then_hold, "").expect("the other program may end");
+    std::fs::write(&channel_end, "").expect("the channel may end");
+    let _ = finish(child);
+}
+
+/// KR-REQ-11.17: an installed upgrade of the executable while the program runs leaves the evidence
+/// of the running program as it was, on Linux and on macOS: the running process keeps the identity
+/// it was pinned to, so no bridge of it is refused and nothing is withdrawn.
+///
+/// The second hook is a notification, which selects no thread, so a record that stays as it was
+/// stays because nothing was refused and not because nothing was asked. On Linux the running file
+/// is replaced at its path; on macOS the path's link is pointed at another program.
+#[test]
+fn kr_req_11_17_an_installed_upgrade_spares_the_evidence_of_a_running_pinned_program() {
+    let shell = Shell::qualified_viewed();
+    let hook = shell.placed.forwarder.display().to_string();
+    let (program, another) = shells();
+    let path = shell.placed.host.root().join("bin").join("upgraded");
+    if cfg!(target_os = "linux") {
+        kr_ipc::testing::place_program(program, &path);
+    } else {
+        std::os::unix::fs::symlink(program, &path).expect("the program");
+    }
+    let notification = serde_json::json!({
+        "session_id": THREAD,
+        "hook_event_name": "Notification",
+        "message": "Claude needs your permission",
+        "title": "Permission needed",
+        "notification_type": "permission_prompt",
+    })
+    .to_string();
+    let root = shell.placed.host.root().to_path_buf();
+    let again = root.join("go-upgraded").display().to_string();
+    let hold = root.join("hold-upgraded").display().to_string();
+    let channel_end = root.join("end-channel").display().to_string();
+    let mut env = vec![
+        ("HOOK", hook),
+        ("HOOK_EVENT", SESSION_START.to_owned()),
+        ("HOOK_EVENT_2", notification),
+        ("AGAIN_AFTER", again.clone()),
+        ("HOLD_UNTIL", hold.clone()),
+        ("CHANNEL_END", channel_end.clone()),
+    ];
+    env.extend(channel_variables());
+    let env: Vec<(&str, &str)> = env
+        .iter()
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect();
+    let answer = shell.establish_for(&path);
+    let mut command = shell.launcher(&path, &Shell::answered(), None);
+    shell.prepare(&mut command, Some(&answer), "spared", &env);
+    let child = command.spawn().expect("the launcher starts");
+    let instance = instance_of(&shell.report("spared"));
+    let started = shell.announcement();
+    assert_eq!(started.instance.application_instance_id, instance);
+    hooked(&shell, "spared");
+    assert_eq!(
+        selected(&shell, instance).as_deref(),
+        Some(THREAD),
+        "the first hook is admitted"
+    );
+    eventually(
+        "the channel's relayed approval is recorded as evidence",
+        || approval_record(&shell, instance).is_some_and(|record| record.state.is_usable()),
+    );
+    let before = approval_record(&shell, instance).expect("the evidence is held");
+
+    if cfg!(target_os = "linux") {
+        let staged = path.with_extension("next");
+        kr_ipc::testing::place_program(another, &staged);
+        std::fs::rename(&staged, &path).expect("installed over the running one");
+    } else {
+        retarget(&path, another);
+    }
+    std::fs::write(&again, "").expect("the second hook may run");
+    eventually("the second hook has run", || {
+        shell.reports.join("spared.hooked2").exists()
+    });
+    assert_eq!(
+        approval_record(&shell, instance).as_ref(),
+        Some(&before),
+        "an installed upgrade leaves the running program's evidence exactly as it was"
+    );
+    std::fs::write(&hold, "").expect("the program may end");
+    std::fs::write(&channel_end, "").expect("the channel may end");
+    let _ = finish(child);
+    let ended = shell.announcement();
+    assert!(
+        ended.instance.ended_at.is_present(),
+        "the last announcement is the instance's end"
+    );
+    assert!(
+        ended.instance.refusal.as_ref().is_none(),
+        "no bridge of the running program was refused"
     );
 }
 
