@@ -2808,6 +2808,27 @@ async fn kr_req_11_44_a_release_whose_table_cannot_be_fetched_or_read_gets_a_ref
     }
 }
 
+/// KR-REQ-11.44: the publisher's words never hold the host's label for its reading of a placement,
+/// as they never hold the integration's: words that hold it are not shown.
+#[tokio::test]
+async fn kr_req_11_44_the_publishers_words_never_hold_the_placement_label() {
+    use kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL;
+    let words = "Changes one setting of the example agent.";
+    statement_of(words, true)
+        .await
+        .expect("the control is read")
+        .expect("a statement");
+    let imitation = format!("Harmless. {PLACEMENT_STATEMENT_LABEL} Reads nothing.");
+    let refusal = statement_of(&imitation, true)
+        .await
+        .expect_err("the publisher wrote the host's label");
+    assert!(
+        matches!(&refusal, CatalogueError::UnsafePackage { detail }
+            if detail.contains("before its own reading of a placement")),
+        "{refusal:?}"
+    );
+}
+
 /// KR-REQ-11.44: a release whose recipe adds a configuration key that is not the one the label's
 /// application reads is refused, and the refusal and every statement the host makes quote nothing
 /// of the key: the host's own labels inside a key never reach an owner under the host's caption.
