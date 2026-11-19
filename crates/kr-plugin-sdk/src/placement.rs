@@ -41,6 +41,11 @@ pub const MAX_SHAPE_DEPTH: usize = 8;
 /// Most bytes in a component of a directory, an area or a tail.
 pub const MAX_COMPONENT_BYTES: usize = 64;
 
+/// Most characters the host's reading of a placement may have: the text with every field at its
+/// largest (eight tails of three 64-byte components, a three-component directory, a 64-byte area,
+/// a 64-byte application label, a 128-byte folder name, the key and the record clause).
+pub const MAX_PLACEMENT_STATEMENT_CHARS: usize = 3_746;
+
 /// Most bytes the value may take when it is written as JSON.
 pub const MAX_SERIALISED_BYTES: usize = 16 * 1024;
 
@@ -125,25 +130,25 @@ pub enum Shape {
         max_bytes: u32,
     },
     /// True or false.
-    Boolean,
+    Boolean {},
     /// A number.
-    Number,
+    Number {},
     /// Text that is exactly this.
     Exact {
         /// The text.
         value: String,
     },
     /// Text that is the name of the plugin's folder.
-    DirectoryName,
+    DirectoryName {},
     /// Text that is `/dev/null/` and the name of the plugin's folder: where an application is told
     /// the plugin was installed from, which leads nowhere.
-    RecordPath,
+    RecordPath {},
     /// A hook handler that runs a command: `type` `command`, the command, and a name, arguments
     /// and a time limit. The command is the forwarder, in the placement's command form.
-    CommandHandler,
+    CommandHandler {},
     /// A server that starts a program with a command: an optional `type` `stdio`, the command and
     /// its arguments. The command is the forwarder, in the placement's command form.
-    StdioServer,
+    StdioServer {},
 }
 
 /// One member of an object shape.
@@ -193,6 +198,10 @@ pub enum PlacementRefusal {
     NameCheckBad,
     /// The placement written as JSON is over 16 KiB.
     TooLarge,
+    /// The application's label is not one plain component, so it cannot be quoted in the reading.
+    ApplicationNotPlain,
+    /// The host's reading of the placement is longer than an owner is shown whole.
+    StatementTooLong,
 }
 
 impl PlacementRefusal {
@@ -213,6 +222,8 @@ impl PlacementRefusal {
             Self::TextNamesAPlace => "placement.text_names_a_place",
             Self::NameCheckBad => "placement.name_check_bad",
             Self::TooLarge => "placement.too_large",
+            Self::ApplicationNotPlain => "placement.application_not_plain",
+            Self::StatementTooLong => "placement.statement_too_long",
         }
     }
 }
@@ -288,7 +299,7 @@ fn manifest_shape(members: &[&str], with_channels: bool) -> Shape {
     let mut held = vec![ShapeMember {
         name: "name".to_owned(),
         required: true,
-        shape: Shape::DirectoryName,
+        shape: Shape::DirectoryName {},
     }];
     for member in members {
         held.push(ShapeMember {
@@ -314,7 +325,7 @@ fn manifest_shape(members: &[&str], with_channels: bool) -> Shape {
         held.push(ShapeMember {
             name: "defaultEnabled".to_owned(),
             required: false,
-            shape: Shape::Boolean,
+            shape: Shape::Boolean {},
         });
     }
     Shape::Object { members: held }
@@ -334,7 +345,7 @@ fn hooks_shape() -> Shape {
                 name: "hooks".to_owned(),
                 required: true,
                 shape: Shape::Array {
-                    items: Box::new(Shape::CommandHandler),
+                    items: Box::new(Shape::CommandHandler {}),
                 },
             },
         ],
@@ -382,7 +393,7 @@ impl Placement {
                             name: "mcpServers".to_owned(),
                             required: true,
                             shape: Shape::Map {
-                                values: Box::new(Shape::StdioServer),
+                                values: Box::new(Shape::StdioServer {}),
                             },
                         }],
                     },
@@ -421,7 +432,7 @@ impl Placement {
                             ShapeMember {
                                 name: "source".to_owned(),
                                 required: true,
-                                shape: Shape::RecordPath,
+                                shape: Shape::RecordPath {},
                             },
                         ],
                     },
@@ -601,6 +612,100 @@ impl Placement {
         found
     }
 
+    /// The host's exact reading of this placement for a bridge's recipe, as one line of plain text
+    /// that the installation statement carries after
+    /// [`kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL`]. The application is the recipe's
+    /// label, the folder is the plugin's folder in the recipe's destinations and the key is the one
+    /// the recipe adds, where it adds one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlacementRefusal::ApplicationNotPlain`] for a label that is not one plain
+    /// component, and [`PlacementRefusal::StatementTooLong`] for a reading over
+    /// [`MAX_PLACEMENT_STATEMENT_CHARS`].
+    pub fn statement(
+        &self,
+        bridge: &crate::plugin::NativeBridge,
+    ) -> Result<String, PlacementError> {
+        let application = bridge.application.as_str();
+        if !is_plain_component(application) {
+            return Err(PlacementError::new(
+                PlacementRefusal::ApplicationNotPlain,
+                format!("{application:?} is not one plain component, so the reading cannot quote it"),
+            ));
+        }
+        let folder = bridge
+            .install
+            .iter()
+            .find_map(|step| match step {
+                crate::plugin::BridgeStep::InstallFile { destination, .. } => destination
+                    .as_str()
+                    .strip_prefix(self.area.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .and_then(|rest| rest.split_once('/'))
+                    .map(|(folder, _)| folder.to_owned()),
+                crate::plugin::BridgeStep::AddConfigurationKey { .. } => None,
+            })
+            .unwrap_or_default();
+        let directory = self.directory_path();
+        let tails: Vec<&str> = self.files.iter().map(|placed| placed.tail.as_str()).collect();
+        let key = bridge.install.iter().find_map(|step| match step {
+            crate::plugin::BridgeStep::AddConfigurationKey { file, key, .. } => {
+                Some(format!(
+                    "It also sets {key} to true in {directory}/{file}, and keeps your other \
+                     settings in that file. "
+                ))
+            }
+            crate::plugin::BridgeStep::InstallFile { .. } => None,
+        });
+        let record = self
+            .files
+            .iter()
+            .any(|placed| placed.shape.holds_record_path())
+            .then(|| {
+                format!(
+                    ", except that an entry that records where the files were installed from \
+                     must be the path /dev/null/{folder}, which leads nowhere and is not where \
+                     the files are"
+                )
+            });
+        let removed = if key.is_some() {
+            " and the key it set"
+        } else {
+            ""
+        };
+        let text = format!(
+            "This package places files for \"{application}\" in a folder it chose: \
+             {directory}/{area}/{folder}/ under your home folder, files {tails}. \
+             \"{application}\", or any other program that reads that folder, can run what the \
+             files hold, as you, with your permissions and outside the plugin sandbox. {key}The \
+             host places these files only after it has checked that each is JSON with no \
+             repeated member name, that every entry named command in them starts the KalaReach \
+             forwarder by its path, and that no other name or text in them holds a slash, a \
+             backslash, a colon, a tilde, a dollar sign or a backtick or is a lone dot or two \
+             dots{record}. The host does not check what \"{application}\", or another program, \
+             does with the other settings in these files, and a plain file name in them can be \
+             read by a program as a path. Removing the package takes out only what this host \
+             placed{removed}; a file that has changed since stays in place, and the host reports \
+             what it cannot remove.",
+            area = self.area,
+            tails = tails.join(", "),
+            key = key.unwrap_or_default(),
+            record = record.unwrap_or_default(),
+        );
+        if text.chars().count() > MAX_PLACEMENT_STATEMENT_CHARS {
+            return Err(PlacementError::new(
+                PlacementRefusal::StatementTooLong,
+                format!(
+                    "the host's reading of it is {} characters, and an owner is shown at most \
+                     {MAX_PLACEMENT_STATEMENT_CHARS} whole",
+                    text.chars().count()
+                ),
+            ));
+        }
+        Ok(text)
+    }
+
     /// Checks one placed file's JSON against its shape, then against the text rule, in the order
     /// the controller checks them. `folder` is the plugin's folder name. A file that is not one of
     /// the placement's tails is refused.
@@ -656,19 +761,19 @@ impl Shape {
             )),
             Self::Exact { .. }
             | Self::Text { .. }
-            | Self::Boolean
-            | Self::Number
-            | Self::DirectoryName
-            | Self::RecordPath
-            | Self::CommandHandler
-            | Self::StdioServer => {}
+            | Self::Boolean {}
+            | Self::Number {}
+            | Self::DirectoryName {}
+            | Self::RecordPath {}
+            | Self::CommandHandler {}
+            | Self::StdioServer {} => {}
         }
     }
 
     /// Whether this shape or one below it is a command.
     fn holds_command(&self) -> bool {
         match self {
-            Self::CommandHandler | Self::StdioServer => true,
+            Self::CommandHandler {} | Self::StdioServer {} => true,
             Self::Object { members } => members.iter().any(|member| member.shape.holds_command()),
             Self::Map { values } => values.holds_command(),
             Self::Array { items } => items.holds_command(),
@@ -679,7 +784,7 @@ impl Shape {
     /// Whether this is an object with a required `name` of the kind `directory_name`.
     fn names_the_directory(&self) -> bool {
         matches!(self, Self::Object { members } if members.iter().any(|member| {
-            member.name == "name" && member.required && member.shape == Self::DirectoryName
+            member.name == "name" && member.required && member.shape == Self::DirectoryName {}
         }))
     }
 
@@ -687,7 +792,7 @@ impl Shape {
     #[must_use]
     pub fn holds_record_path(&self) -> bool {
         match self {
-            Self::RecordPath => true,
+            Self::RecordPath {} => true,
             Self::Object { members } => members
                 .iter()
                 .any(|member| member.shape.holds_record_path()),
@@ -745,34 +850,34 @@ impl Shape {
                 Some(_) => Err(format!("a text is longer than {max_bytes} bytes")),
                 None => Err("a text is expected and the file holds another kind".to_owned()),
             },
-            Self::Boolean => value
+            Self::Boolean {} => value
                 .is_boolean()
                 .then_some(())
                 .ok_or_else(|| "true or false is expected".to_owned()),
-            Self::Number => value
+            Self::Number {} => value
                 .is_number()
                 .then_some(())
                 .ok_or_else(|| "a number is expected".to_owned()),
             Self::Exact { value: wanted } => (value.as_str() == Some(wanted.as_str()))
                 .then_some(())
                 .ok_or_else(|| format!("the text {wanted} is expected")),
-            Self::DirectoryName => {
+            Self::DirectoryName {} => {
                 (value.as_str() == Some(folder))
                     .then_some(())
                     .ok_or_else(|| {
                         format!("the name {folder}, the directory it is installed in, is expected")
                     })
             }
-            Self::RecordPath => (value.as_str() == Some(format!("/dev/null/{folder}").as_str()))
+            Self::RecordPath {} => (value.as_str() == Some(format!("/dev/null/{folder}").as_str()))
                 .then_some(())
                 .ok_or_else(|| format!("the source /dev/null/{folder} is expected")),
-            Self::CommandHandler => command_object(
+            Self::CommandHandler {} => command_object(
                 value,
                 &["type", "name", "command", "args", "timeout"],
                 Some("command"),
                 form,
             ),
-            Self::StdioServer => command_object(value, &["type", "command", "args"], None, form),
+            Self::StdioServer {} => command_object(value, &["type", "command", "args"], None, form),
         }
     }
 
@@ -782,7 +887,7 @@ impl Shape {
     #[must_use]
     pub fn text_refusal(&self, value: &Value) -> Option<String> {
         match (self, value) {
-            (Self::RecordPath, Value::String(_)) => None,
+            (Self::RecordPath {}, Value::String(_)) => None,
             (Self::Object { members }, Value::Object(held)) => {
                 held.iter().find_map(|(key, inner)| {
                     string_refusal(key, "a member name").or_else(|| {

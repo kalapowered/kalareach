@@ -908,6 +908,21 @@
       ],
       "type": "object"
     },
+    "CommandForm": {
+      "description": "How a command that starts the forwarder is written.",
+      "oneOf": [
+        {
+          "const": "line",
+          "description": "One line a shell runs: the command holds the forwarder and its words, and no `args`.",
+          "type": "string"
+        },
+        {
+          "const": "argument_list",
+          "description": "A program with its arguments in a list beside it: the command is the forwarder alone.",
+          "type": "string"
+        }
+      ]
+    },
     "CommandIntegration": {
       "additionalProperties": false,
       "description": "What a package declares about the command it integrates.",
@@ -1067,6 +1082,17 @@
             }
           ],
           "description": "How the application's protocol spells the core's own operations, for a table of an\napplication server a native terminal speaks to.\n\nA table that does not leaves the member out, and the host sends no prompt, steer or\ncancellation of its own to the application."
+        },
+        "placement": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Placement"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the files of the package's native bridge are placed under the account's home, and the\nclosed shape of each: the application's directory, the folder in it that holds one folder\nfor each plugin, and the files each holds.\n\nA table that does not state it leaves the member out, and the host places the bridge by the\nlayout it holds for the application's label, so a connector written before the member\nexisted reads and hashes exactly as it did. A package that states it declares an\n`sdk_range` from SDK 0.1.9, and the installation statement the owner confirms says what the\nhost checks of the files and what it does not."
         },
         "plugin_id": {
           "$ref": "#/$defs/PluginId",
@@ -2741,6 +2767,25 @@
       "pattern": "^[a-z0-9]+([.-][a-z0-9]+)*$",
       "type": "string"
     },
+    "NameCheck": {
+      "additionalProperties": false,
+      "description": "How the application keeps one plugin for each name: the first it reads.",
+      "properties": {
+        "manifest": {
+          "description": "The tail of the manifest that gives a plugin its name. Its shape has a required `name`\nmember of the kind `directory_name`.",
+          "type": "string"
+        },
+        "skips_hidden": {
+          "description": "Whether the application does not read a folder whose name starts with a dot as a plugin.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "manifest",
+        "skips_hidden"
+      ],
+      "type": "object"
+    },
     "NativeBridge": {
       "additionalProperties": false,
       "description": "A native bridge installation recipe.\n\nBridge code runs under the application's own permissions, outside Wasmtime. The installation\ngrant states that, which is why the recipe names its steps rather than running a script.",
@@ -3543,6 +3588,71 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "PlacedFile": {
+      "additionalProperties": false,
+      "description": "One file of a placement.",
+      "properties": {
+        "shape": {
+          "$ref": "#/$defs/Shape",
+          "description": "What the file holds."
+        },
+        "tail": {
+          "description": "Its path in the plugin's folder, one to three plain components.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tail",
+        "shape"
+      ],
+      "type": "object"
+    },
+    "Placement": {
+      "additionalProperties": false,
+      "description": "Where a package says its native bridge is placed.",
+      "properties": {
+        "area": {
+          "description": "The folder of the directory that holds one folder for each plugin: one plain component.",
+          "type": "string"
+        },
+        "command_form": {
+          "$ref": "#/$defs/CommandForm",
+          "description": "How the forwarder is written in a command of these files."
+        },
+        "directory": {
+          "description": "The application's directory under the account's home, as plain components (one to three),\neach of a directory that exists. The host makes none and follows no link in it, except the\nfirst component of a compiled default that the package does not declare.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "files": {
+          "description": "The files each plugin's folder holds, one to eight, each tail named once.",
+          "items": {
+            "$ref": "#/$defs/PlacedFile"
+          },
+          "type": "array"
+        },
+        "one_per_name": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NameCheck"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the application keeps one plugin for each name, where it does."
+        }
+      },
+      "required": [
+        "directory",
+        "area",
+        "files",
+        "command_form"
+      ],
+      "type": "object"
     },
     "PlatformSupport": {
       "additionalProperties": false,
@@ -4561,6 +4671,218 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "Shape": {
+      "description": "The closed shape of a JSON value a placed file holds.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "An object with exactly the members named, each of the shape given.",
+          "properties": {
+            "kind": {
+              "const": "object",
+              "type": "string"
+            },
+            "members": {
+              "description": "The members that may be there.",
+              "items": {
+                "$ref": "#/$defs/ShapeMember"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "members"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "An object of any member names, each value of one shape.",
+          "properties": {
+            "kind": {
+              "const": "map",
+              "type": "string"
+            },
+            "values": {
+              "$ref": "#/$defs/Shape",
+              "description": "What each value is."
+            }
+          },
+          "required": [
+            "kind",
+            "values"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A list, each item of one shape.",
+          "properties": {
+            "items": {
+              "$ref": "#/$defs/Shape",
+              "description": "What each item is."
+            },
+            "kind": {
+              "const": "array",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "items"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Text of at most this many bytes.",
+          "properties": {
+            "kind": {
+              "const": "text",
+              "type": "string"
+            },
+            "max_bytes": {
+              "description": "The most bytes.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "max_bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "True or false.",
+          "properties": {
+            "kind": {
+              "const": "boolean",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A number.",
+          "properties": {
+            "kind": {
+              "const": "number",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Text that is exactly this.",
+          "properties": {
+            "kind": {
+              "const": "exact",
+              "type": "string"
+            },
+            "value": {
+              "description": "The text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Text that is the name of the plugin's folder.",
+          "properties": {
+            "kind": {
+              "const": "directory_name",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Text that is `/dev/null/` and the name of the plugin's folder: where an application is told\nthe plugin was installed from, which leads nowhere.",
+          "properties": {
+            "kind": {
+              "const": "record_path",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A hook handler that runs a command: `type` `command`, the command, and a name, arguments\nand a time limit. The command is the forwarder, in the placement's command form.",
+          "properties": {
+            "kind": {
+              "const": "command_handler",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A server that starts a program with a command: an optional `type` `stdio`, the command and\nits arguments. The command is the forwarder, in the placement's command form.",
+          "properties": {
+            "kind": {
+              "const": "stdio_server",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ShapeMember": {
+      "additionalProperties": false,
+      "description": "One member of an object shape.",
+      "properties": {
+        "name": {
+          "description": "Its name.",
+          "type": "string"
+        },
+        "required": {
+          "description": "Whether the object has to hold it.",
+          "type": "boolean"
+        },
+        "shape": {
+          "$ref": "#/$defs/Shape",
+          "description": "What it is."
+        }
+      },
+      "required": [
+        "name",
+        "shape"
+      ],
+      "type": "object"
     },
     "SourcePin": {
       "additionalProperties": false,
