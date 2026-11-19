@@ -452,6 +452,7 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
         check_hook_events(&manifest, connector, &mut report);
     }
     check_placement(&manifest, connector.as_ref(), &sources, &mut report);
+    check_statement(&manifest, connector.as_ref(), &mut report);
 
     let package = presentation.map(|presentation| Package {
         manifest,
@@ -1150,7 +1151,18 @@ fn check_placement(
         else {
             continue;
         };
+        // A file this check did not keep is a file it cannot read, and it is refused: the host
+        // reads every file a recipe installs.
         let Some(bytes) = sources.get(source.as_str()) else {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                source.as_str(),
+                format!(
+                    "\"{source}\", a file a native bridge installs, was not read whole by this \
+                     check (it reads files of at most 1 MiB each and 8 MiB together), so what it \
+                     registers cannot be checked"
+                ),
+            ));
             continue;
         };
         let Some((folder, tail)) = destination
@@ -1181,6 +1193,47 @@ fn check_placement(
                 format!("{destination} is not a file the placement names: {why}"),
             ));
         }
+    }
+}
+
+/// Refuses a package whose whole installation statement is longer than an owner is shown whole.
+///
+/// The statement is composed as the host composes it for a grant that holds every capability it
+/// has a part for: the publisher's words of the bridge, the host's reading of the placement the
+/// table declares and the host's reading of the command integration, or its words that the
+/// package declares none. Each part may meet its own limit and the three together may not.
+fn check_statement(
+    manifest: &PluginManifest,
+    connector: Option<&ConnectorManifest>,
+    report: &mut Report,
+) {
+    let Some(bridge) = manifest.native_bridge.0.as_ref() else {
+        return;
+    };
+    let placement = connector
+        .and_then(|table| table.placement.as_ref())
+        .and_then(|placement| placement.statement(bridge).ok());
+    let integration = manifest.command_integration.as_ref().map_or_else(
+        || crate::integration::NO_INTEGRATION_STATEMENT.to_owned(),
+        crate::integration::CommandIntegration::statement,
+    );
+    let whole = kr_protocol::confirmation::install_statement(
+        Some(bridge.grant_statement.as_str()),
+        placement.as_deref(),
+        Some(integration.as_str()),
+    );
+    let length = whole.map_or(0, |text| text.chars().count());
+    if length > kr_protocol::confirmation::STATEMENT_CHARS {
+        report.push(Finding::at(
+            FindingCode::BridgeRecipeInvalid,
+            MANIFEST_FILE,
+            format!(
+                "the host's whole statement of this package, with the publisher's words, its \
+                 reading of the placement and its reading of the command integration, is {length} \
+                 characters; the host shows an owner a statement of at most {} characters",
+                kr_protocol::confirmation::STATEMENT_CHARS
+            ),
+        ));
     }
 }
 

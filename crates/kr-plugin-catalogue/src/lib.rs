@@ -2429,7 +2429,7 @@ impl Catalogue {
             .holds(PluginCapability::CommandIntegrationLaunch)
             .then(|| {
                 manifest.command_integration.as_ref().map_or_else(
-                    || "The package declares no command integration.".to_owned(),
+                    || kr_plugin_sdk::integration::NO_INTEGRATION_STATEMENT.to_owned(),
                     kr_plugin_sdk::integration::CommandIntegration::statement,
                 )
             });
