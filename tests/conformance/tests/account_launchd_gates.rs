@@ -630,11 +630,13 @@ fn is_read_for_the_daemon(file: &str, text: &str) -> bool {
 }
 
 /// Whether the function `selecting` of the update harness takes the name a program is looked for by
-/// from `mapping`: it holds `let name = mapping(name);` and, in the block that holds it, after it, a
-/// string that is built from that `name`, which is the file's name, with no later binding or
-/// assignment of `name` in that block. A call whose result is dropped, a `name` that stays the
-/// argument, a map in a block that ends before the path, and a `name` that is changed after the map
-/// are no selection.
+/// from `mapping`: it holds `let name = mapping(name);` and the statement right after it, which ends
+/// in its own `;` and holds no block, builds the path from that `name`: the first string of it that
+/// holds `{name}` is the first argument of a `format!(` that stands directly inside `join(`, and no
+/// `name` stands between the map and that string. A call whose result is dropped, a `name` that stays
+/// the argument, a map in a block that ends before the path or in a closure whose value is the path,
+/// another statement between the map and the path, and a `name` that is bound again, by a pattern or
+/// by a closure parameter or by an assignment, are no selection.
 fn selects_through(tokens: &[Token], selecting: &Function, mapping: &str) -> bool {
     let body = &tokens[selecting.body.clone()];
     let Some(at) = body.windows(8).position(|window| {
@@ -649,34 +651,32 @@ fn selects_through(tokens: &[Token], selecting: &Function, mapping: &str) -> boo
     }) else {
         return false;
     };
-    // What follows the map up to the `}` that closes the block that holds it.
     let rest = &body[at + 8..];
-    let mut depth = 0_i32;
-    let end = rest
+    let Some(end) = rest.iter().position(|token| token.is_punct(';')) else {
+        return false;
+    };
+    let statement = &rest[..end];
+    if statement
         .iter()
-        .position(|token| match token.tok {
-            Tok::Punct('{') => {
-                depth += 1;
-                false
-            }
-            Tok::Punct('}') => {
-                depth -= 1;
-                depth < 0
-            }
-            _ => false,
-        })
-        .unwrap_or(rest.len());
-    let scope = &rest[..end];
-    let changed = scope.iter().enumerate().any(|(index, token)| {
-        token.ident() == Some("name")
-            && (matches!(index.checked_sub(1).map(|before| &scope[before]), Some(before) if matches!(before.ident(), Some("let" | "mut" | "for")))
-                || (scope.get(index + 1).is_some_and(|next| next.is_punct('='))
-                    && !scope.get(index + 2).is_some_and(|next| next.is_punct('='))))
-    });
-    !changed
-        && scope
+        .any(|token| token.is_punct('{') || token.is_punct('}'))
+    {
+        return false;
+    }
+    let Some(path) = statement
+        .iter()
+        .position(|token| matches!(&token.tok, Tok::Str(value, _) if value.contains("{name}")))
+    else {
+        return false;
+    };
+    path >= 5
+        && statement[path - 5].ident() == Some("join")
+        && statement[path - 4].is_punct('(')
+        && statement[path - 3].ident() == Some("format")
+        && statement[path - 2].is_punct('!')
+        && statement[path - 1].is_punct('(')
+        && !statement[..path]
             .iter()
-            .any(|token| matches!(&token.tok, Tok::Str(value, _) if value.contains("{name}")))
+            .any(|token| token.ident() == Some("name"))
 }
 
 /// Whether the harness source maps the plain name to the held build in `mapping`, and selects every
@@ -768,7 +768,9 @@ fn the_daemon_the_suites_start_is_the_one_built_with_the_hold() {
 
 /// The reading of the harness's selection finds a call that selects through the map, and refuses a
 /// map that is not called, a call whose result is dropped, a name that stays the argument, a name
-/// that is changed after the map, and a map that is in another block than the path.
+/// that is changed after the map (by a binding, a pattern, a closure parameter or an assignment), a
+/// statement between the map and the path, a map that is in another block than the path and a map
+/// in a closure whose value is the path.
 #[test]
 fn the_harness_selection_reading_finds_a_selection_through_the_map_and_only_that() {
     // NAME stands for the daemon's plain name, which a source of this file does not spell out.
@@ -808,6 +810,38 @@ fn the_harness_selection_reading_finds_a_selection_through_the_map_and_only_that
         (
             "a map in a block that ends before the path is built",
             r#"{ let name = built_as(name); } let c = profile.join(format!("{name}{}", S));"#,
+        ),
+        (
+            "a name that is bound again by a tuple pattern",
+            r#"let name = built_as(name); let (name, _) = (name.trim_end_matches("-held"), 0); let c = profile.join(format!("{name}{}", S));"#,
+        ),
+        (
+            "a name that is bound again by a one-element tuple pattern",
+            r#"let name = built_as(name); let (name,) = (name.strip_suffix("-held").unwrap_or(name),); let c = profile.join(format!("{name}{}", S));"#,
+        ),
+        (
+            "a name that is bound again by an if-let pattern that holds the path",
+            r#"let name = built_as(name); if let Some(name) = name.strip_suffix("-held") { let c = profile.join(format!("{name}{}", S)); }"#,
+        ),
+        (
+            "a name that is bound again by a let-else pattern",
+            r#"let name = built_as(name); let Some(name) = name.strip_suffix("-held") else { return; }; let c = profile.join(format!("{name}{}", S));"#,
+        ),
+        (
+            "a name that is bound again by a closure parameter that builds the path",
+            r#"let name = built_as(name); let c = [name.trim_end_matches("-held")].iter().map(|name| profile.join(format!("{name}{}", S)));"#,
+        ),
+        (
+            "a first string of the name that is no part of the path",
+            r#"let name = built_as(name); eprintln!("{name}"); let c = profile.join(name.trim_end_matches("-held"));"#,
+        ),
+        (
+            "a map in a closure that is never called, whose value is the path",
+            r#"let _held_path = || { let name = built_as(name); profile.join(format!("{name}{}", S)) }; let c = profile.join(format!("{name}{}", S));"#,
+        ),
+        (
+            "a path that no join takes the format of",
+            r#"let name = built_as(name); let c = format!("{name}{}", S);"#,
         ),
     ] {
         assert!(!selected(&format!("{map}\n{}", programs(body))), "{what}");
