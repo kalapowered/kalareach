@@ -897,6 +897,13 @@ export interface ConfirmationRequest {
    */
   readonly placement: string | null
   /**
+   * What the host reads of the agent the release's table names for the contact skill and where it
+   * installs the skill for it, exactly, where the grant holds the capability and the host says it
+   * writes that reading. It is the host's, captioned apart from the publisher's words; otherwise
+   * the text stays where it was.
+   */
+  readonly skill_target: string | null
+  /**
    * What the host reads of the release's command integration, exactly, where the request would
    * grant one. It is the host's, captioned apart from the publisher's words.
    */

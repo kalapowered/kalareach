@@ -404,6 +404,14 @@ pub const COMMAND_INTEGRATION_NOTICE: &str = "This package changes how a command
      KalaReach session starts, with the arguments and environment variables it declares. The \
      host's own exact reading of what it declares follows in the statement.";
 
+/// What the host says, in its own words, of a skill target an installation would grant: the
+/// package may name an agent and say where the host installs the contact skill for it. The host's
+/// own exact reading of what it declares is in the statement.
+pub const SKILL_TARGET_NOTICE: &str = "This capability lets a package name an agent and say where \
+     the host installs the KalaReach contact skill for it. The host installs nothing for that agent \
+     until a person who manages this host asks for it. The statement below says whether this release \
+     names an agent and gives this host's exact reading of what it declares.";
+
 /// What the host writes before its own exact reading of a command integration in an installation's
 /// statement. A bridge's own words never hold it (the package check refuses them, and the host
 /// refuses a manifest that has it), so the first place it stands is where the host's reading
@@ -424,21 +432,60 @@ pub const PLACEMENT_STATEMENT_LABEL: &str = "The host's exact reading of the pla
 /// cannot tell that text from the host's reading any other way.
 pub const PLACEMENT_READING_CAPABILITY: &str = "statement.placement_reading/1";
 
+/// What the host writes before its own exact reading of the skill target in an installation's
+/// statement, for a package whose table declares the agent the contact skill is installed for. The
+/// publisher's words never hold it (the package check refuses them, and the host refuses a manifest
+/// that has it), so the first place it stands is where the host's reading starts and the
+/// publisher's words end.
+pub const SKILL_TARGET_STATEMENT_LABEL: &str = "The host's exact reading of the skill target:";
+
+/// The capability a host states in its hello when it writes [`SKILL_TARGET_STATEMENT_LABEL`] and
+/// refuses it in the publisher's words. A device takes the label for the host's only on a link
+/// whose host states it, as for [`PLACEMENT_READING_CAPABILITY`].
+pub const SKILL_TARGET_READING_CAPABILITY: &str = "statement.skill_target_reading/1";
+
 /// The longest statement an installation's confirmation carries, and so the longest shown whole:
 /// the publisher's statement of a native bridge, the host's label, and the host's reading of a
 /// command integration, each at the longest the package contract allows. The host's reading of a
-/// placement shares the room: a release whose whole statement is longer is refused by the host.
+/// placement and of a skill target share the room: a release whose whole statement is longer is
+/// refused by the host.
 pub const STATEMENT_CHARS: usize = 5054;
 
-/// Whether a link's hello states that its host writes the placement reading.
-#[must_use]
-pub fn states_placement_reading(
-    capabilities: &crate::scalars::CanonicalSet<crate::ids::CapabilityId>,
-) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == PLACEMENT_READING_CAPABILITY)
+/// The readings a link's host states in its hello that it writes under its own label and refuses
+/// in a publisher's words. A device takes a label for the host's only where its host states the
+/// reading it belongs to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostReadings {
+    /// The reading of a placement ([`PLACEMENT_READING_CAPABILITY`]).
+    pub placement: bool,
+    /// The reading of a skill target ([`SKILL_TARGET_READING_CAPABILITY`]).
+    pub skill_target: bool,
 }
+
+/// Which readings a link's hello states that its host writes.
+#[must_use]
+pub fn states_readings(
+    capabilities: &crate::scalars::CanonicalSet<crate::ids::CapabilityId>,
+) -> HostReadings {
+    let states = |name: &str| {
+        capabilities
+            .iter()
+            .any(|capability| capability.as_str() == name)
+    };
+    HostReadings {
+        placement: states(PLACEMENT_READING_CAPABILITY),
+        skill_target: states(SKILL_TARGET_READING_CAPABILITY),
+    }
+}
+
+/// The labels the host writes before its own readings, each with what the reading is of, which a
+/// publisher's words never hold: the one list the package check and the host's own refusal both
+/// read.
+pub const HOST_STATEMENT_LABELS: [(&str, &str); 3] = [
+    (INTEGRATION_STATEMENT_LABEL, "command integration"),
+    (PLACEMENT_STATEMENT_LABEL, "placement"),
+    (SKILL_TARGET_STATEMENT_LABEL, "skill target"),
+];
 
 /// The host's notices for an installation with this grant, in the order they are shown: one for
 /// each capability in it that the host describes in its own words.
@@ -454,26 +501,32 @@ pub fn install_notices(grant: &[String]) -> Vec<&'static str> {
     {
         notices.push(COMMAND_INTEGRATION_NOTICE);
     }
+    if grant.iter().any(|name| name == "skill_target.install") {
+        notices.push(SKILL_TARGET_NOTICE);
+    }
     notices
 }
 
 /// The statement an installation's confirmation carries, from the words the release's manifest
 /// gives for a native bridge it installs, the host's reading of the placement the package
-/// declares and the host's reading of a command integration it declares, each present only where
-/// the grant holds the capability that applies it.
+/// declares, of the skill target it declares and of a command integration it declares, each
+/// present only where the grant holds the capability that applies it.
 ///
 /// A bridge's words are the publisher's and come first; the placement reading follows after
-/// [`PLACEMENT_STATEMENT_LABEL`] and the integration's after [`INTEGRATION_STATEMENT_LABEL`], both
-/// the host's, so a reader can tell where the publisher's words end.
+/// [`PLACEMENT_STATEMENT_LABEL`], the skill target's after [`SKILL_TARGET_STATEMENT_LABEL`] and the
+/// integration's after [`INTEGRATION_STATEMENT_LABEL`], all the host's, so a reader can tell where
+/// the publisher's words end.
 #[must_use]
 pub fn install_statement(
     bridge: Option<&str>,
     placement: Option<&str>,
+    skill_target: Option<&str>,
     integration: Option<&str>,
 ) -> Option<String> {
     let parts: Vec<String> = [
         bridge.map(str::to_owned),
         placement.map(|text| format!("{PLACEMENT_STATEMENT_LABEL} {text}")),
+        skill_target.map(|text| format!("{SKILL_TARGET_STATEMENT_LABEL} {text}")),
         integration.map(|text| format!("{INTEGRATION_STATEMENT_LABEL} {text}")),
     ]
     .into_iter()
@@ -483,13 +536,16 @@ pub fn install_statement(
 }
 
 /// The parts of an installation's statement: the publisher's words about a native bridge, and the
-/// host's readings of a placement and of a command integration, each where the statement has it.
+/// host's readings of a placement, of a skill target and of a command integration, each where the
+/// statement has it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StatementParts<'a> {
     /// The publisher's own words, before the host's labels.
     pub publisher: Option<&'a str>,
     /// The host's reading of the placement, after its label.
     pub placement: Option<&'a str>,
+    /// The host's reading of the skill target, after its label.
+    pub skill_target: Option<&'a str>,
     /// The host's reading of the integration, after its label.
     pub reading: Option<&'a str>,
 }
@@ -497,15 +553,18 @@ pub struct StatementParts<'a> {
 /// Splits an installation's statement at the host's labels, so that a device captions each part by
 /// who wrote it. A statement with no label is all the publisher's, and so is every statement of a
 /// grant that does not hold the capability a label belongs to: a host writes the integration label
-/// only for a grant that holds `command_integration.launch`, and the placement label only for one
-/// that holds `native_bridge.install`, so for any other grant a device never takes words in the
-/// publisher's bridge statement for the host's reading, even from a host that does not refuse the
-/// label in them. The placement label is the host's only where `host_states_placement` says the
-/// link's host writes it ([`states_placement_reading`]): a host built before the label does not
-/// refuse it in a publisher's words.
+/// only for a grant that holds `command_integration.launch`, the placement label only for one
+/// that holds `native_bridge.install` and the skill-target label only for one that holds
+/// `skill_target.install`, so for any other grant a device never takes words in the publisher's
+/// bridge statement for the host's reading, even from a host that does not refuse the label in
+/// them. The placement and skill-target labels are the host's only where `host` says the link's
+/// host writes them ([`states_readings`]): a host built before a label does not refuse it in a
+/// publisher's words.
 ///
-/// The integration label is split first, then the part before it at the placement label, so a
-/// flag of the integration that holds the placement label stays in the integration's reading.
+/// The integration label is split first, then the part before it at the skill-target label, then
+/// the part before that at the placement label, each at its own place and not searched for
+/// anywhere else, so a flag of the integration that holds either label stays in the integration's
+/// reading.
 ///
 /// A grant that holds both integration and bridge capabilities has one case the device cannot
 /// settle. A host that does not refuse the integration label in a bridge's words and writes no
@@ -516,7 +575,7 @@ pub struct StatementParts<'a> {
 pub fn split_install_statement<'a>(
     grant: &[String],
     statement: &'a str,
-    host_states_placement: bool,
+    host: HostReadings,
 ) -> StatementParts<'a> {
     fn part(text: &str) -> Option<&str> {
         let text = text.trim();
@@ -530,18 +589,27 @@ pub fn split_install_statement<'a>(
         Some((before, after)) => (before, part(after)),
         None => (statement, None),
     };
-    match (host_states_placement && holds("native_bridge.install"))
+    let (before, skill_target) = match (host.skill_target && holds("skill_target.install"))
+        .then(|| before.split_once(SKILL_TARGET_STATEMENT_LABEL))
+        .flatten()
+    {
+        Some((before, after)) => (before, part(after)),
+        None => (before, None),
+    };
+    match (host.placement && holds("native_bridge.install"))
         .then(|| before.split_once(PLACEMENT_STATEMENT_LABEL))
         .flatten()
     {
         Some((publisher, placement)) => StatementParts {
             publisher: part(publisher),
             placement: part(placement),
+            skill_target,
             reading,
         },
         None => StatementParts {
             publisher: part(before),
             placement: None,
+            skill_target,
             reading,
         },
     }
@@ -1191,24 +1259,32 @@ mod tests {
         };
         let both = grant(&["command_integration.launch", "native_bridge.install"]);
         let reading = format!(r#"Runs "x" with "{INTEGRATION_STATEMENT_LABEL} fake"."#);
-        let composed = install_statement(Some("Changes one setting."), None, Some(&reading))
+        let composed = install_statement(Some("Changes one setting."), None, None, Some(&reading))
             .expect("a statement");
-        let parts = split_install_statement(&both, &composed, false);
+        let parts = split_install_statement(&both, &composed, HostReadings::default());
         assert_eq!(parts.publisher, Some("Changes one setting."));
         assert_eq!(parts.reading, Some(reading.as_str()));
 
-        let alone = install_statement(None, None, Some("Runs x.")).expect("a statement");
-        let parts = split_install_statement(&grant(&["command_integration.launch"]), &alone, false);
+        let alone = install_statement(None, None, None, Some("Runs x.")).expect("a statement");
+        let parts = split_install_statement(
+            &grant(&["command_integration.launch"]),
+            &alone,
+            HostReadings::default(),
+        );
         assert_eq!((parts.publisher, parts.reading), (None, Some("Runs x.")));
 
         // No label, or a grant without the integration: all of it is the publisher's.
-        let plain = split_install_statement(&both, "Changes one setting.", false);
+        let plain = split_install_statement(&both, "Changes one setting.", HostReadings::default());
         assert_eq!(
             (plain.publisher, plain.reading),
             (Some("Changes one setting."), None)
         );
         let forged = format!("Harmless. {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
-        let bridge = split_install_statement(&grant(&["native_bridge.install"]), &forged, false);
+        let bridge = split_install_statement(
+            &grant(&["native_bridge.install"]),
+            &forged,
+            HostReadings::default(),
+        );
         assert_eq!(
             (bridge.publisher, bridge.reading),
             (Some(forged.as_str()), None)
@@ -1231,22 +1307,31 @@ mod tests {
         };
         let both = grant(&["command_integration.launch", "native_bridge.install"]);
         let bridge = grant(&["native_bridge.install"]);
-        let composed = install_statement(Some("Words."), Some("Places files."), Some("Runs x."))
-            .expect("a statement");
+        let composed =
+            install_statement(Some("Words."), Some("Places files."), None, Some("Runs x."))
+                .expect("a statement");
 
         // A host that states it: three parts, each captioned by who wrote it.
-        let stated = split_install_statement(&both, &composed, true);
+        let stated = split_install_statement(
+            &both,
+            &composed,
+            HostReadings {
+                placement: true,
+                skill_target: false,
+            },
+        );
         assert_eq!(
             stated,
             StatementParts {
                 publisher: Some("Words."),
                 placement: Some("Places files."),
+                skill_target: None,
                 reading: Some("Runs x."),
             }
         );
 
         // A host that does not: the placement text and its label stay in the publisher's part.
-        let unstated = split_install_statement(&both, &composed, false);
+        let unstated = split_install_statement(&both, &composed, HostReadings::default());
         let whole = format!("Words. {PLACEMENT_STATEMENT_LABEL} Places files.");
         assert_eq!(unstated.publisher, Some(whole.as_str()));
         assert_eq!(unstated.placement, None);
@@ -1255,14 +1340,22 @@ mod tests {
         // A grant without the bridge capability never has a host's placement part, stated or not.
         let integration = grant(&["command_integration.launch"]);
         assert_eq!(
-            split_install_statement(&integration, &composed, true).placement,
+            split_install_statement(
+                &integration,
+                &composed,
+                HostReadings {
+                    placement: true,
+                    skill_target: false
+                }
+            )
+            .placement,
             None
         );
 
         // A publisher's words that imitate the label, on a host that does not state it: all of
         // it is the publisher's.
         let imitation = format!("Harmless. {PLACEMENT_STATEMENT_LABEL} Reads nothing.");
-        let parts = split_install_statement(&bridge, &imitation, false);
+        let parts = split_install_statement(&bridge, &imitation, HostReadings::default());
         assert_eq!(
             (parts.publisher, parts.placement),
             (Some(imitation.as_str()), None)
@@ -1271,9 +1364,17 @@ mod tests {
         // The other order: a placement label that the integration's own reading holds (a flag may
         // hold any text) stays in that reading, with a host placement part before it and with none.
         let reading = format!(r#"Runs "x" with "{PLACEMENT_STATEMENT_LABEL} fake"."#);
-        let with_part = install_statement(Some("Words."), Some("Places files."), Some(&reading))
-            .expect("a statement");
-        let parts = split_install_statement(&both, &with_part, true);
+        let with_part =
+            install_statement(Some("Words."), Some("Places files."), None, Some(&reading))
+                .expect("a statement");
+        let parts = split_install_statement(
+            &both,
+            &with_part,
+            HostReadings {
+                placement: true,
+                skill_target: false,
+            },
+        );
         assert_eq!(
             (parts.publisher, parts.placement, parts.reading),
             (
@@ -1282,8 +1383,16 @@ mod tests {
                 Some(reading.as_str())
             )
         );
-        let no_part = install_statement(Some("Words."), None, Some(&reading)).expect("a statement");
-        let parts = split_install_statement(&both, &no_part, true);
+        let no_part =
+            install_statement(Some("Words."), None, None, Some(&reading)).expect("a statement");
+        let parts = split_install_statement(
+            &both,
+            &no_part,
+            HostReadings {
+                placement: true,
+                skill_target: false,
+            },
+        );
         assert_eq!(
             (parts.publisher, parts.placement, parts.reading),
             (Some("Words."), None, Some(reading.as_str()))
@@ -1302,15 +1411,168 @@ mod tests {
                 .map(|name| CapabilityId::new(*name).expect("a capability"))
                 .collect()
         };
-        assert!(!states_placement_reading(&set(&[])));
-        assert!(!states_placement_reading(&set(&["statement.other/1"])));
-        assert!(states_placement_reading(&set(&[
-            PLACEMENT_READING_CAPABILITY
-        ])));
-        assert!(states_placement_reading(&set(&[
-            "statement.other/1",
-            PLACEMENT_READING_CAPABILITY
-        ])));
+        assert!(!states_readings(&set(&[])).placement);
+        assert!(!states_readings(&set(&["statement.other/1"])).placement);
+        assert!(states_readings(&set(&[PLACEMENT_READING_CAPABILITY])).placement);
+        assert!(
+            states_readings(&set(&["statement.other/1", PLACEMENT_READING_CAPABILITY])).placement
+        );
+    }
+
+    /// KR-REQ-11.01: a link's hello states that its host writes the skill-target reading only by
+    /// the one capability that says so, apart from the placement reading's.
+    #[test]
+    fn a_hello_states_the_skill_target_reading_only_by_its_capability() {
+        use crate::ids::CapabilityId;
+        let set = |names: &[&str]| -> CanonicalSet<CapabilityId> {
+            names
+                .iter()
+                .map(|name| CapabilityId::new(*name).expect("a capability"))
+                .collect()
+        };
+        assert_eq!(states_readings(&set(&[])), HostReadings::default());
+        assert_eq!(
+            states_readings(&set(&[PLACEMENT_READING_CAPABILITY])),
+            HostReadings {
+                placement: true,
+                skill_target: false
+            },
+            "the placement capability does not state the skill-target reading"
+        );
+        assert_eq!(
+            states_readings(&set(&[
+                "statement.other/1",
+                SKILL_TARGET_READING_CAPABILITY
+            ])),
+            HostReadings {
+                placement: false,
+                skill_target: true
+            }
+        );
+    }
+
+    /// KR-REQ-11.01: the parts stand in the order publisher, placement, skill target, integration,
+    /// and a device takes the skill-target label for the host's only for a grant that holds the
+    /// capability and only on a link whose host states it. A label that a flag of the integration
+    /// holds stays in the integration's reading, for both newer labels.
+    #[test]
+    fn the_parts_stand_in_the_order_publisher_placement_skill_target_integration() {
+        let grant = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        let all = grant(&[
+            "command_integration.launch",
+            "native_bridge.install",
+            "skill_target.install",
+        ]);
+        let stated = HostReadings {
+            placement: true,
+            skill_target: true,
+        };
+        let composed = install_statement(
+            Some("Words."),
+            Some("Places files."),
+            Some("Names an agent."),
+            Some("Runs x."),
+        )
+        .expect("a statement");
+        assert_eq!(
+            composed,
+            format!(
+                "Words. {PLACEMENT_STATEMENT_LABEL} Places files. {SKILL_TARGET_STATEMENT_LABEL} \
+                 Names an agent. {INTEGRATION_STATEMENT_LABEL} Runs x."
+            )
+        );
+        assert_eq!(
+            split_install_statement(&all, &composed, stated),
+            StatementParts {
+                publisher: Some("Words."),
+                placement: Some("Places files."),
+                skill_target: Some("Names an agent."),
+                reading: Some("Runs x."),
+            }
+        );
+
+        // A host that does not state the skill-target reading: its label and text stay inside the
+        // part before the integration's, here the placement's, with no host caption of their own.
+        let only_placement = HostReadings {
+            placement: true,
+            skill_target: false,
+        };
+        let parts = split_install_statement(&all, &composed, only_placement);
+        assert_eq!(parts.skill_target, None);
+        assert_eq!(
+            parts.placement,
+            Some(format!("Places files. {SKILL_TARGET_STATEMENT_LABEL} Names an agent.").as_str())
+        );
+        assert_eq!(parts.reading, Some("Runs x."));
+
+        // A grant without the capability never has a skill-target part, stated or not.
+        let without = grant(&["command_integration.launch", "native_bridge.install"]);
+        assert_eq!(
+            split_install_statement(&without, &composed, stated).skill_target,
+            None
+        );
+
+        // A label that a flag of the integration holds stays in the integration's reading.
+        let reading = format!(r#"Runs "x" with "{SKILL_TARGET_STATEMENT_LABEL} fake"."#);
+        let flagged = install_statement(
+            Some("Words."),
+            None,
+            Some("Names an agent."),
+            Some(&reading),
+        )
+        .expect("a statement");
+        let parts = split_install_statement(&all, &flagged, stated);
+        assert_eq!(
+            (parts.publisher, parts.skill_target, parts.reading),
+            (
+                Some("Words."),
+                Some("Names an agent."),
+                Some(reading.as_str())
+            )
+        );
+
+        // The host's labels are one list, which both refusals read.
+        let labels: Vec<&str> = HOST_STATEMENT_LABELS
+            .iter()
+            .map(|(label, _)| *label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                INTEGRATION_STATEMENT_LABEL,
+                PLACEMENT_STATEMENT_LABEL,
+                SKILL_TARGET_STATEMENT_LABEL
+            ]
+        );
+    }
+
+    /// KR-REQ-11.01: the notices an installation shows name the skill target for a grant that holds
+    /// the capability, after the others.
+    #[test]
+    fn the_notice_for_the_skill_target_is_shown_for_a_grant_that_holds_it() {
+        let grant = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            install_notices(&grant(&["skill_target.install"])),
+            [SKILL_TARGET_NOTICE]
+        );
+        assert_eq!(
+            install_notices(&grant(&[
+                "skill_target.install",
+                "command_integration.launch"
+            ])),
+            [COMMAND_INTEGRATION_NOTICE, SKILL_TARGET_NOTICE]
+        );
+        assert!(install_notices(&grant(&["net.fetch"])).is_empty());
     }
 
     fn trust_plan() -> CatalogueTrustPlan {

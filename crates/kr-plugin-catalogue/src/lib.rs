@@ -2396,45 +2396,70 @@ impl Catalogue {
             .as_ref()
             .filter(|_| grant.holds(PluginCapability::NativeBridgeInstall))
             .map(|bridge| bridge.grant_statement.as_str());
-        // The host's label tells its reading from the publisher's words, so words that hold it are
-        // not shown: the package check refuses them, and a manifest kept from before does too.
-        if bridge.is_some_and(|words| {
-            words.contains(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL)
-        }) {
-            return Err(CatalogueError::UnsafePackage {
-                detail: format!(
-                    "{subject} is not a package this host will install: the bridge's statement \
-                     holds the words the host writes before its own reading of a command \
-                     integration"
-                ),
-            });
+        // The host's labels tell its readings from the publisher's words, so words that hold one
+        // are not shown: the package check refuses them, and a manifest kept from before does too.
+        for (label, reading) in kr_protocol::confirmation::HOST_STATEMENT_LABELS {
+            if bridge.is_some_and(|words| words.contains(label)) {
+                return Err(CatalogueError::UnsafePackage {
+                    detail: format!(
+                        "{subject} is not a package this host will install: the bridge's \
+                         statement holds the words the host writes before its own reading of a \
+                         {reading}"
+                    ),
+                });
+            }
         }
-        // The words the host writes before its reading of a placement are the host's too.
-        if bridge.is_some_and(|words| {
-            words.contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL)
-        }) {
-            return Err(CatalogueError::UnsafePackage {
-                detail: format!(
-                    "{subject} is not a package this host will install: the bridge's statement \
-                     holds the words the host writes before its own reading of a placement"
-                ),
-            });
-        }
-        // A package that declares where its bridge is placed gets the host's reading of it, written
-        // from the table the verified manifest pins, which is read only after the range test and
-        // by the one function the controller reads it with. A table that cannot be fetched, read
-        // or used is a refusal, never a statement without the reading.
-        let placement = match manifest
+        // A package that declares where its bridge is placed, or the agent the contact skill is
+        // installed for, gets the host's reading of it, written from the table the verified
+        // manifest pins. The table is fetched once, after the range test, for every capability that
+        // needs it, and read only by the functions the controller reads it with. A table that
+        // cannot be fetched, read or used is a refusal, never a statement without the reading.
+        let recipe = manifest
             .native_bridge
             .0
             .as_ref()
-            .filter(|_| grant.holds(PluginCapability::NativeBridgeInstall))
-        {
-            Some(recipe) => {
-                self.placement_reading(&enrolled, &store, &entry, &manifest, recipe, &subject)
-                    .await?
+            .filter(|_| grant.holds(PluginCapability::NativeBridgeInstall));
+        let holds_skill_target = grant.holds(PluginCapability::SkillTargetInstall);
+        let table = if recipe.is_some() || holds_skill_target {
+            self.connector_table(&enrolled, &store, &entry, &manifest)
+                .await?
+        } else {
+            None
+        };
+        let unsafe_table = |what: &str, why: String| CatalogueError::UnsafePackage {
+            detail: format!(
+                "{subject} is not a package this host will install: the {what} its table \
+                 declares cannot be read to describe it: {why}"
+            ),
+        };
+        let placement = match (recipe, table.as_deref()) {
+            (Some(recipe), Some(bytes)) => {
+                let declared =
+                    kr_plugin_sdk::placement::declared_in(bytes, recipe.application.as_str())
+                        .map_err(|why| unsafe_table("placement", why))?;
+                declared
+                    .map(|placement| {
+                        placement
+                            .statement(recipe)
+                            .map_err(|why| unsafe_table("placement", why.to_string()))
+                    })
+                    .transpose()?
             }
-            None => None,
+            _ => None,
+        };
+        // A release that asks for the skill target and declares none is told so in the reading.
+        let skill_target = if holds_skill_target {
+            Some(match table.as_deref() {
+                Some(bytes) => kr_plugin_sdk::skill_target::declared_in(bytes)
+                    .map_err(|why| unsafe_table("skill target", why))?
+                    .map_or_else(
+                        || kr_plugin_sdk::skill_target::NO_SKILL_TARGET_STATEMENT.to_owned(),
+                        |target| target.statement(),
+                    ),
+                None => kr_plugin_sdk::skill_target::NO_SKILL_TARGET_STATEMENT.to_owned(),
+            })
+        } else {
+            None
         };
         // A release that asks for the integration and declares none is told so in the reading.
         let integration = grant
@@ -2458,6 +2483,7 @@ impl Catalogue {
         let statement = kr_protocol::confirmation::install_statement(
             bridge,
             placement.as_deref(),
+            skill_target.as_deref(),
             integration.as_deref(),
         );
         if statement
@@ -2474,24 +2500,16 @@ impl Catalogue {
         Ok(statement)
     }
 
-    /// The host's reading of the placement a release's connector table declares for its bridge,
-    /// or `None` for a release that declares none.
-    async fn placement_reading(
+    /// The bytes of the connector table a release's manifest pins, fetched once after the range test,
+    /// or `None` for a release that ships none.
+    async fn connector_table(
         &mut self,
         enrolled: &Enrolled,
         store: &Store,
         entry: &IndexEntry,
         manifest: &kr_plugin_sdk::plugin::PluginManifest,
-        recipe: &kr_plugin_sdk::plugin::NativeBridge,
-        subject: &str,
-    ) -> CatalogueResult<Option<String>> {
+    ) -> CatalogueResult<Option<Vec<u8>>> {
         use kr_plugin_sdk::plugin::PayloadRole;
-        let unsafe_package = |why: String| CatalogueError::UnsafePackage {
-            detail: format!(
-                "{subject} is not a package this host will install: the placement its table \
-                 declares cannot be read to describe it: {why}"
-            ),
-        };
         // The range test comes first: a table written for another SDK is not read.
         extract::check_sdk_range(entry)?;
         let Some(payload) = manifest
@@ -2524,15 +2542,7 @@ impl Catalogue {
             }
             Err(other) => return Err(other),
         };
-        let declared = kr_plugin_sdk::placement::declared_in(&bytes, recipe.application.as_str())
-            .map_err(unsafe_package)?;
-        declared
-            .map(|placement| {
-                placement
-                    .statement(recipe)
-                    .map_err(|why| unsafe_package(why.to_string()))
-            })
-            .transpose()
+        Ok(Some(bytes))
     }
 
     /// Installs one verified package into one environment, as the owner acting directly.

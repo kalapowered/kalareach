@@ -429,3 +429,152 @@ pub fn rules() -> serde_json::Value {
         "entry_members": ENTRY_MEMBERS,
     })
 }
+
+/// The seconds the host writes for a deadline in seconds, and the milliseconds for the other unit
+/// and for the environment value: the host's own constants, written by the host from them.
+const DEADLINE_SECONDS: u32 = 660;
+
+impl DocumentFormat {
+    fn phrase(self) -> &'static str {
+        match self {
+            Self::CodexToml => "as the table mcp_servers.kalareach of a TOML file",
+            Self::JsonCommandArgs => {
+                "as mcpServers.kalareach of a JSON file, with a command and its arguments"
+            }
+            Self::JsonLocalCommandList => "as mcp.kalareach of a JSON file, with one command list",
+        }
+    }
+}
+
+impl SkillTarget {
+    /// The host's exact reading of this declaration, the text an owner confirms after the label the
+    /// host writes before it. It holds no colon, so it holds no label, and it is true for every
+    /// declaration the package check allows: a user scope, a project scope or both, with or without
+    /// a configuration document, in any of the three formats, shared or not, with or without a
+    /// deadline.
+    #[must_use]
+    pub fn statement(&self) -> String {
+        let mut parts = vec![format!(
+            "The package names the agent \"{}\" and says where the host installs the KalaReach \
+             contact skill for it, on macOS and Linux. Installing this package does not install \
+             the skill, and the host starts no process when a person who manages this host \
+             installs it.",
+            self.word
+        )];
+        if let Some(location) = &self.user {
+            parts.push(location.statement(
+                &self.word,
+                format!(
+                    "For the user scope, kr skill install --agent {} --scope user makes the host \
+                     write its own files SKILL.md, TOOLS.md and manifest.json into {}/kalareach-contact/ \
+                     under the home folder of the account that runs this host",
+                    self.word,
+                    location.skills.join("/")
+                ),
+                "under that home folder",
+            ));
+        }
+        if let Some(location) = &self.project {
+            parts.push(location.statement(
+                &self.word,
+                format!(
+                    "For a project, kr skill install --agent {} --scope project --project-dir with \
+                     the project folder makes the host write its own files SKILL.md, TOOLS.md and \
+                     manifest.json into {}/kalareach-contact/ under that project folder",
+                    self.word,
+                    location.skills.join("/")
+                ),
+                "under that folder",
+            ));
+        }
+        let scopes = match (&self.user, &self.project) {
+            (Some(_), Some(_)) => "--scope user or --scope project",
+            (Some(_), None) => "--scope user",
+            _ => "--scope project",
+        };
+        parts.push(format!(
+            "The host keeps the other settings in each configuration file, follows no link below \
+             the home folder or the project folder, and replaces no skill file and no entry named \
+             kalareach that it did not write. It does not check which program reads these places \
+             or how it uses their contents, and another program's own settings may be among them. \
+             kr skill remove --agent {} {scopes}, with --project-dir for a project, takes \
+             out only what this host wrote and finds unchanged, also after this package is gone, \
+             and reports what it leaves in place. Removing the package does not remove the skill.",
+            self.word,
+            scopes = scopes
+        ));
+        parts.join(" ")
+    }
+}
+
+impl SkillLocation {
+    fn statement(&self, _word: &str, first: String, folder: &str) -> String {
+        let Some(configuration) = &self.configuration else {
+            return format!("{first}. The host adds no server entry for this scope.");
+        };
+        let path = configuration.path.join("/");
+        let mut text = format!(
+            "{first}, and adds one entry named kalareach to {path} {folder}, {}. The entry starts \
+             kr with the arguments agent-tools --stdio",
+            configuration.format.phrase()
+        );
+        match (&configuration.deadline, configuration.shared) {
+            (_, true) => text.push_str(&format!(
+                ". The package says that other agents also read {path}, so the entry there is the \
+                 same for every installation that writes it and sets no time limit, and the host \
+                 removes it only when no other installation of this host still claims it."
+            )),
+            (Some(deadline), false) => {
+                let number = match deadline.unit {
+                    DeadlineUnit::Seconds => DEADLINE_SECONDS,
+                    DeadlineUnit::Milliseconds => DEADLINE_SECONDS * 1_000,
+                };
+                let unit = match deadline.unit {
+                    DeadlineUnit::Seconds => "seconds",
+                    DeadlineUnit::Milliseconds => "milliseconds",
+                };
+                text.push_str(&format!(
+                    " and sets {} to {number} ({unit}) and KR_TOOL_DEADLINE_MS to {}.",
+                    deadline.field,
+                    DEADLINE_SECONDS * 1_000
+                ));
+            }
+            (None, false) => text.push('.'),
+        }
+        text
+    }
+}
+
+/// The most characters the host's reading of a skill target has: a word of the longest length,
+/// three components of the longest length in each scope, the longest field name and the longest
+/// format phrase, for the shared form, which is the longest. The statement carries it with the
+/// publisher's and the other readings in the room an owner is shown whole.
+pub const MAX_SKILL_TARGET_STATEMENT_CHARS: usize = 3_422;
+
+/// The skill target a connector table declares, or `None` for a table that declares none.
+///
+/// A table that cannot be read, or whose declaration the package check refuses for a reason about
+/// the table, is an error naming the first reason: the host never writes a reading of a
+/// declaration it would refuse.
+///
+/// # Errors
+///
+/// Returns the reason, as a sentence, when the table cannot be read or its declaration is refused.
+pub fn declared_in(table: &[u8]) -> Result<Option<SkillTarget>, String> {
+    let table: crate::connector::ConnectorManifest = serde_json::from_slice(table)
+        .map_err(|error| format!("the connector table cannot be read: {error}"))?;
+    let Some(target) = table.skill_target else {
+        return Ok(None);
+    };
+    match problems(&target, true)
+        .into_iter()
+        .find(Problem::is_about_the_table)
+    {
+        Some(problem) => Err(problem.message()),
+        None => Ok(Some(target)),
+    }
+}
+
+/// What the host says of a grant that holds the capability and a table that declares no skill
+/// target.
+pub const NO_SKILL_TARGET_STATEMENT: &str = "The package declares no skill target.";

@@ -90,6 +90,11 @@ pub struct RequestView {
     /// declares a placement and the host says that it writes that reading. The page captions it as
     /// the host's. Where the host does not say so, the text stays in the publisher's statement.
     pub placement: Option<String>,
+    /// What this host reads of the agent the release's table names for the contact skill and where
+    /// it installs the skill for it, exactly, where the grant holds the capability and the host says
+    /// that it writes that reading. The page captions it as the host's. Where the host does not say
+    /// so, the text stays in the part it was in.
+    pub skill_target: Option<String>,
     /// What this host reads of the release's command integration, exactly, where the request
     /// would grant one. The page captions it as the host's, apart from the publisher's words.
     pub reading: Option<String>,
@@ -547,7 +552,7 @@ fn held_now<'a>(holding: &'a [Listed], shown: &Listed) -> Held<'a> {
         Some(current)
             if current.request == shown.request
                 && current.subject == shown.subject
-                && current.host_states_placement_reading == shown.host_states_placement_reading =>
+                && current.host_readings == shown.host_readings =>
         {
             Held::Unchanged(current)
         }
@@ -571,6 +576,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         notice: None,
         statement: None,
         placement: None,
+        skill_target: None,
         reading: None,
         expires_at_ms,
         checkable: false,
@@ -607,7 +613,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
     };
     // What a request names beyond its sentence is shown as the host wrote it or not at all: text
     // this page could not show exactly makes the request one that is not confirmed here.
-    let Some(particulars) = particulars(subject, listed.host_states_placement_reading) else {
+    let Some(particulars) = particulars(subject, listed.host_readings) else {
         return unchecked(title);
     };
     let value = match subject {
@@ -632,6 +638,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         notice: particulars.notice,
         statement: particulars.statement,
         placement: particulars.placement,
+        skill_target: particulars.skill_target,
         reading: particulars.reading,
         expires_at_ms,
         checkable: true,
@@ -644,6 +651,7 @@ struct Particulars {
     notice: Option<String>,
     statement: Option<String>,
     placement: Option<String>,
+    skill_target: Option<String>,
     reading: Option<String>,
 }
 
@@ -651,13 +659,17 @@ struct Particulars {
 /// enrolment or an installation, the organisation a grant answers to for an invitation or a
 /// device, and nothing for any other request. `None` when a word the host or the publisher wrote
 /// could not be shown exactly as it was written.
-fn particulars(subject: &Subject, host_states_placement_reading: bool) -> Option<Particulars> {
+fn particulars(
+    subject: &Subject,
+    host_readings: kr_protocol::confirmation::HostReadings,
+) -> Option<Particulars> {
     match subject {
         Subject::CatalogueAdd(plan) => Some(Particulars {
             facts: enrolment_facts(plan)?,
             notice: None,
             statement: None,
             placement: None,
+            skill_target: None,
             reading: None,
         }),
         Subject::PluginInstall(plan) => {
@@ -671,14 +683,17 @@ fn particulars(subject: &Subject, host_states_placement_reading: bool) -> Option
                 Some(words) => Some(plain(words, STATEMENT_CHARS)?),
                 None => None,
             };
-            let split = parts.as_deref().map(|statement| {
-                split_install_statement(&grant, statement, host_states_placement_reading)
-            });
+            let split = parts
+                .as_deref()
+                .map(|statement| split_install_statement(&grant, statement, host_readings));
             Some(Particulars {
                 facts: installation_facts(plan)?,
                 notice: (!notices.is_empty()).then(|| notices.join(" ")),
                 statement: split.and_then(|split| split.publisher).map(str::to_owned),
                 placement: split.and_then(|split| split.placement).map(str::to_owned),
+                skill_target: split
+                    .and_then(|split| split.skill_target)
+                    .map(str::to_owned),
                 reading: split.and_then(|split| split.reading).map(str::to_owned),
             })
         }
@@ -698,6 +713,7 @@ fn particulars(subject: &Subject, host_states_placement_reading: bool) -> Option
             notice: None,
             statement: None,
             placement: None,
+            skill_target: None,
             reading: None,
         }),
         Subject::EnrolOrganisation(plan) => Some(Particulars {
@@ -709,6 +725,7 @@ fn particulars(subject: &Subject, host_states_placement_reading: bool) -> Option
             notice: None,
             statement: None,
             placement: None,
+            skill_target: None,
             reading: None,
         }),
         Subject::IssueInvitation { proposed_grant, .. }
@@ -720,6 +737,7 @@ fn particulars(subject: &Subject, host_states_placement_reading: bool) -> Option
             notice: None,
             statement: None,
             placement: None,
+            skill_target: None,
             reading: None,
         }),
         _ => Some(Particulars {
@@ -727,6 +745,7 @@ fn particulars(subject: &Subject, host_states_placement_reading: bool) -> Option
             notice: None,
             statement: None,
             placement: None,
+            skill_target: None,
             reading: None,
         }),
     }
@@ -997,7 +1016,7 @@ mod tests {
                 proposed_grant,
             }),
             answered: false,
-            host_states_placement_reading: false,
+            host_readings: kr_protocol::confirmation::HostReadings::default(),
         }
     }
 
@@ -1441,7 +1460,7 @@ mod tests {
 
         let only = view_of(
             &["command_integration.launch"],
-            install_statement(None, None, Some(reading)),
+            install_statement(None, None, None, Some(reading)),
         );
         assert!(only.checkable);
         assert_eq!(only.notice.as_deref(), Some(COMMAND_INTEGRATION_NOTICE));
@@ -1458,7 +1477,7 @@ mod tests {
 
         let both = view_of(
             &["command_integration.launch", "native_bridge.install"],
-            install_statement(Some(PUBLISHER), None, Some(reading)),
+            install_statement(Some(PUBLISHER), None, None, Some(reading)),
         );
         assert!(both.checkable);
         assert_eq!(
@@ -1483,7 +1502,7 @@ mod tests {
     fn the_placement_reading_is_the_hosts_part_only_where_the_host_states_it_writes_it() {
         use kr_protocol::confirmation::{PLACEMENT_STATEMENT_LABEL, install_statement};
         let placement = "This package places files for \"Quill CLI\" in a folder it chose.";
-        let statement = install_statement(Some(PUBLISHER), Some(placement), None);
+        let statement = install_statement(Some(PUBLISHER), Some(placement), None, None);
         let view_of = |states: bool| {
             let plan = PluginInstallPlan {
                 grant: ["native_bridge.install".to_owned()].into_iter().collect(),
@@ -1494,7 +1513,10 @@ mod tests {
                 Subject::PluginInstall(plan),
                 SensitiveAction::GrantExecutableCapability,
             );
-            listed.host_states_placement_reading = states;
+            listed.host_readings = kr_protocol::confirmation::HostReadings {
+                placement: states,
+                skill_target: false,
+            };
             describe("a reference", "studio", &listed, NOW)
         };
 

@@ -205,8 +205,8 @@ impl Drop for BoundTransport {
 }
 
 impl ControlTransport for BoundTransport {
-    fn host_states_placement_reading(&self) -> bool {
-        self.binding.inner.host_states_placement_reading()
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+        self.binding.inner.host_readings()
     }
 
     fn connection_id(&self) -> ConnectionId {
@@ -330,8 +330,11 @@ mod tests {
     struct Closing(AtomicBool, bool);
 
     impl ControlTransport for Closing {
-        fn host_states_placement_reading(&self) -> bool {
-            self.1
+        fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+            kr_protocol::confirmation::HostReadings {
+                placement: self.1,
+                skill_target: false,
+            }
         }
 
         fn connection_id(&self) -> ConnectionId {
@@ -420,7 +423,7 @@ mod tests {
                 ),
                 over: Arc::new(Notify::new()),
             };
-            assert_eq!(bound.host_states_placement_reading(), says);
+            assert_eq!(bound.host_readings().placement, says);
         }
     }
 
