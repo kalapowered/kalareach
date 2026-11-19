@@ -4488,6 +4488,7 @@ dependencies = [
  "kr-automation",
  "kr-cbor",
  "kr-changeset",
+ "kr-cli",
  "kr-client",
  "kr-controller",
  "kr-crypto",
