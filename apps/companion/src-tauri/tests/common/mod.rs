@@ -500,6 +500,29 @@ impl Page {
         .expect("a state the page waits for within the limit")
     }
 
+    /// The first `showing` state `channel` was sent, read from its whole record, with the proof that
+    /// only `waiting` states stand before it: a screen shown early and replaced is not passed over.
+    pub async fn first_showing(&self, channel: u32) -> Value {
+        self.newest(channel, |state| state["state"] == "showing")
+            .await;
+        let states = self
+            .published
+            .lock()
+            .expect("the record")
+            .get(&channel)
+            .cloned()
+            .unwrap_or_default();
+        let at = states
+            .iter()
+            .position(|state| state["state"] == "showing")
+            .expect("a showing state");
+        assert!(
+            states[..at].iter().all(|state| state["state"] == "waiting"),
+            "{states:?}"
+        );
+        states[at].clone()
+    }
+
     /// A view of `session` that shows its screen.
     pub async fn showing(&self, session: SessionId, channel: u32) -> String {
         let view = self.open(session, channel).await;
