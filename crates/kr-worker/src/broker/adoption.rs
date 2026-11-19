@@ -846,7 +846,9 @@ fn bypass_for(
 mod tests {
     use std::time::Duration;
 
-    use super::{IDLE_LOOK, Pace, WATCH_INTERVAL};
+    use kr_protocol::ids::PluginId;
+
+    use super::{ADOPTED_REFUSAL, IDLE_LOOK, Pace, WATCH_INTERVAL, tie_refusal};
 
     #[test]
     fn a_quiet_watch_waits_a_quarter_of_the_quiet_time_between_the_interval_and_the_idle_look() {
@@ -897,5 +899,51 @@ mod tests {
             IDLE_LOOK,
             "a watch left alone settles on the idle look"
         );
+    }
+
+    /// KR-REQ-12.23: a view says "the host says" and then the refusal as the host wrote it, then a
+    /// full stop of its own. So each refusal an adopted instance can carry, the adopted form and a
+    /// tie among any number of packages, says something, starts in lower case and ends in a letter
+    /// or a digit, with no space at either end.
+    #[test]
+    fn each_refusal_an_adopted_instance_carries_reads_between_the_host_says_and_a_full_stop() {
+        let tied = |names: &[&str]| {
+            let plugins: Vec<PluginId> = names
+                .iter()
+                .map(|name| PluginId::new(*name).expect("an identifier"))
+                .collect();
+            tie_refusal(&plugins)
+        };
+        let refusals = [
+            ("an adopted program", ADOPTED_REFUSAL.to_owned()),
+            (
+                "a tie of two packages",
+                tied(&["kalareach/claude-one", "kalareach/claude-two"]),
+            ),
+            (
+                "a tie of three packages",
+                tied(&["kalareach/a", "kalareach/b", "kalareach/c"]),
+            ),
+            (
+                "a tie of four packages",
+                tied(&["kalareach/a", "kalareach/b", "kalareach/c", "kalareach/d"]),
+            ),
+        ];
+        for (which, words) in &refusals {
+            assert!(!words.trim().is_empty(), "{which} says something: {words:?}");
+            assert_eq!(
+                words.trim(),
+                words,
+                "{which} has no space at either end: {words:?}"
+            );
+            assert!(
+                words.chars().next().is_some_and(char::is_lowercase),
+                "{which} starts in lower case: {words:?}"
+            );
+            assert!(
+                words.ends_with(char::is_alphanumeric),
+                "{which} ends in a letter or a digit, so the view's full stop is the only one: {words:?}"
+            );
+        }
     }
 }
