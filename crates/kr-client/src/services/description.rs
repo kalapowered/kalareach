@@ -301,7 +301,7 @@ const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// A proxy that answers `HTTP/1.0 407` is read by the client only as a failed tunnel, so the
 /// request alone cannot tell a refused login from an unreachable service. The failed request left
 /// its target in the login's suspicion; this makes one `CONNECT` to it, with the same login and
-/// under [`RECHECK_TIMEOUT`], with no loop and no interval. `None` leaves the request's own reading
+/// under a bound of ten seconds, with no loop and no interval. `None` leaves the request's own reading
 /// of the failure as it was.
 pub async fn recheck(proxy: Option<&ProxyUrl>) -> Option<Unread> {
     let proxy = proxy?;
