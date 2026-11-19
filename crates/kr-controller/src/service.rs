@@ -1868,6 +1868,9 @@ mod a_feed_request_beside_a_row_that_cannot_be_read;
 mod a_revocation_beside_a_row_that_cannot_be_read;
 
 #[cfg(test)]
+mod a_repair_of_grants_rows_before_a_start;
+
+#[cfg(test)]
 mod a_revocation_without_an_admission_that_meets_a_registration;
 
 #[cfg(test)]

@@ -9104,3 +9104,70 @@ async fn a_damaged_request_on_page_one_and_a_device_request_on_page_two_are_both
     assert!(revoked_in_the_registry(&rig.host, share.grant_id));
     assert!(rig.has_revoked(other.1.device_id).await);
 }
+
+/// A request the host noted and could not carry out is carried out by the next pass after its
+/// issuer was revoked at the machine: a request already noted is not judged again, where one the
+/// host had not noted is refused for its issuer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_noted_request_is_carried_out_after_its_issuer_is_revoked() {
+    let rig = Rig::start().await;
+    let issuer = rig
+        .pairs(&[ActionRight::HostManage, ActionRight::SessionView])
+        .await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    let session_id = net_support::an_open_session(&rig.host).0;
+    let share = net_support::worker::share(
+        &rig.host,
+        session_id,
+        &kept.0,
+        &kept.1,
+        kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer),
+    )
+    .await;
+    rig.until_the_carrier_is_idle().await;
+    // The registry cannot withdraw the share yet: the pass notes the request and cannot carry it
+    // out.
+    registry_statement(
+        &rig.host,
+        &format!(
+            "CREATE TRIGGER refuse_the_share BEFORE UPDATE OF revoked_at_ms ON grants
+             WHEN NEW.grant_id = {} BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            key_literal(share.grant_id)
+        ),
+    );
+    let key = issuer.0.keys().authorisation.clone();
+    let request = rig.request_of(
+        &key,
+        issuer.1.device_id,
+        0xe4,
+        RevocationTarget::Grants {
+            grant_ids: [share.grant_id].into_iter().collect::<CanonicalSet<_>>(),
+        },
+    );
+    rig.published_as(&key, &request).await;
+    rig.poll().await;
+    assert!(
+        !revoked_in_the_registry(&rig.host, share.grant_id),
+        "the request was noted and not carried out"
+    );
+
+    let mut local = rig.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut local,
+        Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: issuer.1.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the issuer");
+    registry_statement(&rig.host, "DROP TRIGGER refuse_the_share;");
+    rig.until_the_carrier_is_idle().await;
+    rig.poll().await;
+
+    assert!(
+        revoked_in_the_registry(&rig.host, share.grant_id),
+        "a request already noted is carried out although its issuer has been revoked since"
+    );
+}
