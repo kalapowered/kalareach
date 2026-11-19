@@ -10997,7 +10997,7 @@ async fn a_next_root_that_cannot_be_read_fails_the_synchronisation() {
                 .expect("a file nobody may read");
             if std::fs::File::open(&next).is_ok() {
                 eprintln!(
-                    "this process reads a file whatever its mode says, so no root is refused"
+                    "not exercised: this process reads a file whatever its mode says, so no root is refused"
                 );
                 return;
             }

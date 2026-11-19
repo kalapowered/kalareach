@@ -1075,7 +1075,9 @@ mod tests {
         for loopback in ["127.0.0.1:0", "[::1]:0"] {
             let addr: std::net::SocketAddr = loopback.parse().expect("a loopback address");
             if !bindable(addr) {
-                eprintln!("{loopback} cannot be bound on this machine, so that leg is not run");
+                eprintln!(
+                    "not exercised: {loopback} cannot be bound on this machine, so that leg did not run"
+                );
                 continue;
             }
             let config = EndpointConfig {

@@ -349,7 +349,7 @@ fn inside_the_level_for(case: &str) -> Option<&'static Previous> {
     let found = inside_the_level();
     if found.is_none() {
         println!(
-            "{case}: not run, because no kept release of level {} is in the history of this \
+            "skipped: {case} did not run, because no kept release of level {} is in the history of this \
              commit; the cases that update from, and roll back to, the release before still run",
             CompatibilityLevel::of(PACKAGE_VERSION)
         );

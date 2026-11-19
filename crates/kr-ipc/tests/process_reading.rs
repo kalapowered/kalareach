@@ -116,7 +116,9 @@ fn a_process_that_refuses_its_executable_is_still_running() {
     if std::fs::read_link(format!("/proc/{}/exe", child.id())).is_ok() {
         // The superuser reads every link, so no process refuses this reader: the case cannot be
         // made here, and it says so rather than passing as if it had.
-        eprintln!("not run: this account reads every process's executable link");
+        eprintln!(
+            "skipped: this account reads every process's executable link, so the case cannot be made here"
+        );
         end(child);
         return;
     }

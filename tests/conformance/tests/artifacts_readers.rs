@@ -176,7 +176,9 @@ fn answer(look: &Look) -> Option<&Path> {
                 std::env::var_os("CI").is_none(),
                 "a hosted run has PowerShell, and none was found"
             );
-            eprintln!("no PowerShell is installed here: its reader's cases are not run");
+            eprintln!(
+                "skipped: no PowerShell is installed here, so its reader's cases did not run"
+            );
             None
         }
     }
@@ -199,7 +201,9 @@ fn shell() -> Option<PathBuf> {
         "a hosted run has Git Bash, and none was found"
     );
     if found.is_none() {
-        eprintln!("no Git Bash is installed here: the shell reader's cases are not run");
+        eprintln!(
+            "skipped: no Git Bash is installed here, so the shell reader's cases did not run"
+        );
     }
     found
 }
@@ -1180,7 +1184,7 @@ fn the_shell_reader_compares_exact_letters_whatever_the_callers_nocasematch_is()
     }
     if parent.path().join("ROOT").exists() {
         eprintln!(
-            "the disk under {} keeps /root and /ROOT as one folder: the letters are not compared here",
+            "not exercised: the disk under {} keeps /root and /ROOT as one folder, so the letters are not compared here",
             parent.path().display()
         );
         return;
@@ -1214,7 +1218,7 @@ fn a_second_root_that_differs_in_letter_case_alone_is_a_root_where_the_disk_tell
     std::fs::create_dir(&lower).expect("a folder");
     if parent.path().join("TMP").exists() {
         eprintln!(
-            "the disk under {} keeps /tmp and /TMP as one folder: the case says nothing here",
+            "skipped: the disk under {} keeps /tmp and /TMP as one folder, so the case says nothing here",
             parent.path().display()
         );
         return;
@@ -1806,7 +1810,7 @@ mod windows_paths {
             unc.display()
         );
         eprintln!(
-            "{} cannot be reached here: the UNC case is not run",
+            "skipped: {} cannot be reached here, so the UNC case did not run",
             unc.display()
         );
         None

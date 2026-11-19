@@ -544,7 +544,7 @@ async fn a_proxy_whose_certificate_is_not_trusted_is_refused() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tunnel_to_an_ipv6_room_names_it_in_brackets() {
     let Ok(listener) = TcpListener::bind("[::1]:0").await else {
-        eprintln!("this machine has no IPv6 loopback, so there is no IPv6 room to reach");
+        eprintln!("skipped: this machine has no IPv6 loopback, so there is no IPv6 room to reach");
         return;
     };
     let authority = Authority::new("rendezvous test authority");
