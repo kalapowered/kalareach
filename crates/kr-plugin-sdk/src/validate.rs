@@ -35,6 +35,7 @@ use crate::effect::{
 };
 use crate::forwarder;
 use crate::ids::ActionName;
+use crate::launch_variables::LaunchPermits;
 use crate::limits::MANIFEST_BYTES;
 use crate::matching::OperatingSystem;
 use crate::package::{
@@ -1445,7 +1446,8 @@ fn check_manifest(
                  command_integration.launch",
             ));
         }
-        for problem in integration.problems(&manifest.match_rules) {
+        let permits = LaunchPermits::for_package(&manifest.sdk_range, connector);
+        for problem in integration.problems(&manifest.match_rules, &permits) {
             report.push(Finding::at(
                 FindingCode::IntegrationInvalid,
                 MANIFEST_FILE,
@@ -1455,6 +1457,20 @@ fn check_manifest(
         if integration.backend.is_some() {
             check_backend_table(connector, report);
         }
+    }
+    // The variables a table declares are held to rules of their own, and to the integration that
+    // sets them, whether or not the manifest declares one.
+    for problem in crate::launch_variables::problems(
+        connector.and_then(|table| table.launch_variables.as_deref()),
+        manifest.plugin_name.as_str(),
+        manifest.command_integration.as_ref(),
+    ) {
+        let (code, file) = if problem.name.is_about_the_table() {
+            (FindingCode::ConnectorTableInvalid, CONNECTOR_FILE)
+        } else {
+            (FindingCode::IntegrationInvalid, MANIFEST_FILE)
+        };
+        report.push(Finding::at(code, file, problem.message()));
     }
     // A launch probe runs the application's own executable with arguments the package chose, so it
     // has a capability of its own, and what it may declare is closed.

@@ -196,3 +196,58 @@ fn every_effect_class_in_the_contract_names_its_rights() {
         assert!(entry["required_capability"].is_string());
     }
 }
+
+/// The package contract publishes the rules a declared launch variable is held to, so a publisher
+/// reads them without reading the host's code: the values, the bounds, the vendor rule, both lists
+/// of the floor, what the floor costs, and what the host's checks do not establish.
+#[test]
+fn the_package_contract_publishes_the_variable_rules() {
+    let contract = kr_plugin_sdk::schema::package_contract();
+    let integration = &contract["command_integration"];
+    let rules = &integration["launch_variable_rules"];
+    assert_eq!(rules["values"], serde_json::json!(["1", "0"]));
+    assert_eq!(rules["max_entries"], 4);
+    assert_eq!(rules["max_name_bytes"], 64);
+    assert_eq!(rules["min_words"], 2);
+    assert_eq!(
+        rules["vendor"],
+        "the first word of the name is the upper-case first word of the package's plugin name, \
+         the part of the name before its first '-' or '.'"
+    );
+    assert!(
+        rules["floor_first_words"]
+            .as_array()
+            .is_some_and(|words| words.contains(&serde_json::json!("LD"))),
+        "{rules}"
+    );
+    assert!(
+        rules["floor_words"]
+            .as_array()
+            .is_some_and(|words| words.contains(&serde_json::json!("OPTIONS"))),
+        "{rules}"
+    );
+    assert!(
+        rules["floor_cost"]
+            .as_str()
+            .is_some_and(|text| text.contains("AMP_NO_CONFIG_SYNC")),
+        "{rules}"
+    );
+    assert_eq!(
+        rules["floor_note"],
+        "The floor is defence in depth. It is not a statement of what a variable does."
+    );
+    assert_eq!(
+        rules["residual"],
+        "The host checks each declared name and value against its syntax rules and reserved \
+         names. These checks do not establish how a program interprets the variable. A program or \
+         library can read a permitted value as a relative path or use it to select code or \
+         disable checks. A program that starts through a committed integration receives the \
+         declared variables. Its child processes can inherit them. An invocation that runs as \
+         typed receives no variables added by this integration."
+    );
+    // The compiled pair stays published beside the rules.
+    assert_eq!(
+        integration["permitted_variables"][0]["name"],
+        "GEMINI_CLI_NO_RELAUNCH"
+    );
+}

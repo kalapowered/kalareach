@@ -241,6 +241,7 @@ pub fn package_contract() -> Value {
             "max_launching_word_bytes": crate::integration::MAX_LAUNCHING_WORD_BYTES,
             "gateway_placeholder": crate::integration::GATEWAY_PLACEHOLDER,
             "max_backend_methods": kr_protocol::gateway::MAX_TABLE_METHODS,
+            "launch_variable_rules": crate::launch_variables::rules(),
             "permitted_variables": crate::integration::PERMITTED_VARIABLES
                 .iter()
                 .map(|permitted| json!({
