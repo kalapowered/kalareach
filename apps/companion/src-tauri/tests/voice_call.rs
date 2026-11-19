@@ -8585,6 +8585,65 @@ async fn a_start_the_host_accepts_takes_back_the_notice_of_a_call_left_to_it() {
     scene.stop_host().await;
 }
 
+/// The host's reply to the request to send the context is lost: the host's news about the send
+/// still applies, because the phone knows the send by an identity it made before it asked. The
+/// notice that the host did not say whether it took the request is taken back when the news says
+/// the send is done, and the end of the call adds nothing of a send that finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_news_of_a_context_send_applies_when_its_reply_was_lost() {
+    let mut scene = own_scene(own_timings()).await;
+    scene
+        .link
+        .lose_the_answer_to(Some(HostMethod::VoiceContextSend));
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    // The host's sender writes the context whether or not the phone heard its answer.
+    until_written(&scene, "session.thinking.append", |_| true).await;
+    let opening = |state: &serde_json::Value| -> Vec<(String, bool)> {
+        state["problems"]
+            .as_array()
+            .map(|problems| {
+                problems
+                    .iter()
+                    .filter(|each| each["kind"] == "opening_context")
+                    .map(|each| {
+                        (
+                            each["words"].as_str().unwrap_or_default().to_owned(),
+                            each["over"] == true,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let done = scene
+        .state_where("the notice taken back by the news that the send is done", |state| {
+            let problems = opening(state);
+            !problems.is_empty() && problems.iter().all(|(_, over)| *over)
+        })
+        .await;
+    assert_eq!(
+        opening(&done),
+        [(
+            "This call may not have been given the host's context for its session: the host did not say whether it accepted the request to send it.".to_owned(),
+            true
+        )],
+        "{done}"
+    );
+    scene
+        .call("voice_stop", json!({ "voiceSessionId": null }))
+        .expect("the call ends");
+    let ended = scene
+        .state_where("the end", |state| state["running"] == false)
+        .await;
+    assert!(
+        opening(&ended).iter().all(|(_, over)| *over),
+        "the end adds no notice of a send that finished: {ended}"
+    );
+    scene.stop_host().await;
+}
+
 /// A call the host ended and swept out of its list before this phone's stop reached it was closed by
 /// the host: the phone shows only the host's own words, and nothing about the call running on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

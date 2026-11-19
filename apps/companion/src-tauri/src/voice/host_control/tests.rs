@@ -370,13 +370,17 @@ async fn a_context_send_is_queued_with_its_identity_or_refused_with_the_hosts_re
     }
     let (control, _events) = HostControl::open(script, voice_session(), quiet());
     let session = SessionId::new(kr_ipc::new_uuid());
+    let ours = ActionId::new(kr_ipc::new_uuid());
     let queued = control
-        .send_context(session, None)
+        .send_context(ours, session, None)
         .await
         .expect("the host queued it");
     assert_eq!(queued.appends, 3);
+    assert_eq!(queued.action_id, ours, "the news about the send names the caller's identity");
     assert_eq!(
-        control.send_context(session, None).await,
+        control
+            .send_context(ActionId::new(kr_ipc::new_uuid()), session, None)
+            .await,
         Err(HostSendError::Refused(Some(VoiceHostRefusal::Busy)))
     );
     control.stop();

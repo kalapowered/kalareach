@@ -382,10 +382,12 @@ impl HostControl {
     }
 
     /// Asks the host to send the call the context of `session_id`, which it selects, caps and
-    /// writes at its own pace. The answer is given at once; progress arrives as news naming the
-    /// returned action.
+    /// writes at its own pace, under `action_id`, which the caller made. The answer is given at
+    /// once; progress arrives as news naming the action, and applies whether or not the answer
+    /// does.
     pub(super) async fn send_context(
         &self,
+        action_id: ActionId,
         session_id: SessionId,
         delegation: Option<&str>,
     ) -> std::result::Result<ContextQueued, HostSendError> {
@@ -401,7 +403,6 @@ impl HostControl {
             selected: CanonicalSet::new(),
             delegation_id,
         };
-        let action_id = ActionId::new(kr_ipc::new_uuid());
         match tokio::time::timeout(self.within, self.link.send_context(action_id, &params)).await {
             Ok(Ok(VoiceContextSendResult::Queued { appends })) => {
                 Ok(ContextQueued { action_id, appends })
