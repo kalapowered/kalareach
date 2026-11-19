@@ -621,7 +621,9 @@ fn a_missing_and_an_empty_reason_are_refused_by_the_table_s_own_reading() {
     assert!(
         findings
             .iter()
-            .any(|finding| finding.detail.contains("summary is empty")),
+            .any(|finding| finding.code == FindingCode::ManifestUnreadable
+                && finding.path.as_deref() == Some("connector.json")
+                && finding.detail.contains("summary is empty")),
         "{findings:#?}"
     );
     let missing = json!([{ "name": "EXAMPLE_NO_X", "value": "1" }]);
@@ -632,7 +634,9 @@ fn a_missing_and_an_empty_reason_are_refused_by_the_table_s_own_reading() {
     assert!(
         findings
             .iter()
-            .any(|finding| finding.detail.contains("missing field `reason`")),
+            .any(|finding| finding.code == FindingCode::ManifestUnreadable
+                && finding.path.as_deref() == Some("connector.json")
+                && finding.detail.contains("missing field `reason`")),
         "{findings:#?}"
     );
 }
