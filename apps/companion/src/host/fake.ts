@@ -156,7 +156,8 @@ export class FakeHostError extends Error {
   constructor(
     readonly code: string,
     message: string,
-    readonly user_action = 'nothing'
+    readonly user_action = 'nothing',
+    readonly startAgainFor?: string
   ) {
     super(message)
     this.name = 'FakeHostError'
@@ -168,7 +169,8 @@ export class FakeHostError extends Error {
       code: this.code,
       message: this.message,
       user_action: this.user_action,
-      retry: fakeRetryOf(this.code)
+      retry: fakeRetryOf(this.code),
+      ...(this.startAgainFor === undefined ? {} : { start_again_for: this.startAgainFor })
     })
   }
 }
@@ -734,6 +736,12 @@ export interface FakeHostControls {
   refuseVoiceStart(reason: string | null): void
   /** Has the host answer the next start with a typed `creation_unknown`, which the device keeps as a notice. */
   makeVoiceStartUnconfirmed(): void
+  /**
+   * Has the host hold this device for the earlier start `actionId`: a start that does not name it is
+   * refused at the hold in the host's words, with that start offered for "Start again", and one
+   * that names it is admitted and ends the hold.
+   */
+  holdTheDeviceForStart(actionId: string): void
   /**
    * Moves the managed rate on, as an operator deploying a new one does.
    *
@@ -1333,6 +1341,7 @@ export function fakeHost(
     brokerReachable: seed.brokerReachable,
     startRefusal: null,
     startUnconfirmed: false,
+    startHeldFor: null,
     rate: { ...VOICE_TERMS.rate },
     terms: seed.terms,
     scope: 1,
@@ -1779,6 +1788,16 @@ export function fakeHost(
           }
         }
       })
+    }
+    if (voice.startHeldFor !== null) {
+      if (request.afterActionId !== voice.startHeldFor) {
+        return refused(
+          'DRAFT_CONFLICT',
+          `Nothing was started. This host still holds an earlier voice start from this device (action ${voice.startHeldFor}).`,
+          voice.startHeldFor
+        )
+      }
+      voice.startHeldFor = null
     }
     if (voice.startRefusal) {
       return Promise.resolve({
@@ -3727,6 +3746,9 @@ export function fakeHost(
     makeVoiceStartUnconfirmed() {
       voice.startUnconfirmed = true
     },
+    holdTheDeviceForStart(actionId) {
+      voice.startHeldFor = actionId
+    },
     changeVoiceScope() {
       voice.scope += 1
     },
@@ -3977,6 +3999,8 @@ interface VoiceState {
   startRefusal: string | null
   /** Whether the host answers a start with a typed `creation_unknown`, which the device keeps. */
   startUnconfirmed: boolean
+  /** The earlier start that holds the device at the host, when one does. */
+  startHeldFor: string | null
   /** The rate the service would charge a call started now. */
   rate: VoiceRate
   /** What the service tells this host about its terms. */
@@ -4642,10 +4666,10 @@ function controlCharacter(point: number): boolean {
 }
 
 /** A refusal of a view's handle, as native code rejects with it. */
-function refused(code: string, message: string): Promise<never> {
+function refused(code: string, message: string, startAgainFor?: string): Promise<never> {
   return new Promise((_, reject) => {
     // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- a refusal is the data native code rejects with, never an Error
-    reject(new FakeHostError(code, message).toPayload())
+    reject(new FakeHostError(code, message, 'nothing', startAgainFor).toPayload())
   })
 }
 

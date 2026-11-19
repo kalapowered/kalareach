@@ -304,8 +304,55 @@ describe('starting a call', () => {
     expect(
       await screen.findByText(/The host could not confirm whether the voice service created this call\./)
     ).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Start again' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Start again' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+  })
+
+  // "Start again" is the Start path with one more name: the preparation and the rate version the
+  // person was shown go with it, and a plain start names no earlier start.
+  it('starts again under the earlier start with the preparation and rate version that were shown', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    controls.makeVoiceStartUnconfirmed()
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    expect(
+      await screen.findByText(/The host could not confirm whether the voice service created this call\./)
+    ).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Start again' })).toBeInTheDocument()
+    const first = controls.voiceStarts[0]
+    expect(first).not.toHaveProperty('afterActionId')
+
+    await person.click(screen.getByRole('button', { name: 'Start again' }))
+
+    await waitFor(() => {
+      expect(controls.voiceStarts).toHaveLength(2)
+    })
+    const second = controls.voiceStarts[1]
+    expect(second.afterActionId).toBe('a-start-unconfirmed')
+    expect(second.expectedRateVersion).toBe(first.expectedRateVersion)
+    expect(second.prepared).toBe(first.prepared)
+  })
+
+  // A refusal at the host's hold that names an earlier start the device keeps offers "Start again",
+  // and the press names that start, which the host then admits.
+  it('offers Start again beside the hold’s refusal and names the start that holds the device', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    controls.holdTheDeviceForStart('a-held-start')
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    expect(await screen.findByText(/Nothing was started\./)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Start again' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull()
+
+    await person.click(screen.getByRole('button', { name: 'Start again' }))
+
+    await waitFor(() => {
+      expect(controls.voiceStarts).toHaveLength(2)
+    })
+    expect(controls.voiceStarts[1].afterActionId).toBe('a-held-start')
+    expect(await screen.findByRole('heading', { name: 'Voice session' })).toBeInTheDocument()
   })
 
   // The control that was pressed goes with the screen it was on, and focus left on nothing sends a
