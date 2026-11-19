@@ -2543,6 +2543,250 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
     );
 }
 
+/// One bundled bridge package (`name` is its folder under the bundled targets) copied under
+/// `into`, with an SDK range that holds the arrival of a placement, `edit` applied to its
+/// connector table and the table's payload record brought up to the changed file.
+fn placing_package(
+    into: &std::path::Path,
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> std::path::PathBuf {
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).expect("a directory");
+        for entry in std::fs::read_dir(from).expect("lists") {
+            let entry = entry.expect("an entry");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("a type").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), target).expect("copies");
+            }
+        }
+    }
+    let directory = into.join(name);
+    copy_tree(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../bundled-plugins/targets/packages/kalareach")
+            .join(name)
+            .join("0.5.0"),
+        &directory,
+    );
+    let read = |file: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(directory.join(file)).expect("reads")).expect("JSON")
+    };
+    let mut table = read("connector.json");
+    edit(&mut table);
+    let bytes = serde_json::to_vec_pretty(&table).expect("writes");
+    std::fs::write(directory.join("connector.json"), &bytes).expect("writes");
+    let mut manifest = read("plugin.json");
+    manifest["sdk_range"] = serde_json::json!(">=0.1.9, <0.2.0");
+    let record = manifest["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .iter_mut()
+        .find(|payload| payload["path"] == "connector.json")
+        .expect("the table's payload");
+    record["digest"] = serde_json::json!(PayloadDigest::of(&bytes).to_string());
+    record["size_bytes"] = serde_json::json!(bytes.len().to_string());
+    std::fs::write(
+        directory.join("plugin.json"),
+        serde_json::to_vec_pretty(&manifest).expect("writes"),
+    )
+    .expect("writes");
+    directory
+}
+
+/// What an owner is shown of the bundled bridge package `name` as `placing_package` writes it,
+/// for a grant that holds the bridge, where the repository keeps no file behind the table when
+/// `withhold_table` is set.
+async fn placed_statement(
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+    withhold_table: bool,
+) -> CatalogueResult<Option<String>> {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let packages = tempfile::tempdir().expect("a temporary directory");
+    let generation = Generation::build(
+        home.path(),
+        GenerationSpec {
+            package: Some(placing_package(packages.path(), name, edit)),
+            drop_payload: withhold_table.then(|| "connector.json".to_owned()),
+            ..GenerationSpec::default()
+        },
+    )
+    .await;
+    let mut catalogue = enrolled(
+        home.path(),
+        &generation,
+        RepositoryBudgets::defaults(),
+        CapabilityCeiling::default_ceiling(),
+    )
+    .await;
+    catalogue.sync(&repository()).await.expect("a generation");
+    catalogue
+        .grant_statement(
+            &repository(),
+            &PluginId::new(format!("kalareach/{name}")).expect("a plugin identifier"),
+            &PackageVersion::parse("0.5.0").expect("a valid version"),
+            generation.manifest_digest(),
+            &InstallationGrant::with([PluginCapability::NativeBridgeInstall]),
+        )
+        .await
+}
+
+/// The publisher's words for the bundled bridge package `name`.
+fn bridge_words(name: &str) -> String {
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../bundled-plugins/targets/packages/kalareach")
+                .join(name)
+                .join("0.5.0/plugin.json"),
+        )
+        .expect("reads"),
+    )
+    .expect("JSON");
+    manifest["native_bridge"]["grant_statement"]
+        .as_str()
+        .expect("the bridge's words")
+        .to_owned()
+}
+
+/// The host's reading of a placement as its grant text gives it, for the application, the folder
+/// the files go in, their tails, the sentence about a key the host sets (empty where it sets
+/// none), the clause about a record of where the files came from (empty where the shapes have
+/// none) and the words that say a key is taken out again (empty where none is).
+fn the_hosts_reading(
+    application: &str,
+    folder: &str,
+    files: &str,
+    key: &str,
+    record: &str,
+    removed: &str,
+) -> String {
+    format!(
+        "This package places files for \"{application}\" in a folder it chose: {folder} under \
+         your home folder, files {files}. \"{application}\", or any other program that reads \
+         that folder, can run what the files hold, as you, with your permissions and outside \
+         the plugin sandbox. {key}The host places these files only after it has checked that \
+         each is JSON with no repeated member name, that every entry named command in them \
+         starts the KalaReach forwarder by its path, and that no other name or text in them \
+         holds a slash, a backslash, a colon, a tilde, a dollar sign or a backtick or is a lone \
+         dot or two dots{record}. The host does not check what \"{application}\", or another \
+         program, does with the other settings in these files, and a plain file name in them \
+         can be read by a program as a path. Removing the package takes out only what this host \
+         placed{removed}; a file that has changed since stays in place, and the host reports \
+         what it cannot remove."
+    )
+}
+
+/// KR-REQ-11.44: a release whose table declares a placement is shown the host's exact reading of
+/// it after the host's label, behind the publisher's words, written from the table the verified
+/// manifest pins: the whole text for each compiled layout, with the key the host sets for Claude
+/// Code and the record clause for Gemini CLI. A release that declares none is shown its words as
+/// before.
+#[tokio::test]
+async fn kr_req_11_44_the_statement_carries_the_hosts_reading_of_the_placement() {
+    use kr_plugin_sdk::placement::Placement;
+    let label = kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL;
+    let table = |placement: Placement| {
+        move |table: &mut serde_json::Value| {
+            table["placement"] = serde_json::to_value(&placement).expect("a placement");
+        }
+    };
+
+    let words = bridge_words("claude-code");
+    let shown = placed_statement("claude-code", table(Placement::claude_code()), false)
+        .await
+        .expect("the table the manifest pins is read")
+        .expect("a statement");
+    let reading = the_hosts_reading(
+        "Claude Code",
+        ".claude/skills/kalareach-channels/",
+        ".claude-plugin/plugin.json, .mcp.json, hooks/hooks.json",
+        "It also sets enabledPlugins.kalareach-channels@skills-dir to true in \
+         .claude/settings.json, and keeps your other settings in that file. ",
+        "",
+        " and the key it set",
+    );
+    assert_eq!(shown, format!("{words} {label} {reading}"));
+
+    let words = bridge_words("gemini-cli");
+    let shown = placed_statement("gemini-cli", table(Placement::gemini_cli()), false)
+        .await
+        .expect("the table the manifest pins is read")
+        .expect("a statement");
+    let reading = the_hosts_reading(
+        "Gemini CLI",
+        ".gemini/extensions/kalareach/",
+        ".gemini-extension-install.json, gemini-extension.json, hooks/hooks.json",
+        "",
+        ", except that an entry that records where the files were installed from must be the \
+         path /dev/null/kalareach, which leads nowhere and is not where the files are",
+        "",
+    );
+    assert_eq!(shown, format!("{words} {label} {reading}"));
+
+    let shown = placed_statement("gemini-cli", |_| {}, false)
+        .await
+        .expect("the manifest the index pins is read");
+    assert_eq!(
+        shown,
+        Some(bridge_words("gemini-cli")),
+        "no table, no reading"
+    );
+}
+
+/// KR-REQ-11.44: a release whose table cannot be fetched, read or used is refused, and is never
+/// shown a statement without the host's reading of the placement: the file is gone from the
+/// repository, the member is not a placement, a component of its directory is a name Windows
+/// opens as a device, and its layout is another label's. The same releases with an undamaged table
+/// are shown their reading.
+#[tokio::test]
+async fn kr_req_11_44_a_release_whose_table_cannot_be_fetched_or_read_gets_a_refusal() {
+    use kr_plugin_sdk::placement::Placement;
+    let gemini = |table: &mut serde_json::Value| {
+        table["placement"] = serde_json::to_value(Placement::gemini_cli()).expect("a placement");
+    };
+    assert!(
+        placed_statement("gemini-cli", gemini, false)
+            .await
+            .expect("the undamaged table is read")
+            .is_some_and(|text| text
+                .contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL)),
+        "the control"
+    );
+
+    let withheld = placed_statement("gemini-cli", gemini, true).await;
+    assert!(
+        withheld.is_err(),
+        "a table that cannot be fetched is refused: {withheld:?}"
+    );
+
+    type Damage = fn(&mut serde_json::Value);
+    let damages: [(&str, Damage); 3] = [
+        ("a member that is not a placement", |table| {
+            table["placement"] = serde_json::json!(3);
+        }),
+        ("a directory component Windows opens as a device", |table| {
+            table["placement"] =
+                serde_json::to_value(Placement::gemini_cli()).expect("a placement");
+            table["placement"]["directory"] = serde_json::json!(["nul"]);
+        }),
+        ("another label's layout", |table| {
+            table["placement"] =
+                serde_json::to_value(Placement::claude_code()).expect("a placement");
+        }),
+    ];
+    for (what, damage) in damages {
+        let refusal = placed_statement("gemini-cli", damage, false).await;
+        assert!(
+            matches!(refusal, Err(CatalogueError::UnsafePackage { .. })),
+            "{what}: {refusal:?}"
+        );
+    }
+}
+
 /// A command integration is granted to an installed release only by installing it, as a native
 /// bridge is: a later grant is not where the owner is shown the host's reading of what the
 /// integration does, so it refuses naming `plugin.install`. Withdrawing it, and widening by some
