@@ -1261,10 +1261,11 @@ fn check_statement(
     report: &mut Report,
 ) {
     let bridge = manifest.native_bridge.0.as_ref();
+    let asks_for_a_target = manifest.requests(PluginCapability::SkillTargetInstall);
     let target = connector
         .and_then(|table| table.skill_target.as_ref())
-        .filter(|_| manifest.requests(PluginCapability::SkillTargetInstall));
-    if bridge.is_none() && target.is_none() {
+        .filter(|_| asks_for_a_target);
+    if bridge.is_none() && !asks_for_a_target {
         return;
     }
     let placement = bridge.and_then(|bridge| {
@@ -1272,7 +1273,14 @@ fn check_statement(
             .and_then(|table| table.placement.as_ref())
             .and_then(|placement| placement.statement(bridge).ok())
     });
-    let reading = target.map(crate::skill_target::SkillTarget::statement);
+    // A release that asks for the capability and declares none is told so, and that reading counts
+    // as the host composes it.
+    let reading = asks_for_a_target.then(|| {
+        target.map_or_else(
+            || crate::skill_target::NO_SKILL_TARGET_STATEMENT.to_owned(),
+            crate::skill_target::SkillTarget::statement,
+        )
+    });
     let integration = manifest.command_integration.as_ref().map_or_else(
         || crate::integration::NO_INTEGRATION_STATEMENT.to_owned(),
         crate::integration::CommandIntegration::statement,

@@ -34,9 +34,9 @@ pub const MAX_AGENT_BYTES: usize = 32;
 /// The pattern of the word of an agent as the published schema states it, which is the whole of
 /// what [`AgentTarget::parse`] checks: the grammar, no ending of `-user` or `-project` and no ending
 /// in a segment of sixteen hexadecimal digits, which a record's file name could not tell from a
-/// project's digest.
+/// project's digest. A word of one segment ends in it too: the whole word may be those digits.
 pub const AGENT_PATTERN: &str =
-    "^(?!.*-(user|project)$)(?!.*-[0-9a-f]{16}$)[a-z][a-z0-9]*(-[a-z0-9]+)*$";
+    "^(?!.*-(user|project)$)(?!(.*-)?[0-9a-f]{16}$)[a-z][a-z0-9]*(-[a-z0-9]+)*$";
 
 /// One of the six agents this host holds the places of, for an installation made with no
 /// declaration.

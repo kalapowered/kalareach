@@ -2915,6 +2915,54 @@ async fn a_whole_statement_longer_than_the_bound_is_refused() {
     );
 }
 
+/// The host counts the reading of an absent skill target in the whole statement it shows: for a
+/// grant that holds the capability, the longest statement that fits is shown, and one character
+/// more is refused.
+#[tokio::test]
+async fn the_reading_of_an_absent_skill_target_counts_in_the_bound_on_the_whole_statement() {
+    use kr_plugin_sdk::placement::Placement;
+    use kr_plugin_sdk::skill_target::NO_SKILL_TARGET_STATEMENT;
+    use kr_protocol::confirmation::STATEMENT_CHARS;
+    let claude = |table: &mut serde_json::Value| {
+        table["placement"] = serde_json::to_value(Placement::claude_code()).expect("a placement");
+    };
+    let grant = [
+        PluginCapability::NativeBridgeInstall,
+        PluginCapability::CommandIntegrationLaunch,
+        PluginCapability::SkillTargetInstall,
+    ];
+    let with_filler = |length: usize| {
+        move |manifest: &mut serde_json::Value| {
+            asks_for_the_skill_target(manifest);
+            manifest["command_integration"]["flags"]
+                .as_array_mut()
+                .expect("flags")
+                .push(serde_json::json!("x".repeat(length)));
+        }
+    };
+    let shown = placed_statement_granted("claude-code", claude, with_filler(1), false, grant)
+        .await
+        .expect("the release is read")
+        .expect("a statement");
+    assert!(
+        shown.contains(NO_SKILL_TARGET_STATEMENT),
+        "the control holds the reading of the absent target"
+    );
+    let exact = 1 + (STATEMENT_CHARS - shown.chars().count());
+    let fits = placed_statement_granted("claude-code", claude, with_filler(exact), false, grant)
+        .await
+        .expect("the longest that fits is read")
+        .expect("a statement");
+    assert_eq!(fits.chars().count(), STATEMENT_CHARS);
+    let refusal =
+        placed_statement_granted("claude-code", claude, with_filler(exact + 1), false, grant).await;
+    assert!(
+        matches!(&refusal, Err(CatalogueError::UnsafePackage { detail })
+            if detail.contains("whole statement is longer")),
+        "{refusal:?}"
+    );
+}
+
 /// KR-REQ-11.44: the publisher's words never hold the host's label for its reading of a placement,
 /// as they never hold the integration's: words that hold it are not shown.
 #[tokio::test]

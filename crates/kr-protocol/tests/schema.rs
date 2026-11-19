@@ -108,6 +108,54 @@ fn scalars_declare_their_json_representation() {
     );
 }
 
+/// KR-REQ-11.01: the pattern the published schema states for the word of an agent accepts what the
+/// reader of a word accepts and refuses what it refuses, in both forms of a segment of sixteen
+/// hexadecimal digits: after a hyphen, and as the whole word.
+#[test]
+fn the_published_pattern_of_a_word_is_the_grammar_the_reader_checks() {
+    use kr_protocol::skill::AgentTarget;
+
+    let schema = protocol_schema();
+    let validator =
+        jsonschema::validator_for(&schema["$defs"]["AgentTarget"]).expect("a schema of a word");
+    let long = "a".repeat(33);
+    for text in [
+        "amp",
+        "amp-2",
+        "a",
+        "claude-code",
+        "amp-user",
+        "amp-project",
+        "amp-0123456789abcdef",
+        "abcdef0123456789",
+        "aaaaaaaaaaaaaaaa",
+        "amp-0123456789abcdef-x",
+        "amp-0123456789abcde",
+        "amp-0123456789abcdef0",
+        "abcdef012345678",
+        "abcdef01234567890",
+        "amp-0123456789abcdeg",
+        "amp-0123456789ABCDEF",
+        "1amp",
+        "-amp",
+        "amp-",
+        "",
+        long.as_str(),
+    ] {
+        assert_eq!(
+            validator.is_valid(&serde_json::json!(text)),
+            AgentTarget::parse(text).is_ok(),
+            "the pattern and the reader differ on {text:?}"
+        );
+    }
+    for refused in ["amp-0123456789abcdef", "abcdef0123456789"] {
+        assert!(
+            !validator.is_valid(&serde_json::json!(refused)),
+            "{refused:?} ends in a segment of sixteen hexadecimal digits"
+        );
+    }
+}
+
 /// KR-REQ-23.14: the published mutation schemas are closed.
 #[test]
 fn mutation_schemas_are_closed_in_the_generated_document() {
