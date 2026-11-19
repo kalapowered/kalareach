@@ -114,6 +114,23 @@ fn a_stood_down_notice_is_a_skip_of_the_case_it_names_wherever_it_stands_in_the_
         &["a"],
         "a",
     );
+    // (i) glued to the verdict of a case that passed, in a binary where another case failed: the
+    // verdict is the text before the notice, which is not lost among the case's own output.
+    let glued = format!(
+        "     Running tests/t.rs (target/debug/deps/t-1)\n\nrunning 3 tests\ntest b ... ok{a}\ntest a ... ok\ntest c ... FAILED\n\nfailures:\n\nfailures:\n    c\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    );
+    let glued_read = read(&glued, |_| Recording::None);
+    assert!(
+        glued_read[0].readable(),
+        "{:?}: {glued}",
+        glued_read[0].problem
+    );
+    assert_eq!(glued_read[0].tests["b"], Outcome::Passed, "{glued}");
+    assert_eq!(glued_read[0].tests["c"], Outcome::Failed, "{glued}");
+    assert!(
+        matches!(glued_read[0].tests["a"], Outcome::Skipped(_)),
+        "{glued}"
+    );
     // (h) the line the suites printed before the notice existed names no case and skips none.
     let read = reading(
         &binary("test a ... ok\n", &["a"]).replace(
