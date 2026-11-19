@@ -17,8 +17,13 @@ import { endsAsChannelAnswer } from '../src/model/receipts'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
-function start(lostAnswers: number, unrecordedAnswers = 0): ReturnType<typeof fakeHost>['controls'] {
+function start(
+  lostAnswers: number,
+  unrecordedAnswers = 0,
+  paired = false
+): ReturnType<typeof fakeHost>['controls'] {
   const { port, controls } = fakeHost()
+  if (paired) controls.reachAsPairedDevice()
   controls.records.useChannel(SESSION_MAIN, lostAnswers, unrecordedAnswers)
   render(
     <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
@@ -88,29 +93,106 @@ describe('an answer a channel took', () => {
   })
 })
 
+/** Makes the page read once more, as it does when it is shown again. */
+async function readAgain(): Promise<void> {
+  await act(async () => {
+    document.dispatchEvent(new Event('visibilitychange'))
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  })
+}
+
 describe('an answer the host cannot tell was taken, on a paired route', () => {
-  it('lets go of nothing when the host holds no receipt for the answer, and says the same words', async () => {
-    const controls = start(0, 1)
+  it('lets go of nothing when the worker holds no receipt for the answer, and does not ask again', async () => {
+    const controls = start(0, 1, true)
     await allow()
     expect(await screen.findByText(/does not confirm answers/)).toBeInTheDocument()
-    // The page has acted on the answer once it has asked for the receipt or asked to release.
     await waitFor(() => {
-      expect(controls.readActions.length + controls.releaseAttempts).toBeGreaterThan(0)
+      expect(controls.readActions).toHaveLength(1)
     })
     await settle()
-    // The read answered NOT_FOUND: the worker never held the answer, so there is nothing to let go of.
-    expect(controls.readActions).toHaveLength(1)
+    // The worker answers a read of an action it holds no receipt for as an invalid argument: the
+    // answer was lost on the way, so there is nothing to let go of and nothing worth asking again.
     expect(controls.releasedActions).toHaveLength(0)
+    expect(controls.releaseAttempts).toBe(0)
+    await readAgain()
+    expect(controls.readActions).toHaveLength(1)
     expect(controls.releaseAttempts).toBe(0)
   })
 
-  it('asks for the receipt before it lets go, and lets go of an answer whose receipt reads unknown', async () => {
-    const controls = start(0)
+  it('asks for the receipt, names the session, lets go of an answer whose receipt reads unknown once, and asks no more', async () => {
+    const controls = start(0, 0, true)
     await allow()
     await waitFor(() => {
       expect(controls.releasedActions).toHaveLength(1)
     })
     expect(controls.readActions).toEqual(controls.releasedActions)
+    await readAgain()
+    expect(controls.readActions).toHaveLength(1)
+    expect(controls.releasedActions).toHaveLength(1)
+  })
+
+  it('lets go of an answer whose receipt is still with the host only after it reads unknown', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPairedDevice()
+    controls.records.useChannel(SESSION_MAIN, 0)
+    controls.readReceiptsAs('received', 'dispatching')
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+        <App />
+      </AppProvider>
+    )
+    await allow()
+    await waitFor(() => {
+      expect(controls.readActions).toHaveLength(1)
+    })
+    await settle()
+    // The receipt reads received: the host may still change what it says, so nothing is released.
+    expect(controls.releaseAttempts).toBe(0)
+    await readAgain()
+    await waitFor(() => {
+      expect(controls.readActions).toHaveLength(2)
+    })
+    await settle()
+    // Dispatching is not the end either.
+    expect(controls.releaseAttempts).toBe(0)
+    await readAgain()
+    // Now it reads unknown, and it is let go of once.
+    await waitFor(() => {
+      expect(controls.releasedActions).toHaveLength(1)
+    })
+    expect(controls.readActions).toHaveLength(3)
+    await readAgain()
+    expect(controls.readActions).toHaveLength(3)
+    expect(controls.releaseAttempts).toBe(1)
+  })
+
+  it('tries a release again with the next read only for a failure that is worth trying again', async () => {
+    const controls = start(0, 0, true)
+    controls.failReleases(1)
+    await allow()
+    await waitFor(() => {
+      expect(controls.releaseAttempts).toBe(1)
+    })
+    await settle()
+    await readAgain()
+    await waitFor(() => {
+      expect(controls.releasedActions).toHaveLength(1)
+    })
+    expect(controls.releaseAttempts).toBe(2)
+  })
+
+  it('does not try a release again after a refusal the host decided', async () => {
+    const controls = start(0, 0, true)
+    controls.failReleases(1, 'PERMISSION_DENIED')
+    await allow()
+    await waitFor(() => {
+      expect(controls.releaseAttempts).toBe(1)
+    })
+    await settle()
+    await readAgain()
+    await readAgain()
+    expect(controls.releaseAttempts).toBe(1)
+    expect(controls.releasedActions).toHaveLength(0)
   })
 })
 
@@ -158,6 +240,21 @@ describe('the lines that stay beside the requests', () => {
     expect(more?.textContent ?? '').toMatch(/^2 more answers are in the same state/)
   })
 
+  it('count the one answer beyond the five in the singular', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.useChannel(SESSION_MAIN, 0)
+    controls.records.holdAnswered(SESSION_MAIN, 6)
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+        <App />
+      </AppProvider>
+    )
+    expect(await screen.findAllByTestId('approval-unconfirmed')).toHaveLength(5)
+    const more = await screen.findByTestId('approval-unconfirmed-more')
+    expect(more).toHaveTextContent(/^One more answer is in the same state: the host cannot tell whether Claude Code took it\./)
+    expect(more).not.toHaveTextContent(/answers are in the same state/)
+  })
+
   it('keep one line for each of up to five, and no count line', async () => {
     const { port, controls } = fakeHost()
     controls.records.useChannel(SESSION_MAIN, 0)
@@ -189,6 +286,9 @@ describe('a typed upstream that took an answer and left its outcome unknown', ()
     expect(words).toHaveTextContent('The host could not confirm what became of that.')
     expect(words.closest('.toast')?.querySelector('.danger-text')).not.toBeNull()
     await settle()
+    // The host keeps a receipt for the answer, reading unknown, so a release the page started
+    // would read it: none is read and none is asked for.
+    expect(controls.readActions).toHaveLength(0)
     expect(controls.releasedActions).toHaveLength(0)
     expect(controls.releaseAttempts).toBe(0)
     expect(screen.queryByTestId('approval-unconfirmed')).toBeNull()

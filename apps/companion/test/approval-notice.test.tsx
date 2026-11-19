@@ -132,8 +132,9 @@ describe('the notice about approvals', () => {
     open((controls) => {
       controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')
     }, false)
-    // The request is read with the instance's capabilities, so once it is shown the notice has what
-    // it needs to appear, and its absence is a decision and not a page that has not read yet.
+    // The approval is drawn from the approvals' own read, and the notice from the conversation's
+    // read of the instance's capabilities, which is not that read. The turn below lets what both
+    // queued run before the absence is asserted.
     await screen.findByTestId('approval')
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0))

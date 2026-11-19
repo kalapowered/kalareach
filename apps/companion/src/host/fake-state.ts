@@ -337,8 +337,11 @@ export class ScriptedRecords {
   #revision = 10
   /** How many answers a channel instance has taken, for the identity of each. */
   #answers = 0
-  /** The actions whose receipt the worker holds as unknown: the answers a channel took. */
-  readonly #channelReceipts = new Set<string>()
+  /**
+   * The actions whose receipt the worker holds as unknown: the answers a channel took, and the
+   * answers a typed upstream took and the host could not establish.
+   */
+  readonly #unknownReceipts = new Set<string>()
   #reviews: ReviewState[]
   readonly #devices: DeviceSummary[]
   #actions = 0
@@ -948,7 +951,7 @@ export class ScriptedRecords {
       )
       this.#attention = this.#attention.filter((item) => item.rule !== 'attention.pending_approval')
       const action = idOf('c4c4c4c4', ++this.#answers)
-      if (!lost && !unrecorded) this.#channelReceipts.add(action)
+      if (!lost && !unrecorded) this.#unknownReceipts.add(action)
       return { receipt: null, value: null, action_id: action, answer_lost: lost }
     }
     if (unconfirmed) {
@@ -958,12 +961,10 @@ export class ScriptedRecords {
         each.resource_id === read.resource_id ? { ...each, state: 'uncertain' } : each
       )
       this.#attention = this.#attention.filter((item) => item.rule !== 'attention.pending_approval')
-      return {
-        receipt: null,
-        value: null,
-        action_id: idOf('c4c4c4c4', ++this.#answers),
-        answer_lost: false
-      }
+      // The worker holds the receipt of the answer, and it reads unknown: nothing about it is lost.
+      const action = idOf('c4c4c4c4', ++this.#answers)
+      this.#unknownReceipts.add(action)
+      return { receipt: null, value: null, action_id: action, answer_lost: false }
     }
     const mutation = this.#performed(agent).value
     if (mutation === null) refuse('RESOURCE_UNAVAILABLE', 'the answer was not recorded')
@@ -1619,9 +1620,9 @@ export class ScriptedRecords {
     }
   }
 
-  /** Whether the worker holds a receipt, reading unknown, for an answer a channel took. */
-  holdsChannelReceipt(actionId: string): boolean {
-    return this.#channelReceipts.has(actionId)
+  /** Whether the worker holds a receipt, reading unknown, for an answer the host could not confirm. */
+  holdsUnknownReceipt(actionId: string): boolean {
+    return this.#unknownReceipts.has(actionId)
   }
 
   /** The capability records and resources a test reads back. */
