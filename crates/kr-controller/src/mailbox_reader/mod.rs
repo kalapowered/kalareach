@@ -66,6 +66,7 @@ use kr_protocol::ids::EnvelopeId;
 use kr_protocol::mailbox::MailboxPayloadType;
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
+use kr_transport::proxy::ProxyLoginKind;
 use kr_transport::reconnect::Backoff;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -130,12 +131,18 @@ enum Stopped {
     /// still work. That is a limit of the service. The host waits as it does for any delay, and
     /// this only decides what it says.
     Capacity(Offered),
+    /// The proxy's login stopped the request before it was sent, and it stops every request until
+    /// the host restarts.
+    Login(ProxyLoginKind),
     /// This host could not read its devices or write its record. The service is not at fault.
     Local,
 }
 
 impl Stopped {
     fn of(error: &ClientError, quiet: &Quiet) -> Self {
+        if let Some(kind) = error.stopped_by_proxy_login() {
+            return Self::Login(kind);
+        }
         match error {
             ClientError::Refused {
                 error: refused,
@@ -321,6 +328,17 @@ impl MailboxReader {
         let mut offered = None;
         let (status, detail, remedy): (DoctorStatus, Sentence, Option<&'static str>) =
             match observed.stopped {
+                // The feed goes through the same proxy and has a row of its own, so this one says
+                // nothing of the feed.
+                Some(Stopped::Login(kind)) => (
+                    DoctorStatus::Warning,
+                    reads
+                        .stated(", and ")
+                        .stated(kind.clause())
+                        .stated("; ")
+                        .sentence(&read),
+                    Some(crate::config::proxy_login::remedy_for_kind(kind)),
+                ),
                 Some(Stopped::Unreachable) => (
                     DoctorStatus::Warning,
                     reads
@@ -435,27 +453,39 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
         };
         let wait = if let Some(left) = shared.quiet.left() {
             // The service asked to be left alone, and every question to it waits.
-            left
+            Some(left)
         } else {
             match pass(&shared, running, &controller).await {
                 Ok(()) => {
                     backoff = Backoff::default();
-                    POLL_INTERVAL
+                    Some(POLL_INTERVAL)
                 }
                 Err(stopped) => {
                     shared.observed().stopped = Some(stopped);
-                    backoff
-                        .next_delay()
-                        .max(shared.quiet.left().unwrap_or_default())
+                    // The proxy's login stops every request until the host restarts, so no timer
+                    // helps: the reader waits here until the daemon ends.
+                    (!matches!(stopped, Stopped::Login(_))).then(|| {
+                        backoff
+                            .next_delay()
+                            .max(shared.quiet.left().unwrap_or_default())
+                    })
                 }
             }
         };
         drop(controller);
         // The wait is asked for before the pass is counted, so whoever sees the count change finds
         // the reader waiting.
-        let sleeping = timer.sleep(wait);
-        shared.passes.send_modify(|passes| *passes += 1);
-        sleeping.await;
+        match wait {
+            Some(wait) => {
+                let sleeping = timer.sleep(wait);
+                shared.passes.send_modify(|passes| *passes += 1);
+                sleeping.await;
+            }
+            None => {
+                shared.passes.send_modify(|passes| *passes += 1);
+                std::future::pending::<()>().await;
+            }
+        }
     }
 }
 
@@ -552,5 +582,45 @@ async fn pass(
         }
         Err(Stop::Service(error)) => Err(Stopped::of(&error, &shared.quiet)),
         Err(Stop::Local(error)) => Err(Stopped::local(&error)),
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_protocol::error::ProtocolError;
+
+    use super::*;
+
+    /// KR-REQ-10.02: a request the proxy's login stopped is a stop of its own, which the doctor
+    /// says with the kind's words and the reader does not retry by timer; `Needed` and a host
+    /// answer with the same words are the unreachable mailbox they were.
+    #[test]
+    fn kr_req_10_02_the_mailbox_reader_stops_where_the_proxy_login_stops_it() {
+        let quiet = Quiet::new(Arc::new(crate::quiet::RealTimer));
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            assert_eq!(
+                Stopped::of(&ClientError::ProxyLogin(kind), &quiet),
+                Stopped::Login(kind),
+                "{kind:?} stops the reader until the host restarts"
+            );
+        }
+        assert_eq!(
+            Stopped::of(&ClientError::ProxyLogin(ProxyLoginKind::Needed), &quiet),
+            Stopped::Unreachable,
+            "a proxy that asks for a login nobody refused keeps the retry it had"
+        );
+        let same_words = ClientError::Host(ProtocolError::new(
+            ErrorCode::UpstreamUnavailable,
+            ProxyLoginKind::Refused.sentence(),
+        ));
+        assert_eq!(
+            Stopped::of(&same_words, &quiet),
+            Stopped::Unreachable,
+            "the words alone are not the kind"
+        );
     }
 }
