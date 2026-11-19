@@ -6789,17 +6789,10 @@ fn an_agent_leaves_another_host_and_the_host_ends(ending: Ending) {
             return;
         }
     };
-    // The second daemon's sessions open the system's own `zsh` as their root shell.
-    let Some(system_shell) = ["/bin/zsh", "/usr/bin/zsh"]
-        .into_iter()
-        .find(|path| Path::new(path).exists())
-    else {
-        if cfg!(target_os = "macos") {
-            panic!("macOS has /bin/zsh, and this case opens sessions in it");
-        }
-        eprintln!("skipping: no zsh on this machine; the second daemon's sessions need one");
-        return;
-    };
+    // The second daemon's sessions open the managed package's zsh program as their root shell, with
+    // no startup entry installed, so that the case runs wherever the package is installed, with or
+    // without a system zsh.
+    let managed_shell = shell.executable.display().to_string();
     // The second daemon, in a directory of its own, with two sessions open that no terminal is on:
     // the run has one session of its own, number 1, so the second session's number is one the
     // run's own `kr` has no local record of, which it then asks the daemon it reaches to close.
@@ -6818,7 +6811,7 @@ fn an_agent_leaves_another_host_and_the_host_ends(ending: Ending) {
             "--shell-mode",
             "native_compat",
             "--shell",
-            system_shell,
+            &managed_shell,
         ]);
     }
     let opened = other.live_sessions();
