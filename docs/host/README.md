@@ -9818,11 +9818,13 @@ A grants row whose key does not name the grant it holds, whose record does not d
 recipient or parent column does not match its record, or which holds a value of the wrong type in
 a column is judged once, in one place, and gives no authority on any path. A device's own
 `grant.revoke` and the voice stop withdraw the readable subtree they name and nothing more. The
-owner's revocation of a device or of a grant withdraws every grant it can read, including each
-live grant that traces to no root, and marks each row it cannot read revoked, so that the release
-before this one reads none of them as live; a row whose `revoked_at_ms` holds a value that is not
+owner's revocation of a device or of a grant withdraws the named readable subtree or subtrees,
+withdraws every live grant that traces to no root, and marks every damaged row revoked, so that the
+release before this one reads none of them as live; a row whose `revoked_at_ms` holds a value that is not
 an integer is replaced by an integer mark. A row that names no grant fences the whole host. One
-fence debt is written in the same transaction as the withdrawal, and a repeat writes nothing.
+fence debt is written in the same transaction as the withdrawal. An ordinary completed repeat
+writes no new restriction or debt and advances no revision. A revoked voice grant with a held close
+still owes a fence.
 
 An authority-feed request is carried out whatever the damage: a named grant whose row cannot be
 read is marked with what hangs below it, and every target of a request is attempted whatever an

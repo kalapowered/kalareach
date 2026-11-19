@@ -305,11 +305,14 @@ impl Controller {
             // revocation both fence, which is the harmless direction.
             //
             // Whether the admission still decides anything from here depends on what the
-            // transaction above did. If it withdrew something, that is committed, and a deadline
-            // passing afterwards is no reason to stop half way: grants withdrawn beside a device
-            // record still live is the dangerous state, and a revocation takes authority away
-            // rather than granting any, so finishing a late one is the safe direction. If it
-            // withdrew nothing — the paired device whose grant lives in its pairing record — then
+            // transaction above did. If it withdrew something, or committed a debt (a row it could
+            // not read owes one with nothing to withdraw), that is committed: the debt is already
+            // published, and the admission check reads the fence first, so a second check here
+            // would refuse a revocation whose restriction already stands. A deadline passing
+            // afterwards is no reason to stop half way: grants withdrawn beside a device record
+            // still live is the dangerous state, and a revocation takes authority away rather than
+            // granting any, so finishing a late one is the safe direction. If it withdrew nothing
+            // and committed no debt — the paired device whose grant lives in its pairing record — then
             // the record below is the whole withdrawal, nothing is committed, and each wait
             // between here and it gets its own check.
             let withdrew = !revocation.revoked.is_empty() || revocation.debt.is_some();
