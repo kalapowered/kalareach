@@ -696,3 +696,28 @@ async fn a_reconcile_closes_stored_calls_that_no_live_call_owns_and_deletes_clos
     world.provider.reconcile().await;
     assert_eq!(states(&world), [CallState::Open]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_reconcile_at_start_refuses_starts_while_it_runs_and_leaves_the_registry_idle_after() {
+    let world = fresh();
+    stored(&world, 1, CallState::Open, Some("live_a"));
+    world.provider.reconcile_at_start().await;
+    assert!(world.ledger.rows().expect("rows").is_empty());
+    assert_eq!(world.provider.registry().state(), RegistryState::Idle);
+    assert_eq!(world.stand_in.recorded().hangups.len(), 1);
+    // A removal that holds the fence closes its own calls: the start pass does nothing then.
+    let world = fresh();
+    stored(&world, 2, CallState::Open, Some("live_b"));
+    let fence = world.provider.registry().fence().expect("a fence");
+    assert_eq!(fence.before, RegistryState::Idle);
+    world.provider.reconcile_at_start().await;
+    assert!(world.stand_in.recorded().hangups.is_empty());
+    assert_eq!(world.provider.registry().state(), RegistryState::Settling);
+    // While the fence stands, a start is told the approved sentence.
+    let refusal = world
+        .provider
+        .begin(&request(3))
+        .await
+        .expect_err("a start during a settle");
+    assert!(refusal.to_string().contains(words::SETTLING));
+}

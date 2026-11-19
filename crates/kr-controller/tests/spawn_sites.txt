@@ -281,6 +281,7 @@ crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::t
 crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::task::spawn_blocking | closure{.remove_unclaimed_staging} | 1 | joined | - | awaited where it stands, inside a macro
 crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::task::spawn_blocking | closure{Arc::new} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::task::spawn_blocking | closure{crate::backup::BackupService::open} | 1 | joined | - | awaited where it stands
+crates/kr-controller/src/service/start.rs | Controller::start_passing | tokio::spawn | async{.reconcile_at_start} | 1 | supervised-later | 36 | the one pass at start that closes the calls on the owner's own key that an earlier run left, with starts refused meanwhile; it ends after at most one bounded hangup for each stored call
 crates/kr-controller/src/service/start.rs | Controller::start_privacy_tick | tokio::spawn | async{privacy_pass} | 1 | supervised-later | 9 | privacy tick
 crates/kr-controller/src/service/start.rs | launches_between | tokio::task::spawn_blocking | closure{kr_ipc::identity::process_state} | 1 | joined | - | awaited where it stands
 crates/kr-controller/src/service/start.rs | privacy_pass | tokio::task::spawn_blocking | closure{.note_answer} | 1 | joined | - | awaited where it stands

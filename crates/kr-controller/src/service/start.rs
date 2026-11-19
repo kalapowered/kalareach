@@ -1066,6 +1066,10 @@ impl Controller {
                 Arc::new(|| kr_ipc::now_ms().get()),
             ))
         };
+        // Calls an earlier run of this daemon left on the owner's key are closed in the
+        // background, with starts refused meanwhile, and never inside a start.
+        let reconciling = Arc::clone(&own_voice);
+        tokio::spawn(async move { reconciling.reconcile_at_start().await });
         if started.own_voice.provider().is_some() {
             clients.managed_inference =
                 Some(Arc::clone(&own_voice)

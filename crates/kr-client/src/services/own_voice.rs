@@ -867,6 +867,17 @@ impl OwnVoiceProvider {
         }
     }
 
+    /// Closes what an earlier run left, with starts refused while it does (the sentence a start is
+    /// told is the one of a removal in progress). A removal that holds the fence already does its
+    /// own closing, so this one does nothing then.
+    pub async fn reconcile_at_start(&self) {
+        let Some(_fence) = self.core.registry.fence() else {
+            return;
+        };
+        self.reconcile().await;
+        self.core.registry.unfence();
+    }
+
     /// Whether any live call is held by this provider.
     #[must_use]
     pub fn has_live_call(&self) -> bool {
