@@ -970,6 +970,26 @@ pub fn table() -> Vec<Store> {
             levels: None,
             writers: Writers::Daemon,
             entry: entry(
+                "own-key-calls",
+                StoreScope::Environment,
+                "own-key-calls.sqlite3",
+                sqlite_table("own_key_call_schema"),
+                version(kr_controller::voice::own_key_calls::SCHEMA_VERSION),
+                version(kr_controller::voice::own_key_calls::OLDEST_SCHEMA_VERSION),
+            ),
+            owned: Vec::new(),
+            kept: vec![Kept::Words(
+                "the states an own-key call is stored with",
+                kr_controller::voice::own_key_calls::STATES
+                    .iter()
+                    .map(|state| (*state).to_owned())
+                    .collect(),
+            )],
+        },
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
                 "relay-leases",
                 StoreScope::Environment,
                 "relay-leases.sqlite3",

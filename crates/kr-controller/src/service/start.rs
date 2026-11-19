@@ -999,6 +999,9 @@ impl Controller {
         // formats do not depend on the configuration.
         let mailbox_record = crate::mailbox_reader::record::Record::open(setup.paths.state_dir())?;
         let capability_answers = crate::capability_answers::Record::open(setup.paths.state_dir())?;
+        // The record of own-key calls exists whether or not a key is held or a provider is named,
+        // so the environment's stored formats do not depend on the configuration.
+        crate::voice::own_key_calls::OwnKeyCalls::open(setup.paths.state_dir())?;
         let mailbox_reader = match started.authority.origin() {
             None => None,
             Some(origin) => {

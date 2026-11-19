@@ -23,6 +23,7 @@ mod authority;
 mod context;
 mod credentials;
 mod host;
+pub mod own_key_calls;
 mod submit;
 mod worker_half;
 
