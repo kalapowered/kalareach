@@ -2359,39 +2359,10 @@
       "type": "object"
     },
     "AgentTarget": {
-      "description": "One agent an installation can target.",
-      "oneOf": [
-        {
-          "const": "codex",
-          "description": "Codex.",
-          "type": "string"
-        },
-        {
-          "const": "claude-code",
-          "description": "Claude Code.",
-          "type": "string"
-        },
-        {
-          "const": "opencode",
-          "description": "OpenCode.",
-          "type": "string"
-        },
-        {
-          "const": "gemini-cli",
-          "description": "Gemini CLI.",
-          "type": "string"
-        },
-        {
-          "const": "kimi-code-cli",
-          "description": "Kimi Code CLI.",
-          "type": "string"
-        },
-        {
-          "const": "qoder-cli",
-          "description": "Qoder CLI.",
-          "type": "string"
-        }
-      ]
+      "description": "The word of an agent: one of the six compiled agents, or a word a package declares.",
+      "maxLength": 32,
+      "pattern": "^(?!.*-(user|project)$)(?!.*-[0-9a-f]{16}$)[a-z][a-z0-9]*(-[a-z0-9]+)*$",
+      "type": "string"
     },
     "AgentThreadId": {
       "description": "The upstream agent's conversation identifier, where available. Correlation data, not authority.",
@@ -8094,7 +8065,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "One entry added to an agent's configuration document, under the managed marker.\n\nNothing else in the document is read as this installation's, and nothing else is written.",
+          "description": "One entry added to an agent's configuration document, under the name `kalareach`.\n\nNothing else in the document is read as this installation's, and nothing else is written.",
           "properties": {
             "created_document": {
               "description": "True when the document did not exist and this installation created it.",

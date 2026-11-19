@@ -3430,7 +3430,7 @@ async fn an_installation_admitted_before_a_revocation_is_refused_at_its_marker()
     }
     let project = tempfile::TempDir::new().expect("a project directory on the internal disk");
     let params = kr_protocol::skill::AgentToolsParams {
-        agent: kr_protocol::skill::AgentTarget::Codex,
+        agent: kr_protocol::skill::AgentTarget::CODEX,
         scope: kr_protocol::skill::InstallScope::Project,
         project_dir: Nullable::some(project.path().display().to_string()),
     };

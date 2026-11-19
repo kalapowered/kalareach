@@ -90,7 +90,7 @@ fn agent_tools_results_carrying_change_operations_decode_in_a_rust_client() {
     }
     let manifest = ChangeManifest {
         skill_version: "0.1.0".to_owned(),
-        agent: AgentTarget::ClaudeCode,
+        agent: AgentTarget::CLAUDE_CODE,
         scope: InstallScope::User,
         root: "/home/someone".to_owned(),
         entry_point: vec![
@@ -106,7 +106,7 @@ fn agent_tools_results_carrying_change_operations_decode_in_a_rust_client() {
         unresolved: Vec::new(),
     });
     travels(&AgentToolsStatusResult {
-        agent: AgentTarget::Codex,
+        agent: AgentTarget::CODEX,
         scope: InstallScope::Project,
         root: "/work/project".to_owned(),
         installed: true,
@@ -120,7 +120,7 @@ fn agent_tools_results_carrying_change_operations_decode_in_a_rust_client() {
         removal: operations(),
     });
     travels(&AgentToolsRemoveResult {
-        agent: AgentTarget::Codex,
+        agent: AgentTarget::CODEX,
         scope: InstallScope::Project,
         removed: operations(),
         retained: vec!["a file somebody changed".to_owned()],
