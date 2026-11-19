@@ -76,6 +76,12 @@ pub enum Placement {
         /// What the service said, for the notification's record.
         detail: String,
     },
+    /// The request was not sent, because the proxy's login stops every request until the host
+    /// restarts. The object is not given up and no other attempt waits for it.
+    Held {
+        /// The kind's sentence, for the notification's record.
+        detail: String,
+    },
 }
 
 /// What places the objects a delivery owes a device's mailbox.
@@ -159,6 +165,11 @@ impl ObjectPlacer for MailboxPlacer {
 /// saying no to this object: a mailbox that is full, an item it does not keep, an identifier that
 /// carried another item, a signature it does not accept.
 fn placement_of(error: &ClientError) -> Placement {
+    if let Some(kind) = error.stopped_by_proxy_login() {
+        return Placement::Held {
+            detail: format!("the mailbox service was not asked: {}", kind.clause()),
+        };
+    }
     let after = match error {
         ClientError::Refused {
             retry_after_seconds,
@@ -243,5 +254,47 @@ mod tests {
             );
             assert_eq!(after, waits, "the delay is waited whichever words are said");
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_protocol::error::ProtocolError;
+    use kr_transport::proxy::ProxyLoginKind;
+
+    use super::*;
+
+    /// KR-REQ-10.02: a request the proxy's login stopped is held for the host's restart: nothing
+    /// may have left, no later attempt is asked for, and the record says the mailbox was not asked;
+    /// `Needed` and a host answer with the same words wait as before.
+    #[test]
+    fn kr_req_10_02_a_mailbox_request_a_proxy_login_stopped_is_held_not_retried() {
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            let Placement::Held { detail } = placement_of(&ClientError::ProxyLogin(kind)) else {
+                panic!("{kind:?} is held");
+            };
+            assert_eq!(
+                detail,
+                format!("the mailbox service was not asked: {}", kind.clause())
+            );
+        }
+        assert!(matches!(
+            placement_of(&ClientError::ProxyLogin(ProxyLoginKind::Needed)),
+            Placement::Later {
+                may_have_left: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            placement_of(&ClientError::Host(ProtocolError::new(
+                ErrorCode::UpstreamUnavailable,
+                ProxyLoginKind::Refused.sentence(),
+            ))),
+            Placement::Later { .. }
+        ));
     }
 }

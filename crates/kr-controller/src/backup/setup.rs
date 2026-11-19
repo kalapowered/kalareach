@@ -1001,21 +1001,31 @@ impl BackupSetup {
     fn ended_by_error(&self, error: &ClientError) -> Ended {
         let hold = Hold::of(error);
         self.owe(hold);
-        match error {
-            ClientError::Refused { .. } => match hold.code {
-                ErrorCode::QuotaExceeded => declined(BackupEnableCause::NoAllowance {}),
-                ErrorCode::UnknownSession => declined(BackupEnableCause::TokenNotAccepted {}),
-                ErrorCode::RateLimited
-                | ErrorCode::ServiceCapacity
-                | ErrorCode::UpstreamUnavailable
-                | ErrorCode::OutcomeUnknown
-                | ErrorCode::ClockUntrusted
-                | ErrorCode::ResourceUnavailable
-                | ErrorCode::StorageUnavailable => unknown(hold.retry_after),
-                code => declined(BackupEnableCause::ServiceRefused { code }),
-            },
-            _ => unknown(hold.retry_after),
-        }
+        ended_for(error, hold)
+    }
+}
+
+/// What a failed exchange of the setup comes to.
+fn ended_for(error: &ClientError, hold: Hold) -> Ended {
+    if hold.waits_for_restart() {
+        // The proxy's login stopped the request before it was sent: the outcome is known, and
+        // asking again does not change it until the host restarts.
+        return declined(BackupEnableCause::ServiceRefused { code: hold.code });
+    }
+    match error {
+        ClientError::Refused { .. } => match hold.code {
+            ErrorCode::QuotaExceeded => declined(BackupEnableCause::NoAllowance {}),
+            ErrorCode::UnknownSession => declined(BackupEnableCause::TokenNotAccepted {}),
+            ErrorCode::RateLimited
+            | ErrorCode::ServiceCapacity
+            | ErrorCode::UpstreamUnavailable
+            | ErrorCode::OutcomeUnknown
+            | ErrorCode::ClockUntrusted
+            | ErrorCode::ResourceUnavailable
+            | ErrorCode::StorageUnavailable => unknown(hold.retry_after),
+            code => declined(BackupEnableCause::ServiceRefused { code }),
+        },
+        _ => unknown(hold.retry_after),
     }
 }
 
@@ -1312,5 +1322,51 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_protocol::error::ProtocolError;
+    use kr_transport::proxy::ProxyLoginKind;
+
+    use super::*;
+
+    /// KR-REQ-10.02: a setup request the proxy's login stopped ends as a definite decline, not as
+    /// an unknown outcome; `Needed` and a host answer with the same words stay unknown.
+    #[test]
+    fn kr_req_10_02_a_setup_a_proxy_login_stopped_is_declined_not_unknown() {
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            let error = ClientError::ProxyLogin(kind);
+            let ended = ended_for(&error, Hold::of(&error));
+            assert!(
+                matches!(
+                    ended,
+                    BackupEnableResult::Declined {
+                        cause: BackupEnableCause::ServiceRefused {
+                            code: ErrorCode::UpstreamUnavailable
+                        }
+                    }
+                ),
+                "{kind:?} is a decline"
+            );
+        }
+        let needed = ClientError::ProxyLogin(ProxyLoginKind::Needed);
+        assert!(matches!(
+            ended_for(&needed, Hold::of(&needed)),
+            BackupEnableResult::Unknown { .. }
+        ));
+        let same_words = ClientError::Host(ProtocolError::new(
+            ErrorCode::UpstreamUnavailable,
+            ProxyLoginKind::Refused.sentence(),
+        ));
+        assert!(matches!(
+            ended_for(&same_words, Hold::of(&same_words)),
+            BackupEnableResult::Unknown { .. }
+        ));
     }
 }

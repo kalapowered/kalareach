@@ -77,6 +77,7 @@ use kr_protocol::scalars::{CanonicalSet, KeyId, Signature64, TimestampMs};
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::clock::ContinuousInstant;
 use kr_transport::config::ProxyUrl;
+use kr_transport::proxy::ProxyLoginKind;
 use kr_transport::reconnect::Backoff;
 use tokio::task::JoinHandle;
 
@@ -162,6 +163,9 @@ enum Stopped {
     /// still work. That is a limit of the service. The carrier waits as it does for any delay, and
     /// this only decides what it says.
     Capacity(Offered),
+    /// The proxy's login stopped the request before it was sent, and it stops every request until
+    /// the host restarts.
+    Login(ProxyLoginKind),
     /// This host could not carry a request out or read its own records. The feed is not at fault.
     Local,
 }
@@ -175,7 +179,15 @@ impl Stopped {
         Self::Local
     }
 
+    /// What the proxy's login stopped, when the error is that: the request was not sent.
+    fn by_login(error: &ClientError) -> Option<Self> {
+        error.stopped_by_proxy_login().map(Self::Login)
+    }
+
     fn of(error: &ClientError, quiet: &Quiet) -> Self {
+        if let Some(stopped) = Self::by_login(error) {
+            return stopped;
+        }
         match error {
             ClientError::Refused {
                 retry_after_seconds,
@@ -942,6 +954,16 @@ impl FeedRuntime {
                             ),
                         )
                     }
+                    Stopped::Login(kind) => (
+                        DoctorStatus::Warning,
+                        reads
+                            .clone()
+                            .stated(", and ")
+                            .stated(kind.clause())
+                            .stated("; ")
+                            .sentence(&synchronised),
+                        Some(crate::config::proxy_login::remedy_for_kind(kind)),
+                    ),
                     Stopped::Unreachable => waits(", which could not be reached"),
                     Stopped::Refused => waits(", which turned a request back"),
                     Stopped::Local => waits(", which this host could not finish reading"),
@@ -984,7 +1006,12 @@ impl FeedRuntime {
         } else if observed.catching_up
             && !matches!(
                 observed.stopped,
-                Some(Stopped::Unreachable | Stopped::Refused | Stopped::Capacity(_))
+                Some(
+                    Stopped::Unreachable
+                        | Stopped::Refused
+                        | Stopped::Capacity(_)
+                        | Stopped::Login(_)
+                )
             )
         {
             // The registry is the likely cause only when the pass was not stopped by the feed.
@@ -1303,11 +1330,18 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
                 Err(stopped) => {
                     controller.authority_feed_unreachable();
                     shared.observed().stopped = Some(stopped);
-                    Some(
-                        backoff
-                            .next_delay()
-                            .max(shared.quiet.left().unwrap_or_default()),
-                    )
+                    if matches!(stopped, Stopped::Login(_)) {
+                        // The proxy's login stops every request until the host restarts: no
+                        // timer, and a question put to the feed wakes the pass, which is
+                        // stopped at the gate before it sends.
+                        None
+                    } else {
+                        Some(
+                            backoff
+                                .next_delay()
+                                .max(shared.quiet.left().unwrap_or_default()),
+                        )
+                    }
                 }
             }
         };
@@ -2649,6 +2683,45 @@ mod tests {
         assert!(
             runtime.shared.wake.notified().now_or_never().is_some(),
             "a wake from anywhere else is"
+        );
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_protocol::error::ProtocolError;
+
+    use super::*;
+
+    /// KR-REQ-10.02: a request the proxy's login stopped is a stop of its own, which the doctor
+    /// says with the kind's words and the carrier does not retry by timer; `Needed` and a host
+    /// answer with the same words are the unreachable feed they were.
+    #[test]
+    fn kr_req_10_02_the_feed_carrier_stops_where_the_proxy_login_stops_it() {
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            assert_eq!(
+                Stopped::by_login(&ClientError::ProxyLogin(kind)),
+                Some(Stopped::Login(kind)),
+                "{kind:?} stops the carrier until the host restarts"
+            );
+        }
+        assert_eq!(
+            Stopped::by_login(&ClientError::ProxyLogin(ProxyLoginKind::Needed)),
+            None,
+            "a proxy that asks for a login nobody refused keeps the retry it had"
+        );
+        let same_words = ClientError::Host(ProtocolError::new(
+            ErrorCode::UpstreamUnavailable,
+            ProxyLoginKind::Refused.sentence(),
+        ));
+        assert_eq!(
+            Stopped::by_login(&same_words),
+            None,
+            "the words alone are not the kind"
         );
     }
 }

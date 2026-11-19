@@ -342,6 +342,11 @@ impl BackupRelay {
         {
             return Ok(left);
         }
+        // The proxy's login stopped the request before it was sent. It is answered with the code
+        // that recovery's checkpoint loop already reads as no retry, and the kind's sentence.
+        if let Some(refusal) = stopped_by_proxy_login(error) {
+            return Err(refusal);
+        }
         // The service's own text can repeat what it was asked, so a refusal by the service is its
         // code and a sentence of this program's. Everything else failed on this host or on the
         // way, and says what it is.
@@ -584,6 +589,17 @@ fn place_of(position: SyncPosition) -> BackupBundlePlace {
         revision: Nullable(position.revision.0.map(|revision| revision.get())),
         recovery: Nullable(position.recovery().map(|recovery| recovery.get())),
     }
+}
+
+/// The refusal for a request the proxy's login stopped before it was sent, when that is what
+/// `error` is: the code that recovery's checkpoint loop already reads as no retry, and the kind's
+/// sentence.
+fn stopped_by_proxy_login(error: &ClientError) -> Option<ControllerError> {
+    let kind = error.stopped_by_proxy_login()?;
+    Some(ControllerError::Refused {
+        code: ErrorCode::HostNotConfigured,
+        detail: kind.sentence(),
+    })
 }
 
 /// What this program says of a service's refusal of a `what` (a read or a write), whatever the
@@ -898,5 +914,41 @@ mod tests {
             .expect_err("no state to compare with");
         assert_eq!(refused.code(), ErrorCode::PermissionDenied);
         assert_eq!(rig.service.0.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod proxy_login_readers {
+    use kr_protocol::error::ProtocolError;
+    use kr_transport::proxy::ProxyLoginKind;
+
+    use super::*;
+
+    /// KR-REQ-10.02: a request the proxy's login stopped crosses the protocol as the code that
+    /// recovery reads as no retry, with the kind's sentence; `Needed` and a host answer with the
+    /// same words are not that.
+    #[test]
+    fn kr_req_10_02_a_proxy_login_stop_keeps_its_no_retry_code_across_the_conversion() {
+        for kind in [
+            ProxyLoginKind::Refused,
+            ProxyLoginKind::Unsupported,
+            ProxyLoginKind::ClearTextTarget,
+        ] {
+            let Some(ControllerError::Refused { code, detail }) =
+                stopped_by_proxy_login(&ClientError::ProxyLogin(kind))
+            else {
+                panic!("{kind:?} is refused with a code");
+            };
+            assert_eq!(code, ErrorCode::HostNotConfigured);
+            assert_eq!(detail, kind.sentence());
+        }
+        assert!(stopped_by_proxy_login(&ClientError::ProxyLogin(ProxyLoginKind::Needed)).is_none());
+        assert!(
+            stopped_by_proxy_login(&ClientError::Host(ProtocolError::new(
+                ErrorCode::UpstreamUnavailable,
+                ProxyLoginKind::Refused.sentence(),
+            )))
+            .is_none()
+        );
     }
 }

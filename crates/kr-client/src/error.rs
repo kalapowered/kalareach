@@ -257,13 +257,22 @@ impl ClientError {
             class,
         );
         decision.action = self.user_action();
-        if let Self::ProxyLogin(kind) = self
-            && kind.stops_until_restart()
-        {
+        if self.stopped_by_proxy_login().is_some() {
             // The code alone would say `Transient`: the proxy will turn the same request away.
             decision.recovery = crate::retry::Recovery::Stop;
         }
         decision
+    }
+
+    /// The kind of the proxy-login failure this is, when the request was not sent and is not sent
+    /// again until the host restarts: [`ProxyLoginKind::Needed`] is not one, because no login was
+    /// refused and the request keeps the retry it had.
+    #[must_use]
+    pub fn stopped_by_proxy_login(&self) -> Option<ProxyLoginKind> {
+        match self {
+            Self::ProxyLogin(kind) if kind.stops_until_restart() => Some(*kind),
+            _ => None,
+        }
     }
 
     /// Returns the direct action a user interface offers for this failure.
