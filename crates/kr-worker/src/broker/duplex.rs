@@ -3834,6 +3834,8 @@ mod tests {
                 &crate::broker::methods::Caller {
                     actor_id: kr_protocol::ids::ActorId::new("device-1").expect("valid"),
                     grant_id: None,
+                    ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                    device_id: None,
                 },
                 binding,
                 &kr_protocol::agent::PluginActionInvokeParams {

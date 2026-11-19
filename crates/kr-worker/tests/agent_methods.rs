@@ -81,6 +81,8 @@ fn caller() -> Caller {
     Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: Some(GrantId::new(Uuid::from_bytes([7; 16]))),
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     }
 }
 

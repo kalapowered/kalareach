@@ -2498,6 +2498,8 @@ impl Served {
                 &kr_worker::broker::Caller {
                     actor_id: ActorId::new("local:the-owner").expect("an actor"),
                     grant_id: None,
+                    ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                    device_id: None,
                 },
                 &kr_protocol::agent::AgentApprovalRespondParams {
                     target: kr_protocol::agent::AgentMutationTarget {

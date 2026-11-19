@@ -612,6 +612,8 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
             &kr_worker::broker::Caller {
                 actor_id: ActorId::new("device-1").expect("valid"),
                 grant_id: None,
+                ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                device_id: None,
             },
             &kr_protocol::agent::AgentApprovalRespondParams {
                 target: target(),
@@ -1273,6 +1275,8 @@ async fn kr_req_11_33_native_and_rich_answers_lose_to_the_hosts_own_answer() {
     let caller = kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     };
     let respond = |resource_id| kr_protocol::agent::AgentApprovalRespondParams {
         target: target(),
@@ -1913,6 +1917,8 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
     let caller = kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     };
     let prompt = |text: &str| kr_protocol::agent::AgentPromptParams {
         target: target(),
@@ -2123,6 +2129,8 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
             &kr_worker::broker::Caller {
                 actor_id: ActorId::new("device-1").expect("valid"),
                 grant_id: None,
+                ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                device_id: None,
             },
             &kr_protocol::agent::AgentApprovalRespondParams {
                 target: target(),
@@ -2229,6 +2237,8 @@ async fn kr_req_11_33_an_answer_larger_than_the_connection_carries_is_refused_be
     let caller = kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     };
 
     // The admission asks the transport, and refuses.
@@ -2286,6 +2296,8 @@ async fn kr_req_12_12_an_operation_larger_than_the_connection_carries_is_refused
     let caller = kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     };
     let refused = broker
         .agent_prompt(
@@ -2910,6 +2922,8 @@ async fn kr_req_12_13_traffic_in_both_directions_keeps_identifiers_that_look_ali
             &kr_worker::broker::Caller {
                 actor_id: ActorId::new("device-1").expect("valid"),
                 grant_id: None,
+                ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                device_id: None,
             },
             &kr_protocol::agent::AgentPromptParams {
                 target: target(),
@@ -3317,6 +3331,8 @@ async fn kr_req_11_27_a_claim_is_given_back_when_the_upstream_resolves_underneat
     let caller = kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     };
     let params = kr_protocol::agent::AgentApprovalRespondParams {
         target: target(),
@@ -5593,6 +5609,8 @@ async fn kr_req_11_32_an_acknowledgement_is_correlated_behind_a_blocked_client_b
             &kr_worker::broker::Caller {
                 actor_id: ActorId::new("device-1").expect("valid"),
                 grant_id: None,
+                ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                device_id: None,
             },
             &kr_protocol::agent::AgentPromptParams {
                 target: target(),
@@ -5759,6 +5777,8 @@ async fn kr_req_11_30_an_unclassified_client_request_suspends_rich_mutations_bef
             &kr_worker::broker::Caller {
                 actor_id: ActorId::new("device-1").expect("valid"),
                 grant_id: None,
+                ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                device_id: None,
             },
             &kr_protocol::agent::AgentPromptParams {
                 target: target(),
@@ -8204,6 +8224,8 @@ fn device() -> kr_worker::broker::Caller {
     kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     }
 }
 

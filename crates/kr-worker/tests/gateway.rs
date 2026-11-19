@@ -262,6 +262,8 @@ fn caller(name: &str) -> Caller {
     Caller {
         actor_id: actor(name),
         grant_id: Some(GrantId::new(Uuid::from_bytes([7; 16]))),
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     }
 }
 

@@ -829,6 +829,13 @@ mod tests {
                 UpstreamBody::Prompt {
                     draft_id: None,
                     text: Some("hello".to_owned()),
+                    sender: crate::broker::channel_prompt::PromptSender {
+                        actor_id: kr_protocol::ids::ActorId::new("local:the-owner")
+                            .expect("an actor"),
+                        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                        device_id: None,
+                        grant_id: None,
+                    },
                 },
                 "acknowledges nothing",
             ),
