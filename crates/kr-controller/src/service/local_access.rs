@@ -319,6 +319,16 @@ impl Controller {
         }
         #[cfg(feature = "testing")]
         self.before_the_policy_lock.wait();
+        match self.read_local_lease() {
+            (LocalOwnerBound::Closed, _) => Err(lease_not_live()),
+            (_, held) => Ok(held),
+        }
+    }
+
+    /// What the host's local owner's lease is now, read once under the policy's lock: the bound, and
+    /// beside it what a held use of the lease asks again with no lock ([`LeaseHeld`]), which is
+    /// empty where the bound is open or closed.
+    fn read_local_lease(&self) -> (LocalOwnerBound, LeaseHeld) {
         // The clocks are read after the policy lock is taken: a policy commit holds that lock
         // across its storage writes, and a lease that ended while the lock was awaited must not be
         // read against a time taken before the wait. The continuous clock is read first and the
@@ -332,18 +342,18 @@ impl Controller {
         let now_ms = self.settled_utc_now();
         let (bound, held) = policy.local_owner_hold(self.local_owner_device(), now, now_ms);
         drop(policy);
-        match bound {
-            LocalOwnerBound::Open => Ok(LeaseHeld::default()),
-            LocalOwnerBound::Closed => Err(lease_not_live()),
+        let lease = match bound {
+            LocalOwnerBound::Open | LocalOwnerBound::Closed => LeaseHeld::default(),
             LocalOwnerBound::Until { continuous, utc_ms } => {
                 let remaining = std::time::Duration::from_millis(utc_ms.saturating_sub(now_ms));
                 let laid = now.checked_add(remaining).unwrap_or(continuous);
-                Ok(LeaseHeld {
+                LeaseHeld {
                     end: Some(continuous.min(laid)),
                     bound: held,
-                })
+                }
             }
-        }
+        };
+        (bound, lease)
     }
 
     /// A request that a held read must be refused at the door, once the local owner's lease is no
@@ -361,22 +371,44 @@ impl Controller {
         ))
     }
 
+    /// Whether the lease that [`Self::local_hold`] found, which `lease` says, still stands on the
+    /// clock now and as its cell publishes it: the end it was found to have has not come, and no
+    /// renewal that started another run of the bound and no restrictive change has ended it. Takes
+    /// no lock, so it may be asked inside a record's transaction.
+    pub(crate) fn lease_stands(&self, lease: &LeaseHeld) -> bool {
+        self.lease_is_live_until(lease.end).is_ok()
+            && lease.bound.as_ref().is_none_or(|bound| {
+                bound.stands_at(self.clock.now(), self.settled_utc_now())
+                    == crate::grants::policy::Stands::Holds
+            })
+    }
+
     /// The caller a local request is decided as for pairing and owner confirmation: the host's own
     /// account, limited to the recovery set while the local owner has no live lease.
     ///
-    /// The caller carries the question again, so that the places that record or answer what it asks
-    /// read the scope at that moment and not only at the door.
+    /// The caller carries the questions again, so that the places that record or answer what it asks
+    /// decide it at that moment and not only at the door: whether the local owner has no live lease
+    /// now, which waits for the policy's lock, and whether the lease the door found still stands,
+    /// which takes no lock. The scope and the lease are read together, under one hold of the
+    /// policy's lock.
     pub(crate) fn local_caller(
         self: &Arc<Self>,
         actor_id: &kr_protocol::ids::ActorId,
     ) -> super::net::owner::Caller {
-        let controller = Arc::downgrade(self);
+        let (bound, lease) = self.read_local_lease();
+        let for_the_scope = Arc::downgrade(self);
+        let for_the_lease = Arc::downgrade(self);
         super::net::owner::Caller::local(actor_id.clone())
-            .confirming_recovery_only(self.local_owner_is_closed())
+            .confirming_recovery_only(bound == LocalOwnerBound::Closed)
             .asking_again_whether_closed(move || {
-                controller
+                for_the_scope
                     .upgrade()
                     .is_none_or(|controller| controller.local_owner_is_closed())
+            })
+            .asking_again_whether_the_lease_stands(move || {
+                for_the_lease
+                    .upgrade()
+                    .is_some_and(|controller| controller.lease_stands(&lease))
             })
     }
 

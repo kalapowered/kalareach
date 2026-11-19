@@ -340,16 +340,6 @@ impl Controller {
                 if !caller.may_confirm(&params.subject) {
                     return Err(caller.refusal_to_confirm());
                 }
-                // The caller's scope is read again by the request itself, before the record's lock
-                // is taken ([`OwnerAuthority::request`]); the admission is asked inside the record.
-                #[cfg(feature = "testing")]
-                let admission: Admission = {
-                    let controller = Arc::clone(self);
-                    Arc::new(move || {
-                        controller.inside_the_record_of_a_confirmation.wait();
-                        admission()
-                    })
-                };
                 if matches!(params.subject, ConfirmationSubject::EstablishClock) {
                     let owner = Arc::clone(&self.owner);
                     let on_the_network = self.network_guard().is_some();

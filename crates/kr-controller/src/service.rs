@@ -808,11 +808,6 @@ pub struct Controller {
     /// be owed in that wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_the_policy_lock: ThreadPause,
-    /// Where this host's own tests stop a request for an owner confirmation inside the transaction
-    /// that records it, which holds the record's lock, before the request asks anything there, so
-    /// that a policy commit can take its lock in that wait. Compiled away in every shipped build.
-    #[cfg(feature = "testing")]
-    inside_the_record_of_a_confirmation: ThreadPause,
     /// Where this host's own tests stop a frame's ask once the local owner's lease has been read,
     /// and before the footing's question, so that a fence, a withdrawal or a policy commit can come
     /// after the last wait. Compiled away in every shipped build.

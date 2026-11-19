@@ -2582,6 +2582,36 @@ fn an_invitation() -> ConfirmationSubject {
     }
 }
 
+/// How long a step of a case waits for another before the case fails.
+const THE_BOUND: Duration = Duration::from_secs(20);
+
+/// Waits until the step a pause stops has arrived at it.
+async fn arrives(arrived: std::sync::mpsc::Receiver<()>, what: &'static str) {
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(THE_BOUND))
+        .await
+        .expect("the wait for the step ends")
+        .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// Ends the whole process with `message` when the flag it returns is not set within three bounds.
+/// A case that stops on the host's own locks then fails within a bound and does not hang: the stop
+/// holds blocking threads that the runtime's end would wait for, and a panic alone would not end
+/// the run.
+fn ending_the_run_where_it_stops(
+    message: &'static str,
+) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watching = std::sync::Arc::clone(&finished);
+    std::thread::spawn(move || {
+        std::thread::sleep(THE_BOUND * 3);
+        if !watching.load(std::sync::atomic::Ordering::SeqCst) {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+    });
+    finished
+}
+
 /// The refusal the local door gives the owner at the host for a subject outside the recovery set
 /// once the owner's lease has ended: asked of a request that arrives then.
 async fn the_door_refusal_after_the_lease_ended(
@@ -2594,28 +2624,30 @@ async fn the_door_refusal_after_the_lease_ended(
 }
 
 /// KR-REQ-17.54: the owner at the host asks for the confirmation of an invitation under a live
-/// lease, and the lease ends after the door decided the request and before the request is
-/// recorded. The host refuses it with the words the door uses for that subject on a host whose
-/// local owner holds no lease, and records no challenge. The control: where the lease stands, the
-/// challenge is recorded and listed.
+/// lease, and the lease ends after the host read the request's scope and while the request is
+/// inside the transaction that records it, which holds the record's lock. The host refuses it with
+/// the words the door uses for that subject on a host whose local owner holds no lease, and
+/// records no challenge. The control: where the lease stands, the challenge is recorded and
+/// listed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_request_whose_owner_lease_ends_after_the_door_decided_it_records_no_challenge()
  {
+    let finished = ending_the_run_where_it_stops("the request stops inside the record");
     for ends in [false, true] {
         let fixture = Fixture::start().await;
         let environment = fixture.host.environment_id;
         let owner = OwnerDevice::of(&fixture).await;
         let raw = a_host_whose_local_owner_holds_a_lease_of_ten_seconds(&fixture, &owner).await;
         let mut client = fixture.host.client().await;
-        let (arrived, release) = fixture.host.controller().pause_after_the_pairing_caller();
+        let (arrived, release) = fixture
+            .host
+            .controller()
+            .pause_inside_the_record_of_a_confirmation();
         let asking =
             tokio::spawn(
                 async move { calls::request(environment, &mut client, an_invitation()).await },
             );
-        tokio::time::timeout(Duration::from_secs(30), arrived)
-            .await
-            .expect("the request reaches the place after the door decided it")
-            .expect("the pause is armed");
+        arrives(arrived, "the request reaches the record").await;
         if ends {
             fixture.pass(Duration::from_secs(11));
         }
@@ -2638,16 +2670,19 @@ async fn a_confirmation_request_whose_owner_lease_ends_after_the_door_decided_it
         raw.close();
         fixture.host.stop().await;
     }
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// KR-REQ-17.54: the owner at the host answers a challenge for an invitation with an owner
-/// device's proof under a live lease, and the lease ends after the door decided the answer and
-/// before it is recorded. The host refuses it with the door's words for that subject and records
-/// no answer: the same proof, sent again once a lease stands, is accepted. The control: where the
-/// lease stands, the answer is recorded.
+/// device's proof under a live lease, and the lease ends after the host read the answer's scope and
+/// while the answer is inside the transaction that records it, which holds the record's lock. The
+/// host refuses it with the door's words for that subject and records no answer: the same proof,
+/// sent again once a lease stands, is accepted. The control: where the lease stands, the answer is
+/// recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_records_no_answer()
 {
+    let finished = ending_the_run_where_it_stops("the answer stops inside the record");
     for ends in [false, true] {
         let fixture = Fixture::start().await;
         let environment = fixture.host.environment_id;
@@ -2659,15 +2694,15 @@ async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_
             .expect("the leased owner asks for the confirmation of an invitation");
         let (proof, presented) =
             calls::sign(&challenge.request, &Signer::OwnerDevice(&fixture.owner));
-        let (arrived, release) = fixture.host.controller().pause_after_the_pairing_caller();
+        let (arrived, release) = fixture
+            .host
+            .controller()
+            .pause_inside_the_record_of_a_confirmation();
         let answering = tokio::spawn({
             let proof = proof.clone();
             async move { calls::complete(environment, &mut client, proof, presented).await }
         });
-        tokio::time::timeout(Duration::from_secs(30), arrived)
-            .await
-            .expect("the answer reaches the place after the door decided it")
-            .expect("the pause is armed");
+        arrives(arrived, "the answer reaches the record").await;
         if ends {
             fixture.pass(Duration::from_secs(11));
         }
@@ -2693,6 +2728,7 @@ async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_
         raw.close();
         fixture.host.stop().await;
     }
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// A request for an owner confirmation records its challenge in a transaction that holds the
@@ -2705,27 +2741,14 @@ async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_
 async fn a_policy_commit_that_takes_its_lock_while_a_confirmation_request_is_in_the_record_neither_waits_for_the_other()
  {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    const BOUND: Duration = Duration::from_secs(20);
 
     let fixture = Fixture::start().await;
     let environment = fixture.host.environment_id;
     let controller = Arc::clone(fixture.host.controller());
-    let finished = Arc::new(AtomicBool::new(false));
-    {
-        let finished = Arc::clone(&finished);
-        std::thread::spawn(move || {
-            std::thread::sleep(BOUND * 3);
-            if !finished.load(Ordering::SeqCst) {
-                eprintln!(
-                    "a confirmation request that holds the record and a policy commit that holds \
-                     the policy wait for each other"
-                );
-                std::process::exit(1);
-            }
-        });
-    }
+    let finished = ending_the_run_where_it_stops(
+        "a confirmation request that holds the record and a policy commit that holds the policy \
+         wait for each other",
+    );
 
     // The request stops inside the record, which it holds.
     let (in_the_record, let_the_request_go) =
@@ -2735,10 +2758,7 @@ async fn a_policy_commit_that_takes_its_lock_while_a_confirmation_request_is_in_
         tokio::spawn(
             async move { calls::request(environment, &mut client, an_invitation()).await },
         );
-    tokio::task::spawn_blocking(move || in_the_record.recv_timeout(BOUND))
-        .await
-        .expect("the wait for the request ends")
-        .expect("the request reaches the record");
+    arrives(in_the_record, "the request reaches the record").await;
 
     // The commit takes the policy's lock and stops there, then goes on to the record.
     let (policy_is_held, held_rx) = std::sync::mpsc::channel();
@@ -2760,23 +2780,23 @@ async fn a_policy_commit_that_takes_its_lock_while_a_confirmation_request_is_in_
             })
         }
     });
-    tokio::task::spawn_blocking(move || held_rx.recv_timeout(BOUND))
+    tokio::task::spawn_blocking(move || held_rx.recv_timeout(THE_BOUND))
         .await
         .expect("the wait for the commit ends")
         .expect("the commit takes the policy's lock");
     let_the_commit_go.send(()).expect("the commit goes on");
     let_the_request_go.send(()).expect("the request goes on");
 
-    tokio::time::timeout(BOUND, asking)
+    tokio::time::timeout(THE_BOUND, asking)
         .await
         .expect("the request is answered while the commit holds the policy's lock")
         .expect("the request ends")
         .expect("the challenge is recorded");
-    tokio::time::timeout(BOUND, committing)
+    tokio::time::timeout(THE_BOUND, committing)
         .await
         .expect("the commit is made once the request has left the record")
         .expect("the commit ends")
         .expect("the policy is written");
-    finished.store(true, Ordering::SeqCst);
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
     fixture.host.stop().await;
 }
