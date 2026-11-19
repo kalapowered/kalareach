@@ -265,8 +265,10 @@ impl CommandIntegration {
     /// Every flag is written as a JSON string, in the order it is added, and every variable as its
     /// name and its value as a JSON string. Nothing is shortened: every flag and every variable
     /// the host adds is in it, and so is every argument of the application server the declaration
-    /// names. The text is one line: a character the contract forbids in text, or a space other
-    /// than the plain one, is written as an escape.
+    /// names. Where the integration sets a variable, the statement also says that every program the
+    /// command starts gets the variables too, unless the command removes them. The text is one
+    /// line: a character the contract forbids in text, or a space other than the plain one, is
+    /// written as an escape.
     #[must_use]
     pub fn statement(&self) -> String {
         let mut statement = format!("Runs {} in KalaReach sessions", quoted(&self.command));
@@ -296,6 +298,12 @@ impl CommandIntegration {
                 .collect();
             statement.push_str(&variables.join(", "));
             statement.push('.');
+            // The launcher sets the variables on the program it starts, and a program passes its
+            // environment on to its own children, so the owner is told who else receives them.
+            statement.push_str(&format!(
+                " Every program that {command} starts gets them too, unless {command} removes them.",
+                command = quoted(&self.command)
+            ));
         }
         if let Some(backend) = &self.backend {
             statement.push_str(&format!(
@@ -685,7 +693,8 @@ mod tests {
         assert_eq!(
             gemini.statement(),
             "Runs \"gemini\" in KalaReach sessions with no arguments added. It sets these \
-             environment variables: GEMINI_CLI_NO_RELAUNCH=\"true\"."
+             environment variables: GEMINI_CLI_NO_RELAUNCH=\"true\". Every program that \
+             \"gemini\" starts gets them too, unless \"gemini\" removes them."
         );
         // A flag holding JSON is shown whole, with its quotes escaped, and never shortened.
         let long = format!("{{\"hooks\":\"{}\"}}", "x".repeat(3000));
@@ -693,6 +702,101 @@ mod tests {
         assert!(
             statement.contains(&serde_json::to_string(&long).expect("a string")),
             "{statement}"
+        );
+    }
+
+    #[test]
+    fn the_statement_tells_the_owner_that_every_program_the_command_starts_gets_the_variables() {
+        // Several variables, one sentence after the last of them.
+        let several = integration(
+            "gemini",
+            &["--flag"],
+            &[("GEMINI_NO_SELF_UPDATE", "1"), ("GEMINI_NO_TELEMETRY", "0")],
+        );
+        assert_eq!(
+            several.statement(),
+            "Runs \"gemini\" in KalaReach sessions with these arguments added, in this order: \
+             \"--flag\". It sets these environment variables: GEMINI_NO_SELF_UPDATE=\"1\", \
+             GEMINI_NO_TELEMETRY=\"0\". Every program that \"gemini\" starts gets them too, \
+             unless \"gemini\" removes them."
+        );
+        // The command is written as a quoted text, so a name with a space is one piece.
+        let spaced = integration("my tool", &[], &[("TOOL_NO_X", "1")]).statement();
+        assert!(
+            spaced.ends_with(
+                "Every program that \"my tool\" starts gets them too, unless \"my tool\" removes \
+                 them."
+            ),
+            "{spaced}"
+        );
+        // A server's declaration follows the sentence, inside the same reading.
+        let served = with_backend(
+            integration("gemini", &["{gateway}"], &[("GEMINI_NO_X", "1")]),
+            &["serve"],
+            &[],
+        )
+        .statement();
+        assert!(
+            served.contains(
+                "GEMINI_NO_X=\"1\". Every program that \"gemini\" starts gets them too, unless \
+                 \"gemini\" removes them. It also declares a server"
+            ),
+            "{served}"
+        );
+    }
+
+    #[test]
+    fn a_statement_with_no_variable_carries_no_such_sentence() {
+        for declared in [
+            integration("claude", &["--flag"], &[]),
+            integration("claude", &[], &[]),
+            with_backend(
+                integration("codex", &["{gateway}"], &[]),
+                &["serve"],
+                &["resume"],
+            ),
+        ] {
+            let statement = declared.statement();
+            assert!(statement.contains("It sets no environment variables."));
+            assert!(!statement.contains("Every program that"), "{statement}");
+        }
+    }
+
+    #[test]
+    fn the_host_sentence_counts_in_the_statement_bound() {
+        let rules = [rule("gemini", &[])];
+        // The statement as the declaration reads, written out here so the flag's size does not
+        // depend on the code under test.
+        let without = |flag: &str| {
+            format!(
+                "Runs \"gemini\" in KalaReach sessions with these arguments added, in this order: \
+                 \"{flag}\". It sets these environment variables: GEMINI_CLI_NO_RELAUNCH=\"true\"."
+            )
+        };
+        let sentence = " Every program that \"gemini\" starts gets them too, unless \"gemini\" \
+                        removes them.";
+        let room = MAX_STATEMENT_CHARS - without("").chars().count();
+        let bound = "an owner is shown whole";
+        // Within the bound with the sentence: accepted.
+        let fits = "x".repeat(room - sentence.chars().count());
+        assert_eq!(
+            without(&fits).chars().count() + sentence.chars().count(),
+            MAX_STATEMENT_CHARS
+        );
+        let problems =
+            integration("gemini", &[&fits], &[("GEMINI_CLI_NO_RELAUNCH", "true")]).problems(&rules);
+        assert!(
+            problems.iter().all(|problem| !problem.contains(bound)),
+            "{problems:?}"
+        );
+        // Within the bound without the sentence and over it with: refused.
+        let over = "x".repeat(room);
+        assert_eq!(without(&over).chars().count(), MAX_STATEMENT_CHARS);
+        let problems =
+            integration("gemini", &[&over], &[("GEMINI_CLI_NO_RELAUNCH", "true")]).problems(&rules);
+        assert!(
+            problems.iter().any(|problem| problem.contains(bound)),
+            "{problems:?}"
         );
     }
 
