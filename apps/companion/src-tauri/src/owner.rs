@@ -335,7 +335,7 @@ impl Owner {
         let identity = pairing.paired_identity_for(host);
         let session = pairing
             .link
-            .connect_paired(host, &identity)
+            .connect_paired(&host.credentials(), &identity)
             .await
             .map_err(|error| match error {
                 // The host was reached and was asked nothing: this computer could not give it the

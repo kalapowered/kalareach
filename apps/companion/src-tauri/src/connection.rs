@@ -232,7 +232,8 @@ impl Connection {
     async fn open(device: &Arc<Device>, host: &PairedHost) -> std::result::Result<Self, Unopened> {
         let pairing = device.pairing();
         let identity = pairing.paired_identity_for(host);
-        let connecting = pairing.link.connect_paired(host, &identity);
+        let credentials = host.credentials();
+        let connecting = pairing.link.connect_paired(&credentials, &identity);
         let session = tokio::time::timeout(CONNECT_WITHIN, connecting)
             .await
             .map_err(|_| Unopened::unreached(NotReached::NoAnswerInTime))?

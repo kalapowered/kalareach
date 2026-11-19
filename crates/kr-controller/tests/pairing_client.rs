@@ -614,7 +614,7 @@ impl WatchedLink {
     /// A connection to a paired host, counted, cut or gated as the test says.
     fn paired<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a kr_client::pairing::paired::HostCredentials,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
         self.paired_connects.fetch_add(1, Ordering::SeqCst);
@@ -715,7 +715,7 @@ impl HostLink for WatchedLink {
 
     fn connect_paired_transport<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a kr_client::pairing::paired::HostCredentials,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
         self.paired(host, identity)
@@ -878,7 +878,10 @@ async fn a_device_pairs_by_code_through_the_product_client() {
     let session = device
         .pairing
         .link
-        .connect_paired(&paired, &device.pairing.paired_identity_for(&paired))
+        .connect_paired(
+            &paired.credentials(),
+            &device.pairing.paired_identity_for(&paired),
+        )
         .await
         .expect("the paired device connects");
     let status: PairStatusResult = session
@@ -1669,6 +1672,58 @@ async fn pairs_directly(host: &Host, owner_keys: &DeviceKeys) -> PairedHost {
     paired
 }
 
+/// KR-REQ-10.37: a committed device whose first connection as the device it became is refused as
+/// the connection, because the host's authority moved while the host held it, is not told anything
+/// about its commitment by that. It connects again and ends paired.
+///
+/// The host holds the device's connection before it registers it, revokes a third device, which
+/// moves the authority the connection was admitted under, and lets it go: the host answers the
+/// device's first question with a refusal for request zero.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_committed_device_whose_first_connection_is_refused_as_the_connection_connects_again() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let other = pairs_directly(&host, &owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("a direct invitation");
+    let (link, making) = watching(|_| {});
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+
+    let (arrived, release) = host.controller().pause_connection_registration();
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    arrived
+        .await
+        .expect("the host holds the device's connection before it registers it");
+    host.controller()
+        .revoke_device_authority(other.device_id, None, None)
+        .await
+        .expect("the third device's authority is withdrawn");
+    release
+        .send(())
+        .expect("the host is still holding the connection");
+
+    let paired = outcome(attempt).await.expect("the device ends paired");
+    assert_ne!(paired.device_id, other.device_id);
+    assert!(
+        made(&link).paired_connects.load(Ordering::SeqCst) >= 2,
+        "the first connection was refused and a second was made"
+    );
+}
+
 /// KR-REQ-10.36, KR-REQ-10.37: a device running the product client redeems a direct invitation,
 /// shows the value the host locked it with, which is the one the owner sees, and pairs once the
 /// owner approves.
@@ -2358,7 +2413,10 @@ async fn owner_device(
     let session = device
         .pairing
         .link
-        .connect_paired(&paired, &device.pairing.paired_identity_for(&paired))
+        .connect_paired(
+            &paired.credentials(),
+            &device.pairing.paired_identity_for(&paired),
+        )
         .await
         .expect("the owner device connects");
     let channel = Arc::new(WatchedChannel {
@@ -2857,7 +2915,10 @@ async fn each_host_is_reached_through_its_own_network_configuration() {
         let host = host.clone();
         async move {
             let identity = pairing.paired_identity_for(&host);
-            let session = pairing.link.connect_paired(&host, &identity).await?;
+            let session = pairing
+                .link
+                .connect_paired(&host.credentials(), &identity)
+                .await?;
             let info: kr_protocol::hostinfo::HostInfoResult = session
                 .read(Method::HostInfo, &EmptyParams {})
                 .await

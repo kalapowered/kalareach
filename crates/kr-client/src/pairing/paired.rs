@@ -15,10 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use kr_crypto::connect::PairedPeer;
+use kr_protocol::grant::OrganisationRequirement;
 use kr_protocol::ids::{DeviceId, DeviceKeyRevision, GrantId, InvitationId};
 use kr_protocol::pairing::{DevicePublicKeys, NetworkConfig, ProposedGrant};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::EndpointKey;
+use kr_protocol::scalars::{EndpointKey, Nullable};
 use serde::{Deserialize, Serialize};
 
 use super::failure::{FailureKind, PairingFailure};
@@ -85,7 +86,60 @@ crate::debug_fields!(PairedHost {
     device_key_revision
 });
 
+/// What a device needs to reach a host as the device it became: who the host is, where it is, and
+/// the organisation its grant answers to.
+///
+/// It is read from a paired-host record or from an attempt that has not yet written one, so a
+/// device that was committed while it was not listening reaches the host with the same value. It
+/// is owned, never stored and never serialised.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostCredentials {
+    /// The host's device identity.
+    pub host_device_id: DeviceId,
+    /// The revision of the host's keys.
+    pub host_key_revision: DeviceKeyRevision,
+    /// The host's purpose-separated public keys.
+    pub host_keys: DevicePublicKeys,
+    /// The host's iroh endpoint identity.
+    pub host_endpoint_id: EndpointKey,
+    /// The host's selected discovery and relay configuration, with its address hints.
+    pub network_config: NetworkConfig,
+    /// The organisation membership the host's grant to this device requires, if it does.
+    pub organisation: Nullable<OrganisationRequirement>,
+}
+
+crate::debug_fields!(HostCredentials {
+    host_device_id,
+    host_key_revision
+});
+
+impl HostCredentials {
+    /// The host as this device's connection proof is checked against it.
+    #[must_use]
+    pub const fn peer(&self) -> PairedPeer {
+        PairedPeer {
+            device_id: self.host_device_id,
+            device_key_revision: self.host_key_revision,
+            authorisation: self.host_keys.authorisation,
+            endpoint_id: self.host_endpoint_id,
+        }
+    }
+}
+
 impl PairedHost {
+    /// What this device needs to reach the host as the device it became.
+    #[must_use]
+    pub fn credentials(&self) -> HostCredentials {
+        HostCredentials {
+            host_device_id: self.host_device_id,
+            host_key_revision: self.host_key_revision,
+            host_keys: self.host_keys,
+            host_endpoint_id: self.host_endpoint_id,
+            network_config: self.network_config.clone(),
+            organisation: self.proposed_grant.organisation.clone(),
+        }
+    }
+
     /// The host as this device's connection proof is checked against it.
     #[must_use]
     pub const fn peer(&self) -> PairedPeer {
@@ -152,6 +206,22 @@ pub struct PendingAttempt {
     pub recover_until_ms: u64,
     /// How many tries this device has left with the code, for a code attempt.
     pub tries_left: Option<u32>,
+}
+
+impl PendingAttempt {
+    /// What this device needs to reach the host as the device it will become, read from what the
+    /// attempt already holds of the host.
+    #[must_use]
+    pub fn credentials(&self) -> HostCredentials {
+        HostCredentials {
+            host_device_id: self.host_device_id,
+            host_key_revision: self.host_key_revision,
+            host_keys: self.host_keys,
+            host_endpoint_id: self.host_endpoint_id,
+            network_config: self.network_config.clone(),
+            organisation: self.proposed_grant.organisation.clone(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]

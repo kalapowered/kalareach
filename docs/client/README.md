@@ -1012,7 +1012,15 @@ device plans its next step again from when the look ended. A device that is late
 the same, by more than a second, lets the connection go instead of asking a question the host may no
 longer be there to answer. Ten seconds before the attempt's own deadline every answer is final, and
 from then on the device asks the connection it holds at its usual pace and looks for no other. A
-commit made after the last question on the last connection opened before it, while no new connection
+host that refuses a question with `PERMISSION_DENIED` may have committed the device on another
+connection, so the device then connects as the identity derived for it (from the invitation's
+identifier and its own authorisation key), which the host answers only for a device that proves that
+key, and asks `pair.status` there. It writes the host's record only when the host answers on that
+connection. A recovery that reaches no host leaves the attempt waiting, after a rest that grows with
+each recovery lost in a row, until the deadline; it ends by the cutoff of the question the held
+connection keeps, so that question is still asked. A refusal of the connect with a code that permits
+no retry ends the attempt as `approval_unknown`, and no refusal of `pair.status` does, because none is
+the host's word about the commitment. A commit made after the last question on the last connection opened before it, while no new connection
 opens, is one the device cannot learn of by itself, and the attempt ends as `approval_unknown`. A
 change of connection is not a lost connection, and the device does not show it as one. A host that
 turns a question away as too soon keeps the connection. It counts the questions it refuses as well,

@@ -1551,7 +1551,11 @@ async fn visit(
                 let pairing = device.pairing();
                 let identity = pairing.paired_identity_for(paired);
                 let connected = async {
-                    match pairing.link.connect_paired(paired, &identity).await {
+                    match pairing
+                        .link
+                        .connect_paired(&paired.credentials(), &identity)
+                        .await
+                    {
                         Ok(session) => listed(&Arc::new(session)).await,
                         Err(error) => Listing::of_link(&error),
                     }

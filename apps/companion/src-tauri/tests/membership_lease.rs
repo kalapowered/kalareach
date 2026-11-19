@@ -755,9 +755,12 @@ impl Rig {
             .next()
             .expect("a paired host");
         let identity = pairing.paired_identity_for(&host);
-        tokio::time::timeout(WATCHDOG, pairing.link.connect_paired(&host, &identity))
-            .await
-            .expect("the connection ends one way or the other")
+        tokio::time::timeout(
+            WATCHDOG,
+            pairing.link.connect_paired(&host.credentials(), &identity),
+        )
+        .await
+        .expect("the connection ends one way or the other")
     }
 
     /// The device visits the host, as it does a host it is not using: a connection of its own, which
@@ -775,7 +778,7 @@ impl Rig {
         let identity = pairing.paired_identity_for(&host);
         tokio::time::timeout(
             WATCHDOG,
-            support::as_a_visit(pairing.link.connect_paired(&host, &identity)),
+            support::as_a_visit(pairing.link.connect_paired(&host.credentials(), &identity)),
         )
         .await
         .expect("the visit ends one way or the other")

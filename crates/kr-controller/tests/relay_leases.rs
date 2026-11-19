@@ -5284,7 +5284,7 @@ impl kr_client::pairing::link::HostLink for Counting {
 
     fn connect_paired_transport<'a>(
         &'a self,
-        host: &'a kr_client::pairing::paired::PairedHost,
+        host: &'a kr_client::pairing::paired::HostCredentials,
         identity: &'a kr_transport::handshake::LocalIdentity,
     ) -> kr_client::pairing::BoxFuture<
         'a,
@@ -5594,7 +5594,7 @@ async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_
     let as_second = device.paired_identity(b.device_id, b.device_key_revision);
 
     let held = link
-        .connect_paired(&a, &as_first)
+        .connect_paired(&a.credentials(), &as_first)
         .await
         .expect("the first host is reached through the relay");
     answers(&held, "the first host answers").await;
@@ -5609,7 +5609,7 @@ async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_
         .id();
 
     let reached = link
-        .connect_paired(&b, &as_second)
+        .connect_paired(&b.credentials(), &as_second)
         .await
         .expect("the second host is reached through the relay");
     assert_eq!(
@@ -5625,7 +5625,7 @@ async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_
     .await;
 
     let again = link
-        .connect_paired(&b, &as_second)
+        .connect_paired(&b.credentials(), &as_second)
         .await
         .expect("the second host is reached again");
     answers(&again, "the second host answers on its second connection").await;
@@ -5636,7 +5636,7 @@ async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_
     .await;
 
     let beside = link
-        .connect_paired(&a, &as_first)
+        .connect_paired(&a.credentials(), &as_first)
         .await
         .expect("the first host is reached on a second connection");
     answers(&beside, "the first host answers on its second connection").await;
@@ -5657,7 +5657,7 @@ async fn two_owned_hosts_on_one_real_relay_with_other_services_are_both_reached_
     drop((held, reached, again, beside));
     pool.close().await;
     let anew = link
-        .connect_paired(&a, &as_first)
+        .connect_paired(&a.credentials(), &as_first)
         .await
         .expect("the first host is reached through a new endpoint");
     answers(&anew, "the first host answers through the new endpoint").await;

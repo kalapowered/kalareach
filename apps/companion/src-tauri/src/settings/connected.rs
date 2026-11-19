@@ -349,7 +349,11 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                         let pairing = device.pairing();
                         let identity = pairing.paired_identity_for(&host);
                         let visit = async {
-                            match pairing.link.connect_paired(&host, &identity).await {
+                            match pairing
+                                .link
+                                .connect_paired(&host.credentials(), &identity)
+                                .await
+                            {
                                 Ok(session) => listed(&Arc::new(session)).await,
                                 Err(error) => Listing::of_link(&error),
                             }
