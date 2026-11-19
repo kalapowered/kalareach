@@ -53,10 +53,12 @@ fn read(sdk_range: &str, table: &[u8], named: Option<&[u8]>) -> Declared {
     declared_placement(&manifest, folder.path(), "Gemini CLI")
 }
 
-fn refusal(declared: &Declared) -> &str {
+/// Why a placement was refused, and `None` for any other reading: a case asserts on this in its
+/// own body, so a table that is read instead of refused fails the case's own assertion.
+fn refusal(declared: &Declared) -> Option<&str> {
     match declared {
-        Declared::Refused(why) => why,
-        other => panic!("not refused: {other:?}"),
+        Declared::Refused(why) => Some(why),
+        _ => None,
     }
 }
 
@@ -69,14 +71,14 @@ fn a_placement_is_read_only_after_the_range_test() {
     let table = gemini_table(Some(odd));
     let declared = read(">=0.1.0, <0.1.5", &table, None);
     assert!(
-        refusal(&declared).contains("sdk_range does not admit"),
+        refusal(&declared).is_some_and(|why| why.contains("sdk_range does not admit")),
         "{declared:?}"
     );
     // And a table that is whole is refused too, never replaced by the application's layout.
     let table = gemini_table(Some(gemini_placement()));
     let declared = read(">=0.1.0, <0.1.5", &table, None);
     assert!(
-        refusal(&declared).contains("sdk_range does not admit"),
+        refusal(&declared).is_some_and(|why| why.contains("sdk_range does not admit")),
         "{declared:?}"
     );
 }
@@ -87,25 +89,25 @@ fn a_table_that_does_not_validate_is_refused_and_never_defaulted() {
     parent["directory"] = json!(["..", ".gemini"]);
     let declared = read(">=0.1.9, <0.2.0", &gemini_table(Some(parent)), None);
     assert!(
-        refusal(&declared).contains("placement.directory_not_plain"),
+        refusal(&declared).is_some_and(|why| why.contains("placement.directory_not_plain")),
         "{declared:?}"
     );
     let mut elsewhere = gemini_placement();
     elsewhere["directory"] = json!([".gemini-elsewhere"]);
     let declared = read(">=0.1.9, <0.2.0", &gemini_table(Some(elsewhere)), None);
     assert!(
-        refusal(&declared).contains("placement.directory_not_the_labels"),
+        refusal(&declared).is_some_and(|why| why.contains("placement.directory_not_the_labels")),
         "{declared:?}"
     );
     let declared = read(">=0.1.9, <0.2.0", b"not json at all", None);
     assert!(
-        refusal(&declared).contains("cannot be read"),
+        refusal(&declared).is_some_and(|why| why.contains("cannot be read")),
         "{declared:?}"
     );
     let table = gemini_table(Some(gemini_placement()));
     let declared = read(">=0.1.9, <0.2.0", &table, Some(b"other bytes"));
     assert!(
-        refusal(&declared).contains("not the bytes the manifest names"),
+        refusal(&declared).is_some_and(|why| why.contains("not the bytes the manifest names")),
         "{declared:?}"
     );
 }
@@ -116,7 +118,7 @@ fn a_table_whose_file_has_no_object_at_its_root_is_refused_and_never_defaulted()
     array["files"][2]["shape"] = json!({"kind": "array", "items": {"kind": "command_handler"}});
     let declared = read(">=0.1.9, <0.2.0", &gemini_table(Some(array)), None);
     assert!(
-        refusal(&declared).contains("placement.file_not_an_object"),
+        refusal(&declared).is_some_and(|why| why.contains("placement.file_not_an_object")),
         "{declared:?}"
     );
 }
