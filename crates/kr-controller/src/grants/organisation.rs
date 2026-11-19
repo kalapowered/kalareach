@@ -740,6 +740,22 @@ impl Enrolment {
         }
     }
 
+    /// The two ends of the lease installed for `device_id`'s binding, on the continuous clock and
+    /// in UTC milliseconds, whether or not it is still in force: what a reader that decides at its
+    /// own readings compares them with. None when the device is bound to nobody here or holds no
+    /// lease.
+    pub(crate) fn lease_ends_for_device(
+        &self,
+        device_id: DeviceId,
+    ) -> Option<(ContinuousInstant, u64)> {
+        let binding = self.members.get(&device_id)?;
+        let installed = self.installed(&binding.account_id, &binding.device_key)?;
+        Some((
+            installed.continuous_deadline(),
+            installed.lease.payload.expires_at_ms.get(),
+        ))
+    }
+
     /// Every lease installed here now.
     pub(crate) fn installed_leases(&self) -> impl Iterator<Item = &InstalledLease> {
         self.installed.values()

@@ -83,6 +83,70 @@ pub enum LocalOwnerBound {
     },
 }
 
+/// The lease that ends last of those offered as `(continuous end, UTC end, what it is)`: the
+/// latest end on the continuous clock, the later UTC end deciding a tie. The first of two leases
+/// that end together on both clocks stands. Two leases' ends are never combined.
+fn latest_end<T>(
+    leases: impl IntoIterator<Item = (ContinuousInstant, u64, T)>,
+) -> Option<(ContinuousInstant, u64, T)> {
+    let mut latest: Option<(ContinuousInstant, u64, T)> = None;
+    for (continuous, utc_ms, lease) in leases {
+        if latest
+            .as_ref()
+            .is_none_or(|(held_continuous, held_utc, _)| {
+                continuous > *held_continuous
+                    || (continuous == *held_continuous && utc_ms > *held_utc)
+            })
+        {
+            latest = Some((continuous, utc_ms, lease));
+        }
+    }
+    latest
+}
+
+/// The two ends of one lease of the host's own key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LeaseEnds {
+    /// The lease's end on the daemon's continuous clock.
+    continuous: ContinuousInstant,
+    /// The lease's end in UTC milliseconds.
+    utc_ms: u64,
+}
+
+/// What decides whether the host's local owner is shut out, as one policy states it: whether the
+/// host is exclusively organisation-managed, and the two ends of each lease of its own key.
+///
+/// It is one value, published whole when a policy is put in force
+/// ([`HostPolicy::local_owner_standing`]), and a reader that holds one answers from one policy:
+/// it holds the ends the policy's leases state and reads no cell, so no answer is built from two
+/// generations of a lease. It is read with no lock, which a check that runs inside a transaction
+/// on a connection may do where it may not take the policy's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalOwnerStanding {
+    exclusively_managed: bool,
+    leases: Vec<LeaseEnds>,
+}
+
+impl LocalOwnerStanding {
+    /// What the host's local owner may do at `now` on the continuous clock and `now_ms` in UTC:
+    /// the answer [`HostPolicy::local_owner_bound`] gives for the policy this was taken from.
+    /// A lease ends at its continuous end or its UTC end, whichever the readings reach first.
+    pub(crate) fn bound(&self, now: ContinuousInstant, now_ms: u64) -> LocalOwnerBound {
+        if !self.exclusively_managed {
+            return LocalOwnerBound::Open;
+        }
+        let live = self
+            .leases
+            .iter()
+            .filter(|ends| now < ends.continuous && now_ms < ends.utc_ms)
+            .map(|ends| (ends.continuous, ends.utc_ms, ()));
+        match latest_end(live) {
+            Some((continuous, utc_ms, ())) => LocalOwnerBound::Until { continuous, utc_ms },
+            None => LocalOwnerBound::Closed,
+        }
+    }
+}
+
 /// The methods an owner's device reaches on an exclusively organisation-managed host when no lease
 /// serves it: reading what the host holds, asking for, answering and spending the owner's
 /// confirmations, and establishing the clock. Presenting a lease is its own exception, since a
@@ -1638,32 +1702,44 @@ impl HostPolicy {
         if !self.exclusively_managed {
             return (LocalOwnerBound::Open, None);
         }
-        let mut latest: Option<(ContinuousInstant, u64, HeldBound)> = None;
-        for enrolment in self.enrolments.values() {
-            let Ok((_, held)) = enrolment.lease_for_device(host_device, now, now_ms) else {
-                continue;
-            };
-            let (Some(continuous), Some(utc_ms)) = (
-                held.snapshot().continuous_deadline,
-                held.snapshot().utc_deadline_ms,
-            ) else {
-                continue;
-            };
-            if latest
-                .as_ref()
-                .is_none_or(|(held_continuous, held_utc, _)| {
-                    continuous > *held_continuous
-                        || (continuous == *held_continuous && utc_ms > *held_utc)
-                })
-            {
-                latest = Some((continuous, utc_ms, held));
-            }
-        }
-        match latest {
+        let live = self.enrolments.values().filter_map(|enrolment| {
+            let (_, held) = enrolment
+                .lease_for_device(host_device, now, now_ms)
+                .ok()?;
+            let continuous = held.snapshot().continuous_deadline?;
+            let utc_ms = held.snapshot().utc_deadline_ms?;
+            Some((continuous, utc_ms, held))
+        });
+        match latest_end(live) {
             Some((continuous, utc_ms, held)) => {
                 (LocalOwnerBound::Until { continuous, utc_ms }, Some(held))
             }
             None => (LocalOwnerBound::Closed, None),
+        }
+    }
+
+    /// What this policy says the host's local owner may do, as one value that holds the ends of
+    /// its leases and reads no cell ([`LocalOwnerStanding`]): whether the host is exclusively
+    /// organisation-managed, and, for each enrolment, the two ends of the lease installed for the
+    /// binding of `host_device`.
+    ///
+    /// For the policy in force, a lease's cell states exactly the ends the lease holds
+    /// ([`HostPolicy::publish_leases`]), so the answer of [`LocalOwnerStanding::bound`] is the
+    /// one [`Self::local_owner_bound`] gives at the same readings.
+    #[must_use]
+    pub(crate) fn local_owner_standing(&self, host_device: DeviceId) -> LocalOwnerStanding {
+        let leases = if self.exclusively_managed {
+            self.enrolments
+                .values()
+                .filter_map(|enrolment| enrolment.lease_ends_for_device(host_device))
+                .map(|(continuous, utc_ms)| LeaseEnds { continuous, utc_ms })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        LocalOwnerStanding {
+            exclusively_managed: self.exclusively_managed,
+            leases,
         }
     }
 
