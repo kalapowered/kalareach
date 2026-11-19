@@ -3313,11 +3313,12 @@ async fn kr_req_25_22_an_ending_binding_stays_while_the_thread_of_a_cancellation
     assert_eq!(error.code, ErrorCode::OutcomeUnknown, "{error:?}");
 
     installed.revoke(&host, 2);
-    let ending = host
-        .service
-        .broker()
-        .binding_record(binding())
-        .expect("the binding stays while the thread's call is still to be made");
+    let record = host.service.broker().binding_record(binding());
+    assert!(
+        record.is_some(),
+        "the binding stays while the thread's call is still to be made"
+    );
+    let ending = record.expect("the binding is there");
     assert!(ending.ending, "and is ending");
     assert!(
         !transport
