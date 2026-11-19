@@ -684,20 +684,37 @@ fn a_flush_that_fails_keeps_the_record_naming_the_path_it_followed() {
     );
     drop(guard);
     let record = tree.record().expect("the record stays");
-    assert!(record.pending.is_some() && !aside.exists());
+    assert_eq!(
+        aside_of(&record),
+        Some(aside.clone()),
+        "the record keeps naming the aside it followed"
+    );
+    assert!(!aside.exists(), "the aside is already deleted");
+    assert_eq!(bytes(&tree.file()), None, "and so is the file");
 
     // The aside is dropped after a put back and its flush fails.
     let tree = Tree::removing(2);
     let record = tree.record().expect("a record");
     let mut run = tree.run("", Some(record.clone()));
-    run.paths.aside = aside_of(&record).expect("named");
+    let aside = aside_of(&record).expect("named");
+    run.paths.aside.clone_from(&aside);
     let guard = kr_flush::testing::refuse_flushes_of(tree.directory());
     assert!(
         steps::run_all(&mut run, &PUT_BACK).is_err(),
         "the flush fails"
     );
     drop(guard);
-    assert!(tree.record().expect("the record stays").pending.is_some());
+    assert_eq!(
+        aside_of(&tree.record().expect("the record stays")),
+        Some(aside.clone()),
+        "the record keeps naming the aside it followed"
+    );
+    assert!(!aside.exists(), "the aside is already gone");
+    assert_eq!(
+        bytes(&tree.file()).as_deref(),
+        Some(OLD.as_bytes()),
+        "and the file is back"
+    );
 
     // The record's removal is the last step of a removal, and the state directory's flush after
     // it fails: the step says so, and does not report a removal that is not yet durable.
@@ -748,6 +765,140 @@ fn a_removal_whose_aside_cannot_go_back_leaves_it_named_and_drops_the_record() {
         run.events
             .iter()
             .any(|e| matches!(e, Event::AsideStays(path) if *path == aside))
+    );
+    // The line a person reads names the aside and the place, and says nothing of the record.
+    let lines = super::writer::event_lines(
+        &run.events,
+        &tree.file(),
+        &tree.file(),
+        &Shown::said("the record"),
+    );
+    let said: Vec<String> = lines
+        .iter()
+        .map(|(word, line)| format!("{word}: {}", line.as_str()))
+        .collect();
+    assert_eq!(
+        said,
+        vec![format!(
+            "aside_stays: left {}: {} holds another file now, so the file kr moved aside could \
+             not go back",
+            aside.display(),
+            tree.file().display()
+        )],
+        "{said:?}"
+    );
+}
+
+/// What a run's lines say: the word of each, what is at a path they name, and nothing of a
+/// record that is not yet removed.
+#[test]
+fn the_lines_of_a_run_say_only_what_is_done_and_name_what_is_there() {
+    let tree = Tree::new();
+    std::fs::create_dir_all(tree.directory()).expect("a directory");
+    let derived = tree.file();
+    let recorded = tree.directory().join("elsewhere");
+    let staging = record::beside(&recorded, "kr-staging");
+    let aside = record::beside(&recorded, "kr-moving");
+    let said = |events: Vec<Event>| -> Vec<String> {
+        super::writer::event_lines(&events, &derived, &recorded, &Shown::said("R"))
+            .iter()
+            .map(|(word, line)| format!("{word}: {}", line.as_str()))
+            .collect()
+    };
+    assert_eq!(
+        said(vec![
+            Event::LeftFile,
+            Event::Removed(staging.clone()),
+            Event::Removed(aside.clone())
+        ]),
+        vec![
+            "left_file: left the file the record R names: it was changed after kr wrote it, so \
+             it is no longer kr's to remove, and it may still start a daemon when you log in"
+                .to_owned(),
+            "removed_staging: removed a file beside the file the record R names, under a name \
+             that ends in .kr-staging"
+                .to_owned(),
+            "removed_aside: removed a file beside the file the record R names, under a name \
+             that ends in .kr-moving"
+                .to_owned(),
+        ]
+    );
+    // What is at a leftover's name is said as what it is.
+    std::fs::create_dir(&aside).expect("a directory at the aside's name");
+    std::os::unix::fs::symlink(&recorded, &staging).expect("a link at the staging name");
+    assert_eq!(
+        said(vec![Event::Left(aside), Event::Left(staging)]),
+        vec![
+            "left_leftover: left a directory beside the file the record R names, under a name \
+             that ends in .kr-moving: it does not hold what kr wrote"
+                .to_owned(),
+            "left_leftover: left a link beside the file the record R names, under a name that \
+             ends in .kr-staging: it does not hold what kr wrote"
+                .to_owned(),
+        ]
+    );
+}
+
+/// Each step that fails says what it was doing: the staging file, the file moved aside, or the
+/// settling's own flush.
+#[test]
+fn a_failed_settling_says_what_it_was_doing() {
+    let failing = |tree: &Tree| {
+        let record = tree.record().expect("a record");
+        let mut run = tree.run("", Some(record.clone()));
+        let guard = kr_flush::testing::refuse_flushes_of(tree.directory());
+        let result = steps::settle(&mut run, &record, Mode::Install);
+        drop(guard);
+        match result {
+            Err(error) => error.said().as_str().to_owned(),
+            Ok(_) => panic!("the flush fails"),
+        }
+    };
+    // The staging file is one name of the file, and its removal is flushed.
+    let said = failing(&Tree::publishing(4));
+    assert!(
+        said.contains("while it was removing the staging file"),
+        "{said}"
+    );
+    // The aside is one name of the file, and its removal is flushed.
+    let said = failing(&{
+        let tree = Tree::removing(2);
+        let (mut run, record) = tree.finishing();
+        run.paths.aside = aside_of(&record).expect("named");
+        steps::run_all(&mut run, &PUT_BACK[..1]).unwrap_or_else(|_| panic!("links back"));
+        tree
+    });
+    assert!(
+        said.contains("while it was removing the file that was moved aside"),
+        "{said}"
+    );
+    // Nothing is left to remove: the flush before the record is written is the settling's own.
+    let said = failing(&Tree::publishing(5));
+    assert!(
+        said.contains("while it was finishing what an earlier run began"),
+        "{said}"
+    );
+    assert!(!said.contains("staging file"), "{said}");
+}
+
+/// A name under something that is not a directory is not there: a removal of a file under such
+/// a parent finds nothing to move and drops the record.
+#[test]
+fn a_file_under_a_parent_that_is_not_a_directory_is_gone_and_its_removal_finishes() {
+    let (tree, _) = Tree::published();
+    let directory = tree.directory();
+    std::fs::remove_file(tree.file()).expect("the file goes");
+    std::fs::remove_dir(&directory).expect("the directory goes");
+    std::fs::write(&directory, b"a file now\n").expect("a file in its place");
+    let mut run = tree.run("", tree.record());
+    steps::run_all(&mut run, &REMOVE).unwrap_or_else(|error| {
+        panic!("the removal finishes: {}", error.said().as_str());
+    });
+    assert!(tree.record().is_none(), "the record is dropped");
+    assert_eq!(
+        bytes(&directory).as_deref(),
+        Some(&b"a file now\n"[..]),
+        "the file that stands where the directory was is left"
     );
 }
 

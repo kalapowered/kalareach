@@ -206,8 +206,16 @@ mod written {
 
         /// Every file under the home, the roots and the layout's temporary directory, by path.
         fn snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+            self.snapshot_with(&[])
+        }
+
+        /// The same, and every file under each of `homes` as well.
+        fn snapshot_with(&self, homes: &[&Path]) -> BTreeMap<PathBuf, Vec<u8>> {
             let mut found = BTreeMap::new();
             for root in [&self.home, &self.state, &self.runtime] {
+                collect(root, &mut found);
+            }
+            for root in homes {
                 collect(root, &mut found);
             }
             found
@@ -601,12 +609,15 @@ mod written {
                 &["host", "login-item", argument],
             )
         };
-        let before = setup.snapshot();
+        let before = setup.snapshot_with(&[&other_home]);
         let install = output("install");
         assert!(!install.status.success(), "install is refused");
         let said = String::from_utf8_lossy(&install.stderr).into_owned();
         assert!(said.contains("is not what this installation of kr writes, and kr has no record of writing it, so kr does not replace it"), "{said}");
-        assert!(setup.snapshot() == before, "nothing was written");
+        assert!(
+            setup.snapshot_with(&[&other_home]) == before,
+            "nothing was written, in the second home or anywhere else"
+        );
         let remove = output("remove");
         let text = String::from_utf8_lossy(&remove.stdout).into_owned();
         assert!(remove.status.success(), "remove succeeds");
@@ -689,6 +700,76 @@ mod written {
         assert!(!calls.exists(), "no manager was asked");
     }
 
+    /// Runs `kr shell install --shell zsh` in `setup`'s private home, with a zsh package of the
+    /// test's own as a build installs one (its identity record and the file naming the identity in
+    /// use; nothing starts it) and a package root and preferences folder of the test's own.
+    fn shell_install_in(setup: &Setup) -> std::process::Output {
+        use kr_shell_integration::contract::qualification::ShellKind;
+        use kr_shell_integration::host::package::{
+            CURRENT_BASENAME, MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest,
+            PackageShell, PackageStartupEntry,
+        };
+
+        let packages = setup.root.join("packages");
+        let programs = setup.root.join("programs");
+        let package = packages.join("zsh").join("test-1");
+        std::fs::create_dir_all(&package).expect("the package's directory");
+        std::fs::create_dir_all(&programs).expect("a directory");
+        std::fs::write(programs.join("konsole"), b"#!/bin/sh\n").expect("Konsole stands in");
+        let manifest = PackageManifest {
+            identity: "test-1".to_owned(),
+            shell: PackageShell {
+                kind: ShellKind::Zsh,
+                executable: package.join("bin/zsh"),
+                upstream_version: "5.9".to_owned(),
+                editor_abi: "zle-5.9".to_owned(),
+                integration_version: "1".to_owned(),
+                patches: Vec::new(),
+                modules: Vec::new(),
+            },
+            startup_entry: PackageStartupEntry {
+                file: package
+                    .join("startup/entry.zsh")
+                    .to_str()
+                    .expect("the package root is text")
+                    .to_owned(),
+            },
+            launch: kr_shell_integration::host::package::PackageLaunch::default(),
+        };
+        std::fs::write(
+            package.join(MANIFEST_BASENAME),
+            serde_json::to_string(&manifest).expect("the record encodes"),
+        )
+        .expect("writes the identity record");
+        std::fs::write(packages.join("zsh").join(CURRENT_BASENAME), "test-1\n")
+            .expect("names the identity in use");
+        let mut command = setup.command_in(
+            &setup.bin.join("kr"),
+            &setup.home,
+            &["shell", "install", "--shell", "zsh"],
+        );
+        command
+            .env("PATH", format!("{}:/usr/bin:/bin", programs.display()))
+            .env(PACKAGE_ROOT_VARIABLE, &packages);
+        #[cfg(target_os = "macos")]
+        {
+            // `defaults` ignores HOME: the terminal preferences are files of this test's own.
+            std::fs::create_dir_all(setup.home.join("domains")).expect("a directory");
+            for domain in ["com.googlecode.iterm2", "com.apple.Terminal"] {
+                std::fs::write(
+                    setup.home.join("domains").join(format!("{domain}.plist")),
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict/></plist>\n",
+                )
+                .expect("preferences");
+            }
+            command.env(
+                kr_shell_integration::host::terminal_profile::PREFERENCES_DIRECTORY_VARIABLE,
+                setup.home.join("domains"),
+            );
+        }
+        command.output_locked().expect("kr runs")
+    }
+
     #[test]
     fn the_login_item_and_the_other_offers_are_separate_and_neither_touches_the_others_files() {
         let setup = Setup::new();
@@ -741,6 +822,47 @@ mod written {
         );
         assert!(second.item_in(&second.home).is_none());
         assert!(second.record_bytes().is_none());
+        let shell = shell_install_in(&second);
+        assert!(
+            shell.status.success(),
+            "kr shell install succeeds in the private home: {}{}",
+            String::from_utf8_lossy(&shell.stdout),
+            String::from_utf8_lossy(&shell.stderr)
+        );
+        assert!(second.item_in(&second.home).is_none());
+        assert!(second.record_bytes().is_none());
+        // What those two commands wrote is as they wrote it across all three login item commands:
+        // the configuration document that holds `startup.controller`, and the shell's startup file.
+        let written: BTreeMap<PathBuf, Vec<u8>> = second
+            .snapshot()
+            .into_iter()
+            .filter(|(path, contents)| {
+                contents.as_slice() != b"<directory>".as_slice()
+                    && !path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("desktop-host-login"))
+            })
+            .collect();
+        assert!(
+            written
+                .keys()
+                .any(|path| path.extension().is_some_and(|e| e == "json"))
+                && written.keys().any(|path| path.starts_with(&second.home)),
+            "the configuration document and a startup file in the home were written: {:?}",
+            written.keys().collect::<Vec<_>>()
+        );
+        for argument in ["install", "status", "remove"] {
+            second.ok(argument);
+            for (path, contents) in &written {
+                assert_eq!(
+                    std::fs::read(path).ok().as_ref(),
+                    Some(contents),
+                    "{argument} leaves {} as it was",
+                    path.display()
+                );
+            }
+        }
     }
 
     #[test]
@@ -818,6 +940,53 @@ mod written {
         );
         let other: serde_json::Value = serde_json::from_slice(&other.stdout).expect("JSON");
         assert_eq!(other["state"], "outdated");
+        // The whole sentence, the refusal that follows from it, and the clause of a pending install.
+        let outdated = format!(
+            "login item: {} is as kr wrote it, but this installation of kr writes it differently \
+             now; kr host login-item remove takes it out, and kr host login-item install then \
+             writes this installation's",
+            item.display()
+        );
+        let there = |arguments: &[&str]| setup.run_with(&layout.join("kr"), &setup.home, arguments);
+        let text =
+            String::from_utf8_lossy(&there(&["host", "login-item", "status"]).stdout).into_owned();
+        assert_eq!(text.trim_end(), outdated);
+        let before = setup.snapshot();
+        let refused = there(&["host", "login-item", "install"]);
+        assert_eq!(
+            refused.status.code(),
+            Some(2),
+            "install is refused as a usage error"
+        );
+        let said = String::from_utf8_lossy(&refused.stderr).into_owned();
+        assert!(
+            said.contains(&format!(
+                "the login item file {} is as kr wrote it, but this installation of kr writes it \
+                 differently now; run kr host login-item remove first, then run kr host \
+                 login-item install again",
+                item.display()
+            )),
+            "{said}"
+        );
+        assert!(
+            setup.snapshot() == before,
+            "a refused install changes nothing"
+        );
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "publish", "staging": beside(&item, "kr-staging")}),
+        );
+        let text =
+            String::from_utf8_lossy(&there(&["host", "login-item", "status"]).stdout).into_owned();
+        assert_eq!(
+            text.trim_end(),
+            format!(
+                "{outdated}; an earlier kr host login-item install did not finish: kr host \
+                 login-item remove takes out what it left"
+            )
+        );
+        std::fs::write(&record, &kept).expect("the record is as it was");
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o600)).expect("a mode");
         // elsewhere: another home
         let second = setup.root.join("home2");
         std::fs::create_dir_all(&second).expect("a home");
@@ -997,6 +1166,21 @@ mod written {
                 "an earlier kr host login-item install did not finish: kr host login-item install \
                  finishes it, or kr host login-item remove takes out what it left"
             ),
+            "{said}"
+        );
+        // Where the control daemon is gone, install refuses before it settles anything, so status
+        // does not say that install finishes it.
+        let controller = setup.bin.join("kr-controller");
+        let away = setup.bin.join("kr-controller.away");
+        std::fs::rename(&controller, &away).expect("the control daemon goes");
+        let (ok, said, _) = run_in(&setup, &setup.home, &["host", "login-item", "status"]);
+        std::fs::rename(&away, &controller).expect("the control daemon is back");
+        assert!(ok);
+        assert!(
+            said.contains(
+                "an earlier kr host login-item install did not finish: kr host login-item remove \
+                 takes out what it left"
+            ) && !said.contains("install finishes it"),
             "{said}"
         );
         leave_pending(&setup, remove_stopped.clone());
@@ -1248,6 +1432,236 @@ mod written {
     }
 
     #[test]
+    fn a_file_that_is_exactly_what_kr_writes_is_adopted_and_no_byte_of_it_changes() {
+        let setup = Setup::new();
+        setup.ok("install");
+        let item = setup.item();
+        let original = std::fs::read(&item).expect("bytes");
+        setup.ok("remove");
+        // An identity and no record, and no file: the state is none, with the file it would write.
+        let text = setup.ok("status");
+        assert_eq!(
+            text.trim_end(),
+            format!(
+                "login item: none: kr has no record of a login item for this environment, and \
+                 there is no file at {}; kr host login-item install writes one",
+                item.display()
+            )
+        );
+        std::fs::write(&item, &original).expect("the file is there as kr writes it");
+        std::fs::set_permissions(&item, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        assert_eq!(status_word(&setup), "unrecorded");
+        let said = setup.ok("install");
+        assert!(
+            said.contains(&format!(
+                "recorded {}, which is what this installation writes; no byte of it changed",
+                item.display()
+            )),
+            "{said}"
+        );
+        assert!(
+            last_line(&said).starts_with("login item: installed: "),
+            "{said}"
+        );
+        assert_eq!(std::fs::read(&item).expect("bytes"), original);
+        assert_eq!(setup.record()["path"], item.to_string_lossy().as_ref());
+        assert!(setup.record()["pending"].is_null());
+        assert_eq!(status_word(&setup), "installed");
+        let again = setup.ok("install");
+        assert!(again.contains("login item: already installed: "), "{again}");
+    }
+
+    /// One state of an install or a removal that stopped, built by hand from the record and the
+    /// files each step leaves.
+    struct Stopped {
+        name: &'static str,
+        operation: &'static str,
+        file_is_there: bool,
+        leftover: Option<&'static str>,
+    }
+
+    const STOPPED: [Stopped; 8] = [
+        Stopped {
+            name: "publish 1",
+            operation: "publish",
+            file_is_there: false,
+            leftover: None,
+        },
+        Stopped {
+            name: "publish 3",
+            operation: "publish",
+            file_is_there: false,
+            leftover: Some("staged"),
+        },
+        Stopped {
+            name: "publish 4",
+            operation: "publish",
+            file_is_there: true,
+            leftover: Some("linked"),
+        },
+        Stopped {
+            name: "publish 5",
+            operation: "publish",
+            file_is_there: true,
+            leftover: None,
+        },
+        Stopped {
+            name: "remove 1",
+            operation: "remove",
+            file_is_there: true,
+            leftover: None,
+        },
+        Stopped {
+            name: "remove 2",
+            operation: "remove",
+            file_is_there: false,
+            leftover: Some("moved"),
+        },
+        Stopped {
+            name: "remove 3",
+            operation: "remove",
+            file_is_there: false,
+            leftover: None,
+        },
+        Stopped {
+            name: "put back 1",
+            operation: "remove",
+            file_is_there: true,
+            leftover: Some("linked"),
+        },
+    ];
+
+    /// An installed login item turned into `state`, and the bytes it holds.
+    fn stopped_in(setup: &Setup, state: &Stopped) -> (PathBuf, Vec<u8>) {
+        setup.ok("install");
+        let item = setup.item();
+        let original = std::fs::read(&item).expect("bytes");
+        let name = if state.operation == "publish" {
+            "kr-staging"
+        } else {
+            "kr-moving"
+        };
+        let leftover = beside(&item, name);
+        match state.leftover {
+            Some("linked") => std::fs::hard_link(&item, &leftover).expect("two names"),
+            Some("moved") => std::fs::rename(&item, &leftover).expect("moved aside"),
+            Some(_) => {
+                std::fs::write(&leftover, &original).expect("a staged file");
+                std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o600))
+                    .expect("a mode");
+            }
+            None => {}
+        }
+        if !state.file_is_there && state.leftover != Some("moved") {
+            std::fs::remove_file(&item).expect("the file is not there");
+        }
+        let key = if state.operation == "publish" {
+            "staging"
+        } else {
+            "aside"
+        };
+        leave_pending(
+            setup,
+            serde_json::json!({"operation": state.operation, key: leftover}),
+        );
+        (item, original)
+    }
+
+    fn leftovers_in(setup: &Setup) -> Vec<String> {
+        std::fs::read_dir(setup.directory(&setup.home))
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn every_stopped_state_is_read_by_status_and_finished_by_install_and_by_remove() {
+        for state in &STOPPED {
+            let name = state.name;
+            // status reads the state and changes nothing.
+            let setup = Setup::new();
+            let (item, original) = stopped_in(&setup, state);
+            let before = setup.snapshot();
+            let said = setup.ok("status");
+            assert!(
+                said.contains(&format!(
+                    "an earlier kr host login-item {} did not finish: ",
+                    if state.operation == "publish" {
+                        "install"
+                    } else {
+                        "remove"
+                    }
+                )),
+                "{name}: {said}"
+            );
+            assert!(setup.snapshot() == before, "{name}: status changes nothing");
+            // install finishes it, whole, and says what it did from what it found.
+            let said = setup.ok("install");
+            assert!(setup.record()["pending"].is_null(), "{name}: {said}");
+            assert_eq!(leftovers_in(&setup), Vec::<String>::new(), "{name}: {said}");
+            assert_eq!(
+                std::fs::read(&item).ok().as_deref(),
+                Some(original.as_slice()),
+                "{name}"
+            );
+            let sentence = match (
+                state.operation,
+                state.file_is_there || state.leftover == Some("moved"),
+            ) {
+                ("publish", true) => "finished what an earlier kr host login-item install began",
+                ("publish", false) => {
+                    "an earlier kr host login-item install stopped before it put the file in place, \
+                     so kr had no file to finish"
+                }
+                (_, true) => "took back what an earlier kr host login-item remove began",
+                (_, false) => {
+                    "an earlier kr host login-item remove had already taken out the file, so kr \
+                     had nothing to take back"
+                }
+            };
+            assert!(said.contains(sentence), "{name}: {said}");
+            // remove finishes it too: no file, no record, no leftover.
+            let setup = Setup::new();
+            let (item, _) = stopped_in(&setup, state);
+            let said = setup.ok("remove");
+            assert!(setup.record_bytes().is_none(), "{name}: {said}");
+            assert!(!item.exists(), "{name}: {said}");
+            assert_eq!(leftovers_in(&setup), Vec::<String>::new(), "{name}: {said}");
+            let sentence = if state.operation == "publish" {
+                "took out what an earlier kr host login-item install began"
+            } else {
+                "finished what an earlier kr host login-item remove began"
+            };
+            assert!(said.contains(sentence), "{name}: {said}");
+        }
+    }
+
+    /// When the directory the item was written into has become a file, status says the file is
+    /// gone and a removal drops the record, as it does for a file that is gone.
+    #[test]
+    fn a_login_item_whose_directory_became_a_file_is_gone_and_its_removal_finishes() {
+        let setup = Setup::new();
+        setup.ok("install");
+        let item = setup.item();
+        let directory = item.parent().expect("a directory").to_owned();
+        std::fs::remove_file(&item).expect("the file goes");
+        std::fs::remove_dir(&directory).expect("the directory goes");
+        std::fs::write(&directory, b"a file now\n").expect("a file in its place");
+        assert_eq!(status_word(&setup), "gone");
+        let said = setup.ok("remove");
+        assert!(setup.record_bytes().is_none(), "{said}");
+        assert_eq!(
+            std::fs::read(&directory).expect("the file is left"),
+            b"a file now\n"
+        );
+    }
+
+    #[test]
     fn a_removal_with_no_record_makes_no_identity_no_lock_and_no_file() {
         let setup = Setup::new();
         let before = setup.snapshot();
@@ -1294,7 +1708,38 @@ mod written {
                 controller.to_string_lossy(),
                 "{name}"
             );
+            // The runtime and state directories read back whole as well.
+            let mut setup = Setup::new();
+            setup.state = setup.root.join(name).join("s");
+            setup.runtime = setup.root.join(name).join("r");
+            setup.ok("install");
+            let words = read_vector(&setup.item());
+            for root in [&setup.state, &setup.runtime] {
+                let root = root.to_string_lossy();
+                assert!(
+                    words.iter().any(|word| word.contains(root.as_ref())),
+                    "{name}: {root} reads back whole from {words:?}"
+                );
+            }
         }
+        // A path with a control character cannot be written exactly, and nothing is written.
+        let setup = Setup::new();
+        let layout = setup.root.join("a\nb").join("bin");
+        setup.layout(&layout);
+        let before = setup.snapshot();
+        let output = setup.run_with(
+            &layout.join("kr"),
+            &setup.home,
+            &["host", "login-item", "install"],
+        );
+        assert!(!output.status.success(), "a control character is refused");
+        let said = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            said.contains("cannot be written into a property list exactly")
+                && said.contains("; nothing was written"),
+            "{said}"
+        );
+        assert!(setup.snapshot() == before, "nothing was written");
     }
 
     #[cfg(target_os = "linux")]
