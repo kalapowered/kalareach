@@ -2064,6 +2064,13 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
         "STALE_SESSION",
         "is not an action",
     );
+    // The release of an action is made on the session's own link, which holds none by this
+    // identifier, so it changes nothing and is not refused.
+    about(
+        "agent_action_settle",
+        json!({ "session_id": session, "action_id": none }),
+    )
+    .expect("the release reached the link of the share's opening");
     // A receipt the worker does not hold is the worker's own answer: the read reached it on the
     // session's link and was not refused on the way.
     let unheld = ActionId::new(kr_ipc::new_uuid()).to_string();
