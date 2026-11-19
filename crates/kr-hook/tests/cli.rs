@@ -73,6 +73,33 @@ fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
     }
 }
 
+/// KR-REQ-11.44: the invocations the forwarder's command line accepts, apart from its own `launch`
+/// and `relay`, are exactly the ones the host lists as the ones a registration may start, so the
+/// host places no registration the forwarder would refuse and refuses none that it serves.
+#[test]
+fn kr_req_11_44_the_forwarder_accepts_exactly_the_invocations_the_host_may_place() {
+    use clap::CommandFactory as _;
+
+    let mut accepted = std::collections::BTreeSet::new();
+    for application in kr_hook::cli::Cli::command().get_subcommands() {
+        if matches!(application.get_name(), "launch" | "relay") {
+            continue;
+        }
+        for surface in application.get_subcommands() {
+            accepted.insert((
+                application.get_name().to_owned(),
+                surface.get_name().to_owned(),
+            ));
+        }
+    }
+    let served: std::collections::BTreeSet<(String, String)> =
+        kr_worker::broker::bridge::SERVED_INVOCATIONS
+            .iter()
+            .map(|(word, surface)| ((*word).to_owned(), surface.as_str().to_owned()))
+            .collect();
+    assert_eq!(accepted, served);
+}
+
 /// KR-REQ-11.42, KR-REQ-11.43: the hook registration's own invocation, in a process whose
 /// environment names no launch, reads its event, answers exactly `{}` and exits 0 inside the
 /// shortest timeout the package registers, by its own clock, without a word on standard output
