@@ -443,12 +443,13 @@ pub fn undo_apply(
         for suffix in ["-wal", "-shm"] {
             let mut beside = registry.as_os_str().to_owned();
             beside.push(suffix);
-            match std::fs::remove_file(PathBuf::from(beside)) {
+            let beside = PathBuf::from(beside);
+            match kr_flush::retry_while_held(|| std::fs::remove_file(&beside)) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
                 _ => {}
             }
         }
-        std::fs::rename(&restoring, registry)
+        kr_flush::retry_while_held(|| std::fs::rename(&restoring, registry))
     })();
     if let Err(error) = replaced {
         // Best effort: a file left here makes the next undo refuse, and says why.
