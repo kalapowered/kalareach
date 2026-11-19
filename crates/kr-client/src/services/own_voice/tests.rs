@@ -1349,6 +1349,11 @@ async fn a_closure_that_came_while_a_write_waited_is_read_before_the_channel_is_
         control.state(),
         SidebandState::Closed(SidebandEnd::ProviderClosed)
     );
+    assert_eq!(
+        world.stand_in.recorded().attaches_asked,
+        1,
+        "a closure read where the channel was lost asks for no new channel"
+    );
     assert!(
         world.stand_in.recorded().hangups.is_empty(),
         "a closure the provider told is not hung up"
