@@ -404,6 +404,34 @@ fn released(package: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
 }
 
+/// A released declaration that sets Gemini's pair undeclared is refused by name once its package
+/// states a range that starts at the SDK this crate implements, which admits no SDK before launch
+/// variables arrived: the compiled pair is for the older releases only.
+#[test]
+fn a_released_declaration_is_refused_by_name_under_a_range_from_the_arrival() {
+    let manifest: kr_plugin_sdk::plugin::PluginManifest =
+        serde_json::from_slice(&released("gemini-cli")).expect("the released manifest reads");
+    let integration = manifest
+        .command_integration
+        .clone()
+        .expect("gemini-cli declares a command integration");
+    let range = kr_plugin_sdk::version::VersionRange::parse(&format!(
+        ">={}, <0.2.0",
+        kr_plugin_sdk::version::SDK_VERSION
+    ))
+    .expect("a range");
+    let problems = integration.problems(
+        &manifest.match_rules,
+        &kr_plugin_sdk::launch_variables::LaunchPermits::for_package(&range, None),
+    );
+    assert!(
+        problems
+            .iter()
+            .any(|problem| problem.starts_with("launch_variables.not_declared: ")),
+        "{problems:?}"
+    );
+}
+
 /// The command integration a released manifest declares, which the package contract accepts: it
 /// names one of the package's own executables, adds only flags and sets only variables the contract
 /// permits, and the package asks for the capability that confirms it.
@@ -416,7 +444,10 @@ fn declared(package: &str) -> kr_plugin_sdk::integration::CommandIntegration {
         .clone()
         .unwrap_or_else(|| panic!("{package} declares a command integration"));
     assert_eq!(
-        integration.problems(&manifest.match_rules),
+        integration.problems(
+            &manifest.match_rules,
+            &kr_plugin_sdk::launch_variables::LaunchPermits::for_package(&manifest.sdk_range, None)
+        ),
         Vec::<String>::new(),
         "{package}'s declaration is one the package contract accepts"
     );

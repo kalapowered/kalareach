@@ -14,6 +14,11 @@
       "definition": "ConnectorManifest",
       "member": "placement",
       "sdk_version": "0.1.9"
+    },
+    {
+      "definition": "ConnectorManifest",
+      "member": "launch_variables",
+      "sdk_version": "0.1.10"
     }
   ],
   "capabilities": [
@@ -125,6 +130,73 @@
   ],
   "command_integration": {
     "gateway_placeholder": "{gateway}",
+    "launch_variable_rules": {
+      "floor_cost": "CONFIG, DIR, FILE, ROOT, TMP and TEMP also refuse real switches, such as AMP_NO_CONFIG_SYNC; they stay because a value 1 or 0 can be read as a relative path (OPENSSL_CONF=1 makes OpenSSL read a file named 1)",
+      "floor_first_words": [
+        "KR",
+        "LD",
+        "DYLD",
+        "BASH",
+        "NODE",
+        "NPM",
+        "BUN",
+        "DENO",
+        "PYTHON",
+        "PERL",
+        "RUBY",
+        "LUA",
+        "JAVA",
+        "JDK",
+        "GIT",
+        "GCONV",
+        "SSL",
+        "CURL",
+        "REQUESTS",
+        "COMPLUS",
+        "DOTNET",
+        "CORECLR",
+        "COR"
+      ],
+      "floor_note": "The floor is defence in depth. It is not a statement of what a variable does.",
+      "floor_words": [
+        "PATH",
+        "HOME",
+        "SHELL",
+        "ENV",
+        "RC",
+        "INIT",
+        "STARTUP",
+        "PRELOAD",
+        "LIBRARY",
+        "LIBRARIES",
+        "OPTIONS",
+        "OPTS",
+        "ARGS",
+        "PROXY",
+        "CERT",
+        "CERTS",
+        "CA",
+        "BUNDLE",
+        "TLS",
+        "SSL",
+        "NODE",
+        "CONFIG",
+        "DIR",
+        "FILE",
+        "ROOT",
+        "TMP",
+        "TEMP"
+      ],
+      "max_entries": 4,
+      "max_name_bytes": 64,
+      "min_words": 2,
+      "residual": "The host checks each declared name and value against its syntax rules and reserved names. These checks do not establish how a program interprets the variable. A program or library can read a permitted value as a relative path or use it to select code or disable checks. A program that starts through a committed integration receives the declared variables. Its child processes can inherit them. An invocation that runs as typed receives no variables added by this integration.",
+      "values": [
+        "1",
+        "0"
+      ],
+      "vendor": "the first word of the name is the upper-case first word of the package's plugin name, the part of the name before its first '-' or '.'"
+    },
     "max_backend_argument_bytes": 256,
     "max_backend_arguments": 8,
     "max_backend_methods": 256,
@@ -316,7 +388,7 @@
     "retained_generations": "2",
     "retained_metadata_bytes": "134217728"
   },
-  "sdk_version": "0.1.9",
+  "sdk_version": "0.1.10",
   "wit_package": {
     "export_interface": "adapter",
     "exports": [
