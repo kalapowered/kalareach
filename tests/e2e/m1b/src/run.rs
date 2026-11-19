@@ -1060,7 +1060,6 @@ pub struct RootPin {
     place: PathBuf,
 }
 
-/// Opens the directory at `path`, following no link at its last component.
 /// Makes the pipe `name` relative to `directory`, a handle that was checked, refusing a name that
 /// exists.
 #[cfg(not(target_os = "macos"))]
@@ -1069,25 +1068,29 @@ fn make_fifo_in(directory: &std::os::fd::OwnedFd, name: &str) -> Result<(), Stri
         .map_err(|error| format!("the pipe {name} is not made: {error}"))
 }
 
-/// Makes the pipe `name` in the place of `directory`, a handle that was checked: macOS has no call
-/// that makes a pipe relative to a handle.
+/// Makes the pipe `name` relative to `directory`, a handle that was checked, refusing a name that
+/// exists. macOS has the call from version 13, below the host floor; the wrapper the harness uses
+/// elsewhere does not offer it there, so this one function calls it directly.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn make_fifo_in(directory: &std::os::fd::OwnedFd, name: &str) -> Result<(), String> {
-    let place = current_place(directory)
-        .ok_or_else(|| "the system names no place for the directory".to_owned())?;
-    let made = std::process::Command::new("/usr/bin/mkfifo")
-        .arg(place.join(name))
-        .status()
-        .map_err(|error| format!("mkfifo does not start: {error}"))?;
-    if made.success() {
+    use std::os::fd::AsRawFd as _;
+    let named = std::ffi::CString::new(name)
+        .map_err(|_| format!("the pipe name {name:?} holds a NUL byte"))?;
+    // SAFETY: `directory` is an open descriptor for the duration of the call, and `named` is a
+    // NUL-terminated string that the call only reads.
+    let made = unsafe { libc::mkfifoat(directory.as_raw_fd(), named.as_ptr(), 0o600) };
+    if made == 0 {
         Ok(())
     } else {
         Err(format!(
-            "the pipe {name} is not made: mkfifo ended with {made}"
+            "the pipe {name} is not made: {}",
+            std::io::Error::last_os_error()
         ))
     }
 }
 
+/// Opens the directory at `path`, following no link at its last component.
 fn open_directory(path: &Path) -> rustix::io::Result<std::os::fd::OwnedFd> {
     use rustix::fs::{Mode, OFlags};
     rustix::fs::open(
@@ -2597,7 +2600,7 @@ mod tests {
     /// A file's bytes are read at each check, and the system's stamp of the file decides nothing:
     /// a write through a shared mapping leaves the stamp as it was while the mapping stays open, so
     /// a file whose bytes differ and whose stamp reads as it did when it was recorded is not the file
-    /// that was placed. (The workspace forbids unsafe code, which mapping a file needs, so the case
+    /// that was placed. (This crate denies unsafe code, which mapping a file needs, so the case
     /// writes the other bytes and gives the record the stamp the file has now.)
     #[test]
     fn a_placed_file_whose_stamp_reads_as_recorded_is_still_read_for_its_bytes() {
@@ -2920,6 +2923,34 @@ mod root_tests {
         assert_eq!(removal, Removal::Removed);
         assert!(!root.exists());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_pipe_is_made_in_the_directory_the_handle_holds_whatever_name_the_path_now_has() {
+        use std::os::unix::fs::FileTypeExt as _;
+        let base = scratch("fifo");
+        let before = base.join("before");
+        std::fs::create_dir(&before).expect("a directory");
+        let handle = open_directory(&before).expect("it opens");
+        // The directory is renamed: its old path now names nothing, and a new directory stands
+        // there that a pipe made through the path would land in.
+        let after = base.join("after");
+        std::fs::rename(&before, &after).expect("a rename");
+        std::fs::create_dir(&before).expect("another directory at the old path");
+        make_fifo_in(&handle, "pipe").expect("a pipe");
+        assert!(
+            std::fs::symlink_metadata(after.join("pipe"))
+                .expect("the pipe is in the handle's directory")
+                .file_type()
+                .is_fifo()
+        );
+        assert!(
+            !before.join("pipe").exists(),
+            "nothing is made at the old path"
+        );
+        // A name that exists is refused, and is left as it is.
+        assert!(make_fifo_in(&handle, "pipe").is_err());
+        std::fs::remove_dir_all(&base).expect("clean up");
     }
 
     #[test]

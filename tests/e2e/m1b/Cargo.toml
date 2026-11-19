@@ -66,6 +66,7 @@ legs = [
   "dep:portable-pty",
   "dep:rustix",
   "dep:libproc",
+  "dep:libc",
 ]
 
 [dependencies]
@@ -114,6 +115,9 @@ rustix = { workspace = true, features = ["fs", "process", "termios"], optional =
 [target.'cfg(target_os = "macos")'.dependencies]
 # The file a process runs, which the kernel says of a process it will not otherwise describe.
 libproc = { workspace = true, optional = true }
+# The call that makes a pipe relative to a directory's handle, which the system has from macOS 13 and
+# the harness's wrapper of the system calls does not offer there: one function calls it.
+libc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The keys and expiry a test signs a catalogue generation of its own with, through the catalogue's
@@ -137,5 +141,12 @@ tempfile.workspace = true
 tough.workspace = true
 tokio-websockets = { workspace = true, features = ["server"] }
 
-[lints]
-workspace = true
+# The workspace's rules, except that unsafe code is denied rather than forbidden: the one function
+# that makes a pipe relative to a handle on macOS allows it for itself, and nothing else in this
+# crate may.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
