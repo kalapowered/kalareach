@@ -32,6 +32,7 @@ import {
   capabilityRecords,
   composerOffers,
   isChannelPackage,
+  requestLabel,
   subjectOf,
   targetOf
 } from '../model/agent'
@@ -39,6 +40,7 @@ import { describeElapsed } from '../model/attention'
 import {
   CHANNEL_ANSWER_LINE,
   CHANNEL_ANSWER_WORDS,
+  channelAnswersRest,
   endsAsChannelAnswer,
   outcomeMessage,
   outcomeTone
@@ -46,6 +48,9 @@ import {
 
 /** How much of a request's original bytes is shown before the rest is counted instead. */
 const SHOWN_SOURCE_CHARS = 4096
+
+/** How many answers a channel took are kept as a line each beside the requests; the rest are counted. */
+const SHOWN_UNCONFIRMED = 5
 
 /** One request, with what its decoder read and what the instance can do now. */
 interface Waiting {
@@ -188,12 +193,14 @@ export function ApprovalRequests({
           .filter((instance) => isChannelPackage(instance.plugin_id))
           .map((instance) => instance.application_instance_id)
       )
-      const held = agents.resources.filter(
-        (resource) =>
-          resource.kind === 'approval' &&
-          resource.state === 'uncertain' &&
-          channelInstances.has(resource.application_instance_id)
-      )
+      const held = agents.resources
+        .filter(
+          (resource) =>
+            resource.kind === 'approval' &&
+            resource.state === 'uncertain' &&
+            channelInstances.has(resource.application_instance_id)
+        )
+        .sort((a, b) => Number(b.recorded_at) - Number(a.recorded_at))
       const open = actionableApprovals(agents.resources)
       const instances = [...new Set(open.map((resource) => resource.application_instance_id))]
       const facts = new Map(
@@ -372,16 +379,22 @@ export function ApprovalRequests({
           </article>
         )
       })}
-      {held.map((resource) => (
+      {held.slice(0, SHOWN_UNCONFIRMED).map((resource) => (
         <p
           key={resource.resource_id}
           className="small muted"
           data-resource={resource.resource_id}
           data-testid="approval-unconfirmed"
         >
-          {CHANNEL_ANSWER_LINE}
+          Request {requestLabel(resource)}, asked {describeElapsed(now - Number(resource.recorded_at))}{' '}
+          ago. {CHANNEL_ANSWER_LINE}
         </p>
       ))}
+      {held.length > SHOWN_UNCONFIRMED ? (
+        <p className="small muted" data-testid="approval-unconfirmed-more">
+          {channelAnswersRest(held.length - SHOWN_UNCONFIRMED)}
+        </p>
+      ) : null}
     </section>
   )
 }

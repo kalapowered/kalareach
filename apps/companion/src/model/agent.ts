@@ -404,6 +404,21 @@ export function isChannelPackage(pluginId: string | null): boolean {
   return pluginId !== null && CHANNEL_PACKAGES.includes(pluginId)
 }
 
+/**
+ * How a request is named to a person: the identifier its agent sent it under, without the quotes
+ * of the JSON form a string identifier keeps.
+ */
+export function requestLabel(resource: PendingResource): string {
+  const upstream = resource.request.upstream
+  try {
+    const read: unknown = JSON.parse(upstream)
+    if (typeof read === 'string' || typeof read === 'number') return String(read)
+  } catch {
+    // Not JSON: the identifier is shown as it came.
+  }
+  return upstream
+}
+
 /** What the notice about approvals says, and what it offers beside the sentence. */
 export interface ApprovalNotice {
   /** Why approvals are not answered here, in the record's own words where it gave some. */

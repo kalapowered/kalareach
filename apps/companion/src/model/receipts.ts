@@ -381,6 +381,13 @@ export const CHANNEL_ANSWER_WORDS =
 export const CHANNEL_ANSWER_LINE =
   'The host cannot tell whether Claude Code took the answer to this request. If it still waits in its terminal, answer it there.'
 
+/** What stands for the answers beyond the lines kept one by one: how many there are, and what to do. */
+export function channelAnswersRest(count: number): string {
+  return count === 1
+    ? 'One more answer is in the same state: the host cannot tell whether Claude Code took it. If that request still waits in its terminal, answer it there.'
+    : `${String(count)} more answers are in the same state: the host cannot tell whether Claude Code took them. If those requests still wait in its terminal, answer them there.`
+}
+
 /**
  * Whether an answer ended as a channel end: the host's own word, not a lost answer, says the
  * outcome is unknown, and the request's package takes answers over a channel that confirms nothing
