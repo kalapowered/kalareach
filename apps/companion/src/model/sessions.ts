@@ -115,11 +115,15 @@ export function emptySessionState(): SessionState {
 /** The sessions this window is holding state for. */
 export class SessionStates {
   #states = new Map<string, SessionState>()
+  #forgotten = new Map<string, number>()
   #listeners = new Set<() => void>()
 
-  /** Whether a state is held for the session: one that was forgotten is not held again by being written to. */
-  holds(sessionId: string): boolean {
-    return this.#states.has(sessionId)
+  /**
+   * How many times the session was forgotten. A view that began before the last time has no right
+   * to write what it ends with: the tab it belonged to is gone, whatever the state still holds.
+   */
+  forgotten(sessionId: string): number {
+    return this.#forgotten.get(sessionId) ?? 0
   }
 
   /** Reads one session's state, creating it the first time it is asked for. */
@@ -152,9 +156,11 @@ export class SessionStates {
    * has accepted, and one whose outcome nobody knows are all held, so that closing the tab and
    * opening the session again does not lift the hold on sending a prompt twice, an answer that
    * arrives after the tab is gone has the entry it belongs to, and the host's record of the action
-   * is still read.
+   * is still read. What is held is held for those alone: a view that began before the tab closed
+   * may not write to it afterwards (`forgotten`).
    */
   forget(sessionId: string): void {
+    this.#forgotten.set(sessionId, this.forgotten(sessionId) + 1)
     const held = this.#states.get(sessionId)
     if (held === undefined) return
     const owed = unresolved(held.submissions)

@@ -323,7 +323,8 @@ export function useTerminalView(
     let current = true
     // Read once: the place the pane was left at is this opening's to restore, and nothing it does
     // until it has a screen is a reason to ask for another.
-    const restored = kept.read()
+    const began = kept.begin()
+    const restored = began.place
     // eslint-disable-next-line react-hooks/set-state-in-effect -- the opening's own flag, set once from the place it read
     setRestoreOpening(restored?.anchor != null ? { sessionId: scope, attempt } : null)
     const open: Opening = {
@@ -404,11 +405,11 @@ export function useTerminalView(
       if (open.view !== null) void open.view.close()
       // What is kept for the next opening of this session: the place the window was last said to be
       // at, or, when the person asked for the live screen and native code has not settled it, the
-      // live place. Through the `kept` this effect closed over, never through a render's: a pane
+      // live place. Through the opening this effect began, never through a render's: a pane
       // that changed session has already rendered the next one. A frame left from before a live
       // that was never settled is not the place that is kept, so the next opening draws none.
       const where = open.liveNumber !== null ? open.place.live : open.place.anchor
-      kept.keep(where === null ? null : { anchor: where, live: open.liveNumber !== null ? where : open.place.live })
+      began.keep(where === null ? null : { anchor: where, live: open.liveNumber !== null ? where : open.place.live })
       if (open.liveNumber !== null) {
         setFramed(null)
         frameNow.current = null
