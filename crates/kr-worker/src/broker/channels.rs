@@ -49,7 +49,7 @@ use crate::broker::duplex::{Counted, detached};
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::gateway::ChannelConnection;
 use crate::broker::methods::{
-    PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamRequest,
+    PendingTransmission, SubmitGate, UpstreamBody, UpstreamDispatch, UpstreamRequest,
 };
 use crate::broker::{Broker, BrokerState, UpstreamArrival};
 
@@ -365,6 +365,14 @@ impl UpstreamDispatch for ChannelDispatch {
     }
 
     fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission> {
+        self.submit_gated(request, &SubmitGate::default())
+    }
+
+    fn submit_gated(
+        &self,
+        request: &UpstreamRequest,
+        gate: &SubmitGate,
+    ) -> Result<PendingTransmission> {
         self.admit(request)?;
         let UpstreamBody::Approval { response, .. } = &request.body else {
             return Err(BrokerError::invalid(
@@ -390,17 +398,23 @@ impl UpstreamDispatch for ChannelDispatch {
                 })))
             })?;
         let (written, outcome) = tokio::sync::oneshot::channel();
-        queue
-            .try_send(Outgoing {
-                frame: response.frame().to_vec(),
-                written,
-            })
-            .map_err(|_| {
-                BrokerError::NotTransmitted(Box::new(count(BrokerError::UpstreamUnavailable {
-                    detail: "the channel's writer has closed or holds as many answers as it takes"
-                        .to_owned(),
-                })))
-            })?;
+        // Through the gate: the caller that stops waiting for this call decides under the same
+        // lock, so a queue that took the answer is a fact it reads, and one that has not taken it
+        // by then never does.
+        gate.queue(ANSWER_NOT_CONFIRMED, || {
+            queue
+                .try_send(Outgoing {
+                    frame: response.frame().to_vec(),
+                    written,
+                })
+                .map_err(|_| {
+                    BrokerError::NotTransmitted(Box::new(count(BrokerError::UpstreamUnavailable {
+                        detail: "the channel's writer has closed or holds as many answers as \
+                                     it takes"
+                            .to_owned(),
+                    })))
+                })
+        })?;
         let counted = self.counted.clone();
         // On a task of its own: the writer's verdict on the answer is counted whether or not the
         // caller is still waiting for it.
@@ -408,9 +422,10 @@ impl UpstreamDispatch for ChannelDispatch {
         // Every end past the queue is a channel end. A completed write is the host's own fact and
         // not the application's acknowledgement, which a channel never gives, so it ends unknown;
         // a failed write, or a channel that closed first, ends the same way, because the frame may
-        // have gone in part. The worker's own bound on the wait ends the same way: a queued answer
-        // the channel's writer has not reached by then is still a channel's, and the caller is not
-        // told it was a typed upstream that never answered.
+        // have gone in part. The worker's own bound on the wait ends the same way: an answer the
+        // queue took, whether or not this call has returned and whether or not the writer has
+        // reached it, is still a channel's, and the caller is not told it was a typed upstream
+        // that never answered. The gate holds that fact.
         Ok(detached(async move {
             let refusal = match outcome.await {
                 Ok(Ok(())) => {
@@ -429,8 +444,7 @@ impl UpstreamDispatch for ChannelDispatch {
             Err(BrokerError::ChannelEnd {
                 detail: refusal.to_string(),
             })
-        })
-        .with_channel_end(ANSWER_NOT_CONFIRMED.to_owned()))
+        }))
     }
 }
 

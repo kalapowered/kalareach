@@ -5127,6 +5127,18 @@ fn resource_state(
         .state
 }
 
+/// The provenance the journal's file holds for one action's receipt, read as a later run reads it.
+fn stored_provenance(host: &Host, action_id: kr_protocol::ids::ActionId) -> Option<String> {
+    rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal's file opens")
+        .query_row(
+            "SELECT channel_provenance FROM receipts WHERE action_id = ?1",
+            [action_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the receipt is stored")
+}
+
 /// KR-REQ-12.18: two requests wait on one channel and each is answered through the decoder's own
 /// answer. Each answer is written to the channel, each ends as an outcome nobody can establish
 /// (the channel confirms nothing), and the first does not hold the second back.
@@ -5337,6 +5349,80 @@ async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_e
     );
 }
 
+/// KR-REQ-12.18: an answer the channel's queue took is a channel's end although the worker's own
+/// bound passes before the call that queued it has returned. The call is held after the queue took
+/// the answer and before it returns, so the bound passes first and what decides is the pause, not
+/// a delay. The receipt says unknown and the journal holds the provenance the answer went by; the
+/// next answer on the channel and the package's refresh are admitted, the refresh applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_an_answer_the_queue_took_is_a_channel_end_before_the_call_that_queued_it_returns()
+ {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let first = channel.relay(&host, "abcde").await;
+    let second = channel.relay(&host, "fghij").await;
+    let mut client = cli(&host).await;
+    host.service
+        .set_upstream_deadline_for_tests(std::time::Duration::from_secs(1));
+    let (arrived, release) = host.service.broker().pause_after_queueing();
+
+    let mutation = approval_mutation(&client, &host, 60, first);
+    let action_id = mutation.action_id;
+    let Outcome::Error(error) = send(&mut client, mutation).await else {
+        panic!("an answer whose call had not returned at the bound ends as an unknown outcome");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends")
+        .expect("the call reached the pause after its queue took the answer");
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+    assert_eq!(
+        stored_provenance(&host, action_id).as_deref(),
+        Some("authenticated_hook_response"),
+        "the bound passing inside the call does not lose the provenance"
+    );
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "abcde", "behavior": "allow" }
+        }),
+        "the answer the queue took is written all the same"
+    );
+
+    let next = approval_mutation(&client, &host, 61, second);
+    let next_id = next.action_id;
+    let Outcome::Error(error) = send(&mut client, next).await else {
+        panic!("the next answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::OutcomeUnknown,
+        "the answer that passed the bound does not hold the next one: {error:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, next_id).await.state,
+        ReceiptState::Unknown
+    );
+
+    let refresh = channel_refresh(&client, &host, &channel.connector, 62);
+    let refresh_id = refresh.action_id;
+    let outcome = send(&mut client, refresh).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "the package's refresh is admitted after the channel's end: {outcome:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, refresh_id).await.state,
+        ReceiptState::Applied
+    );
+    release.send(()).expect("the call is let go");
+}
+
 /// KR-REQ-12.09: each action records its provenance, and an answer written on a channel is one:
 /// the worker stores, with the receipt that says unknown, that the answer went by the host's own
 /// authenticated bridge. The record is read from the journal's file, as a later run reads it.
@@ -5358,16 +5444,8 @@ async fn kr_req_12_09_a_channels_answer_records_the_authenticated_bridge_it_went
         ReceiptState::Unknown
     );
 
-    let stored: Option<String> = rusqlite::Connection::open(&host.journal_path)
-        .expect("the journal's file opens")
-        .query_row(
-            "SELECT channel_provenance FROM receipts WHERE action_id = ?1",
-            [action_id.get().as_bytes().as_slice()],
-            |row| row.get(0),
-        )
-        .expect("the receipt is stored");
     assert_eq!(
-        stored.as_deref(),
+        stored_provenance(&host, action_id).as_deref(),
         Some("authenticated_hook_response"),
         "the provenance is stored with the receipt of the answer"
     );

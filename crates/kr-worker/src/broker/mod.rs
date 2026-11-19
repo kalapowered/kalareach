@@ -149,7 +149,7 @@ pub use crate::broker::listener::{
 };
 pub use crate::broker::methods::{
     ActionInFlight, AdmittedAgainst, AnswerInFlight, Caller, MarkedAnswer, MutationAdmission,
-    MutationInFlight, PendingTransmission, RegisteredAction, Responsible, SnapshotPart,
+    MutationInFlight, PendingTransmission, RegisteredAction, Responsible, SnapshotPart, SubmitGate,
     TakenAction, TakenMutation, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
     command, subject,
 };
@@ -1048,6 +1048,11 @@ pub struct Broker {
     /// build.
     #[cfg(feature = "testing")]
     submit_pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Where this host's own tests stop the transport's call that takes an operation, on the thread
+    /// that makes it, after a channel's queue has taken the operation and before the call returns.
+    /// Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    queued_pause: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 /// The two ends of one armed pause: what says the recovery arrived, and what lets it go on.
@@ -1199,6 +1204,8 @@ impl Broker {
             marker_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             submit_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            queued_pause: Mutex::new(None),
         })
     }
 
@@ -2544,6 +2551,40 @@ impl Broker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
+    }
+
+    /// Stops the next call that takes an operation at a channel's queue, on the thread that makes
+    /// it, after the queue has taken the operation and before the call returns, for this host's
+    /// own tests: the answer is queued and the caller has not been told.
+    ///
+    /// Returns the end that says the call has arrived there and the end that lets it go on. It is
+    /// compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn pause_after_queueing(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, watch) = std::sync::mpsc::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .queued_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Makes the gate one transport call is made through, which a caller that stops waiting for
+    /// the call decides with.
+    #[must_use]
+    pub(crate) fn submit_gate(&self) -> Arc<SubmitGate> {
+        let gate = Arc::new(SubmitGate::default());
+        #[cfg(feature = "testing")]
+        gate.arm_after_queueing(
+            self.queued_pause
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        gate
     }
 
     /// Waits, blocking this thread, at an armed pause before the transport's call.

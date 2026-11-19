@@ -13451,6 +13451,7 @@ impl UpstreamHandoff {
                 let taken = self.broker.take_mutation(&self.admitted)?;
                 let pending = submit_within(
                     taken.transmission(),
+                    self.broker.submit_gate(),
                     deadline,
                     self.rechecked_before_submit(),
                 )
@@ -13467,6 +13468,7 @@ impl UpstreamHandoff {
                 let taken = self.broker.take_plugin_action(&self.admitted)?;
                 let pending = submit_within(
                     taken.transmission(),
+                    self.broker.submit_gate(),
                     deadline,
                     self.rechecked_before_submit(),
                 )
@@ -13497,7 +13499,8 @@ async fn answer_within(
     broker.at_marker_pause().await;
     let marked = broker.mark_approval(admitted, now)?;
     // On a refusal or at the deadline `marked` is dropped here, which leaves the resource
-    // uncertain before the caller is told anything.
+    // uncertain before the caller is told anything, unless the refusal proves that nothing was
+    // queued: then the claim is given back.
     let against = admitted.admitted_against();
     let rechecked = {
         let broker = Arc::clone(broker);
@@ -13505,22 +13508,31 @@ async fn answer_within(
             broker.recheck_before_submit(&against, request)
         }
     };
-    let pending = match submit_within(marked.transmission(), deadline, rechecked).await {
+    // The gate is kept: a channel's answer that its queue took is a channel's end at whatever
+    // point the wait ends, which the receipt records as one, and not an upstream that never
+    // answered.
+    let gate = broker.submit_gate();
+    let pending = match submit_within(
+        marked.transmission(),
+        Arc::clone(&gate),
+        deadline,
+        rechecked,
+    )
+    .await
+    {
         Ok(pending) => pending,
+        Err(WorkerError::Broker(refusal)) => return Err(marked.refused(refusal).into()),
         Err(error) => {
             drop(marked);
             return Err(error);
         }
     };
-    // Read before the wait: a channel's answer that is still queued at the deadline is a channel's
-    // end, which the receipt records as one, and not an upstream that never answered.
-    let at_the_deadline = pending.channel_end();
     let flight = marked.submitted(pending);
     // At the deadline the answer in flight is dropped with the timeout, which settles it the
     // same way.
     match within(deadline, flight.settled(now)).await {
         Ok(settled) => Ok(settled?),
-        Err(unanswered) => Err(at_the_deadline.map_or(unanswered, WorkerError::Broker)),
+        Err(unanswered) => Err(gate.give_up().map_or(unanswered, WorkerError::Broker)),
     }
 }
 
@@ -13528,12 +13540,16 @@ async fn answer_within(
 /// it until `deadline`.
 ///
 /// A transport that blocks there holds that thread and nothing else. What it returns after the
-/// deadline is dropped: the call's outcome is no longer anybody's to report.
+/// deadline is dropped: the call's outcome is no longer anybody's to report. What a channel's
+/// queue took is not the call's outcome, and `gate` keeps it: the decision to stop waiting is
+/// made against the gate, so an answer the queue took is reported as the channel's, and one it
+/// has not taken is never taken afterwards.
 async fn submit_within(
     (dispatch, request): (
         Arc<dyn crate::broker::UpstreamDispatch>,
         crate::broker::UpstreamRequest,
     ),
+    gate: Arc<crate::broker::SubmitGate>,
     deadline: tokio::time::Instant,
     recheck: impl FnOnce(
         &crate::broker::UpstreamRequest,
@@ -13543,19 +13559,22 @@ async fn submit_within(
 ) -> Result<crate::broker::PendingTransmission> {
     // The broker's checks are asked once more on the thread that makes the call, with nothing but
     // the call after them: the hop to this thread waits for the blocking pool.
+    let queueing = Arc::clone(&gate);
     let submitting = tokio::task::spawn_blocking(move || {
         recheck(&request)?;
-        dispatch.submit(&request)
+        dispatch.submit_gated(&request, &queueing)
     });
     match tokio::time::timeout_at(deadline, submitting).await {
         Ok(Ok(submitted)) => Ok(submitted?),
         Ok(Err(_)) => Err(WorkerError::Broker(
-            crate::broker::BrokerError::UpstreamUnavailable {
-                detail: "the transport's call ended without saying whether it took the operation"
-                    .to_owned(),
-            },
+            gate.give_up()
+                .unwrap_or(crate::broker::BrokerError::UpstreamUnavailable {
+                    detail:
+                        "the transport's call ended without saying whether it took the operation"
+                            .to_owned(),
+                }),
         )),
-        Err(_) => Err(unanswered()),
+        Err(_) => Err(gate.give_up().map_or_else(unanswered, WorkerError::Broker)),
     }
 }
 
