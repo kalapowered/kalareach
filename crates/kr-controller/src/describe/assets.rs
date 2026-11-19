@@ -682,19 +682,13 @@ mod tests {
     }
 }
 
-// The stand-in proxy of the suites that run it from `tests/`.
-#[cfg(test)]
-#[path = "../../../kr-client/tests/support/connect_proxy.rs"]
-#[allow(dead_code)]
-mod connect_proxy;
-
 #[cfg(test)]
 mod proxy_login_gate {
     use kr_crypto::secret::SecretVec;
     use kr_transport::proxy::{ProxyCredential, ProxyLoginKind, StopKind};
 
-    use super::connect_proxy::ConnectProxy;
     use super::*;
+    use crate::catalogue::connect_proxy::ConnectProxy;
 
     /// KR-REQ-10.02: a model file's address that is plain `http` is refused while the proxy holds a
     /// login, and so is every address once the verdict is set; neither reaches the proxy.

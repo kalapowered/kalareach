@@ -3804,11 +3804,10 @@ mod tests {
 #[cfg(test)]
 mod declared_placement_tests;
 
-// The stand-in proxy of the suites that run it from `tests/`.
+// The stand-in proxy of the suites that run it from `tests/`; the model files' tests use it too.
 #[cfg(test)]
 #[path = "../../../kr-client/tests/support/connect_proxy.rs"]
-#[allow(dead_code)]
-mod connect_proxy;
+pub(crate) mod connect_proxy;
 
 #[cfg(test)]
 mod proxy_login_gate {
