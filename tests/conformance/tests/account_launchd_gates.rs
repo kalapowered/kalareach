@@ -1624,7 +1624,7 @@ fn the_scripts_that_start_a_daemon_and_sessions_ask_before_they_launch() {
             if python {
                 python_launches(line)
             } else {
-                shell_launches(line)
+                shell_launches_in(line, &launching)
             }
         });
         match (called, launched) {
@@ -1644,7 +1644,7 @@ fn the_scripts_that_start_a_daemon_and_sessions_ask_before_they_launch() {
     let call = "require_account_launchd \"$(uname -s)\"";
     let order = |text: &str| {
         let called = first_line(text, "#", |line| line.contains(call));
-        let launched = first_line(text, "#", shell_launches);
+        let launched = first_line(text, "#", |line| shell_launches_in(line, &launching));
         matches!((called, launched), (Some(called), Some(launched)) if called < launched)
     };
     assert!(order(before));
@@ -1658,6 +1658,79 @@ fn the_scripts_that_start_a_daemon_and_sessions_ask_before_they_launch() {
     assert!(!order(
         "# require_account_launchd \"$(uname -s)\"\ncargo build -p x\n"
     ));
+/// The names of the functions of the shell script `text` that launch: a function whose body holds a
+/// line that launches, by `shell_launches` or by a first word that names a function that launches.
+/// `self_test` is none, by its name: it runs the check only against the stand-in for `kr`, which
+/// starts no host, and it runs before the guard by design.
+fn launching_functions(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut functions: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut at = 0;
+    while at < lines.len() {
+        let line = lines[at];
+        at += 1;
+        let trimmed = line.trim_start();
+        let Some((name, after)) = trimmed.split_once("()") else {
+            continue;
+        };
+        let Some(after) = after.trim_start().strip_prefix('{') else {
+            continue;
+        };
+        if trimmed.starts_with('#')
+            || name.is_empty()
+            || !name
+                .chars()
+                .all(|letter| letter.is_ascii_alphanumeric() || letter == '_')
+        {
+            continue;
+        }
+        // The body is the rest of a one-line function, or the lines up to the line that closes it at
+        // the indentation of its definition; a function inside it is part of its body.
+        let indent = line.len() - trimmed.len();
+        let mut body = vec![after];
+        if !after.trim_end().ends_with('}') {
+            while at < lines.len() {
+                let next = lines[at];
+                at += 1;
+                if next.len() - next.trim_start().len() == indent
+                    && next.trim_start().starts_with('}')
+                {
+                    break;
+                }
+                body.push(next);
+            }
+        }
+        functions.push((name, body));
+    }
+    let mut launching: Vec<String> = Vec::new();
+    loop {
+        let known = launching.len();
+        for (name, body) in &functions {
+            if *name != "self_test"
+                && !launching.iter().any(|known| known == name)
+                && body.iter().any(|line| {
+                    !line.trim_start().starts_with('#') && shell_launches_in(line, &launching)
+                })
+            {
+                launching.push((*name).to_owned());
+            }
+        }
+        if launching.len() == known {
+            return launching;
+        }
+    }
+}
+
+/// Whether `line` of a shell script launches: it builds or starts a program, or its first word names
+/// one of the `launching` functions of the same script.
+fn shell_launches_in(line: &str, launching: &[String]) -> bool {
+    shell_launches(line)
+        || line
+            .split_whitespace()
+            .next()
+            .is_some_and(|word| launching.iter().any(|name| name == word))
+}
+
 }
 
 /// The refusal of the shell library: a Mac that did not ask is refused with the script's name and
@@ -1687,6 +1760,11 @@ fn the_script_functions_refuse_a_mac_run_that_did_not_ask_and_pass_every_other()
         let said = String::from_utf8_lossy(&refused.stderr);
         assert!(
             said.contains("KR_ALLOW_ACCOUNT_LAUNCHD=1") && said.contains("probe.sh"),
+        let launching = if python {
+            Vec::new()
+        } else {
+            launching_functions(&text)
+        };
             "{said}"
         );
     }
@@ -1711,6 +1789,7 @@ fn the_start_checks_self_test_passes_where_the_run_did_not_ask() {
         .current_dir(repository())
         .args(["scripts/check-host-start.sh", "self-test"])
         .env_remove("KR_ALLOW_ACCOUNT_LAUNCHD")
+        let launching = launching_functions(text);
         .stdin(std::process::Stdio::null())
         .output()
         .expect("bash runs");
@@ -1726,6 +1805,32 @@ fn the_start_checks_self_test_passes_where_the_run_did_not_ask() {
 }
 
 /// The refusal of the attach script: only a Mac run that did not ask raises, by the script's own
+    // A call of a function that launches is a launch where it stands: the guard after the call of
+    // the check, in the function that runs the check, is refused, and before it is not.
+    let script = |main: &str| {
+        format!(
+            "main() {{\n{main}}}\nstart_and_check() {{\n    work=\"$(mktemp -d x)\"\n}}\nself_test() {{\n    start_and_check x\n}}\nprepare() {{\n    echo ready\n}}\nrelay() {{\n    start_and_check \"$1\"\n}}\nmain \"$@\"\n"
+        )
+    };
+    let guard = "    require_account_launchd \"$(uname -s)\"\n";
+    assert!(order(&script(&format!(
+        "{guard}    start_and_check \"$kr\"\n"
+    ))));
+    assert!(!order(&script(&format!(
+        "    start_and_check \"$kr\"\n{guard}"
+    ))));
+    assert!(!order(&script(&format!("    relay \"$kr\"\n{guard}"))));
+    // The stand-in's run is no launch by its name, and a function that holds no launch is none.
+    assert!(order(&script(&format!(
+        "    self_test\n    prepare\n{guard}    start_and_check \"$kr\"\n"
+    ))));
+    assert_eq!(
+        launching_functions(&script("")),
+        ["start_and_check", "relay"]
+    );
+    assert!(!order(
+        &script(&format!("    self_test\n{guard}")).replace("self_test", "stand_in")
+    ));
 /// function, imported as a module so that nothing starts.
 #[test]
 #[cfg(unix)]
