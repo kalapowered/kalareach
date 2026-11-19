@@ -39,6 +39,11 @@ impl Daemon {
     /// Starts the daemon program, placed on the internal disk, on the folders of `host`, with an
     /// empty environment but its home and the system's own program directories.
     fn start(host: &kr_ipc::testing::TempHost) -> Self {
+        Self::start_with(host, &[])
+    }
+
+    /// As [`Self::start`], with the environment variables `variables` set.
+    fn start_with(host: &kr_ipc::testing::TempHost, variables: &[(&str, &str)]) -> Self {
         let program = host.root().join("kr-controller");
         if !program.exists() {
             kr_ipc::testing::place_program(
@@ -58,6 +63,7 @@ impl Daemon {
             .env_clear()
             .env("HOME", &home)
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .envs(variables.iter().copied())
             .arg("--runtime-dir")
             .arg(host.root().join("r"))
             .arg("--state-dir")
@@ -72,6 +78,22 @@ impl Daemon {
             .spawn()
             .expect("the daemon starts");
         Self(Some(child))
+    }
+
+    /// Waits until the daemon's process ends by itself, and says how. The wait ends at the
+    /// watchdog, which fails the case.
+    async fn ended(&mut self) -> std::process::ExitStatus {
+        let child = self.0.as_mut().expect("a running daemon");
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                if let Some(status) = child.try_wait().expect("the daemon's state") {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the daemon's process ended")
     }
 
     /// Ends the daemon and waits for it.
@@ -143,6 +165,18 @@ async fn host_behind(
     tokio::task::JoinHandle<()>,
     String,
 ) {
+    host_behind_with(proxy, |_| {}).await
+}
+
+/// [`host_behind`], with `change` applied to the document before it is written.
+async fn host_behind_with(
+    proxy: &ConnectProxy,
+    change: impl FnOnce(&mut ConfigurationDocument),
+) -> (
+    kr_ipc::testing::TempHost,
+    tokio::task::JoinHandle<()>,
+    String,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
     let port = listener.local_addr().expect("an address").port();
     let held = tokio::spawn(async move {
@@ -157,8 +191,37 @@ async fn host_behind(
     document.network.enabled = Nullable::some(true);
     document.network.relay_urls = Nullable::some(vec![format!("https://127.0.0.1:{port}")]);
     document.network.proxy_url = Nullable::some(proxy.url.clone());
+    change(&mut document);
     net_support::write_document(&host, &document);
     (host, held, format!("127.0.0.1:{port}"))
+}
+
+/// An origin that nothing listens on: its `https` address and the `host:port` a `CONNECT` to it
+/// names.
+async fn unused_origin() -> (String, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let port = listener.local_addr().expect("an address").port();
+    drop(listener);
+    (
+        format!("https://127.0.0.1:{port}"),
+        format!("127.0.0.1:{port}"),
+    )
+}
+
+/// Polls the diagnostics until the network check's detail holds `phrase`, and returns it. The wait
+/// ends at the watchdog, which fails the case.
+async fn until_the_detail_says(host: &kr_ipc::testing::TempHost, phrase: &str) -> String {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let said = network_detail(host).await;
+            if said.contains(phrase) {
+                return said;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the diagnostics never said {phrase:?}"))
 }
 
 /// Keeps `user:PASSWORD` as the login this host holds for `proxy`, in the file store the daemon
@@ -543,4 +606,161 @@ async fn the_scheme_the_proxy_asks_for_decides_the_state_the_daemon_reports() {
         }
         daemon.stop();
     }
+}
+
+/// KR-REQ-10.02: a request that goes to an address the start never tested, and that the proxy
+/// refuses in words no library reads (`HTTP/1.0 407`), is found by the watch's re-check at that
+/// address: the proxy is written the login once more, the verdict is set, the diagnostics say that
+/// the proxy refused the login, and no later request reaches the proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_the_proxy_refuses_without_a_word_is_found_by_the_recheck_at_its_own_address() {
+    let proxy =
+        ConnectProxy::authenticating_in_http10("user", PASSWORD, "Basic realm=\"proxy\"").await;
+    let (origin, target) = unused_origin().await;
+    proxy.refuse_target(&target);
+    let (host, _relay, tested) = host_behind_with(&proxy, |document| {
+        document.relay.origin = Nullable::some(origin.clone());
+    })
+    .await;
+    store_login(&host, &proxy, "user", PASSWORD);
+
+    let mut daemon = Daemon::start_with(
+        &host,
+        &[(
+            kr_controller::testing::ACCOUNT_ORIGIN_VARIABLE,
+            origin.as_str(),
+        )],
+    );
+    let said = until_the_detail_says(&host, "the proxy refused the login this host holds").await;
+    assert!(
+        said.contains("this host starts no new request through the proxy"),
+        "{said}"
+    );
+    let calls = proxy.calls();
+    assert_eq!(
+        calls.first().and_then(|call| call.target.as_deref()),
+        Some(tested.as_str()),
+        "the start check's own request is the first the proxy reads: {calls:?}"
+    );
+    let to_the_address: Vec<_> = calls
+        .iter()
+        .filter(|call| call.target.as_deref() == Some(target.as_str()))
+        .collect();
+    assert!(
+        to_the_address.len() >= 2,
+        "the carrier's request and the re-check's both reached the proxy: {calls:?}"
+    );
+    assert!(
+        to_the_address.iter().all(|call| call.login == Login::Right),
+        "each request to the address carried the login the proxy takes: {calls:?}"
+    );
+
+    // The verdict stands: a request the daemon would make now is not sent.
+    let sent = proxy.calls().len();
+    for _ in 0..2 {
+        network_detail(&host).await;
+    }
+    assert_eq!(
+        proxy.calls().len(),
+        sent,
+        "the daemon sent a request through the proxy after the verdict"
+    );
+    daemon.stop();
+    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    assert!(!log.contains(PASSWORD), "the daemon's log holds the login");
+}
+
+/// KR-REQ-10.02: a login the proxy refuses is written once although a release matrix read is
+/// configured: the check's own request is the only one the proxy reads, and a read the diagnostics
+/// ask for afterwards sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_login_is_sent_once_although_the_release_matrix_is_configured() {
+    let proxy = ConnectProxy::authenticating("user", PASSWORD, "Basic realm=\"proxy\"").await;
+    let (origin, _) = unused_origin().await;
+    let (host, _relay, tested) = host_behind_with(&proxy, |document| {
+        document.relay.origin = Nullable::some(origin.clone());
+    })
+    .await;
+    store_login(&host, &proxy, "user", "not-the-password");
+
+    let mut daemon = Daemon::start_with(
+        &host,
+        &[(
+            kr_controller::testing::ACCOUNT_ORIGIN_VARIABLE,
+            origin.as_str(),
+        )],
+    );
+    let said = until_the_detail_says(&host, "the proxy refused the login this host holds").await;
+    for _ in 0..2 {
+        network_detail(&host).await;
+    }
+    let calls = proxy.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "the check's own request, and no other: {calls:?} ({said})"
+    );
+    assert_eq!(calls[0].target.as_deref(), Some(tested.as_str()));
+    assert_eq!(calls[0].login, Login::Wrong);
+    daemon.stop();
+}
+
+/// KR-REQ-10.02: a trust anchor that cannot be read, in a section that joins the network, ends the
+/// start with the anchors' own error, as it does with no proxy, and sends no request through the
+/// proxy: the check does not run on a trust it could not build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_trust_anchor_that_cannot_be_read_ends_the_start_with_its_own_error_and_sends_nothing() {
+    let proxy = ConnectProxy::authenticating("user", "password", "Basic realm=\"proxy\"").await;
+    let (host, _relay, _) = host_behind_with(&proxy, |document| {
+        let missing = std::env::temp_dir().join("kr-no-such-anchor.der");
+        document.network.relay_trust_anchors =
+            Nullable::some(vec![missing.to_string_lossy().into_owned()]);
+    })
+    .await;
+    store_login(&host, &proxy, "user", PASSWORD);
+
+    let mut daemon = Daemon::start(&host);
+    let status = daemon.ended().await;
+    assert!(!status.success(), "the start ended in failure: {status}");
+    let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+    assert!(
+        log.contains("network.relay_trust_anchors entry 1") && log.contains("is not usable"),
+        "the start says why it ended: {log}"
+    );
+    assert!(
+        proxy.calls().is_empty(),
+        "no request was sent through the proxy: {:?}",
+        proxy.calls()
+    );
+    assert!(!log.contains(PASSWORD), "the daemon's log holds the login");
+}
+
+/// KR-REQ-10.02: a section that does not join the network reads no trust anchor, so a file that
+/// cannot be read there stops nothing: the daemon starts and answers, and the proxy is sent
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_section_that_does_not_join_reads_no_trust_anchor_and_the_daemon_starts() {
+    let proxy = ConnectProxy::authenticating("user", PASSWORD, "Basic realm=\"proxy\"").await;
+    let (host, _relay, _) = host_behind_with(&proxy, |document| {
+        document.network.enabled = Nullable::some(false);
+        document.network.relay_urls = Nullable::null();
+        let missing = std::env::temp_dir().join("kr-no-such-anchor.der");
+        document.network.relay_trust_anchors =
+            Nullable::some(vec![missing.to_string_lossy().into_owned()]);
+    })
+    .await;
+    store_login(&host, &proxy, "user", PASSWORD);
+
+    let mut daemon = Daemon::start(&host);
+    let said = network_detail(&host).await;
+    assert!(
+        !said.contains("relay_trust_anchors"),
+        "no anchor is read where the section does not join: {said}"
+    );
+    assert!(
+        proxy.calls().is_empty(),
+        "nothing named a target to test the proxy with: {:?}",
+        proxy.calls()
+    );
+    daemon.stop();
 }

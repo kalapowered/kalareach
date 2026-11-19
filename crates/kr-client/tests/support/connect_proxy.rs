@@ -49,6 +49,17 @@ pub enum Login {
     Wrong,
 }
 
+/// One request the login mode read: where it went, what its login was, and when.
+#[derive(Clone, Debug)]
+pub struct Call {
+    /// The `host:port` a `CONNECT` named, none for any other request.
+    pub target: Option<String>,
+    /// The class of the request's `Proxy-Authorization`.
+    pub login: Login,
+    /// When the proxy had read the request's head.
+    pub at: std::time::Instant,
+}
+
 /// A tunnel the proxy holds open: the `host:port` it goes to, and what ends it.
 type OpenTunnel = (String, Arc<Notify>);
 
@@ -59,6 +70,8 @@ struct Auth {
     offered: Arc<str>,
     http10: bool,
     logins: Arc<Mutex<Vec<Login>>>,
+    calls: Arc<Mutex<Vec<Call>>>,
+    refused: Arc<Mutex<Vec<String>>>,
     tunnels: Arc<Mutex<Vec<OpenTunnel>>>,
     bytes: Arc<AtomicUsize>,
 }
@@ -137,6 +150,8 @@ impl ConnectProxy {
             offered: Arc::from(offered),
             http10,
             logins: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::new(Mutex::new(Vec::new())),
+            refused: Arc::new(Mutex::new(Vec::new())),
             tunnels: Arc::new(Mutex::new(Vec::new())),
             bytes: Arc::new(AtomicUsize::new(0)),
         }
@@ -163,6 +178,27 @@ impl ConnectProxy {
                 close.notify_one();
             }
         }
+    }
+
+    /// Answers `407` to every `CONNECT` to `target`, the `host:port` it names, whatever login it
+    /// carries, and records the login as it was.
+    pub fn refuse_target(&self, target: &str) {
+        let auth = self.auth.as_ref().expect("an authenticating proxy");
+        auth.refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(target.to_owned());
+    }
+
+    /// Each request the login mode read, in order, with its target, its login and its time.
+    pub fn calls(&self) -> Vec<Call> {
+        self.auth
+            .as_ref()
+            .expect("an authenticating proxy")
+            .calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// What each request's login was, in order.
@@ -375,7 +411,22 @@ where
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(class);
-    let (Login::Right, Some(target)) = (class, target) else {
+    auth.calls
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(Call {
+            target: target.map(str::to_owned),
+            login: class,
+            at: std::time::Instant::now(),
+        });
+    let refused = target.is_some_and(|target| {
+        auth.refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|refused| refused == target)
+    });
+    let (Login::Right, Some(target), false) = (class, target, refused) else {
         let version = if auth.http10 { "HTTP/1.0" } else { "HTTP/1.1" };
         let _ = client
             .write_all(

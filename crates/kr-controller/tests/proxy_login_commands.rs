@@ -7,13 +7,16 @@
 
 mod net_support;
 
-use kr_controller::service::net::proxy_login::{item_name, read_item};
+use kr_controller::config::ProxyItem;
+use kr_controller::service::net::proxy_login::{item_bytes, item_name, read_item};
 use kr_crypto::keys::DeviceKeys;
+use kr_crypto::secret::SecretVec;
 use kr_crypto::store::open_store_in;
+use kr_crypto::store::{MemoryStore, SecretName, SecretStore};
 use kr_protocol::delivery::SecretText;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::ProtocolError;
-use kr_protocol::ids::ActionId;
+use kr_protocol::ids::{ActionId, EnvironmentId};
 use kr_protocol::method::Method;
 use kr_protocol::network_proxy::{
     NetworkProxyLoginClearParams, NetworkProxyLoginResult, NetworkProxyLoginSetParams,
@@ -213,4 +216,172 @@ async fn the_digest_of_a_login_request_is_not_one_a_guess_at_the_login_can_check
         second_digest, plain,
         "the digest is not the plain digest of the parameters"
     );
+}
+
+/// A store that fails its first read and answers every later one from the items it holds.
+struct FailsOnce {
+    items: MemoryStore,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl SecretStore for FailsOnce {
+    fn set(&self, name: &SecretName, secret: &[u8]) -> Result<(), kr_crypto::CryptoError> {
+        self.items.set(name, secret)
+    }
+
+    fn get(&self, name: &SecretName) -> Result<Option<SecretVec>, kr_crypto::CryptoError> {
+        if !self.failed.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(kr_crypto::CryptoError::SecretStore {
+                message: "the store failed once".to_owned(),
+            });
+        }
+        self.items.get(name)
+    }
+
+    fn delete(&self, name: &SecretName) -> Result<(), kr_crypto::CryptoError> {
+        self.items.delete(name)
+    }
+
+    fn describe(&self) -> String {
+        "a store that fails once".to_owned()
+    }
+}
+
+/// KR-REQ-10.02: a store read that fails once gives no login and says the item is unreadable, it
+/// keeps nothing of the failure, and the next read of the same item is the login.
+#[test]
+fn a_store_read_that_fails_once_gives_no_login_and_the_next_read_gives_it() {
+    let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+    let proxy: ProxyUrl = "http://proxy.example.com:3128".parse().expect("a proxy");
+    let store = FailsOnce {
+        items: MemoryStore::new(),
+        failed: std::sync::atomic::AtomicBool::new(false),
+    };
+    store
+        .items
+        .set(
+            &item_name(environment_id).expect("the item's name"),
+            item_bytes("http://proxy.example.com:3128", b"user:password").expose(),
+        )
+        .expect("the item is kept");
+
+    let (login, item) = read_item(&store, environment_id, Some(&proxy));
+    assert_eq!(item, ProxyItem::Unreadable, "the failed read is unreadable");
+    assert!(login.is_none(), "a failed read gives no login");
+    let (login, item) = read_item(&store, environment_id, Some(&proxy));
+    assert_eq!(item, ProxyItem::Held, "the next read finds the item");
+    assert!(login.is_some(), "the next read gives the login");
+}
+
+/// KR-REQ-10.02: an item made for an origin that spells out its scheme's default port is held for
+/// the same proxy that names no port, and one that names another port is for another proxy.
+#[test]
+fn an_item_made_for_an_origin_with_its_default_port_spelled_out_is_the_same_proxy() {
+    let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+    let read = |made_for: &str, document: &str| {
+        let store = MemoryStore::new();
+        store
+            .set(
+                &item_name(environment_id).expect("the item's name"),
+                item_bytes(made_for, b"user:password").expose(),
+            )
+            .expect("the item is kept");
+        let proxy: ProxyUrl = document.parse().expect("a proxy");
+        read_item(&store, environment_id, Some(&proxy)).1
+    };
+    assert_eq!(
+        read("http://proxy.example.com:80", "http://proxy.example.com"),
+        ProxyItem::Held
+    );
+    assert_eq!(
+        read("http://proxy.example.com", "http://proxy.example.com:80"),
+        ProxyItem::Held
+    );
+    assert_eq!(
+        read("https://proxy.example.com", "https://proxy.example.com:443"),
+        ProxyItem::Held
+    );
+    assert_eq!(
+        read(
+            "http://proxy.example.com:80",
+            "http://proxy.example.com:8080"
+        ),
+        ProxyItem::ForAnotherProxy
+    );
+    assert_eq!(
+        read("http://proxy.example.com:443", "https://proxy.example.com"),
+        ProxyItem::ForAnotherProxy
+    );
+}
+
+/// KR-REQ-10.02: the owner repeats `network.proxy_login.set` with the same login and then
+/// `network.proxy_login.clear` twice: each repeat is answered as the first was, the store holds the
+/// one item the first set made, and a clear of nothing succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_set_and_a_repeated_clear_leave_the_state_the_first_one_made() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let mut control = host.client().await;
+    let store = open_store_in(&host.tree().environment().secrets_dir())
+        .expect("the store the daemon keeps its secrets in")
+        .store;
+    let name = item_name(host.environment_id).expect("the item's name");
+    let login = format!("user:{PASSWORD}");
+
+    let first = set(
+        &mut control,
+        &host,
+        &params("http://proxy.example.com:3128", &login),
+    )
+    .await;
+    let kept = store
+        .get(&name)
+        .expect("the store reads")
+        .expect("the first set kept an item")
+        .expose()
+        .to_vec();
+    let second = set(
+        &mut control,
+        &host,
+        &params("http://proxy.example.com:3128", &login),
+    )
+    .await;
+    assert_eq!(
+        rendered(&first),
+        rendered(&second),
+        "the repeated set is answered as the first was"
+    );
+    assert_eq!(
+        store
+            .get(&name)
+            .expect("the store reads")
+            .expect("the item stands")
+            .expose(),
+        kept.as_slice(),
+        "the repeated set left the item the first one made"
+    );
+
+    for round in ["first", "second"] {
+        let cleared = control
+            .mutate(
+                Method::NetworkProxyLoginClear,
+                ActionId::new(kr_ipc::new_uuid()),
+                ActionTarget::environment(host.environment_id),
+                &NetworkProxyLoginClearParams::default(),
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .unwrap_or_else(|error| panic!("the {round} clear is accepted: {error}"));
+        assert!(
+            cleared
+                .to_typed::<NetworkProxyLoginResult>()
+                .expect("the result decodes")
+                .applies_at_next_start,
+            "the {round} clear is answered as a clear"
+        );
+        assert!(
+            store.get(&name).expect("the store reads").is_none(),
+            "no item stands after the {round} clear"
+        );
+    }
 }
