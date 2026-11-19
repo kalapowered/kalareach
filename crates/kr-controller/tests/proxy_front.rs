@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use connect_proxy::{ConnectProxy, Login};
 use kr_client::tunnel::ProxyTunnels;
+use kr_controller::relay_leases::endpoint::{EndpointRelays, HomeRelays, Homing};
 use kr_controller::service::net::config::NetworkSettings;
 use kr_crypto::keys::TransportIdentityKeyPair;
 use kr_crypto::secret::SecretVec;
@@ -440,4 +441,125 @@ async fn the_front_is_up_before_iroh_binds_and_a_late_guard_closes_at_once() {
     assert!(endpoint.is_closed());
     assert_eq!(proxy.accepted(), 0, "nothing reached the proxy");
     assert!(proxy.logins().is_empty());
+}
+
+/// A publication the proxy refuses ends the endpoint, with no verdict set by the case: the record
+/// the endpoint publishes to its Pkarr server goes through the proxy with the login, the proxy
+/// answers `407` to that `CONNECT`, the verdict is set by the request itself, and the guard ends
+/// the endpoint, whose close completes.
+///
+/// Covers KR-REQ-10.02.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_publication_the_proxy_refuses_ends_the_endpoint_with_no_verdict_set_by_the_case() {
+    let relay = LocalRelay::spawn().await;
+    let proxy = ConnectProxy::authenticating("user", "password", "Basic realm=\"x\"").await;
+    let server = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        drop(listener);
+        port
+    };
+    let target = format!("127.0.0.1:{server}");
+    proxy.refuse_target(&target);
+    let login = credential();
+    let proxy_url = proxy
+        .url
+        .parse::<ProxyUrl>()
+        .expect("a proxy address")
+        .with_login(login.clone());
+    let mut settings = config(&relay, proxy_url, trusting(&[]));
+    settings.discovery.pkarr_publisher_url =
+        Some(format!("https://{target}").parse().expect("a Pkarr server address"));
+    let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+    let (endpoint, closer) = bind_network(&settings, &identity)
+        .await
+        .expect("a network endpoint");
+    let guard = guard_proxy(&closer, &login);
+
+    // The endpoint publishes once it has a home relay, which it reaches through the front. The
+    // publication's own `CONNECT` is the only request that names the Pkarr server.
+    until("the publication reaches the proxy", || asked_to(&proxy, &target)).await;
+    let publication: Vec<_> = proxy
+        .calls()
+        .into_iter()
+        .filter(|call| call.target.as_deref() == Some(target.as_str()))
+        .collect();
+    assert!(
+        publication.iter().all(|call| call.login == Login::Right),
+        "the publication carried the login: {publication:?}"
+    );
+    until("the verdict the publication set", || login.stopped().is_some()).await;
+    assert_eq!(login.stopped(), Some(StopKind::Refused));
+    until("the end of the endpoint", || guard.proxy_closed()).await;
+    assert!(closer.closed() && endpoint.is_closed());
+}
+
+/// Once the verdict stands, an endpoint whose close is still draining takes no relay a lease
+/// names: the relay's insertion would start another actor that writes through the front while the
+/// close drains. Before the verdict the same look adds the leased relay to the endpoint's map.
+///
+/// Covers KR-REQ-10.02.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_endpoint_the_proxy_has_refused_takes_no_leased_relay_while_its_close_is_held() {
+    let relay = LocalRelay::spawn().await;
+    let proxy = ConnectProxy::authenticating("user", "password", "Basic realm=\"x\"").await;
+    let login = credential();
+    let proxy_url = proxy
+        .url
+        .parse::<ProxyUrl>()
+        .expect("a proxy address")
+        .with_login(login.clone());
+    let settings = config(&relay, proxy_url, trusting(&[]));
+    let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+    let (endpoint, closer) = bind_network(&settings, &identity)
+        .await
+        .expect("a network endpoint");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let closer = closer.with_gate({
+        let (gate, entered) = (Arc::clone(&gate), Arc::clone(&entered));
+        Box::new(move || {
+            Box::pin(async move {
+                entered.notify_one();
+                gate.notified().await;
+            })
+        })
+    });
+    let relays = EndpointRelays::new(endpoint.clone(), &settings);
+    let before: iroh::RelayUrl = "https://127.0.0.1:11".parse().expect("a relay URL");
+    let after: iroh::RelayUrl = "https://127.0.0.1:12".parse().expect("a relay URL");
+
+    // Before the verdict a lease's relay is added to the endpoint's map.
+    let looked = relays
+        .home_on(Some(before.as_str()), std::time::Instant::now())
+        .await;
+    assert!(
+        looked.look_again.is_some(),
+        "the look waits for the leased relay: {looked:?}"
+    );
+    assert!(
+        endpoint.remove_relay(&before).await.is_some(),
+        "the leased relay was added before the verdict"
+    );
+
+    // The verdict stands and the close is held in its drain: the endpoint is open.
+    login.refuse(StopKind::Refused);
+    let guard = guard_proxy(&closer, &login);
+    entered.notified().await;
+    assert!(
+        closer.closing() && !closer.closed() && !endpoint.is_closed(),
+        "the close is held in its drain"
+    );
+    let looked = relays
+        .home_on(Some(after.as_str()), std::time::Instant::now())
+        .await;
+    assert_eq!(looked, Homing::default(), "the look does nothing");
+    assert!(
+        endpoint.remove_relay(&after).await.is_none(),
+        "no relay was added while the close drains"
+    );
+
+    gate.notify_one();
+    until("the end of the endpoint", || guard.proxy_closed()).await;
+    assert!(closer.closed() && endpoint.is_closed());
 }

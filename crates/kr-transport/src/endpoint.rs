@@ -2207,13 +2207,19 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!closer.closed(), "the guard's end does not end the drain");
         gate.notify_one();
+        // The owner finishes on its own task, in the few turns the scheduler gives it once the
+        // gate is open; the count bounds the turns, not a span of time.
+        for _ in 0..1000 {
+            if closer.closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
         assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(10), closer.close())
-                .await
-                .is_ok(),
+            closer.closed(),
             "the close finishes although its guard is gone"
         );
-        assert!(closer.closed());
+        closer.close().await;
     }
 
     /// KR-REQ-10.02: a guard that is built after the verdict has started the close before it
@@ -2273,12 +2279,43 @@ mod tests {
         }
     }
 
+    /// An opener that opens one tunnel when it is armed, over an in-memory pipe whose far end it
+    /// hands to the case, and refuses every other request.
+    struct OneTunnel {
+        armed: std::sync::atomic::AtomicBool,
+        ends: tokio::sync::mpsc::UnboundedSender<tokio::io::DuplexStream>,
+    }
+
+    impl crate::front::TunnelOpener for OneTunnel {
+        fn open<'a>(
+            &'a self,
+            _host: &'a str,
+            _port: u16,
+        ) -> futures::future::BoxFuture<
+            'a,
+            std::result::Result<crate::front::Tunnel, crate::front::TunnelRefusal>,
+        > {
+            Box::pin(async move {
+                if !self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    return Err(crate::front::TunnelRefusal::Failed);
+                }
+                let (near, far) = tokio::io::duplex(1024);
+                let _ = self.ends.send(far);
+                Ok(crate::front::Tunnel::new(near))
+            })
+        }
+    }
+
     /// KR-REQ-10.02: the closer ends the front after the endpoint's own close. With the real close
-    /// held at the gate the endpoint is open and the front still serves; after the release, at the
-    /// first instant the end reads complete, the endpoint is closed and a connect to the front's
-    /// port is refused by the system, and the steps ran in order.
+    /// held at the gate the endpoint is open, the front still serves and a tunnel through it still
+    /// carries bytes; after the release, at the first instant the end reads complete, the endpoint
+    /// is closed, the tunnel's task is gone (its far end reads the end of the stream) and a connect
+    /// to the front's port is refused by the system, and the steps ran in order.
     #[tokio::test]
     async fn the_closer_ends_the_front_after_iroh_closes() {
+        use futures::FutureExt as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
         let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
         let login = crate::proxy::ProxyCredential::new(
             kr_crypto::secret::SecretVec::new(b"user".to_vec()),
@@ -2286,10 +2323,15 @@ mod tests {
         )
         .expect("a login");
         let proxy: crate::config::ProxyUrl = "https://proxy.example:3128".parse().expect("a proxy");
+        let (ends_in, mut ends) = tokio::sync::mpsc::unbounded_channel();
+        let opener = std::sync::Arc::new(OneTunnel {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            ends: ends_in,
+        });
         let config = EndpointConfig {
             relay_urls: vec!["https://relay.example./".parse().expect("a relay")],
             proxy_url: Some(proxy.with_login(login)),
-            login_front: Some(crate::front::FrontOpener(std::sync::Arc::new(NoTunnels))),
+            login_front: Some(crate::front::FrontOpener(opener.clone())),
             ..EndpointConfig::default()
         };
         let (endpoint, closer) = bind_network(&config, &identity)
@@ -2310,6 +2352,39 @@ mod tests {
             })
         });
         let address = closer.front_address().expect("a front");
+        let secret = closer.front_probe().expect("a front").secret();
+
+        // One tunnel through the front, opened before the close begins.
+        opener
+            .armed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut client = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("the front");
+        {
+            use base64::Engine as _;
+            let basic = base64::engine::general_purpose::STANDARD.encode(format!("kr:{secret}"));
+            client
+                .write_all(
+                    format!(
+                        "CONNECT relay.example.:443 HTTP/1.1\r\nHost: relay.example.:443\r\nProxy-Authorization: Basic {basic}\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("a request");
+        }
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(client.read_u8().await.expect("the front's answer"));
+        }
+        assert!(
+            String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"),
+            "the front opened the tunnel: {}",
+            String::from_utf8_lossy(&head)
+        );
+        let mut far = ends.recv().await.expect("the tunnel's far end");
+
         let closing = tokio::spawn({
             let closer = closer.clone();
             async move { closer.close().await }
@@ -2320,9 +2395,27 @@ mod tests {
             tokio::net::TcpStream::connect(address).await.is_ok(),
             "the front still serves while the close is held"
         );
+        client
+            .write_all(b"held")
+            .await
+            .expect("bytes into the tunnel");
+        let mut carried = [0_u8; 4];
+        far.read_exact(&mut carried)
+            .await
+            .expect("bytes out of the tunnel");
+        assert_eq!(
+            &carried, b"held",
+            "the tunnel is open while the close is held"
+        );
+
         gate.notify_one();
         closing.await.expect("the close");
         assert!(closer.closed() && endpoint.is_closed());
+        let mut rest = [0_u8; 1];
+        assert!(
+            matches!(far.read(&mut rest).now_or_never(), Some(Ok(0))),
+            "the tunnel's task is gone: its far end reads the end of the stream"
+        );
         assert!(
             tokio::net::TcpStream::connect(address).await.is_err(),
             "a connect to the port is refused by the system"
