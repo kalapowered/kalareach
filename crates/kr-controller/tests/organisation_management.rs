@@ -2659,6 +2659,19 @@ async fn the_door_refusal_after_the_lease_ended(
         .expect_err("the door refuses a request that arrives once the lease has ended")
 }
 
+/// Whether the host's durable rows hold an acceptance for the confirmation `id`: what an answer the
+/// host recorded leaves, and an answer it refused does not.
+fn has_an_acceptance_on_record(fixture: &Fixture, id: kr_protocol::ids::ConfirmationId) -> bool {
+    fixture
+        .host
+        .network()
+        .pairing()
+        .rows()
+        .acceptance(id)
+        .expect("the acceptance record is readable")
+        .is_some()
+}
+
 /// KR-REQ-17.54: the owner at the host asks for the confirmation of an invitation under a live
 /// lease, and the lease ends after the host read the request's scope and while the request is
 /// inside the transaction that records it, which holds the record's lock. The host refuses it with
@@ -2752,7 +2765,11 @@ async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_
                 refused.message, at_the_door.message,
                 "the door's own words for that subject"
             );
-            // Nothing was recorded: a lease that stands again lets the same proof be answered.
+            assert!(
+                !has_an_acceptance_on_record(&fixture, challenge.request.confirmation_id),
+                "the refused answer left no acceptance on record"
+            );
+            // A lease that stands again lets the same proof be answered.
             fixture.lease_the_local_owner().await;
             let mut again = fixture.host.client().await;
             calls::complete(environment, &mut again, proof, presented)
@@ -2760,6 +2777,10 @@ async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_
                 .expect("the proof is accepted where no answer was recorded");
         } else {
             answered.expect("the answer is recorded where the lease stands");
+            assert!(
+                has_an_acceptance_on_record(&fixture, challenge.request.confirmation_id),
+                "the control's answer is on record"
+            );
         }
         raw.close();
         fixture.host.stop().await;
@@ -2868,7 +2889,11 @@ async fn a_confirmation_answer_whose_owner_lease_ends_in_its_admission_records_n
                 refused.message, at_the_door.message,
                 "the door's own words for that subject"
             );
-            // Nothing was recorded: a lease that stands again lets the same proof be answered.
+            assert!(
+                !has_an_acceptance_on_record(&fixture, challenge.request.confirmation_id),
+                "the refused answer left no acceptance on record"
+            );
+            // A lease that stands again lets the same proof be answered.
             fixture.lease_the_local_owner().await;
             let mut again = fixture.host.client().await;
             calls::complete(environment, &mut again, proof, presented)
@@ -2876,6 +2901,10 @@ async fn a_confirmation_answer_whose_owner_lease_ends_in_its_admission_records_n
                 .expect("the proof is accepted where no answer was recorded");
         } else {
             answered.expect("the answer is recorded where the lease stands");
+            assert!(
+                has_an_acceptance_on_record(&fixture, challenge.request.confirmation_id),
+                "the control's answer is on record"
+            );
         }
         raw.close();
         fixture.host.stop().await;
