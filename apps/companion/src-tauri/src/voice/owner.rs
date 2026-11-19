@@ -2829,7 +2829,10 @@ impl Owner {
         // by the host when the grant is revoked, and a host that did not confirm it is left to.
         let own_key_call = self.provider == CallProvider::OwnKey && self.descriptor.is_some();
         let needs_broker = self.descriptor.is_some() && !own_key_call;
-        let left_to_host = own_key_call && !matches!(host_end, HostEnd::Revoked { .. });
+        // The host that ended the call itself closed it, and a call the host lost is left to it.
+        let host_ended = matches!(cause, Cause::Host(HostEnding::Reason(_)));
+        let host_lost = matches!(cause, Cause::Host(HostEnding::NotKnown(_)));
+        let left_to_host = own_key_call && !host_ended && (host_lost || !host_end.settles());
         // A request written to the host and not answered may have been carried out, and the aftermath
         // never says nothing was done.
         let unsettled = self.accepting && self.requests_unsettled();
@@ -2873,9 +2876,11 @@ impl Owner {
                     words: {
                         let said = match &cause {
                             // These causes are already the closing sentence.
-                            Cause::Host(HostEnding::Silent | HostEnding::NotKnown(_)) => {
-                                cause.words()
+                            Cause::Host(HostEnding::NotKnown(_)) => cause.words(),
+                            Cause::Host(HostEnding::Silent) if !left_to_host => {
+                                super::cause::HOST_SILENT_SETTLED.to_owned()
                             }
+                            Cause::Host(HostEnding::Silent) => cause.words(),
                             _ if left_to_host => {
                                 format!("{} {}", cause.words(), super::cause::LEFT_TO_HOST)
                             }

@@ -47,6 +47,7 @@ use kr_client::services::{AccountTokenSource, ServiceHttp};
 use kr_protocol::ids::{ActionId, SessionId, VoiceSessionId};
 use kr_protocol::scalars::Digest256;
 use kr_protocol::voice::VoiceStartResult;
+use kr_protocol::voice_host::HOST_CLIENT_ABSENT_SECONDS;
 use tokio::sync::{mpsc, oneshot};
 
 pub use cause::Cause;
@@ -130,7 +131,7 @@ impl Default for Timings {
             session_name_within: Duration::from_secs(3),
             host_beat: None,
             host_miss: Duration::from_secs(10),
-            host_silent: Duration::from_secs(120),
+            host_silent: Duration::from_secs(u64::from(HOST_CLIENT_ABSENT_SECONDS)),
         }
     }
 }
@@ -1023,7 +1024,7 @@ impl Shared {
             (None, end)
                 if kept.provider == CallProvider::OwnKey && kept.grant_until_ms.is_some() =>
             {
-                if matches!(end, HostEnd::Revoked { .. }) {
+                if end.settles() {
                     "closed_by_host"
                 } else {
                     "left_to_host"

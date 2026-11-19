@@ -7856,6 +7856,10 @@ const MANAGER: [ActionRight; 3] = [
 /// confirmed that it closed the call.
 const LEFT_TO_HOST_WORDS: &str = "The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it.";
 
+/// What a person is told when the host did not answer for two minutes and then said, in its answer to
+/// the phone's stop, that the call is over.
+const HOST_SILENT_SETTLED_WORDS: &str = "This phone heard nothing from the host for two minutes, so the call ended on this phone. The host has since said that the call is over.";
+
 /// Timings under which the phone's heartbeat to the host is quick.
 fn own_timings() -> Timings {
     Timings {
@@ -8245,16 +8249,101 @@ async fn local_mute_and_closure_survive_a_host_control_failure() {
 }
 
 /// A host path that is lost: two heartbeats without an answer are told to the person, and a host
-/// not heard from for the host's absent bound ends the call on this device, which stops its media
-/// and shows the closing sentence.
+/// not heard from for the host's absent bound ends the call on this device, which stops its media.
+/// The closing sentence says the call may run on only when the host's answer to the stop does not
+/// settle it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_ends_its_media() {
-    let timings = Timings {
-        host_miss: Duration::from_millis(150),
-        host_silent: Duration::from_secs(3),
-        ..own_timings()
-    };
-    let mut scene = own_scene(timings).await;
+    // The stop that follows the silence is answered by the host, or refused by it with an error that
+    // does not say whether the host holds the call.
+    for stop_answered in [true, false] {
+        let timings = Timings {
+            host_miss: Duration::from_millis(150),
+            host_silent: Duration::from_secs(3),
+            ..own_timings()
+        };
+        let mut scene = own_scene(timings).await;
+        let prepared = scene.prepared().await;
+        let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+        assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+        scene
+            .state_where("an attached control", |state| {
+                state["control"] == "connected"
+            })
+            .await;
+
+        if !stop_answered {
+            scene.link.refuse_request(Some((
+                HostMethod::VoiceStop,
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::PermissionDenied,
+                    "The host did not look at the call.",
+                ),
+            )));
+        }
+        scene
+            .link
+            .lose_the_answer_to(Some(HostMethod::VoiceControl));
+        let told = scene
+            .state_where("the notice of two beats unanswered", |state| {
+                state["problems"].as_array().is_some_and(|problems| {
+                    problems.iter().any(|each| each["kind"] == "host_path")
+                })
+            })
+            .await;
+        let notice = told["problems"]
+            .as_array()
+            .and_then(|problems| problems.iter().find(|each| each["kind"] == "host_path"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            notice["words"],
+            "The host could not be reached. So it is not known whether the host still has the call."
+        );
+        assert_eq!(told["running"], true, "the call is not ended by two misses");
+
+        // The host stays silent: the phone ends the call at the host's absent bound.
+        let ended = scene
+            .state_where("the end", |state| state["ended"]["cause"] == "host_silent")
+            .await;
+        assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+        let owed_kinds: Vec<String> = ended["owed"]
+            .as_array()
+            .map(|owed| {
+                owed.iter()
+                    .filter_map(|entry| entry["kind"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if stop_answered {
+            // The host revoked the grant and closed the call at OpenAI: nothing is left to it.
+            assert_eq!(
+                ended["ended"]["words"], HOST_SILENT_SETTLED_WORDS,
+                "{ended}"
+            );
+            assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+            assert!(
+                !owed_kinds.iter().any(|kind| kind == "host_close"),
+                "a call the host settled is not owed as left to it: {owed_kinds:?}"
+            );
+        } else {
+            assert_eq!(ended["ended"]["words"], LEFT_TO_HOST_WORDS, "{ended}");
+            assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+            assert!(
+                owed_kinds.iter().any(|kind| kind == "host_close"),
+                "a call the host did not settle is owed as left to it: {owed_kinds:?}"
+            );
+        }
+        scene.stop_host().await;
+    }
+}
+
+/// A call the host ended and swept out of its list before this phone's stop reached it was closed by
+/// the host: the phone shows only the host's own words, and nothing about the call running on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_the_host_swept_before_the_phones_stop_reached_it_is_not_left_to_the_host() {
+    let mut scene = own_scene(own_timings()).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
     let prepared = scene.prepared().await;
     let answer = scene.call("voice_start", scene.own_start_request(&prepared));
     assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
@@ -8264,33 +8353,40 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
         })
         .await;
 
-    scene
-        .link
-        .lose_the_answer_to(Some(HostMethod::VoiceControl));
-    let told = scene
-        .state_where("the notice of two beats unanswered", |state| {
-            state["problems"]
-                .as_array()
-                .is_some_and(|problems| problems.iter().any(|each| each["kind"] == "host_path"))
+    // The phone's stop waits until the host's own sweep has taken the call out of its list.
+    scene.link.hold_next_request(HostMethod::VoiceStop);
+    openai.event(&json!({
+        "type": "session.closed", "event_id": "e-1", "reason": "expired",
+        "session": { "id": "live_1", "model": "gpt-live-1", "status": "active", "expires_at": 1 },
+        "usage": { "seconds": 3 },
+    }));
+    scene.link.until_request_held().await;
+    // The host's sweep, run at once in place of at its tick.
+    let voice = scene.host().controller().voice();
+    voice.tick(now_ms()).await;
+    assert_eq!(
+        voice.coordinator().live_sessions(),
+        0,
+        "the host's sweep took the call out of its list"
+    );
+    scene.link.release_request();
+
+    let ended = scene
+        .state_where("the end the host's news brings", |state| {
+            state["ended"]["cause"] == "provider_closed"
         })
         .await;
-    let notice = told["problems"]
+    assert_eq!(ended["ended"]["host"]["kind"], "not_held", "{ended}");
+    assert_eq!(ended["ended"]["words"], "OpenAI closed the call.", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    let owed_kinds: Vec<&str> = ended["owed"]
         .as_array()
-        .and_then(|problems| problems.iter().find(|each| each["kind"] == "host_path"))
-        .cloned()
+        .map(|owed| owed.iter().filter_map(|entry| entry["kind"].as_str()).collect())
         .unwrap_or_default();
-    assert_eq!(
-        notice["words"],
-        "The host could not be reached. So it is not known whether the host still has the call."
+    assert!(
+        !owed_kinds.contains(&"host_close") && !owed_kinds.contains(&"revocation"),
+        "nothing is left to the host: {owed_kinds:?}"
     );
-    assert_eq!(told["running"], true, "the call is not ended by two misses");
-
-    // The host stays silent: the phone ends the call at the host's absent bound.
-    let ended = scene
-        .state_where("the end", |state| state["ended"]["cause"] == "host_silent")
-        .await;
-    assert_eq!(ended["ended"]["words"], LEFT_TO_HOST_WORDS, "{ended}");
-    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
     scene.stop_host().await;
 }
 

@@ -1,7 +1,7 @@
 //! Why a call ends, and what a person is told about it.
 
 use kr_client::services::voice_control::ControlEnd;
-use kr_protocol::voice_host::VoiceEndReason;
+use kr_protocol::voice_host::{HOST_CLIENT_ABSENT_SECONDS, VoiceEndReason};
 
 use super::host_control::HostEnding;
 
@@ -11,6 +11,16 @@ use super::host_control::HostEnding;
 pub(super) const LEFT_TO_HOST: &str = "The call has ended on this phone. This host starts closing \
     the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm \
     that, the call may keep running on your OpenAI account until OpenAI ends it.";
+
+/// What a person is told when this phone heard nothing from the host for as long as the host waits
+/// before it closes a call, and the host has since said, in its answer to the stop, that the call is
+/// over.
+pub(super) const HOST_SILENT_SETTLED: &str = "This phone heard nothing from the host for two \
+    minutes, so the call ended on this phone. The host has since said that the call is over.";
+
+// The sentences above and below say "two minutes" for the bound the host's absence rule and this
+// phone's silence end share, and the words stay true only while that bound is two minutes.
+const _: () = assert!(HOST_CLIENT_ABSENT_SECONDS == 120);
 
 /// Why a call is ending.
 #[derive(Clone, Debug)]
