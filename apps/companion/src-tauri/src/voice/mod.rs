@@ -357,6 +357,11 @@ pub(crate) struct Shared {
     /// reached while the call runs cannot ask to stop the call that is running. The end of the call
     /// replaces it with what the end owes, and it is cleared only by the owner that opened it.
     standing: Mutex<Option<(u64, OwedView)>>,
+    /// The hosts this device stopped pairing with, each with the first owner number that is NOT
+    /// forgotten: a start that an earlier owner sent to such a host writes no entry when its answer
+    /// comes, and an entry the file holds for it is not taken up. A start made after the host is
+    /// paired again has a later number, so it is kept as any other.
+    forgotten: Mutex<Vec<(kr_protocol::ids::DeviceId, u64)>>,
     /// Whether spoken delegations are handed to the host: a case's choice, where a case can make one.
     #[cfg(any(test, feature = "testing", debug_assertions))]
     accept: std::sync::atomic::AtomicBool,
@@ -575,14 +580,29 @@ impl Shared {
             return None;
         };
         let mut changed = false;
+        let mut before = before;
         {
-            let mut view = self.view.lock().expect("the view lock is not poisoned");
-            let since = std::mem::take(&mut view.owed);
-            changed |= !since.is_empty();
-            view.owed = before.owed;
-            for owed in since {
-                view.owe(now, owed);
-            }
+            // A host forgotten while the file could not be read: what the file holds for it goes.
+            let forgotten = self
+                .forgotten
+                .lock()
+                .expect("the forgotten lock is not poisoned");
+            let held = before.owed.len();
+            before.owed.retain(|each| {
+                !(each.is_start()
+                    && each
+                        .host
+                        .is_some_and(|(id, _)| forgotten.iter().any(|(gone, _)| *gone == id)))
+            });
+            changed |= before.owed.len() != held;
+        }
+        {
+            // Nothing was owed since the read that failed: an entry is owed by the owner of a
+            // start, and a start is not sent until the record has been read.
+            self.view
+                .lock()
+                .expect("the view lock is not poisoned")
+                .owed = before.owed;
         }
         {
             let mut note = self.note.lock().expect("the note lock is not poisoned");
@@ -722,6 +742,8 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let took = self.take_up_unread();
+        // An answer that comes after its host was forgotten leaves no entry of the start.
+        let entry = entry.filter(|entry| !self.is_forgotten(owner, entry));
         {
             let now = now_ms();
             let mut view = self.view.lock().expect("the view lock is not poisoned");
@@ -772,14 +794,7 @@ impl Shared {
             return Ok(false);
         }
         let mut owed = after.owed.clone();
-        if let Some((_, standing)) = self
-            .standing
-            .lock()
-            .expect("the standing lock is not poisoned")
-            .clone()
-        {
-            owed.push(standing);
-        }
+        owed.extend(self.standing_to_keep());
         let note = self
             .note
             .lock()
@@ -822,6 +837,10 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let took = self.take_up_unread();
+        let entries: Vec<OwedView> = entries
+            .into_iter()
+            .filter(|entry| !self.is_forgotten(owner, entry))
+            .collect();
         let mut changed = !entries.is_empty();
         {
             let now = now_ms();
@@ -876,20 +895,74 @@ impl Shared {
             .expect("the view lock is not poisoned")
             .owed
             .clone();
-        if let Some((_, standing)) = self
-            .standing
-            .lock()
-            .expect("the standing lock is not poisoned")
-            .clone()
-        {
-            owed.push(standing);
-        }
+        owed.extend(self.standing_to_keep());
         let note = self
             .note
             .lock()
             .expect("the note lock is not poisoned")
             .clone();
         self.kept.write(&KeptVoice { owed, note })
+    }
+
+    /// Whether the entry of a start that `owner` sent is for a host this device forgot after the
+    /// owner was taken, so that the entry is not kept.
+    fn is_forgotten(&self, owner: u64, entry: &OwedView) -> bool {
+        entry.is_start()
+            && entry.host.is_some_and(|(host, _)| {
+                self.forgotten
+                    .lock()
+                    .expect("the forgotten lock is not poisoned")
+                    .iter()
+                    .any(|(gone, first_kept)| *gone == host && owner < *first_kept)
+            })
+    }
+
+    /// What the process owes for the call it is making, unless that is the start of a host this
+    /// device forgot.
+    fn standing_to_keep(&self) -> Option<OwedView> {
+        let (owner, entry) = self
+            .standing
+            .lock()
+            .expect("the standing lock is not poisoned")
+            .clone()?;
+        (!self.is_forgotten(owner, &entry)).then_some(entry)
+    }
+
+    /// Forgets every start entry for `host`: the entries in memory, the start in flight, which is
+    /// no longer kept in the file, an entry that comes with a late answer, and what a file that
+    /// cannot be read yet holds. The save is whole and ordered with every other change.
+    fn forget_starts_of(&self, host: kr_protocol::ids::DeviceId) {
+        let _ordered = self
+            .keeping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        {
+            let mut forgotten = self
+                .forgotten
+                .lock()
+                .expect("the forgotten lock is not poisoned");
+            forgotten.retain(|(each, _)| *each != host);
+            forgotten.push((
+                host,
+                self.next_owner.load(std::sync::atomic::Ordering::SeqCst),
+            ));
+        }
+        let took = self.take_up_unread();
+        let removed = {
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            let before = view.owed.len();
+            view.forget_starts_of(host);
+            view.owed.len() != before
+        };
+        let standing_start = self
+            .standing
+            .lock()
+            .expect("the standing lock is not poisoned")
+            .as_ref()
+            .is_some_and(|(_, entry)| {
+                entry.is_start() && entry.host.is_some_and(|(id, _)| id == host)
+            });
+        self.persist(took, removed || standing_start);
     }
 
     /// Takes a revocation out of what is owed, because the host it is owed to has revoked the grant.
@@ -901,7 +974,11 @@ impl Shared {
         environment: kr_protocol::ids::EnvironmentId,
         voice_session_id: &str,
     ) {
-        self.read_again();
+        let _ordered = self
+            .keeping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let took = self.take_up_unread();
         let removed = {
             let mut view = self.view.lock().expect("the view lock is not poisoned");
             let before = view.owed.len();
@@ -912,9 +989,7 @@ impl Shared {
             });
             view.owed.len() != before
         };
-        if removed {
-            self.keep();
-        }
+        self.persist(took, removed);
     }
 
     /// Keeps what the supervisor needs to end the call if its owner fails.
@@ -1330,6 +1405,7 @@ impl Calls {
                 note_changed: std::sync::atomic::AtomicBool::new(false),
                 keeping: Mutex::new(()),
                 standing: Mutex::new(None),
+                forgotten: Mutex::new(Vec::new()),
                 #[cfg(any(test, feature = "testing", debug_assertions))]
                 accept: std::sync::atomic::AtomicBool::new(ACCEPT_HOST_DELEGATIONS),
                 #[cfg(any(test, feature = "testing"))]
@@ -1769,16 +1845,7 @@ impl Calls {
         let Some(shared) = &self.shared else {
             return;
         };
-        shared.read_again();
-        let removed = {
-            let mut view = shared.view.lock().expect("the view lock is not poisoned");
-            let before = view.owed.len();
-            view.forget_starts_of(host);
-            view.owed.len() != before
-        };
-        if removed {
-            shared.keep();
-        }
+        shared.forget_starts_of(host);
     }
 
     /// What the call is doing, and, when `note` is the host, account and service of a call that
@@ -1830,6 +1897,7 @@ impl Calls {
 mod tests {
     use companion_platform::call::{Answered, CallFuture, CaptureProof, Held, OpenedCall};
 
+    use super::view::{NO_LAPSE_MS, START_KEPT, START_UNANSWERED, START_UNKNOWN};
     use super::*;
 
     /// Native code that is never asked for anything.
@@ -1944,6 +2012,278 @@ mod tests {
         shared.after_failed_owner(7).await;
 
         assert!(finalising_as_read(shared));
+    }
+
+    fn host(n: u8) -> (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId) {
+        (
+            kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([n; 16])),
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+        )
+    }
+
+    fn entry(
+        kind: &str,
+        action: &str,
+        host: (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId),
+    ) -> OwedView {
+        OwedView {
+            kind: kind.to_owned(),
+            words: String::new(),
+            action_id: Some(action.to_owned()),
+            voice_session_id: None,
+            until_ms: NO_LAPSE_MS,
+            host_reference: String::new(),
+            host_name: "host".to_owned(),
+            host: Some(host),
+        }
+    }
+
+    fn calls_in(directory: &std::path::Path) -> Calls {
+        Calls::on_phone(
+            Arc::new(NoNativeCode),
+            Arc::new(crate::verify::NoCeremony),
+            Service::managed().expect("a service"),
+            Timings::default(),
+            Kept::at(directory),
+        )
+    }
+
+    /// The kind and action of every entry the file holds.
+    fn file_holds(directory: &std::path::Path) -> Vec<(String, String)> {
+        Kept::at(directory)
+            .read(0)
+            .expect("the file is read")
+            .owed
+            .into_iter()
+            .map(|each| (each.kind, each.action_id.unwrap_or_default()))
+            .collect()
+    }
+
+    fn pair(kind: &str, action: &str) -> (String, String) {
+        (kind.to_owned(), action.to_owned())
+    }
+
+    /// Unpairing a host removes its start in flight from the file, and neither the answer that
+    /// comes after nor the unknown path puts the start back; a start made after the host is paired
+    /// again is kept, and another host's entries are never touched.
+    #[test]
+    fn forgetting_a_host_drops_its_start_in_flight_and_a_late_answer_writes_no_entry() {
+        let directory = tempfile::tempdir().expect("a folder");
+        let calls = calls_in(directory.path());
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        shared.settle_start(0, None, Some(entry(START_KEPT, "old-1", host(1))), None);
+        shared.settle_start(0, None, Some(entry(START_KEPT, "old-2", host(2))), None);
+        let owner = shared
+            .next_owner
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(shared.stand_open_durably(owner, entry(START_UNKNOWN, "flight", host(1))));
+        assert_eq!(file_holds(directory.path()).len(), 3);
+
+        calls.forget_starts_of(host(1).0);
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_KEPT, "old-2")],
+            "the start in flight went from the file with the host's other entries"
+        );
+
+        // The answer that arrives after the host was forgotten, and the unknown path, write nothing.
+        shared.settle_start(
+            owner,
+            Some(host(1)),
+            Some(entry(START_KEPT, "flight", host(1))),
+            None,
+        );
+        shared.record_end(owner, |_| {}, vec![entry(START_UNKNOWN, "flight", host(1))]);
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_KEPT, "old-2")]
+        );
+        assert_eq!(
+            calls_in(directory.path())
+                .shared
+                .as_ref()
+                .expect("a phone holds calls")
+                .view
+                .lock()
+                .expect("the view lock")
+                .owed
+                .len(),
+            1,
+            "a launch that reads the file finds nothing of the host"
+        );
+
+        let later = shared
+            .next_owner
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        shared.settle_start(later, None, Some(entry(START_KEPT, "again", host(1))), None);
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_KEPT, "old-2"), pair(START_KEPT, "again")],
+            "a start made after the host is paired again is kept"
+        );
+    }
+
+    /// Unpairing while the file cannot be read yet is not lost when it can: what the file holds for
+    /// the host is not taken up.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_forgotten_while_the_file_cannot_be_read_stays_forgotten() {
+        let directory = tempfile::tempdir().expect("a folder");
+        Kept::at(directory.path())
+            .write(&KeptVoice {
+                owed: vec![
+                    entry(START_KEPT, "one", host(1)),
+                    entry(START_UNANSWERED, "two", host(2)),
+                ],
+                note: None,
+            })
+            .expect("the file is written");
+        let file = directory.path().join("voice-kept.json");
+        std::fs::rename(&file, directory.path().join("voice-kept.locked")).expect("put aside");
+        std::os::unix::fs::symlink(&file, &file).expect("a link that cannot be opened");
+        let calls = calls_in(directory.path());
+
+        calls.forget_starts_of(host(1).0);
+        assert!(
+            std::fs::symlink_metadata(&file)
+                .expect("the file is there")
+                .file_type()
+                .is_symlink(),
+            "a file that could not be read was not written over"
+        );
+
+        std::fs::rename(directory.path().join("voice-kept.locked"), &file).expect("unlocked");
+        calls
+            .shared
+            .as_ref()
+            .expect("a phone holds calls")
+            .read_again();
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNANSWERED, "two")],
+            "the host's entry is not back, and the file says so"
+        );
+    }
+
+    /// A revocation settled while a dismissal is being saved is not brought back by the dismissal:
+    /// both take the same order as every other change of the record.
+    #[test]
+    fn a_removal_that_runs_during_a_dismissal_is_not_lost() {
+        let directory = tempfile::tempdir().expect("a folder");
+        let calls = calls_in(directory.path());
+        let shared = Arc::clone(calls.shared.as_ref().expect("a phone holds calls"));
+        let mut revocation = entry("revocation", "", host(1));
+        revocation.action_id = None;
+        revocation.voice_session_id = Some("v1".to_owned());
+        shared.view.lock().expect("the view lock").owed =
+            vec![revocation, entry(START_UNKNOWN, "n1", host(2))];
+
+        let (started, wait_started) = std::sync::mpsc::channel();
+        let (done, wait_done) = std::sync::mpsc::channel();
+        let mut removing = None;
+        let other = Arc::clone(&shared);
+        let changed = shared.change_owed_durably(|state| {
+            removing = Some(std::thread::spawn(move || {
+                started.send(()).expect("the dismissal waits");
+                other.settled(host(1).0, host(1).1, "v1");
+                done.send(()).expect("the dismissal waits");
+            }));
+            wait_started.recv().expect("the removal started");
+            // A removal that does not wait for this change finishes here, and the change then
+            // replaces what it left with the copy it made before.
+            let _ = wait_done.recv_timeout(std::time::Duration::from_millis(300));
+            state.dismiss_start("n1")
+        });
+        assert_eq!(changed, Ok(true));
+        removing.expect("the removal ran").join().expect("it ended");
+
+        let kinds: Vec<String> = shared
+            .view
+            .lock()
+            .expect("the view lock")
+            .owed
+            .iter()
+            .map(|each| each.kind.clone())
+            .collect();
+        assert_eq!(kinds, vec![START_UNANSWERED.to_owned()]);
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNANSWERED, "n1")]
+        );
+    }
+
+    /// The one earlier start of a host that its refusal's words name is found, and only that one:
+    /// the newest kept start is not the answer, two named starts are no candidate, the start the
+    /// refused start itself named is passed over, a start the host never answered is a candidate,
+    /// and another host's start is none.
+    #[test]
+    fn the_start_a_refusal_names_is_the_one_kept_start_its_words_hold() {
+        let directory = tempfile::tempdir().expect("a folder");
+        let calls = calls_in(directory.path());
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        let (a, x, y) = ("a-0003-cccc", "x-0001-aaaa", "y-0002-bbbb");
+        let owed = |entries: Vec<OwedView>| {
+            shared.view.lock().expect("the view lock").owed = entries;
+        };
+
+        owed(vec![
+            entry(START_KEPT, x, host(1)),
+            entry(START_UNANSWERED, y, host(1)),
+        ]);
+        let older = shared.start_named_in(host(1), &format!("held under action {x}, begun"), None);
+        assert_eq!(
+            older.as_deref(),
+            Some(x),
+            "the older kept start, beside a newer hidden one"
+        );
+        let both = shared.start_named_in(host(1), &format!("actions {x} and {y}"), None);
+        assert_eq!(both, None, "two named starts are no candidate");
+
+        owed(vec![
+            entry(START_UNANSWERED, a, host(1)),
+            entry(START_KEPT, x, host(1)),
+        ]);
+        let misnamed = shared.start_named_in(
+            host(1),
+            &format!("held under {a}; you named {x}"),
+            Some(x.to_owned()),
+        );
+        assert_eq!(
+            misnamed.as_deref(),
+            Some(a),
+            "the start's own argument is passed over"
+        );
+
+        owed(vec![entry(START_UNANSWERED, a, host(1))]);
+        let unanswered = shared.start_named_in(host(1), &format!("held under {a}"), None);
+        assert_eq!(
+            unanswered.as_deref(),
+            Some(a),
+            "a start the host never answered is a candidate"
+        );
+
+        owed(vec![entry(START_KEPT, x, host(2))]);
+        let elsewhere = shared.start_named_in(host(1), &format!("held under {x}"), None);
+        assert_eq!(elsewhere, None, "another host's start is none");
+    }
+
+    /// A start can name an earlier start only of the host it was made to: the same device in
+    /// another environment is another host.
+    #[test]
+    fn an_earlier_start_is_named_only_for_the_host_it_was_made_to() {
+        let directory = tempfile::tempdir().expect("a folder");
+        let calls = calls_in(directory.path());
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        shared.view.lock().expect("the view lock").owed = vec![entry(START_KEPT, "x", host(1))];
+        let other_environment = (
+            host(1).0,
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+        );
+
+        assert_eq!(shared.earlier_start("x", host(1)), Ok(()));
+        assert!(shared.earlier_start("x", other_environment).is_err());
+        assert!(shared.earlier_start("x", host(2)).is_err());
+        assert!(shared.earlier_start("nothing", host(1)).is_err());
     }
 }
 
