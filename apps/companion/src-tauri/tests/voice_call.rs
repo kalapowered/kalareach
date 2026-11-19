@@ -3041,14 +3041,31 @@ async fn a_start_names_an_earlier_start_only_when_this_device_keeps_it() {
 async fn the_reply_to_a_mute_shows_no_start_that_is_only_kept() {
     let timings = Timings {
         // No bound of time decides this case: the host's answers to the first start are lost by
-        // the test's own control, and the second start's questions are answered by the host
-        // whenever it has finished.
+        // the test's own control, its first question is held until the host has finished that
+        // start, and the second start's questions are answered by the host whenever it has
+        // finished.
+        start_within: Duration::from_secs(600),
         host_within: Duration::from_secs(600),
         ..asking_again()
     };
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.link.lose_the_answer_to(Some(HostMethod::VoiceStart));
-    let started = scene.start().await;
+    scene.link.hold_request_after(1, HostMethod::VoiceStart);
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    scene.link.until_request_held().await;
+    scene
+        .link
+        .until_the_host_answers(1, HostMethod::VoiceStart)
+        .await;
+    scene.link.release_request();
+    let started = starting
+        .await
+        .expect("the start ran")
+        .expect("a call starts");
     let earlier = started["action_id"]
         .as_str()
         .expect("the action")
