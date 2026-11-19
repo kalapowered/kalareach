@@ -387,6 +387,83 @@ test.describe('the conversation keeps its place', () => {
     await expect(page.getByTestId('composer-input')).toHaveValue('half a thought, written while reading')
     await page.screenshot({ path: shot(`conversation-place-13.15-${test.info().project.name}`) })
   })
+
+  // KR-REQ-13.03: the terminal keeps its own place across the same pane change. The scripted host
+  // stands for native code, which restores the place the last view showed before it draws anything.
+  test('the terminal keeps its place', async ({ page }) => {
+    await openSession(page)
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    const surface = page.getByTestId('terminal-surface')
+    await expect(page.getByTestId('terminal-grid')).toBeVisible()
+    const firstRow = () =>
+      page
+        .getByTestId('terminal-grid')
+        .locator('[data-testid="terminal-piece"][data-line="0"]')
+        .allTextContents()
+        .then((pieces) => pieces.join(''))
+    await expect.poll(firstRow).toBe('$ cargo test -p kr-client')
+    // Into the history, as far as the wheel goes.
+    await surface.hover()
+    await page.mouse.wheel(0, -2000)
+    await expect.poll(firstRow).toBe('$ echo earlier 1')
+
+    await page.getByRole('tab', { name: 'Conversation' }).click()
+    await expect(page.getByTestId('conversation-scroll')).toBeVisible()
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByTestId('terminal-grid')).toBeVisible()
+    await expect.poll(firstRow).toBe('$ echo earlier 1')
+    await page.screenshot({ path: shot(`terminal-place-13.03-${test.info().project.name}`) })
+
+    // The live screen is where taking control and a return to the live end go.
+    await page.getByRole('button', { name: 'Take control' }).click()
+    await expect.poll(firstRow).toBe('$ cargo test -p kr-client')
+  })
+})
+
+// KR-REQ-13.03: the note a restored terminal gives fits a phone at 360 px, at an enlarged text size,
+// collapsed and expanded: the page does not run sideways and the whole fact is inside its box.
+test.describe('the terminal place note on a phone', () => {
+  const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+  for (const scale of ['100%', '200%']) {
+    test(`fits 360 px wide with text at ${scale}, collapsed and expanded`, async ({ page }) => {
+      await withTextSize(page, scale)
+      await page.setViewportSize({ width: 360, height: 720 })
+      await page.goto(`/harness.html?surface=ios&session=${SESSION_MAIN}`)
+      await page.getByRole('tab', { name: 'Terminal' }).click()
+      await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
+      const slot = page.locator('p.terminal-place-note')
+      await expect(slot).toBeAttached()
+      const fits = async (what: string) => {
+        const badge = page.getByTestId('terminal-place-note')
+        const [inner, outer, past] = await Promise.all([
+          badge.boundingBox(),
+          slot.boundingBox(),
+          page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
+        ])
+        expect(inner, `${what}: the note is drawn`).not.toBeNull()
+        expect(past, `${what}: the page does not run sideways`).toBeLessThanOrEqual(0)
+        expect((inner?.x ?? 0) + (inner?.width ?? 0), `${what}: inside its paragraph`).toBeLessThanOrEqual(
+          (outer?.x ?? 0) + (outer?.width ?? 0) + 1
+        )
+        expect((inner?.x ?? 0) + (inner?.width ?? 0), `${what}: inside the window`).toBeLessThanOrEqual(360)
+        expect(inner?.x ?? -1, `${what}: inside the window`).toBeGreaterThanOrEqual(0)
+      }
+      for (const kind of ['gone', 'unavailable', 'different'] as const) {
+        await page.evaluate((note) => {
+          window.krTestHost?.terminalViews.at(-1)?.show(undefined, undefined, note)
+        }, kind)
+        await expect(page.getByTestId('terminal-place-note')).toHaveAttribute('data-kind', kind)
+        await fits(`${kind}, collapsed`)
+      }
+      const more = page.getByRole('button', { name: 'More', exact: true })
+      await expect(more).toBeVisible()
+      await more.click()
+      await expect(page.getByRole('button', { name: 'Less', exact: true })).toBeVisible()
+      await fits('expanded')
+      await page.screenshot({ path: shot(`terminal-note-13.03-${scale}-${test.info().project.name}`) })
+    })
+  }
 })
 
 // KR-REQ-13.15: the retained output is read a page at a time with its cursor and byte bound, the
