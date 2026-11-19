@@ -5099,12 +5099,13 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_connect_reset_by_a_listener_that_closes_with_it_queued_is_the_daemons_end() {
         use std::future::Future as _;
+        use std::io::Read as _;
 
         let directory = kr_ipc::testing::PrivateTempDir::create();
         let path = directory.path().join("stand-in.sock");
         let listener =
             std::os::unix::net::UnixListener::bind(&path).expect("the stand-in listener binds");
-        let endpoint = kr_ipc::paths::Endpoint::from_path(path).expect("the endpoint");
+        let endpoint = kr_ipc::paths::Endpoint::from_path(path.clone()).expect("the endpoint");
         let reach = startup::reach(&endpoint, startup::ANSWER_BOUND, &[]);
         let mut reach = std::pin::pin!(reach);
         // One poll makes the connect, which the kernel queues at the listener that never accepts;
@@ -5115,7 +5116,24 @@ pub(crate) mod tests {
             first.is_pending(),
             "the connection waits in the listener's queue"
         );
+        // The connect fails with a reset only if the listener is gone before the runtime's first
+        // look at the connection: a connect that has completed meets the close at its greeting
+        // instead. A listener closes when its last holder lets go, and a child process that
+        // another thread started holds a copy of it until the child's exec, so the drop below may
+        // not close it. The kernel resets the connections in a closed listener's queue oldest
+        // first, so a probe connection queued behind the reach's tells, by its own reset, that the
+        // reach's is reset: the case goes on only after that.
+        let probe = std::os::unix::net::UnixStream::connect(&path).expect("the probe connects");
+        probe
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("the probe's read is bounded");
         drop(listener);
+        let mut byte = [0_u8; 1];
+        match (&probe).read(&mut byte) {
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+            Ok(0) => {}
+            other => panic!("the listener's queue was not reset within 30 s: {other:?}"),
+        }
         let startup::Reached::Refused(error) = reach.await else {
             panic!("the reach of a listener that closed with the connection queued is refused");
         };
@@ -5140,6 +5158,52 @@ pub(crate) mod tests {
             before_said(&before),
             the_end_said_for(id, Some(4000), &error)
         );
+    }
+
+    /// The kernel's own order on Linux for a daemon that goes after it took the connection: a
+    /// connection that the daemon closes with part of the greeting unread is reset at the
+    /// greeting's read, which the connection reads as its peer's end. That failure is the daemon's
+    /// end as a closed greeting is, with no look first, and the command sent nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_greeting_whose_connection_the_daemon_closes_with_it_unread_is_the_daemons_end() {
+        use tokio::io::AsyncReadExt as _;
+
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let path = directory.path().join("stand-in.sock");
+        let listener = tokio::net::UnixListener::bind(&path).expect("the stand-in listener binds");
+        let endpoint = kr_ipc::paths::Endpoint::from_path(path).expect("the endpoint");
+        // The stand-in daemon takes the connection and reads one byte of the greeting: the
+        // greeting has arrived, and the rest of it is unread when the connection is closed.
+        let daemon = async {
+            let (mut connection, _) = listener.accept().await.expect("the connection is taken");
+            let mut byte = [0_u8; 1];
+            connection
+                .read_exact(&mut byte)
+                .await
+                .expect("the greeting begins");
+            drop(connection);
+        };
+        let (reached, ()) = tokio::join!(
+            startup::reach(&endpoint, startup::ANSWER_BOUND, &[]),
+            daemon
+        );
+        let startup::Reached::Refused(error) = reached else {
+            panic!("the reach of a daemon that closed the greeting unread is refused");
+        };
+        assert!(matches!(&error, kr_ipc::IpcError::PeerClosed), "{error:?}");
+
+        // The stand-in advances a paused clock; the reach above ran on real time.
+        tokio::time::pause();
+        let id = an_environment();
+        let process = asked_process();
+        let supplied = Supplied::new()
+            .process(vec![at_once(ProcessState::Ended)])
+            .look(vec![at_once(Endpoint::Nobody)]);
+        let before = greeting_failed(&supplied, &error, Some(&process), id, the_deadline()).await;
+        assert_eq!(before_said(&before), the_end_said(id, Some(4000)));
+        assert_eq!(supplied.looks(), 0, "{}", before_said(&before));
+        assert_eq!(supplied.start.elapsed(), Duration::ZERO);
     }
 
     /// A greeting that fails on the socket and is no closure is judged as any failure before the
