@@ -28,9 +28,9 @@ use kr_protocol::projection::{
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::session::Dimensions;
 use scripted_worker::{
-    CallKind, Challenge, Frame, Keys, Link, Mouse, Negotiated, ScriptedWorker, Stated, WATCHDOG,
-    WorkerLease, delta, frame, frame_delta, keys_delta, mouse_delta, page as rows_page, reset, row,
-    screen, snapshot, written,
+    CallKind, Challenge, FirstRow, Frame, Keys, Link, Mouse, Negotiated, ScriptedWorker, Stated,
+    WATCHDOG, WorkerLease, delta, frame, frame_delta, keys_delta, mouse_delta, page as rows_page,
+    reset, row, screen, snapshot, written,
 };
 use serde_json::{Value, json};
 use tauri::Manager as _;
@@ -4517,6 +4517,15 @@ fn first_row(state: &Value) -> u64 {
     30 - window["above"].as_u64().expect("a distance above")
 }
 
+/// A pan of three columns, made as the page's move `number` after a `showing` state, and the report
+/// it goes as. Reports go one at a time and in order, so a move that stood behind the restore and
+/// was made would be this call and not the probe: the probe is the first report after the
+/// restore if, and only if, none of them was.
+async fn probed(page: &Page, view: &str, link: &mut Link, number: u64) -> AttachmentViewportParams {
+    page.pan(view, number, 3, 0);
+    report(link).await.1
+}
+
 /// KR-REQ-13.03: a view opened with a place asks the host for it before any move, and a move made
 /// while it waits goes behind it, from where the restore landed.
 #[tokio::test(flavor = "multi_thread")]
@@ -4592,9 +4601,11 @@ async fn a_restore_the_host_refuses_is_judged_unavailable_and_a_pan_behind_it_is
             "{code:?}: the window stays at home"
         );
         assert!(settled(&shown, 1), "{code:?}: the pan is told as not made");
-        assert!(
-            link.quiet_for(QUIET).await,
-            "{code:?}: nothing is sent later"
+        let probe = probed(&page, &view, &mut link, 2).await;
+        assert_eq!(
+            (probe.position.0, probe.column.get()),
+            (None, 3),
+            "{code:?}: the probe is the first report after the restore, from home"
         );
     }
 }
@@ -4816,14 +4827,14 @@ async fn an_anchor_for_another_buffer_or_width_is_not_sent() {
 /// the same text is the place.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_row_in_the_same_generation_is_trusted_and_another_generation_compares_its_text() {
-    for generation in [1, 2] {
+    for (generation, first) in [(1, FirstRow::Blank), (2, FirstRow::Letters)] {
         let mut worker = ScriptedWorker::start(Challenge::Answered);
         let page = Page::new(worker.paths());
         let anchor = place_of(&page, &mut worker, 3, &kept()).await;
         let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
         let (restore, _) = report(&mut link).await;
         link.answer(&restore, &viewport_answer(1)).await;
-        let mut landing = kept().revision(1);
+        let mut landing = kept().revision(1).first_row(first);
         landing.generation = generation;
         frame(&mut link, &landing).await;
         let shown = first_showing(&page, 4).await;
@@ -4848,7 +4859,12 @@ async fn a_pan_behind_a_restore_that_lands_elsewhere_is_not_made() {
     let shown = first_showing(&page, 4).await;
     assert_eq!(shown["note"], "gone");
     assert!(settled(&shown, 1), "the pan is told as not made");
-    assert!(link.quiet_for(QUIET).await, "no report follows the restore");
+    let probe = probed(&page, &view, &mut link, 2).await;
+    assert_eq!(
+        (probe.position.0, probe.column.get()),
+        (row_position(10), 3),
+        "the probe is the first report after the restore, from the host's landing"
+    );
 }
 
 /// KR-REQ-13.03: a pan behind a restore that lands with its row lower down, with no note, is not
@@ -4870,7 +4886,12 @@ async fn a_pan_behind_a_restore_that_lands_with_its_row_lower_down_is_not_made()
     let shown = first_showing(&page, 4).await;
     assert_eq!(shown["note"], Value::Null);
     assert!(settled(&shown, 1));
-    assert!(link.quiet_for(QUIET).await, "no report follows the restore");
+    let probe = probed(&page, &view, &mut link, 2).await;
+    assert_eq!(
+        (probe.position.0, probe.column.get()),
+        (None, 3),
+        "the probe is the first report after the restore, from the host's landing"
+    );
 }
 
 /// KR-REQ-13.03: a state carries the anchor of its window and the one after a return to the live
@@ -4939,4 +4960,283 @@ async fn an_anchor_row_above_2_pow_53_is_kept_exact_and_one_above_u64_is_refused
         .expect_err("the place is refused");
     assert_eq!(code(&refused), "INVALID_ARGUMENT");
     assert_eq!(page.held(), 1, "nothing opened");
+}
+
+/// A restore whose answer comes after the screen it would be judged on was discarded, by the host's
+/// reset or by the view's own recovery: nothing is shown until the replacement screen arrives, and
+/// that screen is shown with its judgement. The replacement is a wider session, which the anchor
+/// says is different; a stale screen judged at the answer would show with no note.
+async fn a_discarded_screen_leaves_the_restore_unjudged(recovery: bool) {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let anchor = place_of(&page, &mut worker, 3, &kept()).await;
+    let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
+    let (restore, _) = report(&mut link).await;
+    frame(&mut link, &kept().revision(1)).await;
+    if recovery {
+        link.push("session.resync", &resync_marker(60)).await;
+        let subscribe = link.expect(Method::EventsSubscribe).await;
+        link.answer(&restore, &viewport_answer(1)).await;
+        link.answer(&subscribe, &scripted_worker::subscribed())
+            .await;
+        link.restart_stream();
+    } else {
+        link.push(
+            PROJECTION_RESET_EVENT,
+            &reset(2, 60, ProjectionResetReason::BufferSwitch, 1),
+        )
+        .await;
+        link.answer(&restore, &viewport_answer(1)).await;
+    }
+    let mut replacement = Frame::live((30, 6), (10, 2), 30)
+        .in_history(13, 0)
+        .revision(1);
+    replacement.generation = 2;
+    frame(&mut link, &replacement).await;
+    let shown = first_showing(&page, 4).await;
+    assert_eq!(shown["note"], "different", "recovery {recovery}");
+    assert_eq!(first_row(&shown), 13, "recovery {recovery}");
+}
+
+/// KR-REQ-13.03: a screen discarded by the host's reset before the restore is judged keeps the
+/// hold; the replacement screen is the first one shown, with its judgement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_screen_discarded_by_a_reset_before_the_restore_is_judged_keeps_the_hold() {
+    a_discarded_screen_leaves_the_restore_unjudged(false).await;
+}
+
+/// KR-REQ-13.03: the same, by the view's own recovery.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_screen_discarded_by_a_recovery_before_the_restore_is_judged_keeps_the_hold() {
+    a_discarded_screen_leaves_the_restore_unjudged(true).await;
+}
+
+/// The first `showing` state of a view restoring row 13, whose landing is in another generation
+/// and has `first` for its first row.
+async fn landing_in_another_generation(first: FirstRow) -> Value {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let anchor = place_of(&page, &mut worker, 3, &kept()).await;
+    let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
+    let (restore, _) = report(&mut link).await;
+    link.answer(&restore, &viewport_answer(1)).await;
+    let mut landing = kept().revision(1).first_row(first);
+    landing.generation = 2;
+    frame(&mut link, &landing).await;
+    let shown = first_showing(&page, 4).await;
+    assert_eq!(first_row(&shown), 13);
+    shown
+}
+
+/// KR-REQ-13.03: a first row with other text in another generation is not taken for the place.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_with_other_text_in_another_generation_is_said_to_be_different() {
+    let shown = landing_in_another_generation(FirstRow::Text("another line, wholly")).await;
+    assert_eq!(shown["note"], "different");
+}
+
+/// KR-REQ-13.03: a blank first row in another generation is not taken for the place.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blank_first_row_in_another_generation_is_said_to_be_different() {
+    let shown = landing_in_another_generation(FirstRow::Blank).await;
+    assert_eq!(shown["note"], "different");
+}
+
+/// KR-REQ-13.03: a first row the host cut, in another generation, is not taken for the place.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cut_first_row_in_another_generation_is_said_to_be_different() {
+    let shown = landing_in_another_generation(FirstRow::Cut).await;
+    assert_eq!(shown["note"], "different");
+}
+
+/// How the host answers the return to the live screen that took a restore's place, when it does not
+/// take it.
+#[derive(Clone, Copy, Debug)]
+enum Untaken {
+    Refused,
+    ForNow,
+    Unknown,
+}
+
+impl Untaken {
+    async fn answer(self, link: &mut Link, call: &scripted_worker::Call) {
+        match self {
+            Self::Refused => {
+                link.refuse(call, "that window is not one this session shows")
+                    .await
+            }
+            Self::ForNow => {
+                link.refuse_with(call, ErrorCode::ResourceUnavailable, "not now")
+                    .await;
+            }
+            Self::Unknown => {
+                link.refuse_with(call, ErrorCode::OutcomeUnknown, "no word of it")
+                    .await;
+            }
+        }
+    }
+}
+
+/// KR-REQ-13.03: a return to the live screen that the host does not take, after the restore landed
+/// at row 13, ends the hold on the host's window, which is at row 13, with no note; the return is
+/// told as not made, and so is the pan made behind it, whose origin the return was to give.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_go_live_the_host_does_not_take_ends_the_hold_on_the_hosts_window() {
+    for how in [Untaken::Refused, Untaken::ForNow, Untaken::Unknown] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page = Page::new(worker.paths());
+        let anchor = place_of(&page, &mut worker, 3, &kept()).await;
+        let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
+        let (restore, _) = report(&mut link).await;
+        page.live(&view, 1);
+        page.pan(&view, 2, 3, 0);
+        link.answer(&restore, &viewport_answer(1)).await;
+        frame(&mut link, &kept().revision(1)).await;
+        let (live, asked) = report(&mut link).await;
+        assert_eq!(asked.position.0, None, "{how:?}: the live screen");
+        how.answer(&mut link, &live).await;
+        let shown = first_showing(&page, 4).await;
+        assert_eq!(first_row(&shown), 13, "{how:?}: the host's window");
+        assert_eq!(shown["note"], Value::Null, "{how:?}");
+        assert!(
+            settled(&shown, 2),
+            "{how:?}: the return and the pan are told as not made"
+        );
+        let probe = probed(&page, &view, &mut link, 3).await;
+        assert_eq!(
+            (probe.position.0, probe.column.get()),
+            (row_position(13), 3),
+            "{how:?}: the probe is the first report after the return, from the host's window"
+        );
+    }
+}
+
+/// KR-REQ-13.03: a pan made behind a return to the live screen is made only when the return landed
+/// where it was to: at the anchor's column on the live screen's first line. Where a wider viewport
+/// held the column elsewhere, the pan is not made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pan_behind_a_go_live_is_made_only_when_it_landed_where_it_was_to() {
+    for column in [4, 2] {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page = Page::new(worker.paths());
+        let anchor = place_of(&page, &mut worker, 3, &wide_session().in_history(13, 4)).await;
+        let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
+        let (restore, _) = report(&mut link).await;
+        page.live(&view, 1);
+        page.pan(&view, 2, 3, 0);
+        link.answer(&restore, &viewport_answer(1)).await;
+        frame(&mut link, &wide_session().in_history(13, 4).revision(1)).await;
+        let (live, asked) = report(&mut link).await;
+        assert_eq!(
+            (asked.position.0, asked.column.get()),
+            (None, 4),
+            "column {column}"
+        );
+        link.answer(&live, &viewport_answer(2)).await;
+        frame(&mut link, &wide_session().at(0, column).revision(2)).await;
+        let shown = first_showing(&page, 4).await;
+        assert_eq!(place(&shown), (column, 0, 0), "column {column}");
+        if column == 4 {
+            assert!(
+                settled(&shown, 1),
+                "column {column}: the pan is still to go"
+            );
+            let (_, pan) = report(&mut link).await;
+            assert_eq!(
+                (pan.position.0, pan.column.get()),
+                (None, 7),
+                "column {column}: from the return's landing"
+            );
+        } else {
+            assert!(settled(&shown, 2), "column {column}: the pan is not made");
+            let probe = probed(&page, &view, &mut link, 3).await;
+            assert_eq!(
+                (probe.position.0, probe.column.get()),
+                (None, 5),
+                "column {column}: from the host's window"
+            );
+        }
+    }
+}
+
+/// KR-REQ-13.03: a pan behind a restore that lands at another column, held by a wider viewport, or
+/// on another line of the live screen, held by a taller one, is not made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pan_behind_a_restore_that_lands_at_another_column_or_line_is_not_made() {
+    // The anchor, the landing the host gives for it, and the probe's place from that landing.
+    let cases = [
+        (
+            "column",
+            wide_session().in_history(13, 8),
+            kept().in_history(13, 5),
+            (row_position(13), 8),
+        ),
+        (
+            "line",
+            wide_session().at(2, 0),
+            wide_session().at(1, 0),
+            (line_position(1), 3),
+        ),
+    ];
+    for (what, kept_at, landing, expected) in cases {
+        let mut worker = ScriptedWorker::start(Challenge::Answered);
+        let page = Page::new(worker.paths());
+        let anchor = place_of(&page, &mut worker, 3, &kept_at).await;
+        let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
+        page.pan(&view, 1, 0, -1);
+        let (restore, _) = report(&mut link).await;
+        link.answer(&restore, &viewport_answer(1)).await;
+        frame(&mut link, &landing.revision(1)).await;
+        let shown = first_showing(&page, 4).await;
+        assert_eq!(shown["note"], Value::Null, "{what}");
+        assert!(settled(&shown, 1), "{what}: the pan is told as not made");
+        let probe = probed(&page, &view, &mut link, 2).await;
+        assert_eq!(
+            (probe.position.0, probe.column.get()),
+            expected,
+            "{what}: the probe is the first report after the restore, from the host's landing"
+        );
+    }
+}
+
+/// KR-REQ-13.03, KR-REQ-13.18: a take made with a return to the live screen while the restore is in
+/// flight lets a paste through to the program before the return settles, and the restored screen is
+/// never shown: the first state is the live screen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_take_with_a_go_live_made_while_the_restore_is_in_flight_lets_a_paste_through_before_the_live_settles()
+ {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+    let anchor = place_of(&page, &mut worker, 3, &kept()).await;
+    let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
+    let (restore, asked) = report(&mut link).await;
+    assert_eq!(asked.position.0, row_position(13));
+    page.live(&view, 1);
+    page.take(&view, 1);
+    let acquire = link.expect(Method::InputAcquire).await;
+    link.answer(&restore, &viewport_answer(1)).await;
+    frame(&mut link, &kept().revision(1)).await;
+    let (live, asked) = report(&mut link).await;
+    assert_eq!(asked.position.0, None, "the return goes after the restore");
+    let mut lease = WorkerLease::default();
+    lease.answer(&mut link, &acquire).await;
+    page.newest(4, |state| control(state) == (1, "controlling".to_owned()))
+        .await;
+    page.paste(&view, 1, "x").expect("the paste is taken");
+    let (_, bytes) = next_write(&mut link, &mut lease).await;
+    assert!(
+        String::from_utf8_lossy(&bytes).contains('x'),
+        "the paste reached the program while the return was unanswered: {bytes:?}"
+    );
+    link.answer(&live, &viewport_answer(2)).await;
+    frame(&mut link, &wide_session().revision(2)).await;
+    let shown = first_showing(&page, 4).await;
+    assert_eq!(place(&shown), (0, 0, 0));
+    assert!(
+        page.states(4)
+            .iter()
+            .filter(|state| state["state"] == "showing")
+            .all(|state| first_row(state) != 13),
+        "no state starts at row 13"
+    );
 }

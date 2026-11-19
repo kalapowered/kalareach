@@ -895,6 +895,22 @@ pub struct Frame {
     pub mouse: Mouse,
     /// How the program reads keys.
     pub keys: Keys,
+    /// What the window's first row holds.
+    pub first: FirstRow,
+}
+
+/// What the first row of a window holds: the letters every row has, other text, nothing, or a row
+/// the host cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirstRow {
+    /// The letters of the alphabet across the session's width, as every other row.
+    Letters,
+    /// This text.
+    Text(&'static str),
+    /// No cells at all.
+    Blank,
+    /// The letters, marked as cut by the host.
+    Cut,
 }
 
 /// How a program reads keys, as a screen says: the keyboard negotiation of each buffer, and the
@@ -1065,7 +1081,13 @@ impl Frame {
             buffer: ProjectedBuffer::Primary,
             mouse: Mouse::Off,
             keys: Keys::ordinary(),
+            first: FirstRow::Letters,
         }
+    }
+
+    /// The same window, whose first row holds `first`.
+    pub fn first_row(self, first: FirstRow) -> Self {
+        Self { first, ..self }
     }
 
     /// The same window, of a program that reads keys as `keys` says.
@@ -1117,10 +1139,21 @@ impl Frame {
     pub fn rows(&self) -> Vec<ProjectedRow> {
         (self.top_row..self.top_row + self.window_rows)
             .map(|id| {
-                let text: String = (0..self.columns)
+                let letters: String = (0..self.columns)
                     .map(|column| char::from(b'a' + u8::try_from(column % 26).unwrap_or(0)))
                     .collect();
-                row(id, &text)
+                if id != self.top_row {
+                    return row(id, &letters);
+                }
+                match self.first {
+                    FirstRow::Letters => row(id, &letters),
+                    FirstRow::Text(text) => row(id, text),
+                    FirstRow::Blank => row(id, ""),
+                    FirstRow::Cut => ProjectedRow {
+                        truncated: true,
+                        ..row(id, &letters)
+                    },
+                }
             })
             .collect()
     }
