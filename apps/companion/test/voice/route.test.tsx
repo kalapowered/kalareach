@@ -1494,6 +1494,61 @@ describe('while a call is running', () => {
     })
   })
 
+  // A call left to the host does not lapse: the host's own rule ends it, and what the device owes
+  // for it stands until the host says it is closed. The screen sets a timer to read the device at
+  // the first lapse of what is owed that lapses, and sets none for a call left to the host.
+  describe('the timer for the lapse of what is owed', () => {
+    const far = 1_700_000
+
+    /** The delays, about as long as `far`, of the timers the screen sets from now on. */
+    function watchLapseTimers(): () => number[] {
+      const delays: number[] = []
+      const real = window.setTimeout.bind(window)
+      vi.spyOn(window, 'setTimeout').mockImplementation(((
+        handler: TimerHandler,
+        delay?: number,
+        ...args: unknown[]
+      ) => {
+        if (typeof delay === 'number') delays.push(delay)
+        return real(handler, delay, ...args)
+      }) as typeof window.setTimeout)
+      return () => delays.filter((delay) => delay > far - 100_000 && delay <= far + 100)
+    }
+
+    it('is set for what is owed that lapses', async () => {
+      const lapses = watchLapseTimers()
+      start((controls) => {
+        controls.oweVoice({ until_ms: Date.now() + far })
+      })
+      await waitForChoice()
+      expect(await screen.findByRole('status', { name: 'The last call' })).toBeInTheDocument()
+
+      await waitFor(() => {
+        expect(lapses().length).toBeGreaterThan(0)
+      })
+    })
+
+    it('is not set for a call left to the host', async () => {
+      const lapses = watchLapseTimers()
+      start((controls) => {
+        controls.oweVoice({
+          kind: 'host_close',
+          words:
+            'The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it.',
+          until_ms: Date.now() + far
+        })
+      })
+      await waitForChoice()
+      expect(await screen.findByRole('status', { name: 'The last call' })).toBeInTheDocument()
+      // The effects of the render that showed the notice have run.
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      expect(lapses()).toEqual([])
+    })
+  })
+
   // The voice service is asked after the host and the screen does not wait for it: what it came to
   // is said when it is known.
   it('says what the voice service came to once it has said', async () => {
