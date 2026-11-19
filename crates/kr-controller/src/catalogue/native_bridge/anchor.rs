@@ -428,6 +428,7 @@ pub(crate) mod publish_pause {
     }
 
     /// Runs `then` once, the next time a write on this thread has staged its file.
+    #[cfg(unix)]
     pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
         BEFORE_PUBLISH.with(|before| *before.borrow_mut() = Some(Box::new(then)));
     }
