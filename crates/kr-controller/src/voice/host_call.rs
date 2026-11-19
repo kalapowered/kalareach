@@ -228,7 +228,8 @@ struct CallState {
     /// Whether the model was told, and the write was accepted, that the phone is silent.
     silent_told: bool,
     /// Whether the model is owed the note that the phone is back, because it was told the phone
-    /// was silent and the write of the note that it is back was refused by the pace.
+    /// was silent and the note that it is back is not yet written. A writer claims it under the
+    /// lock before its write awaits, and sets it again when the write is not done with.
     back_owed: bool,
     delegations: BTreeMap<String, DelegationRecord>,
     told: BTreeMap<Option<String>, Told>,
@@ -674,17 +675,25 @@ impl HostCall {
     /// Runs the phone-absence rules. Returns true when the phone has been silent long enough that
     /// the caller begins closing the call.
     ///
-    /// A note the call's pace refuses is kept, and written on a later pass: the model is told the
-    /// phone is silent, or back, once the write is accepted and not before.
+    /// A note counts as told when it was written, or refused for a reason a later try would not
+    /// change (too large, or refused by the provider). Any other refusal keeps it owed: the call's
+    /// pace, a side channel that is not ready or was lost. It is written on a later pass.
     async fn tick(&self, now_ms: u64) -> bool {
         let (silent_for, beat, back, tell) = {
-            let state = self.state();
+            let mut state = self.state();
             if state.ended.is_some() {
                 return false;
             }
             let silent_for = now_ms.saturating_sub(state.last_beat_ms);
             let tell = silent_for >= SILENT_AFTER_MS && !state.silent_told;
-            (silent_for, state.last_beat_ms, state.back_owed, tell)
+            // An owed back note is claimed here, under the lock, so that a request that comes
+            // while it is written does not write it too.
+            (
+                silent_for,
+                state.last_beat_ms,
+                std::mem::take(&mut state.back_owed),
+                tell,
+            )
         };
         if back {
             self.tell_that_the_phone_is_back().await;
@@ -702,7 +711,9 @@ impl HostCall {
     }
 
     /// Writes one automatic note. Says whether the note is done with: written, or refused for a
-    /// reason a later try would not change. A note the pace refused is not done with.
+    /// reason a later try would not change (too large, or refused by the provider). A refusal that
+    /// a later try can change (the call's pace, a side channel that is not ready, one that was
+    /// lost) leaves the note owed.
     async fn write_automatic_note(&self, note: HostNote) -> bool {
         let id = self.next_write_id(None);
         let Ok(frame) = VoiceContextFrame::new(
@@ -713,15 +724,17 @@ impl HostCall {
         ) else {
             return true;
         };
-        !matches!(
+        matches!(
             self.control.write(self.control.revision(), frame).await,
-            Err(WriteRefusal::Rate)
+            Ok(()) | Err(WriteRefusal::TooLarge | WriteRefusal::ProviderRefused)
         )
     }
 
+    /// Writes the back note that the caller claimed from `back_owed`, and owes it again when it
+    /// is not done with.
     async fn tell_that_the_phone_is_back(&self) {
-        if self.write_automatic_note(HostNote::PhoneBack).await {
-            self.state().back_owed = false;
+        if !self.write_automatic_note(HostNote::PhoneBack).await {
+            self.state().back_owed = true;
         }
     }
 
@@ -739,9 +752,11 @@ impl HostCall {
     }
 
     /// Notes that the next request after a silence is the phone coming back, and tells the model
-    /// once. Every control arm but the heartbeat calls it, as does the heartbeat itself. A note
-    /// the pace refuses is owed, and written by the next request or the next pass of the tick; it
-    /// never waits inside a request's answer.
+    /// once. Every control arm calls it, the heartbeat among them, and the request's answer waits
+    /// for the write of the note, which is bounded by the side channel's own write bound. A note
+    /// that is not done with is owed, and written by the next request or the next pass of the
+    /// tick. The owed note is claimed under the lock before the write awaits, so a request and a
+    /// pass that meet write it once between them.
     pub async fn phone_is_back(&self, now_ms: u64) {
         let owed = {
             let mut state = self.state();
@@ -750,7 +765,7 @@ impl HostCall {
                 state.back_owed = true;
             }
             state.last_beat_ms = now_ms;
-            state.back_owed
+            std::mem::take(&mut state.back_owed)
         };
         if owed {
             self.tell_that_the_phone_is_back().await;
@@ -1360,6 +1375,8 @@ mod tests {
         /// Whether a write is taken and then reported as not finished: the provider may have read
         /// it, and the writer cannot say.
         loses_the_write: std::sync::atomic::AtomicBool,
+        /// A gate every write waits at, until the test lets the writes through.
+        gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
         pacer: Mutex<Pacer>,
     }
 
@@ -1378,6 +1395,7 @@ mod tests {
                 closes_with_the_write: std::sync::atomic::AtomicBool::new(false),
                 rate_refuses: std::sync::atomic::AtomicBool::new(false),
                 loses_the_write: std::sync::atomic::AtomicBool::new(false),
+                gate: Mutex::new(None),
                 pacer: Mutex::new(Pacer::new(timings.burst_window, timings.minute_window)),
             })
         }
@@ -1455,6 +1473,10 @@ mod tests {
                 }
                 if self.rate_refuses.load(Ordering::SeqCst) || self.next_write_at().is_some() {
                     return Err(WriteRefusal::Rate);
+                }
+                let gate = self.gate.lock().expect("the gate").clone();
+                if let Some(gate) = gate {
+                    gate.notified().await;
                 }
                 self.pacer
                     .lock()
@@ -2692,6 +2714,71 @@ mod tests {
         };
         owed_then_paid(false).await;
         owed_then_paid(true).await;
+    }
+
+    /// A note refused while the side channel recovers is not counted as told: it is kept, and
+    /// written once the channel is ready again.
+    #[tokio::test]
+    async fn a_note_refused_while_the_channel_recovers_is_kept_and_written_when_it_is_back() {
+        let (calls, call, sideband) = held();
+        // The silent note meets a channel that is not ready.
+        sideband.set(SidebandState::Recovering);
+        assert!(calls.tick(OPENED + 45_000).await.is_empty());
+        assert!(sideband.written().is_empty(), "the channel was not ready");
+        sideband.set(SidebandState::Ready);
+        assert!(calls.tick(OPENED + 50_000).await.is_empty());
+        let written = sideband.written();
+        assert_eq!(
+            written.len(),
+            1,
+            "the kept note is written once the channel is ready"
+        );
+        assert_eq!(written[0].2.as_deref(), Some(HostNote::PhoneSilent.words()));
+        // The back note meets a channel that is not ready.
+        sideband.set(SidebandState::Recovering);
+        call.phone_is_back(OPENED + 70_000).await;
+        assert_eq!(sideband.written().len(), 1, "the channel was not ready");
+        sideband.set(SidebandState::Ready);
+        call.phone_is_back(OPENED + 71_000).await;
+        let written = sideband.written();
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[1].2.as_deref(), Some(HostNote::PhoneBack.words()));
+        assert!(calls.tick(OPENED + 72_000).await.is_empty());
+        call.phone_is_back(OPENED + 73_000).await;
+        assert_eq!(sideband.written().len(), 2, "told once");
+    }
+
+    /// A request and a pass of the tick that meet while the owed back note is written write it
+    /// once between them.
+    #[tokio::test]
+    async fn a_tick_and_a_request_that_meet_write_the_owed_back_note_once() {
+        let (calls, call, sideband) = held();
+        assert!(calls.tick(OPENED + 45_000).await.is_empty());
+        assert_eq!(sideband.written().len(), 1, "the silent note");
+        sideband.rate_refuses.store(true, Ordering::SeqCst);
+        call.phone_is_back(OPENED + 70_000).await;
+        assert_eq!(
+            sideband.written().len(),
+            1,
+            "the pace refused the back note"
+        );
+        sideband.rate_refuses.store(false, Ordering::SeqCst);
+        // Both reach the side channel before either write is let through.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *sideband.gate.lock().expect("the gate") = Some(Arc::clone(&gate));
+        let pass = calls.tick(OPENED + 75_000);
+        let request = call.phone_is_back(OPENED + 76_000);
+        let open = async {
+            settle().await;
+            gate.notify_waiters();
+        };
+        let (_, (), ()) = tokio::join!(pass, request, open);
+        let backs = sideband
+            .written()
+            .iter()
+            .filter(|(_, _, words)| words.as_deref() == Some(HostNote::PhoneBack.words()))
+            .count();
+        assert_eq!(backs, 1, "the owed note is written once");
     }
 
     #[tokio::test]
