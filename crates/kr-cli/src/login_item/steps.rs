@@ -214,11 +214,10 @@ fn flush(directory: &Path, doing: Doing) -> Result<()> {
 }
 
 fn write_record(run: &Run, record: &Record, doing: Doing) -> Result<()> {
-    kr_ipc::paths::write_owner_only_file(&run.paths.record, &record.bytes()).map_err(|error| {
-        StepError {
-            doing,
-            cause: Cause::Ipc(error),
-        }
+    let bytes = record.bytes().map_err(io(doing))?;
+    kr_ipc::paths::write_owner_only_file(&run.paths.record, &bytes).map_err(|error| StepError {
+        doing,
+        cause: Cause::Ipc(error),
     })
 }
 
