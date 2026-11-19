@@ -8,19 +8,26 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use kr_protocol::broker::{ActionProvenance, BrokerGrant, BrokerGrants};
+use kr_protocol::broker::{
+    ActionName, ActionProvenance, ActionTokenClaim, BrokerGrant, BrokerGrants,
+    InstanceCapabilityRecord, InstanceCapabilityState, InstanceEvidenceSource,
+    InstanceInvalidation, MAX_BROKER_REASON_LEN,
+};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{GatewayMode, PendingResource, PendingState};
-use kr_protocol::ids::{ActorId, AgentBindingRevision, PendingResourceId, PublisherId};
+use kr_protocol::ids::{
+    ActorId, AgentBindingRevision, AgentThreadId, CapabilityId, CapabilityRevision, GrantId,
+    PendingResourceId, PublisherId,
+};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
-use kr_worker::broker::Broker;
 use kr_worker::broker::channel_fixture::{
     Channel, PERMISSION_REQUEST, Package, binding, channel_process, instance, launched, register,
-    session,
+    register_with_digest, session,
 };
 use kr_worker::broker::channels::ChannelEnd;
 use kr_worker::broker::connectors::{InstalledConnector, decoding_trust, fixture};
 use kr_worker::broker::ledger::TransitionCause;
+use kr_worker::broker::{Broker, BrokerError, Invocation};
 use kr_worker::persistence::JournalHealth;
 
 mod common;
@@ -2201,4 +2208,412 @@ async fn record_the_frames_of_an_approval_and_its_verdict() {
     .expect("the record is written");
     channel.close().await;
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
+}
+
+// -- evidence the product's own channel writer records ----------------------------------------------
+
+/// The record an instance holds about its approval capability, where it holds one.
+fn approval(broker: &Broker, number: u8) -> Option<InstanceCapabilityRecord> {
+    broker
+        .capabilities(instance(number))
+        .record(&CapabilityId::new("agent.approval").expect("valid"))
+        .cloned()
+}
+
+/// Opens an instance's channel, relays one approval through it, and waits until the broker holds
+/// the evidence the product records for a relayed approval.
+async fn channel_with_evidence(broker: &Arc<Broker>, package: &Package, number: u8) -> Channel {
+    let mut channel = Channel::open(
+        package.launch(broker, number, Some(fixture::QUALIFIED_VERSION)),
+        number,
+        launched(number),
+    );
+    channel.relay("abcde").await;
+    eventually("the relayed approval is recorded as evidence", || {
+        approval(broker, number).is_some_and(|record| record.state.is_usable())
+    })
+    .await;
+    channel
+}
+
+/// Binds the connector's package to an instance with the grant an action needs as well.
+fn bound_to_act(package: &Package, broker: &Broker, number: u8) {
+    broker
+        .bind_descriptor(
+            binding(number),
+            instance(number),
+            package.connector.plugin_id(),
+            PublisherId::new("kalareach").expect("valid"),
+            package.connector.package_digest(),
+            BrokerGrants::granted([
+                BrokerGrant::ApprovalInterpreter,
+                BrokerGrant::UpstreamAction,
+            ]),
+            decoding_trust(&package.connector, TimestampMs::new(1)),
+            TimestampMs::new(1),
+        )
+        .expect("the package is bound");
+}
+
+/// An action of the instance that needs its approval capability, read at `read_at`.
+fn needing_approval(
+    number: u8,
+    binding_revision: u64,
+    read_at: Option<CapabilityRevision>,
+) -> Invocation {
+    Invocation {
+        actor_id: ActorId::new("device-1").expect("valid"),
+        grant: BrokerGrant::UpstreamAction,
+        grant_id: Some(GrantId::new(Uuid::from_bytes([7; 16]))),
+        application_instance_id: instance(number),
+        binding_revision: AgentBindingRevision::new(binding_revision),
+        action: ActionName::new("prompt.submit").expect("valid"),
+        draft_id: None,
+        capability: Some((CapabilityId::new("agent.approval").expect("valid"), read_at)),
+        parameters: b"{}".to_vec(),
+    }
+}
+
+/// KR-REQ-11.17: a rebind withdraws the evidence a channel gathered through the old binding, and
+/// what was prepared against it stops being authority: a token issued before the move cannot be
+/// spent, and an action prepared at the capability's old revision is refused.
+#[tokio::test]
+async fn kr_req_11_17_a_rebind_withdraws_the_evidence_gathered_through_the_old_binding() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    bound_to_act(&package, &broker, 2);
+    let mut channel = channel_with_evidence(&broker, &package, 2).await;
+    let before = approval(&broker, 2).expect("the evidence is held");
+    let token = broker
+        .issue_token(
+            binding(2),
+            &needing_approval(2, 1, None),
+            TimestampMs::new(2),
+        )
+        .expect("an action on the evidence is issued its token");
+
+    let moved = broker
+        .advance_binding(
+            instance(2),
+            Some(AgentThreadId::new("thread-1").expect("a thread")),
+            TimestampMs::new(3),
+        )
+        .expect("the binding moves");
+
+    let after = approval(&broker, 2).expect("the record is still held");
+    assert_eq!(
+        after.state,
+        InstanceCapabilityState::NotTested,
+        "the evidence gathered through the old binding is withdrawn"
+    );
+    assert_eq!(
+        after.disabled_reason.0.as_deref(),
+        Some("the upstream owner or selected thread changed")
+    );
+    assert_eq!(after.revision.get(), before.revision.get() + 1);
+    assert!(
+        broker.spend_token(&ActionTokenClaim::from(&token)).is_err(),
+        "a token issued before the move is not authority after it"
+    );
+    let stale = broker
+        .issue_token(
+            binding(2),
+            &needing_approval(2, moved.get(), Some(before.revision)),
+            TimestampMs::new(4),
+        )
+        .expect_err("an action prepared at the old capability revision is refused");
+    assert!(
+        matches!(stale, BrokerError::StaleBinding { .. }),
+        "{stale:?}"
+    );
+    channel.close().await;
+    let _ = channel.ended().await;
+}
+
+/// KR-REQ-11.17: an action rechecks its capability when its token is spent, and a capability that
+/// was withdrawn while the action waited is refused for what it is: the tokens and the binding's
+/// revision stay as they were, so the recheck is the only thing that refuses.
+#[tokio::test]
+async fn kr_req_11_17_an_action_whose_capability_was_withdrawn_meanwhile_is_refused_when_its_token_is_spent()
+ {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    bound_to_act(&package, &broker, 2);
+    let mut channel = channel_with_evidence(&broker, &package, 2).await;
+    let held = approval(&broker, 2).expect("the evidence is held");
+    let unread = broker
+        .issue_token(
+            binding(2),
+            &needing_approval(2, 1, None),
+            TimestampMs::new(2),
+        )
+        .expect("a token for an action that read no revision");
+    let read = broker
+        .issue_token(
+            binding(2),
+            &needing_approval(2, 1, Some(held.revision)),
+            TimestampMs::new(3),
+        )
+        .expect("a token for an action that read the revision held");
+
+    // The channel closes while the actions wait: the capability is withdrawn and nothing else moves.
+    channel.close().await;
+    let _ = channel.ended().await;
+    let withdrawn = approval(&broker, 2).expect("the record is still held");
+    assert_eq!(
+        withdrawn.state,
+        InstanceCapabilityState::TemporarilyUnavailable
+    );
+    assert_eq!(withdrawn.revision.get(), held.revision.get() + 1);
+    assert_eq!(
+        broker
+            .binding_state(instance(2))
+            .expect("the instance is held")
+            .binding_revision
+            .get(),
+        1,
+        "the binding did not move"
+    );
+
+    let refused = broker
+        .spend_token(&ActionTokenClaim::from(&unread))
+        .expect_err("the recheck refuses a capability that is not usable");
+    match refused {
+        BrokerError::UnsupportedCapability { detail } => assert!(
+            detail.contains("agent.approval"),
+            "the refusal names the capability: {detail}"
+        ),
+        other => panic!("a withdrawn capability is refused as one: {other:?}"),
+    }
+    let moved = broker
+        .spend_token(&ActionTokenClaim::from(&read))
+        .expect_err("an action that read an earlier revision is refused");
+    assert!(
+        matches!(moved, BrokerError::StaleBinding { .. }),
+        "{moved:?}"
+    );
+}
+
+/// KR-REQ-11.17: an action prepared at a capability revision that has moved is refused when it is
+/// issued, and one that read no revision is refused for the capability's state; before the change
+/// the revision held issues.
+#[tokio::test]
+async fn kr_req_11_17_an_action_prepared_at_a_capability_revision_that_moved_is_refused() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    bound_to_act(&package, &broker, 2);
+    let mut channel = channel_with_evidence(&broker, &package, 2).await;
+    let held = approval(&broker, 2).expect("the evidence is held");
+    broker
+        .issue_token(
+            binding(2),
+            &needing_approval(2, 1, Some(held.revision)),
+            TimestampMs::new(2),
+        )
+        .expect("the revision the caller read is the one held");
+
+    channel.close().await;
+    let _ = channel.ended().await;
+
+    let stale = broker
+        .issue_token(
+            binding(2),
+            &needing_approval(2, 1, Some(held.revision)),
+            TimestampMs::new(3),
+        )
+        .expect_err("a revision that moved is refused");
+    assert!(
+        matches!(stale, BrokerError::StaleBinding { .. }),
+        "{stale:?}"
+    );
+    let unusable = broker
+        .issue_token(
+            binding(2),
+            &needing_approval(2, 1, None),
+            TimestampMs::new(4),
+        )
+        .expect_err("a capability that is not usable is refused");
+    assert!(
+        matches!(unusable, BrokerError::UnsupportedCapability { .. }),
+        "{unusable:?}"
+    );
+}
+
+/// KR-REQ-11.17: the grant and the capability are rechecked independently: a withdrawn grant is
+/// refused as the grant, and the capability's record is left as it was.
+#[tokio::test]
+async fn kr_req_11_17_a_withdrawn_grant_is_refused_as_the_grant_while_the_capability_stays_usable()
+{
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    bound_to_act(&package, &broker, 2);
+    let mut channel = channel_with_evidence(&broker, &package, 2).await;
+    let held = approval(&broker, 2).expect("the evidence is held");
+
+    broker
+        .withdraw_grant(binding(2), BrokerGrant::UpstreamAction)
+        .expect("the grant is withdrawn");
+
+    let refused = broker
+        .issue_token(
+            binding(2),
+            &needing_approval(2, 1, Some(held.revision)),
+            TimestampMs::new(2),
+        )
+        .expect_err("an action the grant no longer allows is refused");
+    assert!(matches!(refused, BrokerError::Grant(_)), "{refused:?}");
+    assert_eq!(
+        approval(&broker, 2),
+        Some(held),
+        "the capability's record is as it was"
+    );
+    channel.close().await;
+    let _ = channel.ended().await;
+}
+
+/// KR-REQ-11.17: a record the channel's writer makes names only causes a detector raises: the
+/// binary, which an image refusal raises, and the binding, which a rebind does.
+#[tokio::test]
+async fn kr_req_11_17_a_channel_record_names_only_causes_a_detector_raises() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    let package = Package::laid_out();
+    let mut channel = channel_with_evidence(&broker, &package, 2).await;
+    let record = approval(&broker, 2).expect("the evidence is held");
+    let raised = [
+        InstanceInvalidation::BinaryChanged,
+        InstanceInvalidation::BindingChanged,
+    ];
+    assert!(
+        raised
+            .iter()
+            .all(|cause| record.invalidated_by.contains(cause)),
+        "the record names both causes: {:?}",
+        record.invalidated_by
+    );
+    assert!(
+        record
+            .invalidated_by
+            .iter()
+            .all(|cause| raised.contains(cause)),
+        "and no cause nothing raises: {:?}",
+        record.invalidated_by
+    );
+    channel.close().await;
+    let _ = channel.ended().await;
+}
+
+/// KR-REQ-11.17: a launch that begins after an upgrade starts with no evidence of the earlier one:
+/// the end of an instance takes its map with it, and the next instance under the same identifier
+/// records the digest its own launch hashed.
+#[tokio::test]
+async fn kr_req_11_17_a_new_launch_after_an_upgrade_starts_with_no_inherited_evidence() {
+    let broker = memory_broker();
+    let older = Digest256::from_bytes([3; 32]);
+    let upgraded = Digest256::from_bytes([4; 32]);
+    register_with_digest(&broker, 2, older);
+    let package = Package::laid_out();
+    let mut first = channel_with_evidence(&broker, &package, 2).await;
+    assert_eq!(
+        approval(&broker, 2)
+            .expect("the evidence is held")
+            .identity
+            .binary_digest
+            .0,
+        Some(older)
+    );
+
+    assert!(broker.end(instance(2)), "the instance was registered");
+    assert!(
+        broker.capabilities(instance(2)).records.is_empty(),
+        "the end of an instance takes its map with it"
+    );
+    // Its channel ends too, before the identifier is used again: a second channel for an
+    // identifier is refused while the first is open.
+    first.close().await;
+    let _ = first.ended().await;
+
+    register_with_digest(&broker, 2, upgraded);
+    let mut second = channel_with_evidence(&broker, &package, 2).await;
+    assert_eq!(
+        approval(&broker, 2)
+            .expect("the evidence is held")
+            .identity
+            .binary_digest
+            .0,
+        Some(upgraded),
+        "the new launch's evidence names the executable it hashed"
+    );
+    second.close().await;
+    let _ = second.ended().await;
+}
+
+/// KR-REQ-11.17: a refusal that arrives after the instance ended holds nothing: the identifier's
+/// next instance records evidence as any other.
+#[tokio::test]
+async fn kr_req_11_17_a_refusal_that_arrives_after_the_instance_ended_holds_nothing() {
+    let broker = memory_broker();
+    register(&broker, 2);
+    assert!(broker.end(instance(2)), "the instance was registered");
+    broker.image_refused(instance(2), "the program is another one");
+
+    register(&broker, 2);
+    let package = Package::laid_out();
+    let mut channel = Channel::open(
+        package.launch(&broker, 2, Some(fixture::QUALIFIED_VERSION)),
+        2,
+        launched(2),
+    );
+    // The channel takes its frames one at a time and records the evidence of the first before it
+    // reads the second, so once the second is recorded the first's evidence has been decided.
+    channel.relay("abcde").await;
+    channel.relay("fghij").await;
+    eventually("both approvals are recorded", || {
+        ["abcde", "fghij"]
+            .iter()
+            .all(|request| relayed(&broker, 2, request).is_some())
+    })
+    .await;
+    assert!(
+        approval(&broker, 2).is_some_and(|record| record.state.is_usable()),
+        "a refusal that came after the end holds no instance: the next one records its evidence"
+    );
+    channel.close().await;
+    let _ = channel.ended().await;
+}
+
+/// KR-REQ-11.17: a refusal's reason is cut to the wire's bound at a character boundary, so no
+/// refusal text makes a record the wire refuses, whichever side of a character the cut falls on.
+#[tokio::test]
+async fn kr_req_11_17_an_image_refusals_reason_is_cut_to_the_reason_bound() {
+    let broker = memory_broker();
+    let package = Package::laid_out();
+    let mut channels = Vec::new();
+    for (number, refusal) in [
+        (2_u8, "é".repeat(2000)),
+        (3_u8, format!("a{}", "é".repeat(2000))),
+    ] {
+        register(&broker, number);
+        channels.push(channel_with_evidence(&broker, &package, number).await);
+        broker.image_refused(instance(number), &refusal);
+        let record = approval(&broker, number).expect("the record is held");
+        assert_eq!(record.state, InstanceCapabilityState::NotTested);
+        assert_eq!(record.source, InstanceEvidenceSource::HostProbe);
+        let reason = record.disabled_reason.0.clone().expect("a reason");
+        assert!(
+            reason.len() <= MAX_BROKER_REASON_LEN,
+            "{} bytes is over the bound",
+            reason.len()
+        );
+        assert!(reason.starts_with("the host cannot confirm that the program still runs"));
+        record.validate().expect("the wire accepts the record");
+    }
+    for mut channel in channels {
+        channel.close().await;
+        let _ = channel.ended().await;
+    }
 }

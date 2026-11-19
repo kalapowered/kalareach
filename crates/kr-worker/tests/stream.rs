@@ -3730,3 +3730,250 @@ async fn kr_req_12_06_a_selection_answered_after_an_unreadable_request_names_the
         .await;
     assert!(unknown(world.waiting()), "{:?}", world.waiting());
 }
+
+/// The four capabilities a gateway connection's tables give the instance, and the one they refuse.
+const GATEWAY_CAPABILITIES: [&str; 5] = [
+    "agent.prompt",
+    "agent.prompt.queue",
+    "agent.steer",
+    "agent.cancel",
+    "agent.approval",
+];
+
+impl World {
+    /// The record the instance holds about one capability.
+    fn record(&self, name: &str) -> kr_protocol::broker::InstanceCapabilityRecord {
+        self.broker
+            .capabilities(instance())
+            .record(&CapabilityId::new(name).expect("a capability"))
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} is recorded"))
+    }
+}
+
+/// KR-REQ-11.17: a refused image withdraws what a gateway connection's tables gave the instance,
+/// and nothing that renews that evidence afterwards writes it usable again: the record the
+/// renewal would write is refused for the instance.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_17_a_refused_image_leaves_gateway_evidence_withdrawn_through_renewal() {
+    let world = World::new(1 << 20);
+    for name in [
+        "agent.prompt",
+        "agent.steer",
+        "agent.cancel",
+        "agent.approval",
+    ] {
+        assert_eq!(
+            world.record(name).state,
+            InstanceCapabilityState::QualifiedAvailable,
+            "{name} is usable before the refusal"
+        );
+    }
+    world
+        .broker
+        .image_refused(instance(), "the program is another one");
+    let withdrawn: Vec<_> = GATEWAY_CAPABILITIES
+        .iter()
+        .map(|name| (*name, world.record(name)))
+        .collect();
+    for name in [
+        "agent.prompt",
+        "agent.steer",
+        "agent.cancel",
+        "agent.approval",
+    ] {
+        let record = &world.record(name);
+        assert_eq!(
+            record.state,
+            InstanceCapabilityState::NotTested,
+            "{name}: the refusal withdraws the evidence"
+        );
+        assert_eq!(
+            record.source,
+            kr_protocol::broker::InstanceEvidenceSource::HostProbe
+        );
+    }
+
+    // A change of a grant renews every connection's evidence: the instance is held, so nothing it
+    // would write is taken.
+    world
+        .broker
+        .withdraw_grant(
+            binding_id(),
+            kr_protocol::broker::BrokerGrant::UpstreamAction,
+        )
+        .expect("the grant is withdrawn");
+    for (name, earlier) in withdrawn {
+        assert_eq!(
+            world.record(name),
+            earlier,
+            "{name}: a renewal after the refusal leaves the record as it was"
+        );
+    }
+}
+
+/// KR-REQ-11.17: a mutation admitted before an image refusal is stopped when its permit is taken,
+/// with nothing sent and the refusal proven unsent, whether it is taken for a caller's transport or
+/// dispatched.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_17_a_mutation_admitted_before_an_image_refusal_is_stopped_at_its_take() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    world
+        .server_says(&turn_event("turn/started", "thread-1", "turn-7"))
+        .await;
+    let caller = World::owner_caller();
+    let steer = kr_protocol::agent::AgentSteerParams {
+        target: world.target(),
+        turn_id: World::turn_id("turn-7"),
+        text: kr_protocol::agent::PromptText::new("steer").expect("a steer"),
+    };
+    let admitted = world
+        .broker
+        .admit_steer(&caller, &steer, NOW)
+        .expect("the steer is admitted");
+    world
+        .broker
+        .image_refused(instance(), "the program is another one");
+    let Err(stopped) = world.broker.take_mutation(&admitted) else {
+        panic!("a permit admitted before an image refusal is stopped");
+    };
+    assert!(stopped.proven_unsent(), "{stopped:?}");
+    let kr_worker::broker::BrokerError::NotTransmitted(cause) = stopped else {
+        panic!("a refusal at the take is proven unsent");
+    };
+    assert!(
+        matches!(
+            *cause,
+            kr_worker::broker::BrokerError::UnsupportedCapability { .. }
+        ),
+        "the cause is the program: {cause:?}"
+    );
+    world.nothing_written().await;
+
+    // The same for a mutation dispatched in one step.
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let admitted = world
+        .broker
+        .admit_prompt(&caller, &world.prompt("hello"), false, NOW)
+        .expect("a prompt is admitted");
+    world
+        .broker
+        .image_refused(instance(), "the program is another one");
+    let Err(stopped) = world.broker.dispatch_mutation(&admitted, NOW) else {
+        panic!("a dispatch admitted before an image refusal is stopped");
+    };
+    assert!(stopped.proven_unsent(), "{stopped:?}");
+    world.nothing_written().await;
+}
+
+/// KR-REQ-11.17: a mutation admitted after an image refusal is refused at its admission for the
+/// capability it needs, as the independent recheck of a capability does for any evidence that is
+/// not usable; the binding, the transport and what was written are as they were.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_17_an_upstream_mutation_admitted_after_an_image_refusal_is_refused_for_its_capability()
+ {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let revision = world.revision();
+    world
+        .broker
+        .image_refused(instance(), "the program is another one");
+    let refused = world
+        .broker
+        .admit_prompt(&World::owner_caller(), &world.prompt("hello"), false, NOW)
+        .expect_err("a prompt whose capability was withdrawn is refused at its admission");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UnsupportedCapability,
+        "{refused:?}"
+    );
+    assert!(
+        refused.to_string().contains("agent.prompt"),
+        "the refusal names the capability: {refused}"
+    );
+    assert_eq!(world.revision(), revision, "the binding did not move");
+    assert_eq!(world.thread().as_deref(), Some("thread-1"));
+    world.nothing_written().await;
+}
+
+/// KR-REQ-11.17: a change of binding is renewed for a gateway connection at once: the records its
+/// tables give are written again at the revision the instance is now at.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_17_a_rebind_renews_the_gateway_evidence_at_the_new_revision() {
+    let mut world = World::new(1 << 20);
+    world.terminal_selects("thread-1").await;
+    let before = world.record("agent.prompt");
+    let moved = world
+        .broker
+        .advance_binding(
+            instance(),
+            Some(kr_protocol::ids::AgentThreadId::new("thread-2").expect("a thread")),
+            NOW,
+        )
+        .expect("the binding moves");
+    for name in [
+        "agent.prompt",
+        "agent.steer",
+        "agent.cancel",
+        "agent.approval",
+    ] {
+        let record = world.record(name);
+        assert_eq!(
+            record.state,
+            InstanceCapabilityState::QualifiedAvailable,
+            "{name}: renewed"
+        );
+        assert_eq!(
+            record.identity.binding_revision.0,
+            Some(moved),
+            "{name}: written at the new binding revision"
+        );
+    }
+    assert!(
+        world.record("agent.prompt").revision.get() > before.revision.get(),
+        "a renewed record is a newer revision"
+    );
+}
+
+/// KR-REQ-11.17: a record the gateway's writer makes names only causes a detector raises: the
+/// binary, which an image refusal raises, and the binding, which a rebind does.
+///
+/// Not claimed: Windows, where no gateway runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_11_17_a_gateway_record_names_only_causes_a_detector_raises() {
+    use kr_protocol::broker::InstanceInvalidation;
+
+    let world = World::new(1 << 20);
+    let raised = [
+        InstanceInvalidation::BinaryChanged,
+        InstanceInvalidation::BindingChanged,
+    ];
+    for name in GATEWAY_CAPABILITIES {
+        let record = world.record(name);
+        assert!(
+            raised
+                .iter()
+                .all(|cause| record.invalidated_by.contains(cause)),
+            "{name} names both causes: {:?}",
+            record.invalidated_by
+        );
+        assert!(
+            record
+                .invalidated_by
+                .iter()
+                .all(|cause| raised.contains(cause)),
+            "{name} names no cause nothing raises: {:?}",
+            record.invalidated_by
+        );
+    }
+}
