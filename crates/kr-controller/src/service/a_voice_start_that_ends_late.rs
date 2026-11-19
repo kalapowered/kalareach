@@ -15,7 +15,7 @@ use kr_client::services::voice::{
     VoiceRefusalReason, VoiceSession, VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActorId, DeviceId, SessionId};
+use kr_protocol::ids::{ActionId, ActorId, DeviceId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::voice::{VoiceGrantParams, VoicePrepareParams, VoiceStartParams};
@@ -685,7 +685,13 @@ async fn a_start_that_comes_late_after_another_start_passed_leaves_its_hold_stan
 async fn a_start_the_hold_refused_is_told_the_same_refusal_when_it_is_sent_again() {
     let world = scripted(&Scripted::new()).await;
     let controller = Arc::clone(&world.controller);
-    let service = ServiceScript::new(vec![Answer::Fails(ErrorCode::OutcomeUnknown)], true);
+    let service = ServiceScript::new(
+        vec![
+            Answer::Fails(ErrorCode::OutcomeUnknown),
+            Answer::Refuses { gate: None },
+        ],
+        true,
+    );
     controller
         .voice()
         .attach_provider(Some(Arc::clone(&service) as Arc<dyn ManagedVoiceService>));
@@ -706,7 +712,9 @@ async fn a_start_the_hold_refused_is_told_the_same_refusal_when_it_is_sent_again
     .into_answer_for_test();
     assert!(first.is_err(), "{first:?}");
     service.a_start_arrives().await;
-    assert!(hold_of(&controller, &actor_id).is_some());
+    let first_action = hold_of(&controller, &actor_id)
+        .expect("the first start left its hold")
+        .action;
 
     // A second start is refused for the hold, and sent again under its action it is told the same.
     let mutation = voice_mutation_of(Method::VoiceStart, world.environment_id, &params);
@@ -721,17 +729,50 @@ async fn a_start_the_hold_refused_is_told_the_same_refusal_when_it_is_sent_again
     .into_answer_for_test()
     .expect_err("the device is held");
     assert_eq!(refused.code(), ErrorCode::DraftConflict, "{refused}");
-    let repeated = starting_under(&controller, actor_id.clone(), device.device_id, mutation)
-        .await
-        .expect("the repeat ran")
-        .into_answer_for_test()
-        .expect_err("the repeat is refused as the first send was");
+    let repeated = starting_under(
+        &controller,
+        actor_id.clone(),
+        device.device_id,
+        mutation.clone(),
+    )
+    .await
+    .expect("the repeat ran")
+    .into_answer_for_test()
+    .expect_err("the repeat is refused as the first send was");
     assert_eq!(repeated.code(), refused.code(), "{repeated}");
     assert_eq!(repeated.to_string(), refused.to_string());
     assert_eq!(
         service.arrived.available_permits(),
         0,
         "neither the refused start nor its repeat reached the service"
+    );
+
+    // The row ends: a start that names the first is sent, and the service refuses it. The refusal
+    // the second start was given is still its answer: the repeat is told it again, and asks the
+    // service nothing, though no hold stands to refuse it.
+    let ending = naming(
+        voice_mutation_of(Method::VoiceStart, world.environment_id, &params),
+        first_action,
+    );
+    let _ = starting_under(&controller, actor_id.clone(), device.device_id, ending)
+        .await
+        .expect("the named start ran");
+    service.a_start_arrives().await;
+    assert!(
+        hold_of(&controller, &actor_id).is_none(),
+        "the named start's refusal ended the row"
+    );
+    let again = starting_under(&controller, actor_id.clone(), device.device_id, mutation)
+        .await
+        .expect("the repeat after the row ended ran")
+        .into_answer_for_test()
+        .expect_err("the refusal is the action's answer, not the hold's");
+    assert_eq!(again.code(), refused.code(), "{again}");
+    assert_eq!(again.to_string(), refused.to_string());
+    assert_eq!(
+        service.arrived.available_permits(),
+        0,
+        "the repeat after the row ended asked the service nothing"
     );
     world.serving.abort();
 }
@@ -824,7 +865,16 @@ async fn a_restart_keeps_a_hold_written_before_the_answer() {
 
     let world = restarted(world).await;
     let controller = Arc::clone(&world.controller);
-    let after = ServiceScript::new(Vec::new(), true);
+    // The service answers a start that reaches it, so a restart that lost the row fails at the
+    // refusal below and not at the script.
+    let after = ServiceScript::new(
+        vec![Answer::Call {
+            call: "call-2",
+            replayed: false,
+            gate: None,
+        }],
+        true,
+    );
     controller
         .voice()
         .attach_provider(Some(Arc::clone(&after) as Arc<dyn ManagedVoiceService>));
@@ -850,9 +900,25 @@ async fn a_restart_keeps_a_hold_written_before_the_answer() {
     world.serving.abort();
 }
 
+/// What a start whose admission ended after the service answered saw: the calls the host asked the
+/// service to close, the action of the row that stands, and what the next start found.
+struct AfterTheAdmissionEnded {
+    ended: String,
+    closes: Vec<String>,
+    action: ActionId,
+    row: Option<ActionId>,
+    /// The code the next start was refused with, or none when it was answered.
+    next: Option<ErrorCode>,
+    /// The starts that reached the service after the first.
+    reached_the_service_after: usize,
+}
+
 /// A start whose admission ends after the service answered with a call: the host closes the call,
-/// and its hold ends only when that close is confirmed.
-async fn the_admission_ends_after_the_service_answered(close_works: bool, seed: u8) {
+/// and its hold ends only when that close is confirmed. The case that calls it asserts.
+async fn the_admission_ends_after_the_service_answered(
+    close_works: bool,
+    seed: u8,
+) -> AfterTheAdmissionEnded {
     let (let_it_answer, gate) = tokio::sync::oneshot::channel();
     let (world, service, device_id, actor_id, params) = with_service(
         vec![
@@ -890,64 +956,72 @@ async fn the_admission_ends_after_the_service_answered(close_works: bool, seed: 
         .expect("the start ran")
         .into_answer_for_test()
         .expect_err("a start whose admission ended is not given its answer");
-    assert_eq!(
-        service.closes(),
-        vec!["call-1".to_owned()],
-        "the host asked the service to close the call it made: {ended}"
-    );
-    if close_works {
-        assert!(
-            hold_of(&controller, &actor_id).is_none(),
-            "the close was confirmed, so the hold ends"
-        );
-        let answered = starting(
-            &controller,
-            world.environment_id,
-            actor_id.clone(),
-            device_id,
-            &params,
-        )
-        .await
-        .expect("the next start ran")
-        .into_answer_for_test();
-        let Ok(_) = answered else {
-            panic!("the device is not held: {answered:?}");
-        };
-        assert_eq!(service.arrived.available_permits(), 1);
-    } else {
-        assert_eq!(
-            hold_of(&controller, &actor_id).map(|row| row.action),
-            Some(mutation.action_id),
-            "the close was not confirmed, so the hold stands"
-        );
-        let held = starting(
-            &controller,
-            world.environment_id,
-            actor_id.clone(),
-            device_id,
-            &params,
-        )
-        .await
-        .expect("the next start ran")
-        .into_answer_for_test()
-        .expect_err("the device is held");
-        assert_eq!(held.code(), ErrorCode::DraftConflict, "{held}");
-        assert_eq!(service.arrived.available_permits(), 0);
-    }
+    let closes = service.closes();
+    let row = hold_of(&controller, &actor_id).map(|row| row.action);
+    let next = starting(
+        &controller,
+        world.environment_id,
+        actor_id.clone(),
+        device_id,
+        &params,
+    )
+    .await
+    .expect("the next start ran")
+    .into_answer_for_test()
+    .err()
+    .map(|refused| refused.code());
+    let seen = AfterTheAdmissionEnded {
+        ended: ended.to_string(),
+        closes,
+        action: mutation.action_id,
+        row,
+        next,
+        reached_the_service_after: service.arrived.available_permits(),
+    };
     world.serving.abort();
+    seen
 }
 
 /// KR-REQ-23.24: a call the host closed after its admission ended leaves no hold.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_closed_after_an_admission_ended_leaves_no_hold() {
-    the_admission_ends_after_the_service_answered(true, 66).await;
+    let seen = the_admission_ends_after_the_service_answered(true, 66).await;
+    assert_eq!(
+        seen.closes,
+        vec!["call-1".to_owned()],
+        "the host asked the service to close the call it made: {}",
+        seen.ended
+    );
+    assert!(
+        seen.row.is_none(),
+        "the close was confirmed, so the hold ends"
+    );
+    assert_eq!(seen.next, None, "the device is not held");
+    assert_eq!(seen.reached_the_service_after, 1);
 }
 
 /// KR-REQ-23.24: a call the host could not confirm closed after its admission ended holds the
 /// device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_not_closed_after_an_admission_ended_holds_the_device() {
-    the_admission_ends_after_the_service_answered(false, 67).await;
+    let seen = the_admission_ends_after_the_service_answered(false, 67).await;
+    assert_eq!(
+        seen.closes,
+        vec!["call-1".to_owned()],
+        "the host asked the service to close the call it made: {}",
+        seen.ended
+    );
+    assert_eq!(
+        seen.row,
+        Some(seen.action),
+        "the close was not confirmed, so the hold stands"
+    );
+    assert_eq!(
+        seen.next,
+        Some(ErrorCode::DraftConflict),
+        "the device is held"
+    );
+    assert_eq!(seen.reached_the_service_after, 0);
 }
 
 /// KR-REQ-23.24: a refusal that this host cannot record is the caller's answer all the same, and
