@@ -92,9 +92,9 @@ const ACCOUNT_WORDS: [&str; 7] = ["user", "owner", "uid", "gid", "group", "accou
 const COMMAND_WORDS: [&str; 6] = ["chmod", "chown", "sudo", "doas", "systemctl", "launchctl"];
 
 /// Refusals whose reason a device is told without the place or the account: a text that holds every
-/// one of the markers is told as the sentence beside them. The first two are refusals of the
+/// one of the markers is told as the sentence beside them. The second and third are refusals of the
 /// project service, in terms of the location the device's grant names, which is all of the place
-/// the device has. The third is the refusal to start a worker over a scheduled task under the
+/// the device has. The fourth is the refusal to start a worker over a scheduled task under the
 /// environment's name that is not this installation's own, whose text can name the account it is
 /// registered for, or quote what the Task Scheduler said. The next four are the Task Scheduler's own
 /// refusals of a command this host gave it, each of which carries what the scheduler printed after
