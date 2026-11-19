@@ -82,7 +82,9 @@ pub use crate::context::{
     ITEM_FRAMING_BYTES, OPENING_FRAMING_BYTES, SecretPatterns, Selection, select_context,
     token_bound,
 };
-pub use crate::delegate::{Coordinator, Proposal, UnclosedCall, narrower_history};
+pub use crate::delegate::{
+    CallEndObserver, Coordinator, HostCallTarget, Proposal, UnclosedCall, narrower_history,
+};
 pub use crate::error::{Result, VoiceError};
 pub use crate::grant::{
     GrantBinding, VoiceGrantPlan, permits, permitted_actions, plan_voice_grant,

@@ -163,3 +163,166 @@ impl VoiceProviderService for OfflineProvider {
         })
     }
 }
+
+/// What the host wrote to a side channel: the command's wire word, the delegation it named and its
+/// text.
+pub type Written = Vec<(String, Option<String>, Option<String>)>;
+
+/// A side channel the test steers: what the host wrote to it, and what it says it has heard.
+#[derive(Debug, Default)]
+pub struct StandInSideband {
+    written: std::sync::Mutex<Written>,
+}
+
+impl StandInSideband {
+    /// What the host wrote: the command's wire word, the delegation it named and its text.
+    pub fn written(&self) -> Written {
+        self.written.lock().expect("what was written").clone()
+    }
+}
+
+impl kr_client::services::host_call::HostCallControl for StandInSideband {
+    fn state(&self) -> kr_client::services::host_call::SidebandState {
+        kr_client::services::host_call::SidebandState::Ready
+    }
+
+    fn revision(&self) -> u64 {
+        1
+    }
+
+    fn write<'a>(
+        &'a self,
+        _revision: u64,
+        frame: kr_client::services::voice::VoiceContextFrame,
+    ) -> kr_client::services::host_call::HostFuture<
+        'a,
+        Result<(), kr_client::services::host_call::WriteRefusal>,
+    > {
+        self.written.lock().expect("what was written").push((
+            frame.command.as_str().to_owned(),
+            frame.delegation_id.clone(),
+            frame.content.clone(),
+        ));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn heard(&self, _delegation_id: &str) -> Option<u64> {
+        None
+    }
+
+    fn heard_within<'a>(
+        &'a self,
+        _delegation_id: &'a str,
+        _within: std::time::Duration,
+    ) -> kr_client::services::host_call::HostFuture<'a, Option<u64>> {
+        Box::pin(async { None })
+    }
+
+    fn listen(&self, _listener: kr_client::services::host_call::HostCallListener) {}
+}
+
+/// A provider for a call on the owner's own key: it quotes a held key, spends it, answers a start
+/// with a call the host controls, and shows one side channel for it.
+#[derive(Debug, Default)]
+pub struct OwnKeyStandIn {
+    closed: std::sync::Mutex<Vec<String>>,
+    sideband: std::sync::Arc<StandInSideband>,
+}
+
+impl OwnKeyStandIn {
+    /// The calls this provider was told to close.
+    pub fn closed(&self) -> Vec<String> {
+        self.closed.lock().expect("what was closed").clone()
+    }
+
+    /// The side channel it shows for its call.
+    pub fn sideband(&self) -> std::sync::Arc<StandInSideband> {
+        std::sync::Arc::clone(&self.sideband)
+    }
+}
+
+impl VoiceProviderService for OwnKeyStandIn {
+    fn terms(&self) -> ServiceFuture<'_, VoiceProviderTerms> {
+        Box::pin(async move {
+            Ok(VoiceProviderTerms::OwnKey(
+                kr_client::services::voice::VoiceOwnKeyTerms {
+                    model: "gpt-live-1".to_owned(),
+                    disclosure: vec![
+                        "This call runs on the OpenAI key set on this host.".to_owned(),
+                    ],
+                    held: true,
+                },
+            ))
+        })
+    }
+
+    fn account_bound(&self) -> bool {
+        false
+    }
+
+    fn spends_the_owners_key(&self) -> bool {
+        true
+    }
+
+    fn call_is_open<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, bool> {
+        Box::pin(async move { Ok(true) })
+    }
+
+    fn provider(&self) -> String {
+        "openai_live".to_owned()
+    }
+
+    fn host_control(
+        &self,
+        _call_id: &str,
+    ) -> Option<std::sync::Arc<dyn kr_client::services::host_call::HostCallControl>> {
+        Some(self.sideband() as std::sync::Arc<dyn kr_client::services::host_call::HostCallControl>)
+    }
+
+    fn begin<'a>(
+        &'a self,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, kr_client::services::StartAttempt> {
+        Box::pin(async { Ok(kr_client::services::StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(&'a self, _attempt: kr_client::services::StartAttempt) -> ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
+        request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart> {
+        let closes_at_ms = kr_ipc::now_ms().get() + u64::from(request.duration_seconds) * 1_000;
+        Box::pin(async move {
+            Ok(VoiceStart::StartedOwn(Box::new(
+                kr_client::services::voice::OwnSession {
+                    call_id: "own-1".to_owned(),
+                    provider_session_id: "sess_own_1".to_owned(),
+                    answer_sdp: "v=0\r\n".to_owned(),
+                    model: "gpt-live-1".to_owned(),
+                    closes_at_ms,
+                    disclosure: Vec::new(),
+                },
+            )))
+        })
+    }
+
+    fn close<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, VoiceClosure> {
+        self.closed
+            .lock()
+            .expect("what was closed")
+            .push(call_id.to_owned());
+        let call_id = call_id.to_owned();
+        Box::pin(async move {
+            Ok(VoiceClosure {
+                call_id,
+                state: "closed".to_owned(),
+                usage_seconds: 0,
+                usage_provisional: false,
+            })
+        })
+    }
+}

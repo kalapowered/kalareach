@@ -728,7 +728,11 @@ impl Controller {
         // or not the link it was asked on is still there to carry it.
         if matches!(
             method,
-            Method::VoiceDelegate | Method::VoiceStop | Method::VoiceGrant
+            Method::VoiceDelegate
+                | Method::VoiceStop
+                | Method::VoiceGrant
+                | Method::VoiceControl
+                | Method::VoiceContextSend
         ) {
             let daemon = Arc::clone(self);
             return match tokio::spawn(async move { daemon.voice_attempt(attempt).await }).await {
@@ -770,7 +774,7 @@ impl Controller {
         // under the identifier is refused as running until the claim is given back, so no other
         // attempt can have taken the route in the meantime, and one that comes after takes both
         // afresh. If the claim then cannot be given back, both stay spent.
-        if method == Method::VoiceDelegate && is_a_challenge(&outcome) {
+        if answer_keeps_nothing(method, &outcome) {
             if let Some(route) = &route {
                 route.give_back()?;
             }
@@ -1172,16 +1176,37 @@ impl kr_voice::Admission for VoiceAdmission {
     }
 }
 
-/// Whether a delegation's answer is the challenge a device signs, which admits nothing.
-fn is_a_challenge(outcome: &Result<ParamsValue>) -> bool {
-    outcome
-        .as_ref()
-        .ok()
-        .and_then(|answer| answer.to_typed::<VoiceDelegateResult>().ok())
-        .is_some_and(|result| {
-            matches!(
-                result.outcome,
-                VoiceDelegationOutcome::ConfirmationRequired { .. }
-            )
-        })
+/// Whether an answer admits nothing, so that its claim is given back rather than kept.
+///
+/// A delegation's challenge is the one a device signs, and the same delegation then claims the
+/// identifier afresh. A heartbeat is answered with where the call stands now: keeping it would be a
+/// row for every beat of a call, each held for thirty days, and a repeat would be told a state that
+/// is no longer true. Both are a first request again, whatever their payload.
+fn answer_keeps_nothing(method: Method, outcome: &Result<ParamsValue>) -> bool {
+    let Ok(answer) = outcome.as_ref() else {
+        return false;
+    };
+    match method {
+        Method::VoiceDelegate => {
+            answer
+                .to_typed::<VoiceDelegateResult>()
+                .ok()
+                .is_some_and(|result| {
+                    matches!(
+                        result.outcome,
+                        VoiceDelegationOutcome::ConfirmationRequired { .. }
+                    )
+                })
+        }
+        Method::VoiceControl => answer
+            .to_typed::<kr_protocol::voice_host::VoiceControlResult>()
+            .ok()
+            .is_some_and(|result| {
+                matches!(
+                    result,
+                    kr_protocol::voice_host::VoiceControlResult::Heartbeat { .. }
+                )
+            }),
+        _ => false,
+    }
 }

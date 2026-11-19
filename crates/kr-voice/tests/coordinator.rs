@@ -1195,6 +1195,8 @@ struct OwnKeyFake {
     closed: Mutex<Vec<String>>,
     /// What `dispatch` answers.
     answer: Mutex<Option<VoiceStart>>,
+    /// The side channel it shows for a call it started, when it has one.
+    control: Mutex<Option<Arc<dyn kr_client::services::host_call::HostCallControl>>>,
 }
 
 impl OwnKeyFake {
@@ -1203,6 +1205,7 @@ impl OwnKeyFake {
             halves: Mutex::new(Vec::new()),
             closed: Mutex::new(Vec::new()),
             answer: Mutex::new(None),
+            control: Mutex::new(None),
         }
     }
 
@@ -1240,6 +1243,13 @@ impl VoiceProviderService for OwnKeyFake {
 
     fn provider(&self) -> String {
         "openai_live".to_owned()
+    }
+
+    fn host_control(
+        &self,
+        _call_id: &str,
+    ) -> Option<Arc<dyn kr_client::services::host_call::HostCallControl>> {
+        self.control.lock().expect("the side channel").clone()
     }
 
     fn begin<'a>(
@@ -1425,10 +1435,11 @@ async fn a_start_on_the_owners_key_from_a_device_without_host_management_writes_
     assert_eq!(provider.halves(), ["begin", "dispatch"]);
 }
 
-/// A call on the owner's account that this coordinator holds no record for is closed, and the start
-/// is refused: a call nobody holds is a call the owner pays for.
+/// A call on the owner's account whose provider shows no side channel for it is closed, and the
+/// start is refused: a call the host cannot control is a call nobody can end but its deadline, and
+/// the owner pays for it.
 #[tokio::test]
-async fn an_own_call_the_coordinator_has_no_record_for_is_closed_and_the_start_refused() {
+async fn an_own_call_whose_provider_has_no_side_channel_is_closed_and_the_start_refused() {
     let (coordinator, authority, provider) = own_key_fixture();
     coordinator
         .grant(
@@ -1472,6 +1483,210 @@ async fn an_own_call_the_coordinator_has_no_record_for_is_closed_and_the_start_r
         ["own_call_1"]
     );
     assert_eq!(coordinator.live_sessions(), 0);
+}
+
+/// A side channel that holds still: the state is whatever the test set.
+#[derive(Debug)]
+struct StillSideband;
+
+impl kr_client::services::host_call::HostCallControl for StillSideband {
+    fn state(&self) -> kr_client::services::host_call::SidebandState {
+        kr_client::services::host_call::SidebandState::Ready
+    }
+
+    fn revision(&self) -> u64 {
+        1
+    }
+
+    fn write<'a>(
+        &'a self,
+        _revision: u64,
+        _frame: kr_client::services::voice::VoiceContextFrame,
+    ) -> kr_client::services::host_call::HostFuture<
+        'a,
+        Result<(), kr_client::services::host_call::WriteRefusal>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn heard(&self, _delegation_id: &str) -> Option<u64> {
+        None
+    }
+
+    fn heard_within<'a>(
+        &'a self,
+        _delegation_id: &'a str,
+        _within: std::time::Duration,
+    ) -> kr_client::services::host_call::HostFuture<'a, Option<u64>> {
+        Box::pin(async { None })
+    }
+
+    fn listen(&self, _listener: kr_client::services::host_call::HostCallListener) {}
+}
+
+/// Starts one call on the owner's key whose provider shows a side channel, as device `PHONE`.
+async fn own_call_started() -> (
+    Coordinator,
+    Arc<Authority>,
+    Arc<OwnKeyFake>,
+    kr_protocol::voice::VoiceSessionDescriptor,
+) {
+    let (coordinator, authority, provider) = own_key_fixture();
+    coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    authority
+        .owners
+        .lock()
+        .expect("the owners")
+        .push(device(PHONE));
+    let params = start_params_for(&coordinator).await;
+    *provider.control.lock().expect("the side channel") = Some(Arc::new(StillSideband));
+    *provider.answer.lock().expect("the answer") = Some(VoiceStart::StartedOwn(Box::new(
+        kr_client::services::voice::OwnSession {
+            call_id: "own_call_1".to_owned(),
+            provider_session_id: "sess_1".to_owned(),
+            answer_sdp: "v=0\r\n".to_owned(),
+            model: "gpt-live-1".to_owned(),
+            closes_at_ms: 610_000,
+            disclosure: vec!["This call runs on the OpenAI key set on this host.".to_owned()],
+        },
+    )));
+    let started = coordinator
+        .start(
+            device(PHONE),
+            action(0x43),
+            &params,
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("the start is answered");
+    let VoiceStartOutcome::Started { session } = started.outcome else {
+        panic!("the call runs: {:?}", started.outcome);
+    };
+    (coordinator, authority, provider, *session)
+}
+
+/// A call on the owner's key is a voice session with the same record as any other, and the device is
+/// told to send its writes and heartbeats to the host.
+#[tokio::test]
+async fn a_started_own_call_is_recorded_and_its_device_is_told_the_host_controls_it() {
+    let (coordinator, _authority, provider, session) = own_call_started().await;
+
+    assert_eq!(
+        session.control,
+        kr_protocol::voice::VoiceSessionControl::Host {
+            heartbeat_seconds: kr_protocol::voice_host::HOST_HEARTBEAT_SECONDS
+        }
+    );
+    assert_eq!(session.call_id, "own_call_1");
+    assert_eq!(coordinator.live_sessions(), 1);
+    assert!(provider.closed.lock().expect("what was closed").is_empty());
+    let target = coordinator
+        .host_call_target(device(PHONE), session.voice_session_id)
+        .expect("the host holds the call's side channel");
+    assert_eq!(target.closes_at_ms, 610_000);
+    assert_eq!(target.started_at_ms, 10_000);
+    assert!(matches!(
+        coordinator.host_call_target(device(HOST), session.voice_session_id),
+        Err(kr_protocol::voice_host::VoiceHostRefusal::NotThisDevice)
+    ));
+    assert!(matches!(
+        coordinator.host_call_target(
+            device(PHONE),
+            kr_protocol::ids::VoiceSessionId::new(Uuid::from_bytes([9; 16]))
+        ),
+        Err(kr_protocol::voice_host::VoiceHostRefusal::UnknownCall)
+    ));
+}
+
+/// The observer is told why a call ends, and told BEFORE the call's grant is revoked: a phone that
+/// asks after the revocation learns the call ended and why, and not that it never was.
+#[tokio::test]
+async fn the_end_observer_is_told_a_stop_before_the_grant_is_revoked() {
+    let (coordinator, authority, _provider, session) = own_call_started().await;
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let grant_id = session.grant_id;
+    {
+        let told = Arc::clone(&told);
+        let authority = Arc::clone(&authority);
+        coordinator.on_call_end(Arc::new(move |voice_session_id, reason, now_ms| {
+            told.lock().expect("what was told").push((
+                voice_session_id,
+                reason,
+                now_ms,
+                authority.revoked_at(grant_id).is_some(),
+            ));
+        }));
+    }
+    coordinator
+        .stop(
+            device(PHONE),
+            &VoiceStopParams {
+                voice_session_id: session.voice_session_id,
+            },
+            20_000,
+        )
+        .await
+        .expect("the stop is answered");
+    assert_eq!(
+        told.lock().expect("what was told").as_slice(),
+        [(
+            session.voice_session_id,
+            kr_protocol::voice_host::VoiceEndReason::Stop,
+            20_000,
+            false
+        )],
+        "told once, as a stop, with the grant still standing"
+    );
+    assert!(authority.revoked_at(grant_id).is_some());
+}
+
+/// A sweep ends a call at its deadline and says so; a revoked device's calls end as a revocation.
+#[tokio::test]
+async fn a_call_ended_by_the_sweep_is_told_as_its_deadline_and_a_revoked_devices_as_a_revocation() {
+    let (coordinator, _authority, _provider, session) = own_call_started().await;
+    let told = Arc::new(Mutex::new(Vec::new()));
+    {
+        let told = Arc::clone(&told);
+        coordinator.on_call_end(Arc::new(move |_, reason, _| {
+            told.lock().expect("what was told").push(reason);
+        }));
+    }
+    assert_eq!(coordinator.end_calls_that_are_over(609_999).await, 0);
+    assert!(told.lock().expect("what was told").is_empty());
+    assert_eq!(coordinator.end_calls_that_are_over(610_000).await, 1);
+    assert_eq!(
+        told.lock().expect("what was told").as_slice(),
+        [kr_protocol::voice_host::VoiceEndReason::Deadline]
+    );
+    let (second, _authority, _provider, _session) = own_call_started().await;
+    let revoked = Arc::new(Mutex::new(Vec::new()));
+    {
+        let revoked = Arc::clone(&revoked);
+        second.on_call_end(Arc::new(move |_, reason, _| {
+            revoked.lock().expect("what was told").push(reason);
+        }));
+    }
+    assert_eq!(
+        second
+            .end_calls_of_revoked_device(device(PHONE), 30_000)
+            .await,
+        1
+    );
+    assert_eq!(
+        revoked.lock().expect("what was told").as_slice(),
+        [kr_protocol::voice_host::VoiceEndReason::Revocation]
+    );
+    drop(session);
 }
 
 // ---------------------------------------------------------------------------------------------

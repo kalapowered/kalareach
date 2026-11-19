@@ -31,10 +31,11 @@ pub struct VoiceSessionRecord {
     pub parent_grant_id: GrantId,
     /// The terminal sessions it may reach. They outlive it.
     pub session_ids: CanonicalSet<SessionId>,
-    /// The broker's identifier for the call, when a managed call is behind it.
+    /// The provider's identifier for the call.
     ///
-    /// Absent for a voice session running on a provider of the person's own, which is the same
-    /// voice session with a different provider behind it.
+    /// Every call a provider created has one: the managed service's own for a managed call, and a
+    /// name this host minted for a call on the owner's own account. It means something only to the
+    /// provider that issued it, which is why the record also holds that provider.
     pub call_id: Option<String>,
     /// The provider that created the call, so the same one is told when it ends.
     ///

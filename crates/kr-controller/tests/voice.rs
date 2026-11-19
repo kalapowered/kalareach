@@ -2129,7 +2129,7 @@ impl RawVoice {
     /// (the default set where none is named).
     async fn prepare_with(
         owner: &kr_crypto::keys::DeviceKeys,
-        broker: Arc<OfflineProvider>,
+        broker: Arc<dyn VoiceProviderService>,
         rights: &[ActionRight],
         actions: Option<&[VoiceAction]>,
     ) -> Self {
@@ -2139,9 +2139,7 @@ impl RawVoice {
             net_support::pair_with(&host, &device, owner, net_support::proposal(rights)).await;
         let raw = net_support::RawDevice::connect(&host, &device, &record).await;
         raw.claim();
-        host.controller()
-            .voice()
-            .attach_provider(Some(broker as Arc<dyn VoiceProviderService>));
+        host.controller().voice().attach_provider(Some(broker));
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let target = ActionTarget::environment(host.environment_id);
         raw.mutate(
@@ -2808,7 +2806,7 @@ async fn a_delegation_spent_in_an_ended_call_is_not_a_new_action_later_or_after_
     let broker = Arc::new(OfflineProvider::default());
     let voice = RawVoice::prepare_with(
         &owner,
-        Arc::clone(&broker),
+        broker.clone(),
         &[ActionRight::SessionView, ActionRight::AgentPrompt],
         Some(&[VoiceAction::SubmitPrompt]),
     )
@@ -3378,4 +3376,273 @@ async fn a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate
     assert_eq!(sent[1].1["expectedRateVersion"], "2026-09-a");
     assert_eq!(sent[2].1["expectedRateVersion"], "2026-10-b");
     host.stop().await;
+}
+
+/// A call on the owner's own key, started by a device the owner paired with host management.
+async fn own_key_call() -> (
+    Arc<voice_provider::OwnKeyStandIn>,
+    RawVoice,
+    kr_protocol::ids::VoiceSessionId,
+) {
+    let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+    let provider = Arc::new(voice_provider::OwnKeyStandIn::default());
+    let voice = RawVoice::prepare_with(
+        &owner,
+        Arc::clone(&provider) as Arc<dyn VoiceProviderService>,
+        &[
+            ActionRight::SessionView,
+            ActionRight::AgentPrompt,
+            ActionRight::HostManage,
+        ],
+        None,
+    )
+    .await;
+    let started: kr_protocol::voice::VoiceStartResult = voice
+        .raw
+        .mutate(
+            Method::VoiceStart,
+            ActionId::new(kr_ipc::new_uuid()),
+            voice.target.clone(),
+            &voice.start,
+        )
+        .await
+        .expect("the call is created")
+        .to_typed()
+        .expect("a start result");
+    let VoiceStartOutcome::Started { session } = started.outcome else {
+        panic!("the call runs: {:?}", started.outcome);
+    };
+    assert_eq!(
+        session.control,
+        kr_protocol::voice::VoiceSessionControl::Host {
+            heartbeat_seconds: kr_protocol::voice_host::HOST_HEARTBEAT_SECONDS
+        },
+        "the device is told the host controls the call"
+    );
+    let voice_session_id = session.voice_session_id;
+    (provider, voice, voice_session_id)
+}
+
+impl RawVoice {
+    /// Asks `voice.control` under `action_id`.
+    async fn control(
+        &self,
+        action_id: ActionId,
+        voice_session_id: kr_protocol::ids::VoiceSessionId,
+        arm: kr_protocol::voice_host::VoiceControlArm,
+    ) -> std::result::Result<
+        kr_protocol::voice_host::VoiceControlResult,
+        kr_protocol::error::ProtocolError,
+    > {
+        self.raw
+            .mutate(
+                Method::VoiceControl,
+                action_id,
+                self.target.clone(),
+                &kr_protocol::voice_host::VoiceControlParams {
+                    voice_session_id,
+                    arm,
+                },
+            )
+            .await
+            .map(|answered| answered.to_typed().expect("a control result"))
+    }
+}
+
+/// A heartbeat is a write on the ordinary path whose answer is the call's state now: its claim is
+/// given back, so the same action identifier asked again, even with another payload, is a first
+/// request again and not a conflict, while a mute under one identifier is kept and a repeat of it
+/// writes nothing a second time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_heartbeat_is_a_write_through_the_ordinary_path_whose_claim_is_given_back_and_a_mute_is_kept()
+ {
+    use kr_protocol::voice_host::{VoiceControlArm, VoiceControlResult, VoiceHostCallState};
+    let (provider, voice, call) = own_key_call().await;
+    let beat = ActionId::new(kr_ipc::new_uuid());
+
+    let first = voice
+        .control(
+            beat,
+            call,
+            VoiceControlArm::Heartbeat {
+                after_seq: U64::new(0),
+            },
+        )
+        .await
+        .expect("a heartbeat is answered");
+    let VoiceControlResult::Heartbeat {
+        state,
+        remaining_seconds,
+        news,
+        dropped,
+    } = first
+    else {
+        panic!("a heartbeat answer");
+    };
+    assert_eq!(state, VoiceHostCallState::Open);
+    assert!(remaining_seconds > 0 && remaining_seconds <= 600);
+    assert!(news.is_empty() && !dropped);
+    // The same identifier with another payload is a first request again, not a conflict.
+    let again = voice
+        .control(
+            beat,
+            call,
+            VoiceControlArm::Heartbeat {
+                after_seq: U64::new(5),
+            },
+        )
+        .await
+        .expect("a heartbeat identifier is not kept");
+    assert!(matches!(again, VoiceControlResult::Heartbeat { .. }));
+
+    // A mute is kept under its identifier: a repeat is answered from the record and writes
+    // nothing, and the same identifier with another payload is the claim's conflict.
+    let mute = ActionId::new(kr_ipc::new_uuid());
+    for _ in 0..2 {
+        let answered = voice
+            .control(mute, call, VoiceControlArm::Mute { muted: true })
+            .await
+            .expect("a mute is answered");
+        assert!(matches!(answered, VoiceControlResult::Admitted { .. }));
+    }
+    assert_eq!(
+        provider.sideband().written(),
+        [("mute".to_owned(), None, None)],
+        "the repeat of a mute wrote nothing"
+    );
+    let conflict = voice
+        .control(mute, call, VoiceControlArm::Mute { muted: false })
+        .await
+        .expect_err("the identifier names another payload");
+    assert_eq!(conflict.code, kr_protocol::error::ErrorCode::IdConflict);
+}
+
+/// A note is the device's choice of sentence and the host's words: what reaches the provider's
+/// side channel is the table's text, as instructions when it names no delegation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_note_through_the_daemon_is_written_as_the_hosts_own_words() {
+    use kr_protocol::voice_host::{VoiceControlArm, VoiceControlResult, VoiceNote};
+    let (provider, voice, call) = own_key_call().await;
+    let answered = voice
+        .control(
+            ActionId::new(kr_ipc::new_uuid()),
+            call,
+            VoiceControlArm::Note {
+                note: VoiceNote::HostActionsUnavailable,
+                delegation_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("a note is answered");
+    assert_eq!(
+        answered,
+        VoiceControlResult::Admitted {
+            note: Nullable::some(VoiceNote::HostActionsUnavailable)
+        }
+    );
+    assert_eq!(
+        provider.sideband().written(),
+        [(
+            "instructions".to_owned(),
+            None,
+            Some(VoiceNote::HostActionsUnavailable.words().to_owned())
+        )]
+    );
+}
+
+/// After the call is stopped, and its grant revoked, the device's heartbeat is still answered: from
+/// the final status the host kept, to the device that started the call, until it acknowledges the
+/// end. Every other arm is refused as no such call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_heartbeat_after_a_stop_is_answered_from_the_final_status_and_the_other_arms_are_refused()
+{
+    use kr_protocol::voice_host::{
+        VoiceControlArm, VoiceControlResult, VoiceEndReason, VoiceHostCallState, VoiceHostRefusal,
+        VoiceNewsItem,
+    };
+    let (provider, voice, call) = own_key_call().await;
+    let _: kr_protocol::voice::VoiceStopResult = voice
+        .raw
+        .mutate(
+            Method::VoiceStop,
+            ActionId::new(kr_ipc::new_uuid()),
+            voice.target.clone(),
+            &kr_protocol::voice::VoiceStopParams {
+                voice_session_id: call,
+            },
+        )
+        .await
+        .expect("the call is stopped")
+        .to_typed()
+        .expect("a stop result");
+    assert_eq!(provider.closed(), ["own-1"]);
+
+    let VoiceControlResult::Heartbeat { state, news, .. } = voice
+        .control(
+            ActionId::new(kr_ipc::new_uuid()),
+            call,
+            VoiceControlArm::Heartbeat {
+                after_seq: U64::new(0),
+            },
+        )
+        .await
+        .expect("a heartbeat after the stop is answered")
+    else {
+        panic!("a heartbeat answer");
+    };
+    assert_eq!(
+        state,
+        VoiceHostCallState::Closed {
+            reason: VoiceEndReason::Stop
+        }
+    );
+    let ended = news.last().expect("the ended item");
+    assert_eq!(
+        ended.item,
+        VoiceNewsItem::Ended {
+            reason: VoiceEndReason::Stop
+        }
+    );
+    // Nothing else is taken for a call that ended.
+    let mute = voice
+        .control(
+            ActionId::new(kr_ipc::new_uuid()),
+            call,
+            VoiceControlArm::Mute { muted: true },
+        )
+        .await
+        .expect("a refusal is an answer");
+    assert_eq!(
+        mute,
+        VoiceControlResult::Refused {
+            reason: VoiceHostRefusal::UnknownCall
+        }
+    );
+    assert!(provider.sideband().written().is_empty());
+    // Acknowledging the ended item is the last the host keeps of the call.
+    let _ = voice
+        .control(
+            ActionId::new(kr_ipc::new_uuid()),
+            call,
+            VoiceControlArm::Heartbeat {
+                after_seq: ended.seq,
+            },
+        )
+        .await
+        .expect("the acknowledgement is answered");
+    assert_eq!(
+        voice
+            .control(
+                ActionId::new(kr_ipc::new_uuid()),
+                call,
+                VoiceControlArm::Heartbeat {
+                    after_seq: ended.seq
+                },
+            )
+            .await
+            .expect("a heartbeat for a forgotten call is answered"),
+        VoiceControlResult::Refused {
+            reason: VoiceHostRefusal::UnknownCall
+        }
+    );
 }

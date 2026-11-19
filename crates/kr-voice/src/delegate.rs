@@ -62,6 +62,7 @@ use kr_protocol::voice::{
     VoiceRefusal, VoiceSessionControl, VoiceSessionDescriptor, VoiceStartOutcome, VoiceStartParams,
     VoiceStartResult, VoiceStopParams, VoiceStopResult,
 };
+use kr_protocol::voice_host::{HOST_HEARTBEAT_SECONDS, VoiceEndReason, VoiceHostRefusal};
 
 use crate::confirm::{ConfirmationLedger, issue_confirmation, verify_confirmation};
 use crate::context::{SecretPatterns, select_context};
@@ -205,6 +206,17 @@ struct Ending {
     provider: Option<Arc<dyn VoiceProviderService>>,
 }
 
+/// A call a provider created, in the shape the coordinator records it.
+struct Created {
+    call_id: String,
+    provider_session_id: String,
+    answer_sdp: String,
+    model: String,
+    control: VoiceSessionControl,
+    disclosure: Vec<String>,
+    replayed: bool,
+}
+
 /// What running every check produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Proposed {
@@ -224,6 +236,20 @@ enum Spend {
     Nothing,
 }
 
+/// Who is told that a call is ending, before its grant is revoked: the call, why, and when.
+pub type CallEndObserver = Arc<dyn Fn(VoiceSessionId, VoiceEndReason, u64) + Send + Sync>;
+
+/// What the host needs to control one running call that the host controls itself.
+#[derive(Clone, Debug)]
+pub struct HostCallTarget {
+    /// The provider's side channel for the call.
+    pub control: Arc<dyn kr_client::services::host_call::HostCallControl>,
+    /// When the call started, in UTC milliseconds.
+    pub started_at_ms: u64,
+    /// When the call's own deadline falls, in UTC milliseconds.
+    pub closes_at_ms: u64,
+}
+
 /// Where a call this host could not end is reported.
 type UnclosedReport = Arc<dyn Fn(&UnclosedCall) + Send + Sync>;
 
@@ -231,6 +257,8 @@ type UnclosedReport = Arc<dyn Fn(&UnclosedCall) + Send + Sync>;
 pub struct Coordinator {
     /// Where a call this host could not end is reported.
     unclosed: Mutex<UnclosedReport>,
+    /// Who is told that a call is ending.
+    ends: Mutex<Option<CallEndObserver>>,
     context: Arc<dyn ContextSource>,
     authority: Arc<dyn VoiceAuthority>,
     submitter: Arc<dyn ActionSubmitter>,
@@ -365,6 +393,7 @@ impl Coordinator {
                     call.call_id, call.provider, call.error
                 );
             })),
+            ends: Mutex::new(None),
             context,
             authority,
             submitter,
@@ -454,6 +483,65 @@ impl Coordinator {
         self
     }
 
+    /// Registers who is told that a call is ending, replacing an earlier observer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's observer panicked.
+    pub fn on_call_end(&self, observer: CallEndObserver) {
+        *self.ends.lock().expect("the coordinator's end observer") = Some(observer);
+    }
+
+    /// Tells the observer that a call is ending. Called before the call's grant is revoked, so a
+    /// device that asks after the revocation is told why the call ended and not that it never was.
+    fn call_ended(&self, voice_session_id: VoiceSessionId, reason: VoiceEndReason, now_ms: u64) {
+        let observer = self
+            .ends
+            .lock()
+            .expect("the coordinator's end observer")
+            .clone();
+        if let Some(observer) = observer {
+            observer(voice_session_id, reason, now_ms);
+        }
+    }
+
+    /// The side channel of one call this host controls itself, for the device that started it.
+    ///
+    /// # Errors
+    ///
+    /// [`VoiceHostRefusal::UnknownCall`] when no such call is live or its provider has no side
+    /// channel for it, and [`VoiceHostRefusal::NotThisDevice`] when it is another device's.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    pub fn host_call_target(
+        &self,
+        device_id: DeviceId,
+        voice_session_id: VoiceSessionId,
+    ) -> std::result::Result<HostCallTarget, VoiceHostRefusal> {
+        let state = self.state.lock().expect("the coordinator's state");
+        let record = state
+            .sessions
+            .iter()
+            .find(|record| record.voice_session_id == voice_session_id)
+            .ok_or(VoiceHostRefusal::UnknownCall)?;
+        if record.device_id != device_id {
+            return Err(VoiceHostRefusal::NotThisDevice);
+        }
+        let control = record
+            .provider
+            .as_ref()
+            .zip(record.call_id.as_deref())
+            .and_then(|(provider, call_id)| provider.host_control(call_id))
+            .ok_or(VoiceHostRefusal::UnknownCall)?;
+        Ok(HostCallTarget {
+            control,
+            started_at_ms: record.started_at_ms,
+            closes_at_ms: record.closes_at_ms,
+        })
+    }
+
     /// How many voice sessions are live.
     ///
     /// # Panics
@@ -514,25 +602,32 @@ impl Coordinator {
         };
         let mut over = Vec::new();
         for record in live {
-            let is_over = if record.closes_at_ms <= now_ms {
-                true
+            let reason = if record.closes_at_ms <= now_ms {
+                Some(VoiceEndReason::Deadline)
             } else {
                 match (record.provider.as_ref(), record.call_id.as_deref()) {
                     // Asked outside the lock, and only about a call a managed service holds.
-                    (Some(provider), Some(call_id)) => {
-                        matches!(provider.call_is_open(call_id).await, Ok(false))
+                    (Some(provider), Some(call_id))
+                        if matches!(provider.call_is_open(call_id).await, Ok(false)) =>
+                    {
+                        Some(VoiceEndReason::ProviderClosed)
                     }
-                    _ => false,
+                    _ => None,
                 }
             };
-            if is_over {
-                over.push((record.voice_session_id, record.device_id, record.grant_id));
+            if let Some(reason) = reason {
+                over.push((
+                    record.voice_session_id,
+                    record.device_id,
+                    record.grant_id,
+                    reason,
+                ));
             }
         }
         let mut ended = 0;
-        for (voice_session_id, device_id, grant_id) in over {
+        for (voice_session_id, device_id, grant_id, reason) in over {
             if self
-                .end_held(voice_session_id, device_id, grant_id, now_ms)
+                .end_held(voice_session_id, device_id, grant_id, reason, now_ms)
                 .await
             {
                 ended += 1;
@@ -555,8 +650,10 @@ impl Coordinator {
         voice_session_id: VoiceSessionId,
         device_id: DeviceId,
         grant_id: kr_protocol::ids::GrantId,
+        reason: VoiceEndReason,
         now_ms: u64,
     ) -> bool {
+        self.call_ended(voice_session_id, reason, now_ms);
         if !matches!(self.authority.grant(grant_id), Ok(None))
             && self
                 .authority
@@ -602,7 +699,13 @@ impl Coordinator {
         let mut ended = 0;
         for (voice_session_id, grant_id) in held {
             if self
-                .end_held(voice_session_id, device_id, grant_id, now_ms)
+                .end_held(
+                    voice_session_id,
+                    device_id,
+                    grant_id,
+                    VoiceEndReason::Revocation,
+                    now_ms,
+                )
                 .await
             {
                 ended += 1;
@@ -697,6 +800,7 @@ impl Coordinator {
                 && let Some(replaced) = replaced.as_ref()
             {
                 for ended in state.sessions.stop_under(replaced.grant_id) {
+                    self.call_ended(ended.voice_session_id, VoiceEndReason::Revocation, now_ms);
                     state.ledger.forget_session(ended.voice_session_id);
                     ended_sessions.extend(ended.session_ids.iter().copied());
                     if let Some(call_id) = ended.call_id {
@@ -1104,14 +1208,41 @@ impl Coordinator {
                     },
                 });
             }
-            VoiceStart::Started(session) => session,
-            VoiceStart::StartedOwn(own) => {
-                // This coordinator holds no record of a call on the owner's own account yet, and
-                // a call nobody holds is a call somebody is paying for: it is closed, and the
-                // start is answered as a host with no voice service is.
+            VoiceStart::Started(session) => Created {
+                control: VoiceSessionControl::Broker {
+                    origin: self.broker_origin.clone(),
+                    control_path: session.control_path.clone(),
+                    heartbeat_seconds: session.heartbeat_seconds,
+                },
+                call_id: session.call_id,
+                provider_session_id: session.provider_session_id,
+                answer_sdp: session.answer_sdp,
+                model: session.model,
+                disclosure: session.disclosure,
+                replayed: session.replayed,
+            },
+            // A call on the owner's own account: the host controls it, so the device is told to
+            // send its writes and heartbeats here. It is never a replay: the host minted its
+            // name, and no earlier attempt could have produced it.
+            VoiceStart::StartedOwn(own) if provider.host_control(&own.call_id).is_none() => {
+                // A call the host controls itself needs the provider's side channel to control it
+                // by. Without one nobody could end it but its deadline, and a call nobody holds
+                // is a call somebody is paying for: it is closed, and the start is answered as a
+                // host with no voice service is.
                 let _ = provider.close(&own.call_id).await;
                 return Err(VoiceError::NotConfigured(NO_VOICE_SERVICE.to_owned()));
             }
+            VoiceStart::StartedOwn(own) => Created {
+                control: VoiceSessionControl::Host {
+                    heartbeat_seconds: HOST_HEARTBEAT_SECONDS,
+                },
+                call_id: own.call_id,
+                provider_session_id: own.provider_session_id,
+                answer_sdp: own.answer_sdp,
+                model: own.model,
+                disclosure: own.disclosure,
+                replayed: false,
+            },
         };
 
         if session.replayed {
@@ -1246,11 +1377,7 @@ impl Coordinator {
                     provider_session_id: session.provider_session_id.clone(),
                     answer_sdp: session.answer_sdp.clone(),
                     model: session.model.clone(),
-                    control: VoiceSessionControl::Broker {
-                        origin: self.broker_origin.clone(),
-                        control_path: session.control_path.clone(),
-                        heartbeat_seconds: session.heartbeat_seconds,
-                    },
+                    control: session.control,
                     closes_at_ms: TimestampMs::new(closes_at_ms),
                     // The service's own words for this call, carried as they came. A host copy put
                     // in their place would be a second statement of what the operator can see.
@@ -1439,6 +1566,7 @@ impl Coordinator {
                 .of_device(params.voice_session_id, device_id)?
                 .grant_id
         };
+        self.call_ended(params.voice_session_id, VoiceEndReason::Stop, now_ms);
         let Revoked { at_ms, fence } =
             self.authority
                 .revoke(grant_id, now_ms, &crate::seams::Unbounded)?;

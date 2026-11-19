@@ -1174,6 +1174,18 @@ pub trait VoiceProviderService: Send + Sync + fmt::Debug {
     /// named a call the same way. Two clients of the same service answer the same thing; the
     /// managed broker answers the origin it reaches.
     fn provider(&self) -> String;
+
+    /// The host's handle on the side channel of one running call, for a provider whose call the
+    /// host controls itself.
+    ///
+    /// A provider whose calls are controlled through a service of its own, as the managed broker's
+    /// are, has none and answers `None`.
+    fn host_control(
+        &self,
+        _call_id: &str,
+    ) -> Option<std::sync::Arc<dyn super::host_call::HostCallControl>> {
+        None
+    }
 }
 
 /// One origin in the spelling this crate compares.

@@ -23,6 +23,7 @@ mod authority;
 mod context;
 mod credentials;
 mod host;
+mod host_call;
 pub mod own_key_calls;
 mod submit;
 mod worker_half;
@@ -44,6 +45,10 @@ pub use context::{
 };
 pub use credentials::VoiceCredentials;
 pub use host::{ControllerDispatch, ControllerFacts};
+pub use host_call::{
+    DelegationKind, DelegationRecord, FINAL_STATUS_KEEP_MS, FINAL_STATUS_RECORDS, FinalStatus,
+    HostCall, HostCalls, NoteSupport, performed_words,
+};
 pub use submit::{HostDispatch, ProposalSubmitter, method_for};
 pub use worker_half::{
     BEFORE_PRIVACY_CHANGE, MAX_HISTORY_PARTS, PRIVACY_ON, WorkerHalf, approval, decisions, message,
@@ -94,6 +99,9 @@ pub struct VoiceModule {
     /// Kept beside the coordinator so `kr doctor` reports the broker this service is actually
     /// naming to devices, rather than what some other record says it should be.
     broker_origin: String,
+    /// The calls on the owner's own key that this host controls itself: the phone's heartbeats,
+    /// its notes and the news it has not yet been told.
+    host_calls: HostCalls,
 }
 
 impl VoiceModule {
@@ -113,19 +121,34 @@ impl VoiceModule {
         environment_id: EnvironmentId,
         broker_origin: String,
     ) -> Self {
+        let host_calls = HostCalls::new();
+        let coordinator = Coordinator::new(
+            Arc::new(FilteredContext::new(Arc::clone(&facts))),
+            authority,
+            Arc::new(ProposalSubmitter::new(dispatch)),
+            provider,
+            host_device_id,
+            environment_id,
+            broker_origin.clone(),
+        );
+        // A call that is ending is told to the call object before its grant goes, so a phone that
+        // asks afterwards learns why it ended.
+        let ending = host_calls.clone();
+        coordinator.on_call_end(Arc::new(move |voice_session_id, reason, now_ms| {
+            ending.end(voice_session_id, reason, now_ms);
+        }));
         Self {
-            facts: Arc::clone(&facts),
-            coordinator: Coordinator::new(
-                Arc::new(FilteredContext::new(facts)),
-                authority,
-                Arc::new(ProposalSubmitter::new(dispatch)),
-                provider,
-                host_device_id,
-                environment_id,
-                broker_origin.clone(),
-            ),
+            facts,
+            coordinator,
             broker_origin,
+            host_calls,
         }
+    }
+
+    /// The calls on the owner's own key that this host controls itself.
+    #[must_use]
+    pub const fn host_calls(&self) -> &HostCalls {
+        &self.host_calls
     }
 
     /// The managed broker's origin this service names to a device whose voice session starts,
@@ -190,6 +213,8 @@ impl VoiceModule {
                 | Method::VoiceDelegate
                 | Method::VoiceContext
                 | Method::VoicePrepare
+                | Method::VoiceControl
+                | Method::VoiceContextSend
         )
     }
 
@@ -221,6 +246,12 @@ impl VoiceModule {
             }
             Method::VoiceDelegate => {
                 let _: kr_protocol::voice::VoiceDelegateParams = parse(&mutation.params)?;
+            }
+            Method::VoiceControl => {
+                let _: kr_protocol::voice_host::VoiceControlParams = parse(&mutation.params)?;
+            }
+            Method::VoiceContextSend => {
+                let _: kr_protocol::voice_host::VoiceContextSendParams = parse(&mutation.params)?;
             }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
@@ -350,6 +381,118 @@ impl VoiceModule {
         )
     }
 
+    /// Takes a call the host controls itself into the registry that answers its heartbeats.
+    fn hold_a_host_call(
+        &self,
+        device_id: DeviceId,
+        started: &kr_protocol::voice::VoiceStartResult,
+    ) {
+        use kr_protocol::voice::{VoiceSessionControl, VoiceStartOutcome};
+        let VoiceStartOutcome::Started { session } = &started.outcome else {
+            return;
+        };
+        if !matches!(session.control, VoiceSessionControl::Host { .. }) {
+            return;
+        }
+        // The coordinator refuses a start whose provider has no side channel for the call, so a
+        // host call that was started has one.
+        if let Ok(target) = self
+            .coordinator
+            .host_call_target(device_id, session.voice_session_id)
+        {
+            self.host_calls.register(
+                session.voice_session_id,
+                device_id,
+                target.started_at_ms,
+                target.closes_at_ms,
+                target.control,
+            );
+        }
+    }
+
+    /// Answers `voice.control` for a call the host controls itself.
+    async fn control(
+        &self,
+        device_id: DeviceId,
+        action_id: ActionId,
+        params: &kr_protocol::voice_host::VoiceControlParams,
+        now_ms: u64,
+    ) -> kr_protocol::voice_host::VoiceControlResult {
+        use kr_protocol::voice_host::{VoiceControlArm, VoiceControlResult};
+        let call = match self
+            .host_calls
+            .of_device(params.voice_session_id, device_id)
+        {
+            Ok(call) => call,
+            // A call that ended answers a heartbeat from its final status; everything else about
+            // it is over.
+            Err(reason) => {
+                return match params.arm {
+                    VoiceControlArm::Heartbeat { after_seq } => self.host_calls.heartbeat(
+                        params.voice_session_id,
+                        device_id,
+                        after_seq.get(),
+                        now_ms,
+                    ),
+                    _ => VoiceControlResult::Refused { reason },
+                };
+            }
+        };
+        match &params.arm {
+            VoiceControlArm::Heartbeat { after_seq } => {
+                call.phone_is_back(now_ms).await;
+                self.host_calls.heartbeat(
+                    params.voice_session_id,
+                    device_id,
+                    after_seq.get(),
+                    now_ms,
+                )
+            }
+            VoiceControlArm::Mute { muted } => call.mute(action_id, *muted, now_ms).await,
+            VoiceControlArm::Note {
+                note,
+                delegation_id,
+            } => {
+                let support = ReadAgain {
+                    coordinator: &self.coordinator,
+                    device_id,
+                    now_ms,
+                };
+                call.note(
+                    action_id,
+                    *note,
+                    delegation_id.0.as_ref().map(|id| id.as_str()),
+                    &support,
+                    now_ms,
+                )
+                .await
+            }
+            VoiceControlArm::Heard { delegation_id } => {
+                call.heard(delegation_id.as_str(), now_ms).await
+            }
+        }
+    }
+
+    /// Answers `voice.context.send`.
+    fn context_send(
+        &self,
+        device_id: DeviceId,
+        params: &kr_protocol::voice_host::VoiceContextSendParams,
+    ) -> kr_protocol::voice_host::VoiceContextSendResult {
+        use kr_protocol::voice_host::{VoiceContextSendResult, VoiceHostRefusal};
+        match self
+            .host_calls
+            .of_device(params.voice_session_id, device_id)
+        {
+            // The sender that writes a selection in paced appends is not wired yet: a call the
+            // host holds is not ready for one.
+            Ok(_) => VoiceContextSendResult::Refused {
+                reason: VoiceHostRefusal::NotReady,
+            },
+            Err(reason) => VoiceContextSendResult::Refused { reason },
+        }
+    }
+
     async fn dispatch(
         &self,
         actor: VoiceActor,
@@ -395,20 +538,21 @@ impl VoiceModule {
             }
             Method::VoiceStart => {
                 let params: kr_protocol::voice::VoiceStartParams = parse(&mutation.params)?;
-                value(
-                    &self
-                        .coordinator
-                        .start(
-                            device_of(actor)?,
-                            mutation.action_id,
-                            &params,
-                            authority_revision,
-                            now_ms,
-                            &**admission,
-                        )
-                        .await
-                        .map_err(voice_error)?,
-                )
+                let device_id = device_of(actor)?;
+                let started = self
+                    .coordinator
+                    .start(
+                        device_id,
+                        mutation.action_id,
+                        &params,
+                        authority_revision,
+                        now_ms,
+                        &**admission,
+                    )
+                    .await
+                    .map_err(voice_error)?;
+                self.hold_a_host_call(device_id, &started);
+                value(&started)
             }
             Method::VoiceStop => {
                 let params: kr_protocol::voice::VoiceStopParams = parse(&mutation.params)?;
@@ -422,19 +566,85 @@ impl VoiceModule {
             }
             Method::VoiceDelegate => {
                 let params: kr_protocol::voice::VoiceDelegateParams = parse(&mutation.params)?;
+                let device_id = device_of(actor)?;
+                let answered = self
+                    .coordinator
+                    .delegate(device_id, action_id, &params, now_ms, admission)
+                    .await
+                    .map_err(voice_error)?;
+                // What a note about this delegation's outcome is checked against, for a call the
+                // host controls itself.
+                if let Ok(call) = self
+                    .host_calls
+                    .of_device(params.voice_session_id, device_id)
+                {
+                    call.record_delegation(
+                        params.delegation_id.as_str(),
+                        DelegationRecord {
+                            delegate_action_id: action_id,
+                            params: params.clone(),
+                            kept: answered.clone(),
+                        },
+                    );
+                }
+                value(&answered)
+            }
+            Method::VoiceControl => {
+                let params: kr_protocol::voice_host::VoiceControlParams = parse(&mutation.params)?;
                 value(
                     &self
-                        .coordinator
-                        .delegate(device_of(actor)?, action_id, &params, now_ms, admission)
-                        .await
-                        .map_err(voice_error)?,
+                        .control(device_of(actor)?, action_id, &params, now_ms)
+                        .await,
                 )
+            }
+            Method::VoiceContextSend => {
+                let params: kr_protocol::voice_host::VoiceContextSendParams =
+                    parse(&mutation.params)?;
+                value(&self.context_send(device_of(actor)?, &params))
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a voice mutation",
                 method.as_str()
             ))),
         }
+    }
+}
+
+/// What a note about a performed delegation reads again: the coordinator's own re-read, under the
+/// grants, the history bound and privacy mode as they stand now.
+struct ReadAgain<'a> {
+    coordinator: &'a Coordinator,
+    device_id: DeviceId,
+    now_ms: u64,
+}
+
+impl NoteSupport for ReadAgain<'_> {
+    fn fresh_summary<'a>(
+        &'a self,
+        record: &'a DelegationRecord,
+    ) -> kr_client::services::host_call::HostFuture<
+        'a,
+        std::result::Result<String, kr_protocol::voice_host::VoiceHostRefusal>,
+    > {
+        Box::pin(async move {
+            let again = self
+                .coordinator
+                .restate(
+                    self.device_id,
+                    record.delegate_action_id,
+                    &record.params,
+                    &record.kept,
+                    self.now_ms,
+                )
+                .await
+                .map_err(|_| kr_protocol::voice_host::VoiceHostRefusal::OutsideGrant)?;
+            match again.outcome {
+                kr_protocol::voice::VoiceDelegationOutcome::Performed { summary, .. } => {
+                    Ok(summary)
+                }
+                _ => Err(kr_protocol::voice_host::VoiceHostRefusal::OutsideGrant),
+            }
+        })
     }
 }
 

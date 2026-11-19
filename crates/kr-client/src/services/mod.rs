@@ -127,6 +127,7 @@ pub mod alternatives;
 pub mod authority;
 pub mod backup;
 pub mod description;
+pub mod host_call;
 pub mod http;
 pub mod json;
 pub mod mailbox;
