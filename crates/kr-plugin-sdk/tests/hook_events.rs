@@ -95,23 +95,13 @@ fn declaring(events: Value) -> Validated {
     })
 }
 
-/// The check refuses the package for the refusal's name, as a finding on the connector table, and
-/// for no other member of the table.
-fn assert_refused_by_name(validated: &Validated, refusal: HookEventsRefusal) {
-    let named: Vec<_> = validated
-        .report
-        .findings
-        .iter()
-        .filter(|finding| finding.detail.contains(refusal.name()))
-        .collect();
-    assert!(
-        named
-            .iter()
-            .any(|finding| finding.code == FindingCode::ConnectorTableInvalid),
-        "{} is a finding of the connector table: {:?}",
-        refusal.name(),
-        validated.report.findings
-    );
+/// Whether the check refuses the package for the refusal's name, as a finding on the connector
+/// table.
+fn refused_by_name(validated: &Validated, refusal: HookEventsRefusal) -> bool {
+    validated.report.findings.iter().any(|finding| {
+        finding.code == FindingCode::ConnectorTableInvalid
+            && finding.detail.contains(refusal.name())
+    })
 }
 
 /// What the Claude Code map is, with `edit` applied.
@@ -161,13 +151,21 @@ fn the_default_map_equals_the_fixture_a_package_may_copy() {
 #[test]
 fn a_map_place_with_no_segment_is_refused_by_name() {
     let validated = declaring(edited(|map| map["event"] = json!({ "segments": [] })));
-    assert_refused_by_name(&validated, HookEventsRefusal::PlaceEmpty);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::PlaceEmpty),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
 fn a_map_place_deeper_than_three_is_refused_by_name() {
     let validated = declaring(edited(|map| map["thread"] = place(&["a", "b", "c", "d"])));
-    assert_refused_by_name(&validated, HookEventsRefusal::PlaceTooDeep);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::PlaceTooDeep),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -175,16 +173,28 @@ fn a_map_place_with_an_index_is_refused_by_name() {
     let validated = declaring(edited(|map| {
         map["event"] = json!({ "segments": [{ "type": "index", "index": 0 }] });
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::PlaceHasIndex);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::PlaceHasIndex),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
 fn a_map_member_that_is_empty_is_refused_by_name() {
     let validated = declaring(edited(|map| map["event"] = place(&[""])));
-    assert_refused_by_name(&validated, HookEventsRefusal::PlaceMemberBad);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::PlaceMemberBad),
+        "{:?}",
+        validated.report.findings
+    );
     let long = "m".repeat(65);
     let validated = declaring(edited(|map| map["event"] = place(&[&long])));
-    assert_refused_by_name(&validated, HookEventsRefusal::PlaceMemberBad);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::PlaceMemberBad),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -193,13 +203,21 @@ fn a_map_place_that_is_the_start_of_another_is_refused_by_name() {
         map["event"] = place(&["hook"]);
         map["thread"] = place(&["hook", "session"]);
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::PlacesOverlap);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::PlacesOverlap),
+        "{:?}",
+        validated.report.findings
+    );
     // The contact's input is an object whose member `request_id` is read, so a place that is the
     // input itself is the start of that one.
     let validated = declaring(edited(|map| {
         map["details"]["tool_name"] = place(&["tool_input"]);
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::PlacesOverlap);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::PlacesOverlap),
+        "{:?}",
+        validated.report.findings
+    );
     // Two roles that read one member as a value do not overlap.
     let validated = declaring(edited(|map| {
         map["contact"]["agreeing"][2]["place"] = place(&["tool_name"]);
@@ -217,7 +235,11 @@ fn a_map_with_no_event_is_refused_by_name() {
         map["events"] = json!([]);
         map.as_object_mut().expect("an object").remove("contact");
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::NoEvents);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::NoEvents),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -231,15 +253,27 @@ fn a_map_of_more_than_thirty_two_events_is_refused_by_name() {
         map.as_object_mut().expect("an object").remove("contact");
         map["details"]["start_source"] = Value::Null;
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::TooManyEvents);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::TooManyEvents),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
 fn a_map_event_name_that_is_empty_is_refused_by_name() {
     let validated = declaring(edited(|map| map["events"][1]["name"] = json!("")));
-    assert_refused_by_name(&validated, HookEventsRefusal::EventNameBad);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::EventNameBad),
+        "{:?}",
+        validated.report.findings
+    );
     let validated = declaring(edited(|map| map["events"][1]["name"] = json!("Bell\u{7}")));
-    assert_refused_by_name(&validated, HookEventsRefusal::EventNameBad);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::EventNameBad),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -247,7 +281,11 @@ fn a_map_with_two_events_of_one_name_is_refused_by_name() {
     let validated = declaring(edited(|map| {
         map["events"][1]["name"] = json!("SessionStart")
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::EventDuplicate);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::EventDuplicate),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -255,14 +293,22 @@ fn a_continuation_on_another_report_is_refused_by_name() {
     let validated = declaring(edited(|map| {
         map["events"][1]["continued_by"] = json!("compact");
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::ContinuedByMisplaced);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::ContinuedByMisplaced),
+        "{:?}",
+        validated.report.findings
+    );
     let validated = declaring(edited(|map| {
         map["details"]
             .as_object_mut()
             .expect("an object")
             .remove("start_source");
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::ContinuedByMisplaced);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::ContinuedByMisplaced),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -279,11 +325,19 @@ fn a_contact_template_that_names_another_word_is_refused_by_name() {
         let validated = declaring(edited(|map| {
             map["contact"]["tool_name"] = json!(template);
         }));
-        assert_refused_by_name(&validated, HookEventsRefusal::ContactTemplateBad);
+        assert!(
+            refused_by_name(&validated, HookEventsRefusal::ContactTemplateBad),
+            "{:?}",
+            validated.report.findings
+        );
     }
     let long = format!("{}{{server}}{{tool}}", "a".repeat(60));
     let validated = declaring(edited(|map| map["contact"]["tool_name"] = json!(long)));
-    assert_refused_by_name(&validated, HookEventsRefusal::ContactTemplateBad);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::ContactTemplateBad),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -295,7 +349,11 @@ fn a_contact_no_event_can_report_is_refused_by_name() {
             .expect("an object")
             .remove("start_source");
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::ContactWithoutToolFinished);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::ContactWithoutToolFinished),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -306,7 +364,11 @@ fn a_contact_with_no_tool_name_place_is_refused_by_name() {
             .expect("an object")
             .remove("tool_name");
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::ContactWithoutToolNamePlace);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::ContactWithoutToolNamePlace),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -328,7 +390,11 @@ fn a_map_over_eight_kib_is_refused_by_name() {
                 .collect(),
         );
     }));
-    assert_refused_by_name(&validated, HookEventsRefusal::TooLarge);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::TooLarge),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -336,7 +402,11 @@ fn a_map_in_a_package_that_starts_no_forwarder_is_refused_by_name() {
     let validated = check(">=0.1.8, <0.2.0", false, |table| {
         table["hook_events"] = fixture();
     });
-    assert_refused_by_name(&validated, HookEventsRefusal::NoForwarder);
+    assert!(
+        refused_by_name(&validated, HookEventsRefusal::NoForwarder),
+        "{:?}",
+        validated.report.findings
+    );
 }
 
 #[test]
@@ -385,10 +455,87 @@ fn a_package_that_uses_hook_events_needs_an_sdk_range_from_its_arrival() {
     );
 }
 
-/// A table that declares no map is written with the bytes it had before the member existed: every
-/// connector table the repository keeps reads and writes back to the same document.
+/// The connector tables of the repository that read as connector tables, each with the digest of the
+/// bytes the code wrote for it before the `hook_events` member existed. They are the retained
+/// fixtures of `fixtures/plugins` (the valid, the invalid and the released ones) and the installed
+/// tables of `bundled-plugins/targets/packages`.
+const TABLES_AS_THEY_WERE_WRITTEN: [(&str, &str); 15] = [
+    (
+        "bundled-plugins/targets/packages/kalareach/claude-code/0.5.0/connector.json",
+        "cde1cdc21e0c0df0355b66079f9961696a092abb114f063dc53feaccf12b2ce4",
+    ),
+    (
+        "bundled-plugins/targets/packages/kalareach/codex/0.2.1/connector.json",
+        "e02cacb3b49b148020dc102856208686d2e3cdb4f5b0176ab87467d45e8a8a23",
+    ),
+    (
+        "bundled-plugins/targets/packages/kalareach/gemini-cli/0.5.0/connector.json",
+        "847b357d8e0d077db80dbf3707b2a3ed2d647ed64b6eef748c88e0c46afef827",
+    ),
+    (
+        "bundled-plugins/targets/packages/kalareach/kimi-cli/0.1.1/connector.json",
+        "5e8c457904a49ba7515a837f45801e527fb847afbadf72a4d3cab96a0617b14f",
+    ),
+    (
+        "bundled-plugins/targets/packages/kalareach/kimi-code-cli/0.2.1/connector.json",
+        "f21d2fced76a4e276a409d92761b65d5e3892a384d63ca7f395f4687fc1fd806",
+    ),
+    (
+        "bundled-plugins/targets/packages/kalareach/opencode/0.2.1/connector.json",
+        "425ec77bc570ef0f713acf3c3d96026194904e752ab89e60415c81d707366690",
+    ),
+    (
+        "bundled-plugins/targets/packages/kalareach/opencode-attach/0.1.1/connector.json",
+        "fe276956cbff1b3aeb299895e1939b2c5b9bc95cb3b07c19e40cac28894cdde8",
+    ),
+    (
+        "bundled-plugins/targets/packages/kalareach/qoder-cli/0.5.0/connector.json",
+        "c52dbafd10413c13c1dbe65eeb27827f195598e09d4ac85aeed2430ebb464f0c",
+    ),
+    (
+        "fixtures/plugins/invalid/connector-table-invalid/package/connector.json",
+        "f62a4f0e1eb600e2c566510fb5bee7ac0f1027046339e268b72a0307425e4252",
+    ),
+    (
+        "fixtures/plugins/invalid/connector-undeclared/package/connector.json",
+        "f6cd8b1554d178cac79b48910dc858e2ac8c27ee4722f40288d502b8ed4020f7",
+    ),
+    (
+        "fixtures/plugins/invalid/control-widens-a-range/package/connector.json",
+        "f6cd8b1554d178cac79b48910dc858e2ac8c27ee4722f40288d502b8ed4020f7",
+    ),
+    (
+        "fixtures/plugins/invalid/upstream-binding-conflict/package/connector.json",
+        "f6cd8b1554d178cac79b48910dc858e2ac8c27ee4722f40288d502b8ed4020f7",
+    ),
+    (
+        "fixtures/plugins/invalid/upstream-route-direction/package/connector.json",
+        "dfa8af40cdcd215df2dca6f8eaf27dccb9bc5f0bdbc43ba3a5766736b42fa088",
+    ),
+    (
+        "fixtures/plugins/released/kalareach/codex/0.3.0/connector.json",
+        "e360951ea2e9f5d0611db8c25702f54f464c9ff3f267f12a451473ec4f4aea92",
+    ),
+    (
+        "fixtures/plugins/valid/example-connector/connector.json",
+        "40ae4095227e47cf7257344384519294ab3e020a7610306dfcaec9ec7e237f21",
+    ),
+];
+
+/// A table that declares no map is written with the bytes it had before the member existed: each
+/// table in [`TABLES_AS_THEY_WERE_WRITTEN`] reads, declares no map, and is written with the pinned
+/// bytes, and every connector table the two folders keep reads and writes back to the same document.
 #[test]
 fn a_table_that_declares_no_map_serialises_to_the_bytes_it_had_before() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (relative, digest) in TABLES_AS_THEY_WERE_WRITTEN {
+        let text = std::fs::read_to_string(root.join(relative)).expect("the pinned table reads");
+        let table: kr_plugin_sdk::connector::ConnectorManifest =
+            serde_json::from_str(&text).expect("the pinned table parses");
+        assert!(table.hook_events.is_none(), "{relative}");
+        let bytes = serde_json::to_vec(&table).expect("writes");
+        assert_eq!(PayloadDigest::of(&bytes).to_string(), digest, "{relative}");
+    }
     fn tables(under: &Path, found: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(under).expect("a directory").flatten() {
             let path = entry.path();
@@ -403,11 +550,10 @@ fn a_table_that_declares_no_map_serialises_to_the_bytes_it_had_before() {
         }
     }
     let mut found = Vec::new();
-    tables(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/plugins"),
-        &mut found,
-    );
-    assert!(found.len() >= 2, "the repository keeps connector tables");
+    for folder in ["fixtures/plugins", "bundled-plugins/targets/packages"] {
+        tables(&root.join(folder), &mut found);
+    }
+    let mut parsed = 0;
     for path in found {
         let text = std::fs::read_to_string(&path).expect("reads");
         let Ok(table) = serde_json::from_str::<kr_plugin_sdk::connector::ConnectorManifest>(&text)
@@ -415,7 +561,8 @@ fn a_table_that_declares_no_map_serialises_to_the_bytes_it_had_before() {
             // A table kept to be refused does not read, and is not one that declares a map.
             continue;
         };
-        assert!(table.hook_events.is_none());
+        parsed += 1;
+        assert!(table.hook_events.is_none(), "{}", path.display());
         let written = serde_json::to_value(&table).expect("writes");
         let original: Value = serde_json::from_str(&text).expect("a document");
         assert_eq!(written, original, "{}", path.display());
@@ -424,5 +571,54 @@ fn a_table_that_declares_no_map_serialises_to_the_bytes_it_had_before() {
             "{}",
             path.display()
         );
+    }
+    assert!(
+        parsed >= TABLES_AS_THEY_WERE_WRITTEN.len(),
+        "{parsed} tables parse, so a skip has not emptied the check"
+    );
+}
+
+/// The plugin documentation states the three conditions an application's module bridge is admitted
+/// on, each in its own words, and says which of them the worker does not check.
+#[test]
+fn the_plugin_documentation_names_the_three_conditions_of_a_module_bridge() {
+    let text = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plugins/README.md"),
+    )
+    .expect("the documentation reads");
+    let start = text
+        .find("An application whose bridge is code that starts the forwarder")
+        .expect("the section on a module bridge");
+    let section = text[start..]
+        .split("\n## ")
+        .next()
+        .expect("the section ends at a heading");
+    assert!(
+        section.contains("checks the first two at the hook's first connection"),
+        "which conditions the worker checks"
+    );
+    let conditions: Vec<&str> = section
+        .lines()
+        .filter(|line| line.starts_with("- "))
+        .collect();
+    assert_eq!(conditions.len(), 3, "three conditions: {conditions:?}");
+    let words: [&[&str]; 3] = [
+        &[
+            "runs in the launched process or a descendant",
+            "kernel parent chain",
+            "each link's start identity checked",
+            "a hook that another descendant starts is admitted and selects no thread",
+        ],
+        &["starts the installed forwarder by its path"],
+        &[
+            "keeps the launch environment the forwarder reads",
+            "names the registration",
+            "The worker does not check this",
+        ],
+    ];
+    for (condition, words) in conditions.iter().zip(words) {
+        for word in words {
+            assert!(condition.contains(word), "{word:?} is in {condition:?}");
+        }
     }
 }
