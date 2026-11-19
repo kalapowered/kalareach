@@ -80,8 +80,9 @@ finished. A recipe whose removal does not end with the record is refused.
 The core repository keeps a copy of all three files in `fixtures/bridges/gemini-cli/`, pinned by the
 SHA-256 digests the package's recipe records, and `crates/kr-hook/tests/fixtures.rs` checks that
 every hook starts the forwarder's `gemini-cli hook` invocation as the placeholder and plain words, for
-exactly the events the forwarder reports, with a timeout its deadline fits inside, and that the
-record names `/dev/null/kalareach` and nothing else.
+exactly a session starting, a session ending and a notification, each an event the forwarder reads,
+with a timeout its deadline fits inside, and that the record names `/dev/null/kalareach` and
+nothing else.
 
 ## How Gemini CLI starts the forwarder
 
