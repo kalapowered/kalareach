@@ -1200,8 +1200,13 @@ impl OwnVoiceProvider {
                     ));
                 }
                 // The call exists and is not usable: it is hung up, and the row says what came
-                // of it.
-                let closed = core.hang_up_and_mark(&call.call_id, &session_id).await;
+                // of it. A closure that came while the hangup waited is the confirmed end,
+                // whatever the hangup's answer was.
+                let mut closed = core.hang_up_and_mark(&call.call_id, &session_id).await;
+                if !closed && task.read_queued().await {
+                    core.mark_closed(&call.call_id);
+                    closed = true;
+                }
                 let fenced = core.registry.epoch() != epoch;
                 core.registry.finished(ticket, late_end(fenced, closed));
                 return Ok(refused(
@@ -1219,7 +1224,13 @@ impl OwnVoiceProvider {
                 core.mark_closed(&call.call_id);
                 true
             } else {
-                core.hang_up_and_mark(&call.call_id, &session_id).await
+                let mut closed = core.hang_up_and_mark(&call.call_id, &session_id).await;
+                // The closure may also come while the hangup waits.
+                if !closed && task.read_queued().await {
+                    core.mark_closed(&call.call_id);
+                    closed = true;
+                }
+                closed
             };
             core.registry.end_start(&slot, late_end(true, closed));
             return Ok(refused(
@@ -2080,13 +2091,19 @@ impl CallTask {
                 }
             }
         }
-        self.socket = None;
+        // The channel stays open through the hangup: a closure that comes while it waits is read
+        // after it, and `finish` lets the channel go.
         Some(self.hang_up().await)
     }
 
+    /// One bounded hangup. A hangup that is not confirmed reads the channel once more: the
+    /// provider's closure may have come while the hangup waited, and it is the confirmed end
+    /// whatever the hangup's answer was.
     async fn hang_up(&mut self) -> Outcome {
         if self.core.hang_up(&self.shared.session_id).await {
             Outcome::HostClosed
+        } else if self.read_queued().await {
+            Outcome::ProviderClosed
         } else {
             Outcome::Unconfirmed
         }
