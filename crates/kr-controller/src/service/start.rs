@@ -854,7 +854,7 @@ impl Controller {
         // nothing a process inherited. They go through the proxy this daemon started with, the
         // endpoint's own, and nothing runs yet: settling comes before the store is reconciled,
         // and the carrier starts after it.
-        let mut clients = Self::build_service_clients(
+        let clients = Self::build_service_clients(
             &started,
             &super::clients::ClientParts {
                 account: &account,

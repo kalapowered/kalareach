@@ -10,8 +10,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::stand_in::{
-    CreateScript, HangupScript, MemoryLedger, STAND_IN_MARKER, StandIn, StaticKey, created_body,
-    not_found_body,
+    CreateScript, HangupScript, MemoryLedger, StandIn, StaticKey, created_body, not_found_body,
 };
 use super::*;
 use crate::services::own_registry::RegistryState;
