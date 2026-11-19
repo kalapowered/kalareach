@@ -467,9 +467,10 @@ impl EndpointCloser {
         self.0.started.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Ends the endpoint, and waits until the end is complete. Every caller waits for the same
-    /// end, and a caller that is cancelled leaves it to finish.
-    pub async fn close(&self) {
+    /// Starts the end if it has not started, and does not wait for it. The one owner task is
+    /// spawned here, so a caller that is cancelled, or that does not wait, leaves the end to
+    /// finish.
+    fn begin(&self) {
         if self
             .0
             .started
@@ -495,6 +496,12 @@ impl EndpointCloser {
                 inner.done.send_replace(true);
             });
         }
+    }
+
+    /// Ends the endpoint, and waits until the end is complete. Every caller waits for the same
+    /// end, and a caller that is cancelled leaves it to finish.
+    pub async fn close(&self) {
+        self.begin();
         let mut done = self.0.done.subscribe();
         // The sender lives in the shared state this very call holds.
         let _ = done.wait_for(|complete| *complete).await;
@@ -569,9 +576,13 @@ impl Drop for ProxyGuard {
 }
 
 /// Starts the guard of `login`'s verdict over `closer`. A verdict that was set before the guard
-/// started closes the endpoint at once.
+/// started has started the end before this returns, so `closing` reads true at once and nothing
+/// waits for the guard's task to run.
 #[must_use]
 pub fn guard_proxy(closer: &EndpointCloser, login: &ProxyCredential) -> ProxyGuard {
+    if login.stopped().is_some() {
+        closer.begin();
+    }
     let watched = closer.clone();
     let login = login.clone();
     let task = tokio::spawn(async move {
@@ -2198,10 +2209,11 @@ mod tests {
         assert!(closer.closed());
     }
 
-    /// KR-REQ-10.02: a guard that is built after the verdict closes the endpoint with no further
-    /// event.
+    /// KR-REQ-10.02: a guard that is built after the verdict has started the close before it
+    /// returns, with no further event and no close of the case's own: the end has started when the
+    /// guard is in the caller's hands, and it completes by itself.
     #[tokio::test]
-    async fn a_guard_built_after_the_verdict_closes_at_once() {
+    async fn a_guard_built_after_the_verdict_starts_the_close_before_it_returns() {
         let (closer, gate, calls) = held_closer();
         gate.notify_one();
         let login = crate::proxy::ProxyCredential::new(
@@ -2211,8 +2223,17 @@ mod tests {
         .expect("a login");
         login.refuse(crate::proxy::StopKind::Unsupported);
         let guard = guard_proxy(&closer, &login);
-        closer.close().await;
-        assert!(guard.proxy_closed());
+        assert!(
+            closer.closing(),
+            "the end has started when the guard is returned"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !guard.proxy_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the end completes with no close of the case's own");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 

@@ -286,6 +286,92 @@ async fn a_followed_request_is_the_one_the_librarys_own_policy_sends() {
     }
 }
 
+/// The one place `follow` differs from the library's own policy: in a chain from one host to a
+/// second and then to the second again, a header that holds a login is removed at the change of
+/// host and stays removed. The library, as locked in this build, sends it again on the second
+/// request to the second host; `follow` does not, and every other header is the library's.
+///
+/// Covers KR-REQ-10.02.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_login_header_removed_at_a_change_of_host_stays_removed_in_a_chain_to_the_same_host_twice()
+ {
+    let first = Origin::start().await;
+    let second = Origin::start().await;
+    let to_second = second.url("/b").to_string();
+    first.answer(move |_| Reply {
+        status: 307,
+        location: Some(to_second.clone()),
+        ..Reply::default()
+    });
+    second.answer(|seen| match seen.target.as_str() {
+        "/b" => Reply {
+            status: 307,
+            location: Some("/c".to_owned()),
+            ..Reply::default()
+        },
+        _ => Reply {
+            status: 200,
+            ..Reply::default()
+        },
+    });
+    let (follows, library) = (following_client(), library_client());
+    let url = first.url("/a");
+
+    let done = follow(
+        &follows,
+        request(&follows, &Method::GET, &url),
+        following(10, WATCHDOG),
+        free,
+    )
+    .await
+    .expect("a followed request");
+    assert_eq!(done.status(), 200);
+    let ours: Vec<Seen> = second.take();
+    first.take();
+    let done = library
+        .execute(request(&library, &Method::GET, &url))
+        .await
+        .expect("the library's own request");
+    assert_eq!(done.status(), 200);
+    let theirs: Vec<Seen> = second.take();
+
+    let reach = |seen: &[Seen], target: &str| {
+        seen.iter()
+            .find(|seen| seen.target == target)
+            .unwrap_or_else(|| panic!("{target} was requested"))
+            .clone()
+    };
+    for (who, seen) in [("follow", &ours), ("the library", &theirs)] {
+        assert_eq!(
+            reach(seen, "/b").headers.get("authorization"),
+            None,
+            "{who}: the login goes no further than the host that received it"
+        );
+        assert_eq!(
+            reach(seen, "/b").headers.get("x-kept").map(String::as_str),
+            Some("yes"),
+            "{who}: the other headers follow"
+        );
+    }
+    assert_eq!(
+        reach(&ours, "/c").headers.get("authorization"),
+        None,
+        "follow: the login stays removed on the second request to the same host"
+    );
+    assert_eq!(
+        reach(&ours, "/c").headers.get("x-kept").map(String::as_str),
+        Some("yes")
+    );
+    assert_eq!(
+        reach(&theirs, "/c")
+            .headers
+            .get("authorization")
+            .map(String::as_str),
+        Some("Bearer secret"),
+        "the library restores it on that request: the exception to equivalence"
+    );
+}
+
 /// Ten redirects are followed and the eleventh is refused, with the address that answered it, and
 /// the library's policy makes the same eleven requests.
 ///

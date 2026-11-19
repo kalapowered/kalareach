@@ -743,6 +743,12 @@ fn referer_of(next: &Url, previous: &Url) -> Option<HeaderValue> {
 /// received it, and a followed request carries a `Referer`. `following.limit` redirects are followed
 /// and the next is [`FollowFailure::TooManyRedirects`].
 ///
+/// One difference from the library's own policy is kept on purpose. A header that holds a login is
+/// removed at the first change of host and stays removed for the rest of the chain. The library, as
+/// locked in this build, can send it again on the second request to the new host of a chain from
+/// one host to a second and then to the second again; `follow` never does. Every other header, the
+/// method, the body and the `Referer` are the library's.
+///
 /// One deadline, `following.deadline`, bounds every hop and the body of the last response: each hop
 /// is given the time that is left. With none, the client's own timeout applies to each hop.
 ///
@@ -853,6 +859,49 @@ pub async fn follow(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An inner connect that sets the verdict as it is called and is finished at once.
+    #[derive(Clone)]
+    struct ConnectsAsTheVerdictLands(ProxyCredential);
+
+    impl tower_service::Service<()> for ConnectsAsTheVerdictLands {
+        type Response = ();
+        type Error = BoxError;
+        type Future = std::future::Ready<Result<(), BoxError>>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), BoxError>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, (): ()) -> Self::Future {
+            self.0.refuse(StopKind::Refused);
+            std::future::ready(Ok(()))
+        }
+    }
+
+    /// A connect that is finished in the poll in which the verdict is set ends in the verdict,
+    /// because the layer polls the verdict first. In 64 runs, a race that is not biased lets a
+    /// connect through with a chance of 1 - 2^-64.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test]
+    async fn a_verdict_and_a_finished_connect_in_one_poll_end_in_the_verdict() {
+        for run in 0..64 {
+            let login = ProxyCredential::new(line("user"), line("password")).expect("a login");
+            let mut service = tower_layer::Layer::layer(
+                &ProxyLoginLayer::new(Some(login.clone())),
+                ConnectsAsTheVerdictLands(login),
+            );
+            let ended = tower_service::Service::call(&mut service, ()).await;
+            assert!(
+                ended.is_err(),
+                "run {run}: a finished connect won against the verdict"
+            );
+        }
+    }
 
     fn line(text: &str) -> SecretVec {
         SecretVec::new(text.as_bytes().to_vec())
