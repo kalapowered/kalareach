@@ -28,8 +28,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::io;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -38,6 +41,7 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, DeviceId};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
@@ -2255,25 +2259,92 @@ fn reply_of(answer: Result<super::http::StatusAnswer>) -> std::result::Result<Re
         .map_err(|_| Lost)
 }
 
-/// How many messages one write reads ahead of itself.
+/// How many messages one read ahead takes.
 ///
 /// A message the library holds, or the socket has ready, when a write begins is out of reach once
 /// that write fails: a failed write ends the library's reading, buffered messages and all. So a
-/// write first takes what is ready into [`WebSocketSideband::ahead`], at most this many messages.
-/// A closure behind more than this many ready messages, when the write fails, is not read; the
-/// hangup's answer decides then, as it does for a closure still in transit, or one that reaches
-/// the socket after the write began and before its flush failed.
+/// write first takes what is ready into [`WebSocketSideband::ahead`], at most this many messages,
+/// and so does a read that finds nothing taken. A closure behind more than this many ready
+/// messages, when the write fails, is not read; the hangup's answer decides then, as it does for a
+/// closure still in transit, or one that reaches the socket after a write began: its window runs
+/// until the next read or write, because the library flushes what is left of a frame there, and a
+/// flush that fails ends the reading.
 const READ_AHEAD_MESSAGES: usize = 256;
 
+/// The stream of a side channel, whose writes can be held back. While they are, a write or a
+/// flush that the library makes by itself neither reaches the stream nor fails: it waits.
+struct HoldWrites<S> {
+    inner: S,
+    held: bool,
+}
+
+impl<S> HoldWrites<S> {
+    const fn new(inner: S) -> Self {
+        Self { inner, held: false }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for HoldWrites<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for HoldWrites<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.held {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.held {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.held {
+            return Poll::Pending;
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 struct WebSocketSideband<S> {
-    socket: tokio_websockets::WebSocketStream<S>,
-    /// Messages a write read ahead, in the order they came, and not yet handed on. A closing
+    socket: tokio_websockets::WebSocketStream<HoldWrites<S>>,
+    /// Messages a read ahead took, in the order they came, and not yet handed on. A closing
     /// frame or a failure the read ahead met is the last of them.
     ahead: VecDeque<SocketRead>,
 }
 
-impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WebSocketSideband<S> {
-    const fn new(socket: tokio_websockets::WebSocketStream<S>) -> Self {
+impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketSideband<S> {
+    const fn new(socket: tokio_websockets::WebSocketStream<HoldWrites<S>>) -> Self {
         Self {
             socket,
             ahead: VecDeque::new(),
@@ -2300,28 +2371,45 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WebSocketSideband<
     /// Takes what the library holds or the socket has ready into `ahead`, without waiting, outside
     /// the task's cooperative budget, and stops at the first end or after
     /// [`READ_AHEAD_MESSAGES`].
+    ///
+    /// The library answers a Ping by queueing a Pong that its next read writes before it reads
+    /// anything, and a write that fails ends its reading. So the stream's writes are held while
+    /// this reads: a Pong waits, and the closure behind the Ping is read. The writes are let go
+    /// when it returns, and the Pong goes with the next write or flush.
     fn read_ahead(&mut self) {
         use futures_util::StreamExt;
+        self.socket.get_mut().held = true;
         let mut taken = 0;
         while taken < READ_AHEAD_MESSAGES {
             let Some(item) = tokio::task::unconstrained(self.socket.next()).now_or_never() else {
-                return;
+                break;
             };
             taken += 1;
             if let Some(read) = Self::read_of(item) {
                 let ended = read == SocketRead::Closed;
                 self.ahead.push_back(read);
                 if ended {
-                    return;
+                    break;
                 }
             }
         }
+        self.socket.get_mut().held = false;
+    }
+
+    /// Lets the writes the library holds go, as far as the stream takes them, without waiting for
+    /// the rest. A write that fails ends the reading, which no longer matters once everything
+    /// that was ready is in `ahead`.
+    async fn flush_what_is_ready(&mut self) {
+        use futures_util::SinkExt;
+        std::future::poll_fn(|cx| {
+            let _ = self.socket.poll_flush_unpin(cx);
+            Poll::Ready(())
+        })
+        .await;
     }
 }
 
-impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> SidebandSocket
-    for WebSocketSideband<S>
-{
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> SidebandSocket for WebSocketSideband<S> {
     fn send(&mut self, text: String) -> TransportFuture<'_, bool> {
         use futures_util::SinkExt;
         Box::pin(async move {
@@ -2336,6 +2424,12 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> SidebandSoc
     fn next(&mut self) -> TransportFuture<'_, SocketRead> {
         use futures_util::StreamExt;
         Box::pin(async move {
+            if self.ahead.is_empty() {
+                self.read_ahead();
+                if !self.ahead.is_empty() {
+                    self.flush_what_is_ready().await;
+                }
+            }
             if let Some(read) = self.ahead.pop_front() {
                 return read;
             }
@@ -2425,6 +2519,7 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
                     proxy: self.proxy.as_ref(),
                     loopback_plain: false,
                 },
+                HoldWrites::new,
             )
             .await
             // A refused upgrade carries no recognised closure, so none of its statuses ends a

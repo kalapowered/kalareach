@@ -219,8 +219,11 @@ impl AsyncWrite for Wire {
     }
 }
 
+/// The stream an upgrade runs over, as [`open`] hands it to its caller's `wrap`.
+pub(crate) type Io = UpgradeGuard<Wire>;
+
 /// An open socket.
-pub(crate) type Socket = WebSocketStream<UpgradeGuard<Wire>>;
+pub(crate) type Socket = WebSocketStream<Io>;
 
 /// `tls` set up to offer the one protocol an upgrade is made in.
 ///
@@ -234,20 +237,35 @@ pub(crate) fn for_upgrade(mut tls: ClientConfig) -> Arc<ClientConfig> {
 /// host, and the upgrade with the caller's headers. The whole attempt is bounded by
 /// [`OPEN_DEADLINE`].
 ///
+/// The stream the upgrade runs over goes through `wrap` first, and the socket runs over what
+/// `wrap` returns: a caller that needs nothing more passes [`std::convert::identity`] and gets a
+/// [`Socket`].
+///
 /// # Errors
 ///
 /// Returns a [`Failure`] saying how far the socket got.
-pub(crate) async fn open(
+pub(crate) async fn open<W>(
     tls: &Arc<ClientConfig>,
     upgrade: &Upgrade<'_>,
-) -> Result<Socket, Failure> {
-    tokio::time::timeout(OPEN_DEADLINE, open_now(tls, upgrade))
+    wrap: impl FnOnce(Io) -> W,
+) -> Result<WebSocketStream<W>, Failure>
+where
+    W: AsyncRead + AsyncWrite + Unpin,
+{
+    tokio::time::timeout(OPEN_DEADLINE, open_now(tls, upgrade, wrap))
         .await
         .map_err(|_| Failure::Unreachable(TOO_SLOW.to_owned()))?
 }
 
 /// Opens one socket without a deadline of its own.
-async fn open_now(tls: &Arc<ClientConfig>, upgrade: &Upgrade<'_>) -> Result<Socket, Failure> {
+async fn open_now<W>(
+    tls: &Arc<ClientConfig>,
+    upgrade: &Upgrade<'_>,
+    wrap: impl FnOnce(Io) -> W,
+) -> Result<WebSocketStream<W>, Failure>
+where
+    W: AsyncRead + AsyncWrite + Unpin,
+{
     let (secure, authority) = if let Some(authority) = upgrade.origin.strip_prefix("https://") {
         (true, authority)
     } else if let Some(authority) = upgrade
@@ -309,7 +327,7 @@ async fn open_now(tls: &Arc<ClientConfig>, upgrade: &Upgrade<'_>) -> Result<Sock
     let retry_after = Arc::new(OnceLock::new());
     let (socket, _) = builder
         .limits(Limits::default().max_payload_len(Some(upgrade.max_payload)))
-        .connect_on(UpgradeGuard::new(wire, Arc::clone(&retry_after)))
+        .connect_on(wrap(UpgradeGuard::new(wire, Arc::clone(&retry_after))))
         .await
         .map_err(|error| upgrade_failed(error, retry_after.get().copied()))?;
     Ok(socket)

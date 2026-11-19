@@ -1563,6 +1563,7 @@ async fn attach(
             proxy: None,
             loopback_plain: true,
         },
+        std::convert::identity,
     )
     .await
     .map_err(|failure| match failure {

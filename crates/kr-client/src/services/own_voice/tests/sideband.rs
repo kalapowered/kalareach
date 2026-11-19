@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
-use futures_util::{FutureExt, SinkExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio_websockets::{ClientBuilder, Message, ServerBuilder, WebSocketStream};
 
@@ -44,10 +44,12 @@ impl Gate {
     }
 }
 
-/// The adapter's end of an in-memory connection, with writes under a [`Gate`].
+/// The adapter's end of an in-memory connection, with writes under a [`Gate`]. It takes writes as
+/// the library offers them, in one buffer or in several, as `vectored` says.
 struct Wire {
     inner: DuplexStream,
     gate: Gate,
+    vectored: bool,
 }
 
 impl AsyncRead for Wire {
@@ -73,6 +75,10 @@ impl AsyncWrite for Wire {
         }
     }
 
+    fn is_write_vectored(&self) -> bool {
+        self.vectored
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.gate.mode() {
             Writes::Pass => Pin::new(&mut self.inner).poll_flush(cx),
@@ -89,17 +95,30 @@ impl AsyncWrite for Wire {
 /// The adapter on a connection to the library's server, with that server's end and the gate of
 /// the adapter's writes.
 async fn connected() -> (WebSocketSideband<Wire>, WebSocketStream<DuplexStream>, Gate) {
+    connected_over(false).await
+}
+
+/// [`connected`], on a connection whose writes take several buffers at once.
+async fn connected_vectored() -> (WebSocketSideband<Wire>, WebSocketStream<DuplexStream>, Gate) {
+    connected_over(true).await
+}
+
+async fn connected_over(
+    vectored: bool,
+) -> (WebSocketSideband<Wire>, WebSocketStream<DuplexStream>, Gate) {
     let (near, far) = tokio::io::duplex(1 << 20);
     let gate = Gate::new();
     let wire = Wire {
         inner: near,
         gate: gate.clone(),
+        vectored,
     };
     let client = ClientBuilder::new()
         .uri("ws://stand-in.invalid/side")
         .expect("an address");
     let server = ServerBuilder::new();
-    let (opened, accepted) = tokio::join!(client.connect_on(wire), server.accept(far));
+    let (opened, accepted) =
+        tokio::join!(client.connect_on(HoldWrites::new(wire)), server.accept(far));
     let (socket, _) = opened.expect("the client's upgrade");
     let (_, provider) = accepted.expect("the server's upgrade");
     (WebSocketSideband::new(socket), provider, gate)
@@ -121,6 +140,19 @@ async fn said(provider: &mut WebSocketStream<DuplexStream>, texts: &[String]) {
             .await
             .expect("the provider writes");
     }
+}
+
+/// The provider pings the adapter, which owes a Pong for it.
+async fn pinged(provider: &mut WebSocketStream<DuplexStream>) {
+    provider
+        .send(Message::ping("keep-alive"))
+        .await
+        .expect("the provider pings");
+}
+
+/// Whether what the provider read, without waiting, is a Pong.
+fn is_pong(read: Option<Option<std::result::Result<Message, tokio_websockets::Error>>>) -> bool {
+    matches!(read, Some(Some(Ok(message))) if message.is_pong())
 }
 
 /// Lets the call's task run, without moving the clock.
@@ -324,6 +356,183 @@ async fn a_call_whose_write_is_cancelled_beside_a_closure_on_the_socket_ends_as_
         control.state(),
         SidebandState::Closed(SidebandEnd::ProviderClosed),
         "the closure that was on the socket when the write began was read"
+    );
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+/// A Ping and a valid closure are on the connection when a write fails, after the adapter read an
+/// event: the Pong the Ping owes waits while they are read, and the closure is read.
+#[tokio::test]
+async fn a_closure_behind_a_ping_is_read_after_a_write_that_fails() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    said(&mut provider, &[usage()]).await;
+    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    pinged(&mut provider).await;
+    said(&mut provider, &[closure()]).await;
+    gate.set(Writes::Fail);
+    assert!(!sideband.send("{}".to_owned()).await, "the write failed");
+    assert_eq!(
+        sideband.next().await,
+        SocketRead::Text(closure()),
+        "the closure behind the Ping, which was on the connection when the write began, is read"
+    );
+    assert_eq!(sideband.next().await, SocketRead::Closed);
+}
+
+/// The same, on a connection whose writes take several buffers at once.
+#[tokio::test]
+async fn a_closure_behind_a_ping_is_read_after_a_write_that_fails_on_vectored_writes() {
+    let (mut sideband, mut provider, gate) = connected_vectored().await;
+    said(&mut provider, &[usage()]).await;
+    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    pinged(&mut provider).await;
+    said(&mut provider, &[closure()]).await;
+    gate.set(Writes::Fail);
+    assert!(!sideband.send("{}".to_owned()).await, "the write failed");
+    assert_eq!(
+        sideband.next().await,
+        SocketRead::Text(closure()),
+        "the closure behind the Ping, which was on the connection when the write began, is read"
+    );
+    assert_eq!(sideband.next().await, SocketRead::Closed);
+}
+
+/// A read that waits is cancelled with the Pong of a Ping queued in the library, and a closure
+/// comes before the next write, which fails: the closure is read.
+#[tokio::test]
+async fn a_closure_after_a_cancelled_read_that_left_a_pong_queued_is_read_after_a_write_that_fails()
+{
+    let (mut sideband, mut provider, gate) = connected().await;
+    gate.set(Writes::Hold);
+    pinged(&mut provider).await;
+    assert!(
+        sideband.next().now_or_never().is_none(),
+        "the read waits, with the Pong it owes held"
+    );
+    said(&mut provider, &[closure()]).await;
+    gate.set(Writes::Fail);
+    assert!(!sideband.send("{}".to_owned()).await, "the write failed");
+    assert_eq!(
+        sideband.next().await,
+        SocketRead::Text(closure()),
+        "the closure that came before the write is read"
+    );
+    assert_eq!(sideband.next().await, SocketRead::Closed);
+}
+
+/// An event, a Ping and a valid closure are on the connection when writes already fail, and no
+/// write is made: reads alone give the event, the closure, and then the end.
+#[tokio::test]
+async fn a_closure_behind_a_ping_is_read_by_reads_alone_while_writes_fail() {
+    let (mut sideband, mut provider, gate) = connected().await;
+    said(&mut provider, &[usage()]).await;
+    pinged(&mut provider).await;
+    said(&mut provider, &[closure()]).await;
+    gate.set(Writes::Fail);
+    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    assert_eq!(
+        sideband.next().await,
+        SocketRead::Text(closure()),
+        "the closure behind the Ping is read"
+    );
+    assert_eq!(sideband.next().await, SocketRead::Closed);
+}
+
+/// A read that finds a Ping and an event answers the Ping at once, with no write made.
+#[tokio::test]
+async fn a_ping_read_with_an_event_is_answered_before_any_write() {
+    let (mut sideband, mut provider, _gate) = connected().await;
+    pinged(&mut provider).await;
+    said(&mut provider, &[usage()]).await;
+    assert_eq!(sideband.next().await, SocketRead::Text(usage()));
+    assert!(
+        is_pong(provider.next().now_or_never()),
+        "the Pong went out with the read"
+    );
+}
+
+/// A write that reads a Ping ahead lets the Pong go with its own text.
+#[tokio::test]
+async fn a_ping_read_ahead_by_a_write_is_answered_with_the_write() {
+    let (mut sideband, mut provider, _gate) = connected().await;
+    pinged(&mut provider).await;
+    assert_eq!(
+        sideband.send("{}".to_owned()).now_or_never(),
+        Some(true),
+        "the write finished"
+    );
+    assert!(
+        is_pong(provider.next().now_or_never()),
+        "the Pong came first"
+    );
+    let text = provider.next().now_or_never();
+    assert!(
+        matches!(text, Some(Some(Ok(ref message))) if message.as_text() == Some("{}")),
+        "the text came after it"
+    );
+}
+
+/// An event, a Ping and a valid closure are on the connection when a write fails before any is
+/// read: the call ends as the provider's, nothing is hung up, and no row stands.
+#[tokio::test(start_paused = true)]
+async fn a_call_whose_write_fails_beside_a_ping_and_a_closure_on_the_socket_ends_as_the_providers()
+{
+    let (world, own, mut provider, gate) = bridged().await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    said(&mut provider, &[usage()]).await;
+    pinged(&mut provider).await;
+    said(&mut provider, &[closure()]).await;
+    gate.set(Writes::Fail);
+    assert_eq!(
+        control.write(control.revision(), thinking()).await,
+        Err(WriteRefusal::Lost),
+        "the write is refused as lost"
+    );
+    settle().await;
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed),
+        "the closure behind the Ping was read"
+    );
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+/// A Ping is read while writes are held and a closure comes before the next write, which fails:
+/// the call ends as the provider's, nothing is hung up, and no row stands.
+#[tokio::test(start_paused = true)]
+async fn a_call_whose_read_left_a_pong_held_and_whose_write_fails_beside_a_closure_ends_as_the_providers()
+ {
+    let (world, own, mut provider, gate) = bridged().await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    gate.set(Writes::Hold);
+    pinged(&mut provider).await;
+    settle().await;
+    said(&mut provider, &[closure()]).await;
+    gate.set(Writes::Fail);
+    assert_eq!(
+        control.write(control.revision(), thinking()).await,
+        Err(WriteRefusal::Lost),
+        "the write is refused as lost"
+    );
+    settle().await;
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed),
+        "the closure that came after the Ping was read"
     );
     assert!(
         world.stand_in.recorded().hangups.is_empty(),

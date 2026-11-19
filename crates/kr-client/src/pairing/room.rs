@@ -296,6 +296,7 @@ impl RoomConnector {
                 proxy: self.proxy.as_ref(),
                 loopback_plain: false,
             },
+            std::convert::identity,
         )
         .await
         .map_err(|failure| room_failure(origin, failure))?;
