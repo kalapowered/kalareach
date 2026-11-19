@@ -2169,12 +2169,14 @@ mod tests {
     }
 
     /// The identity a host gave this device when it was paired with the host again.
+    #[cfg(unix)]
     fn paired_again() -> kr_protocol::ids::DeviceId {
         kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]))
     }
 
     /// The pairings of a device that holds the first pairing of every host it paired with except
     /// `gone`, and holds a later pairing with that one.
+    #[cfg(unix)]
     fn paired_again_with(
         gone: kr_protocol::ids::DeviceId,
     ) -> impl Fn(kr_protocol::ids::DeviceId) -> PairedNow + Send + Sync + 'static {
@@ -2188,6 +2190,7 @@ mod tests {
     }
 
     /// The pairings of a device that holds the first pairing of every host except `gone`.
+    #[cfg(unix)]
     fn paired_except(
         gone: kr_protocol::ids::DeviceId,
     ) -> impl Fn(kr_protocol::ids::DeviceId) -> PairedNow + Send + Sync + 'static {
@@ -2497,6 +2500,7 @@ mod tests {
     }
 
     /// Records a start that these calls made under the pairing held after the host was paired again.
+    #[cfg(unix)]
     fn a_start_under_the_new_pairing(calls: &Calls, action: &str) {
         let shared = calls.shared.as_ref().expect("a phone holds calls");
         shared.settle_start(
