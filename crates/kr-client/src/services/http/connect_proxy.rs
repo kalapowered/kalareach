@@ -7,7 +7,8 @@
 //! `CONNECT`; the proxy records that line too and answers it with its status, or with 502 when it
 //! tunnels, because it forwards nothing but tunnels.
 //!
-//! Suites in other crates include this module by its path rather than keep a copy of their own.
+//! Suites in other crates include this module by its path rather than keep a copy of their own; the
+//! library of this crate holds it as a module of its own at its standard place.
 
 #![allow(
     dead_code,

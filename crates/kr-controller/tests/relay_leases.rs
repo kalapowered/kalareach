@@ -22,7 +22,7 @@ mod local_relay;
 mod pkarr;
 
 // A stand-in proxy that opens every tunnel, for the endpoint of the case that holds a login.
-#[path = "../../kr-client/tests/support/connect_proxy.rs"]
+#[path = "../../kr-client/src/services/http/connect_proxy.rs"]
 mod connect_proxy;
 
 use std::sync::Arc;
@@ -1866,15 +1866,23 @@ async fn the_keeper_asks_the_lease_service_for_nothing_once_the_proxy_has_refuse
         "the refill is asked for while the login stands"
     );
 
-    // The same fall of time after the verdict: the keeper asks for nothing.
+    // The same fall of time after the verdict, and the payer's authorisation falls due too: the
+    // keeper asks the lease service for nothing and the payer is asked nothing.
+    let signed = rig.requests(SIGN_IN);
     login.refuse(kr_transport::proxy::StopKind::Refused);
     rig.time_passes(due);
+    rig.time_passes(Duration::from_secs(30 * 24 * 60 * 60));
     rig.pass().await;
     rig.pass().await;
     assert_eq!(
         rig.requests(ISSUE),
         issued + 1,
         "no lease was asked for after the verdict"
+    );
+    assert_eq!(
+        rig.requests(SIGN_IN),
+        signed,
+        "the payer was asked nothing after the verdict"
     );
 }
 

@@ -2205,7 +2205,12 @@ mod tests {
         tokio::task::yield_now().await;
         assert!(!closer.closed(), "the guard's end does not end the drain");
         gate.notify_one();
-        closer.close().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), closer.close())
+                .await
+                .is_ok(),
+            "the close finishes although its guard is gone"
+        );
         assert!(closer.closed());
     }
 
