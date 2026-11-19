@@ -440,8 +440,8 @@ impl HostCalls {
     ///
     /// The call stays held, and answers `closing`, until its side channel reports the close. Its
     /// final status is then built and kept for [`FINAL_STATUS_KEEP_MS`], with the close confirmed
-    /// or not as the channel reported it. A close the channel has not reported
-    /// [`FINAL_STATUS_CLOSE_WAIT_MS`] after the end is told as it stands at the next tick or
+    /// or not as the channel reported it. A close the channel has not reported one minute
+    /// (`FINAL_STATUS_CLOSE_WAIT_MS`) after the end is told as it stands at the next tick or
     /// heartbeat. Called before the call's grant is revoked.
     pub fn end(&self, voice_session_id: VoiceSessionId, reason: VoiceEndReason, now_ms: u64) {
         let call = self.registry().calls.get(&voice_session_id).cloned();
