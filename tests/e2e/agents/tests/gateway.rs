@@ -3622,20 +3622,21 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
                 .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                 .unwrap_or_default();
             let identity = helper_identity(&text);
-            let mut servers: Vec<ProcessStartIdentity> = Vec::new();
+            let servers: std::cell::RefCell<Vec<ProcessStartIdentity>> =
+                std::cell::RefCell::new(Vec::new());
             let instance = ctx.instances_within(
                 &session.remote,
                 session.session_id(),
                 "an instance served through the gateway",
                 |read| {
-                    let _ = servers_seen(&[worker], &mut servers);
+                    let _ = servers_seen(&[worker], &mut servers.borrow_mut());
                     read.agent_instances
                         .instances
                         .iter()
                         .any(|summary| summary.mode.uses_gateway())
                 },
             );
-            let _ = servers_seen(&[worker], &mut servers);
+            let _ = servers_seen(&[worker], &mut servers.borrow_mut());
             let after = String::from_utf8_lossy(&session.person.window.collected().since(mark))
                 .into_owned();
 
@@ -3677,7 +3678,12 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
                 "the line ran as typed: {after}"
             );
             // (e) one application server for the session's worker.
-            assert_eq!(servers.len(), 1, "one application server: {servers:?}");
+            assert_eq!(
+                servers.borrow().len(),
+                1,
+                "one application server: {:?}",
+                servers.borrow()
+            );
             // (f) no `kr` ran after the agent started.
             assert!(
                 session
@@ -3692,7 +3698,7 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
                 "forged_presentation_refused": true,
                 "one_process_identity": true,
                 "gateway_served_after_the_same_launch_was_admitted": true,
-                "servers": servers.len(),
+                "servers": servers.borrow().len(),
             })
         },
     );
