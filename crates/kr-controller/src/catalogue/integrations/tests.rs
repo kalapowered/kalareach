@@ -1039,7 +1039,6 @@ fn many(store: &Store, prefix: &str, count: usize, flags: &[String]) -> Vec<Admi
                     answers: false,
                     hook_events: None,
                     launch_variables: None,
-                    skill_target: None,
                 },
                 |_| {},
             )
