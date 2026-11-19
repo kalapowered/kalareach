@@ -2282,4 +2282,79 @@ mod a_start_hold_on_clocks_moved_by_hand {
         );
         closure(BrokerEffect::Closed);
     }
+
+    /// The closure a start leaves for a deferred call, run before the claim has settled, leaves
+    /// the row standing; the settlement that follows ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferred_closure_before_the_claim_settles_ends_the_row_when_it_settles() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, _wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let (start, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        start.before_the_broker(600).expect("admitted");
+        let closure = start.deferred().expect("a start defers its closure");
+        let stands = || {
+            controller
+                .voice_start_holds
+                .standing(actor())
+                .expect("the record reads")
+                .map(|row| row.action)
+        };
+        closure(BrokerEffect::Closed);
+        assert_eq!(
+            stands(),
+            Some(action(1)),
+            "the closure ran and the claim has not settled: the row stands"
+        );
+        start.settled();
+        assert!(
+            controller
+                .voice_start_holds
+                .standing(actor())
+                .expect("the record reads")
+                .is_none(),
+            "the claim settled after the closure: the row ends"
+        );
+    }
+
+    /// The claim that settles before the closure runs leaves the row standing until the closure
+    /// ends it, and only a closure whose effect leaves no call unreconciled does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_claim_settling_before_the_closure_ends_the_row_at_the_closure() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, _wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let (start, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        start.before_the_broker(600).expect("admitted");
+        let closure = start.deferred().expect("a start defers its closure");
+        let stands = || {
+            controller
+                .voice_start_holds
+                .standing(actor())
+                .expect("the record reads")
+                .map(|row| row.action)
+        };
+        start.settled();
+        assert_eq!(
+            stands(),
+            Some(action(1)),
+            "the claim settled and the call is not closed: the row stands"
+        );
+        closure(BrokerEffect::Unknown);
+        assert_eq!(
+            stands(),
+            Some(action(1)),
+            "a closure whose effect leaves a call unreconciled ends nothing"
+        );
+        let second = start.deferred().expect("a start defers its closure");
+        second(BrokerEffect::Closed);
+        assert!(
+            controller
+                .voice_start_holds
+                .standing(actor())
+                .expect("the record reads")
+                .is_none(),
+            "the closure ended the row after the claim had settled"
+        );
+    }
 }
