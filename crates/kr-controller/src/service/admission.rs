@@ -313,9 +313,9 @@ impl Controller {
     /// task up. The lock does not say whether a commit that begins while a withdrawal waits goes
     /// first or waits behind it.
     ///
-    /// Taken before any lock a withdrawal holds for longer than the change it makes (the policy's),
-    /// and never while holding one a commit takes. Letting go of it, however it is let go of,
-    /// withdraws the registrations of the connections that ended meanwhile ([`Held`]).
+    /// Its place among the crate's locks is in the lock order on `commit_hold`. Letting go of it,
+    /// however it is let go of, withdraws the registrations of the connections that ended
+    /// meanwhile ([`Held`]).
     pub(super) fn withdraw_hold(&self) -> WithdrawHold<'_> {
         #[cfg(test)]
         self.withdrawals_waiting
