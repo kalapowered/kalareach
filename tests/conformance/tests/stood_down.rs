@@ -6,6 +6,7 @@
 //! another case's line when cases run in parallel. The reader finds it anywhere in a line, takes
 //! what stood before it for the line, and refuses a notice it cannot tie to one case of the binary.
 
+#[cfg(unix)]
 use std::process::Command;
 
 use kr_conformance::libtest::{Binary, Outcome, Record, Recording, read};
@@ -188,6 +189,7 @@ fn a_fixture_that_passes() {}
 /// and the other as a pass: parallel, one at a time, one at a time with the output shown, and
 /// parallel with the output shown.
 #[test]
+#[cfg(unix)]
 fn a_real_run_with_and_without_shown_output_reads_the_stood_down_case_as_a_skip() {
     let names = ["a_fixture_that_passes", "a_fixture_that_stands_down"];
     let program = std::env::current_exe().expect("this test program's path");
