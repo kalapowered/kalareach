@@ -16,11 +16,11 @@ use rusqlite::{Connection, OpenFlags};
 
 use kr_protocol::ids::{EnvironmentId, GrantId};
 
-use crate::error::DamageClass;
+use crate::error::{ControllerError, DamageClass};
 use crate::grants::store::{
     Disposal, GrantDirectory, Plan, Roots, Scan, Scope, next_moment, plan_withdrawal, scan_all,
 };
-use crate::registry::{RecordedIn, Registry, SCHEMA_VERSION, recorded_version};
+use crate::registry::{LOG_BUSY, RecordedIn, Registry, SCHEMA_VERSION, recorded_version};
 
 /// What the debt a repair writes says it covers.
 const COVERS: &str = "the repair of damaged grants rows";
@@ -146,6 +146,20 @@ fn unreadable<T>(_: T) -> Refusal {
     Refusal::RegistryUnreadable
 }
 
+/// Takes in the log beside `path`. Only the checkpoint's refusal, while another connection holds
+/// the log, says the registry is in use; a registry that cannot be looked at, or a log that is not a
+/// regular file, is unreadable.
+fn take_in_the_log(path: &Path) -> Result<(), Refusal> {
+    Registry::take_in_its_log(path)
+        .map(drop)
+        .map_err(|error| match error {
+            ControllerError::RegistryUnavailable { detail } if detail == LOG_BUSY => {
+                Refusal::LogBusy
+            }
+            _ => Refusal::RegistryUnreadable,
+        })
+}
+
 /// Opens `path` for reading and writing, which creates nothing.
 fn open(path: &Path, writing: bool) -> Result<Connection, Refusal> {
     let flags = if writing {
@@ -163,7 +177,7 @@ fn open(path: &Path, writing: bool) -> Result<Connection, Refusal> {
 /// The registry at `path`, ready to read and write its grants tables: its log taken in, its
 /// version this build's, and every table of the shape this build reads.
 fn prepare(path: &Path) -> Result<Connection, Refusal> {
-    Registry::take_in_its_log(path).map_err(|_| Refusal::LogBusy)?;
+    take_in_the_log(path)?;
     match recorded_version(path, RecordedIn::Table("schema_version")) {
         Ok(Some(version)) if version == SCHEMA_VERSION => {}
         Ok(Some(version)) => return Err(Refusal::OtherBuild { version }),
@@ -223,16 +237,14 @@ pub fn preview(registry: &Path) -> Result<Found, Refusal> {
     Ok(found_of(&scan, &plan))
 }
 
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(path)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Ok(())
-    }
+/// Flushes the file at `path` to disk. Windows flushes a file only through a handle that may write
+/// it, so the file is opened for writing; nothing is created and nothing is cut.
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?
+        .sync_all()
 }
 
 /// Writes the copy in a fresh private folder beside the registry, and makes its entry durable:
@@ -258,10 +270,10 @@ fn make_the_copy(registry: &Path, unix_seconds: u64) -> std::io::Result<(PathBuf
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::File::open(&copy)?.sync_all()?;
-    sync_directory(&folder)?;
+    sync_file(&copy)?;
+    kr_flush::flush_directory(&folder, kr_flush::NameKind::File)?;
     if let Some(parent) = folder.parent() {
-        sync_directory(parent)?;
+        kr_flush::flush_directory(parent, kr_flush::NameKind::Directory)?;
     }
     Ok((folder, copy))
 }
@@ -342,7 +354,7 @@ fn check_the_copy(
     copy: &Path,
     environment_id: EnvironmentId,
 ) -> Result<(Connection, Connection), Refusal> {
-    Registry::take_in_its_log(registry).map_err(|_| Refusal::LogBusy)?;
+    take_in_the_log(registry)?;
     let held = open(registry, false)?;
     let copied = open(copy, false).map_err(|_| Refusal::CopyUnreadable)?;
     let verdict: String = copied
@@ -427,7 +439,7 @@ pub fn undo_apply(
     drop(held);
     drop(copied);
     let replaced = (|| -> std::io::Result<()> {
-        std::fs::File::open(&restoring)?.sync_all()?;
+        sync_file(&restoring)?;
         for suffix in ["-wal", "-shm"] {
             let mut beside = registry.as_os_str().to_owned();
             beside.push(suffix);
@@ -447,7 +459,9 @@ pub fn undo_apply(
     // the person is told which of the two failed.
     registry
         .parent()
-        .map_or(Ok(()), sync_directory)
+        .map_or(Ok(()), |folder| {
+            kr_flush::flush_directory(folder, kr_flush::NameKind::File)
+        })
         .map_err(Refusal::ReplacedButNotSynced)
 }
 
@@ -465,19 +479,89 @@ mod tests {
     struct Fixture {
         temp: kr_ipc::testing::TempHost,
         path: PathBuf,
-        directory: GrantDirectory,
+        /// Open while a case writes grants, and closed before an undo replaces the registry: a
+        /// file that a connection holds open cannot be removed or renamed over on Windows.
+        directory: Option<GrantDirectory>,
     }
 
     fn fixture() -> Fixture {
         let temp = kr_ipc::testing::TempHost::create();
         let path = temp.environment().registry_database();
         drop(Registry::open(&path, temp.environment_id()).expect("the registry"));
+        drop(
+            crate::service::net::devices::DeviceDirectory::open(&path).expect("the devices tables"),
+        );
         let directory = GrantDirectory::open(&path).expect("the grants tables");
-        Fixture {
+        let store = Fixture {
             temp,
             path,
-            directory,
-        }
+            directory: Some(directory),
+        };
+        store.sql(NEIGHBOURS);
+        store
+    }
+
+    /// Rows of the tables a repair leaves alone: a claim and a receipt, a paired device, a spent
+    /// voice delegation and a host record.
+    const NEIGHBOURS: &str = "
+        INSERT INTO authority_receipts (actor_id, action_id, payload_digest, claimed_at_ms)
+            VALUES ('owner', X'0a0a', X'0b0b', 11);
+        INSERT INTO authority_receipts (actor_id, action_id, payload_digest, claimed_at_ms, result,
+                                        recorded_at_ms, refusal_code, refusal_detail, withdrawn)
+            VALUES ('owner', X'0c0c', X'0d0d', 12, X'0e0e', 13, 'a_code', 'a detail', X'0f0f');
+        INSERT INTO network_devices (device_id, endpoint_id, device_key_revision, authorisation_key,
+                                     device_name, platform, grant_id, grant, paired_at_ms)
+            VALUES (X'e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1', X'1111', 1, X'2222', 'a phone', 'ios',
+                    X'3333', X'4444', 14);
+        INSERT INTO voice_delegations (device_id, delegation_id, action_id, spent_at_ms)
+            VALUES (X'e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1', 'one', X'5555', 15);
+        INSERT INTO host_authority (key, value) VALUES ('a_note', X'6666');";
+
+    /// Every column of every row of `table` in the registry at `path`, as SQL text, in rowid order,
+    /// leaving out the columns in `skip`.
+    fn dump_at(path: &Path, table: &str, skip: &[&str]) -> Vec<String> {
+        let connection = Connection::open(path).expect("opens");
+        let columns: Vec<String> = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepares")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("queries")
+            .map(|column| column.expect("a column"))
+            .filter(|column| !skip.contains(&column.as_str()))
+            .map(|column| format!("quote(\"{column}\")"))
+            .collect();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {} FROM \"{table}\" ORDER BY rowid",
+                columns.join(" || '|' || ")
+            ))
+            .expect("prepares");
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("queries")
+            .map(|row| row.expect("a row"))
+            .collect()
+    }
+
+    /// Every table of the registry at `path`, whole, by name.
+    fn tables_at(path: &Path) -> std::collections::BTreeMap<String, Vec<String>> {
+        let connection = Connection::open(path).expect("opens");
+        let names: Vec<String> = connection
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )
+            .expect("prepares")
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("queries")
+            .map(|name| name.expect("a name"))
+            .collect();
+        names
+            .into_iter()
+            .map(|name| {
+                let rows = dump_at(path, &name, &[]);
+                (name, rows)
+            })
+            .collect()
     }
 
     fn id(byte: u8) -> GrantId {
@@ -488,33 +572,50 @@ mod tests {
         format!("X'{}'", format!("{byte:02x}").repeat(16))
     }
 
+    fn grant_of(byte: u8, parent: Option<u8>, action: ActionRight) -> Grant {
+        Grant {
+            grant_id: id(byte),
+            parent_grant_id: Nullable(parent.map(id)),
+            issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+            recipient_device_id: DeviceId::new(Uuid::from_bytes([0xe0; 16])),
+            authority_revision: AuthorityRevision::new(1),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: [action].into_iter().collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::some(TimestampMs::new(1)),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::Never,
+            organisation: Nullable::null(),
+        }
+    }
+
     impl Fixture {
         fn issue(&self, byte: u8, parent: Option<u8>) -> GrantId {
-            let grant = Grant {
-                grant_id: id(byte),
-                parent_grant_id: Nullable(parent.map(id)),
-                issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
-                recipient_device_id: DeviceId::new(Uuid::from_bytes([0xe0; 16])),
-                authority_revision: AuthorityRevision::new(1),
-                environment_selector: EnvironmentSelector::Any,
-                session_selector: SessionSelector::Any,
-                actions: [ActionRight::SessionView].into_iter().collect(),
-                history: HistoryScope {
-                    lower_bound_ms: Nullable::some(TimestampMs::new(1)),
-                    include_live_screen: false,
-                    named_questions: CanonicalSet::new(),
-                    named_approvals: CanonicalSet::new(),
-                },
-                expiry: GrantExpiry::Never,
-                organisation: Nullable::null(),
-            };
+            self.issue_with(byte, parent, ActionRight::SessionView, true)
+        }
+
+        /// A grant of the one right `action`, active or still a proposal.
+        fn issue_with(
+            &self,
+            byte: u8,
+            parent: Option<u8>,
+            action: ActionRight,
+            active: bool,
+        ) -> GrantId {
+            let grant = grant_of(byte, parent, action);
             self.directory
+                .as_ref()
+                .expect("the grants tables are open")
                 .issue(
                     &crate::grants::GrantRecord {
                         grant,
                         session_id: None,
                         issued_at_ms: 1_000,
-                        activated_at_ms: Some(1_000),
+                        activated_at_ms: active.then_some(1_000),
                         revoked_at_ms: None,
                         revoked_by_parent: None,
                     },
@@ -532,26 +633,58 @@ mod tests {
             connection.execute_batch(statements).expect("runs");
         }
 
-        /// Every row of the tables the repair touches, as text, in a stable order.
+        fn close(&mut self) {
+            drop(self.directory.take());
+        }
+
+        /// Gives the row of grant `byte` a record and a parent column that name `parent`, as a
+        /// hand edit can: the way to make a loop that the store itself would not write.
+        fn reparent(&self, byte: u8, parent: u8) {
+            let encoded =
+                kr_cbor::to_canonical_vec(&grant_of(byte, Some(parent), ActionRight::SessionView))
+                    .expect("the grant encodes");
+            let hex: String = encoded.iter().map(|b| format!("{b:02x}")).collect();
+            self.sql(&format!(
+                "UPDATE grants SET grant = X'{hex}', parent_grant_id = {} WHERE grant_id = {};",
+                key(parent),
+                key(byte)
+            ));
+        }
+
+        /// The moment grant `byte` was revoked at, none while it is live or when no row holds it.
+        fn marked_at(&self, byte: u8) -> Option<i64> {
+            Connection::open(&self.path)
+                .expect("opens")
+                .query_row(
+                    &format!(
+                        "SELECT revoked_at_ms FROM grants WHERE grant_id = {}",
+                        key(byte)
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten()
+        }
+
+        /// Every column of every row of every table, as text, in a stable order.
         fn rows(&self) -> Vec<String> {
-            let connection = Connection::open(&self.path).expect("opens");
-            let mut out = Vec::new();
-            for query in [
-                "SELECT hex(grant_id) || '|' || hex(grant) || '|' || ifnull(revoked_at_ms, 'null') \
-                 || '|' || ifnull(hex(revoked_by_parent), 'null') FROM grants ORDER BY rowid",
-                "SELECT hex(invitation_id) || '|' || hex(grant_id) || '|' || state \
-                 FROM session_invitations ORDER BY rowid",
-                "SELECT hex(debt_id) || '|' || covers FROM fence_debt ORDER BY rowid",
-            ] {
-                let mut statement = connection.prepare(query).expect("prepares");
-                out.extend(
-                    statement
-                        .query_map([], |row| row.get::<_, String>(0))
-                        .expect("queries")
-                        .map(|row| row.expect("a row")),
-                );
-            }
-            out
+            tables_at(&self.path)
+                .into_iter()
+                .flat_map(|(name, rows)| rows.into_iter().map(move |row| format!("{name}|{row}")))
+                .collect()
+        }
+
+        /// The state of the invitation that waits on the grant `key` names.
+        fn invitation_state(&self, key: &str) -> Option<String> {
+            Connection::open(&self.path)
+                .expect("opens")
+                .query_row(
+                    &format!("SELECT state FROM session_invitations WHERE grant_id = {key}"),
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
         }
 
         fn count(&self, table: &str) -> i64 {
@@ -586,8 +719,8 @@ mod tests {
         }
     }
 
-    /// A store with one of each kind of fault: a row whose record does not decode, a row deleted
-    /// by hand that leaves a readable child, a malformed key with a readable child, and a cycle.
+    /// A store with one of each kind of fault, each with a readable child below it: a row whose
+    /// record does not decode, a row deleted by hand, and a row with a malformed key.
     fn damaged() -> Fixture {
         let store = fixture();
         store.issue(0x41, None);
@@ -643,12 +776,42 @@ mod tests {
     #[test]
     fn the_repair_removes_the_damaged_rows_and_keeps_every_other_row_whole() {
         let store = damaged();
-        let before = store.rows();
+        // A sound grant with an open offer, and an open offer on a row the repair removes.
+        store.issue(0x47, None);
+        store.invitation(&key(0x47), 7, "open");
+        store.invitation(&key(0x41), 4, "open");
+        let before = tables_at(&store.path);
         let repaired = apply(&store.path, 5_000, 77)
             .expect("the repair")
             .expect("there was something to repair");
         assert_eq!(repaired.found.damaged.len(), 2);
-        assert_eq!(store.count("grants"), 3, "the two damaged rows are removed");
+        let after = tables_at(&store.path);
+        // The copy holds the registry as it was, every table whole.
+        assert_eq!(
+            tables_at(&repaired.copy),
+            before,
+            "the copy holds the registry as it was"
+        );
+        // Every table the repair does not write is as it was, row for row.
+        for (name, rows) in &before {
+            if !["grants", "session_invitations", "fence_debt"].contains(&name.as_str()) {
+                assert_eq!(after.get(name), Some(rows), "the table {name} is as it was");
+            }
+        }
+        // The grants: the two damaged rows are removed; each other row keeps every column but the
+        // two marks, and the withdrawn ones differ in those alone.
+        let marks = ["revoked_at_ms", "revoked_by_parent"];
+        let gone = [key(0x41), key(0x45)];
+        let kept_before: Vec<String> = dump_at(&repaired.copy, "grants", &marks)
+            .into_iter()
+            .filter(|row| !gone.iter().any(|name| row.to_lowercase().starts_with(name)))
+            .collect();
+        assert_eq!(kept_before.len(), 4, "the rows that stay");
+        assert_eq!(
+            dump_at(&store.path, "grants", &marks),
+            kept_before,
+            "every kept row holds every column it held, but its marks"
+        );
         for withdrawn in [0x42, 0x44, 0x46] {
             assert_eq!(
                 store.is_live(&key(withdrawn)),
@@ -656,13 +819,30 @@ mod tests {
                 "{withdrawn:x} is revoked"
             );
         }
-        // The copy holds the registry as it was.
-        let copied = Connection::open(&repaired.copy).expect("the copy opens");
-        let rows: i64 = copied
-            .query_row("SELECT COUNT(*) FROM grants", [], |row| row.get(0))
-            .expect("counts");
-        assert_eq!(rows, 5, "the copy holds the rows the repair removed");
-        assert_ne!(store.rows(), before);
+        assert_eq!(
+            store.is_live(&key(0x47)),
+            Some(true),
+            "a sound grant is untouched"
+        );
+        // The offers: the one on a removed row reads cancelled and the sound grant's stays open;
+        // every other column of every offer is as it was.
+        assert_eq!(
+            dump_at(&store.path, "session_invitations", &["state"]),
+            dump_at(&repaired.copy, "session_invitations", &["state"]),
+            "every offer keeps every column but its state"
+        );
+        assert_eq!(
+            store.invitation_state(&key(0x41)).as_deref(),
+            Some("cancelled")
+        );
+        assert_eq!(store.invitation_state(&key(0x47)).as_deref(), Some("open"));
+        // The debts: the ones there were stay, and the repair adds one.
+        let debts_before = &before["fence_debt"];
+        assert_eq!(after["fence_debt"].len(), debts_before.len() + 1);
+        assert_eq!(
+            &after["fence_debt"][..debts_before.len()],
+            &debts_before[..]
+        );
     }
 
     #[test]
@@ -704,12 +884,27 @@ mod tests {
             key(0x62),
             key(0x61)
         ));
+        // A second alias: a row filed under key 0x72 whose record is the readable grant 0x51's.
+        store.issue(0x71, None);
+        store.sql(&format!(
+            "UPDATE grants SET grant = (SELECT grant FROM grants WHERE grant_id = {}), grant_id = {}
+              WHERE grant_id = {};",
+            key(0x51),
+            key(0x72),
+            key(0x71)
+        ));
         store.invitation(&key(0x51), 1, "open");
         store.invitation(&key(0x62), 2, "open");
+        store.invitation(&key(0x72), 3, "open");
         apply(&store.path, 5_000, 79)
             .expect("ok")
             .expect("repaired");
         assert_eq!(store.is_live(&key(0x62)), None, "the alias row is removed");
+        assert_eq!(
+            store.is_live(&key(0x72)),
+            None,
+            "the second alias row is removed"
+        );
         assert_eq!(
             store.is_live(&key(0x61)),
             None,
@@ -720,27 +915,21 @@ mod tests {
             Some(true),
             "the valid grant stays live"
         );
-        let rows = store.rows();
-        let state_of = |grant: u8| {
-            rows.iter()
-                .find(|row| {
-                    row.contains(&format!(
-                        "|{}|",
-                        format!("{grant:02x}").repeat(16).to_uppercase()
-                    )) && !row.contains("|DEBT|")
-                })
-                .and_then(|row| row.rsplit('|').next())
-                .map(str::to_owned)
-        };
         assert_eq!(
-            state_of(0x51).as_deref(),
+            store.invitation_state(&key(0x51)).as_deref(),
             Some("open"),
             "the valid grant's offer stays open"
         );
         assert_eq!(
-            state_of(0x62).as_deref(),
+            store.invitation_state(&key(0x62)).as_deref(),
             Some("cancelled"),
             "the alias's own offer is cancelled"
+        );
+        assert_eq!(
+            store.invitation_state(&key(0x72)).as_deref(),
+            Some("cancelled"),
+            "the offer of an alias whose record names a readable grant is cancelled, and that \
+             grant's own offer stays open"
         );
     }
 
@@ -828,11 +1017,12 @@ mod tests {
 
     #[test]
     fn the_undo_puts_the_registry_back_and_refuses_after_the_host_has_run() {
-        let store = damaged();
+        let mut store = damaged();
         let before = store.rows();
         let repaired = apply(&store.path, 5_000, 85)
             .expect("ok")
             .expect("repaired");
+        store.close();
         let environment_id = store.temp.environment_id();
         let preview = undo_preview(&store.path, &repaired.copy, environment_id).expect("preview");
         let mut live_again = preview.live_again.clone();
@@ -926,10 +1116,11 @@ mod tests {
     fn the_undo_leaves_the_registry_usable_when_the_replacement_cannot_be_made() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let store = damaged();
+        let mut store = damaged();
         let repaired = apply(&store.path, 5_000, 87)
             .expect("ok")
             .expect("repaired");
+        store.close();
         let environment_id = store.temp.environment_id();
         let after_the_repair = store.rows();
         let folder = store.path.parent().expect("a folder").to_owned();
@@ -955,30 +1146,214 @@ mod tests {
             .expect("the undo goes on once the folder can be written to");
     }
 
-    /// A folder that can be written to and not read can take the replacement and cannot be synced:
-    /// the undo says the registry is back to what the copy held and that the folder was not
-    /// synced, where the refusal for a registry that was not replaced would be untrue.
-    #[cfg(unix)]
+    /// A folder whose flush fails after the replacement was renamed in: the undo says the registry
+    /// is back to what the copy held and that the folder was not synced, where the refusal for a
+    /// registry that was not replaced would be untrue. The flush is the platform's own, through
+    /// the one call that the product's other stores use, so the case runs on every platform.
     #[test]
     fn the_undo_says_so_when_the_folder_cannot_be_synced_after_the_replacement() {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let store = damaged();
+        let mut store = damaged();
         let before = store.rows();
         let repaired = apply(&store.path, 5_000, 88)
             .expect("ok")
             .expect("repaired");
         let environment_id = store.temp.environment_id();
+        store.close();
         let folder = store.path.parent().expect("a folder").to_owned();
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o300))
-            .expect("the folder can be written to and not read");
+        let refused = kr_flush::testing::refuse_flushes_of(folder);
         let undone = undo_apply(&store.path, &repaired.copy, environment_id);
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
-            .expect("the folder can be read again");
+        drop(refused);
         assert!(
             matches!(undone, Err(Refusal::ReplacedButNotSynced(_))),
             "the replacement is made and the folder is not synced: {undone:?}"
         );
         assert_eq!(store.rows(), before, "the registry is what the copy held");
+    }
+
+    /// The copy's own folder and the folder that holds it are flushed through the platform's own
+    /// call before the registry is changed: a flush that fails stops the repair, on every platform.
+    #[test]
+    fn the_repair_changes_nothing_when_a_folder_of_the_copy_cannot_be_synced() {
+        for (seconds, which) in [
+            (90_u64, "the copy's own folder"),
+            (91, "the folder that holds it"),
+        ] {
+            let store = damaged();
+            let before = store.rows();
+            let refused = if seconds == 90 {
+                let mut name = store.path.as_os_str().to_owned();
+                name.push(format!(".grants-repair-{seconds}"));
+                PathBuf::from(name)
+            } else {
+                store.path.parent().expect("a folder").to_owned()
+            };
+            let guard = kr_flush::testing::refuse_flushes_of(refused);
+            let result = apply(&store.path, 5_000, seconds);
+            drop(guard);
+            assert!(
+                matches!(result, Err(Refusal::CopyFailed(_))),
+                "{which}: {result:?}"
+            );
+            assert_eq!(store.rows(), before, "{which}: nothing is changed");
+        }
+    }
+
+    /// Only the checkpoint's refusal says the registry is in use: a registry that is not there is
+    /// unreadable.
+    #[test]
+    fn a_registry_that_cannot_be_looked_at_is_not_said_to_be_in_use() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let missing = temp.environment().registry_database();
+        assert!(!missing.exists(), "nothing stands at the path");
+        let previewed = preview(&missing);
+        assert!(
+            matches!(previewed, Err(Refusal::RegistryUnreadable)),
+            "{previewed:?}"
+        );
+        let applied = apply(&missing, 1, 92);
+        assert!(
+            matches!(applied, Err(Refusal::RegistryUnreadable)),
+            "{applied:?}"
+        );
+        let undone = undo_preview(
+            &missing,
+            &missing.with_extension("copy"),
+            temp.environment_id(),
+        );
+        assert!(
+            matches!(undone, Err(Refusal::RegistryUnreadable)),
+            "{undone:?}"
+        );
+    }
+
+    /// A revoked row below a damaged one, with a live grant below it; a live top that no row places,
+    /// with a revoked middle row and a live grant below that; a loop of three live rows with a live
+    /// tail below one of them. The preview names each live grant once, and the repair withdraws
+    /// each once, leaving the revoked rows' own moments.
+    #[test]
+    fn the_repair_withdraws_what_hangs_below_through_a_revoked_middle_row_and_a_cycle_with_a_tail()
+    {
+        let store = fixture();
+        // A damaged row, a revoked row below it, a live grant below that.
+        store.issue(0x41, None);
+        store.issue(0x42, Some(0x41));
+        store.issue(0x43, Some(0x42));
+        // A live top whose parent row is gone, a revoked middle row, a live grant below it.
+        store.issue(0x60, None);
+        store.issue(0x61, Some(0x60));
+        store.issue(0x62, Some(0x61));
+        store.issue(0x63, Some(0x62));
+        // A loop of three, and a tail below one of them.
+        store.issue(0x51, None);
+        store.issue(0x52, Some(0x51));
+        store.issue(0x53, Some(0x52));
+        store.issue(0x54, Some(0x52));
+        store.reparent(0x51, 0x53);
+        store.sql(&format!(
+            "UPDATE grants SET grant = X'00' WHERE grant_id = {};
+             DELETE FROM grants WHERE grant_id = {};
+             UPDATE grants SET revoked_at_ms = 9 WHERE grant_id IN ({}, {});",
+            key(0x41),
+            key(0x60),
+            key(0x42),
+            key(0x62)
+        ));
+        let expected = [0x43, 0x51, 0x52, 0x53, 0x54, 0x61, 0x63].map(id);
+        let found = preview(&store.path).expect("the preview");
+        let mut previewed = found.withdraw.clone();
+        previewed.sort();
+        assert_eq!(previewed, expected, "each live grant once: {found:?}");
+        assert_eq!(found.damaged.len(), 1, "the one damaged row");
+        let repaired = apply(&store.path, 5_000, 95)
+            .expect("ok")
+            .expect("repaired");
+        let mut withdrawn = repaired.found.withdraw.clone();
+        withdrawn.sort();
+        assert_eq!(withdrawn, expected, "the repair withdraws each once");
+        for byte in [0x43, 0x51, 0x52, 0x53, 0x54, 0x61, 0x63] {
+            assert_eq!(
+                store.is_live(&key(byte)),
+                Some(false),
+                "{byte:x} is revoked"
+            );
+        }
+        for byte in [0x42, 0x62] {
+            assert_eq!(
+                store.marked_at(byte),
+                Some(9),
+                "{byte:x}, revoked already, keeps its own moment"
+            );
+        }
+        assert_eq!(
+            store.is_live(&key(0x41)),
+            None,
+            "the damaged row is removed"
+        );
+        assert_eq!(store.count("fence_debt"), 1, "one debt for the change");
+    }
+
+    /// A repair that withdraws a grant owes one fence, though the ordinary withdrawal owes none for
+    /// a proposal nobody redeemed or for a voice grant, and no damaged row is there to owe one.
+    #[test]
+    fn the_repair_owes_one_fence_for_an_unplaced_proposal_or_voice_grant_with_no_damaged_row() {
+        for (name, action, active) in [
+            ("a proposal", ActionRight::SessionView, false),
+            ("a voice grant", ActionRight::VoiceUse, true),
+        ] {
+            let store = fixture();
+            store.issue(0x41, None);
+            store.issue_with(0x42, Some(0x41), action, active);
+            store.sql(&format!(
+                "DELETE FROM grants WHERE grant_id = {};",
+                key(0x41)
+            ));
+            let found = preview(&store.path).expect("the preview");
+            assert!(found.damaged.is_empty(), "{name}: no row is damaged");
+            assert_eq!(found.withdraw, [id(0x42)], "{name}: it is unplaced");
+            let repaired = apply(&store.path, 5_000, 93)
+                .expect("ok")
+                .expect("repaired");
+            assert_eq!(
+                store.is_live(&key(0x42)),
+                Some(false),
+                "{name} is withdrawn"
+            );
+            assert!(
+                repaired.fence_owed,
+                "{name}: the repair says a fence is owed"
+            );
+            assert_eq!(store.count("fence_debt"), 1, "{name}: exactly one debt");
+        }
+    }
+
+    /// A copy of another schema is refused by both modes of the undo, and the registry is as it
+    /// was.
+    #[test]
+    fn the_undo_refuses_a_copy_of_another_schema() {
+        let store = damaged();
+        let repaired = apply(&store.path, 5_000, 94)
+            .expect("ok")
+            .expect("repaired");
+        Connection::open(&repaired.copy)
+            .expect("the copy opens")
+            .execute_batch("UPDATE schema_version SET version = version + 1;")
+            .expect("the copy takes another schema");
+        let environment_id = store.temp.environment_id();
+        let before = store.rows();
+        let previewed = undo_preview(&store.path, &repaired.copy, environment_id);
+        assert!(
+            matches!(previewed, Err(Refusal::CopyUnreadable)),
+            "the preview: {previewed:?}"
+        );
+        let undone = undo_apply(&store.path, &repaired.copy, environment_id);
+        assert!(
+            matches!(undone, Err(Refusal::CopyUnreadable)),
+            "the undo: {undone:?}"
+        );
+        assert_eq!(store.rows(), before, "the registry is as it was");
+        assert!(
+            std::fs::symlink_metadata(leftover(&store.path)).is_err(),
+            "no replacement file is left"
+        );
     }
 }
