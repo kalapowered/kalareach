@@ -4932,6 +4932,17 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
                     .get(),
             )
             .expect("a pid");
+            // The forging launcher's root is among the variables the shell is expected to hold on
+            // every route, and its value is compared when the shell's environment is read, before
+            // any probe or start.
+            assert!(
+                session
+                    .person
+                    .expected
+                    .names()
+                    .contains(&"KALAREACH_E2E_FORGE_ROOT"),
+                "the forging launcher's root is not among the variables the shell is expected to hold"
+            );
             // The shell's environment is read at its prompt before the agent's first start, as for
             // every case, and the mode of this case was chosen before any key was acquired: it
             // takes no login.
