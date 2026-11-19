@@ -1446,15 +1446,24 @@ pub type Pairings = Arc<dyn Fn(kr_protocol::ids::DeviceId) -> PairedNow + Send +
 /// Whether the pairing `entry` was made under is the one `paired` reports for its host now: `None`
 /// while the records cannot say, and `Some(false)` for a start entry whose host was unpaired, or
 /// paired again since, which gave the device another identity. Only a start entry is told: what
-/// else is owed stands whatever the pairings are.
+/// else is owed stands whatever the pairings are, and so does a start entry that carries no
+/// pairing.
 fn pairing_holds(paired: &Pairings, entry: &OwedView) -> Option<bool> {
     let Some((host, _)) = entry.host.filter(|_| entry.is_start()) else {
+        return Some(true);
+    };
+    // A start entry with no pairing is one the release before wrote: it is neither matched nor
+    // mismatched. It is kept and handled as that release handled it until its own `until_ms`, and
+    // it is never written back with the identity of the pairing held now. Remove this arm when
+    // that release can no longer be the one a device is updated from: it writes no pairing, and its
+    // entries lapse at their own finite `until_ms`.
+    let Some(made) = entry.pairing else {
         return Some(true);
     };
     match paired(host) {
         PairedNow::Unknown => None,
         PairedNow::Not => Some(false),
-        PairedNow::As(now) => Some(entry.pairing == Some(now)),
+        PairedNow::As(now) => Some(made == now),
     }
 }
 
@@ -2169,14 +2178,12 @@ mod tests {
     }
 
     /// The identity a host gave this device when it was paired with the host again.
-    #[cfg(unix)]
     fn paired_again() -> kr_protocol::ids::DeviceId {
         kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]))
     }
 
     /// The pairings of a device that holds the first pairing of every host it paired with except
     /// `gone`, and holds a later pairing with that one.
-    #[cfg(unix)]
     fn paired_again_with(
         gone: kr_protocol::ids::DeviceId,
     ) -> impl Fn(kr_protocol::ids::DeviceId) -> PairedNow + Send + Sync + 'static {
@@ -2622,6 +2629,123 @@ mod tests {
             actions_shown(&last),
             vec!["two".to_owned(), "three".to_owned()],
             "the start of the new pairing stays"
+        );
+    }
+
+    /// Writes `entries` into the file as the release before wrote them: an entry with no pairing
+    /// carries no pairing identity at all.
+    fn write_in_the_form_before(directory: &std::path::Path, entries: Vec<OwedView>) {
+        Kept::at(directory)
+            .write(&KeptVoice {
+                owed: entries,
+                note: None,
+            })
+            .expect("the file is written");
+        let file = directory.join("voice-kept.json");
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).expect("the file is read"))
+                .expect("the file is JSON");
+        for each in document["owed"].as_array_mut().expect("the entries") {
+            let entry = each.as_object_mut().expect("an entry");
+            if entry["pairing_device_id"].is_null() {
+                entry.remove("pairing_device_id");
+            }
+        }
+        std::fs::write(&file, serde_json::to_vec(&document).expect("JSON"))
+            .expect("the file is written again");
+    }
+
+    /// A start notice of the release before: a finite lapse and no pairing.
+    fn notice_of_the_release_before(
+        action: &str,
+        host: (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId),
+    ) -> OwedView {
+        OwedView {
+            until_ms: now_ms() + 3_600_000,
+            pairing: None,
+            ..entry(START_UNKNOWN, action, host)
+        }
+    }
+
+    /// The pairing identity each entry in the file carries, by action.
+    fn pairings_in_file(
+        directory: &std::path::Path,
+    ) -> Vec<(String, Option<kr_protocol::ids::DeviceId>)> {
+        Kept::at(directory)
+            .read(0)
+            .expect("the file is read")
+            .owed
+            .into_iter()
+            .map(|each| (each.action_id.unwrap_or_default(), each.pairing))
+            .collect()
+    }
+
+    /// A start notice the release before kept, with the pairing unchanged, is shown until it
+    /// lapses and is neither removed by the check of the pairing nor written back with the
+    /// identity of the pairing held now.
+    #[test]
+    fn a_start_notice_of_the_release_before_stays_while_the_pairing_is_unchanged() {
+        let directory = tempfile::tempdir().expect("a folder");
+        write_in_the_form_before(
+            directory.path(),
+            vec![notice_of_the_release_before("before", host(1))],
+        );
+        let calls = calls_in(directory.path());
+        calls.know_pairings(PairedNow::As);
+        assert_eq!(
+            actions_shown(&calls),
+            vec!["before".to_owned()],
+            "the notice is shown until it lapses"
+        );
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNKNOWN, "before")],
+            "the pairing check removed nothing"
+        );
+
+        // A write for another start leaves the notice as the release before wrote it.
+        calls
+            .shared
+            .as_ref()
+            .expect("a phone holds calls")
+            .settle_start(0, None, Some(entry(START_UNKNOWN, "now", host(2))), None);
+        assert_eq!(
+            pairings_in_file(directory.path()),
+            vec![
+                ("before".to_owned(), None),
+                ("now".to_owned(), Some(host(2).0))
+            ],
+            "the notice is not written back with the identity of the pairing held now"
+        );
+    }
+
+    /// A start notice the release before kept, for a host that was forgotten and paired again, is
+    /// kept until it lapses and is not removed by the check of the pairing; a start entry with the
+    /// identity of the first pairing is removed by it.
+    #[test]
+    fn a_start_notice_of_the_release_before_stays_after_the_host_is_paired_again() {
+        let directory = tempfile::tempdir().expect("a folder");
+        write_in_the_form_before(
+            directory.path(),
+            vec![
+                notice_of_the_release_before("before", host(1)),
+                OwedView {
+                    until_ms: now_ms() + 3_600_000,
+                    ..entry(START_UNKNOWN, "first-pairing", host(1))
+                },
+            ],
+        );
+        let calls = calls_in(directory.path());
+        calls.know_pairings(paired_again_with(host(1).0));
+        assert_eq!(
+            actions_shown(&calls),
+            vec!["before".to_owned()],
+            "the notice of the release before is shown; the start of the first pairing is not"
+        );
+        assert_eq!(
+            pairings_in_file(directory.path()),
+            vec![("before".to_owned(), None)],
+            "the notice stays as written, and only the first pairing's start is removed"
         );
     }
 
