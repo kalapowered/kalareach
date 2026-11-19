@@ -201,10 +201,9 @@ pub struct SubjectSelectors {
     pub params: &'static [&'static str],
     /// Precondition keys that name it.
     ///
-    /// Section 23's own example is `agent.approval.respond`, whose `expected.approval_request_id`
-    /// names *which* upstream approval is being answered. That is subject identity living in the
-    /// preconditions, and leaving it out would make two answers to two different approvals the
-    /// same subject.
+    /// No method selects by a precondition. A precondition guards when a request may run, and the
+    /// worker refuses any key it does not evaluate, so identity that a subject needs has to travel
+    /// as a parameter: `agent.approval.respond` names the approval it answers by `resource_id`.
     pub expected: &'static [&'static str],
 }
 
@@ -253,9 +252,13 @@ pub fn subject_selectors(method: Option<crate::method::Method>) -> SubjectSelect
             params: &["action_id"],
             expected: &[],
         },
+        // An answer is to one pending resource, and `resource_id` is the parameter that names it.
+        // Two answers to two approvals of one session are two subjects, so an uncertain answer to
+        // the first does not hold back the second; two answers to the same approval are one,
+        // whichever option they choose.
         Some(Method::AgentApprovalRespond) => SubjectSelectors {
-            params: &[],
-            expected: &["approval_request_id"],
+            params: &["resource_id"],
+            expected: &[],
         },
         _ => SubjectSelectors::TARGET_ONLY,
     }
@@ -1126,25 +1129,36 @@ mod tests {
         }
     }
 
+    /// The parameters of an answer to the approval named by `resource`, choosing `option_id`.
+    fn approval_answer(resource: u8, option_id: &str) -> ParamsValue {
+        ParamsValue::from_typed(&crate::agent::AgentApprovalRespondParams {
+            target: crate::agent::AgentMutationTarget {
+                subject: crate::agent::AgentSubject {
+                    session_id: crate::ids::SessionId::new(Uuid::from_bytes([3; 16])),
+                    application_instance_id: crate::ids::ApplicationInstanceId::new(
+                        Uuid::from_bytes([5; 16]),
+                    ),
+                },
+                binding_revision: crate::ids::AgentBindingRevision::new(7),
+            },
+            resource_id: crate::ids::PendingResourceId::new(Uuid::from_bytes([resource; 16])),
+            option_id: option_id.to_owned(),
+        })
+        .expect("parameters")
+    }
+
     #[test]
     fn the_subject_digest_ignores_what_a_later_request_has_to_change() {
-        let first = mutation(Method::AgentApprovalRespond, ParamsValue::empty());
+        let first = mutation(Method::AgentApprovalRespond, approval_answer(1, "deny"));
         let mut later = first.clone();
         later.action_id = action(10);
         later.action_window_id =
             ActionWindowId::new("window-2".to_owned()).expect("a valid window");
         later.requested_ttl_ms = DurationMs::new(60_000);
         later.request_id = RequestId::new(8);
-        // The later request keeps the preconditions the first one carried and adds the two keys
-        // that show the earlier result. Only those two are outside the subject.
-        let mut expected = kr_cbor::CanonicalMap::new();
-        expected
-            .insert(
-                "approval_request_id".to_owned(),
-                kr_cbor::CanonicalValue::text("upstream-opaque-request-id"),
-            )
-            .expect("one key");
-        let mut superseding = expected.clone();
+        // The later request adds the two preconditions that show the earlier result. Only those
+        // two are outside the subject.
+        let mut superseding = kr_cbor::CanonicalMap::new();
         superseding
             .insert(
                 SUPERSEDES_ACTION_KEY.to_owned(),
@@ -1157,10 +1171,6 @@ mod tests {
                 kr_cbor::CanonicalValue::integer(3).expect("a revision"),
             )
             .expect("a key");
-        let first = MutationRequest {
-            expected: ParamsValue::new(kr_cbor::CanonicalValue::Map(expected)),
-            ..first
-        };
         later.expected = ParamsValue::new(kr_cbor::CanonicalValue::Map(superseding));
         assert_eq!(
             subject_digest(&first).expect("a digest"),
@@ -1171,50 +1181,26 @@ mod tests {
 
     #[test]
     fn the_subject_digest_separates_two_answers_to_two_different_approvals() {
-        // Section 23's own example: what makes one approval response a different subject from
-        // another is the upstream request its preconditions name.
-        let approval = |upstream: &str| {
-            let mut expected = kr_cbor::CanonicalMap::new();
-            expected
-                .insert(
-                    "approval_request_id".to_owned(),
-                    kr_cbor::CanonicalValue::text(upstream),
-                )
-                .expect("one key");
-            MutationRequest {
-                expected: ParamsValue::new(kr_cbor::CanonicalValue::Map(expected)),
-                ..mutation(Method::AgentApprovalRespond, ParamsValue::empty())
-            }
+        // What makes one approval response a different subject from another is the pending
+        // resource it names. `resource_id` is a parameter: the worker admits no precondition that
+        // could carry it.
+        let approval = |resource: u8| {
+            mutation(
+                Method::AgentApprovalRespond,
+                approval_answer(resource, "deny"),
+            )
         };
         assert_ne!(
-            subject_digest(&approval("upstream-one")).expect("a digest"),
-            subject_digest(&approval("upstream-two")).expect("a digest"),
+            subject_digest(&approval(1)).expect("a digest"),
+            subject_digest(&approval(2)).expect("a digest"),
             "an uncertain answer to one approval does not stand in another's way"
         );
     }
 
     #[test]
     fn the_subject_digest_is_what_a_request_asks_of_a_resource_rather_than_how_it_asks() {
-        let decision = |decision: &str| {
-            let mut expected = kr_cbor::CanonicalMap::new();
-            expected
-                .insert(
-                    "approval_request_id".to_owned(),
-                    kr_cbor::CanonicalValue::text("upstream-one"),
-                )
-                .expect("one key");
-            MutationRequest {
-                expected: ParamsValue::new(kr_cbor::CanonicalValue::Map(expected)),
-                ..mutation(
-                    Method::AgentApprovalRespond,
-                    ParamsValue::from_typed(&std::collections::BTreeMap::from([(
-                        "decision".to_owned(),
-                        decision.to_owned(),
-                    )]))
-                    .expect("parameters"),
-                )
-            }
-        };
+        let decision =
+            |option_id: &str| mutation(Method::AgentApprovalRespond, approval_answer(1, option_id));
         // Two answers to the same approval are one subject, whichever way they answer it. Section
         // 23 is about the operation: if the first answer's outcome is uncertain, the upstream
         // approval may already have been denied, and a later request to allow it has to show that
@@ -1227,22 +1213,14 @@ mod tests {
         // An ordinary guard is not part of what the request asks for. A subject that moved with
         // one would let any service evade the rule by adding a precondition that happens to hold.
         let mut guarded = decision("deny");
-        let kr_cbor::CanonicalValue::Map(existing) = guarded.expected.as_value().clone() else {
-            panic!("the preconditions are a map");
-        };
-        let mut with_guard = kr_cbor::CanonicalMap::new();
-        for (key, value) in existing.entries() {
-            with_guard
-                .insert(key.clone(), value.clone())
-                .expect("a key");
-        }
-        with_guard
+        let mut guard = kr_cbor::CanonicalMap::new();
+        guard
             .insert(
                 "session_state".to_owned(),
                 kr_cbor::CanonicalValue::text("live"),
             )
             .expect("a guard");
-        guarded.expected = ParamsValue::new(kr_cbor::CanonicalValue::Map(with_guard));
+        guarded.expected = ParamsValue::new(kr_cbor::CanonicalValue::Map(guard));
         assert_eq!(
             subject_digest(&decision("deny")).expect("a digest"),
             subject_digest(&guarded).expect("a digest"),
