@@ -355,6 +355,14 @@ Negotiated limits are the smaller of the two declarations, and the transcript co
 downgrade after `hello` breaks both signatures. From the moment the connection is authorised those
 limits are what the control stream enforces, in both directions.
 
+A paired endpoint's connection that sends a request where its `ConnectProof` belongs, as a device
+does that asks on a fresh unpaired connection after the host paired it, is refused in a frame it
+reads: the host answers the request under its own identifier with `PERMISSION_DENIED` ("this
+endpoint is paired: connect as its paired device before you ask"), abandons the challenge and ends
+the stream, and admits nothing. A first frame that is neither a proof nor a request is refused as a
+bad proof, with the code its decoding gives. An endpoint with no paired record never meets this
+refusal: it reaches the pairing surface below.
+
 ### Unpaired connections
 
 An endpoint with no paired record is not refused. It exchanges only the first two frames above, the

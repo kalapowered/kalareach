@@ -927,6 +927,138 @@ async fn an_unpaired_endpoint_reaches_only_the_pairing_surface() {
     let _ = tokio::time::timeout(Duration::from_secs(5), serving).await;
 }
 
+/// KR-REQ-10.37: a paired endpoint that sends a request where its connection proof belongs is
+/// refused in a frame it can read, as the answer to that request, with the code every request that
+/// has not proved its key gets. The host's challenge is abandoned, and the connection is not
+/// admitted. A first frame that is neither a proof nor a request is refused as it always was.
+#[tokio::test]
+async fn a_paired_endpoints_request_before_its_proof_is_refused_in_a_frame_it_reads() {
+    let (host, client) = paired_pair().await;
+    let challenges = ledger();
+    let accepting = {
+        let endpoint = host.endpoint.clone();
+        let identity = Arc::clone(&host.identity);
+        let directory = one_device(&client);
+        let challenges = Arc::clone(&challenges);
+        let clock = ManualClock::new();
+        tokio::spawn(async move {
+            let connection = accept_connection(&endpoint).await;
+            allow_streams(&connection);
+            let issuer = windows(&clock);
+            let admitted = handshake::accept(
+                &connection,
+                &identity,
+                epochs(),
+                directory.as_ref(),
+                &challenges,
+                &issuer,
+            )
+            .await;
+            (connection, admitted)
+        })
+    };
+    let connection = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    let (mut writer, mut reader) = control_streams(&connection).await;
+    writer.write_message(&offer(&client)).await.expect("sent");
+    assert!(matches!(
+        read_frame::<HelloReply>(&mut reader).await,
+        HelloReply::Selected(_)
+    ));
+    writer
+        .write_message(&request(Method::PairStatus, 1))
+        .await
+        .expect("sent");
+    let response = reader
+        .read_message::<Response>()
+        .await
+        .expect("the host answers a request in a frame the peer reads")
+        .expect("the host sent a frame");
+    assert_eq!(
+        response.request_id.get(),
+        1,
+        "the answer is to that request"
+    );
+    let Outcome::Error(error) = response.outcome else {
+        panic!("the request is refused");
+    };
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    let (_connection, admitted) = tokio::time::timeout(Duration::from_secs(5), accepting)
+        .await
+        .expect("the host finishes")
+        .expect("the host's task");
+    assert!(
+        admitted.is_err(),
+        "a request is no proof, and nothing is admitted"
+    );
+    assert!(
+        challenges.lock().expect("the ledger").is_empty(),
+        "the host's challenge was abandoned"
+    );
+    connection.close(0u32.into(), b"done");
+
+    // The same endpoint's connection with its proof is still authorised.
+    let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+    let proving = client
+        .endpoint
+        .connect(direct_addr(&host), ALPN)
+        .await
+        .expect("a connection");
+    handshake::connect(&proving, &client.identity, &host.record)
+        .await
+        .expect("the paired endpoint's proof is accepted");
+    let (_connection, admitted) = accepting.await.expect("the host task");
+    assert!(admitted.is_ok(), "the host admitted the proof");
+    proving.close(0u32.into(), b"done");
+}
+
+/// KR-REQ-10.37: a first frame of a paired endpoint's connection that is neither a proof nor a
+/// request is refused as it always was: with the code its decoding gives, in a frame the peer
+/// reads.
+#[tokio::test]
+async fn a_first_frame_that_is_neither_a_proof_nor_a_request_is_refused_as_it_always_was() {
+    for unknown_member in [true, false] {
+        let (host, client) = paired_pair().await;
+        let accepting = spawn_accept(&host, one_device(&client), ManualClock::new());
+        let connection = client
+            .endpoint
+            .connect(direct_addr(&host), ALPN)
+            .await
+            .expect("a connection");
+        let (mut writer, mut reader) = control_streams(&connection).await;
+        writer.write_message(&offer(&client)).await.expect("sent");
+        assert!(matches!(
+            read_frame::<HelloReply>(&mut reader).await,
+            HelloReply::Selected(_)
+        ));
+        if unknown_member {
+            let mut member = std::collections::BTreeMap::new();
+            member.insert("not_a_member".to_owned(), 1_u32);
+            writer.write_message(&member).await.expect("sent");
+        } else {
+            writer
+                .write_payload(&[0xff, 0xff, 0xff])
+                .await
+                .expect("sent");
+        }
+        let ConnectReply::Refused(error) = read_frame::<ConnectReply>(&mut reader).await else {
+            panic!("a first frame that is no proof and no request is refused");
+        };
+        let wanted = if unknown_member {
+            ErrorCode::UnsupportedSchema
+        } else {
+            ErrorCode::InvalidArgument
+        };
+        assert_eq!(error.code, wanted, "unknown member: {unknown_member}");
+        let (_connection, admitted) = accepting.await.expect("the host task");
+        assert!(admitted.is_err(), "nothing is admitted");
+        connection.close(0u32.into(), b"done");
+    }
+}
+
 /// KR-REQ-10.39: the pre-authorisation surface is rate limited per connection.
 /// KR-REQ-23.19: the unpaired surface is bounded by a per-connection request budget.
 #[tokio::test]

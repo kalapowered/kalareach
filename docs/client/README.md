@@ -998,7 +998,8 @@ device plans its next step again from when the look ended. A device that is late
 the same, by more than a second, lets the connection go instead of asking a question the host may no
 longer be there to answer. Ten seconds before the attempt's own deadline every answer is final, and
 from then on the device asks the connection it holds at its usual pace and looks for no other. A
-host that refuses a question with `PERMISSION_DENIED` may have committed the device on another
+host that refuses a question with `PERMISSION_DENIED`, as it refuses every question that a fresh
+connection of an endpoint it has paired asks, may have committed the device on another
 connection, so the device then connects as the identity derived for it (from the invitation's
 identifier and its own authorisation key), which the host answers only for a device that proves that
 key, and asks `pair.status` there. It writes the host's record only when the host answers on that

@@ -498,8 +498,14 @@ struct WatchedLink {
     status_gate: Option<Arc<Gate>>,
     /// Every connection as a paired device waits here.
     paired_gate: Option<Arc<Gate>>,
-    /// Every connection as a paired device fails.
-    sever_paired: bool,
+    /// The first this many connections as a paired device fail.
+    sever_paired: usize,
+    /// Every connection as a paired device proves another authorisation key than the one the
+    /// device was committed under, over the same transport key.
+    proves_another_key: bool,
+    /// The first connection's pre-authorisation surface answers this many status questions of
+    /// its own and then none, with the connection held open; every later connection answers.
+    first_surface_silence: Option<usize>,
     /// While set, every dial after the first fails, as a network that drops new connections
     /// would: at once, or after `fresh_dial_stall`.
     fresh_dials_fail: Arc<AtomicBool>,
@@ -544,7 +550,9 @@ impl WatchedLink {
             reconnect_gate: None,
             status_gate: None,
             paired_gate: None,
-            sever_paired: false,
+            sever_paired: 0,
+            proves_another_key: false,
+            first_surface_silence: None,
             fresh_dials_fail: Arc::new(AtomicBool::new(false)),
             fresh_dial_stall: None,
             fail_hold: false,
@@ -624,7 +632,7 @@ impl WatchedLink {
         identity: &'a LocalIdentity,
         visiting: Option<&'a kr_client::pairing::link::HostInUse<'a>>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
-        self.paired_connects.fetch_add(1, Ordering::SeqCst);
+        let earlier = self.paired_connects.fetch_add(1, Ordering::SeqCst);
         if self.severed.load(Ordering::SeqCst) {
             return Box::pin(async { Err(severed()) });
         }
@@ -632,9 +640,25 @@ impl WatchedLink {
             if let Some(gate) = &self.paired_gate {
                 gate.passed().await;
             }
-            if self.sever_paired {
+            if earlier < self.sever_paired {
                 return Err(severed());
             }
+            let other_key;
+            let identity = if self.proves_another_key {
+                other_key = LocalIdentity::new(
+                    identity.device_id,
+                    identity.device_key_revision,
+                    identity.endpoint_id,
+                    DeviceKeys::generate()
+                        .expect("device keys")
+                        .authorisation
+                        .clone(),
+                    identity.build_id.clone(),
+                );
+                &other_key
+            } else {
+                identity
+            };
             match visiting {
                 Some(in_use) => {
                     self.inner
@@ -716,6 +740,8 @@ impl HostLink for WatchedLink {
                 lose_finish_answer: self.lose_finish_answer,
                 sever_after_finish: self.sever_after_finish,
                 answers_before_silence: self.answers_before_silence,
+                silent_after: self.first_surface_silence.filter(|_| earlier == 0),
+                asked_here: 0,
                 withhold_submission_answer: self.withhold_submission_answer,
                 status_gate: self.status_gate.clone(),
                 transit: Arc::clone(&self.transit),
@@ -770,6 +796,9 @@ struct Watched {
     lose_finish_answer: bool,
     sever_after_finish: bool,
     answers_before_silence: Option<usize>,
+    /// Answer this many questions of this surface's own, and then none.
+    silent_after: Option<usize>,
+    asked_here: usize,
     withhold_submission_answer: bool,
     status_gate: Option<Arc<Gate>>,
     transit: Arc<Transit>,
@@ -853,6 +882,13 @@ impl Preauth for Watched {
             if self
                 .answers_before_silence
                 .is_some_and(|answers| asked >= answers)
+            {
+                std::future::pending::<()>().await;
+            }
+            self.asked_here += 1;
+            if self
+                .silent_after
+                .is_some_and(|answers| self.asked_here > answers)
             {
                 std::future::pending::<()>().await;
             }
@@ -1448,7 +1484,7 @@ async fn the_deadline_holds_while_the_device_confirms_what_it_became() {
         let paired_gate = Arc::clone(&paired_gate);
         move |link| {
             link.paired_gate = Some(paired_gate);
-            link.sever_paired = true;
+            link.sever_paired = usize::MAX;
         }
     });
     let device = ProductDevice::new(Arc::new(host.room.clone()), making);
@@ -3113,5 +3149,465 @@ async fn a_resume_that_cannot_reach_the_host_does_not_know_whether_the_owner_dec
             .expect("readable")
             .is_some(),
         "the attempt is kept until a person stops it"
+    );
+}
+
+/// What the identity the host commits a device under is, as the design's formula computes it from
+/// the invitation and the device's own authorisation key.
+fn derived_identity(invited: &PairInviteResult, keys: &DeviceKeys) -> kr_protocol::ids::DeviceId {
+    kr_pairing::identity::committed_device_id(
+        invited.invitation_id,
+        &keys.public_keys().authorisation,
+    )
+    .expect("an identity")
+}
+
+/// KR-REQ-10.37: a device whose connection went silent after the owner approved is not left
+/// without its answer. Its question on a fresh connection is refused in a frame it reads, it
+/// connects as the identity it was committed under, learns the commitment there, and keeps no
+/// record of the host until the host has answered on that connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_committed_while_its_connection_is_silent_recovers_as_the_device_it_became() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let paired_gate = Gate::closed();
+    let (link, making) = watching({
+        let paired_gate = Arc::clone(&paired_gate);
+        move |link| {
+            link.first_surface_silence = Some(1);
+            link.paired_gate = Some(paired_gate);
+        }
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    let link = made(&link);
+    tokio::time::timeout(WATCHDOG, async {
+        while link.answered.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host answers the device's first question");
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+
+    // The first connection answers nothing more. The device asks on a fresh one, is refused, and
+    // connects as the device it was committed as: that connection waits at the gate.
+    tokio::time::timeout(WATCHDOG, async {
+        while link.paired_connects.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device connects as the device it was committed as");
+    assert!(
+        link.failed_statuses.load(Ordering::SeqCst) >= 1,
+        "the host refused the question the device asked on a fresh connection"
+    );
+    assert!(
+        device.pairing.hosts.list().expect("readable").is_empty(),
+        "the device keeps no record of the host before the host answered as the device it became"
+    );
+    paired_gate.open();
+    let paired = tokio::time::timeout(WATCHDOG, attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect("the device ends paired");
+    assert_eq!(paired.device_id, confirmed.device_id);
+    assert_eq!(
+        paired.device_id,
+        derived_identity(&invited, &device.keys),
+        "the device is the one the design's formula names"
+    );
+    assert_eq!(device.pairing.hosts.list().expect("readable").len(), 1);
+}
+
+/// KR-REQ-10.37: the same recovery for a device that pairs by a short code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_device_committed_while_its_connection_is_silent_recovers_as_the_device_it_became() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(environment, &mut client, &viewer(), None, &owner).await;
+    let (origin, code, _) = code_of(&invited);
+
+    let (link, making) = watching(|link| link.first_surface_silence = Some(1));
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.enter(&origin, &code);
+    awaiting_value(&mut shown).await;
+    let link = made(&link);
+    tokio::time::timeout(WATCHDOG, async {
+        while link.answered.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host answers the device's first question");
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, async {
+        while link.paired_connects.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device connects as the device it was committed as");
+    let paired = tokio::time::timeout(WATCHDOG, attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect("the device ends paired");
+    assert_eq!(paired.device_id, confirmed.device_id);
+    assert_eq!(paired.device_id, derived_identity(&invited, &device.keys));
+}
+
+/// KR-REQ-10.37: a device the owner declined is told it was declined, and makes no connection as a
+/// device it never became.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_declined_device_is_told_it_was_declined_and_connects_as_nothing() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|_| {});
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    calls::cancel(environment, &mut client, invited.invitation_id, true)
+        .await
+        .expect("the owner declines");
+    let failure = outcome(attempt).await.expect_err("not paired");
+    assert_eq!(failure.kind, FailureKind::Declined);
+    assert_eq!(
+        made(&link).paired_connects.load(Ordering::SeqCst),
+        0,
+        "a declined device makes no connection as a device it never became"
+    );
+    assert!(device.pairing.hosts.list().expect("readable").is_empty());
+}
+
+/// KR-REQ-10.37: a device on another endpoint that claims the identity a device was committed under
+/// is refused, writes no record, and is told nothing of the device's identity by the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_endpoint_claiming_a_committed_identity_is_refused_and_learns_nothing() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let committed = net_support::Device::create().await;
+    let record = net_support::pair_with(&host, &committed, &owner_keys, viewer()).await;
+    let before = host.network().devices().devices().expect("readable");
+
+    let impostor = net_support::Device::create().await;
+    let claimed = net_support::paired_dial(&host, &impostor, &record);
+    let error = tokio::time::timeout(WATCHDOG, claimed.try_dial())
+        .await
+        .expect("the host answers")
+        .err()
+        .expect("the host refuses an endpoint it did not pair");
+    let told = format!("{error:?}");
+    assert!(
+        !told.contains(&record.device_id.to_string()),
+        "the refusal names no device identity: {told}"
+    );
+    let after = host.network().devices().devices().expect("readable");
+    assert_eq!(after.len(), before.len(), "no record was written");
+    assert!(
+        after
+            .iter()
+            .filter(|device| device.device_id == record.device_id)
+            .count()
+            == 1,
+        "the host's list holds the committed device once"
+    );
+}
+
+/// KR-REQ-10.37: a device whose recovery proves another authorisation key than the one it was
+/// committed under, over the same transport key, is refused at the binding in the proof exchange:
+/// it ends not knowing, after one connection, and writes no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_that_proves_another_authorisation_key_is_refused_at_the_binding() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|link| {
+        link.first_surface_silence = Some(1);
+        link.proves_another_key = true;
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    let link = made(&link);
+    tokio::time::timeout(WATCHDOG, async {
+        while link.answered.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host answers the device's first question");
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, async {
+        while link.paired_connects.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device connects as the device it was committed as");
+    let failure = tokio::time::timeout(WATCHDOG, attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect_err("not paired");
+    assert_eq!(failure.kind, FailureKind::ApprovalUnknown);
+    assert_eq!(
+        link.paired_connects.load(Ordering::SeqCst),
+        1,
+        "a refusal at the binding is the host's word: no second connection"
+    );
+    assert!(device.pairing.hosts.list().expect("readable").is_empty());
+}
+
+/// KR-REQ-10.37: a host that restarted after it committed a device, and so holds no invitation in
+/// memory, still answers a fresh question of the device in a frame it reads, and the device learns
+/// the commitment by connecting as the device it became.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_committed_before_the_host_restarted_recovers_as_the_device_it_became() {
+    let owner_keys = keys();
+    let mut host = Host::start(&owner_keys).await;
+    host.comes_back_at_its_address();
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|link| link.first_surface_silence = Some(1));
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    let link = made(&link);
+    tokio::time::timeout(WATCHDOG, async {
+        while link.answered.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host answers the device's first question");
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    drop(client);
+    let _restarted = host.restart().await;
+
+    tokio::time::timeout(WATCHDOG, async {
+        while link.paired_connects.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device connects as the device it was committed as");
+    let paired = tokio::time::timeout(WATCHDOG, attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect("the device ends paired");
+    assert_eq!(paired.device_id, confirmed.device_id);
+}
+
+/// KR-REQ-10.37: a recovery that loses its connections does not end the attempt. The first four
+/// connections as the device it became fail; the host's refusal of a later question starts another
+/// recovery, and the device ends paired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_that_reaches_no_connection_is_followed_by_another() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|link| {
+        link.first_surface_silence = Some(1);
+        link.sever_paired = 4;
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    let link = made(&link);
+    tokio::time::timeout(WATCHDOG, async {
+        while link.answered.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host answers the device's first question");
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, async {
+        while link.paired_connects.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device connects as the device it was committed as");
+    let paired = tokio::time::timeout(Duration::from_secs(150), attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect("the device ends paired and not unknown");
+    assert_eq!(paired.device_id, confirmed.device_id);
+    assert!(
+        link.paired_connects.load(Ordering::SeqCst) >= 5,
+        "the four lost connections were followed by a fifth"
+    );
+    assert!(
+        link.failed_statuses.load(Ordering::SeqCst) >= 2,
+        "the host refused a question again after the first recovery was lost"
+    );
+}
+
+/// KR-REQ-10.37: a recovery whose connection never answers is not waited on past the attempt's
+/// deadline: the attempt ends not knowing within one step of it, and keeps no record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovery_whose_connection_never_answers_ends_by_the_attempts_deadline() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let paired_gate = Gate::closed();
+    let (link, making) = watching({
+        let paired_gate = Arc::clone(&paired_gate);
+        move |link| {
+            link.first_surface_silence = Some(1);
+            link.paired_gate = Some(paired_gate);
+        }
+    });
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    let link = made(&link);
+    tokio::time::timeout(WATCHDOG, async {
+        while link.answered.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host answers the device's first question");
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, async {
+        while link.paired_connects.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device enters the connection that never answers");
+
+    device.clock.advance(PAST_THE_DEADLINE);
+    let failure = tokio::time::timeout(
+        kr_client::pairing::candidate::WAIT_STEP + Duration::from_secs(10),
+        attempt,
+    )
+    .await
+    .expect("the attempt ends within one step of its deadline")
+    .expect("the attempt ran")
+    .expect_err("not paired");
+    assert_eq!(failure.kind, FailureKind::ApprovalUnknown);
+    assert!(device.pairing.hosts.list().expect("readable").is_empty());
+    assert!(
+        device
+            .pairing
+            .hosts
+            .waiting_attempt()
+            .expect("readable")
+            .is_none(),
+        "the attempt is let go"
+    );
+}
+
+/// KR-REQ-10.37: a device that is on a fresh connection when the owner approves is refused there
+/// after the commitment, recovers, and meets a refusal of its first connection as the connection
+/// the host itself ended; it connects again and ends paired.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_on_another_connection_than_the_one_that_proved_it_recovers_and_connects_again() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let other = pairs_directly(&host, &owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = issue_direct(environment, &mut client, &owner).await;
+
+    let (link, making) = watching(|link| link.first_surface_silence = Some(0));
+    let device = ProductDevice::new(Arc::new(host.room.clone()), making);
+    let (attempt, mut shown) = device.redeem(&direct_text(&invited));
+    awaiting_value(&mut shown).await;
+    let link = made(&link);
+    // The connection that proved the device never answers, so the device moves to a fresh one, and
+    // the host answers it there that the owner has not decided.
+    tokio::time::timeout(WATCHDOG, async {
+        while link.answered.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host answers the fresh connection");
+
+    let (arrived, release) = host.controller().pause_connection_registration();
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    tokio::time::timeout(WATCHDOG, arrived)
+        .await
+        .expect("the device connects as the device it was committed as")
+        .expect("the host holds the connection before it registers it");
+    host.controller()
+        .revoke_device_authority(other.device_id, None, None)
+        .await
+        .expect("the third device's authority is withdrawn");
+    release
+        .send(())
+        .expect("the host is still holding the connection");
+
+    let paired = tokio::time::timeout(WATCHDOG, attempt)
+        .await
+        .expect("the attempt ends")
+        .expect("the attempt ran")
+        .expect("the device ends paired");
+    assert_eq!(paired.device_id, confirmed.device_id);
+    assert!(
+        link.failed_statuses.load(Ordering::SeqCst) >= 1,
+        "the host refused the question the device asked after the commitment on a connection that did not prove it"
+    );
+    assert!(
+        link.paired_connects.load(Ordering::SeqCst) >= 2,
+        "the first connection was refused and a second was made"
     );
 }

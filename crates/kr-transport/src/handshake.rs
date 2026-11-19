@@ -357,7 +357,18 @@ pub async fn accept_on(
     .await;
 
     match outcome {
-        Ok((digest, accepted)) => {
+        // A paired endpoint that asked for something before it proved its key: the host answers
+        // that request in the frame the peer reads, and not with a reply to a proof it never sent.
+        Ok(Admission::Request(response)) => {
+            challenge.abandon();
+            writer.write_message(&response).await?;
+            writer.finish_and_flush(REFUSAL_FLUSH).await;
+            Err(TransportError::handshake(
+                ErrorCode::PermissionDenied,
+                "a request arrived before the connection proof",
+            ))
+        }
+        Ok(Admission::Proved(digest, accepted)) => {
             let mut window_guard = WindowGuard {
                 windows,
                 action_window_id: Some(accepted.action_window.action_window_id.clone()),
@@ -460,13 +471,34 @@ async fn admit_paired_peer(
     directory: &dyn PairedDirectory,
     challenge: &mut Challenge,
     windows: &ActionWindowIssuer,
-) -> Result<(Digest256, ConnectAccepted)> {
-    let client_proof: ConnectProof = reader
-        .read_message_within(MAX_OFFER_LEN)
-        .await?
-        .ok_or_else(|| {
-            TransportError::handshake(ErrorCode::PermissionDenied, "no connection proof arrived")
-        })?;
+) -> Result<Admission> {
+    let Some(payload) = reader.read_payload_within(MAX_OFFER_LEN).await? else {
+        return Err(TransportError::handshake(
+            ErrorCode::PermissionDenied,
+            "no connection proof arrived",
+        ));
+    };
+    let limits = kr_cbor::Limits::DEFAULT.with_max_message_len(MAX_OFFER_LEN);
+    let client_proof: ConnectProof = match kr_protocol::wire::decode(&payload, &limits) {
+        Ok(proof) => proof,
+        // The first frame of a paired endpoint's connection is its proof. One that is a request is
+        // refused as one, in a frame the peer reads; one that is neither is refused as it always
+        // was, with the proof's own decode error.
+        Err(not_a_proof) => {
+            let Ok(request) =
+                kr_protocol::wire::decode::<kr_protocol::envelope::Request>(&payload, &limits)
+            else {
+                return Err(kr_protocol::frame::FrameError::Cbor(not_a_proof).into());
+            };
+            return Ok(Admission::Request(kr_protocol::envelope::Response {
+                request_id: request.request_id,
+                outcome: kr_protocol::envelope::Outcome::Error(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this endpoint is paired: connect as its paired device before you ask",
+                )),
+            }));
+        }
+    };
 
     // The host's own proof over the same transcript. It is produced before verification only
     // because both signatures are needed to check the pair; it is sent afterwards, and only if the
@@ -522,7 +554,7 @@ async fn admit_paired_peer(
     }
 
     let action_window = windows.issue(selection.connection_id, selection.boot_epoch)?;
-    Ok((
+    Ok(Admission::Proved(
         digest,
         ConnectAccepted {
             host_proof: ConnectProof {
@@ -531,6 +563,14 @@ async fn admit_paired_peer(
             action_window,
         },
     ))
+}
+
+/// What a paired endpoint's first frame was, once the host has read it.
+enum Admission {
+    /// A connection proof that verified, and what the host accepts it with.
+    Proved(Digest256, ConnectAccepted),
+    /// A request, which the host answers with this refusal and nothing more.
+    Request(kr_protocol::envelope::Response),
 }
 
 /// Retires an issued window unless the connection that would own it is admitted.
