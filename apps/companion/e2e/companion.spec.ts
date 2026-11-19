@@ -434,6 +434,8 @@ test.describe('the terminal place note on a phone', () => {
       await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
       const slot = page.locator('p.terminal-place-note')
       await expect(slot).toBeAttached()
+      // Empty, the slot is still in the accessibility tree, so its words are announced when they come.
+      await expect(page.getByRole('status').and(slot)).toHaveCount(1)
       const fits = async (what: string) => {
         const badge = page.getByTestId('terminal-place-note')
         const [inner, outer, past] = await Promise.all([
