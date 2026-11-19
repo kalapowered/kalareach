@@ -971,7 +971,11 @@ export interface FakeTerminalView {
   /**
    * Publishes the session's screen at the view's newest grid and where its window now is, with any
    * of its fields replaced by those `screen` gives, as settling the page's moves up to `settled`
-   * (the newest move the view has applied, unless the test says otherwise).
+   * (the newest move the view has applied, unless the test says otherwise). The first screen of a
+   * view opened with a place lands on it and ends the restore; `note` says that it did not: the
+   * window is then at home for `unavailable` and at the oldest row for `gone`, and the pans made
+   * while the restore waited are settled and not made. States carry the anchor of the window and
+   * the place a return to the live screen leaves.
    */
   show(screen?: Partial<TerminalScreen>, settled?: number, note?: TerminalNote): void
   /** Publishes that it waits for a screen, as after the host's reset. */
@@ -4336,6 +4340,61 @@ function fakeTerminalView(
   // Where the window is, and the newest move that put it there.
   let place: TerminalPlace = HOME
   let applied = 0
+  // A view opened with a place restores it before it shows anything: moves made meanwhile wait behind
+  // the restore, as in native code, and the first screen settles all of them. A return to the live
+  // screen drops the pans made before it and the restore with them; the pans made after it follow it.
+  let restoring = anchor !== null
+  let wentLive = false
+  let taken = 0
+  let queued: TerminalMove[] = []
+  const session = fakeScreenOf(sessionId)
+  // The anchor and the return place of a window at `at`, as native code mints them from its screen:
+  // none for the live screen's first line and column, where a view starts.
+  const anchorOf = (at: TerminalPlace): TerminalAnchor | null => {
+    if (at.above === 0 && at.line === 0 && at.column === 0) return null
+    const row = at.above > 0 ? session.history.length - at.above : null
+    return {
+      row: row === null ? null : String(row),
+      line: at.line,
+      column: at.column,
+      buffer: 'primary',
+      columns: session.columns,
+      generation: '1',
+      fingerprint: row === null ? null : String((session.history[row] ?? '').length)
+    }
+  }
+  const liveOf = (at: TerminalPlace): TerminalAnchor | null =>
+    anchorOf({ column: at.column, line: at.above > 0 ? 0 : at.line, above: 0 })
+  const anchorPlace = (): TerminalPlace => {
+    if (anchor === null) return HOME
+    const row = anchor.row === null ? null : Number(anchor.row)
+    return heldInside(
+      sessionId,
+      grids.at(-1) ?? grid,
+      row === null
+        ? { column: anchor.column, line: anchor.line, above: 0 }
+        : { column: anchor.column, line: 0, above: Math.max(0, session.history.length - row) }
+    )
+  }
+  const livePlace = (): TerminalPlace => {
+    const at = anchorPlace()
+    return { column: at.column, line: at.above > 0 ? 0 : at.line, above: 0 }
+  }
+  // The first screen ends the restore. A note says it did not land on the anchor's place, and the
+  // pans made behind it are then not made, as the origin rule of native code has it; they are
+  // settled all the same. Without a note the restore landed, or the person's return went first.
+  const resolve = (note: TerminalNote | undefined) => {
+    if (!restoring) return
+    restoring = false
+    place = wentLive ? livePlace() : anchorPlace()
+    if (!wentLive && note === 'unavailable') place = HOME
+    if (!wentLive && note === 'gone') place = { column: 0, line: 0, above: session.history.length }
+    if (note === undefined || wentLive) {
+      for (const move of queued) place = moved(sessionId, grids.at(-1) ?? grid, place, move)
+    }
+    queued = []
+    applied = Math.max(applied, taken)
+  }
   // Control, kept as native code keeps the session's input lease: the page's newest control request,
   // whether it asks for control and nothing has ended it since, whether the lease is held, whether an
   // acquire is in flight, and why control last ended or was refused.
@@ -4433,14 +4492,15 @@ function fakeTerminalView(
       publish({ state: 'waiting', attachment, settled: applied, control: controlNow() })
     },
     show(screen, settled, note) {
+      resolve(note)
       publish({
         state: 'showing',
         attachment,
         screen: { ...screenAt(), ...screen },
         settled: settled ?? applied,
         control: controlNow(),
-        anchor: null,
-        live: null,
+        anchor: anchorOf(place),
+        live: liveOf(place),
         note: note ?? null
       })
     },
@@ -4488,7 +4548,23 @@ function fakeTerminalView(
           ? { number: args.number, live: true }
           : { number: args.number, across: args.across, down: args.down }
         moves.push(asked)
-        if (!held.holdingMoves && !closed && !ended && asked.number > applied) {
+        if (restoring) {
+          if (!closed && !ended && asked.number > taken) {
+            taken = asked.number
+            if ('live' in asked) {
+              // The pans made before it are not made, and native code tells the page so at once, with
+              // a waiting state that settles them: the page removes no pan itself.
+              const before = queued.at(-1)?.number
+              wentLive = true
+              queued = []
+              if (before !== undefined) {
+                publish({ state: 'waiting', attachment, settled: before, control: controlNow() })
+              }
+            } else {
+              queued.push(asked)
+            }
+          }
+        } else if (!held.holdingMoves && !closed && !ended && asked.number > applied) {
           place = moved(sessionId, grids.at(-1) ?? grid, place, asked)
           applied = asked.number
           setTimeout(() => {
@@ -4499,8 +4575,8 @@ function fakeTerminalView(
               screen: screenAt(),
               settled: applied,
               control: controlNow(),
-              anchor: null,
-              live: null,
+              anchor: anchorOf(place),
+              live: liveOf(place),
               note: null
             })
           }, 0)

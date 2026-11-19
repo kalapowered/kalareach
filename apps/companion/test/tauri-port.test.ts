@@ -593,7 +593,24 @@ describe('the desktop port and a session screen’s opening', () => {
     shell.answers.set('terminal_view_open', '7')
     await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined, OPENING, null)
     const [opened] = shell.invoked
-    expect((opened?.args as { opening?: string }).opening).toBe(OPENING)
+    const args = opened?.args as { opening?: string; anchor?: unknown }
+    expect({ opening: args.opening, anchor: args.anchor }).toEqual({ opening: OPENING, anchor: null })
+  })
+
+  it('opens a terminal view with the anchor of the place it restores, its row kept as a decimal string', async () => {
+    shell.answers.set('terminal_view_open', '7')
+    const anchor = {
+      row: '9007199254740993',
+      line: 0,
+      column: 4,
+      buffer: 'primary' as const,
+      columns: 80,
+      generation: '3',
+      fingerprint: '12345678901234567890'
+    }
+    await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined, undefined, anchor)
+    const [opened] = shell.invoked
+    expect((opened?.args as { anchor?: unknown }).anchor).toEqual(anchor)
   })
 })
 

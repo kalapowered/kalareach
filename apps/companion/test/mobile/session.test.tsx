@@ -1019,6 +1019,186 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     }
   })
 
+  /** The phone's first drawn line, as the person reads it. */
+  const firstLine = () => screen.queryAllByTestId('mobile-terminal-line')[0]?.textContent?.trim() ?? ''
+
+  /** A phone whose terminal was scrolled up a row, left for the conversation and returned to, its new view held. */
+  async function returnedToAPlace(controls: ReturnType<typeof fakeHost>['controls'], person: ReturnType<typeof userEvent.setup>) {
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    finger('pointerdown', 1, 100, 100)
+    finger('pointermove', 1, 100, 116)
+    finger('pointerup', 1, 100, 116)
+    await waitFor(() => {
+      expect(firstLine()).toBe('$ echo earlier 12')
+    })
+    controls.holdTerminalViews()
+    await person.click(screen.getByRole('tab', { name: 'Conversation' }))
+    await person.click(await screen.findByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(2)
+    })
+    act(() => {
+      controls.terminalViews[1]?.attach()
+    })
+  }
+
+  it('opens its terminal at the place it was left at, and a drag made meanwhile goes from there', async () => {
+    const restore = measured()
+    try {
+      const { port, controls } = fakeHost()
+      const person = await onTerminal(port)
+      await returnedToAPlace(controls, person)
+      const view = controls.terminalViews[1]
+      expect(view?.anchor).toMatchObject({ row: '11', column: 0 })
+      // The kept frame stays while the restore waits, and a drag made then is queued behind it.
+      expect(firstLine()).toBe('$ echo earlier 12')
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 116)
+      finger('pointerup', 1, 100, 116)
+      expect(view?.moves).toEqual([{ number: 1, across: 0, down: -1 }])
+      act(() => {
+        view?.show()
+      })
+      await waitFor(() => {
+        expect(firstLine()).toBe('$ echo earlier 11')
+      })
+    } finally {
+      restore()
+    }
+  })
+
+  it('makes no drag that was made while the restore waited when the restore lands elsewhere', async () => {
+    const restore = measured()
+    try {
+      const { port, controls } = fakeHost()
+      const person = await onTerminal(port)
+      await returnedToAPlace(controls, person)
+      const view = controls.terminalViews[1]
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 116)
+      finger('pointerup', 1, 100, 116)
+      act(() => {
+        view?.show(undefined, undefined, 'unavailable')
+      })
+      await waitFor(() => {
+        expect(screen.getByTestId('terminal-place-note')).toHaveAttribute('data-kind', 'unavailable')
+      })
+      expect(firstLine()).toBe('$ cargo test -p kr-client')
+      expect(gridShift()).toEqual({ x: 0, y: 0 })
+    } finally {
+      restore()
+    }
+  })
+
+  it('draws no frame and makes no move after a return to the live screen was left unsettled', async () => {
+    const restore = measured()
+    try {
+      const { port, controls } = fakeHost()
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 116)
+      finger('pointerup', 1, 100, 116)
+      await waitFor(() => {
+        expect(firstLine()).toBe('$ echo earlier 12')
+      })
+      // The return is made and the pane left in one turn, before native code can settle it.
+      act(() => {
+        fireEvent.click(screen.getByRole('button', { name: 'Take control' }))
+        fireEvent.click(screen.getByRole('tab', { name: 'Conversation' }))
+      })
+      controls.holdTerminalViews()
+      await person.click(await screen.findByRole('tab', { name: 'Terminal' }))
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      act(() => {
+        controls.terminalViews[1]?.attach()
+      })
+      expect(screen.queryAllByTestId('mobile-terminal-line')).toHaveLength(0)
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 132)
+      finger('pointerup', 1, 100, 132)
+      expect(controls.terminalViews[1]?.moves).toEqual([])
+    } finally {
+      restore()
+    }
+  })
+
+  it('draws no old frame after a return to the live screen, an end and a return to the pane', async () => {
+    const restore = measured()
+    try {
+      const { port, controls } = fakeHost()
+      const person = await onTerminal(port)
+      await waitFor(() => {
+        expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+      })
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 116)
+      finger('pointerup', 1, 100, 116)
+      await waitFor(() => {
+        expect(firstLine()).toBe('$ echo earlier 12')
+      })
+      // The view ends before native code settles the return, which the end leaves unsettled.
+      act(() => {
+        fireEvent.click(screen.getByRole('button', { name: 'Take control' }))
+        controls.terminalViews[0]?.end('The session closed.')
+      })
+      controls.holdTerminalViews()
+      await person.click(screen.getByRole('tab', { name: 'Conversation' }))
+      await person.click(await screen.findByRole('tab', { name: 'Terminal' }))
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      act(() => {
+        controls.terminalViews[1]?.attach()
+      })
+      expect(screen.queryAllByTestId('mobile-terminal-line')).toHaveLength(0)
+      finger('pointerdown', 1, 100, 100)
+      finger('pointermove', 1, 100, 132)
+      finger('pointerup', 1, 100, 132)
+      expect(controls.terminalViews[1]?.moves).toEqual([])
+    } finally {
+      restore()
+    }
+  })
+
+  it('takes the drags made before a return to the live screen out of the room a later drag has', async () => {
+    const restore = laidOutPhone()
+    try {
+      const { port, controls } = fakeHost()
+      const person = await onTerminal(port)
+      await returnedToAPlace(controls, person)
+      const view = controls.terminalViews[1]
+      // A drag that uses all the room to the right is queued behind the restore.
+      finger('pointerdown', 1, 330, 100)
+      finger('pointermove', 1, 170, 100)
+      finger('pointermove', 1, 10, 100)
+      finger('pointerup', 1, 10, 100)
+      const queued = view?.moves.length ?? 0
+      expect(queued).toBeGreaterThan(0)
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      await person.click(await screen.findByRole('button', { name: 'Look around' }))
+      // A drag moves the window only in view mode.
+      await screen.findByRole('button', { name: 'Take control' })
+      // The return took the restore's place, and the drag with it: a second drag of the same size
+      // has all its room again, and is sent.
+      finger('pointerdown', 2, 330, 100)
+      finger('pointermove', 2, 170, 100)
+      finger('pointermove', 2, 10, 100)
+      finger('pointerup', 2, 10, 100)
+      const last = view?.moves.at(-1)
+      expect(last).toBeDefined()
+      expect(last && 'across' in last ? last.across : 0).toBeGreaterThan(0)
+    } finally {
+      restore()
+    }
+  })
+
   it('begins a drag again from the finger when the row it sends draws a screen laid out in a new cell', async () => {
     const cell = { width: 8, height: 16 }
     const restore = measured(cell)
