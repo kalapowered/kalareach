@@ -6046,6 +6046,70 @@ fn signal(name: &str, pid: u32) {
     assert!(sent.success(), "sends {name} to {pid}");
 }
 
+/// The line that is typed into a session's shell to run `kr host stop` with both session variables
+/// taken out, as a workflow's shell node would run it: it names the daemon's two folders and the
+/// program, and writes what the command said to the file `said`.
+fn the_stop_line_typed_into_a_session(
+    runtime: &Path,
+    state: &Path,
+    kr: &Path,
+    said: &Path,
+) -> String {
+    format!(
+        "env -u KR_SESSION -u KR_ATTACHMENT {runtime_variable}={runtime} {state_variable}={state} \
+         {kr} host stop > {said} 2>&1; echo done-$?",
+        runtime_variable = kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+        runtime = runtime.display(),
+        state_variable = kr_ipc::paths::STATE_DIR_VARIABLE,
+        state = state.display(),
+        kr = kr.display(),
+        said = said.display(),
+    )
+}
+
+/// The line typed into a session's shell for `kr host stop`, run from a folder whose name holds a
+/// quote and a space, names every path as one word: the program is run with the two folders in its
+/// environment and without the session variables, and what it said is written where it was asked.
+#[test]
+fn the_stop_line_typed_into_a_session_reads_its_paths_in_a_folder_whose_name_holds_a_quote_and_a_space()
+ {
+    let tree = teardown::Tree::create();
+    let folder = tree.root().join("it's a folder");
+    std::fs::create_dir(&folder).expect("a folder whose name holds a quote and a space");
+    let kr = folder.join("the kr");
+    kr_ipc::testing::place_script(
+        &kr,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"${{{runtime}}}\" \"${{{state}}}\" \"${{KR_SESSION-unset}}\" \
+             \"${{KR_ATTACHMENT-unset}}\" \"$@\"\n",
+            runtime = kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+            state = kr_ipc::paths::STATE_DIR_VARIABLE,
+        ),
+    );
+    let runtime = folder.join("a runtime");
+    let state = folder.join("a state");
+    let said = folder.join("said out");
+    let line = the_stop_line_typed_into_a_session(&runtime, &state, &kr, &said);
+    let run = spawning(|| {
+        Command::new("/bin/sh")
+            .args(["-c", &line])
+            .env("KR_SESSION", "x")
+            .env("KR_ATTACHMENT", "x")
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+    })
+    .expect("runs the shell");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "done-0\n", "{run:?}");
+    assert_eq!(
+        std::fs::read_to_string(&said).expect("the command wrote what it said"),
+        format!(
+            "{}\n{}\nunset\nunset\nhost\nstop\n",
+            runtime.display(),
+            state.display()
+        )
+    );
+}
+
 /// KR-REQ-07.58 (the guard): `kr host stop` refuses where the session variables are set, and where
 /// a live session's worker says the process is its own, and the daemon that answered before
 /// answers after. The worker's word is what the second form shows: the command typed into the
@@ -6077,15 +6141,11 @@ fn kr_host_stop_is_refused_inside_a_session_and_goes_on_where_a_worker_cannot_sa
 
     // The worker's word: both variables are taken out, so only the worker can tell.
     let said = host.tree.root().join("typed-stop.out");
-    let line = format!(
-        "env -u KR_SESSION -u KR_ATTACHMENT {runtime_variable}={runtime} {state_variable}={state} \
-         {kr} host stop > {said} 2>&1; echo done-$?",
-        runtime_variable = kr_ipc::paths::RUNTIME_DIR_VARIABLE,
-        runtime = host.tree.paths().runtime_root().display(),
-        state_variable = kr_ipc::paths::STATE_DIR_VARIABLE,
-        state = host.tree.paths().state_root().display(),
-        kr = installation().join("kr").display(),
-        said = said.display(),
+    let line = the_stop_line_typed_into_a_session(
+        host.tree.paths().runtime_root(),
+        host.tree.paths().state_root(),
+        &installation().join("kr"),
+        &said,
     );
     let runtime = runtime();
     runtime.block_on(async {
