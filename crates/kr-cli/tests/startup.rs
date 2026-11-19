@@ -205,10 +205,10 @@ fn installation() -> &'static Path {
 fn daemon_script(daemon: &Path, supervisor: &Path) -> String {
     format!(
         "#!/bin/sh\n\
-         exec /usr/bin/env {SUPERVISE}='{}' {SUPERVISED_ARGUMENTS}=\"$(printf '%s\\n' \"$@\")\" \
-         '{}' {SUPERVISOR_TEST} --exact --quiet\n",
-        daemon.display(),
-        supervisor.display()
+         exec /usr/bin/env {SUPERVISE}={} {SUPERVISED_ARGUMENTS}=\"$(printf '%s\\n' \"$@\")\" \
+         {} {SUPERVISOR_TEST} --exact --quiet\n",
+        kr_worker::testing::shell_quoted(daemon),
+        kr_worker::testing::shell_quoted(supervisor)
     )
 }
 
@@ -1158,9 +1158,9 @@ fn recording_tools(tools: &Path, calls: &Path, passes: &[&str]) {
                  \x20 printf '%s\\t%s\\t%s\\t%s' \"$PPID\" \"$$\" \"$(ps -o comm= -p \"$PPID\" 2>/dev/null)\" '{tool}'\n\
                  \x20 for argument in \"$@\"; do printf '\\t%s' \"$argument\"; done\n\
                  \x20 printf '\\n'\n\
-                 }} >> '{}'\n\
+                 }} >> {}\n\
                  {ending}",
-                calls.display()
+                kr_worker::testing::shell_quoted(calls)
             ),
         )
         .expect("writes a recording tool");
@@ -3239,8 +3239,8 @@ fn the_service_daemon_script(daemon: &Path) -> String {
          \x20 mv \"$KR_TEST_HOLD_DIR/daemon.pid.tmp\" \"$KR_TEST_HOLD_DIR/daemon.pid\"\n\
          \x20 while [ ! -e \"$KR_TEST_HOLD_DIR/go\" ]; do sleep 0.05; done\n\
          fi\n\
-         exec '{}' --secret-store file \"$@\"\n",
-        daemon.display()
+         exec {} --secret-store file \"$@\"\n",
+        kr_worker::testing::shell_quoted(daemon)
     )
 }
 
@@ -4885,41 +4885,46 @@ fn the_root_shell_that_runs_the_second_new(
 ) -> String {
     let environment: String = environment
         .iter()
-        .map(|(name, value)| format!("{name}='{value}' "))
+        .map(|(name, value)| format!("{name}={} ", kr_worker::testing::shell_word(value)))
         .collect();
     let waiting = if setup.hold {
         format!(
-            "while [ ! -e '{}/go' ]; do echo .; sleep 0.2; done\n",
-            hold.display()
+            "while [ ! -e {} ]; do echo .; sleep 0.2; done\n",
+            kr_worker::testing::shell_quoted(&hold.join("go"))
         )
     } else {
         String::new()
     };
     let gate = if setup.gate {
         format!(
-            "while [ ! -e '{}/start' ]; do sleep 0.05; done\n",
-            hold.display()
+            "while [ ! -e {} ]; do sleep 0.05; done\n",
+            kr_worker::testing::shell_quoted(&hold.join("start"))
         )
     } else {
         String::new()
     };
+    let said_file = |suffix: &str| kr_worker::testing::shell_quoted(&named_after(said, suffix));
     format!(
         "#!/bin/sh\n\
          {gate}\
-         ( env -i {environment}'{kr}' new --invisible --headless --cwd '{cwd}' \
+         ( env -i {environment}{kr} new --invisible --headless --cwd {cwd} \
          --shell /bin/sh --shell-mode native_compat --startup interactive \
-         < /dev/null > '{said}.out' 2> '{said}.err'; \
-         echo $? > '{said}.tmp' && mv '{said}.tmp' '{said}.status' ) &\n\
+         < /dev/null > {out} 2> {err}; \
+         echo $? > {tmp} && mv {tmp} {status} ) &\n\
          {waiting}\
          exec /bin/sh \"$@\"\n",
-        kr = kr.display(),
-        cwd = cwd.display(),
-        said = said.display(),
+        kr = kr_worker::testing::shell_quoted(kr),
+        cwd = kr_worker::testing::shell_quoted(cwd),
+        out = said_file(".out"),
+        err = said_file(".err"),
+        tmp = said_file(".tmp"),
+        status = said_file(".status"),
     )
 }
 
 /// Runs the root shell the second `kr new` is run by, from a folder whose name holds a quote and a
-/// space, and returns the file that holds what the command it ran said, as `said` names them.
+/// space, waits for the command it ran in the background to end, and returns the `said` it was
+/// given, which names the files that command's record is in.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_the_root_shell_in_a_folder_whose_name_holds_a_quote_and_a_space(
     tree: &teardown::Tree,
