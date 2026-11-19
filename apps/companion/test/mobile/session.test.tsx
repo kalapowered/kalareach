@@ -351,7 +351,7 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
 
   // What the host writes in the refusal of an agent that two packages recognise equally well.
   const TIE =
-    'it was not launched through the integration, and openai.codex and acme.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+    'it was not launched through the integration, and acme.codex and openai.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
 
   it("says why no package takes a prompt, in the host's own words, as the desktop does (KR-REQ-12.23)", async () => {
     const person = userEvent.setup()
@@ -408,6 +408,74 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
     await person.type(screen.getByLabelText('Message this session'), 'go on')
     expect(await screen.findByText('No package recognised this agent.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
+
+  // The host's read of a session whose agent no package took, the refusal as the host wrote it.
+  const tiedAgent = (port: ReturnType<typeof fakeHost>['port']) => ({
+    ...port,
+    sessionAgents: async (...args: Parameters<typeof port.sessionAgents>) => {
+      const read = await port.sessionAgents(...args)
+      const instances = read.instances.instances.map((each) => ({ ...each, plugin_id: null, refusal: TIE }))
+      return { ...read, instances: { ...read.instances, instances } }
+    }
+  })
+  const TIE_NOTICE = `No package is bound to this agent. The host says ${TIE}.`
+
+  it('keeps the tie notice beside Send when the composer is its line on a short session (KR-REQ-12.23)', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    // jsdom lays nothing out: a session 20 lines of the root text size high is too short for the
+    // whole composer.
+    const root = document.documentElement
+    root.style.fontSize = '16px'
+    const heights = vi.spyOn(Element.prototype, 'clientHeight', 'get').mockImplementation(function (
+      this: Element
+    ) {
+      return this.classList.contains('m-session') ? 20 * 16 : 0
+    })
+    try {
+      render(
+        <AppProvider port={tiedAgent(port)}>
+          <OnSession sessionId={SESSION_MAIN} />
+        </AppProvider>
+      )
+      const field = await screen.findByLabelText('Message this session')
+      await waitFor(() => {
+        expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'line')
+      })
+      await person.type(field, 'go on')
+      const notice = await screen.findByText(TIE_NOTICE)
+      expect(field).toHaveAttribute('aria-describedby', notice.id)
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+      expect(screen.queryByText('No agent is running in this session.')).toBeNull()
+      // An empty draft needs no words beside the line: the notice goes with the text.
+      await person.clear(field)
+      expect(screen.queryByText(TIE_NOTICE)).toBeNull()
+    } finally {
+      heights.mockRestore()
+      root.style.removeProperty('font-size')
+    }
+  })
+
+  it('keeps the tie notice beside Send in the terminal view without control of the program (KR-REQ-12.23)', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    render(
+      <AppProvider port={tiedAgent(port)}>
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Find why the reconnect test is flaky.')
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    const field = screen.getByLabelText('Message this session')
+    expect(document.querySelector('.m-session')).toHaveAttribute('data-composer', 'line')
+    await person.type(field, 'go on')
+    const notice = await screen.findByText(TIE_NOTICE)
+    expect(field).toHaveAttribute('aria-describedby', notice.id)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.queryByText('No agent is running in this session.')).toBeNull()
+    await person.clear(field)
+    expect(screen.queryByText(TIE_NOTICE)).toBeNull()
   })
 })
 
