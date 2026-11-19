@@ -786,6 +786,15 @@ mod tests {
         let rows = Rows::with(CallState::Closed, 1);
         let registry = CallRegistry::new(rows);
         assert_eq!(registry.while_idle(|| 7), Ok(7));
+        // The registry's own lock is held across the change: no start is admitted, and none
+        // reads the state, until the change is done.
+        let held_during_the_change = registry.while_idle(|| {
+            matches!(
+                registry.inner.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            )
+        });
+        assert_eq!(held_during_the_change, Ok(true));
         let ticket = registry.begin_start().expect("a start");
         assert_eq!(registry.while_idle(|| 7), Err(StartRefusal::InProgress));
         drop(ticket);
