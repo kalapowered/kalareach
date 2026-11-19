@@ -44,7 +44,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use kr_client::services::voice::{ManagedVoiceService, VoiceMetadata, VoiceRateQuote, VoiceStart};
+use kr_client::services::voice::{VoiceMetadata, VoiceProviderService, VoiceRateQuote, VoiceStart};
 use kr_protocol::grant::Grant;
 use kr_protocol::ids::{
     ActionId, AuthorityRevision, DeviceId, EnvironmentId, GrantId, SessionId, VoiceSessionId,
@@ -195,7 +195,7 @@ struct Intent {
 #[derive(Debug)]
 struct Ending {
     call_id: String,
-    provider: Option<Arc<dyn ManagedVoiceService>>,
+    provider: Option<Arc<dyn VoiceProviderService>>,
 }
 
 /// What running every check produced.
@@ -234,7 +234,7 @@ pub struct Coordinator {
     /// Replaceable while the coordinator runs, so that a provider the host's configuration cannot
     /// name, a backend of the person's own or a stand-in, can be attached to the service the
     /// daemon has already registered.
-    provider: Mutex<Option<Arc<dyn ManagedVoiceService>>>,
+    provider: Mutex<Option<Arc<dyn VoiceProviderService>>>,
     host_device_id: DeviceId,
     environment_id: EnvironmentId,
     broker_origin: String,
@@ -320,7 +320,7 @@ const BROKER_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(8)
 /// [`BROKER_CLOSE_WAIT`]. Says whether the service confirmed the close in that time. The task keeps
 /// `closing`, so a close that outlasts the wait still counts as open until it ends.
 async fn close_within_bound(
-    provider: Arc<dyn ManagedVoiceService>,
+    provider: Arc<dyn VoiceProviderService>,
     call_id: String,
     closing: Closing,
 ) -> bool {
@@ -345,7 +345,7 @@ impl Coordinator {
         context: Arc<dyn ContextSource>,
         authority: Arc<dyn VoiceAuthority>,
         submitter: Arc<dyn ActionSubmitter>,
-        provider: Option<Arc<dyn ManagedVoiceService>>,
+        provider: Option<Arc<dyn VoiceProviderService>>,
         host_device_id: DeviceId,
         environment_id: EnvironmentId,
         broker_origin: impl Into<String>,
@@ -394,7 +394,7 @@ impl Coordinator {
     /// The seam is filled by the managed broker, by a backend of the person's own, or by nothing
     /// at all. Nothing else in this crate changes with it.
     #[must_use]
-    pub fn with_provider(mut self, provider: Option<Arc<dyn ManagedVoiceService>>) -> Self {
+    pub fn with_provider(mut self, provider: Option<Arc<dyn VoiceProviderService>>) -> Self {
         *self.provider.get_mut().expect("the coordinator's provider") = provider;
         self
     }
@@ -424,7 +424,7 @@ impl Coordinator {
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's provider panicked.
-    pub fn attach_provider(&self, provider: Option<Arc<dyn ManagedVoiceService>>) {
+    pub fn attach_provider(&self, provider: Option<Arc<dyn VoiceProviderService>>) {
         *self.provider.lock().expect("the coordinator's provider") = provider;
     }
 
@@ -433,7 +433,7 @@ impl Coordinator {
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's provider panicked.
-    fn provider(&self) -> Option<Arc<dyn ManagedVoiceService>> {
+    fn provider(&self) -> Option<Arc<dyn VoiceProviderService>> {
         self.provider
             .lock()
             .expect("the coordinator's provider")
@@ -921,13 +921,21 @@ impl Coordinator {
     pub async fn start(
         &self,
         device_id: DeviceId,
+        action_id: ActionId,
         params: &VoiceStartParams,
         authority_revision: kr_protocol::ids::AuthorityRevision,
         now_ms: u64,
         admission: &dyn Admission,
     ) -> Result<VoiceStartResult> {
         let answer = self
-            .start_call(device_id, params, authority_revision, now_ms, admission)
+            .start_call(
+                device_id,
+                action_id,
+                params,
+                authority_revision,
+                now_ms,
+                admission,
+            )
             .await;
         // Whatever this start came to, and after its own gate is released: a replayed call this
         // host left open because a start might bind it is closed once no start is left that
@@ -940,6 +948,7 @@ impl Coordinator {
     async fn start_call(
         &self,
         device_id: DeviceId,
+        action_id: ActionId,
         params: &VoiceStartParams,
         authority_revision: kr_protocol::ids::AuthorityRevision,
         now_ms: u64,
@@ -997,18 +1006,26 @@ impl Coordinator {
             duration_seconds: params.duration_seconds,
             reasoning_budget_minor: params.reasoning_budget_minor.0.map(U64::get),
             device_id: Some(device_id.to_string()),
+            action_id,
             // The version the person was shown, passed on unchanged. The service is what knows
             // the rate it would charge now, so the comparison is its to make; this host only
             // makes sure the version that reaches it is the one the device named.
             expected_rate_version: params.expected_rate_version.0.clone(),
         };
-        // Asked immediately before the broker, after the reads above, because creating the call
-        // is the first thing a start does that costs anything: a call created for a start the
-        // host then refuses is a metered call nobody can use, and closing it afterwards is only
-        // attempted. The same check runs again once the broker has answered, before the call's
+        // What a provider writes before it asks for a call is written first, so that the check
+        // below sits after that record and immediately before the request: creating the call is
+        // the first thing a start does that costs anything, a call created for a start the host
+        // then refuses is a metered call nobody can use, and closing it afterwards is only
+        // attempted. The same check runs again once the provider has answered, before the call's
         // grant is written.
-        Self::still_admitted(admission)?;
-        let outcome = provider.start(&request).await?;
+        let attempt = provider.begin(&request).await?;
+        if let Err(refusal) = Self::still_admitted(admission) {
+            // Nothing was sent, so the record `begin` wrote is the only thing to undo. Failing to
+            // undo it changes nothing the caller can do, so its own error is not the answer.
+            let _ = provider.abandon(attempt).await;
+            return Err(refusal);
+        }
+        let outcome = provider.dispatch(attempt, &request).await?;
 
         let session = match outcome {
             VoiceStart::CreationUnknown {
@@ -1297,7 +1314,7 @@ impl Coordinator {
     fn may_close_replayed(
         &self,
         call_id: &str,
-        provider: &Arc<dyn ManagedVoiceService>,
+        provider: &Arc<dyn VoiceProviderService>,
         device_id: DeviceId,
     ) -> bool {
         let state = self.state.lock().expect("the coordinator's state");
@@ -1322,7 +1339,7 @@ impl Coordinator {
     /// the caller's own answer is already decided, and the service's deadline closes the call in
     /// any case. The failure is reported ([`Self::report_unclosed_calls_to`]) and nothing else
     /// changes. Nothing here retries creation.
-    async fn close_unbound(&self, provider: &Arc<dyn ManagedVoiceService>, call_id: &str) {
+    async fn close_unbound(&self, provider: &Arc<dyn VoiceProviderService>, call_id: &str) {
         if let Err(error) = provider.close(call_id).await {
             let report = Arc::clone(&self.unclosed.lock().expect("the coordinator's reporter"));
             report(&UnclosedCall {

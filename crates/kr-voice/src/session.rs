@@ -41,7 +41,7 @@ pub struct VoiceSessionRecord {
     /// Held rather than looked up: the coordinator's provider can be replaced while a call runs,
     /// and telling a different service to close a call it never created would leave the real one
     /// metering.
-    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::ManagedVoiceService>>,
+    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::VoiceProviderService>>,
     /// When it started, in UTC milliseconds.
     pub started_at_ms: u64,
     /// When the call's own deadline falls, in UTC milliseconds.
@@ -74,7 +74,7 @@ pub struct Stopped {
     /// The broker's call identifier, for the caller to finalise afterwards.
     pub call_id: Option<String>,
     /// The provider that created it.
-    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::ManagedVoiceService>>,
+    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::VoiceProviderService>>,
     /// The terminal sessions it reached, which keep running.
     pub sessions_left_running: CanonicalSet<SessionId>,
 }
@@ -95,7 +95,7 @@ pub struct NewVoiceSession {
     /// The broker's identifier for the call, when a managed call is behind it.
     pub call_id: Option<String>,
     /// The provider that created it, so the same one is told when it ends.
-    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::ManagedVoiceService>>,
+    pub provider: Option<std::sync::Arc<dyn kr_client::services::voice::VoiceProviderService>>,
     /// When it started, in UTC milliseconds.
     pub started_at_ms: u64,
     /// When the call's own deadline falls, in UTC milliseconds.

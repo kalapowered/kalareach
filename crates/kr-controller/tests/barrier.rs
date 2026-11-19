@@ -5174,7 +5174,7 @@ async fn the_startup_exchange_binds_a_worker_to_its_own_reservation() {
 #[derive(Debug)]
 struct OfflineProvider;
 
-impl kr_client::services::voice::ManagedVoiceService for OfflineProvider {
+impl kr_client::services::voice::VoiceProviderService for OfflineProvider {
     fn metadata(
         &self,
     ) -> kr_client::services::ServiceFuture<'_, Option<kr_client::services::voice::VoiceMetadata>>
@@ -5193,8 +5193,23 @@ impl kr_client::services::voice::ManagedVoiceService for OfflineProvider {
         "the offline provider".to_owned()
     }
 
-    fn start<'a>(
+    fn begin<'a>(
         &'a self,
+        _request: &'a kr_client::services::voice::VoiceSessionRequest,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::StartAttempt> {
+        Box::pin(async { Ok(kr_client::services::StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
+    ) -> kr_client::services::ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
         _request: &'a kr_client::services::voice::VoiceSessionRequest,
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::voice::VoiceStart> {
         use kr_client::services::voice::{
@@ -5379,6 +5394,7 @@ async fn a_spoken_close_the_device_confirmed_is_taken_up_by_the_sessions_real_wo
     let started = coordinator
         .start(
             device_id,
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
             &VoiceStartParams {
                 session_ids: [session_id].into_iter().collect(),
                 offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),

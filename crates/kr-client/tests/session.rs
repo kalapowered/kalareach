@@ -4300,7 +4300,7 @@ impl kr_client::services::BackupManifestService for ForkServices {
     }
 }
 
-impl kr_client::services::ManagedVoiceService for ForkServices {
+impl kr_client::services::VoiceProviderService for ForkServices {
     fn metadata(
         &self,
     ) -> kr_client::services::ServiceFuture<'_, Option<kr_client::services::voice::VoiceMetadata>>
@@ -4319,8 +4319,23 @@ impl kr_client::services::ManagedVoiceService for ForkServices {
         "the fork's own".to_owned()
     }
 
-    fn start<'a>(
+    fn begin<'a>(
         &'a self,
+        _request: &'a kr_client::services::VoiceSessionRequest,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::StartAttempt> {
+        Box::pin(async { Ok(kr_client::services::StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
+    ) -> kr_client::services::ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
         _request: &'a kr_client::services::VoiceSessionRequest,
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::VoiceStart> {
         self.refuses("voice.start")

@@ -167,6 +167,9 @@ pub struct VoiceSessionRequest {
     pub reasoning_budget_minor: Option<u64>,
     /// The paired device asking, as the host knows it. Recorded, never authority.
     pub device_id: Option<String>,
+    /// The action the device's `voice.start` was sent under: the identity of this start, so a
+    /// provider that records an attempt before it dispatches it can say whose attempt it was.
+    pub action_id: kr_protocol::ids::ActionId,
     /// The version of the rate the person was shown, as the metadata read answered it.
     ///
     /// The service starts a call only under the rate its request names, and answers a version that
@@ -946,11 +949,57 @@ pub fn read_control_event(value: &serde_json::Value) -> Option<VoiceControlEvent
 /* The service                                                                 */
 /* -------------------------------------------------------------------------- */
 
-/// Where managed voice is brokered.
+/// What a provider holds between the two halves of a start.
 ///
-/// The interface is deliberately this small, because it is the seam a BYOK backend, a local voice
-/// engine or another provider replaces. Nothing above it knows which one answered.
-pub trait ManagedVoiceService: Send + Sync + fmt::Debug {
+/// [`VoiceProviderService::begin`] returns one and [`VoiceProviderService::dispatch`] or
+/// [`VoiceProviderService::abandon`] takes it back. A provider that writes nothing before it
+/// dispatches holds nothing ([`StartAttempt::none`]); one that records the attempt first holds the
+/// record's handle. What it holds is the provider's own, and dropping the attempt without either
+/// call drops it, so a provider whose handle must undo something puts that in the handle's own
+/// `Drop`.
+pub struct StartAttempt {
+    held: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl StartAttempt {
+    /// An attempt that holds nothing: the provider writes nothing before it dispatches.
+    #[must_use]
+    pub fn none() -> Self {
+        Self { held: None }
+    }
+
+    /// An attempt that holds `value`, the provider's own handle on what it recorded.
+    #[must_use]
+    pub fn holding<T: std::any::Any + Send + Sync>(value: T) -> Self {
+        Self {
+            held: Some(Box::new(value)),
+        }
+    }
+
+    /// Takes back the handle this attempt holds, if it holds one of type `T`.
+    #[must_use]
+    pub fn into_held<T: std::any::Any>(self) -> Option<T> {
+        self.held
+            .and_then(|held| held.downcast::<T>().ok())
+            .map(|held| *held)
+    }
+}
+
+impl fmt::Debug for StartAttempt {
+    /// That it exists and whether it holds anything, and never what it holds.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StartAttempt")
+            .field("holds", &self.held.is_some())
+            .finish()
+    }
+}
+
+/// Where a voice call is created: the managed broker, or the host's own provider account.
+///
+/// The interface is deliberately this small, because it is the seam every provider sits behind.
+/// Nothing above it knows which one answered.
+pub trait VoiceProviderService: Send + Sync + fmt::Debug {
     /// What a call started now would be: the model, the disclosure, the rate and the limits.
     ///
     /// Reading it creates nothing and holds nothing. `None` is a provider that is not the managed
@@ -962,13 +1011,38 @@ pub trait ManagedVoiceService: Send + Sync + fmt::Debug {
     /// this client could not show a person.
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>>;
 
-    /// Creates one managed call from the caller's own SDP offer.
+    /// The first half of a start: everything a provider writes down before it asks for a call.
+    ///
+    /// A provider that records an attempt does it here, so that the caller can check once more
+    /// that the start is still wanted after the record exists and before anything is sent. The
+    /// caller then calls [`dispatch`](Self::dispatch) with the attempt or, when it will not send,
+    /// [`abandon`](Self::abandon).
+    ///
+    /// # Errors
+    ///
+    /// Returns the provider's refusal to start, or a transport or protocol error. Nothing was
+    /// sent, and nothing is left recorded.
+    fn begin<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, StartAttempt>;
+
+    /// The second half of a start: creates one call from the caller's own SDP offer.
     ///
     /// # Errors
     ///
     /// Returns a transport or protocol error. A refusal by the service is an answer rather than
     /// an error: see [`VoiceStart::Refused`].
-    fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart>;
+    fn dispatch<'a>(
+        &'a self,
+        attempt: StartAttempt,
+        request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart>;
+
+    /// Gives up an attempt that [`begin`](Self::begin) returned and nothing was sent for.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record could not be removed. The caller ignores it, because the
+    /// start is over either way.
+    fn abandon<'a>(&'a self, attempt: StartAttempt) -> ServiceFuture<'a, ()>;
 
     /// Ends one call and asks the service to finalise it.
     ///
@@ -1260,7 +1334,7 @@ impl ManagedVoiceBroker {
     }
 }
 
-impl ManagedVoiceService for ManagedVoiceBroker {
+impl VoiceProviderService for ManagedVoiceBroker {
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
         Box::pin(async move {
             // An empty object. The service refuses any member, because a member it ignored would
@@ -1277,7 +1351,21 @@ impl ManagedVoiceService for ManagedVoiceBroker {
         normalised_origin(&self.origin)
     }
 
-    fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
+    fn begin<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, StartAttempt> {
+        // The managed service holds an attempt on its own side and keeps its answer to a repeat,
+        // so this host writes nothing before it asks.
+        Box::pin(async { Ok(StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(&'a self, _attempt: StartAttempt) -> ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: StartAttempt,
+        request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
             let body = serde_json::to_vec(&request.body()?).map_err(|error| {
                 local(crate::shown!(
@@ -1491,7 +1579,7 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 ///
 /// The service reports an unknown creation and an unavailable service as refusals with a voice
 /// reason, and this is where the reason becomes the state a caller branches on. It is separate
-/// from [`ManagedVoiceService::start`] so a caller holding an answer from anywhere, a recorded
+/// from [`VoiceProviderService::dispatch`] so a caller holding an answer from anywhere, a recorded
 /// exchange or a self-hosted broker, reads it the same way.
 ///
 /// A success this client cannot read is an unknown creation: the service answers a start with
@@ -1710,6 +1798,9 @@ mod tests {
             duration_seconds: 300,
             reasoning_budget_minor: Some(500),
             device_id: Some("44444444-4444-4444-4444-444444444444".to_owned()),
+            action_id: kr_protocol::ids::ActionId::new(
+                kr_transport::random::fresh_uuid_v4().expect("an identifier"),
+            ),
             expected_rate_version: Some("2026-09-a".to_owned()),
         };
         renders_only(
@@ -2493,6 +2584,9 @@ mod tests {
             duration_seconds: 600,
             reasoning_budget_minor: None,
             device_id: None,
+            action_id: kr_protocol::ids::ActionId::new(
+                kr_transport::random::fresh_uuid_v4().expect("an identifier"),
+            ),
             expected_rate_version: version.map(str::to_owned),
         }
     }
@@ -2563,15 +2657,25 @@ mod tests {
             }}),
         )]);
         let client = broker(&service);
-        assert!(client.start(&start_request(None)).await.is_err());
-        assert!(client.start(&start_request(Some(""))).await.is_err());
+        assert!(
+            client
+                .dispatch(StartAttempt::none(), &start_request(None))
+                .await
+                .is_err()
+        );
+        assert!(
+            client
+                .dispatch(StartAttempt::none(), &start_request(Some("")))
+                .await
+                .is_err()
+        );
         assert!(
             service.sent().is_empty(),
             "a start that names no rate is never sent"
         );
 
         let _ = client
-            .start(&start_request(Some("2026-09-a")))
+            .dispatch(StartAttempt::none(), &start_request(Some("2026-09-a")))
             .await
             .expect("an answer");
         let sent = service.sent();

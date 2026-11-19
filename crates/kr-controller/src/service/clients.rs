@@ -24,7 +24,7 @@ use kr_protocol::hostinfo::configuration::{self, Selection};
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
 use kr_protocol::service::GatewayOrigin;
-use kr_voice::broker::ManagedVoiceService;
+use kr_voice::broker::VoiceProviderService;
 
 use super::Controller;
 use crate::account::HostAccount;
@@ -127,7 +127,7 @@ impl Controller {
     fn managed_voice_provider(
         started: &Started,
         account: &Arc<HostAccount>,
-    ) -> Option<Arc<dyn ManagedVoiceService>> {
+    ) -> Option<Arc<dyn VoiceProviderService>> {
         let origin = started.voice.broker_origin()?;
         let unavailable = |reason: &dyn std::fmt::Display| {
             eprintln!("kr-controller: managed voice is not attached: {reason}");

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::services::ServiceFuture;
 use kr_client::services::voice::{
-    ManagedVoiceService, VoiceClosure, VoiceHold, VoiceMetadata, VoiceRateQuote, VoiceSession,
+    VoiceClosure, VoiceHold, VoiceMetadata, VoiceProviderService, VoiceRateQuote, VoiceSession,
     VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 use kr_client::services::voice_confirm::sign_voice_confirmation;
@@ -806,6 +806,9 @@ struct ManagedFake {
     /// Whether a close waits to be let through, as one does when the service is slow to answer.
     close_held: Mutex<bool>,
     closing: tokio::sync::Semaphore,
+    /// The halves of a start, in the order the coordinator called them, and the action each
+    /// start named.
+    halves: Mutex<Vec<(&'static str, ActionId)>>,
 }
 
 impl ManagedFake {
@@ -823,6 +826,7 @@ impl ManagedFake {
             held: Mutex::new(false),
             close_held: Mutex::new(false),
             closing: tokio::sync::Semaphore::new(0),
+            halves: Mutex::new(Vec::new()),
         }
     }
 
@@ -869,6 +873,11 @@ impl ManagedFake {
 
     fn offers(&self) -> Vec<String> {
         self.offers.lock().expect("the offers").clone()
+    }
+
+    /// The halves of a start the coordinator called, in order, with the action each named.
+    fn halves(&self) -> Vec<(&'static str, ActionId)> {
+        self.halves.lock().expect("the halves").clone()
     }
 
     fn versions(&self) -> Vec<Option<String>> {
@@ -935,7 +944,7 @@ fn running_call(name: &str) -> VoiceSession {
     }
 }
 
-impl ManagedVoiceService for ManagedFake {
+impl VoiceProviderService for ManagedFake {
     fn call_is_open<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, bool> {
         self.asked
             .lock()
@@ -975,7 +984,34 @@ impl ManagedVoiceService for ManagedFake {
         "the managed broker".to_owned()
     }
 
-    fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
+    fn begin<'a>(
+        &'a self,
+        request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, kr_client::services::StartAttempt> {
+        self.halves
+            .lock()
+            .expect("the halves")
+            .push(("begin", request.action_id));
+        Box::pin(async { Ok(kr_client::services::StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(&'a self, _attempt: kr_client::services::StartAttempt) -> ServiceFuture<'a, ()> {
+        self.halves
+            .lock()
+            .expect("the halves")
+            .push(("abandon", action(0)));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
+        request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart> {
+        self.halves
+            .lock()
+            .expect("the halves")
+            .push(("dispatch", request.action_id));
         self.offers
             .lock()
             .expect("the offers")
@@ -1085,7 +1121,7 @@ struct OwnBackend {
     closed: Mutex<Vec<String>>,
 }
 
-impl ManagedVoiceService for OwnBackend {
+impl VoiceProviderService for OwnBackend {
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
         // Not the managed service: it quotes no managed rate and publishes no managed terms.
         Box::pin(async move { Ok(None) })
@@ -1100,7 +1136,22 @@ impl ManagedVoiceService for OwnBackend {
         "a backend of the person's own".to_owned()
     }
 
-    fn start<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
+    fn begin<'a>(
+        &'a self,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, kr_client::services::StartAttempt> {
+        Box::pin(async { Ok(kr_client::services::StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(&'a self, _attempt: kr_client::services::StartAttempt) -> ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move { Ok(VoiceStart::Started(Box::new(running_call("byok")))) })
     }
 
@@ -1204,7 +1255,7 @@ fn fixture_with(actions: &[ActionRight], answer: Answer) -> Fixture {
         Arc::clone(&context) as Arc<dyn ContextSource>,
         Arc::clone(&authority) as Arc<dyn VoiceAuthority>,
         Arc::clone(&submitter) as Arc<dyn ActionSubmitter>,
-        Some(Arc::clone(&broker) as Arc<dyn ManagedVoiceService>),
+        Some(Arc::clone(&broker) as Arc<dyn VoiceProviderService>),
         device(HOST),
         environment(),
         "https://reach.example",
@@ -1363,6 +1414,7 @@ async fn started(fixture: &Fixture, actions: Option<&[VoiceAction]>) -> VoiceSes
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
@@ -1471,7 +1523,7 @@ async fn a_call_runs_on_either_provider_through_one_interface() {
         Arc::new(Context::new(gathered())) as Arc<dyn ContextSource>,
         Arc::clone(&authority) as Arc<dyn VoiceAuthority>,
         Arc::new(Submitter::new()) as Arc<dyn ActionSubmitter>,
-        Some(Arc::clone(&own) as Arc<dyn ManagedVoiceService>),
+        Some(Arc::clone(&own) as Arc<dyn VoiceProviderService>),
         device(HOST),
         environment(),
         "https://voice.example",
@@ -1488,6 +1540,7 @@ async fn a_call_runs_on_either_provider_through_one_interface() {
     let result = coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&coordinator).await,
             AuthorityRevision::new(1),
             10_000,
@@ -1521,6 +1574,7 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
@@ -1541,6 +1595,43 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
         fixture.broker.offers().len(),
         1,
         "an unknown creation is never retried"
+    );
+}
+
+/// A start asks the provider for its first half, then asks the host whether the start is still
+/// wanted, and only then dispatches, under the action the device sent the start with.
+#[tokio::test]
+async fn a_start_calls_the_providers_halves_in_order_under_the_action_it_was_sent_with() {
+    let fixture = fixture();
+    fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a standing voice grant");
+    let params = start_params_for(&fixture.coordinator).await;
+
+    fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            action(0x31),
+            &params,
+            AuthorityRevision::new(1),
+            10_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("a call");
+
+    assert_eq!(
+        fixture.broker.halves(),
+        [("begin", action(0x31)), ("dispatch", action(0x31))],
+        "the first half is written before the request and the request carries the action"
     );
 }
 
@@ -1602,6 +1693,7 @@ async fn a_start_whose_admission_lapsed_while_it_read_asks_the_broker_for_nothin
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &params,
             AuthorityRevision::new(1),
             10_000,
@@ -1624,6 +1716,16 @@ async fn a_start_whose_admission_lapsed_while_it_read_asks_the_broker_for_nothin
         fixture.broker.offers().is_empty(),
         "the broker was asked for nothing"
     );
+    assert_eq!(
+        fixture
+            .broker
+            .halves()
+            .iter()
+            .map(|(half, _)| *half)
+            .collect::<Vec<_>>(),
+        ["begin", "abandon"],
+        "what the provider wrote before the request is given up, and nothing is dispatched"
+    );
     assert!(
         fixture.broker.closed().is_empty(),
         "so there was no call to close"
@@ -1643,6 +1745,7 @@ async fn a_replayed_answer_does_not_become_a_second_grant() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_100,
@@ -1682,6 +1785,7 @@ async fn a_replayed_answer_for_a_call_nothing_holds_is_closed() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_100,
@@ -1726,6 +1830,9 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
             coordinator
                 .start(
                     device(PHONE),
+                    kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                        [9; 16],
+                    )),
                     &params,
                     AuthorityRevision::new(1),
                     10_010,
@@ -1744,6 +1851,7 @@ async fn a_second_start_while_the_first_is_still_waiting_is_told_so() {
     let second = coordinator
         .start(
             device(PHONE),
+            action(9),
             &params,
             AuthorityRevision::new(1),
             10_020,
@@ -1872,6 +1980,9 @@ async fn a_call_created_under_a_grant_that_was_replaced_is_not_kept() {
             coordinator
                 .start(
                     device(PHONE),
+                    kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                        [9; 16],
+                    )),
                     &params,
                     AuthorityRevision::new(1),
                     10_010,
@@ -2130,6 +2241,7 @@ async fn exhausted_capacity_reports_what_still_works() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
@@ -2180,6 +2292,7 @@ async fn a_start_the_broker_refuses_on_the_account_holds_no_call() {
             .coordinator
             .start(
                 device(PHONE),
+                action(9),
                 &start_params_for(&fixture.coordinator).await,
                 AuthorityRevision::new(1),
                 10_000,
@@ -2230,6 +2343,7 @@ async fn every_voice_method_needs_the_voice_grant() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
@@ -2897,6 +3011,7 @@ async fn one_action_identifier_carries_one_delegation() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             11_300,
@@ -2957,6 +3072,7 @@ async fn a_delegation_spent_in_a_call_that_ended_is_not_a_new_action_in_a_later_
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             11_200,
@@ -3473,6 +3589,7 @@ async fn started_over_both(fixture: &Fixture, actions: &[VoiceAction]) -> VoiceS
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &VoiceStartParams {
                 session_ids: both,
                 prepared,
@@ -4329,7 +4446,7 @@ async fn the_terms_a_person_reads_before_a_call_are_the_services_own() {
 #[tokio::test]
 async fn a_host_without_the_services_terms_says_why() {
     async fn prepared(
-        provider: Option<Arc<dyn ManagedVoiceService>>,
+        provider: Option<Arc<dyn VoiceProviderService>>,
     ) -> kr_protocol::voice::VoicePrepareResult {
         let key = AuthorisationKeyPair::generate().expect("a device identity key");
         let authority = Arc::new(Authority::new(
@@ -4366,7 +4483,7 @@ async fn a_host_without_the_services_terms_says_why() {
     assert!(said.starts_with("This host has no voice service"), "{said}");
 
     let own = prepared(Some(
-        Arc::new(OwnBackend::default()) as Arc<dyn ManagedVoiceService>
+        Arc::new(OwnBackend::default()) as Arc<dyn VoiceProviderService>
     ))
     .await;
     assert!(own.managed.0.is_none());
@@ -4375,7 +4492,7 @@ async fn a_host_without_the_services_terms_says_why() {
 
     let silent = Arc::new(ManagedFake::new(Answer::Started));
     *silent.terms_unreachable.lock().expect("the switch") = true;
-    let unread = prepared(Some(silent as Arc<dyn ManagedVoiceService>)).await;
+    let unread = prepared(Some(silent as Arc<dyn VoiceProviderService>)).await;
     assert!(unread.managed.0.is_none());
     let said = unread.managed_unavailable.0.clone().expect("a reason");
     assert!(
@@ -4437,6 +4554,7 @@ async fn a_changed_rate_leaves_nothing_behind_and_carries_the_new_rate() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &start_params_for(&fixture.coordinator).await,
             AuthorityRevision::new(1),
             10_000,
@@ -4515,6 +4633,7 @@ async fn a_session_outside_the_voice_grant_is_neither_described_nor_started() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &VoiceStartParams {
                 session_ids: [session(SESSION_B)].into_iter().collect(),
                 ..start_params()
@@ -4581,6 +4700,7 @@ async fn a_voice_grant_over_no_session_gives_a_call_nothing_to_reach() {
             .coordinator
             .start(
                 device(PHONE),
+                action(9),
                 &VoiceStartParams {
                     session_ids: empty.clone(),
                     ..start_params()
@@ -4689,6 +4809,7 @@ async fn a_start_is_bound_to_the_preparation_the_person_was_shown() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &shown,
             AuthorityRevision::new(1),
             10_020,
@@ -4713,12 +4834,13 @@ async fn a_start_is_bound_to_the_preparation_the_person_was_shown() {
     let reread = start_params_for(&fixture.coordinator).await;
     assert_ne!(reread.prepared, shown.prepared);
     fixture.coordinator.attach_provider(Some(
-        Arc::new(OwnBackend::default()) as Arc<dyn ManagedVoiceService>
+        Arc::new(OwnBackend::default()) as Arc<dyn VoiceProviderService>
     ));
     let refused = fixture
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &reread,
             AuthorityRevision::new(1),
             10_030,
@@ -4741,6 +4863,7 @@ async fn a_start_is_bound_to_the_preparation_the_person_was_shown() {
         .coordinator
         .start(
             device(PHONE),
+            action(9),
             &current,
             AuthorityRevision::new(1),
             10_040,

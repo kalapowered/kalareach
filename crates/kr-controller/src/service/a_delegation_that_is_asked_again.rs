@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use kr_client::services::ServiceFuture;
 use kr_client::services::voice::{
-    ManagedVoiceService, VoiceClosure, VoiceHold, VoiceMetadata, VoiceRateQuote, VoiceSession,
+    VoiceClosure, VoiceHold, VoiceMetadata, VoiceProviderService, VoiceRateQuote, VoiceSession,
     VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
@@ -265,7 +265,7 @@ pub(super) async fn held_before_its_claim(
 #[derive(Debug)]
 struct OfflineProvider;
 
-impl ManagedVoiceService for OfflineProvider {
+impl VoiceProviderService for OfflineProvider {
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
         Box::pin(async move { Ok(None) })
     }
@@ -279,7 +279,22 @@ impl ManagedVoiceService for OfflineProvider {
         "the offline provider".to_owned()
     }
 
-    fn start<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
+    fn begin<'a>(
+        &'a self,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, kr_client::services::StartAttempt> {
+        Box::pin(async { Ok(kr_client::services::StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(&'a self, _attempt: kr_client::services::StartAttempt) -> ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
             Ok(VoiceStart::Started(Box::new(VoiceSession {
                 call_id: "call-1".to_owned(),
@@ -478,7 +493,7 @@ pub(super) async fn call_over_for(
     duration_seconds: u32,
 ) -> VoiceSessionId {
     controller.voice().attach_provider(Some(
-        Arc::new(OfflineProvider) as Arc<dyn ManagedVoiceService>
+        Arc::new(OfflineProvider) as Arc<dyn VoiceProviderService>
     ));
     let coordinator = controller.voice().coordinator();
     let revision = controller.policy().authority_revision();
@@ -510,6 +525,7 @@ pub(super) async fn call_over_for(
     let started = coordinator
         .start(
             device_id,
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
             &VoiceStartParams {
                 session_ids: [session_id].into_iter().collect(),
                 offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),

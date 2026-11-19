@@ -40,7 +40,7 @@ use std::time::Duration;
 use companion_platform::call::{CallId, CallPlatform, Mute};
 use kr_client::pairing::owner::Ceremony;
 use kr_client::services::account::SignedInAccount;
-use kr_client::services::voice::{ManagedVoiceBroker, ManagedVoiceService};
+use kr_client::services::voice::{ManagedVoiceBroker, VoiceProviderService};
 use kr_client::services::voice_control::ControlConnector;
 use kr_client::services::{AccountTokenSource, ServiceHttp};
 use kr_protocol::ids::{ActionId, SessionId, VoiceSessionId};
@@ -128,7 +128,7 @@ pub type BrokerFor = dyn Fn(
         &str,
         Arc<dyn ServiceHttp>,
         Arc<dyn AccountTokenSource>,
-    ) -> std::result::Result<Arc<dyn ManagedVoiceService>, String>
+    ) -> std::result::Result<Arc<dyn VoiceProviderService>, String>
     + Send
     + Sync;
 
@@ -137,7 +137,7 @@ pub type BrokerFor = dyn Fn(
 pub fn managed_brokers() -> Arc<BrokerFor> {
     Arc::new(|origin, http, tokens| {
         ManagedVoiceBroker::new(origin, http, tokens)
-            .map(|broker| Arc::new(broker) as Arc<dyn ManagedVoiceService>)
+            .map(|broker| Arc::new(broker) as Arc<dyn VoiceProviderService>)
             .map_err(|error| error.to_string())
     })
 }
@@ -182,7 +182,7 @@ impl Service {
     pub fn broker(
         &self,
         tokens: Arc<dyn AccountTokenSource>,
-    ) -> std::result::Result<Arc<dyn ManagedVoiceService>, String> {
+    ) -> std::result::Result<Arc<dyn VoiceProviderService>, String> {
         (self.brokers)(&self.origin, Arc::clone(&self.http), tokens)
     }
 
@@ -1097,7 +1097,7 @@ impl Calls {
     pub fn broker(
         &self,
         tokens: Arc<dyn AccountTokenSource>,
-    ) -> Option<Arc<dyn ManagedVoiceService>> {
+    ) -> Option<Arc<dyn VoiceProviderService>> {
         self.shared.as_ref()?.service.broker(tokens).ok()
     }
 

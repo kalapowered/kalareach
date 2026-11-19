@@ -74,7 +74,7 @@ use kr_client::services::account::{
     StoredGrant,
 };
 use kr_client::services::voice::{
-    ManagedVoiceService, VoiceClosure, VoiceMetadata, VoiceSessionRequest, VoiceStart,
+    VoiceClosure, VoiceMetadata, VoiceProviderService, VoiceSessionRequest, VoiceStart,
 };
 use kr_client::services::voice_control::ControlConnector;
 use kr_client::services::{HttpDeadlines, HttpService, managed_response_limits};
@@ -473,17 +473,32 @@ async fn scene_built(
 /// to close and is the managed client for the rest.
 #[derive(Debug)]
 struct ForkBroker {
-    managed: Arc<dyn ManagedVoiceService>,
+    managed: Arc<dyn VoiceProviderService>,
     closed: Arc<Mutex<Vec<String>>>,
 }
 
-impl ManagedVoiceService for ForkBroker {
+impl VoiceProviderService for ForkBroker {
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
         self.managed.metadata()
     }
 
-    fn start<'a>(&'a self, request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
-        self.managed.start(request)
+    fn begin<'a>(
+        &'a self,
+        request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, kr_client::services::StartAttempt> {
+        self.managed.begin(request)
+    }
+
+    fn abandon<'a>(&'a self, attempt: kr_client::services::StartAttempt) -> ServiceFuture<'a, ()> {
+        self.managed.abandon(attempt)
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        attempt: kr_client::services::StartAttempt,
+        request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart> {
+        self.managed.dispatch(attempt, request)
     }
 
     fn close<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, VoiceClosure> {
@@ -3172,7 +3187,7 @@ async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_
                 Ok(Arc::new(ForkBroker {
                     managed: managed_brokers()(origin, http, tokens)?,
                     closed: Arc::clone(&recording),
-                }) as Arc<dyn ManagedVoiceService>)
+                }) as Arc<dyn VoiceProviderService>)
             }))
         },
     )

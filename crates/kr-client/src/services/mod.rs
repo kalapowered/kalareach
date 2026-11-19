@@ -196,9 +196,9 @@ pub use sync::{
     SharedSyncService, SyncComparison, SyncHeldCopy, SyncHeldObject, SyncUsage,
 };
 pub use voice::{
-    ManagedVoiceBroker, ManagedVoiceService, VoiceClosure, VoiceCommand, VoiceContextFrame,
-    VoiceControlEvent, VoiceRefusal, VoiceRefusalReason, VoiceSession, VoiceSessionRequest,
-    VoiceStart,
+    ManagedVoiceBroker, StartAttempt, VoiceClosure, VoiceCommand, VoiceContextFrame,
+    VoiceControlEvent, VoiceProviderService, VoiceRefusal, VoiceRefusalReason, VoiceSession,
+    VoiceSessionRequest, VoiceStart,
 };
 
 /// A boxed future, so every service client stays usable behind a trait object.
@@ -1366,7 +1366,7 @@ pub struct ServiceClients {
     /// The backup manifest, where a host publishes the generations it uploaded.
     pub backup_manifest: Option<std::sync::Arc<dyn BackupManifestService>>,
     /// Managed inference: the voice broker, which is what this product meters inference through.
-    pub managed_inference: Option<std::sync::Arc<dyn ManagedVoiceService>>,
+    pub managed_inference: Option<std::sync::Arc<dyn VoiceProviderService>>,
 }
 
 impl ServiceClients {
@@ -1678,7 +1678,7 @@ impl BackupManifestService for NullService {
     }
 }
 
-impl ManagedVoiceService for NullService {
+impl VoiceProviderService for NullService {
     fn metadata(&self) -> ServiceFuture<'_, Option<voice::VoiceMetadata>> {
         unconfigured(ManagedService::ManagedInference.as_str())
     }
@@ -1687,11 +1687,23 @@ impl ManagedVoiceService for NullService {
         "none".to_owned()
     }
 
-    fn start<'a>(
+    fn begin<'a>(
         &'a self,
+        _request: &'a voice::VoiceSessionRequest,
+    ) -> ServiceFuture<'a, voice::StartAttempt> {
+        unconfigured(ManagedService::ManagedInference.as_str())
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: voice::StartAttempt,
         _request: &'a voice::VoiceSessionRequest,
     ) -> ServiceFuture<'a, voice::VoiceStart> {
         unconfigured(ManagedService::ManagedInference.as_str())
+    }
+
+    fn abandon<'a>(&'a self, _attempt: voice::StartAttempt) -> ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
     }
 
     fn close<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, voice::VoiceClosure> {

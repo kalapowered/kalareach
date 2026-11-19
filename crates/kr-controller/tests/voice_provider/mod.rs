@@ -9,7 +9,7 @@
 
 use kr_client::services::ServiceFuture;
 use kr_client::services::voice::{
-    ManagedVoiceService, VoiceClosure, VoiceHold, VoiceMetadata, VoiceRateQuote, VoiceSession,
+    VoiceClosure, VoiceHold, VoiceMetadata, VoiceProviderService, VoiceRateQuote, VoiceSession,
     VoiceSessionRequest, VoiceStart, VoiceStartLatency,
 };
 
@@ -70,7 +70,7 @@ impl OfflineProvider {
     }
 }
 
-impl ManagedVoiceService for OfflineProvider {
+impl VoiceProviderService for OfflineProvider {
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
         // This stand-in quotes nothing. The test that needs the service's terms scripts the
         // service's own wire instead, so what it proves is what a real answer does.
@@ -86,7 +86,22 @@ impl ManagedVoiceService for OfflineProvider {
         "the offline provider".to_owned()
     }
 
-    fn start<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
+    fn begin<'a>(
+        &'a self,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, kr_client::services::StartAttempt> {
+        Box::pin(async { Ok(kr_client::services::StartAttempt::none()) })
+    }
+
+    fn abandon<'a>(&'a self, _attempt: kr_client::services::StartAttempt) -> ServiceFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn dispatch<'a>(
+        &'a self,
+        _attempt: kr_client::services::StartAttempt,
+        _request: &'a VoiceSessionRequest,
+    ) -> ServiceFuture<'a, VoiceStart> {
         Box::pin(async move {
             if let Some(gate) = &self.gate {
                 gate.reached.notify_one();

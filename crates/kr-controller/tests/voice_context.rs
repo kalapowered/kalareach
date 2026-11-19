@@ -136,6 +136,7 @@ impl World {
             .coordinator()
             .start(
                 device_id,
+                kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
                 &VoiceStartParams {
                     session_ids: [session_id].into_iter().collect(),
                     offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),

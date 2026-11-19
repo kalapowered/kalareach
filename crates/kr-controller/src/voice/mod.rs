@@ -35,7 +35,7 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, AuthorityRevision, DeviceId, EnvironmentId};
 use kr_protocol::method::Method;
 use kr_voice::Coordinator;
-use kr_voice::broker::{ManagedVoiceBroker, ManagedVoiceService, ServiceHttp};
+use kr_voice::broker::{ManagedVoiceBroker, ServiceHttp, VoiceProviderService};
 
 pub use authority::GrantAuthority;
 pub use context::{
@@ -107,7 +107,7 @@ impl VoiceModule {
         facts: Arc<dyn SessionFacts>,
         authority: Arc<GrantAuthority>,
         dispatch: Arc<dyn HostDispatch>,
-        provider: Option<Arc<dyn ManagedVoiceService>>,
+        provider: Option<Arc<dyn VoiceProviderService>>,
         host_device_id: DeviceId,
         environment_id: EnvironmentId,
         broker_origin: String,
@@ -145,7 +145,7 @@ impl VoiceModule {
         origin: &str,
         http: Arc<dyn ServiceHttp>,
         tokens: Arc<dyn kr_client::services::AccountTokenSource>,
-    ) -> std::result::Result<Arc<dyn ManagedVoiceService>, kr_client::ClientError> {
+    ) -> std::result::Result<Arc<dyn VoiceProviderService>, kr_client::ClientError> {
         Ok(Arc::new(ManagedVoiceBroker::new(origin, http, tokens)?))
     }
 
@@ -154,7 +154,7 @@ impl VoiceModule {
     /// A caller with a provider of its own, a backend of the person's own or a stand-in, builds the
     /// service with it here. Nothing above the seam knows which one answered.
     #[must_use]
-    pub fn with_provider(mut self, provider: Option<Arc<dyn ManagedVoiceService>>) -> Self {
+    pub fn with_provider(mut self, provider: Option<Arc<dyn VoiceProviderService>>) -> Self {
         self.coordinator = self.coordinator.with_provider(provider);
         self
     }
@@ -165,7 +165,7 @@ impl VoiceModule {
     /// this is for a provider that document cannot name: a backend of the person's own, or a
     /// stand-in. Until a provider is attached this host brokers no managed call, which is a
     /// complete host and says so.
-    pub fn attach_provider(&self, provider: Option<Arc<dyn ManagedVoiceService>>) {
+    pub fn attach_provider(&self, provider: Option<Arc<dyn VoiceProviderService>>) {
         self.coordinator.attach_provider(provider);
     }
 
@@ -399,6 +399,7 @@ impl VoiceModule {
                         .coordinator
                         .start(
                             device_of(actor)?,
+                            mutation.action_id,
                             &params,
                             authority_revision,
                             now_ms,

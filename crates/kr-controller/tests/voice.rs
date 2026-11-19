@@ -15,7 +15,7 @@ use std::sync::Arc;
 use kr_client::services::ServiceFuture;
 use kr_client::services::account::{AccountToken, AccountTokenSource};
 use kr_client::services::voice::{
-    ManagedVoiceBroker, ManagedVoiceService, ServiceHeader, ServiceHttp, ServiceHttpAnswer,
+    ManagedVoiceBroker, ServiceHeader, ServiceHttp, ServiceHttpAnswer, VoiceProviderService,
 };
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -249,6 +249,7 @@ impl Host {
             .coordinator()
             .start(
                 self.device_id,
+                kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
                 &VoiceStartParams {
                     session_ids: [self.session_id].into_iter().collect(),
                     offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
@@ -476,6 +477,7 @@ async fn voice_needs_a_paired_device_and_a_voice_grant() {
         .coordinator()
         .start(
             host.device_id,
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
             &VoiceStartParams {
                 session_ids: [host.session_id].into_iter().collect(),
                 offer_sdp: "v=0\r\n".to_owned(),
@@ -1244,7 +1246,7 @@ async fn a_paired_device_reaches_voice_over_its_own_connection() {
     let broker = Arc::new(OfflineProvider::default());
     host.controller()
         .voice()
-        .attach_provider(Some(Arc::clone(&broker) as Arc<dyn ManagedVoiceService>));
+        .attach_provider(Some(Arc::clone(&broker) as Arc<dyn VoiceProviderService>));
     let session_id = SessionId::new(kr_ipc::new_uuid());
 
     // Without a voice grant, the registry's own requirement refuses the call before the
@@ -1458,7 +1460,7 @@ async fn a_stop_with_a_close_on_its_way_is_answered_on_the_link_that_sent_it() {
     .await;
     let environment_id = host.environment_id;
     host.controller().voice().attach_provider(Some(
-        Arc::new(OfflineProvider::default()) as Arc<dyn ManagedVoiceService>
+        Arc::new(OfflineProvider::default()) as Arc<dyn VoiceProviderService>
     ));
     let session_id = SessionId::new(kr_ipc::new_uuid());
     let device_id = host
@@ -1564,7 +1566,7 @@ async fn a_stop_for_a_voice_session_the_host_does_not_hold_is_refused_as_unknown
     .await;
     let environment_id = host.environment_id;
     host.controller().voice().attach_provider(Some(
-        Arc::new(OfflineProvider::default()) as Arc<dyn ManagedVoiceService>
+        Arc::new(OfflineProvider::default()) as Arc<dyn VoiceProviderService>
     ));
     let session_id = SessionId::new(kr_ipc::new_uuid());
     let device_id = host
@@ -1833,7 +1835,7 @@ async fn a_voice_start_that_waited_writes_nothing_once_a_fence_is_owed() {
     let broker = Arc::new(OfflineProvider::holding());
     host.controller()
         .voice()
-        .attach_provider(Some(Arc::clone(&broker) as Arc<dyn ManagedVoiceService>));
+        .attach_provider(Some(Arc::clone(&broker) as Arc<dyn VoiceProviderService>));
     let device_id = host
         .controller()
         .devices()
@@ -2139,7 +2141,7 @@ impl RawVoice {
         raw.claim();
         host.controller()
             .voice()
-            .attach_provider(Some(broker as Arc<dyn ManagedVoiceService>));
+            .attach_provider(Some(broker as Arc<dyn VoiceProviderService>));
         let session_id = SessionId::new(kr_ipc::new_uuid());
         let target = ActionTarget::environment(host.environment_id);
         raw.mutate(
@@ -2203,7 +2205,7 @@ impl RawVoice {
         let host = host.restart().await;
         host.controller()
             .voice()
-            .attach_provider(Some(broker as Arc<dyn ManagedVoiceService>));
+            .attach_provider(Some(broker as Arc<dyn VoiceProviderService>));
         let raw = net_support::RawDevice::connect(&host, &device, &record).await;
         raw.claim();
         Self {
@@ -3238,7 +3240,7 @@ async fn a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate
     .expect("a broker client");
     host.controller()
         .voice()
-        .attach_provider(Some(Arc::new(broker) as Arc<dyn ManagedVoiceService>));
+        .attach_provider(Some(Arc::new(broker) as Arc<dyn VoiceProviderService>));
 
     let device_id = host
         .controller()

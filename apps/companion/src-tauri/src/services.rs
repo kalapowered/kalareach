@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use kr_client::services::voice::ManagedVoiceService;
+use kr_client::services::voice::VoiceProviderService;
 use kr_client::services::{
     AccountService, AccountTokenSource, HttpDeadlines, HttpService, ManagedService,
     ManagedSyncService, PushService, ServiceClients, ServiceSigner, SharedSyncService,
@@ -133,7 +133,7 @@ pub struct Held {
     /// The client of the push gateway this phone talks to.
     pub push: Option<Arc<dyn PushService>>,
     /// The client of the voice service's broker.
-    pub inference: Option<Arc<dyn ManagedVoiceService>>,
+    pub inference: Option<Arc<dyn VoiceProviderService>>,
 }
 
 impl Held {
