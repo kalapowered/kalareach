@@ -7910,24 +7910,31 @@ the client's. A client that does not replace an action by itself is what keeps t
 Reading what the earlier action did is a repeat of it, which carries the request: no read names a
 share's claim, since no record of one holds the method it was made under.
 
-A `voice.start` under a fresh action is refused with `DRAFT_CONFLICT` while an earlier start from the
-same paired device may still have a call running. Before the host asks the managed voice service for
+A `voice.start` under a fresh action is refused with `DRAFT_CONFLICT`, after the checks that come
+before the hold, while an earlier start from the same paired device may still have a call running
+that this host cannot account for. Before the host asks the managed voice service for
 a call, it writes one row for the device to `voice-start-holds.sqlite3`, beside the other stores: the
 action, the moment it read the start, and the moment the hold ends. The row survives a restart.
 
 While the row stands, an unnamed start, or one that names another action, is refused in words that
 name the standing action and say when the hold ends by this host's clock. The host keeps the refusal
-as that action's answer, so a repeat of it gets the same refusal and asks the service nothing. A
-start that names the standing action in `supersedes_action_id` is admitted and replaces the row. If
-the host cannot write the row, it refuses the start with `STORAGE_UNAVAILABLE`, in its own words, and
-asks the service nothing.
+as that action's answer, so a repeat of it gets the same refusal and asks the service nothing; if the
+host cannot keep the refusal, a repeat is answered as an outcome that is not known. A start that
+names the standing action in `supersedes_action_id` passes this check and replaces the row; the
+other admission checks still apply. If the host cannot write the row, or the standing row names an
+action it cannot read, it refuses the start with `STORAGE_UNAVAILABLE`, in its own words, and asks
+the service nothing.
 
 The row ends when two things have happened, in either order: the start's effect shows that no call of
 it can still be running unreconciled, and the claim the start answers under has settled. The effect
 shows that when the service was not asked, refused the start, or created nothing; when the call is
 bound to a voice session; when a live session already holds it; or when this host closed it and the
 service confirmed the close. The row stays when the outcome may have been carried out and is not
-known, when the service did not confirm a close, and when the answer could not be kept.
+known, when the service did not confirm a close, when the result could not be kept, when the row
+could not be deleted, and when the task that held the start was dropped; it then ends at its bound
+or when a start names it. A refusal that the host could not keep does not keep the row. An answer
+the host cannot read leaves no row, except a 502 or 504 from a gateway: the request may still have
+reached the service, so the row stays.
 
 The hold has a bound: the call's length (at most 1,800 seconds, the service's maximum) plus 120
 seconds. Those 120 seconds are the 30 seconds a start may wait before its request is written, the 50
@@ -7935,8 +7942,10 @@ seconds the exchange may take, and 40 seconds for the difference between this ho
 service's. The bound does not cover a creation the service itself lost, or a request the network
 delivers after the host stopped waiting. The 30 seconds are enforced: the broker client reads them on
 the continuous clock, after the account token and the transport are ready and immediately before it
-writes the request. A start that has run out of them sends nothing and is refused
-`UPSTREAM_UNAVAILABLE`. A suspend during the connection itself can still delay the write.
+starts the exchange. A start that has run out of them sends nothing and is refused
+`UPSTREAM_UNAVAILABLE`. The exchange can connect up to twice inside the 50 seconds, so the write can
+come after the 30 seconds; the bound still holds. A suspend during the connection itself can also
+delay the write.
 
 The times are on the host's settled clock. A forward step of the wall clock ends a hold early; a
 backward step lengthens it in real time, because the settled clock does not move back. An earlier
