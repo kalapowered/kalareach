@@ -1555,10 +1555,12 @@ function Composer({
   const typed = draft.text.startsWith('/') ? draft.text.slice(1).toLowerCase() : null
   const offered =
     typed === null ? [] : commands.filter((command) => command.name.toLowerCase().startsWith(typed))
-  // The draft's own reason comes first: a detached, conflicted or empty draft says so whatever the
-  // agent offers. Then why the agent will not take one as it stands.
-  const reason =
-    held ?? notSubmittableBecause(draft) ?? (offers.submit.offered ? null : offers.submit.reason)
+  // Why the agent cannot take a message at all comes first, for every draft, an empty one included.
+  // The draft's own reason follows it: a detached, conflicted or empty draft says so.
+  const reasons = [offers.submit.offered ? null : offers.submit.reason, notSubmittableBecause(draft)].filter(
+    (each): each is string => each !== null
+  )
+  const reason = held ?? (reasons.length > 0 ? reasons.join(' ') : null)
   const canSubmit = offers.submit.offered && submittable(draft) && connected && held === null
   const canWrite = submittable(draft) && connected && held === null
   // The one way past the hold on an unconfirmed action: the person says they checked it.
