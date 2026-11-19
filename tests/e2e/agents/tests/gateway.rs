@@ -790,7 +790,8 @@ impl Real {
     /// newer build, with its own configuration directory and no login, by the file recorded for it,
     /// and for each the answer's lines and whether it holds what the pinned entry expects of the
     /// pinned build. Nothing is judged here: the lines are what the entry's set for the newer build
-    /// is written from, after both reviewers read them against the isolation criteria.
+    /// is written from, once they are read against the isolation criteria (no server, each listed
+    /// feature off, the read-only sandbox, no skills section, only the exec tools).
     fn records_the_newer_probes(
         &self,
         run: &Run,
