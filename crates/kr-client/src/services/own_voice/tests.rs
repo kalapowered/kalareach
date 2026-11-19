@@ -1428,6 +1428,11 @@ async fn a_closure_behind_more_than_256_messages_is_read_before_the_channel_is_l
         SidebandState::Closed(SidebandEnd::ProviderClosed),
         "the closure behind 300 messages was read"
     );
+    assert_eq!(
+        world.stand_in.recorded().attaches_asked,
+        1,
+        "the closure behind 300 messages is read where the channel was lost, before a new channel is asked for"
+    );
     assert!(
         world.stand_in.recorded().hangups.is_empty(),
         "a closure the provider told is not hung up"
