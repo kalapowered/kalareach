@@ -9,6 +9,9 @@ with a runtime and a state directory of its own under a directory of this script
 prints a marker and then waits, and `kr attach` runs in a terminal of this script's making. The
 marker has to reach that terminal, which is the session's screen put on it by the attach. Every
 process this starts it ends by its own number, and that directory is removed.
+
+On macOS this script needs KR_ALLOW_ACCOUNT_LAUNCHD=1: it starts a daemon and sessions, which load jobs
+into the account's own launchd, and it refuses to start without it.
 """
 
 import fcntl
@@ -28,7 +31,18 @@ import time
 MARKER = "KR-ATTACH-MARKER"
 
 
+def require_account_launchd(platform, value):
+    """Refuses a Mac run that did not ask for the account's own launchd: only exactly 1 asks."""
+    if platform == "darwin" and value != "1":
+        raise SystemExit(
+            "e2e-update-attach.py starts a daemon and sessions, which load jobs into the account's own "
+            "launchd, and this run did not ask for it: set KR_ALLOW_ACCOUNT_LAUNCHD=1 where that "
+            "account is a test account or a hosted runner's"
+        )
+
+
 def main(programs):
+    require_account_launchd(sys.platform, os.environ.get("KR_ALLOW_ACCOUNT_LAUNCHD"))
     # A short path under /tmp: the daemon's socket lives in the runtime directory, and a socket's path
     # is held to about a hundred characters.
     run = os.path.realpath(tempfile.mkdtemp(prefix="kr-at-", dir="/tmp"))

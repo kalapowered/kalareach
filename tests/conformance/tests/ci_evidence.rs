@@ -1202,24 +1202,80 @@ fn the_linux_runs_of_the_workspace_tests_require_a_user_service_manager() {
     );
 }
 
+/// The names of the jobs of a workflow, in the order they are written.
+fn job_names(workflow: &str) -> Vec<String> {
+    let mut in_jobs = false;
+    let mut names = Vec::new();
+    for line in workflow.lines() {
+        if line == "jobs:" {
+            in_jobs = true;
+        } else if in_jobs
+            && line.starts_with("  ")
+            && !line.starts_with("   ")
+            && !line.trim_start().starts_with('#')
+            && without_comment(line).ends_with(':')
+        {
+            names.push(
+                without_comment(line)
+                    .trim()
+                    .trim_end_matches(':')
+                    .to_owned(),
+            );
+        }
+    }
+    names
+}
+
 /// The tests that start a daemon through the user's service manager load jobs into the account's
-/// own launchd on macOS, and stand down, and pass, in a run that does not set
-/// `KR_ALLOW_ACCOUNT_LAUNCHD`, as a person's own Mac does. The macOS runs that report on the
-/// workspace's tests set it, so that those tests run on the runner whose account is for the run
-/// alone and are not reported as passed without having run.
+/// own launchd on macOS, and stand down, or run detached, in a run that does not set
+/// `KR_ALLOW_ACCOUNT_LAUNCHD`, as a person's own Mac does. Every macOS job of the landing workflow
+/// that runs the workspace's tests, the end-to-end demonstrations or the performance measurements
+/// sets it for the whole job, and so does the macOS job of the conformance workflow, so that those
+/// runs happen on the runner whose account is for the run alone and are not reported as passed
+/// without having run.
 #[test]
 fn the_macos_runs_of_the_workspace_tests_ask_for_the_accounts_launchd() {
     let variable = "KR_ALLOW_ACCOUNT_LAUNCHD: \"1\"";
     let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
         .expect("the landing workflow");
-    let tests = steps_running(&job(&landing, "macos"), "cargo test --locked --workspace");
-    assert!(
-        tests
-            .iter()
-            .all(|step| step.lines().any(|line| line.trim() == variable)),
-        "a step of the landing workflow's macos job that runs the workspace's tests does not ask \
-         for the account's own launchd"
-    );
+    let asking: Vec<String> = job_names(&landing)
+        .into_iter()
+        .filter(|name| {
+            let text = job(&landing, name);
+            header(&text)
+                .lines()
+                .any(|line| line.trim().starts_with("runs-on: macos"))
+                && steps_of(&text).iter().any(|step| {
+                    step.lines().any(|line| {
+                        [
+                            "cargo test --locked --workspace",
+                            "scripts/end-to-end.sh",
+                            "scripts/performance.sh",
+                        ]
+                        .iter()
+                        .any(|tool| starts(line, tool))
+                    })
+                })
+        })
+        .collect();
+    // A selection that finds nothing would pass for every job: the two jobs that exist are named.
+    for name in ["macos", "macos-reference"] {
+        assert!(
+            asking.iter().any(|found| found == name),
+            "the {name} job of the landing workflow is no macOS job that runs the workspace's tests, \
+             the demonstrations or the measurements; found {asking:?}"
+        );
+    }
+    for name in &asking {
+        assert!(
+            header(&job(&landing, name))
+                .lines()
+                .any(|line| line.trim() == variable),
+            "the {name} job of the landing workflow runs the workspace's tests, the end-to-end \
+             demonstrations or the measurements on macOS and does not ask for the account's own \
+             launchd in its own environment"
+        );
+    }
     let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
         .expect("the conformance workflow");
     // Among the job's own keys, in its environment ahead of its steps, so that every step that runs

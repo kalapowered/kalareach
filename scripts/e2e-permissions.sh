@@ -26,6 +26,7 @@
 # Nothing the person at this machine owns is touched. No check sends input to an application, none
 # changes user data, and the one check that would do either is not run. Every process this script
 # ends is one it started, by the identifier it recorded.
+# On macOS this script needs KR_ALLOW_ACCOUNT_LAUNCHD=1: it starts a daemon and sessions, which load jobs into the account's own launchd, and it refuses to start without it.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -41,6 +42,9 @@ fi
 
 # shellcheck source=scripts/lib/artifacts-dir.sh
 . "$root/scripts/lib/artifacts-dir.sh"
+# shellcheck source=scripts/lib/account-launchd.sh
+. "$root/scripts/lib/account-launchd.sh"
+require_account_launchd "$(uname -s)"
 kr_artifacts_dir
 artefacts="$kr_artifacts/permissions"
 mkdir -p "$artefacts"

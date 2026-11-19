@@ -27,9 +27,13 @@
 #
 # The demonstrations need a person's graphical login session, so this runs on a Mac at its console.
 # Every path it uses is on the internal disk.
+# On macOS this script needs KR_ALLOW_ACCOUNT_LAUNCHD=1: it starts a daemon and sessions, which load jobs into the account's own launchd, and it refuses to start without it.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/account-launchd.sh
+. "$root/scripts/lib/account-launchd.sh"
+require_account_launchd "$(uname -s)"
 
 first=""
 second=""

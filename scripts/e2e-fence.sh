@@ -22,6 +22,7 @@
 #
 # Nothing here reaches the person's own credential store: the daemon is given `--secret-store
 # file`, so the keys a run creates leave with the run.
+# On macOS this script needs KR_ALLOW_ACCOUNT_LAUNCHD=1: it starts a daemon and sessions, which load jobs into the account's own launchd, and it refuses to start without it.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,6 +38,9 @@ fi
 
 # shellcheck source=scripts/lib/artifacts-dir.sh
 . "$root/scripts/lib/artifacts-dir.sh"
+# shellcheck source=scripts/lib/account-launchd.sh
+. "$root/scripts/lib/account-launchd.sh"
+require_account_launchd "$(uname -s)"
 kr_artifacts_dir
 artifacts="$kr_artifacts"
 mkdir -p "$artifacts"
