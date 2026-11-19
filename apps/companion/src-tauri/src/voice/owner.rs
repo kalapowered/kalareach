@@ -57,7 +57,7 @@ use kr_protocol::voice::{
     VoiceDelegationId, VoiceDelegationOutcome, VoiceSessionControl, VoiceSessionDescriptor,
     VoiceStartOutcome, VoiceStartParams, VoiceStartResult,
 };
-use kr_protocol::voice_host::{VoiceContextState, VoiceNote};
+use kr_protocol::voice_host::{VoiceContextState, VoiceEndReason, VoiceNote};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
@@ -187,6 +187,15 @@ enum Opened {
 }
 
 impl Opened {
+    /// Whether this tells of the opening anything that the host's news of its send, when the news
+    /// has finished or stopped the send, did not. A reply that failed and a call that ended before
+    /// the reply came say only that the reply is missing: the progress the news gave governs them as
+    /// it governs a reply that came late.
+    fn applies_after(&self, send: Option<&ContextSend>) -> bool {
+        let reply_missing = matches!(self, Self::Cut | Self::HostRefused | Self::HostUnanswered);
+        !(reply_missing && send.is_some_and(ContextSend::is_over))
+    }
+
     /// What giving the context came to, from what the control sent of it.
     fn of(sent: &OpeningContextSent) -> Self {
         let Some(stopped_by) = &sent.stopped_by else {
@@ -1974,6 +1983,10 @@ impl Owner {
     /// after it.
     fn note_the_opening(&mut self, opened: &Opened) {
         self.opening = None;
+        // A send the host's news has finished or stopped stands as the news left it.
+        if !opened.applies_after(self.context.as_ref()) {
+            return;
+        }
         match opened {
             Opened::Queued(queued) => {
                 if let Some(send) = self
@@ -2872,11 +2885,9 @@ impl Owner {
         // call the host controls is closed through the host whichever was asked for.
         let own_key_call = self.descriptor.as_ref().is_some_and(is_host_controlled);
         let needs_broker = self.descriptor.is_some() && !own_key_call;
-        // The host that ended the call itself closed it, and a call the host lost is left to it.
-        let host_ended = matches!(cause, Cause::Host(HostEnding::Reason(_)));
+        // A call the host lost is left to it, and so is a call that the host did not say it closed.
         let host_lost = matches!(cause, Cause::Host(HostEnding::NotKnown(_)));
-        let left_to_host =
-            own_key_call && !host_ended && (host_lost || !host_end.closes_the_call());
+        let left_to_host = own_key_call && (host_lost || !host_closed_the_call(&cause, &host_end));
         // A request written to the host and not answered may have been carried out, and the aftermath
         // never says nothing was done.
         let unsettled = shows_requests_unsettled(
@@ -3131,6 +3142,21 @@ fn provider_for(control: &VoiceSessionControl) -> CallProvider {
     match control {
         VoiceSessionControl::Host { .. } => CallProvider::OwnKey,
         VoiceSessionControl::Broker { .. } => CallProvider::Managed,
+    }
+}
+
+/// Whether the end of a call on the host's own key says that the host closed the call at the
+/// provider. A host that ended the call for a reason closed it, but not one that lost the provider's
+/// side channel and could not restore it: it could not confirm the closure either, and only its
+/// answer to the stop, with the provider's confirmation, says that it has since closed the call.
+/// Any other end is read by the host's answer to the stop.
+fn host_closed_the_call(cause: &Cause, host_end: &HostEnd) -> bool {
+    match cause {
+        Cause::Host(HostEnding::Reason(VoiceEndReason::SidebandLost)) => {
+            host_end.confirms_closure()
+        }
+        Cause::Host(HostEnding::Reason(_)) => true,
+        _ => host_end.closes_the_call(),
     }
 }
 
@@ -3807,6 +3833,102 @@ mod tests {
             commands.send(Cmd::Stop(late)).await.is_err(),
             "a command sent after the end is turned away"
         );
+    }
+
+    /// A host that ended a call for a reason closed it, but not one that lost the provider's side
+    /// channel and could not restore it: that end says nothing of a closure, and only the provider's
+    /// confirmation in the host's answer to the stop does. Any other end is read by the answer,
+    /// where a host that holds no such call is read as having closed it.
+    #[test]
+    fn a_lost_side_channel_is_a_closed_call_only_when_the_provider_confirms_it() {
+        let revoked = |broker_notified| HostEnd::Revoked {
+            fence: crate::commands::VoiceFence::NotOwed,
+            broker_notified,
+        };
+        let not_held = HostEnd::NotHeld {
+            words: String::new(),
+        };
+        let lost = Cause::Host(HostEnding::Reason(VoiceEndReason::SidebandLost));
+        assert!(host_closed_the_call(&lost, &revoked(true)));
+        assert!(!host_closed_the_call(&lost, &revoked(false)));
+        assert!(
+            !host_closed_the_call(&lost, &not_held),
+            "a host that holds no such call after it lost the channel did not say it closed it"
+        );
+        assert!(!host_closed_the_call(&lost, &HostEnd::NotNeeded));
+        for reason in [
+            VoiceEndReason::Stop,
+            VoiceEndReason::Deadline,
+            VoiceEndReason::Revocation,
+            VoiceEndReason::ProviderClosed,
+            VoiceEndReason::Silence,
+            VoiceEndReason::CredentialRemoved,
+        ] {
+            let ended = Cause::Host(HostEnding::Reason(reason));
+            assert!(host_closed_the_call(&ended, &revoked(false)), "{reason:?}");
+            assert!(host_closed_the_call(&ended, &not_held), "{reason:?}");
+        }
+        // Any other end is read by the answer.
+        assert!(host_closed_the_call(&Cause::Requested, &not_held));
+        assert!(host_closed_the_call(&Cause::Requested, &revoked(true)));
+        assert!(!host_closed_the_call(&Cause::Requested, &revoked(false)));
+    }
+
+    /// The host's news of its send governs a reply that failed and a call that ended before the
+    /// reply came, as it governs a reply that came late: a send that is done or stopped is not
+    /// restored to a problem, and its stopped notice is not replaced.
+    #[test]
+    fn a_failed_reply_or_an_end_before_the_reply_does_not_undo_the_news_of_a_finished_send() {
+        let id = ActionId::new(kr_ipc::new_uuid());
+        let missing = [Opened::HostUnanswered, Opened::HostRefused, Opened::Cut];
+        let mut send = ContextSend::begun(id);
+        // Nothing of the send is known yet: what is missing from the reply is a problem.
+        for (at, opened) in missing.iter().enumerate() {
+            assert!(opened.applies_after(Some(&send)), "missing {at}");
+        }
+        assert!(Opened::HostUnanswered.applies_after(None));
+        send.news(id, 2, 5, 0, VoiceContextState::Sending);
+        for (at, opened) in missing.iter().enumerate() {
+            assert!(
+                opened.applies_after(Some(&send)),
+                "missing {at} while sending"
+            );
+        }
+        // Done, then a time-out of the reply, a refusal of it, or the call's end before it.
+        send.news(id, 5, 5, 0, VoiceContextState::Done);
+        for (at, opened) in missing.iter().enumerate() {
+            assert!(
+                !opened.applies_after(Some(&send)),
+                "missing {at} after done"
+            );
+        }
+        // Stopped, then the same.
+        let mut stopped = ContextSend::begun(id);
+        stopped.news(
+            id,
+            1,
+            5,
+            1,
+            VoiceContextState::Stopped {
+                stopped_by: kr_protocol::voice_host::VoiceContextStop::SidebandLost,
+            },
+        );
+        for (at, opened) in missing.iter().enumerate() {
+            assert!(
+                !opened.applies_after(Some(&stopped)),
+                "missing {at} after stopped"
+            );
+        }
+        // What the news itself brings still applies.
+        assert!(
+            Opened::HostStopped {
+                appended: 1,
+                of: 5,
+                unconfirmed: true
+            }
+            .applies_after(Some(&stopped))
+        );
+        assert!(Opened::Given.applies_after(Some(&send)));
     }
 
     /// A setup clause is ended by a full stop where another sentence follows it, and only there:

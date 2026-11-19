@@ -267,18 +267,28 @@ impl HostEnd {
     }
 
     /// Whether the host's answer says the call is closed at its provider: it revoked the grant and
-    /// the provider confirmed the closure, or it holds no call of this device by that name, so its
-    /// own end closed it. A revoked grant is not a closed call: the host may have revoked the grant
-    /// and not been able to confirm the provider's closure, and the call is then left to the host.
+    /// the provider confirmed the closure. A revoked grant alone is not a closed call, and neither
+    /// is a host that holds no such call: the host takes a call out of its list before it closes the
+    /// call at the provider, so after a hang-up the provider did not confirm it holds no call of this
+    /// device by that name and the call can still run on its owner's account.
     #[must_use]
-    pub const fn closes_the_call(&self) -> bool {
+    pub const fn confirms_closure(&self) -> bool {
         matches!(
             self,
             Self::Revoked {
                 broker_notified: true,
                 ..
-            } | Self::NotHeld { .. }
+            }
         )
+    }
+
+    /// Whether the host's answer to the stop that ends a call leaves nothing for the host to close:
+    /// it confirmed the closure, or it holds no call of this device by that name, which at the end
+    /// of a call is read as the host's own end of it. A call that was left to the host is settled
+    /// by `confirms_closure` alone.
+    #[must_use]
+    pub const fn closes_the_call(&self) -> bool {
+        self.confirms_closure() || matches!(self, Self::NotHeld { .. })
     }
 }
 
@@ -523,8 +533,9 @@ mod tests {
         assert_eq!(kinds, [OwedView::HOST_CLOSE, "revocation"], "{kinds:?}");
     }
 
-    /// The host's answer to a stop says the call is closed only when the provider confirmed it or
-    /// the host holds no such call: a revoked grant with the closure unconfirmed does not.
+    /// The host's answer to the stop that ends a call says the call is closed when the provider
+    /// confirmed it or the host holds no such call: a revoked grant with the closure unconfirmed does
+    /// not. A call left to the host is settled by the provider's confirmation alone.
     #[test]
     fn a_revoked_grant_is_a_closed_call_only_when_the_provider_confirmed_it() {
         let revoked = |broker_notified| HostEnd::Revoked {
@@ -534,11 +545,20 @@ mod tests {
         assert!(revoked(true).closes_the_call());
         assert!(!revoked(false).closes_the_call());
         assert!(revoked(false).settles(), "the grant is gone either way");
+        assert!(revoked(true).confirms_closure());
+        assert!(!revoked(false).confirms_closure());
         assert!(
             HostEnd::NotHeld {
                 words: String::new()
             }
             .closes_the_call()
+        );
+        assert!(
+            !HostEnd::NotHeld {
+                words: String::new()
+            }
+            .confirms_closure(),
+            "a host that holds no such call has not said that the provider closed it"
         );
         assert!(
             !HostEnd::Refused {

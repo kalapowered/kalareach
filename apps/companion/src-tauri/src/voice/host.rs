@@ -24,6 +24,7 @@ use tauri::{AppHandle, Manager as _, Runtime};
 use tokio::time::Instant;
 
 use super::delegation::{Cause, usable};
+use super::host_control::Settling;
 use super::view::HostEnd;
 use crate::commands::{MUTATION_TTL, NoPreconditions, fence_of};
 use crate::connection::{Connection, Standing, Unopened};
@@ -204,14 +205,35 @@ pub async fn revoke(
     within: Duration,
 ) -> HostEnd {
     let params = kr_protocol::voice::VoiceStopParams { voice_session_id };
-    let asking = session.mutate(
-        Method::VoiceStop,
-        ActionTarget::environment(environment_id),
-        None,
-        &NoPreconditions {},
-        &params,
-        MUTATION_TTL,
-    );
+    // Each stop is an action of its own, under an identity this function owns: one that is dropped
+    // when the host does not answer in time is settled, so that stops asked again and again of a
+    // host that does not answer leave nothing unresolved on the connection.
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let composed = match session
+        .compose(
+            Method::VoiceStop,
+            action_id,
+            ActionTarget::environment(environment_id),
+            None,
+            &NoPreconditions {},
+            &params,
+            MUTATION_TTL,
+        )
+        .await
+    {
+        Ok(composed) => composed,
+        Err(error) => {
+            return HostEnd::NotTold {
+                words: error.to_string(),
+            };
+        }
+    };
+    let mut settling = Settling::new(Arc::clone(session), action_id);
+    let asking = async {
+        let sent = session.send(&composed).await;
+        settling.settle().await;
+        sent
+    };
     match tokio::time::timeout(within, asking).await {
         Err(_) => HostEnd::NotTold {
             words: format!(

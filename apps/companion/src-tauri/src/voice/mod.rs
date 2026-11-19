@@ -362,6 +362,10 @@ pub(crate) struct Shared {
     /// files, and a file it cannot read is not one that holds nothing: the view says nothing is
     /// owed only until the file can be read, and nothing is written over the file meanwhile.
     unread: std::sync::atomic::AtomicBool,
+    /// The hosts that accepted a start while the file could not be read: the calls this device left
+    /// to them are closed, and the file's records of them are dropped when it is read.
+    closed_by_start:
+        Mutex<Vec<Option<(kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId)>>>,
     /// Whether the note was remembered or forgotten since the read that failed, so that what is
     /// read later is older than the note and does not replace it.
     note_changed: std::sync::atomic::AtomicBool,
@@ -599,10 +603,23 @@ impl Shared {
             return Some(false);
         }
         let now = now_ms();
-        let Ok(before) = self.kept.read(now) else {
+        let Ok(mut before) = self.kept.read(now) else {
             return None;
         };
         let mut changed = false;
+        // A host that accepted a start while the file could not be read closed the calls left to
+        // it: what the file holds of them is not owed.
+        let closed = std::mem::take(
+            &mut *self
+                .closed_by_start
+                .lock()
+                .expect("the closed record is not poisoned"),
+        );
+        let held = before.owed.len();
+        before
+            .owed
+            .retain(|owed| owed.kind != OwedView::HOST_CLOSE || !closed.contains(&owed.host));
+        changed |= before.owed.len() != held;
         {
             let mut view = self.view.lock().expect("the view lock is not poisoned");
             let since = std::mem::take(&mut view.owed);
@@ -754,8 +771,10 @@ impl Shared {
 
     /// Takes what the host's answer to a stop settles out of what is owed for that call: the
     /// revocation, when the host revoked the grant or holds no such call, and the call left to the
-    /// host, when the host says the call is closed. Only an entry owed to that host and environment
-    /// goes: another host's answer says nothing of what a different host holds.
+    /// host, only when the host revoked the grant and the provider confirmed the closure. A host that
+    /// holds no such call has not said that: it takes a call out of its list before it closes it at
+    /// the provider. Only an entry owed to that host and environment goes: another host's answer says
+    /// nothing of what a different host holds.
     fn settled(
         &self,
         host: kr_protocol::ids::DeviceId,
@@ -772,7 +791,7 @@ impl Shared {
                     && owed.host == Some((host, environment));
                 let settled = match owed.kind.as_str() {
                     "revocation" => answer.settles(),
-                    OwedView::HOST_CLOSE => answer.closes_the_call(),
+                    OwedView::HOST_CLOSE => answer.confirms_closure(),
                     _ => false,
                 };
                 !(this_call && settled)
@@ -785,9 +804,32 @@ impl Shared {
     }
 
     /// Takes the calls left to `host` out of what is owed, because the host has made a call on its
-    /// own key: it makes none while it holds another, so the calls before it are closed.
+    /// own key: it makes none while it holds another, so the calls before it are closed. What the
+    /// file holds is read first when it can be, so that it is cleared too; when it cannot be read
+    /// yet, the host's word is kept, and the file's records of these calls are dropped when it is.
     pub(crate) fn left_calls_are_closed(&self, host: &CallHost) {
-        let pair = Some((host.paired.host_device_id, host.environment_id));
+        self.close_calls_left_to(Some((host.paired.host_device_id, host.environment_id)));
+    }
+
+    /// Takes the calls left to the host `pair` names out of what is owed, as
+    /// [`Self::left_calls_are_closed`] does.
+    fn close_calls_left_to(
+        &self,
+        pair: Option<(kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId)>,
+    ) {
+        self.read_again();
+        {
+            let _ordered = self
+                .keeping
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.unread.load(std::sync::atomic::Ordering::SeqCst) {
+                self.closed_by_start
+                    .lock()
+                    .expect("the closed record is not poisoned")
+                    .push(pair);
+            }
+        }
         let removed = {
             let mut view = self.view.lock().expect("the view lock is not poisoned");
             let before = view.owed.len();
@@ -1256,6 +1298,7 @@ impl Calls {
                 emergency: Mutex::new(None),
                 kept,
                 unread: std::sync::atomic::AtomicBool::new(unread),
+                closed_by_start: Mutex::new(Vec::new()),
                 note_changed: std::sync::atomic::AtomicBool::new(false),
                 keeping: Mutex::new(()),
                 standing: Mutex::new(None),
@@ -1464,9 +1507,10 @@ impl Calls {
     /// not lapsed, and each call left to it, goes to the host as a stop again. That the host revoked
     /// the grant, or holds no such call, settles a revocation; any other refusal, or no answer,
     /// leaves it owed until the grant lapses, because such a refusal does not say the grant is gone.
-    /// A call left to the host is settled only by an answer that says it is closed: a revoked grant
-    /// the provider did not confirm closing leaves it owed. It runs on a task of its own and the
-    /// screen does not wait for it.
+    /// A call left to the host is settled only by the provider's confirmation of the closure, which
+    /// the host's answer to the stop carries, or by a start the host accepts: a revoked grant the
+    /// provider did not confirm closing leaves it owed, and so does a host that holds no such call.
+    /// It runs on a task of its own and the screen does not wait for it.
     pub fn host_reached(
         &self,
         host: kr_protocol::ids::DeviceId,
@@ -1498,7 +1542,7 @@ impl Calls {
             })
             .collect();
         // One question for each voice session: two entries for one call (a crash between two
-        // writes can leave them) are one thing owed, and one answer settles both.
+        // writes can leave them) are one thing owed, and one answer is read for both.
         let mut owed = owed;
         // A call left to the host is asked whenever it stands, and whether the grant has lapsed
         // does not matter to it; so is a call that has both entries, asked once.
@@ -1843,6 +1887,99 @@ mod tests {
         let view = shared.view.lock().expect("the view lock");
         assert_eq!(view.owner, 9, "the later call's record is left as it is");
         assert!(view.ended.is_none());
+    }
+
+    /// A host that accepts a start closes the calls this device left to it: what the file holds of
+    /// them is cleared when the file can be read, and dropped when it can be read only later, so
+    /// that a file that was refused while the start was accepted does not bring the notice back.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_accepted_start_closes_the_calls_left_to_the_host_whenever_the_file_can_be_read() {
+        let host = (
+            kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+            kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+        );
+        let other = (
+            kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+            kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+        );
+        let entry =
+            |kind: &str, owed_to: (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId)| {
+                OwedView {
+                    kind: kind.to_owned(),
+                    words: "The host's rule.".to_owned(),
+                    action_id: None,
+                    voice_session_id: Some(VoiceSessionId::new(kr_ipc::new_uuid()).to_string()),
+                    until_ms: u64::MAX / 2,
+                    host_reference: "a-host".to_owned(),
+                    host_name: "A host".to_owned(),
+                    host: Some(owed_to),
+                }
+            };
+        for readable_at_the_start in [true, false] {
+            let directory = tempfile::tempdir().expect("a directory");
+            let file = directory.path().join("voice-kept.json");
+            Kept::at(directory.path())
+                .write(&KeptVoice {
+                    owed: vec![
+                        entry(OwedView::HOST_CLOSE, host),
+                        entry(OwedView::HOST_CLOSE, other),
+                        entry("revocation", host),
+                    ],
+                    note: None,
+                })
+                .expect("the file is written");
+            let aside = directory.path().join("voice-kept.locked");
+            if !readable_at_the_start {
+                std::fs::rename(&file, &aside).expect("the file is put aside");
+                std::os::unix::fs::symlink(&file, &file).expect("a link stands in its place");
+            }
+            let calls = Calls::on_phone(
+                Arc::new(NoNativeCode),
+                Arc::new(crate::verify::NoCeremony),
+                Service::managed().expect("a service"),
+                Timings::default(),
+                Kept::at(directory.path()),
+            );
+            let shared = calls.shared.as_ref().expect("a phone holds calls");
+
+            // The host accepts a start: the calls left to it are closed, those left to another host
+            // and the revocation owed to this one are not.
+            shared.close_calls_left_to(Some(host));
+            if !readable_at_the_start {
+                // The file is read from here on.
+                std::fs::rename(&aside, &file).expect("the file is back");
+                shared.read_again();
+            }
+            let kinds: Vec<(
+                String,
+                Option<(kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId)>,
+            )> = shared
+                .view
+                .lock()
+                .expect("the view lock")
+                .owed
+                .iter()
+                .map(|owed| (owed.kind.clone(), owed.host))
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    (OwedView::HOST_CLOSE.to_owned(), Some(other)),
+                    ("revocation".to_owned(), Some(host)),
+                ],
+                "(readable at the start: {readable_at_the_start})"
+            );
+            // What is kept says the same.
+            let kept = Kept::at(directory.path())
+                .read(0)
+                .expect("the file is read");
+            assert_eq!(
+                kept.owed.len(),
+                2,
+                "(readable at the start: {readable_at_the_start})"
+            );
+        }
     }
 
     /// Another owner's finalisation is not the failed owner's to end.
