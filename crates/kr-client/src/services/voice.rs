@@ -3009,4 +3009,85 @@ mod tests {
             "Refused(VoiceRefusal{reason:InvalidRequest,..})",
         );
     }
+
+    /// The managed control's frames are what they were: each command's frame has the same members in
+    /// the same order, and a text over 500 bytes is refused locally in the same words.
+    #[test]
+    fn the_managed_frames_and_the_managed_500_byte_refusal_are_byte_for_byte_what_they_were() {
+        let golden = [
+            (
+                VoiceCommand::Mute,
+                None,
+                None,
+                r#"{"type":"context","id":"req-1","command":"mute","delegationId":null}"#,
+            ),
+            (
+                VoiceCommand::Unmute,
+                None,
+                None,
+                r#"{"type":"context","id":"req-1","command":"unmute","delegationId":null}"#,
+            ),
+            (
+                VoiceCommand::Close,
+                None,
+                None,
+                r#"{"type":"context","id":"req-1","command":"close","delegationId":null}"#,
+            ),
+            (
+                VoiceCommand::Instructions,
+                None,
+                Some("Say hi."),
+                r#"{"type":"context","id":"req-1","command":"instructions","delegationId":null,"content":"Say hi."}"#,
+            ),
+            (
+                VoiceCommand::Thinking,
+                Some("item_1"),
+                Some("a thought"),
+                r#"{"type":"context","id":"req-1","command":"thinking","delegationId":"item_1","content":"a thought"}"#,
+            ),
+            (
+                VoiceCommand::Commentary,
+                Some("item_1"),
+                Some("done"),
+                r#"{"type":"context","id":"req-1","command":"commentary","delegationId":"item_1","content":"done"}"#,
+            ),
+        ];
+        for (command, delegation, content, expected) in golden {
+            let frame = VoiceContextFrame::new(
+                "req-1",
+                command,
+                delegation.map(str::to_owned),
+                content.map(str::to_owned),
+            )
+            .expect("a frame");
+            assert_eq!(
+                serde_json::to_string(&frame).expect("serialises"),
+                expected,
+                "{command:?}"
+            );
+        }
+        assert!(
+            VoiceContextFrame::new(
+                "r",
+                VoiceCommand::Instructions,
+                None,
+                Some("a".repeat(VOICE_CONTEXT_BYTES))
+            )
+            .is_ok(),
+            "exactly 500 bytes is taken"
+        );
+        let refused = VoiceContextFrame::new(
+            "r",
+            VoiceCommand::Instructions,
+            None,
+            Some("a".repeat(VOICE_CONTEXT_BYTES + 1)),
+        )
+        .expect_err("501 bytes are refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("an append is at most 500 UTF-8 bytes"),
+            "{refused}"
+        );
+    }
 }

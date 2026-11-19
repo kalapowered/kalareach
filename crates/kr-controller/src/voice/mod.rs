@@ -1119,4 +1119,298 @@ mod tests {
             "the first five origins are the ones the schema accepts"
         );
     }
+
+    /// What the stand-ins below were asked, which the cases below read.
+    static ASKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn asked_so_far() -> usize {
+        ASKED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn asked() -> kr_voice::VoiceError {
+        ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        kr_voice::VoiceError::NotConfigured("the case's stand-in answers nothing".to_owned())
+    }
+
+    /// An authority that answers no question and counts each one asked.
+    #[derive(Debug)]
+    struct AuthorityAskedNothing;
+
+    impl kr_voice::seams::VoiceAuthority for AuthorityAskedNothing {
+        fn device_grant(
+            &self,
+            _device_id: DeviceId,
+            _session_id: Option<kr_protocol::ids::SessionId>,
+        ) -> kr_voice::Result<Option<kr_protocol::grant::Grant>> {
+            Err(asked())
+        }
+
+        fn holds_host_management(&self, _device_id: DeviceId) -> kr_voice::Result<bool> {
+            Err(asked())
+        }
+
+        fn grant(
+            &self,
+            _grant_id: kr_protocol::ids::GrantId,
+        ) -> kr_voice::Result<Option<kr_protocol::grant::Grant>> {
+            Err(asked())
+        }
+
+        fn standing_voice_grant(
+            &self,
+            _device_id: DeviceId,
+        ) -> kr_voice::Result<Option<kr_protocol::grant::Grant>> {
+            Err(asked())
+        }
+
+        fn issue(
+            &self,
+            _plan: &kr_voice::grant::VoiceGrantPlan,
+            _admission: &dyn kr_voice::Admission,
+        ) -> kr_voice::Result<kr_protocol::grant::Grant> {
+            Err(asked())
+        }
+
+        fn replace(
+            &self,
+            _replaced: kr_protocol::ids::GrantId,
+            _plan: &kr_voice::grant::VoiceGrantPlan,
+            _now_ms: u64,
+            _admission: &dyn kr_voice::Admission,
+        ) -> kr_voice::Result<kr_voice::seams::Replaced> {
+            Err(asked())
+        }
+
+        fn revoke(
+            &self,
+            _grant_id: kr_protocol::ids::GrantId,
+            _now_ms: u64,
+            _admission: &dyn kr_voice::Admission,
+        ) -> kr_voice::Result<kr_voice::seams::Revoked> {
+            Err(asked())
+        }
+
+        fn device_identity_key(
+            &self,
+            _device_id: DeviceId,
+        ) -> kr_voice::Result<Option<kr_protocol::scalars::AuthorisationKey>> {
+            Err(asked())
+        }
+
+        fn spend_delegation(
+            &self,
+            _device_id: DeviceId,
+            _delegation_id: &kr_protocol::voice::VoiceDelegationId,
+            _action_id: ActionId,
+            _now_ms: u64,
+        ) -> kr_voice::Result<bool> {
+            Err(asked())
+        }
+
+        fn release_delegation(
+            &self,
+            _device_id: DeviceId,
+            _delegation_id: &kr_protocol::voice::VoiceDelegationId,
+            _action_id: ActionId,
+        ) -> kr_voice::Result<()> {
+            Err(asked())
+        }
+    }
+
+    /// Session facts that answer no question but one: whether privacy mode moved.
+    #[derive(Debug)]
+    struct FactsAskedNothing {
+        unmoved: bool,
+    }
+
+    impl crate::voice::SessionFacts for FactsAskedNothing {
+        fn snapshot<'a>(
+            &'a self,
+            _session_id: kr_protocol::ids::SessionId,
+        ) -> kr_voice::seams::VoiceFuture<'a, crate::voice::SessionSnapshot> {
+            Box::pin(async { Err(asked()) })
+        }
+
+        fn approval_digest<'a>(
+            &'a self,
+            _session_id: kr_protocol::ids::SessionId,
+            _approval_request_id: &'a kr_protocol::ids::ApprovalRequestId,
+        ) -> kr_voice::seams::VoiceFuture<'a, Option<kr_protocol::scalars::Digest256>> {
+            Box::pin(async { Err(asked()) })
+        }
+
+        fn display_number<'a>(
+            &'a self,
+            _session_id: kr_protocol::ids::SessionId,
+        ) -> kr_voice::seams::VoiceFuture<'a, Option<u64>> {
+            Box::pin(async { Err(asked()) })
+        }
+
+        fn privacy(&self) -> crate::privacy::Published {
+            crate::privacy::Published::default()
+        }
+
+        fn unmoved(&self, _decided: crate::privacy::Published) -> bool {
+            self.unmoved
+        }
+    }
+
+    /// A context source that answers no question and counts each one asked.
+    #[derive(Debug)]
+    struct ContextAskedNothing;
+
+    impl kr_voice::seams::ContextSource for ContextAskedNothing {
+        fn gather<'a>(
+            &'a self,
+            _request: &'a kr_voice::seams::ContextRequest,
+        ) -> kr_voice::seams::VoiceFuture<'a, kr_voice::seams::GatheredContext> {
+            Box::pin(async { Err(asked()) })
+        }
+
+        fn approval_details<'a>(
+            &'a self,
+            _session_id: kr_protocol::ids::SessionId,
+            _approval_request_id: &'a kr_protocol::ids::ApprovalRequestId,
+        ) -> kr_voice::seams::VoiceFuture<'a, Option<kr_protocol::scalars::Digest256>> {
+            Box::pin(async { Err(asked()) })
+        }
+
+        fn display_numbers<'a>(
+            &'a self,
+            _sessions: &'a [kr_protocol::ids::SessionId],
+        ) -> kr_voice::seams::VoiceFuture<'a, Vec<(kr_protocol::ids::SessionId, u64)>> {
+            Box::pin(async { Err(asked()) })
+        }
+    }
+
+    /// A submitter that performs nothing and counts each proposal.
+    #[derive(Debug)]
+    struct SubmitterAskedNothing;
+
+    impl kr_voice::seams::ActionSubmitter for SubmitterAskedNothing {
+        fn submit<'a>(
+            &'a self,
+            _proposal: &'a kr_voice::Proposal,
+            _admission: &'a Arc<dyn kr_voice::Admission>,
+        ) -> kr_voice::seams::VoiceFuture<'a, kr_voice::seams::HostReceipt> {
+            Box::pin(async { Err(asked()) })
+        }
+    }
+
+    fn a_kept_delegation(
+        action: kr_protocol::voice::VoiceAction,
+        outcome: kr_protocol::voice::VoiceDelegationOutcome,
+    ) -> DelegationRecord {
+        let delegation_id =
+            kr_protocol::voice::VoiceDelegationId::new("item_kept").expect("an identifier");
+        DelegationRecord {
+            delegate_action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+            params: kr_protocol::voice::VoiceDelegateParams {
+                voice_session_id: kr_protocol::ids::VoiceSessionId::new(
+                    kr_protocol::scalars::Uuid::from_bytes([8; 16]),
+                ),
+                delegation_id: delegation_id.clone(),
+                offset_ms: kr_protocol::scalars::U64::new(0),
+                fragments: Vec::new(),
+                confirmation: Nullable::null(),
+            },
+            kept: kr_protocol::voice::VoiceDelegateResult {
+                delegation_id,
+                action: Nullable::some(action),
+                session_id: Nullable::null(),
+                outcome,
+            },
+        }
+    }
+
+    /// The real note path over a real coordinator that answers nothing: a write that was performed
+    /// and confirmed is told in the receipt's words, a read is read again under the grants, and a
+    /// write that was only admitted is not told as done.
+    #[tokio::test]
+    async fn a_note_about_a_confirmed_close_is_told_in_the_receipts_words_and_a_read_is_read_again()
+    {
+        use kr_protocol::voice::{VoiceAction, VoiceDelegationOutcome};
+        use kr_protocol::voice_host::VoiceHostRefusal;
+        let coordinator = Coordinator::new(
+            Arc::new(ContextAskedNothing),
+            Arc::new(AuthorityAskedNothing),
+            Arc::new(SubmitterAskedNothing),
+            None,
+            DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
+            String::new(),
+        );
+        let clock = Clock::new(|| 1_700_000_000_000);
+        let device_id = DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        let performed = |action| {
+            a_kept_delegation(
+                action,
+                VoiceDelegationOutcome::Performed {
+                    action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+                    summary: "Closed session 3.".to_owned(),
+                },
+            )
+        };
+
+        let facts = FactsAskedNothing { unmoved: true };
+        let again = ReadAgain {
+            coordinator: &coordinator,
+            facts: &facts,
+            decided: crate::privacy::Published::default(),
+            device_id,
+            clock: &clock,
+        };
+        let before = asked_so_far();
+        assert_eq!(
+            again
+                .fresh_summary(&performed(VoiceAction::CloseSession))
+                .await,
+            Ok("Closed session 3.".to_owned()),
+            "a confirmed close is told in the receipt's words"
+        );
+        assert_eq!(
+            asked_so_far(),
+            before,
+            "the close is not proposed or confirmed a second time: nothing was asked"
+        );
+
+        assert_eq!(
+            again
+                .fresh_summary(&a_kept_delegation(
+                    VoiceAction::CloseSession,
+                    VoiceDelegationOutcome::Admitted {
+                        action_id: ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+                        note: "admitted".to_owned(),
+                    },
+                ))
+                .await,
+            Err(VoiceHostRefusal::OutsideGrant),
+            "an admitted write is never told as done"
+        );
+        assert_eq!(asked_so_far(), before);
+
+        let read = again.fresh_summary(&performed(VoiceAction::Status)).await;
+        assert_ne!(
+            read,
+            Ok("Closed session 3.".to_owned()),
+            "a read is read again by the coordinator and is not told from the receipt"
+        );
+        assert!(
+            read.is_err(),
+            "the coordinator that could not say gives no words: {read:?}"
+        );
+
+        let moved = FactsAskedNothing { unmoved: false };
+        let privacy = ReadAgain {
+            facts: &moved,
+            ..again
+        };
+        assert_eq!(
+            privacy
+                .fresh_summary(&performed(VoiceAction::CloseSession))
+                .await,
+            Err(VoiceHostRefusal::Privacy),
+            "privacy mode that moved under a performed note gives nothing"
+        );
+    }
 }

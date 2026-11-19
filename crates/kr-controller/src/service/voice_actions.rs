@@ -1293,3 +1293,39 @@ fn answer_keeps_nothing(method: Method, outcome: &Result<ParamsValue>) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The body of the account's callback, cut out of the source text.
+    fn callback_body(source: &str) -> &str {
+        let start = source
+            .find("fn end_those_that_are_over")
+            .expect("the callback is in the source");
+        let rest = &source[start..];
+        let end = rest.find("\n    }\n}").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Whether a callback body sweeps the calls bound to the account alone.
+    fn sweeps_the_account_alone(body: &str) -> bool {
+        body.contains(".end_account_calls_that_are_over(")
+            && !body.contains(".end_calls_that_are_over(")
+    }
+
+    /// The account's callback ends the calls bound to the account and no other: a call on the
+    /// owner's own key is the voice tick's. The callback needs a running daemon for its clock and a
+    /// coordinator holding two kinds of call, which no library case builds, so the wiring is held by
+    /// its text, with a plant of each wrong form; the coordinator's own case proves the filter.
+    #[test]
+    fn the_account_callback_sweeps_the_calls_bound_to_the_account_alone() {
+        assert!(sweeps_the_account_alone(callback_body(include_str!(
+            "voice_actions.rs"
+        ))));
+        assert!(!sweeps_the_account_alone(
+            "fn end_those_that_are_over() { module.coordinator().end_calls_that_are_over(now) }"
+        ));
+        assert!(!sweeps_the_account_alone(
+            "fn end_those_that_are_over() { c.end_account_calls_that_are_over(a); c.end_calls_that_are_over(b) }"
+        ));
+    }
+}
