@@ -8451,8 +8451,9 @@ fn owed_kinds_of(state: &serde_json::Value) -> Vec<String> {
 
 /// A call left to the host stays owed past the end of its grant, with the host's rule, until the
 /// host says the call is closed: a revoked grant whose closure the provider did not confirm does not
-/// say that, and a host that holds no such call does. What is owed to a host that is reached is asked
-/// again, as a stop.
+/// say that, and neither does a host that holds no such call, which is what a host answers to a
+/// second stop after it took the call out of its list. What is owed to a host that is reached is
+/// asked again, as a stop, each time the host is reached.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_left_to_the_host_stays_owed_past_its_grant_until_the_host_says_it_is_closed() {
     let mut scene = own_scene(own_timings()).await;
@@ -8485,35 +8486,43 @@ async fn a_call_left_to_the_host_stays_owed_past_its_grant_until_the_host_says_i
     let this_host = (host.host_device_id, connection.environment_id());
     let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
     let long_past = now_ms().saturating_sub(3_600_000);
-    let owed =
-        |kind: &str, id: kr_protocol::ids::VoiceSessionId| companion_tauri::voice::OwedView {
+    let owed = |kind: &str, id: kr_protocol::ids::VoiceSessionId, until_ms: u64| {
+        companion_tauri::voice::OwedView {
             kind: kind.to_owned(),
             words: "The host's rule.".to_owned(),
             action_id: None,
             voice_session_id: Some(id.to_string()),
-            until_ms: long_past,
+            until_ms,
             host_reference: "a-host".to_owned(),
             host_name: "A host".to_owned(),
             host: Some(this_host),
-        };
+        }
+    };
     let lapsed_revocation = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
-    let directory = scene.phone.data.path().join("relaunch-left-to-host");
-    Kept::at(&directory)
-        .write(&companion_tauri::voice::KeptVoice {
-            owed: vec![
-                owed("host_close", live),
-                owed("host_close", unknown),
-                owed("revocation", lapsed_revocation),
-            ],
-            note: None,
-        })
-        .expect("the file is written");
-    let relaunched = calls_on_phone(
-        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
-        service_at(scene.stand_in.origin()),
-        quick(),
-        Kept::at(&directory),
-    );
+    // A revocation the host holds no call for is settled by its answer, and it is asked after the
+    // calls left to the host: the phone's task asks each in turn, so that its settling is the
+    // event that the calls before it were asked and answered.
+    let last_asked = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let relaunch = |name: &str, last: kr_protocol::ids::VoiceSessionId| {
+        let directory = scene.phone.data.path().join(name);
+        Kept::at(&directory)
+            .write(&companion_tauri::voice::KeptVoice {
+                owed: vec![
+                    owed("host_close", live, long_past),
+                    owed("host_close", unknown, long_past),
+                    owed("revocation", lapsed_revocation, long_past),
+                    owed("revocation", last, now_ms() + 3_600_000),
+                ],
+                note: None,
+            })
+            .expect("the file is written");
+        calls_on_phone(
+            ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+            service_at(scene.stand_in.origin()),
+            quick(),
+            Kept::at(&directory),
+        )
+    };
     let ids = |calls: &Calls| -> Vec<(String, Option<String>)> {
         calls
             .state(None)
@@ -8522,41 +8531,151 @@ async fn a_call_left_to_the_host_stays_owed_past_its_grant_until_the_host_says_i
             .map(|entry| (entry.kind.clone(), entry.voice_session_id.clone()))
             .collect()
     };
+    let stays = [
+        ("host_close".to_owned(), Some(live.to_string())),
+        ("host_close".to_owned(), Some(unknown.to_string())),
+    ];
+    let relaunched = relaunch("relaunch-left-to-host", last_asked);
+    let asked_last = |calls: &Calls, last: kr_protocol::ids::VoiceSessionId| {
+        ids(calls).contains(&("revocation".to_owned(), Some(last.to_string())))
+    };
+    let held: Vec<_> = ids(&relaunched)
+        .into_iter()
+        .filter(|(kind, _)| kind == "host_close")
+        .collect();
     assert_eq!(
-        ids(&relaunched),
-        [
-            ("host_close".to_owned(), Some(live.to_string())),
-            ("host_close".to_owned(), Some(unknown.to_string())),
-        ],
+        held, stays,
         "a grant that ended long ago ends the revocation owed and not the call left to the host"
     );
 
     // The host revokes the live call's grant and the provider does not confirm the closure: that is
-    // no word that the call is closed. The host holds no call by the other name, which is.
+    // no word that the call is closed. The host holds no call by the other name, and a host that
+    // holds none is no word either.
     openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Answer(500, None));
     relaunched.host_reached(this_host.0, this_host.1, connection.session());
     tokio::time::timeout(WATCHDOG, async {
-        while ids(&relaunched).len() != 1 || scene.link.sent(HostMethod::VoiceStop) < 2 {
+        while asked_last(&relaunched, last_asked) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("the host was asked about both calls and settled the one it holds no record of");
+    .expect("the host was asked about the calls and settled the revocation asked last");
     assert_eq!(
         ids(&relaunched),
-        [("host_close".to_owned(), Some(live.to_string()))],
-        "a revoked grant with the closure unconfirmed leaves the call to the host"
+        stays,
+        "a revoked grant with the closure unconfirmed, and a host that holds no such call, leave the call to the host"
     );
 
-    // The host holds no such call now, which is its word that the call is over.
-    relaunched.host_reached(this_host.0, this_host.1, connection.session());
+    // The second reach: the host took the live call out of its list at the first stop, and a stop for
+    // it is now answered as a call the host does not hold, which is no word that the call is closed.
+    let second_last = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let again = relaunch("second-reach-left-to-host", second_last);
+    again.host_reached(this_host.0, this_host.1, connection.session());
     tokio::time::timeout(WATCHDOG, async {
-        while !ids(&relaunched).is_empty() {
+        while asked_last(&again, second_last) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("the host holds no such call, and the entry was settled");
+    .expect("the host was asked again and settled the revocation asked last");
+    assert_eq!(
+        ids(&again),
+        stays,
+        "a host that holds no such call after the first stop does not say the call is closed"
+    );
+    scene.stop_host().await;
+}
+
+/// Each stop this device asks again of a host it reaches is an action of its own, and one the host
+/// does not answer in time is settled in the connection's book: stops asked again and again leave
+/// nothing unresolved there, and the call left to the host stays owed through all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stops_asked_again_of_a_host_that_does_not_answer_leave_nothing_unresolved_on_the_connection()
+ {
+    let mut scene = own_scene(own_timings()).await;
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    let this_host = (host.host_device_id, connection.environment_id());
+    let session = connection.session();
+    let left = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let owed = |kind: &str, id: kr_protocol::ids::VoiceSessionId, until_ms: u64| {
+        companion_tauri::voice::OwedView {
+            kind: kind.to_owned(),
+            words: "The host's rule.".to_owned(),
+            action_id: None,
+            voice_session_id: Some(id.to_string()),
+            until_ms,
+            host_reference: "a-host".to_owned(),
+            host_name: "A host".to_owned(),
+            host: Some(this_host),
+        }
+    };
+    let ids = |calls: &Calls| -> Vec<(String, Option<String>)> {
+        calls
+            .state(None)
+            .owed
+            .iter()
+            .map(|entry| (entry.kind.clone(), entry.voice_session_id.clone()))
+            .collect()
+    };
+    for round in 1..=3 {
+        // A revocation is asked after the call left to the host: its being settled is the event that
+        // the stop for the call was asked, was not answered, and was given up.
+        let revocation = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+        let directory = scene.phone.data.path().join(format!("stops-again-{round}"));
+        Kept::at(&directory)
+            .write(&companion_tauri::voice::KeptVoice {
+                owed: vec![
+                    owed("host_close", left, now_ms().saturating_sub(3_600_000)),
+                    owed("revocation", revocation, now_ms() + 3_600_000),
+                ],
+                note: None,
+            })
+            .expect("the file is written");
+        let relaunched = calls_on_phone(
+            ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+            service_at(scene.stand_in.origin()),
+            Timings {
+                host_within: Duration::from_millis(300),
+                ..quick()
+            },
+            Kept::at(&directory),
+        );
+        scene.link.hold_next_request(HostMethod::VoiceStop);
+        relaunched.host_reached(this_host.0, this_host.1, session.clone());
+        scene.link.until_request_held().await;
+        assert!(
+            !session.submitted_actions().await.is_empty(),
+            "round {round}: the stop that is held is on the connection's book"
+        );
+        tokio::time::timeout(WATCHDOG, async {
+            while ids(&relaunched)
+                .contains(&("revocation".to_owned(), Some(revocation.to_string())))
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the stop was given up and the revocation asked after it was settled");
+        assert!(
+            session.submitted_actions().await.is_empty(),
+            "round {round}: a stop the host did not answer in time is not left unresolved"
+        );
+        assert_eq!(
+            ids(&relaunched),
+            [("host_close".to_owned(), Some(left.to_string()))],
+            "round {round}: the call left to the host stays owed"
+        );
+        scene.link.release_request();
+    }
     scene.stop_host().await;
 }
 
@@ -8918,9 +9037,12 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
         match cause {
             "recovery" | "recovery_unconfirmed" => {
                 if cause == "recovery_unconfirmed" {
-                    openai.script_hangup(
-                        kr_client::services::own_voice::stand_in::HangupScript::Lost,
-                    );
+                    // The host's own hang-up and the one the phone's stop asks for are both lost.
+                    for _ in 0..2 {
+                        openai.script_hangup(
+                            kr_client::services::own_voice::stand_in::HangupScript::Lost,
+                        );
+                    }
                 }
                 for _ in 0..200 {
                     openai.fail_attach(kr_client::services::own_voice::AttachFault::Unavailable);
@@ -8951,8 +9073,64 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
                 shown == words || shown == format!("{words} {LEFT_TO_HOST_WORDS}"),
                 "({cause}) {ended}"
             );
+        } else if cause == "recovery_unconfirmed" {
+            // The host could not confirm that it closed the call: the end says so, with the charge
+            // warning, and the call stays owed to the host.
+            assert_eq!(
+                ended["ended"]["words"],
+                format!("{words} {LEFT_TO_HOST_WORDS}"),
+                "({cause}) {ended}"
+            );
         } else {
             assert_eq!(ended["ended"]["words"], words, "({cause}) {ended}");
+        }
+        let owes_the_host = owed_kinds_of(&ended).contains(&"host_close".to_owned());
+        if cause == "recovery_unconfirmed" {
+            assert_eq!(
+                ended["ended"]["broker"], "left_to_host",
+                "({cause}) {ended}"
+            );
+            assert!(
+                owes_the_host,
+                "the call is left to the host ({cause}): {ended}"
+            );
+            // The host takes the call out of its list when it is asked to stop, and what it answers
+            // to a stop again is no word that the provider closed the call.
+            let session = answer
+                .as_ref()
+                .ok()
+                .and_then(|answer| {
+                    answer
+                        .pointer("/value/outcome/started/session/voice_session_id")
+                        .cloned()
+                })
+                .expect("the voice session of the call");
+            for _ in 0..2 {
+                let _ = scene.call("voice_stop", json!({ "voiceSessionId": session }));
+                let after = scene.state();
+                assert_eq!(
+                    after["ended"]["broker"], "left_to_host",
+                    "({cause}) {after}"
+                );
+                assert!(
+                    owed_kinds_of(&after).contains(&"host_close".to_owned()),
+                    "a stop again does not settle the call left to the host ({cause}): {after}"
+                );
+                assert_eq!(
+                    after["ended"]["words"],
+                    format!("{words} {LEFT_TO_HOST_WORDS}"),
+                    "the charge warning stands ({cause}): {after}"
+                );
+            }
+        } else if cause != "deadline" {
+            assert_eq!(
+                ended["ended"]["broker"], "closed_by_host",
+                "({cause}) {ended}"
+            );
+            assert!(
+                !owes_the_host,
+                "nothing is left to the host ({cause}): {ended}"
+            );
         }
         assert!(
             scene.platform.count("stop") >= 1,

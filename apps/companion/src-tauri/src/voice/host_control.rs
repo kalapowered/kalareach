@@ -95,14 +95,14 @@ pub(super) trait HostLink: Send + Sync + 'static {
 /// An action this device holds the book of until it settles it: dropped before it was settled, it
 /// is settled on a task of its own, so that a write that was cut short leaves nothing unresolved
 /// on the connection.
-struct Settling {
+pub(super) struct Settling {
     session: Arc<Session>,
     action_id: ActionId,
     settled: bool,
 }
 
 impl Settling {
-    const fn new(session: Arc<Session>, action_id: ActionId) -> Self {
+    pub(super) const fn new(session: Arc<Session>, action_id: ActionId) -> Self {
         Self {
             session,
             action_id,
@@ -110,7 +110,7 @@ impl Settling {
         }
     }
 
-    async fn settle(&mut self) {
+    pub(super) async fn settle(&mut self) {
         self.session.settle(self.action_id).await;
         self.settled = true;
     }
