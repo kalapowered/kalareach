@@ -553,6 +553,17 @@ impl Controller {
         self.before_the_policy_lock.arm()
     }
 
+    /// Arms the pause the next request for an owner confirmation stops at inside the transaction
+    /// that records it, which holds the record's lock, before the request asks anything there.
+    /// Returns the end that says the request has arrived, and the end that lets it go. The pause
+    /// fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_inside_the_record_of_a_confirmation(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.inside_the_record_of_a_confirmation.arm()
+    }
+
     /// Arms the pause the next frame written to a local connection stops at once the local owner's
     /// lease has been read, before the footing's question. Returns the end that says the frame has
     /// arrived, and the end that lets it go. The pause fires once.
