@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/server/session.input_audio.muted.json",
+  "title": "Acknowledgement of session.input_audio.mute",
+  "description": "Confirms that session.input_audio.mute was accepted. Match client_event_id to the command. Muting caller input stops neither inference nor generated speech.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "const": "session.input_audio.muted"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider-assigned identifier for this server event."
+    },
+    "client_event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The event_id of the broker command this event answers, when the broker supplied one."
+    }
+  },
+  "required": [
+    "type",
+    "event_id"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/client/session.close.json",
+  "title": "Close the session",
+  "description": "Asks the provider to finalise the session. The terminal session.closed event carries the reason and the final usage.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "const": "session.close"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "The broker's correlation ID for this command. It returns as client_event_id on the answering event."
+    }
+  },
+  "required": [
+    "type",
+    "event_id"
+  ],
+  "additionalProperties": false
+}

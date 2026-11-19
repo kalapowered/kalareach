@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/server/session.delegation.created.json",
+  "title": "Delegation created",
+  "description": "The model delegated work. Correlation data only: it carries no task text, and it grants no authority.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "const": "session.delegation.created"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider-assigned identifier for this server event."
+    },
+    "client_event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The event_id of the broker command this event answers, when the broker supplied one."
+    },
+    "offset_ms": {
+      "type": "number",
+      "description": "Where the delegation was created in milliseconds from the start of the session timeline."
+    },
+    "delegation": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque delegation ID. Return it unchanged; never construct or parse one. That it belongs to this session is the broker's precondition to check, not this schema's."
+        },
+        "type": {
+          "const": "delegation"
+        },
+        "target": {
+          "const": "client",
+          "description": "Pinned. The session selects client delegation, so a responses target would contradict the negotiated configuration; such an event fails this schema and is dropped as unknown rather than acted on. The provider field response_id, which accompanies a responses delegation, is excluded for the same reason."
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "target"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "type",
+    "event_id",
+    "offset_ms",
+    "delegation"
+  ],
+  "additionalProperties": false
+}

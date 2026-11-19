@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/server/session.closed.json",
+  "title": "Session closed",
+  "description": "Finalisation. This event, and only this event, establishes final usage; a transport close on its own does not.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "const": "session.closed"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider-assigned identifier for this server event."
+    },
+    "client_event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The event_id of the broker command this event answers, when the broker supplied one."
+    },
+    "reason": {
+      "enum": [
+        "close_requested",
+        "expired",
+        "content",
+        "remote_hangup",
+        "connection_lost"
+      ],
+      "description": "close_requested: the broker sent session.close or called hangup. expired: the provider duration limit. content: a provider safety filter. remote_hangup: the primary connection ended gracefully. connection_lost: the primary or upstream connection dropped."
+    },
+    "session": {
+      "type": "object",
+      "description": "The resolved session configuration. It echoes what the broker sent plus server defaults. It stays open where every other object in the profile is closed, because it echoes configuration: a new configuration field must not invalidate a running call. Only id, model, status and expires_at are read from it afterwards; the service separately compares the configuration it asked for against what came back before it admits any work.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Opaque provider session ID. Preserve its prefix."
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "const": "active",
+          "description": "Always active, including in the final snapshot. The event type says the session closed."
+        },
+        "expires_at": {
+          "type": "number",
+          "description": "Unix time in seconds at which the provider expires the session."
+        }
+      },
+      "required": [
+        "id",
+        "model",
+        "status",
+        "expires_at"
+      ],
+      "additionalProperties": true
+    },
+    "usage": {
+      "type": "object",
+      "description": "Cumulative voice duration. A snapshot, never an increment to add to an earlier one.",
+      "properties": {
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "seconds"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "type",
+    "event_id",
+    "reason",
+    "session",
+    "usage"
+  ],
+  "additionalProperties": false
+}

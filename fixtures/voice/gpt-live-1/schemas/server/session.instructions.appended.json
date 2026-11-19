@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/server/session.instructions.appended.json",
+  "title": "Acknowledgement of session.instructions.append",
+  "description": "Confirms context admission for session.instructions.append. It waits for estimated context injection, so it needs frame progress; it proves neither speech, playback, nor any host action.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "const": "session.instructions.appended"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider-assigned identifier for this server event."
+    },
+    "client_event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The event_id of the broker command this event answers, when the broker supplied one."
+    },
+    "start_ms": {
+      "type": "number",
+      "description": "Start of the estimated injection range in milliseconds from the start of the session timeline."
+    },
+    "end_ms": {
+      "type": "number",
+      "description": "End of the estimated injection range in milliseconds from the start of the session timeline."
+    }
+  },
+  "required": [
+    "type",
+    "event_id",
+    "start_ms",
+    "end_ms"
+  ],
+  "additionalProperties": false
+}

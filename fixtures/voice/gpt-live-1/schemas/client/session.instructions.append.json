@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/client/session.instructions.append.json",
+  "title": "Append application instructions",
+  "description": "Adds application-authored instructions to the running session. Never carries project text or caller text.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "const": "session.instructions.append"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "The broker's correlation ID for this command. It returns as client_event_id on the answering event."
+    },
+    "delegation_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "description": "A client delegation ID the provider has already announced, or null for session-wide context. The provider answers an unknown ID with invalid_request_error on param delegation_id."
+    },
+    "content": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "maxBytes": 500,
+      "description": "Plain text. maxBytes is a KalaReach keyword bounding the string in UTF-8 bytes. The provider's limit is 500 tokens, which the broker cannot count without the provider's encoder; 500 UTF-8 bytes is at most 500 tokens under a byte-level encoder, so the broker's bound holds the provider's without counting. The provider answers invalid_value on param content if it is ever exceeded anyway."
+    }
+  },
+  "required": [
+    "type",
+    "event_id",
+    "delegation_id",
+    "content"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/client/session.input_audio.mute.json",
+  "title": "Mute caller input",
+  "description": "Stops caller audio reaching the model without ending the session. Acknowledged by session.input_audio.muted.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "const": "session.input_audio.mute"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "The broker's correlation ID for this command. It returns as client_event_id on the answering event."
+    }
+  },
+  "required": [
+    "type",
+    "event_id"
+  ],
+  "additionalProperties": false
+}

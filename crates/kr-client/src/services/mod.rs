@@ -135,6 +135,7 @@ pub mod matrix;
 pub mod organisation;
 pub mod own_call;
 pub mod own_registry;
+pub mod own_voice;
 pub mod push;
 pub mod relay;
 pub mod signed;

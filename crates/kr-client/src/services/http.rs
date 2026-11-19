@@ -467,6 +467,25 @@ impl HttpService {
         body: Option<(&str, &[u8])>,
         headers: &[ServiceHeader<'_>],
     ) -> Result<ServiceHttpAnswer> {
+        let answer = self.exchange_status(method, target, body, headers).await?;
+        Ok(ServiceHttpAnswer {
+            status: answer.status,
+            body: answer.body?,
+        })
+    }
+
+    /// The same exchange, with the status kept when the body then fails.
+    ///
+    /// An error is returned only when no status line arrived. Once one has, the status is the
+    /// answer and a failure of the body is carried beside it: a caller that classifies by status
+    /// does not lose a refusal because its body was cut off or too long.
+    async fn exchange_status(
+        &self,
+        method: reqwest::Method,
+        target: Url,
+        body: Option<(&str, &[u8])>,
+        headers: &[ServiceHeader<'_>],
+    ) -> Result<StatusAnswer> {
         let limit = self.limits.of(target.path());
         let named = crate::shown!("{}{}", self.origin.clone(), Shown::route(target.path()));
         // A header value can be a token, so neither the name's value nor the value itself reaches
@@ -513,23 +532,86 @@ impl HttpService {
             .content_length()
             .is_some_and(|stated| stated > limit)
         {
-            return Err(too_large(&named, limit));
+            return Ok(StatusAnswer {
+                status,
+                body: Err(too_large(&named, limit)),
+            });
         }
 
-        let mut read = Vec::new();
-        loop {
-            let chunk = response
-                .chunk()
-                .await
-                .map_err(|error| failure(&named, ExchangePhase::Answer, &error))?;
-            let Some(chunk) = chunk else { break };
-            if read.len() as u64 + chunk.len() as u64 > limit {
-                return Err(too_large(&named, limit));
+        let body = async {
+            let mut read = Vec::new();
+            loop {
+                let chunk = response
+                    .chunk()
+                    .await
+                    .map_err(|error| failure(&named, ExchangePhase::Answer, &error))?;
+                let Some(chunk) = chunk else { break };
+                if read.len() as u64 + chunk.len() as u64 > limit {
+                    return Err(too_large(&named, limit));
+                }
+                read.extend_from_slice(&chunk);
             }
-            read.extend_from_slice(&chunk);
+            Ok(read)
         }
+        .await;
 
-        Ok(ServiceHttpAnswer { status, body: read })
+        Ok(StatusAnswer { status, body })
+    }
+
+    /// A JSON request whose status survives a failure of the answer's body.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the address is not the gateway's or no status line arrived. A body
+    /// that failed after the status is in [`StatusAnswer::body`].
+    pub async fn post_json_keeping_status(
+        &self,
+        url: &str,
+        body: &[u8],
+        headers: &[ServiceHeader<'_>],
+    ) -> Result<StatusAnswer> {
+        let target = self.target(url)?;
+        self.exchange_status(
+            reqwest::Method::POST,
+            target,
+            Some(("application/json", body)),
+            headers,
+        )
+        .await
+    }
+
+    /// A request with no body whose status survives a failure of the answer's body.
+    ///
+    /// # Errors
+    ///
+    /// As [`post_json_keeping_status`](Self::post_json_keeping_status).
+    pub async fn post_empty_keeping_status(
+        &self,
+        url: &str,
+        headers: &[ServiceHeader<'_>],
+    ) -> Result<StatusAnswer> {
+        let target = self.target(url)?;
+        self.exchange_status(reqwest::Method::POST, target, None, headers)
+            .await
+    }
+}
+
+/// What an exchange answered when its status is wanted even if its body failed.
+pub struct StatusAnswer {
+    /// The status the service answered with.
+    pub status: u16,
+    /// The body, or why it could not be read.
+    pub body: Result<Vec<u8>>,
+}
+
+impl fmt::Debug for StatusAnswer {
+    /// The status and whether the body was read, and nothing the service wrote.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StatusAnswer")
+            .field("status", &self.status)
+            .field("body_read", &self.body.is_ok())
+            .finish()
     }
 }
 

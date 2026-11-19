@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/session-create-request.json",
+  "title": "Brokered session creation request",
+  "description": "The exact body the broker sends to POST /v1/live/sessions. Every field the broker sends appears here; nothing else is sent.",
+  "type": "object",
+  "properties": {
+    "session": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "const": "gpt-live-1"
+        },
+        "instructions": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "maxBytes": 16384,
+          "description": "Application-authored. The provider allows 16384 client-supplied tokens; 16384 UTF-8 bytes is at most that many tokens under a byte-level encoder, so the broker's bound holds the provider's without counting tokens."
+        },
+        "delegation": {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "client"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        "client": {
+          "type": "object",
+          "description": "Startup-only limits on the caller data channel. Trusted sideband connections are unaffected.",
+          "properties": {
+            "data_channel": {
+              "type": "object",
+              "properties": {
+                "allowed_client_events": {
+                  "const": [],
+                  "description": "Pinned empty: the caller sends zero provider control events."
+                },
+                "allowed_server_events": {
+                  "const": [
+                    {
+                      "type": "session.started"
+                    },
+                    {
+                      "type": "session.closed"
+                    },
+                    {
+                      "type": "session.input_transcript.delta"
+                    },
+                    {
+                      "type": "session.output_transcript.delta"
+                    },
+                    {
+                      "type": "session.delegation.created"
+                    },
+                    {
+                      "type": "session.input_audio.muted"
+                    },
+                    {
+                      "type": "session.input_audio.unmuted"
+                    },
+                    {
+                      "type": "session.instructions.appended"
+                    },
+                    {
+                      "type": "session.thinking.appended"
+                    },
+                    {
+                      "type": "session.commentary.appended"
+                    },
+                    {
+                      "type": "session.usage.updated"
+                    },
+                    {
+                      "type": "error"
+                    }
+                  ],
+                  "description": "Pinned to the twelve events the allowlist accepts, in this order. A request that adds, drops, reorders or duplicates a selector is a different contract and fails this schema. No selector names response.event, so response_event never applies."
+                }
+              },
+              "required": [
+                "allowed_client_events",
+                "allowed_server_events"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "data_channel"
+          ],
+          "additionalProperties": false
+        },
+        "store": {
+          "const": false,
+          "description": "No provider-side recording, so no download and no fork."
+        }
+      },
+      "required": [
+        "model",
+        "instructions",
+        "delegation",
+        "client",
+        "store"
+      ],
+      "additionalProperties": false
+    },
+    "transport": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "webrtc"
+        },
+        "sdp": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The caller's SDP offer, forwarded unchanged."
+        }
+      },
+      "required": [
+        "type",
+        "sdp"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "session",
+    "transport"
+  ],
+  "additionalProperties": false
+}

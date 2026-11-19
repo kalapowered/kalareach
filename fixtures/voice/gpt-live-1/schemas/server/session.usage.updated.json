@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/server/session.usage.updated.json",
+  "title": "Cumulative usage",
+  "description": "A cumulative voice-duration counter. Never sum these values.",
+  "type": "object",
+  "properties": {
+    "type": {
+      "const": "session.usage.updated"
+    },
+    "event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider-assigned identifier for this server event."
+    },
+    "client_event_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The event_id of the broker command this event answers, when the broker supplied one."
+    },
+    "usage": {
+      "type": "object",
+      "description": "Cumulative voice duration. A snapshot, never an increment to add to an earlier one.",
+      "properties": {
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "seconds"
+      ],
+      "additionalProperties": false
+    },
+    "context_window": {
+      "type": "object",
+      "description": "Latest measured context use. Omitted when the provider has not measured it.",
+      "properties": {
+        "usage_ratio": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "usage_ratio"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "type",
+    "event_id",
+    "usage"
+  ],
+  "additionalProperties": false
+}

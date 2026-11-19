@@ -132,7 +132,7 @@ pub fn same_origin(first: &str, second: &str) -> bool {
 ///
 /// A call identifier comes from the service and is a UUID today. It is encoded anyway, because a
 /// client that trusted a remote value to be path-safe would be trusting the wrong party.
-fn encode_segment(value: &str) -> String {
+pub(crate) fn encode_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {

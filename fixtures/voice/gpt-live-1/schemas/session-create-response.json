@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reach.kala.to/schemas/providers/gpt-live-1/session-create-response.json",
+  "title": "Brokered session creation response",
+  "description": "HTTP 201. The session ID is durable state; the SDP answer is what the caller needs.",
+  "type": "object",
+  "properties": {
+    "session": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": true
+    },
+    "transport": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "webrtc"
+        },
+        "sdp": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "required": [
+        "type",
+        "sdp"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "session",
+    "transport"
+  ],
+  "additionalProperties": false
+}
