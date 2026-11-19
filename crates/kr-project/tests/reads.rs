@@ -1017,18 +1017,54 @@ mod confined {
 
         impl Drop for Attached {
             fn drop(&mut self) {
-                let detached = Command::new("/usr/bin/hdiutil")
-                    .arg("detach")
-                    .arg(&self.mount)
-                    .arg("-force")
-                    .output();
-                if !detached.as_ref().is_ok_and(|done| done.status.success()) {
-                    eprintln!(
-                        "the disk image at {} was not detached: {detached:?}",
+                if let Err(said) = kr_ipc::testing::volumes::detach_attached(&self.mount) {
+                    let report = format!(
+                        "the disk image attached at {} did not detach ({said})",
                         self.mount.display()
                     );
+                    // A second panic while the first unwinds would abort the whole test binary, so
+                    // a case that has already failed says it here instead.
+                    if std::thread::panicking() {
+                        eprintln!("{report}");
+                    } else {
+                        panic!("{report}");
+                    }
                 }
             }
+        }
+
+        /// What a panic said, as text.
+        fn said(panic: &(dyn std::any::Any + Send)) -> String {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+                .unwrap_or_default()
+        }
+
+        /// A disk image that does not come off fails the case that attached it, and a case that is
+        /// already failing says so on standard error and ends with its own failure.
+        #[test]
+        fn a_disk_image_that_does_not_detach_fails_the_case_that_attached_it() {
+            // Nothing is attached at this directory, so there is no disk to take off.
+            let nothing = tempfile::TempDir::new().expect("a directory with nothing attached");
+            let ended = std::panic::catch_unwind(|| {
+                drop(Attached {
+                    mount: nothing.path().to_path_buf(),
+                });
+            });
+            let ended = said(&*ended.expect_err("the guard fails the case that holds it"));
+            assert!(ended.contains("did not detach"), "{ended}");
+            let failing = std::panic::catch_unwind(|| {
+                let _guard = Attached {
+                    mount: nothing.path().to_path_buf(),
+                };
+                panic!("the case's own failure");
+            });
+            assert_eq!(
+                said(&*failing.expect_err("the case fails")),
+                "the case's own failure"
+            );
         }
 
         /// A secret in the machine's shared temporary directory, and the system's own hosts file,

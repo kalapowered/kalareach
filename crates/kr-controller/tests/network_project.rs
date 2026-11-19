@@ -6599,6 +6599,58 @@ async fn a_filesystem_mounted_beneath_a_granted_directory_refuses_a_devices_clon
     );
 }
 
+/// A disk image this account attached at a directory, taken off when it goes. A detach that does
+/// not take the image off fails the case that attached it, or, where that case is already failing,
+/// is said on standard error.
+#[cfg(target_os = "macos")]
+struct AttachedImage(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for AttachedImage {
+    fn drop(&mut self) {
+        if let Err(said) = kr_ipc::testing::volumes::detach_attached(&self.0) {
+            let report = format!(
+                "the disk image attached at {} did not detach ({said})",
+                self.0.display()
+            );
+            // A second panic while the first unwinds would abort the whole test binary, so a case
+            // that has already failed says it here instead.
+            if std::thread::panicking() {
+                eprintln!("{report}");
+            } else {
+                panic!("{report}");
+            }
+        }
+    }
+}
+
+/// A disk image that does not come off fails the case that attached it, and a case that is already
+/// failing says so on standard error and ends with its own failure.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_disk_image_that_does_not_detach_fails_the_case_that_attached_it() {
+    let said = |panic: Box<dyn std::any::Any + Send>| {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default()
+    };
+    // Nothing is attached at this directory, so there is no disk to take off.
+    let nothing = tempfile::TempDir::new().expect("a directory with nothing attached");
+    let ended = std::panic::catch_unwind(|| drop(AttachedImage(nothing.path().to_path_buf())));
+    let ended = said(ended.expect_err("the guard fails the case that holds it"));
+    assert!(ended.contains("did not detach"), "{ended}");
+    let failing = std::panic::catch_unwind(|| {
+        let _guard = AttachedImage(nothing.path().to_path_buf());
+        panic!("the case's own failure");
+    });
+    assert_eq!(
+        said(failing.expect_err("the case fails")),
+        "the case's own failure"
+    );
+}
+
 /// KR-REQ-23.42: a disk image this account attaches beneath a directory a device's operation is
 /// granted refuses the operation, with the reason and not the place, before Git starts, and the
 /// same clone is made once the image is detached.
@@ -6660,17 +6712,7 @@ async fn a_disk_image_attached_beneath_a_granted_directory_refuses_a_devices_clo
         return;
     }
     // Whatever happens next, the image goes: the guard detaches it.
-    struct Detach(PathBuf);
-    impl Drop for Detach {
-        fn drop(&mut self) {
-            let _ = std::process::Command::new("/usr/bin/hdiutil")
-                .arg("detach")
-                .arg(&self.0)
-                .arg("-force")
-                .output();
-        }
-    }
-    let detach = Detach(mounted);
+    let detach = AttachedImage(mounted);
     let Some(refused) = a_device_clones_from_a_repository_in(&root, "inside", test).await else {
         return;
     };
