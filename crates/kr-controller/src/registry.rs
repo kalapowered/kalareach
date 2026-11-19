@@ -5024,7 +5024,7 @@ mod tests {
                 .execute_batch(sql)
                 .expect("changes the registry");
         };
-        change("UPDATE schema_version SET version = 16;");
+        change("UPDATE schema_version SET version = 17;");
 
         assert_eq!(
             Registry::bring_forward(&path, environment_id).expect("is left"),
@@ -5049,16 +5049,16 @@ mod tests {
         drop(opened);
         assert_eq!(
             recorded(&path),
-            vec![16],
+            vec![17],
             "and the version is as it was found"
         );
 
-        change("UPDATE schema_version SET version = 17;");
+        change("UPDATE schema_version SET version = 18;");
         assert!(Registry::open(&path, environment_id).is_err());
         assert!(Registry::open_to_read(&path, environment_id).is_err());
         assert_eq!(
             recorded(&path),
-            vec![17],
+            vec![18],
             "and the version is as it was found"
         );
     }

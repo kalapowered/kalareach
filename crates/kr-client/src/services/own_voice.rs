@@ -497,7 +497,7 @@ pub fn closure_recognised(reply: &std::result::Result<Reply, Lost>) -> bool {
         Ok(Reply {
             status: 404,
             body: Some(body),
-        }) => serde_json::from_slice::<Value>(body).is_ok_and(|value| {
+        }) => super::json::read::<Value>(body).is_ok_and(|value| {
             let code = value
                 .pointer("/error/code")
                 .or_else(|| value.get("code"))
@@ -1710,7 +1710,7 @@ impl CallTask {
 
     /// Reads one message and keeps only what the call needs of it.
     fn read(&mut self, text: &str) -> Read {
-        let Ok(value) = serde_json::from_str::<Value>(text) else {
+        let Ok(value) = super::json::read::<Value>(text.as_bytes()) else {
             self.shared.inner().unknown_events += 1;
             return Read::default();
         };

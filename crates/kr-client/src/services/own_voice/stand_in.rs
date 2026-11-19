@@ -114,6 +114,28 @@ pub fn created_body(session_id: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A `session.closed` event with every member the vendored profile requires, answering the
+/// command `client_event_id` when there is one.
+#[must_use]
+pub fn closed_event(reason: &str, client_event_id: Option<&Value>) -> Value {
+    let mut event = json!({
+        "type": "session.closed",
+        "event_id": "e",
+        "reason": reason,
+        "session": {
+            "id": "live_u1_stand_in",
+            "model": "gpt-live-1",
+            "status": "active",
+            "expires_at": 1,
+        },
+        "usage": { "seconds": 3 },
+    });
+    if let Some(id) = client_event_id {
+        event["client_event_id"] = id.clone();
+    }
+    event
+}
+
 /// The body OpenAI answers a hangup for a session it does not know with.
 #[must_use]
 pub fn not_found_body() -> Vec<u8> {
@@ -236,7 +258,7 @@ struct StandSocket {
 impl SidebandSocket for StandSocket {
     fn send(&mut self, text: String) -> TransportFuture<'_, bool> {
         Box::pin(async move {
-            let Ok(command) = serde_json::from_str::<Value>(&text) else {
+            let Ok(command) = crate::services::json::read::<Value>(text.as_bytes()) else {
                 return false;
             };
             self.stand_in
@@ -251,9 +273,7 @@ impl SidebandSocket for StandSocket {
                 .unwrap_or_default();
             let id = command.get("event_id").cloned().unwrap_or(Value::Null);
             let reply = match kind {
-                "session.close" if answer_close => Some(json!({
-                    "type": "session.closed", "event_id": "e", "client_event_id": id,
-                    "reason": "close_requested" })),
+                "session.close" if answer_close => Some(closed_event("close_requested", Some(&id))),
                 "session.input_audio.mute" if ack => Some(json!({
                     "type": "session.input_audio.muted", "event_id": "e", "client_event_id": id })),
                 "session.input_audio.unmute" if ack => Some(json!({
@@ -289,7 +309,7 @@ impl OwnVoiceTransport for StandIn {
         _bound: Duration,
     ) -> TransportFuture<'a, Result<Reply, Lost>> {
         Box::pin(async move {
-            let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+            let value = crate::services::json::read::<Value>(&body).unwrap_or(Value::Null);
             *self
                 .state
                 .last_body

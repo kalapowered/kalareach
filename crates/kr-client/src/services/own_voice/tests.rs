@@ -4,13 +4,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kr_protocol::ids::ActionId;
+use kr_protocol::ids::{ActionId, DeviceId};
 use kr_protocol::scalars::Uuid;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use super::stand_in::{
-    CreateScript, HangupScript, MemoryLedger, StandIn, StaticKey, created_body, not_found_body,
+    CreateScript, HangupScript, MemoryLedger, StandIn, StaticKey, closed_event, created_body,
+    not_found_body,
 };
 use super::*;
 use crate::services::own_registry::RegistryState;
@@ -52,13 +53,18 @@ fn fixture() -> Value {
     serde_json::from_slice(&std::fs::read(path).expect("the vendored request")).expect("json")
 }
 
+/// The device every call of these cases is made by.
+fn device() -> String {
+    DeviceId::new(Uuid::from_bytes([0xd1; 16])).to_string()
+}
+
 fn request(action: u8) -> VoiceSessionRequest {
     VoiceSessionRequest {
         offer_sdp: fixture()["offer"].as_str().expect("the offer").to_owned(),
         host_id: "host".to_owned(),
         duration_seconds: 300,
         reasoning_budget_minor: None,
-        device_id: Some("device-1".to_owned()),
+        device_id: Some(device()),
         action_id: ActionId::new(Uuid::from_bytes([action; 16])),
         expected_rate_version: None,
     }
@@ -227,7 +233,7 @@ async fn a_working_start_records_the_id_proves_the_channel_and_a_second_start_is
     let refusal = start(&world, 2).await.expect_err("a conflict");
     assert_eq!(refusal.code(), ErrorCode::DraftConflict);
     let said = refusal.to_string();
-    assert!(said.contains("device-1") && said.contains("not confirmed closed"));
+    assert!(said.contains(&device()) && said.contains("not confirmed closed"));
     assert!(world.stand_in.recorded().hangups.is_empty());
     assert_eq!(states(&world), [CallState::Open]);
 }
@@ -465,9 +471,7 @@ async fn a_lost_side_channel_is_attached_again_under_a_higher_revision_and_a_clo
     assert!(acks.lock().expect("acks").iter().any(|event| matches!(
         event, HostCallEvent::WriteAcknowledged { write_id } if write_id == "w-1")));
     // The provider says it closed; the socket closing after it is not a loss.
-    world
-        .stand_in
-        .event(&json!({"type":"session.closed","event_id":"e","reason":"expired"}));
+    world.stand_in.event(&closed_event("expired", None));
     world.stand_in.drop_socket();
     for _ in 0..8 {
         tokio::task::yield_now().await;
@@ -681,7 +685,7 @@ fn stored(world: &World, byte: u8, state: CallState, session: Option<&str>) {
             call_id: format!("call-{byte}"),
             attempt_id: format!("attempt-{byte}"),
             action_id: ActionId::new(Uuid::from_bytes([byte; 16])),
-            device_id: "device-1".to_owned(),
+            device_id: device(),
             asked_ms: 1_000,
             closes_at_ms: 2_000,
         },
