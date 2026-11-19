@@ -265,13 +265,15 @@ enum Route {
     Real(Box<Real>),
 }
 
-/// A real agent: the entry, its turn ledger, the keys the run's files are searched for, the person's
-/// home as the system's account database names it, and the person's own files as they stood before
-/// anything started.
+/// A real agent: the entry, its turn ledger (none where the case runs with no login), the keys the
+/// run's files are searched for, the person's home as the system's account database names it, and
+/// the person's own files as they stood before anything started.
 struct Real {
     build: Build,
     account: Account,
-    ledger: Ledger,
+    /// The ledger the case's turns are charged to: none in a case that runs with no login, which
+    /// starts no model turn and so owns no allowance.
+    ledger: Option<Ledger>,
     held: HeldKeys,
     home: PathBuf,
     person: MetaGuard,
@@ -290,10 +292,17 @@ impl Route {
     ///
     /// # Panics
     ///
+    /// With `login` false the case runs with no login: the entry still gives its configuration, but
+    /// the descriptor of the login's value is not read, no ledger is asked for and none can be
+    /// charged, while the file guards and the searches for the other keys are kept. The mode is
+    /// the case's own and is chosen here, before any key is acquired.
+    ///
+    /// # Panics
+    ///
     /// Panics when the entry names no login, the run's `HOME` is not the person's home as the
     /// system's account database names it, the values of the keys cannot be read, or the person's
     /// files cannot be looked at: nothing has started, and no turn is spent.
-    fn from_environment(case: &str) -> Self {
+    fn from_environment(case: &str, login: bool) -> Self {
         let Some(path) = std::env::var_os(BUILD_VARIABLE)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
@@ -315,7 +324,7 @@ impl Route {
             person_home(std::env::var_os("HOME").as_deref()).unwrap_or_else(|why| panic!("{why}"));
         // The turn ledger is made by the operator before the run: a missing one, or one with no
         // array for the budget, stops the run here, before anything starts and before any key is read.
-        let ledger = Ledger::from_environment(&account.budget, account.turns);
+        let ledger = login.then(|| Ledger::from_environment(&account.budget, account.turns));
         // The guard over the person's directory compares the whole of it at the end, and cannot
         // tell a write of another agent process of theirs from the run's: none runs at the start.
         let others = other_agent_processes(&executable_name(&build.command), None)
@@ -325,7 +334,12 @@ impl Route {
             "{}",
             other_agents_refusal(&others, "before the run starts")
         );
-        let held = HeldKeys::read(&format!("gateway case {case}"), &account);
+        let who = format!("gateway case {case}");
+        let held = if login {
+            HeldKeys::read(&who, &account)
+        } else {
+            HeldKeys::read_without_login(&who)
+        };
         let person = MetaGuard::take(&home, &PERSON_TREES);
         Self::Real(Box::new(Real {
             build,
@@ -685,6 +699,10 @@ impl Real {
             .unwrap_or_else(|why| panic!("no turn is charged: the person's files changed: {why}"));
         let _ = self
             .ledger
+            .as_ref()
+            .unwrap_or_else(|| {
+                panic!("the case {case} runs with no login and has no ledger: nothing is charged")
+            })
             .charge(case, what)
             .unwrap_or_else(|why| panic!("{why}"));
     }
@@ -2599,7 +2617,7 @@ fn ends(
         let (guard_stops, guard_evidence) = real.person.compare();
         stops.extend(guard_stops);
         evidence["person_files"] = guard_evidence;
-        let charged = real.ledger.charged_here();
+        let charged = real.ledger.as_ref().map_or(0, Ledger::charged_here);
         evidence["turns"] = serde_json::json!({ "charged": charged });
         if let (Some(run), Ok(())) = (&run, &readable) {
             let recorded = turns_recorded(
@@ -2611,17 +2629,21 @@ fn ends(
             match audit_turns(result.is_ok(), charged, &recorded) {
                 Audit::Agrees => {}
                 Audit::Surplus(surplus) => {
-                    let said = real
-                        .ledger
-                        .charge_found(
-                            case,
-                            "a turn in the agent's record that the case did not charge",
-                            surplus,
-                        )
-                        .map_or_else(
-                            |why| format!("the ledger could not be written: {why}"),
-                            |total| format!("the ledger now says {total} spent"),
-                        );
+                    let said = real.ledger.as_ref().map_or_else(
+                        || "the case runs with no login and has no ledger".to_owned(),
+                        |ledger| {
+                            ledger
+                                .charge_found(
+                                    case,
+                                    "a turn in the agent's record that the case did not charge",
+                                    surplus,
+                                )
+                                .map_or_else(
+                                    |why| format!("the ledger could not be written: {why}"),
+                                    |total| format!("the ledger now says {total} spent"),
+                                )
+                        },
+                    );
                     let found = recorded.as_ref().ok().cloned().unwrap_or_default();
                     stops.push((
                         "uncharged_turns",
@@ -2848,6 +2870,8 @@ struct Setup {
     upgrade: bool,
     /// The forging launcher at the place of the worker's launcher, the real one beside it (8b).
     forge: bool,
+    /// The case runs with no login: no login descriptor is read and no turn is charged (8b).
+    no_login: bool,
 }
 
 /// [`run_case`], with the run `setup` asks for.
@@ -2872,7 +2896,7 @@ fn run_case_in(
             return;
         }
     };
-    let route = match std::panic::catch_unwind(|| Route::from_environment(case)) {
+    let route = match std::panic::catch_unwind(|| Route::from_environment(case, !setup.no_login)) {
         Ok(route) => route,
         Err(panic) => {
             records_failure(case, test, &kept_panic_text(&panic_text(&*panic)), &[]);
@@ -3580,6 +3604,7 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
     run_case_in(
         Setup {
             forge: true,
+            no_login: true,
             ..Setup::default()
         },
         "gateway-credential",
@@ -3587,11 +3612,6 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
         TEST,
         "stay",
         |ctx, session| {
-            assert!(
-                matches!(ctx.route, Route::StandIn),
-                "the real arm of this part runs with no login once the build's launch is admitted \
-                 behind the gateway; the stand-in route is the one this build runs"
-            );
             let stand_in_inode = inode_of(&ctx.executable);
             let worker = u32::try_from(
                 ctx.run
@@ -3613,9 +3633,24 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
             session.environment_read.set(true);
             session.host.agent_starts();
             ctx.checks_the_placed_files();
+            // The real arm: the files that would load the person's own settings are known absent
+            // and the entry's isolation probes answer as they must, with the run's configuration
+            // directory and no login, before the build is started; the route to it is checked
+            // right before the typing.
+            if let Route::Real(real) = &ctx.route {
+                let absent = real.absent_list(&ctx.run);
+                real.checks_absent(&ctx.run, &absent);
+                real.proves_isolation(&ctx.run, &ctx.variables(&session.host));
+                real.checks_absent(&ctx.run, &absent);
+                real.checks_the_route(&ctx.run);
+            }
             // One typed launch: the line is typed once, with a mark on the byte stream before it.
             let mark = session.person.window.collected().mark();
-            session.person.types("codex");
+            let typed = match &ctx.route {
+                Route::StandIn => "codex".to_owned(),
+                Route::Real(real) => real.typed(&[]),
+            };
+            session.person.types(&typed);
             let line = bytes_show_within(&session.person, mark, "forged presentation");
             let text = line
                 .as_ref()
@@ -3672,11 +3707,20 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
                 instance.is_ok(),
                 "the instance served through the gateway: {instance:?}"
             );
-            // (d) the program did not run as typed.
-            assert!(
-                !after.contains(RAN_AS_TYPED),
-                "the line ran as typed: {after}"
-            );
+            // (d) the program did not run as typed: the stand-in's marker is absent; the real
+            // build reaches its first screen with the gateway behind it.
+            match &ctx.route {
+                Route::StandIn => assert!(
+                    !after.contains(RAN_AS_TYPED),
+                    "the line ran as typed: {after}"
+                ),
+                Route::Real(real) => {
+                    let _ = session.person.sees(
+                        &real.build.ready,
+                        "the build reaches its first screen behind the gateway",
+                    );
+                }
+            }
             // (e) one application server for the session's worker.
             assert_eq!(
                 servers.borrow().len(),

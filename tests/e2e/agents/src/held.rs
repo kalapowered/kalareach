@@ -88,6 +88,25 @@ impl HeldKeys {
             });
             (name.clone(), value)
         });
+        Self::searched(who, key)
+    }
+
+    /// The keys of a case that runs with no login: the descriptor of the login's value is neither
+    /// asked for nor read, so a run given none starts, and the values of the other keys the
+    /// harness's shell holds are read and searched for as for any case.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`HeldKeys::read`] does for the other keys.
+    #[must_use]
+    pub fn read_without_login(who: &str) -> Self {
+        Self::searched(who, None)
+    }
+
+    /// The keys with the login's own `key`, where there is one: the other keys are read, every
+    /// panic of the process goes through the held-key rule from here, and a value that cannot be
+    /// searched for is refused.
+    fn searched(who: &str, key: Option<(String, String)>) -> Self {
         // The other keys the harness's shell holds, whose values the driver's data is searched for;
         // the login's own value is searched for by the key scan.
         let others: Vec<String> = keys::scan_values_from_descriptor()
