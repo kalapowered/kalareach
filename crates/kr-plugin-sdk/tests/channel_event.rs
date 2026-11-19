@@ -142,8 +142,8 @@ fn kr_req_12_26_an_event_is_written_only_for_a_method_the_table_routes_toward_th
 }
 
 /// An event is built from members and writes each place once: a path with an index or no
-/// segment, a place written twice, a place inside a value already written, and the method's own
-/// place are refused, so a member cannot change the method.
+/// segment, a place written twice, a place inside a value already written, the method's own
+/// place and a place that holds the method are refused, so a member cannot change the method.
 #[test]
 fn an_event_is_built_from_members_and_writes_each_place_once() {
     let table = channels();
@@ -202,10 +202,19 @@ fn an_event_is_built_from_members_and_writes_each_place_once() {
         table.event(&route, &[(&under_method, json!("other"))]),
         Err(EventError::Unwritable { .. })
     ));
+
+    let mut nested = channels();
+    nested.method_path = path(&["envelope", "kind"]);
+    let above_method = path(&["envelope"]);
+    assert!(matches!(
+        nested.event(&route, &[(&above_method, json!({"kind": "other/method"}))]),
+        Err(EventError::Unwritable { .. })
+    ));
 }
 
-/// KR-REQ-12.26: an event carries no identifier. A member at the table's request-identifier path is
-/// refused, so the message cannot be taken for a request that waits for an answer.
+/// KR-REQ-12.26: an event carries no identifier. A member at the table's request-identifier
+/// path, or inside it, is refused, so the message cannot be taken for a request that waits for
+/// an answer.
 #[test]
 fn kr_req_12_26_an_event_refuses_a_member_at_the_tables_identifier_path() {
     let table = channels();
@@ -219,6 +228,12 @@ fn kr_req_12_26_an_event_refuses_a_member_at_the_tables_identifier_path() {
     ));
     assert!(matches!(
         table.event(&route, &[(&identifier, json!(7)), (&content, json!("hi"))]),
+        Err(EventError::Unwritable { .. })
+    ));
+
+    let inside_identifier = path(&["id", "part"]);
+    assert!(matches!(
+        table.event(&route, &[(&inside_identifier, json!(7))]),
         Err(EventError::Unwritable { .. })
     ));
 }
