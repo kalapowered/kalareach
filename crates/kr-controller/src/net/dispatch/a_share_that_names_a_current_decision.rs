@@ -2489,7 +2489,9 @@ impl Served {
 
     /// The local owner's answer to `approval`, which the channel carries to the application.
     async fn answer_approval(&self, approval: &PendingResource) {
-        let (answered, _) = self
+        // The channel carries the verdict and confirms nothing, so the answer ends as an outcome
+        // nobody can establish and the request is held as uncertain: terminal, not resolved.
+        let answered = self
             .service
             .broker()
             .agent_approval_respond(
@@ -2511,8 +2513,17 @@ impl Served {
                 kr_ipc::now_ms(),
             )
             .await
-            .expect("the owner answers the approval");
-        assert!(answered.state.is_terminal(), "{answered:?}");
+            .expect_err("the answer ends as an outcome nobody can establish");
+        assert_eq!(
+            answered.code(),
+            kr_protocol::error::ErrorCode::OutcomeUnknown
+        );
+        let held = self
+            .service
+            .broker()
+            .pending(approval.resource_id)
+            .expect("the request is held");
+        assert!(held.state.is_terminal(), "{held:?}");
     }
 
     /// Shares the session with `recipient` as the local owner, as `role`, and has the recipient

@@ -31,7 +31,7 @@
 use std::sync::{Arc, Mutex, Weak};
 
 use kr_protocol::broker::{
-    ActionProvenance, DecodedProjection, InstanceCapabilityIdentity, InstanceCapabilityRecord,
+    DecodedProjection, InstanceCapabilityIdentity, InstanceCapabilityRecord,
     InstanceCapabilityState, InstanceEvidenceSource, InstanceInvalidation, MethodTableVersionText,
 };
 use kr_protocol::gateway::{GatewayMode, PendingResource};
@@ -49,9 +49,17 @@ use crate::broker::duplex::{Counted, detached};
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::gateway::ChannelConnection;
 use crate::broker::methods::{
-    PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest,
+    PendingTransmission, UpstreamBody, UpstreamDispatch, UpstreamRequest,
 };
 use crate::broker::{Broker, BrokerState, UpstreamArrival};
+
+/// What the receipt of an answer a channel took says, and so what an inspection of it reads.
+///
+/// It claims no write, because a failed write ends the same way: what the host can say is that
+/// the channel confirms nothing.
+pub const ANSWER_NOT_CONFIRMED: &str = "The host cannot tell whether Claude Code took this \
+     answer. Claude Code does not confirm answers. If the request still waits in its terminal, \
+     answer it there.";
 
 /// How many admitted answers one channel holds before its writer takes them.
 ///
@@ -358,12 +366,7 @@ impl UpstreamDispatch for ChannelDispatch {
 
     fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission> {
         self.admit(request)?;
-        let UpstreamBody::Approval {
-            response,
-            upstream_request_id,
-            ..
-        } = &request.body
-        else {
+        let UpstreamBody::Approval { response, .. } = &request.body else {
             return Err(BrokerError::invalid(
                 "only an answer is carried on a channel",
             ));
@@ -374,15 +377,17 @@ impl UpstreamDispatch for ChannelDispatch {
             }
             refusal
         };
+        // Both refusals below come before a byte enters the queue: nothing was sent, which is
+        // established and not uncertain.
         let queue = self
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
             .ok_or_else(|| {
-                count(BrokerError::UpstreamUnavailable {
+                BrokerError::NotTransmitted(Box::new(count(BrokerError::UpstreamUnavailable {
                     detail: "the channel has closed".to_owned(),
-                })
+                })))
             })?;
         let (written, outcome) = tokio::sync::oneshot::channel();
         queue
@@ -391,22 +396,24 @@ impl UpstreamDispatch for ChannelDispatch {
                 written,
             })
             .map_err(|_| {
-                count(BrokerError::UpstreamUnavailable {
+                BrokerError::NotTransmitted(Box::new(count(BrokerError::UpstreamUnavailable {
                     detail: "the channel's writer has closed or holds as many answers as it takes"
                         .to_owned(),
-                })
+                })))
             })?;
-        let upstream_request_id = upstream_request_id.clone();
         let counted = self.counted.clone();
         // On a task of its own: the writer's verdict on the answer is counted whether or not the
         // caller is still waiting for it.
+        //
+        // Every end past the queue is a channel end. A completed write is the host's own fact and
+        // not the application's acknowledgement, which a channel never gives, so it ends unknown;
+        // a failed write, or a channel that closed first, ends the same way, because the frame may
+        // have gone in part.
         Ok(detached(async move {
             let refusal = match outcome.await {
                 Ok(Ok(())) => {
-                    return Ok(UpstreamOutcome {
-                        upstream_request_id: Some(upstream_request_id),
-                        turn_id: None,
-                        provenance: ActionProvenance::AuthenticatedHookResponse,
+                    return Err(BrokerError::ChannelEnd {
+                        detail: ANSWER_NOT_CONFIRMED.to_owned(),
                     });
                 }
                 Ok(Err(error)) => error,
@@ -417,7 +424,9 @@ impl UpstreamDispatch for ChannelDispatch {
             if let Some(counted) = &counted {
                 counted.refused(&refusal);
             }
-            Err(refusal)
+            Err(BrokerError::ChannelEnd {
+                detail: refusal.to_string(),
+            })
         }))
     }
 }
