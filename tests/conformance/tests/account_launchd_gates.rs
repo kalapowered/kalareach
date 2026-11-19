@@ -309,25 +309,24 @@ fn the_daemon_the_suites_start_is_the_one_built_with_the_hold() {
 /// The scan of the pickers finds a plain pick in each form and not a held one or a comment.
 #[test]
 fn the_picker_scan_finds_a_plain_daemon_pick_and_only_that() {
-    let found = |source: &str| picks_of(source, &PICKERS, &plain_daemon()).len();
-    assert_eq!(found(r#"let p = beside_this_test("kr-controller");"#), 1);
-    assert_eq!(found(r#"let p = beside("kr-controller").unwrap();"#), 1);
-    assert_eq!(found(r#"let p = env!("CARGO_BIN_EXE_kr-controller");"#), 1);
-    assert_eq!(found(r#"let p = built_binary("kr-controller");"#), 0);
-    assert_eq!(found(r#"let all = ["CARGO_BIN_EXE_kr-controller"];"#), 0);
-    assert_eq!(
-        found(r#"let p = env!("CARGO_BIN_EXE_kr-controller-held");"#),
-        0
-    );
-    assert_eq!(
-        found(r#"let p = beside_this_test("kr-controller-held");"#),
-        0
-    );
+    // NAME stands for the daemon's plain name, which a source of this file does not spell out.
+    let found = |source: &str| {
+        picks_of(
+            &source.replace("NAME", &plain_daemon()),
+            &PICKERS,
+            &plain_daemon(),
+        )
+        .len()
+    };
+    assert_eq!(found(r#"let p = beside_this_test("NAME");"#), 1);
+    assert_eq!(found(r#"let p = beside("NAME").unwrap();"#), 1);
+    assert_eq!(found(r#"let p = env!("CARGO_BIN_EXE_NAME");"#), 1);
+    assert_eq!(found(r#"let p = built_binary("NAME");"#), 0);
+    assert_eq!(found(r#"let all = ["CARGO_BIN_EXE_NAME"];"#), 0);
+    assert_eq!(found(r#"let p = env!("CARGO_BIN_EXE_NAME-held");"#), 0);
+    assert_eq!(found(r#"let p = beside_this_test("NAME-held");"#), 0);
     assert_eq!(found(r#"let p = beside_this_test("kr-worker");"#), 0);
-    assert_eq!(
-        found("// beside_this_test(\"kr-controller\")\nfn f() {}"),
-        0
-    );
+    assert_eq!(found("// beside_this_test(\"NAME\")\nfn f() {}"), 0);
     assert_eq!(
         found(r#"fn beside_this_test(name: &str) -> PathBuf { }"#),
         0
