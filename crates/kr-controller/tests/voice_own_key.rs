@@ -1198,6 +1198,98 @@ async fn a_plain_removal_that_cannot_confirm_the_late_session_closed_keeps_the_k
     daemon.host.stop().await;
 }
 
+/// A removal that cannot wait out the task of a call it ended keeps the key, the record and the
+/// fence: no start is admitted and no key is put until that task has ended, and then the registry
+/// is free again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_that_task_ends() {
+    let mut daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    // The call's own task has ended in the host; what stays is a task that still holds the key.
+    let task = daemon.host.controller().own_key_task_token();
+    let refused = remove_key(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("the removal could not wait out the task");
+    assert_eq!(refused.message, words::STILL_CLOSING);
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the fence is kept while a task that may read the key still runs"
+    );
+    let replaced = set_key(&mut daemon.control, &daemon.host, OTHER_KEY)
+        .await
+        .expect_err("the key is not replaced while the task runs");
+    assert_eq!(replaced.message, words::KEY_IN_USE);
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+    let refused_start = phone
+        .start()
+        .await
+        .expect_err("no start is admitted while the fence is kept");
+    assert_eq!(refused_start.code, ErrorCode::ResourceUnavailable);
+    assert_eq!(refused_start.message, words::SETTLING);
+
+    drop(task);
+    assert!(the_registry_is(&daemon, RegistryState::Idle));
+    set_key(&mut daemon.control, &daemon.host, OTHER_KEY)
+        .await
+        .expect("the key is replaced once the task has ended");
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(OTHER_KEY));
+    daemon.host.stop().await;
+}
+
+/// A forget-calls that cannot wait out the task of a call it ended forgets nothing and keeps the
+/// fence until that task has ended, so that the task never finds its record or its key gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forget_calls_that_cannot_wait_out_a_calls_task_keeps_the_record_and_the_fence() {
+    let mut daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    let task = daemon.host.controller().own_key_task_token();
+    let rows_before = rows_of(&daemon).len();
+    let refused = forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("forgetting could not wait out the task");
+    assert_eq!(refused.message, words::STILL_CLOSING);
+    assert_eq!(
+        rows_of(&daemon).len(),
+        rows_before,
+        "the record is kept while a task may still write to it"
+    );
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the fence is kept while the task runs"
+    );
+    drop(task);
+    assert!(the_registry_is(&daemon, RegistryState::Idle));
+    forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect("forgetting is answered once the task has ended");
+    assert!(rows_of(&daemon).is_empty());
+    daemon.host.stop().await;
+}
+
+/// A clean stop takes the fence first and keeps it: the serving tasks still run while the daemon
+/// stops, so no start is admitted from then on, and the calls the host controls are ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clean_stop_fences_the_registry_before_it_ends_the_calls_and_admits_no_start_after() {
+    let daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    daemon.host.controller().close_host_calls_for_stop().await;
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the fence taken by the stop is kept"
+    );
+    let refused = phone
+        .start()
+        .await
+        .expect_err("no start is admitted while the daemon stops");
+    assert_eq!(refused.message, words::SETTLING);
+    assert!(rows_of(&daemon).is_empty(), "the call was closed");
+    daemon.host.stop().await;
+}
+
 /// A forget-calls hangs a live call up once, and only when its close did not hear `session.closed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn forget_calls_hangs_a_live_call_up_once_and_only_when_its_close_heard_no_closing_event() {

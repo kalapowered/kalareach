@@ -1499,11 +1499,14 @@ impl Controller {
         self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
             .await;
         let quiet = provider.registry().quiesce(CLEANUP_BOUND).await;
-        let left = match provider.close_stored_calls().await {
-            // A task that is still running may hold a call the record does not show yet.
-            StoredCalls::NoneLeft if !quiet => StoredCalls::NotConfirmed,
-            left => left,
-        };
+        let left = provider.close_stored_calls().await;
+        if !quiet {
+            // A task that still runs may read the key and write a row, and the call it holds may
+            // not be in the record yet. The key and the record stay as they are, and the fence
+            // stays until that task has ended: no start is admitted and no key is put meanwhile.
+            provider.registry().unfence_when_quiet();
+            return Err(refused_voice(words::STILL_CLOSING));
+        }
         // No stored call with a session id stands, so each was confirmed closed: a late session
         // that was hung up is closed, whatever the start reported.
         let settled = if left == StoredCalls::NoneLeft && settled == StartSettled::MayStillRun {
@@ -1562,7 +1565,12 @@ impl Controller {
         let settled = provider.settle().await;
         self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
             .await;
-        provider.registry().quiesce(CLEANUP_BOUND).await;
+        if !provider.registry().quiesce(CLEANUP_BOUND).await {
+            // A task that still runs may read the key and write a row: the record stays as it is
+            // and the fence stays until that task has ended.
+            provider.registry().unfence_when_quiet();
+            return Err(refused_voice(words::STILL_CLOSING));
+        }
         // A call whose close was confirmed is hung up no more. One bounded best-effort hangup of
         // each call that is still live, before its record goes.
         for session in &provider.live_sessions() {
@@ -3206,10 +3214,10 @@ fn late_start_of(
     }
 }
 
-/// The one refusal of parameters that do not read as `voice.credential.remove`'s.
 /// How long a removal waits for the tasks of the calls it ended to finish their records.
 const CLEANUP_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The one refusal of parameters that do not read as `voice.credential.remove`'s.
 const VOICE_REMOVE_PARAMS_REFUSAL: &str = "voice.credential.remove takes one provider: {kind: \
      openai_live}";
 

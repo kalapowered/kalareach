@@ -168,6 +168,10 @@ struct Inner {
     slot: Option<Arc<StartSlot>>,
     /// Whether the fence that is held is the start-time reconcile's, which a removal waits for.
     reconciling: bool,
+    /// Whether the fence that is held is kept until every tracked task has ended: a settle that
+    /// could not wait for them leaves the key and the record as they are, and no start runs
+    /// meanwhile.
+    draining: bool,
 }
 
 #[derive(Default)]
@@ -227,6 +231,7 @@ impl CallRegistry {
                 epoch: 1,
                 slot: None,
                 reconciling: false,
+                draining: false,
             }),
             ledger,
             tasks: Arc::new(Tasks::default()),
@@ -241,7 +246,27 @@ impl CallRegistry {
     /// Where the registry stands now.
     #[must_use]
     pub fn state(&self) -> RegistryState {
-        self.inner().state
+        let mut inner = self.inner();
+        self.lapse_drained(&mut inner);
+        inner.state
+    }
+
+    /// Ends a fence that is kept for tasks once no tracked task is left. Every read of the
+    /// registry's state comes through here, under its lock, so no start, change or fence sees the
+    /// held fence after the last task has ended, and none sees it end before.
+    fn lapse_drained(&self, inner: &mut Inner) {
+        if inner.draining
+            && inner.state == RegistryState::Settling
+            && *self
+                .tasks
+                .running
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                == 0
+        {
+            inner.state = RegistryState::Idle;
+            inner.draining = false;
+        }
     }
 
     /// The current ownership epoch.
@@ -260,6 +285,7 @@ impl CallRegistry {
     /// Returns the reason the start is refused.
     pub fn begin_start(self: &Arc<Self>) -> Result<StartTicket, StartRefusal> {
         let mut inner = self.inner();
+        self.lapse_drained(&mut inner);
         match inner.state {
             RegistryState::Settling => return Err(StartRefusal::Settling),
             RegistryState::Starting | RegistryState::Running => {
@@ -296,7 +322,8 @@ impl CallRegistry {
     ///
     /// Returns why a start would be refused now, and runs nothing.
     pub fn while_idle<T>(&self, change: impl FnOnce() -> T) -> Result<T, StartRefusal> {
-        let inner = self.inner();
+        let mut inner = self.inner();
+        self.lapse_drained(&mut inner);
         match inner.state {
             RegistryState::Settling => return Err(StartRefusal::Settling),
             RegistryState::Starting | RegistryState::Running => {
@@ -441,6 +468,7 @@ impl CallRegistry {
 
     fn take_fence(&self, reconciling: bool) -> Option<Fenced> {
         let mut inner = self.inner();
+        self.lapse_drained(&mut inner);
         if inner.state == RegistryState::Settling {
             return None;
         }
@@ -475,12 +503,25 @@ impl CallRegistry {
         }
     }
 
+    /// Keeps the fence that is held until no tracked task is left, and ends it then, without any
+    /// further call. A settle whose wait for the tasks ran out uses it instead of
+    /// [`unfence`](Self::unfence): a task that still runs may read the key and write a row, so
+    /// neither is changed and no start is admitted until that task has ended.
+    pub fn unfence_when_quiet(&self) {
+        let mut inner = self.inner();
+        if inner.state == RegistryState::Settling {
+            inner.draining = true;
+        }
+        self.lapse_drained(&mut inner);
+    }
+
     /// Ends a fence: the registry is idle and starts are taken again.
     pub fn unfence(&self) {
         let mut inner = self.inner();
         if inner.state == RegistryState::Settling {
             inner.state = RegistryState::Idle;
             inner.reconciling = false;
+            inner.draining = false;
         }
         drop(inner);
         self.unfenced.notify_waiters();
@@ -753,6 +794,37 @@ mod tests {
             blocked.while_idle(|| 7),
             Err(StartRefusal::Blocked { .. })
         ));
+    }
+
+    /// A fence kept for a task that still runs holds until that task has ended: no start, no
+    /// change of the key and no second fence meanwhile, and then the registry is idle again.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_kept_for_a_task_that_still_runs_holds_until_that_task_ends() {
+        let registry = CallRegistry::new(Rows::with(CallState::Closed, 1));
+        let token = registry.track();
+        let _fenced = registry.fence().expect("a fence");
+        assert!(
+            !registry.quiesce(Duration::from_secs(1)).await,
+            "the task outlasts the wait"
+        );
+        registry.unfence_when_quiet();
+        assert_eq!(registry.state(), RegistryState::Settling);
+        assert!(matches!(
+            registry.begin_start(),
+            Err(StartRefusal::Settling)
+        ));
+        assert_eq!(registry.while_idle(|| 7), Err(StartRefusal::Settling));
+        assert!(registry.fence().is_none());
+        assert!(
+            registry
+                .fence_after_reconcile(Duration::from_secs(1))
+                .await
+                .is_none()
+        );
+        drop(token);
+        assert_eq!(registry.state(), RegistryState::Idle);
+        assert_eq!(registry.while_idle(|| 7), Ok(7));
+        assert!(registry.begin_start().is_ok());
     }
 
     #[tokio::test(start_paused = true)]

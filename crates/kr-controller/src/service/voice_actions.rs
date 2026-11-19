@@ -150,13 +150,17 @@ impl Controller {
     /// crash, a sleep or a lost network leaves their records for the next start to reconcile.
     pub async fn close_host_calls_for_stop(&self) {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+            // The serving tasks still run while the daemon stops, so no start is admitted from
+            // here on: the fence is taken first and is not let go. A removal that holds it
+            // already settles the same calls.
+            let registry = self.own_voice.registry();
+            let _fenced = registry.fence();
+            // A start in flight is waited for, so the call it gives out is one this ends.
+            self.own_voice.settle().await;
             self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::Stop)
                 .await;
             // The calls' tasks have finished their records before the daemon exits.
-            self.own_voice
-                .registry()
-                .quiesce(std::time::Duration::from_secs(20))
-                .await;
+            registry.quiesce(std::time::Duration::from_secs(20)).await;
         })
         .await;
     }
@@ -167,6 +171,14 @@ impl Controller {
     #[must_use]
     pub fn own_key_registry_state(&self) -> kr_client::services::RegistryState {
         self.own_voice.registry().state()
+    }
+
+    /// What a call's task holds while it runs, as a test takes it: a removal, a forget and a stop
+    /// wait for it, and the key is not replaced while it is held.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn own_key_task_token(&self) -> kr_client::services::TaskToken {
+        self.own_voice.registry().track()
     }
 
     /// The environment's voice service.
