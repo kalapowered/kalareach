@@ -291,6 +291,23 @@ describe('starting a call', () => {
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
   })
 
+  // A typed `creation_unknown` answer is kept by the device as a notice: the screen reads the
+  // state at once, so the notice and its two controls show without another read.
+  it('shows the saved notice of a start the host could not confirm at once', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    controls.makeVoiceStartUnconfirmed()
+    await waitForChoice()
+
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+
+    expect(
+      await screen.findByText(/The host could not confirm whether the voice service created this call\./)
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Start again' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+  })
+
   // The control that was pressed goes with the screen it was on, and focus left on nothing sends a
   // keyboard or screen-reader user back to the top of the document: the call this screen's own start
   // began takes focus on its heading.

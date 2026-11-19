@@ -810,6 +810,9 @@ export function VoiceRoute({
               setChoice((current) =>
                 current ? choiceWithRate(current, outcome.rate_changed.rate) : current
               )
+              // The host's hold took this start, so the device changed the entries of the starts
+              // before it: what it keeps is read again.
+              void ask(() => port.voiceCallState()).then(settle, () => undefined)
               return
             }
             if ('unavailable' in outcome) {
@@ -818,6 +821,9 @@ export function VoiceRoute({
             }
             if ('creation_unknown' in outcome) {
               setNotice(outcome.creation_unknown.message)
+              // The device keeps this start as a notice with "Start again" and "Dismiss", and
+              // changed the entries of the starts before it: what it keeps is read at once.
+              void ask(() => port.voiceCallState()).then(settle, () => undefined)
               return
             }
             const session = outcome.started.session

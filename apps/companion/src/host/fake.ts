@@ -732,6 +732,8 @@ export interface FakeHostControls {
   speechReachesTheHost(reaches: boolean): void
   /** Makes the next start answer `unavailable` with this reason, or clears that with null. */
   refuseVoiceStart(reason: string | null): void
+  /** Has the host answer the next start with a typed `creation_unknown`, which the device keeps as a notice. */
+  makeVoiceStartUnconfirmed(): void
   /**
    * Moves the managed rate on, as an operator deploying a new one does.
    *
@@ -1330,6 +1332,7 @@ export function fakeHost(
     finalising: false,
     brokerReachable: seed.brokerReachable,
     startRefusal: null,
+    startUnconfirmed: false,
     rate: { ...VOICE_TERMS.rate },
     terms: seed.terms,
     scope: 1,
@@ -1746,6 +1749,30 @@ export function fakeHost(
               reason: 'service_capacity',
               message: 'Managed voice is closed at the moment.',
               alternatives: [...VOICE_TERMS.alternatives]
+            }
+          }
+        }
+      })
+    }
+    if (voice.startUnconfirmed) {
+      // As the device does: the start is kept as a notice, in the state read after the answer.
+      voice.owed.push({
+        kind: 'start_unconfirmed',
+        words: 'The host could not confirm whether the voice service created this call.',
+        action_id: 'a-start-unconfirmed',
+        voice_session_id: null,
+        until_ms: 18_446_744_073_709_552_000,
+        host_reference: 'a-host',
+        host_name: 'Your Mac'
+      })
+      return Promise.resolve({
+        receipt: null,
+        action_id: 'a-start-unconfirmed',
+        value: {
+          outcome: {
+            creation_unknown: {
+              attempt_id: 'attempt-1',
+              message: 'The voice service may hold a call for this start.'
             }
           }
         }
@@ -3695,6 +3722,9 @@ export function fakeHost(
     refuseVoiceStart(reason) {
       voice.startRefusal = reason
     },
+    makeVoiceStartUnconfirmed() {
+      voice.startUnconfirmed = true
+    },
     changeVoiceScope() {
       voice.scope += 1
     },
@@ -3943,6 +3973,8 @@ interface VoiceState {
   brokerReachable: boolean
   /** The reason a start answers `unavailable` with, when one is set. */
   startRefusal: string | null
+  /** Whether the host answers a start with a typed `creation_unknown`, which the device keeps. */
+  startUnconfirmed: boolean
   /** The rate the service would charge a call started now. */
   rate: VoiceRate
   /** What the service tells this host about its terms. */

@@ -648,11 +648,18 @@ export function startNoticeOf(owed: VoiceOwed): string | null {
 }
 
 /**
+ * The `until_ms` the device writes for an entry that no clock ends (the largest 64-bit count).
+ * This number type holds it only approximately, so the lapse is told by being beyond any time.
+ */
+const NO_LAPSE_FROM_MS = Number.MAX_SAFE_INTEGER
+
+/**
  * The moment the screen reads the device's state again because an entry lapses by itself, or null
- * when none does: a notice of a start has no lapse, and is not waited for.
+ * when none does: an entry that no clock ends is not waited for, and an old entry that has a
+ * finite end is, whatever its kind.
  */
 export function nextLapseOf(owed: readonly VoiceOwed[]): number | null {
-  const ends = owed.filter((each) => startNoticeOf(each) === null).map((each) => each.until_ms)
+  const ends = owed.map((each) => each.until_ms).filter((until) => until <= NO_LAPSE_FROM_MS)
   return ends.length === 0 ? null : Math.min(...ends)
 }
 
