@@ -167,6 +167,18 @@ fn a_live_grant_below_a_revoked_unplaced_row_is_withdrawn() {
     );
     owner_revokes(&store, DEVICE);
     assert!(!live(&store, 3));
+    let by_parent: Option<Vec<u8>> = one(
+        &store,
+        &format!(
+            "SELECT revoked_by_parent FROM grants WHERE grant_id = {}",
+            key(3)
+        ),
+    );
+    assert_eq!(
+        by_parent,
+        Some(id_of(1).get().as_bytes().to_vec()),
+        "the walk starts at the revoked top, which is withdrawn under the parent its record names"
+    );
 }
 
 /// A guard: a named grant is walked below even when it is revoked, and a device's root that is

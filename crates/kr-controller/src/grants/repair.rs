@@ -25,7 +25,8 @@ use crate::registry::{RecordedIn, Registry, SCHEMA_VERSION, recorded_version};
 /// What the debt a repair writes says it covers.
 const COVERS: &str = "the repair of damaged grants rows";
 
-/// Why a repair or an undo changed nothing. Every one of these leaves the registry as it was.
+/// Why a repair or an undo changed nothing. Every one of these leaves the registry as it was,
+/// except [`Self::ReplacedButNotSynced`], which says the undo replaced it.
 #[derive(Debug)]
 pub enum Refusal {
     /// The registry's write-ahead log could not be taken in while another connection uses it.
@@ -53,6 +54,10 @@ pub enum Refusal {
     LeftoverFile(PathBuf),
     /// The registry could not be replaced by the copy.
     ReplaceFailed(std::io::Error),
+    /// The registry was replaced by the copy, and the folder that holds it could not be synced to
+    /// disk, so the earlier registry may come back if the computer stops before the disk writes
+    /// the folder.
+    ReplacedButNotSynced(std::io::Error),
 }
 
 /// A row of the registry that cannot be read.
@@ -237,6 +242,7 @@ fn make_the_copy(registry: &Path, unix_seconds: u64) -> std::io::Result<(PathBuf
     let mut name = registry.as_os_str().to_owned();
     name.push(format!(".grants-repair-{unix_seconds}"));
     let folder = PathBuf::from(name);
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -430,15 +436,19 @@ pub fn undo_apply(
                 _ => {}
             }
         }
-        std::fs::rename(&restoring, registry)?;
-        registry.parent().map_or(Ok(()), sync_directory)
+        std::fs::rename(&restoring, registry)
     })();
     if let Err(error) = replaced {
         // Best effort: a file left here makes the next undo refuse, and says why.
         let _ = std::fs::remove_file(&restoring);
         return Err(Refusal::ReplaceFailed(error));
     }
-    Ok(())
+    // The replacement is made. Whether the folder's entry for it is on disk is a separate fact, and
+    // the person is told which of the two failed.
+    registry
+        .parent()
+        .map_or(Ok(()), sync_directory)
+        .map_err(Refusal::ReplacedButNotSynced)
 }
 
 #[cfg(test)]
@@ -663,10 +673,10 @@ mod tests {
         assert_eq!(with.count("fence_debt"), 1);
         let without = fixture();
         without.issue(0x41, None);
-        without.sql(&format!(
+        without.sql(
             "INSERT INTO grants (grant_id, recipient_device_id, grant, issued_at_ms)
-             VALUES (X'00', X'11111111111111111111111111111111', X'00', 1);"
-        ));
+             VALUES (X'00', X'11111111111111111111111111111111', X'00', 1);",
+        );
         assert_eq!(without.count("grants"), 2);
         apply(&without.path, 5_000, 78)
             .expect("ok")
@@ -860,5 +870,115 @@ mod tests {
             undo_apply(&store.path, &repaired.copy, environment_id),
             Err(Refusal::HostRanSinceTheCopy)
         ));
+    }
+
+    /// A connection that reads while the registry's log holds frames keeps the log from being taken
+    /// in, so the undo says so and leaves the registry as it was.
+    #[test]
+    fn the_undo_refuses_when_the_registrys_log_cannot_be_taken_in() {
+        let store = damaged();
+        let repaired = apply(&store.path, 5_000, 86)
+            .expect("ok")
+            .expect("repaired");
+        let environment_id = store.temp.environment_id();
+        let writer = Connection::open(&store.path).expect("a writer");
+        writer
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("write-ahead logging");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no checkpoint");
+        writer
+            .execute_batch(
+                "UPDATE environment SET generation = generation + 1;
+             UPDATE environment SET generation = generation - 1;",
+            )
+            .expect("a write the log holds");
+        let reader = Connection::open(&store.path).expect("a reader");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM grants;")
+            .expect("a read that holds the log");
+        let before = store.rows();
+
+        let refused = undo_apply(&store.path, &repaired.copy, environment_id);
+        assert!(
+            matches!(refused, Err(Refusal::LogBusy)),
+            "the log is busy: {refused:?}"
+        );
+        let previewed = undo_preview(&store.path, &repaired.copy, environment_id);
+        assert!(
+            matches!(previewed, Err(Refusal::LogBusy)),
+            "the preview says so too: {previewed:?}"
+        );
+        drop(reader);
+        drop(writer);
+        assert_eq!(store.rows(), before, "the registry is as it was");
+        assert!(
+            std::fs::symlink_metadata(leftover(&store.path)).is_err(),
+            "no replacement file is left"
+        );
+    }
+
+    /// A registry that cannot be replaced is left in place and usable: the refusal names the
+    /// failure and the registry still opens and reads its rows.
+    #[cfg(unix)]
+    #[test]
+    fn the_undo_leaves_the_registry_usable_when_the_replacement_cannot_be_made() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let store = damaged();
+        let repaired = apply(&store.path, 5_000, 87)
+            .expect("ok")
+            .expect("repaired");
+        let environment_id = store.temp.environment_id();
+        let after_the_repair = store.rows();
+        let folder = store.path.parent().expect("a folder").to_owned();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o500))
+            .expect("the folder cannot be written to");
+        let refused = undo_apply(&store.path, &repaired.copy, environment_id);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
+            .expect("the folder can be written to again");
+        assert!(
+            matches!(refused, Err(Refusal::ReplaceFailed(_))),
+            "the replacement fails: {refused:?}"
+        );
+        assert_eq!(
+            store.rows(),
+            after_the_repair,
+            "the registry opens and reads the rows it held"
+        );
+        assert!(
+            std::fs::symlink_metadata(leftover(&store.path)).is_err(),
+            "no replacement file is left"
+        );
+        undo_apply(&store.path, &repaired.copy, environment_id)
+            .expect("the undo goes on once the folder can be written to");
+    }
+
+    /// A folder that can be written to and not read can take the replacement and cannot be synced:
+    /// the undo says the registry is back to what the copy held and that the folder was not
+    /// synced, where the refusal for a registry that was not replaced would be untrue.
+    #[cfg(unix)]
+    #[test]
+    fn the_undo_says_so_when_the_folder_cannot_be_synced_after_the_replacement() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let store = damaged();
+        let before = store.rows();
+        let repaired = apply(&store.path, 5_000, 88)
+            .expect("ok")
+            .expect("repaired");
+        let environment_id = store.temp.environment_id();
+        let folder = store.path.parent().expect("a folder").to_owned();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o300))
+            .expect("the folder can be written to and not read");
+        let undone = undo_apply(&store.path, &repaired.copy, environment_id);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700))
+            .expect("the folder can be read again");
+        assert!(
+            matches!(undone, Err(Refusal::ReplacedButNotSynced(_))),
+            "the replacement is made and the folder is not synced: {undone:?}"
+        );
+        assert_eq!(store.rows(), before, "the registry is what the copy held");
     }
 }

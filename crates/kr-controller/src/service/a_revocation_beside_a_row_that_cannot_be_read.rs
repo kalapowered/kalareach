@@ -6,7 +6,7 @@
 //! whole host only when a marked row names no grant.
 
 use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
-use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId};
+use kr_protocol::ids::{ActorId, AuthorityRevision, ConnectionId, DeviceId, GrantId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
@@ -17,7 +17,7 @@ use super::a_revocation_answered_to_a_device::revoke_request;
 use super::a_transfer_left_unanswered::daemon;
 use super::a_voice_grant_on_the_floor::paired;
 use super::one_barrier_for_every_restriction::{beside, owed, revision};
-use super::{Audience, Controller};
+use super::{AdmittedConnection, Audience, Controller};
 
 pub(super) fn grant_id(byte: u8) -> GrantId {
     GrantId::new(Uuid::from_bytes([byte; 16]))
@@ -255,6 +255,83 @@ async fn the_fence_of_a_revocation_names_the_key_of_each_damaged_row_it_marks() 
     };
     assert!(grants.contains(&below), "the marked row's key is named");
     assert!(grants.contains(&grant_id(0x41)), "and the device's grant");
+}
+
+/// A connection that decided a request under a grant whose row cannot be read, a subscription
+/// among its work, is withdrawn with the device that holds the grant above it, and the notice the
+/// worker is told names the grant, so the worker ends an input lease held under it: the row cannot
+/// show which rights it held. A connection that acted under no revoked grant keeps its
+/// registration, and the issuer of leases takes the revision the revocation raised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscription_and_a_lease_under_a_damaged_row_are_ended_with_its_device() {
+    let (temp, controller) = daemon().await;
+    let held = paired(&controller, 1, None).device_id;
+    issue(&controller, 0x41, None, held);
+    let below = issue(&controller, 0x42, Some(0x41), device_id(0xe5));
+    let other = issue(&controller, 0x43, None, device_id(0xe6));
+    let actor = ActorId::new("local:test").expect("a principal");
+    let subscribed = ConnectionId::new(kr_ipc::new_uuid());
+    let bystander = ConnectionId::new(kr_ipc::new_uuid());
+    let revision_in_force = controller.leases.authority_revision();
+    {
+        let mut table = controller.admitted_write();
+        for connection_id in [subscribed, bystander] {
+            table.insert(
+                connection_id,
+                AdmittedConnection::new(actor.clone(), revision_in_force),
+            );
+        }
+    }
+    assert!(
+        controller.note_acting(subscribed, below),
+        "the connection acts under the grant"
+    );
+    assert!(
+        controller.note_acting(bystander, other),
+        "the other acts under another grant"
+    );
+    beside(&temp)
+        .execute_batch(&format!(
+            "UPDATE grants SET parent_grant_id = X'00' WHERE grant_id = {};",
+            key(below)
+        ))
+        .expect("the parent column no longer matches the record");
+
+    controller
+        .revoke_device_authority(held, None, None)
+        .await
+        .expect("a row that cannot be read does not stop the revocation");
+    {
+        let table = controller.admitted_read();
+        assert!(
+            !table.contains_key(&subscribed),
+            "the connection that acted under the damaged row is withdrawn"
+        );
+        assert!(
+            table.contains_key(&bystander),
+            "a connection that acted under no revoked grant is not"
+        );
+    }
+    let raised = AuthorityRevision::new(revision(&controller).await);
+    let RevisionReach::Within { grants, .. } = controller
+        .revision_notice(raised, AuthorityRevision::new(0), 0)
+        .reach
+    else {
+        panic!("a named row is fenced by name");
+    };
+    assert!(
+        grants.contains(&below),
+        "the notice names the row, so a worker ends the input lease held under it"
+    );
+    assert!(
+        !grants.contains(&other),
+        "a grant of another tree is not named"
+    );
+    assert_eq!(
+        controller.leases.authority_revision(),
+        raised,
+        "the issuer of leases takes the revision the revocation raised"
+    );
 }
 
 /// An admission that lapsed before the call marks nothing beside a damaged row, and its refusal is

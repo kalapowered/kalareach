@@ -396,3 +396,63 @@ fn the_json_form_of_a_refusal_is_one_failure_document() {
     );
     assert_eq!(grants_rows(&path), 2);
 }
+
+/// A connection that reads while the registry's log holds frames keeps the log from being taken
+/// in: the undo says so, in the sentence for it, and the registry is as the repair left it.
+#[test]
+fn the_undo_refuses_when_the_registrys_log_cannot_be_taken_in() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = damaged_registry(&temp);
+    let applied = document_of(&run_kr(
+        &temp,
+        &["--json", "host", "repair-grants", "--apply"],
+    ));
+    let copy = applied["copy"]
+        .as_str()
+        .expect("the copy is named")
+        .to_owned();
+    let writer = rusqlite::Connection::open(&path).expect("a writer");
+    writer
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("write-ahead logging");
+    writer
+        .pragma_update(None, "wal_autocheckpoint", 0)
+        .expect("no checkpoint");
+    writer
+        .execute_batch(
+            "UPDATE environment SET generation = generation + 1;
+             UPDATE environment SET generation = generation - 1;",
+        )
+        .expect("a write the log holds");
+    let reader = rusqlite::Connection::open(&path).expect("a reader");
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM grants;")
+        .expect("a read that holds the log");
+    let mut log = path.as_os_str().to_owned();
+    log.push("-wal");
+    assert!(
+        std::fs::metadata(&log).is_ok_and(|log| log.len() > 0),
+        "the log holds frames"
+    );
+
+    let refused = run_kr(
+        &temp,
+        &["host", "repair-grants", "--undo", &copy, "--apply"],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        said(&refused).contains(
+            "The registry's write-ahead log could not be taken in while another connection uses \
+             it. Nothing is changed."
+        ),
+        "{}",
+        said(&refused)
+    );
+    drop(reader);
+    drop(writer);
+    assert_eq!(
+        grants_rows(&path),
+        1,
+        "the registry is as the repair left it"
+    );
+}

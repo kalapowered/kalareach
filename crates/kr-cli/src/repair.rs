@@ -19,7 +19,8 @@ use crate::error::{CliError, Result};
 use crate::output::{self, Document};
 use crate::report::Completion;
 
-/// The sentence a refusal is told in. Every one says that nothing was changed.
+/// The sentence a refusal is told in. Every one says that nothing was changed, except the one for a
+/// folder that could not be synced after the registry was replaced.
 fn said(refusal: Refusal) -> Shown {
     match refusal {
         Refusal::LogBusy => Shown::said(
@@ -64,6 +65,12 @@ fn said(refusal: Refusal) -> Shown {
         ),
         Refusal::ReplaceFailed(error) => shown!(
             "The registry could not be replaced: {}. Nothing is changed.",
+            Shown::io(&error)
+        ),
+        Refusal::ReplacedButNotSynced(error) => shown!(
+            "The registry is back to what the copy held, but its folder could not be synced to \
+             disk: {}. If this computer stops before the disk writes it, the earlier registry may \
+             come back.",
             Shown::io(&error)
         ),
     }
@@ -316,4 +323,25 @@ fn undo(
          with it, and the grants the repair withdrew are live again.",
     ));
     Ok(Completion::Done)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal for a folder that could not be synced says the registry was replaced, and never
+    /// that nothing is changed.
+    #[test]
+    fn a_folder_that_could_not_be_synced_after_the_replacement_is_said_as_such() {
+        let said = said(Refusal::ReplacedButNotSynced(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert_eq!(
+            said.as_str(),
+            "The registry is back to what the copy held, but its folder could not be synced to \
+             disk: permission denied. If this computer stops before the disk writes it, the \
+             earlier registry may come back."
+        );
+        assert!(!said.as_str().contains("Nothing is changed"));
+    }
 }
