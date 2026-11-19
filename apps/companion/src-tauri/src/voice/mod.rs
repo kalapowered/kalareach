@@ -642,6 +642,13 @@ impl Shared {
         });
     }
 
+    /// The call's state as a person is shown it: every reply that carries the record carries
+    /// this.
+    pub(crate) fn shown(&self, mut state: VoiceCallState) -> VoiceCallState {
+        self.keep_what_is_shown(&mut state.owed);
+        state
+    }
+
     /// Takes up what the file holds, if it can be read now. `None` while it cannot, and otherwise
     /// whether anything was owed or noted since the read that failed. Called with `keeping` held.
     fn take_up_unread(&self) -> Option<bool> {
@@ -2612,6 +2619,51 @@ mod tests {
             vec!["two".to_owned(), "three".to_owned()],
             "the start of the new pairing stays"
         );
+    }
+
+    /// What a reply that carries the record shows: nothing that has lapsed, no start that is only
+    /// kept, and no start whose pairing is not told.
+    #[test]
+    fn what_the_replies_show_leaves_out_hidden_lapsed_and_untold_starts() {
+        let directory = tempfile::tempdir().expect("a folder");
+        Kept::at(directory.path())
+            .write(&KeptVoice {
+                owed: vec![
+                    entry(START_UNKNOWN, "shown", host(2)),
+                    entry(START_KEPT, "kept", host(2)),
+                    entry(START_UNANSWERED, "unanswered", host(2)),
+                    entry(START_UNKNOWN, "untold", host(1)),
+                ],
+                note: None,
+            })
+            .expect("the file is written");
+        let calls = calls_in(directory.path());
+        calls.know_pairings(|paired| {
+            if paired == host(1).0 {
+                PairedNow::Unknown
+            } else {
+                PairedNow::As(paired)
+            }
+        });
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        shared.read_again();
+        let mut raw = shared
+            .view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .clone();
+        raw.owed.push(OwedView {
+            until_ms: 5,
+            ..entry("revocation", "lapsed", host(2))
+        });
+        assert_eq!(raw.owed.len(), 5, "the record holds all five");
+        let shown: Vec<String> = shared
+            .shown(raw)
+            .owed
+            .into_iter()
+            .filter_map(|each| each.action_id)
+            .collect();
+        assert_eq!(shown, vec!["shown".to_owned()]);
     }
 
     /// The starts a launch kept, by the kinds of D-3731's table, are what the launch that follows

@@ -3033,6 +3033,65 @@ async fn a_start_names_an_earlier_start_only_when_this_device_keeps_it() {
     scene.stop_host().await;
 }
 
+/// The reply to a mute is what the call's state shows a person: an earlier start that a later one
+/// passed is only kept, so the reply carries no notice for it, and the file keeps the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_reply_to_a_mute_shows_no_start_that_is_only_kept() {
+    let timings = Timings {
+        host_within: Duration::from_millis(300),
+        ..asking_again()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.hold_creations();
+    let started = scene.start().await;
+    let earlier = started["action_id"]
+        .as_str()
+        .expect("the action")
+        .to_owned();
+    let prepared = scene.prepared().await;
+    scene.stand_in.release_creations();
+    let mut named = scene.start_request(&prepared);
+    named["afterActionId"] = json!(earlier);
+    scene
+        .call("voice_start", named)
+        .expect("a start that names a kept start is sent");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    let muted = scene
+        .call(
+            "voice_set_muted",
+            json!({ "what": "microphone", "muted": true }),
+        )
+        .expect("the microphone is muted");
+
+    assert!(
+        muted["owed"]
+            .as_array()
+            .expect("the entries")
+            .iter()
+            .all(|owed| owed["action_id"] != earlier.as_str()),
+        "the reply shows a start that is only kept: {muted}"
+    );
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the kept file"),
+    )
+    .expect("a file");
+    assert!(
+        file["owed"]
+            .as_array()
+            .expect("the entries")
+            .iter()
+            .any(|owed| owed["action_id"] == earlier.as_str()),
+        "the earlier start is kept: {file}"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
 /// The person presses stop while the device is still asking the host what became of its start. The
 /// media stops at once and the stop is answered, and the device goes on asking: when the host turns
 /// out to have made the call, the call is ended in full and the host's grant is revoked.
