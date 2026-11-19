@@ -13,12 +13,15 @@ use kr_pairing::direct::{
     verification_values_match,
 };
 use kr_pairing::grants::{GrantIdentities, GrantKind};
+use kr_pairing::host::ProvedOn;
 use kr_pairing::host::{HostIdentity, OwnerApproval, OwnerContext};
 use kr_pairing::identity::committed_device_id;
 use kr_pairing::platform::{InvitationState, TestClock, TestInvitationStore, TestLivePeer};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
-use kr_protocol::ids::{ActorId, AuthorityRevision, DeviceId, DeviceKeyRevision, GrantId};
+use kr_protocol::ids::{
+    ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision, GrantId,
+};
 use kr_protocol::pairing::{
     ConfirmationChannel, DeviceName, DevicePlatform, DevicePublicKeys, DirectQrPayload,
     INVITATION_LIFETIME_MS, NetworkConfig, NetworkHint, OwnerConfirmationProof,
@@ -1150,16 +1153,32 @@ fn a_candidate_that_never_learnt_its_attempt_is_still_told_it_is_paired() {
         .expect("the same candidate");
     assert_eq!(retried, candidate);
 
-    // After a restart the store answers, still only for that endpoint.
+    // Once the invitation object is gone the store answers: only for that endpoint, and only on
+    // the connection that proved the candidate.
     let invitation_id = invitation.invitation_id();
     drop(invitation);
+    let proving = ConnectionId::new(Uuid::from_bytes([0xc1; 16]));
+    let another = ConnectionId::new(Uuid::from_bytes([0xc2; 16]));
+    let told = |peer: &TestLivePeer, proved: Option<ConnectionId>, asking: ConnectionId| {
+        kr_pairing::host::recover_candidate_status(
+            &&harness.store,
+            invitation_id,
+            None,
+            peer,
+            ProvedOn { proved, asking },
+        )
+    };
     assert!(matches!(
-        kr_pairing::host::recover_candidate_status(&&harness.store, invitation_id, None, &peer),
+        told(&peer, Some(proving), proving),
         Ok(PairStatus::Committed { .. })
+    ));
+    assert!(matches!(
+        told(&peer, Some(proving), another),
+        Err(PairingError::NotIssuingOwner)
     ));
     let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x88; 32]));
     assert!(matches!(
-        kr_pairing::host::recover_candidate_status(&&harness.store, invitation_id, None, &impostor),
+        told(&impostor, Some(proving), proving),
         Err(PairingError::NotIssuingOwner)
     ));
 }

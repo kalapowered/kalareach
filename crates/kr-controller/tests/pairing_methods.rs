@@ -1998,6 +1998,153 @@ async fn a_pairing_proposal_naming_a_current_approval_or_question_is_given_no_ch
     host.stop().await;
 }
 
+/// A second unpaired connection of the candidate's endpoint to this host, and its surface.
+async fn open_unpaired(
+    host: &Host,
+    candidate: &Device,
+) -> (
+    iroh::endpoint::Connection,
+    kr_transport::handshake::CandidateConnection,
+) {
+    let candidate = candidate.candidate();
+    let mut addr = iroh::EndpointAddr::new(
+        iroh::PublicKey::from_bytes(host.network().endpoint_id().as_bytes())
+            .expect("a usable endpoint identity"),
+    );
+    for socket in host.network().bound_sockets() {
+        addr = addr.with_ip_addr(socket);
+    }
+    let connection = calls::dial_until_connected(candidate.endpoint, addr).await;
+    let unpaired = kr_transport::handshake::connect_unpaired(&connection, candidate.identity)
+        .await
+        .expect("an unpaired connection");
+    (connection, unpaired)
+}
+
+/// What `pair.status` answers on an unpaired surface.
+async fn status_on(
+    surface: &mut kr_transport::handshake::CandidateConnection,
+    invitation_id: kr_protocol::ids::InvitationId,
+) -> Result<PairStatusResult, kr_transport::error::TransportError> {
+    surface
+        .call::<_, PairStatusResult>(Method::PairStatus, &PairStatusParams { invitation_id })
+        .await
+}
+
+/// KR-REQ-10.37: a committed result is told only on the connection that proved the candidate. A
+/// second connection of the same endpoint, opened before the commit and told that the owner has not
+/// decided, is refused once the pairing is committed; the connection that proved the candidate is
+/// told what it became. A connection of another endpoint is refused too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_connection_of_the_candidate_is_not_told_it_is_committed() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    let device = Device::create().await;
+    let (proving, mut proved, _value) = calls::redeem(&device.candidate(), &invited).await;
+    let (other_connection, mut other) = open_unpaired(&host, &device).await;
+    let waiting = status_on(&mut other, invited.invitation_id)
+        .await
+        .expect("the host answers the second connection before the commit");
+    assert!(
+        matches!(waiting.status, PairStatus::AwaitingApproval { .. }),
+        "{:?}",
+        waiting.status
+    );
+
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    let told = status_on(&mut proved, invited.invitation_id)
+        .await
+        .expect("the proving connection is answered");
+    assert!(
+        matches!(told.status, PairStatus::Committed { device_id, .. } if device_id == confirmed.device_id),
+        "{:?}",
+        told.status
+    );
+    match status_on(&mut other, invited.invitation_id).await {
+        Err(kr_transport::error::TransportError::Refused(error)) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the second connection is refused, not {other:?}"),
+    }
+    proving.close(0u32.into(), b"done");
+    other_connection.close(0u32.into(), b"done");
+    host.stop().await;
+}
+
+/// KR-REQ-10.37: a confirmation that fails after its commitment leaves nothing in memory that
+/// tells another connection what the device became. The owner's call returns the failure; a second
+/// connection of the candidate's endpoint is refused; the connection that proved the candidate is
+/// told; and the owner's view reads the commitment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_that_fails_after_its_commitment_tells_only_the_proving_connection() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    let device = Device::create().await;
+    let (proving, mut proved, _value) = calls::redeem(&device.candidate(), &invited).await;
+    let (other_connection, mut other) = open_unpaired(&host, &device).await;
+
+    host.network()
+        .pairing()
+        .fail_the_next_confirm_after_the_commit();
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect_err("the confirmation fails after its commitment");
+
+    match status_on(&mut other, invited.invitation_id).await {
+        Err(kr_transport::error::TransportError::Refused(error)) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the second connection is refused, not {other:?}"),
+    }
+    let told = status_on(&mut proved, invited.invitation_id)
+        .await
+        .expect("the proving connection is answered");
+    let PairStatus::Committed { device_id, .. } = told.status else {
+        panic!(
+            "the proving connection is told it is committed: {:?}",
+            told.status
+        );
+    };
+    let viewed = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view after the failure");
+    assert!(
+        matches!(viewed.status, PairStatus::Committed { device_id: viewed, .. } if viewed == device_id),
+        "the owner reads the commitment: {:?}",
+        viewed.status
+    );
+    proving.close(0u32.into(), b"done");
+    other_connection.close(0u32.into(), b"done");
+    host.stop().await;
+}
+
 /// A new candidate's first redemption step for `invitation_id`, dialled at this host as it runs
 /// now, and the host's refusal of it.
 async fn refused_challenge(

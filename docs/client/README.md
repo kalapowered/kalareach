@@ -1000,8 +1000,8 @@ does, counts that minute from before its offer went, which is never later than t
 the window is full, and asks nothing on a connection after its last call, ten seconds before the
 host ends it. From four questions before the end, by count or by time, it opens a fresh connection
 before each question, asks there, and changes to it once it has answered. A host that commits the
-device serves it nothing on a new unpaired connection, so the old connection is then the only place
-to learn what the device became. The device keeps its last question there while fresh connections
+device tells only the connection that carried its proof what it became, so the old connection is
+then the only place to learn it without the recovery below. The device keeps its last question there while fresh connections
 fail, and asks it at the last call. A question that would leave the host's window no room at the
 call is kept for the call instead, so the window always has room for the last question when the call
 comes. The device waits at most ten seconds for an answer, so from ten seconds before the call it

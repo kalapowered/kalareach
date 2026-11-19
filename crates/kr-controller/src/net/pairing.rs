@@ -29,7 +29,7 @@ use kr_pairing::direct::{
 };
 use kr_pairing::grants::{GrantIdentities, GrantKind, validate_proposal};
 use kr_pairing::host::{
-    HostIdentity, HostInvitation, InvitationProposal, LockedCandidate, StatusViewer,
+    HostIdentity, HostInvitation, InvitationProposal, LockedCandidate, ProvedOn, StatusViewer,
     recover_candidate_status,
 };
 use kr_pairing::platform::{InvitationState, LivePeer, PairingClock, RendezvousHost};
@@ -40,7 +40,7 @@ use kr_protocol::confirmation::{
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
-    ActionId, ActorId, AttemptId, AuthorityRevision, DeviceId, GrantId, InvitationId,
+    ActionId, ActorId, AttemptId, AuthorityRevision, ConnectionId, DeviceId, GrantId, InvitationId,
 };
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
@@ -139,6 +139,9 @@ struct Open {
     issued_by: ActorId,
     grant_kind: InviteGrantKind,
     proposed_grant: ProposedGrant,
+    /// The connection that carried the candidate's proof, set once, where the invitation first
+    /// locked a candidate. It is the only connection a committed result is told on.
+    proved_on: Option<ConnectionId>,
 }
 
 enum OpenMode {
@@ -305,6 +308,13 @@ pub struct PairingHost {
     /// Invitations that ended without a commitment and were replaced, newest last, so each one's
     /// candidate can still be told how it ended. At most [`ENDED_KEPT`] of them.
     ended: Mutex<VecDeque<Open>>,
+    /// The connection that proved the candidate of each invitation that was committed, newest last,
+    /// so that connection alone is told what its candidate became. At most [`ENDED_KEPT`] of them;
+    /// never stored, so a restart forgets them all.
+    proved: Mutex<VecDeque<(InvitationId, ConnectionId)>>,
+    /// Fails the next `pair.confirm` once its commitment is written, for a test.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_confirm: AtomicBool,
 }
 
 /// How many ended invitations a host keeps for their candidates once newer ones replace them.
@@ -348,7 +358,37 @@ impl PairingHost {
             rendezvous,
             open: Mutex::new(None),
             ended: Mutex::new(VecDeque::new()),
+            proved: Mutex::new(VecDeque::new()),
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_confirm: AtomicBool::new(false),
         })
+    }
+
+    /// Fails the next `pair.confirm` after its commitment is written and its invitation's object is
+    /// gone, as a store that fails at that moment would, for a test of what such a failure leaves.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_the_next_confirm_after_the_commit(&self) {
+        self.fail_next_confirm
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Keeps the connection that proved the candidate of `invitation_id`.
+    fn keep_proving(&self, invitation_id: InvitationId, connection: ConnectionId) {
+        let mut kept = self.proved.lock().unwrap_or_else(|held| held.into_inner());
+        kept.push_back((invitation_id, connection));
+        while kept.len() > ENDED_KEPT {
+            kept.pop_front();
+        }
+    }
+
+    /// The connection that proved the candidate of `invitation_id`, while this host still knows it.
+    fn proving(&self, invitation_id: InvitationId) -> Option<ConnectionId> {
+        self.proved
+            .lock()
+            .unwrap_or_else(|held| held.into_inner())
+            .iter()
+            .find(|(id, _)| *id == invitation_id)
+            .map(|(_, connection)| *connection)
     }
 
     /// Returns what this host declares about itself in an invitation.
@@ -765,6 +805,7 @@ impl PairingHost {
             issued_by: caller.actor_id.clone(),
             grant_kind: params.grant_kind,
             proposed_grant: params.proposed_grant.clone(),
+            proved_on: None,
         });
         drop(open);
         if let Some(room) = ended_room {
@@ -900,6 +941,31 @@ impl PairingHost {
         challenges.forget(spendable.request());
         drop(challenges);
         let commitment = committed?;
+        // The pairing is committed, so the invitation's object is done with before anything that
+        // can fail: the room has nothing left to relay and its locator is released once this lock
+        // is, the connection that proved the candidate is kept as the only one that is told what
+        // it became, and no committed invitation stays in memory for another connection to ask.
+        let room = open
+            .as_mut()
+            .and_then(Open::code_mut)
+            .and_then(CodeOffer::end);
+        if let Some(proving) = open.as_ref().and_then(|offered| offered.proved_on) {
+            self.keep_proving(commitment.invitation_id, proving);
+        }
+        *open = None;
+        drop(open);
+        if let Some(room) = room {
+            self.release_room(&room, life);
+        }
+        #[cfg(any(test, feature = "testing"))]
+        if self
+            .fail_next_confirm
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ControllerError::registry(
+                "a confirmation that failed after its commitment",
+            ));
+        }
         // A pairing kr-pairing found committed already was not written by this call, and neither
         // was this action's record.
         if !written {
@@ -911,16 +977,6 @@ impl PairingHost {
             .ok_or_else(|| {
                 ControllerError::registry("a committed pairing has no security event")
             })?;
-        // The room has nothing left to relay: its locator is released once this lock is.
-        let room = open
-            .as_mut()
-            .and_then(Open::code_mut)
-            .and_then(CodeOffer::end);
-        *open = None;
-        drop(open);
-        if let Some(room) = room {
-            self.release_room(&room, life);
-        }
         Ok(PairConfirmResult {
             device_id: commitment.device_id,
             grant_id: commitment.grant.grant_id,
@@ -1413,6 +1469,9 @@ impl PairingHost {
             verification_value: locked.verification_value.clone(),
         };
         offer.bound = Some(locked);
+        if let Some(offered) = open.as_mut() {
+            offered.proved_on.get_or_insert(peer.connection_id());
+        }
         Ok(answer)
     }
 
@@ -1657,10 +1716,14 @@ impl PairingHost {
                 let candidate = invitation
                     .redeem(proof, peer.endpoint_id(), peer as &dyn LivePeer)
                     .map_err(protocol_refusal)?;
-                Ok(PairRedeemResult::Locked {
+                let locked = PairRedeemResult::Locked {
                     attempt_id: candidate.attempt_id,
                     verification_value: candidate.verification_value.clone(),
-                })
+                };
+                if let Some(offered) = open.as_mut() {
+                    offered.proved_on.get_or_insert(peer.connection_id());
+                }
+                Ok(locked)
             }
         }
     }
@@ -1691,14 +1754,21 @@ impl PairingHost {
         }
         // No invitation object for this candidate to ask about, which is the ordinary state after
         // a commit or a restart. A committed pairing is on record with the endpoint the candidate
-        // proved, so this answers the caller about itself and about nothing else.
-        let status = recover_candidate_status(&self.rows, params.invitation_id, None, peer)
-            .map_err(|_| {
-                ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this host is not offering that invitation",
-                )
-            })?;
+        // proved, and it is told only to the connection that carried the proof: any other
+        // connection is refused, and a device that was committed meanwhile learns it by proving
+        // the key it was committed under.
+        let proved_on = ProvedOn {
+            proved: self.proving(params.invitation_id),
+            asking: peer.connection_id(),
+        };
+        let status =
+            recover_candidate_status(&self.rows, params.invitation_id, None, peer, proved_on)
+                .map_err(|_| {
+                    ProtocolError::new(
+                        ErrorCode::PermissionDenied,
+                        "this host is not offering that invitation",
+                    )
+                })?;
         Ok(PairStatusResult {
             status,
             owner: Nullable::null(),
