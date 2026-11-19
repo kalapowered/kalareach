@@ -8,21 +8,19 @@
 //!
 //! Two properties make "preserve unrelated settings" checkable rather than hoped for:
 //!
-//! * A configuration entry is added under a marker. [`MANAGED_MARKER`] says who owns that entry,
-//!   and nothing without the marker is ever changed or removed.
+//! * A configuration entry is named `kalareach`. Nothing is ever replaced or removed there that a
+//!   record of this host does not claim, and an entry this host did not write is refused.
 //! * Every operation records the digest of what it wrote. A removal that finds a different digest
 //!   reports drift and leaves the file alone.
 
 use core::fmt;
 use core::str::FromStr;
+use std::borrow::Cow;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::scalars::{Digest256, Nullable};
-
-/// The key that marks a configuration entry as this installation's own.
-pub const MANAGED_MARKER: &str = "x-kalareach-managed";
 
 /// The skill package this installation carries.
 pub const SKILL_NAME: &str = "kalareach-contact";
@@ -30,12 +28,20 @@ pub const SKILL_NAME: &str = "kalareach-contact";
 /// The name the MCP server is registered under.
 pub const SERVER_NAME: &str = "kalareach";
 
-/// One agent an installation can target.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(rename_all = "kebab-case")]
-pub enum AgentTarget {
+/// The most bytes in the word of an agent.
+pub const MAX_AGENT_BYTES: usize = 32;
+
+/// The pattern of the word of an agent as the published schema states it, which is the whole of
+/// what [`AgentTarget::parse`] checks: the grammar, no ending of `-user` or `-project` and no ending
+/// in a segment of sixteen hexadecimal digits, which a record's file name could not tell from a
+/// project's digest.
+pub const AGENT_PATTERN: &str =
+    "^(?!.*-(user|project)$)(?!.*-[0-9a-f]{16}$)[a-z][a-z0-9]*(-[a-z0-9]+)*$";
+
+/// One of the six agents this host holds the places of, for an installation made with no
+/// declaration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CompiledAgent {
     /// Codex.
     Codex,
     /// Claude Code.
@@ -50,8 +56,8 @@ pub enum AgentTarget {
     QoderCli,
 }
 
-impl AgentTarget {
-    /// Every target, in declaration order.
+impl CompiledAgent {
+    /// Every compiled agent, in declaration order.
     pub const ALL: &'static [Self] = &[
         Self::Codex,
         Self::ClaudeCode,
@@ -73,14 +79,108 @@ impl AgentTarget {
             Self::QoderCli => "qoder-cli",
         }
     }
+}
 
-    /// Returns the target for a wire string.
+/// The word that names the agent an installation is for: one of the six compiled agents' words, or
+/// a word a package declares.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AgentTarget(Cow<'static, str>);
+
+impl AgentTarget {
+    /// Codex.
+    pub const CODEX: Self = Self(Cow::Borrowed("codex"));
+    /// Claude Code.
+    pub const CLAUDE_CODE: Self = Self(Cow::Borrowed("claude-code"));
+    /// OpenCode.
+    pub const OPENCODE: Self = Self(Cow::Borrowed("opencode"));
+    /// Gemini CLI.
+    pub const GEMINI_CLI: Self = Self(Cow::Borrowed("gemini-cli"));
+    /// Kimi Code CLI.
+    pub const KIMI_CODE_CLI: Self = Self(Cow::Borrowed("kimi-code-cli"));
+    /// Qoder CLI.
+    pub const QODER_CLI: Self = Self(Cow::Borrowed("qoder-cli"));
+
+    /// The six compiled agents' words, in declaration order.
+    pub const ALL: &'static [Self] = &[
+        Self::CODEX,
+        Self::CLAUDE_CODE,
+        Self::OPENCODE,
+        Self::GEMINI_CLI,
+        Self::KIMI_CODE_CLI,
+        Self::QODER_CLI,
+    ];
+
+    /// Returns the word for a wire string, or says what is wrong with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UnknownAgent`] when the text is not in the grammar of a word.
+    pub fn parse(value: &str) -> Result<Self, UnknownAgent> {
+        match Self::problem(value) {
+            None => Ok(Self(Cow::Owned(value.to_owned()))),
+            Some(problem) => Err(UnknownAgent(problem)),
+        }
+    }
+
+    /// What is wrong with `value` as a word, or `None`. The grammar is a lower-case letter, then
+    /// lower-case letters and digits, in segments joined by one `-`; at most [`MAX_AGENT_BYTES`]
+    /// bytes; not ending in `-user` or `-project`; not ending in a segment of sixteen hexadecimal
+    /// digits.
     #[must_use]
-    pub fn from_wire(value: &str) -> Option<Self> {
-        Self::ALL
+    pub fn problem(value: &str) -> Option<&'static str> {
+        if value.is_empty() || value.len() > MAX_AGENT_BYTES {
+            return Some("a word is one to 32 bytes");
+        }
+        let segments_are_plain = value.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        });
+        if !segments_are_plain
+            || !value
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_lowercase())
+        {
+            return Some(
+                "a word starts with a lower-case letter and has lower-case letters and digits in \
+                 segments joined by one -",
+            );
+        }
+        if value.ends_with("-user") || value.ends_with("-project") {
+            return Some("a word does not end in -user or -project");
+        }
+        if value.rsplit('-').next().is_some_and(|last| {
+            last.len() == 16
+                && last
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        }) {
+            return Some("a word does not end in a segment of sixteen hexadecimal digits");
+        }
+        None
+    }
+
+    /// Returns the wire string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the compiled agent this word names, or `None` for any other word.
+    #[must_use]
+    pub fn compiled(&self) -> Option<CompiledAgent> {
+        CompiledAgent::ALL
             .iter()
             .copied()
-            .find(|target| target.as_str() == value)
+            .find(|agent| agent.as_str() == self.as_str())
+    }
+}
+
+impl From<CompiledAgent> for AgentTarget {
+    fn from(agent: CompiledAgent) -> Self {
+        Self(Cow::Borrowed(agent.as_str()))
     }
 }
 
@@ -94,17 +194,57 @@ impl FromStr for AgentTarget {
     type Err = UnknownAgent;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::from_wire(value).ok_or(UnknownAgent)
+        Self::parse(value)
     }
 }
 
-/// A target that is not one of the bundled agents.
+impl Serialize for AgentTarget {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentTarget {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for AgentTarget {
+    fn schema_name() -> Cow<'static, str> {
+        "AgentTarget".into()
+    }
+
+    fn schema_id() -> Cow<'static, str> {
+        "kalareach::AgentTarget".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": AGENT_PATTERN,
+            "maxLength": MAX_AGENT_BYTES,
+            "description": "The word of an agent: one of the six compiled agents, or a word a package declares."
+        })
+    }
+}
+
+/// Text that is not in the grammar of the word of an agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UnknownAgent;
+pub struct UnknownAgent(&'static str);
+
+impl UnknownAgent {
+    /// Why the text is not a word, in a sentence of the protocol crate.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        self.0
+    }
+}
 
 impl fmt::Display for UnknownAgent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("that is not one of the agents this installation supports")
+        formatter.write_str(self.0)
     }
 }
 
@@ -187,7 +327,7 @@ pub enum ChangeOperation {
         /// The digest of what was there before, when the file already existed.
         replaced_digest: Nullable<Digest256>,
     },
-    /// One entry added to an agent's configuration document, under the managed marker.
+    /// One entry added to an agent's configuration document, under the name `kalareach`.
     ///
     /// Nothing else in the document is read as this installation's, and nothing else is written.
     AddConfigurationEntry {
@@ -332,15 +472,90 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), AgentTarget::ALL.len());
-        for target in AgentTarget::ALL {
-            assert_eq!(AgentTarget::from_wire(target.as_str()), Some(*target));
+        for (target, compiled) in AgentTarget::ALL.iter().zip(CompiledAgent::ALL) {
+            assert_eq!(target.compiled(), Some(*compiled));
+            assert_eq!(&AgentTarget::from(*compiled), target);
+            assert_eq!(
+                &AgentTarget::parse(target.as_str()).expect("a word"),
+                target
+            );
         }
     }
 
     #[test]
     fn an_unknown_agent_or_scope_is_refused() {
-        assert!("some-other-agent".parse::<AgentTarget>().is_err());
+        assert!("Some-other-agent".parse::<AgentTarget>().is_err());
+        assert!("some-other-agent".parse::<AgentTarget>().is_ok());
         assert!("global".parse::<InstallScope>().is_err());
         assert_eq!("project".parse::<InstallScope>(), Ok(InstallScope::Project));
+    }
+
+    /// A word in the grammar that the host does not know decodes, and encodes as the same string.
+    #[test]
+    fn a_word_in_the_grammar_that_the_host_does_not_know_decodes() {
+        let word: AgentTarget =
+            serde_json::from_str("\"amp\"").expect("a word in the grammar decodes");
+        assert_eq!(word.as_str(), "amp");
+        assert!(word.compiled().is_none());
+        assert_eq!(
+            serde_json::to_string(&word).expect("a word encodes"),
+            "\"amp\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentTarget>("\"amp-2\"")
+                .expect("a segment of digits decodes")
+                .as_str(),
+            "amp-2"
+        );
+    }
+
+    /// A text outside the grammar of a word is refused at decode, and the reserved endings are
+    /// refused as the published schema's pattern refuses them.
+    #[test]
+    fn a_word_outside_the_grammar_is_refused_at_decode() {
+        let long = "a".repeat(MAX_AGENT_BYTES + 1);
+        for text in [
+            "../x",
+            "Codex",
+            "a b",
+            "codex-user",
+            "amp-project",
+            "amp-0123456789abcdef",
+            "amp_",
+            "-amp",
+            "amp-",
+            "1amp",
+            "",
+            long.as_str(),
+        ] {
+            assert!(
+                serde_json::from_value::<AgentTarget>(serde_json::json!(text)).is_err(),
+                "{text:?} is not a word"
+            );
+            assert!(AgentTarget::parse(text).is_err(), "{text:?} is not a word");
+        }
+    }
+
+    /// The six compiled words keep the wire strings every earlier build wrote.
+    #[test]
+    fn the_six_compiled_words_keep_their_wire_strings_and_record_names() {
+        let wire: Vec<&str> = AgentTarget::ALL.iter().map(AgentTarget::as_str).collect();
+        assert_eq!(
+            wire,
+            [
+                "codex",
+                "claude-code",
+                "opencode",
+                "gemini-cli",
+                "kimi-code-cli",
+                "qoder-cli"
+            ]
+        );
+        for word in AgentTarget::ALL {
+            let decoded: AgentTarget =
+                serde_json::from_value(serde_json::json!(word.as_str())).expect("decodes");
+            assert_eq!(&decoded, word);
+            assert!(decoded.compiled().is_some());
+        }
     }
 }

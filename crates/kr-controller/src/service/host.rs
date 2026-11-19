@@ -201,7 +201,7 @@ impl Controller {
                 )));
             }
         };
-        installer.settle(actor_id, mutation.action_id, digest, &result)?;
+        installer.settle(actor_id, mutation.action_id, digest, &result, &params.agent)?;
         Ok(result)
     }
 

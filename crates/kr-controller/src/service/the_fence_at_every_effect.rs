@@ -2878,7 +2878,7 @@ async fn an_installation_recorded_before_a_late_attempts_lookup_is_not_shown_at_
             &temp,
             Method::AgentToolsInstall,
             ParamsValue::from_typed(&AgentToolsParams {
-                agent: AgentTarget::Codex,
+                agent: AgentTarget::CODEX,
                 scope: InstallScope::Project,
                 project_dir: Nullable::some(directory.display().to_string()),
             })
@@ -3055,7 +3055,7 @@ async fn an_installation_recorded_before_a_late_attempts_lookup_is_not_given_bac
             &temp,
             Method::AgentToolsInstall,
             ParamsValue::from_typed(&AgentToolsParams {
-                agent: AgentTarget::Codex,
+                agent: AgentTarget::CODEX,
                 scope: InstallScope::Project,
                 project_dir: Nullable::some(directory.display().to_string()),
             })
@@ -3574,7 +3574,7 @@ async fn an_installation_answered_from_its_record_is_given_as_a_copy() {
         &temp,
         Method::AgentToolsInstall,
         ParamsValue::from_typed(&AgentToolsParams {
-            agent: AgentTarget::Codex,
+            agent: AgentTarget::CODEX,
             scope: InstallScope::Project,
             project_dir: Nullable::some(project.path().display().to_string()),
         })
@@ -3744,7 +3744,7 @@ pub(super) fn installation_in(
         temp,
         Method::AgentToolsInstall,
         ParamsValue::from_typed(&AgentToolsParams {
-            agent: AgentTarget::Codex,
+            agent: AgentTarget::CODEX,
             scope: InstallScope::Project,
             project_dir: Nullable::some(project.display().to_string()),
         })

@@ -8638,7 +8638,7 @@ async fn a_hold_turns_away_a_session_and_an_installation_over_the_wire() {
         .expect("the worktree opens")
         .identity();
     let installation = kr_protocol::skill::AgentToolsParams {
-        agent: kr_protocol::skill::AgentTarget::Codex,
+        agent: kr_protocol::skill::AgentTarget::CODEX,
         scope: kr_protocol::skill::InstallScope::Project,
         project_dir: Nullable::some(host.work().join("source").display().to_string()),
     };
