@@ -3960,6 +3960,76 @@ async fn kr_req_09_an_answer_never_acknowledged_is_uncertain_before_its_caller_h
     );
 }
 
+/// KR-REQ-23.24 and KR-REQ-11.27: an answer to one approval whose outcome is uncertain holds back
+/// no answer to another approval of the same session and application instance. Each approval is
+/// its own question put to the person, and only a second answer to the same approval is the retry
+/// that has to show the first.
+///
+/// Not shown here: a second answer to the same approval, which has to name the uncertain one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_answer_to_one_approval_does_not_hold_back_the_answer_to_another() {
+    let host = host().await;
+    // The transport takes the first answer and never says what came of it. It carries every later
+    // one at once.
+    let (_never, waiting) = tokio::sync::oneshot::channel::<()>();
+    let upstream = Arc::new(WaitingUpstream {
+        release: std::sync::Mutex::new(Some(waiting)),
+        carried: std::sync::atomic::AtomicUsize::new(0),
+    });
+    register(&host, None);
+    let first = offer_approval(&host, Arc::clone(&upstream));
+    let second = offer_another(&host, 12);
+    let mut client = cli(&host).await;
+
+    let lost = approval_mutation(&client, &host, 73, first);
+    let lost_id = lost.action_id;
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, lost),
+    )
+    .await
+    .expect("the caller is answered at the deadline");
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer nobody acknowledged is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut client, lost_id).await.state,
+        ReceiptState::Unknown
+    );
+    assert_eq!(
+        state_of(&host, first),
+        kr_protocol::gateway::PendingState::Uncertain
+    );
+    assert_eq!(
+        state_of(&host, second),
+        kr_protocol::gateway::PendingState::Pending,
+        "the other approval is still waiting for its answer"
+    );
+
+    let answer = approval_mutation(&client, &host, 74, second);
+    let answer_id = answer.action_id;
+    let outcome = send(&mut client, answer).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "an uncertain answer to one approval stands in the way of the answer to another: {outcome:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, answer_id).await.state,
+        ReceiptState::Applied
+    );
+    assert_eq!(
+        state_of(&host, second),
+        kr_protocol::gateway::PendingState::Resolved
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both answers went to the transport"
+    );
+}
+
 /// Connects as the control daemon and proves the generation this worker accepts.
 async fn daemon(host: &Host) -> BoundLink {
     let mut daemon = BoundLink::connect(&host.endpoint, build())
