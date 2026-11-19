@@ -3038,18 +3038,26 @@ async fn a_start_names_an_earlier_start_only_when_this_device_keeps_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reply_to_a_mute_shows_no_start_that_is_only_kept() {
     let timings = Timings {
-        host_within: Duration::from_millis(300),
+        // No bound of time decides this case: the host's answers to the first start are lost by
+        // the test's own control, and the second start's questions are answered by the host
+        // whenever it has finished.
+        host_within: Duration::from_secs(600),
         ..asking_again()
     };
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
-    scene.stand_in.hold_creations();
+    scene.link.lose_the_answer_to(Some(HostMethod::VoiceStart));
     let started = scene.start().await;
     let earlier = started["action_id"]
         .as_str()
         .expect("the action")
         .to_owned();
+    assert_eq!(
+        scene.state()["ended"]["cause"],
+        "start_unknown",
+        "the host never said whether it made the first call"
+    );
+    scene.link.lose_the_answer_to(None);
     let prepared = scene.prepared().await;
-    scene.stand_in.release_creations();
     let mut named = scene.start_request(&prepared);
     named["afterActionId"] = json!(earlier);
     scene
