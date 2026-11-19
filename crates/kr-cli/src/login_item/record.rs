@@ -119,10 +119,10 @@ impl Record {
         bytes == self.contents.as_bytes() || bytes == self.new_bytes().as_bytes()
     }
 
-    /// The record as the bytes of its file.
-    pub(super) fn bytes(&self) -> Vec<u8> {
-        // A record of strings and paths always encodes.
-        serde_json::to_vec_pretty(self).unwrap_or_default()
+    /// The record as the bytes of its file, or why it cannot be written: a path that is not text
+    /// has no form in it.
+    pub(super) fn bytes(&self) -> std::io::Result<Vec<u8>> {
+        serde_json::to_vec_pretty(self).map_err(std::io::Error::other)
     }
 }
 

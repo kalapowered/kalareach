@@ -364,6 +364,10 @@ mod written {
             last_line(&text).starts_with("login item: installed: "),
             "{text}"
         );
+        assert!(
+            setup.item_in(&setup.home).is_some(),
+            "the login item's file is there with the login item's own name: {text}"
+        );
         let item = setup.item();
         let name = item
             .file_name()
@@ -719,14 +723,22 @@ mod written {
         for argument in ["install", "status", "remove"] {
             setup.ok(argument);
             for (path, contents) in &seeded {
-                assert_eq!(&std::fs::read(path).expect("kept"), contents, "{argument}");
+                assert_eq!(
+                    std::fs::read(path).ok().as_ref(),
+                    Some(contents),
+                    "{argument}"
+                );
             }
         }
         // In a tree of its own with no service record, `kr host startup --set standalone` and
         // `kr shell install` write no login item and no record.
         let second = Setup::new();
         let output = second.run(&["host", "startup", "--set", "standalone"]);
-        let _ = output;
+        assert!(
+            output.status.success(),
+            "kr host startup --set standalone succeeds: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(second.item_in(&second.home).is_none());
         assert!(second.record_bytes().is_none());
     }
@@ -827,6 +839,293 @@ mod written {
     }
 
     #[cfg(target_os = "macos")]
+    /// The name a path left beside the login item's file has, as a record names it.
+    fn beside(item: &Path, extension: &str) -> PathBuf {
+        let name = item.file_name().and_then(|n| n.to_str()).expect("a name");
+        item.with_file_name(format!(
+            ".{name}.0d15ea5e-0000-4000-8000-000000000001.{extension}"
+        ))
+    }
+
+    /// Writes into the record what an earlier command that stopped would have left: `pending`.
+    fn leave_pending(setup: &Setup, pending: serde_json::Value) {
+        let mut record = setup.record();
+        record["pending"] = pending;
+        std::fs::write(
+            setup.record_path().expect("a record"),
+            serde_json::to_vec_pretty(&record).expect("encodes"),
+        )
+        .expect("the record is written");
+    }
+
+    /// A second home beside the first, which the first one's record does not name.
+    fn other_home(setup: &Setup) -> PathBuf {
+        let second = setup.root.join("home2");
+        std::fs::create_dir_all(&second).expect("a home");
+        second
+    }
+
+    fn run_in(setup: &Setup, home: &Path, arguments: &[&str]) -> (bool, String, String) {
+        let output = setup.run_with(&setup.bin.join("kr"), home, arguments);
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn a_home_that_is_not_text_is_refused_before_anything_is_made() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let setup = Setup::new();
+        let before = setup.snapshot();
+        let bad = setup.root.join(std::ffi::OsStr::from_bytes(b"home-\xff"));
+        let mut homes = vec![(bad.clone(), None)];
+        if cfg!(target_os = "linux") {
+            homes.push((
+                setup.home.clone(),
+                Some(setup.root.join(std::ffi::OsStr::from_bytes(b"cfg-\xff"))),
+            ));
+        }
+        for (home, config) in homes {
+            for argument in ["install", "remove", "status"] {
+                let mut command = setup.command_in(
+                    &setup.bin.join("kr"),
+                    &home,
+                    &["host", "login-item", argument],
+                );
+                if let Some(config) = &config {
+                    command.env("XDG_CONFIG_HOME", config);
+                }
+                let output = command.output_locked().expect("kr runs");
+                let said = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                if argument == "install" {
+                    assert!(!output.status.success(), "install is refused: {said}");
+                    assert!(
+                        said.contains("cannot be written into a")
+                            && said.contains("; nothing was written"),
+                        "{said}"
+                    );
+                }
+                assert!(
+                    before == setup.snapshot(),
+                    "{argument}: no identity, state directory, record or file was made"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn what_a_settling_did_is_told_though_a_refusal_follows_it() {
+        let setup = Setup::new();
+        setup.ok("install");
+        let first = setup.item();
+        // An earlier install stopped after it staged: its staging file holds other bytes.
+        let staging = beside(&first, "kr-staging");
+        std::fs::write(&staging, b"somebody else's bytes\n").expect("a staging file");
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "publish", "staging": staging}),
+        );
+        let second = other_home(&setup);
+        let (ok, said, refused) = run_in(&setup, &second, &["host", "login-item", "install"]);
+        assert!(!ok, "install from another home is refused: {said}{refused}");
+        assert!(
+            refused.contains("kr wrote this environment's login item at the file the record "),
+            "{refused}"
+        );
+        assert!(
+            said.contains("under a name that ends in .kr-staging")
+                && said.contains("it does not hold what kr wrote"),
+            "the leftover the settling kept is named though the record no longer names it: {said}"
+        );
+        assert!(
+            setup.record()["pending"].is_null(),
+            "the record drops what it named"
+        );
+        assert!(staging.exists(), "the leftover is left");
+        // The same in the document.
+        std::fs::write(&staging, b"somebody else's bytes\n").expect("a staging file");
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "publish", "staging": staging}),
+        );
+        let (ok, said, _) = run_in(
+            &setup,
+            &second,
+            &["host", "login-item", "install", "--json"],
+        );
+        assert!(!ok, "install from another home is refused: {said}");
+        // The settling's document comes first, and the refusal's follows it.
+        let document: serde_json::Value = serde_json::Deserializer::from_str(&said)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        assert!(
+            document["actions"]
+                .as_array()
+                .is_some_and(|actions| actions.iter().any(|a| a == "left_leftover")),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn each_stopped_state_says_what_the_next_command_does_about_it() {
+        let setup = Setup::new();
+        setup.ok("install");
+        let first = setup.item();
+        let staging = beside(&first, "kr-staging");
+        let install_stopped = serde_json::json!({"operation": "publish", "staging": staging});
+        let aside = beside(&first, "kr-moving");
+        let remove_stopped = serde_json::json!({"operation": "remove", "aside": aside});
+
+        // The file is as kr wrote it: install finishes an install, remove finishes a remove.
+        leave_pending(&setup, install_stopped.clone());
+        let (ok, said, _) = run_in(&setup, &setup.home, &["host", "login-item", "status"]);
+        assert!(ok);
+        assert!(
+            said.contains(
+                "an earlier kr host login-item install did not finish: kr host login-item install \
+                 finishes it, or kr host login-item remove takes out what it left"
+            ),
+            "{said}"
+        );
+        leave_pending(&setup, remove_stopped.clone());
+        let (_, said, _) = run_in(&setup, &setup.home, &["host", "login-item", "status"]);
+        assert!(
+            said.contains(
+                "an earlier kr host login-item remove did not finish: kr host login-item remove \
+                 finishes it"
+            ),
+            "{said}"
+        );
+        let (_, said, _) = run_in(
+            &setup,
+            &setup.home,
+            &["host", "login-item", "status", "--json"],
+        );
+        let document: serde_json::Value = serde_json::from_str(&said).unwrap_or_default();
+        assert_eq!(document["pending"], "remove", "{said}");
+
+        // An install takes back a removal that stopped, and says so, and the item is as it was.
+        let (ok, said, _) = run_in(&setup, &setup.home, &["host", "login-item", "install"]);
+        assert!(ok, "{said}");
+        assert!(
+            said.contains("took back what an earlier kr host login-item remove began"),
+            "{said}"
+        );
+        assert!(!said.contains("finished what"), "{said}");
+        assert!(setup.record()["pending"].is_null());
+
+        // A removal takes out what an install left, and says so.
+        leave_pending(&setup, install_stopped.clone());
+        let (ok, said, _) = run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
+        assert!(ok, "{said}");
+        assert!(
+            said.contains("took out what an earlier kr host login-item install began"),
+            "{said}"
+        );
+        assert!(setup.item_in(&setup.home).is_none());
+
+        // From another home, an install that stopped is settled by remove, and status says that
+        // install would only refuse.
+        setup.ok("install");
+        let first = setup.item();
+        let staging = beside(&first, "kr-staging");
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "publish", "staging": staging}),
+        );
+        let second = other_home(&setup);
+        let (_, said, _) = run_in(&setup, &second, &["host", "login-item", "status"]);
+        assert!(
+            said.contains(
+                "an earlier kr host login-item install did not finish: kr host login-item remove \
+                 takes out what it left"
+            ) && !said.contains("install finishes it"),
+            "{said}"
+        );
+
+        // The file changed after kr wrote it: the refusal names the file the record names, not the
+        // place under the home that the command was run from.
+        let mut changed = std::fs::read(&first).expect("the file");
+        changed.extend_from_slice(b"\n");
+        std::fs::write(&first, changed).expect("a changed file");
+        let (ok, _, refused) = run_in(&setup, &second, &["host", "login-item", "install"]);
+        assert!(!ok, "{refused}");
+        assert!(
+            refused.contains(&first.display().to_string())
+                && refused.contains("was changed after kr wrote it"),
+            "{refused}"
+        );
+        assert!(
+            !refused.contains(&second.display().to_string()),
+            "a file under the other home is not said to be changed: {refused}"
+        );
+    }
+
+    #[test]
+    fn a_path_the_record_names_that_is_not_the_homes_is_never_printed() {
+        let setup = Setup::new();
+        let marked = setup.root.join("home-MARKER-9f3a");
+        std::fs::create_dir_all(&marked).expect("a home");
+        let (ok, said, _) = run_in(&setup, &marked, &["host", "login-item", "install"]);
+        assert!(ok, "{said}");
+        let item = setup
+            .item_in(&marked)
+            .expect("the item is in the marked home");
+        let staging = beside(&item, "kr-staging");
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "publish", "staging": staging}),
+        );
+        std::fs::write(&staging, b"somebody else's bytes\n").expect("a staging file");
+        let second = other_home(&setup);
+        for argument in [
+            &["status"][..],
+            &["install"],
+            &["status", "--json"],
+            &["remove"],
+        ] {
+            let mut arguments = vec!["host", "login-item"];
+            arguments.extend_from_slice(argument);
+            let (_, said, refused) = run_in(&setup, &second, &arguments);
+            assert!(
+                !said.contains("MARKER-9f3a") && !refused.contains("MARKER-9f3a"),
+                "{argument:?} prints text of a path that is not this home's: {said}{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_removal_with_no_record_makes_no_identity_no_lock_and_no_file() {
+        let setup = Setup::new();
+        let before = setup.snapshot();
+        let (ok, said, _) = run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
+        assert!(ok, "{said}");
+        assert!(
+            said.contains("nothing of the login item's to remove"),
+            "{said}"
+        );
+        assert!(before == setup.snapshot(), "nothing was made: {said}");
+        // With an identity but no record and no lock, nothing is made either.
+        setup.ok("install");
+        setup.ok("remove");
+        let directory = setup.state_dir().expect("a state directory");
+        let lock = directory.join("desktop-host-login.lock");
+        let _ = std::fs::remove_file(&lock);
+        let before = setup.snapshot();
+        let (ok, said, _) = run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
+        assert!(ok, "{said}");
+        assert!(!lock.exists(), "no lock file was made: {said}");
+        assert!(before == setup.snapshot(), "nothing was made: {said}");
+    }
+
     #[test]
     fn a_path_a_property_list_must_escape_reads_back_whole() {
         for name in ["a&b", "a<b>", "a'b", "a\"b"] {
