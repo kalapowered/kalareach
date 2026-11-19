@@ -6,9 +6,10 @@
 //! never answers with a decision, never prints anything a hook's output could be read as, and
 //! never waits for a person.
 //!
-//! What differs between applications is an [`Application`]: the name the bridge declares, and what
-//! each event its registration names reports. The deadline, the input bound, the exchange with the
-//! worker and the answer are this module's, the same for all of them.
+//! What differs between applications is the name the bridge declares, which an [`Application`]
+//! holds. What each hook event reports is [`EVENTS`], the same for every application. The deadline,
+//! the input bound, the exchange with the worker and the answer are this module's, the same for all
+//! of them.
 //!
 //! Every run waits for its observation for at most [`HOOK_DEADLINE`] from its start, well inside the
 //! shortest timeout any registration names (one second, for a session ending). When that passes,
@@ -92,8 +93,9 @@ pub struct Application {
     /// The application name its registration invokes the forwarder with, which is also the
     /// application its bridge declares to the worker.
     pub name: Cow<'static, str>,
-    /// The events its registration names, each with what it reports. An event not named here is
-    /// answered and reports nothing.
+    /// The events the forwarder reads, each with what it reports: [`EVENTS`], for every
+    /// application. An application's registration decides which of them start the forwarder. An
+    /// event not named here is answered and reports nothing.
     pub events: &'static [(&'static str, Report)],
 }
 
@@ -125,7 +127,7 @@ impl Application {
         }
     }
 
-    /// What an event reports, where this application's registration names it.
+    /// What an event reports, where it is one of the events the forwarder reads.
     #[must_use]
     pub fn report(&self, event: &str) -> Option<Report> {
         self.events
@@ -508,8 +510,8 @@ pub fn read_input(input: impl std::io::Read) -> Result<HookInput, String> {
         .map_err(|error| format!("the hook's input is not an event this bridge reads: {error}"))
 }
 
-/// Translates one hook's input into the observation the worker reads, or `None` for an event the
-/// application's registration does not name, or input that names no thread.
+/// Translates one hook's input into the observation the worker reads, or `None` for an event
+/// outside the application's event vocabulary, or input that names no thread.
 ///
 /// A session starting or ending selects or ends the thread, and a start the application marks as
 /// a continuation goes on in it; a tool finishing or failing and a notification are recorded as
@@ -1286,7 +1288,7 @@ mod tests {
         );
     }
 
-    /// Every application this forwarder serves today, by its word.
+    /// The three package words that exist today, which these tests use.
     fn every() -> [Application; 3] {
         ["claude-code", "gemini-cli", "qoder-cli"].map(Application::for_word)
     }
@@ -1299,8 +1301,8 @@ mod tests {
         observation(application, &input).map(|frame| frame["kr_observation"].clone())
     }
 
-    /// Each application declares itself under its own name, as the `hook` surface, and names each
-    /// event it registers once.
+    /// Each application declares itself under its own name, as the `hook` surface, and holds each
+    /// event of the vocabulary once.
     #[test]
     fn each_application_declares_its_own_hook_bridge() {
         let every = every();
