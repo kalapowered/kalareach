@@ -9578,3 +9578,169 @@ async fn a_session_not_named_or_more_said_on_an_own_key_call_stops_the_confirmat
     hang_up(&scene);
     scene.stop_host().await;
 }
+
+/* ---------------------------------------------------------------------------------------------- */
+/* The frames of a managed call's control                                                          */
+/* ---------------------------------------------------------------------------------------------- */
+//
+// The sentences the model is told come from one table, and a managed call's control writes each of
+// them as a context request. Its frames are what they were when each sentence was written where it
+// was made: the command, the delegation, the words, and nothing else.
+
+/// What a call is told on attaching when this phone can ask the host, as the control wrote it
+/// before the sentences were kept in one table.
+const BASE_ACTIONS_AVAILABLE: &str = "The phone can ask the person's computer to read some things when the person says so clearly. What you are told about each such request is all that is known of it: do not say or imply that anything was done that you were not told was done.";
+
+/// What the model is told of a request that came to nothing as the first thing said in the call.
+const BASE_REFUSED: &str = "Nothing was done on the person's computer: what was said could not be used as a request. Say so, and ask the person to say it again.";
+
+/// What the model is told before the summary of a performed request.
+const BASE_PERFORMED: &str = "The person's computer read it. Say what it reports:";
+
+/// A frame's command, delegation and content, and the names it carries.
+fn frame_shape(frame: &serde_json::Value) -> (String, Option<String>, Option<String>, Vec<String>) {
+    let mut names: Vec<String> = frame
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default();
+    names.sort();
+    (
+        frame["command"].as_str().unwrap_or_default().to_owned(),
+        frame["delegationId"].as_str().map(str::to_owned),
+        frame["content"].as_str().map(str::to_owned),
+        names,
+    )
+}
+
+/// Has the host's next performed result say `summary`.
+fn the_host_reports(scene: &Scene, summary: String) {
+    scene
+        .link
+        .change_the_next_performed_result(move |result, _| {
+            if let VoiceDelegationOutcome::Performed { summary: shown, .. } = &mut result.outcome {
+                shown.clone_from(&summary);
+            }
+        });
+}
+
+/// The context frames the control route read from a managed call that said what each sentence says:
+/// on attaching, for a first sentence that came to nothing and for a performed status, each with
+/// the command, the delegation and the words the control wrote before the sentences were kept in
+/// one table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_control_writes_each_sentence_as_the_frame_it_wrote_before_the_table() {
+    let mut scene = delegating().await;
+    the_host_reports(&scene, "session one is running".to_owned());
+    calling(&scene).await;
+    chatter(&scene).await;
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200).await;
+    row_reaching(&scene, "d-1", "performed").await;
+    scene
+        .stand_in
+        .control()
+        .until("the service read the performed sentence", |report| {
+            report
+                .frames
+                .iter()
+                .any(|frame| frame.contains("session one is running"))
+        })
+        .await;
+
+    let names = ["command", "content", "delegationId", "id", "type"];
+    let shapes: Vec<_> = frames_of(&scene)
+        .iter()
+        .filter(|frame| frame["type"] == "context" && frame["command"] != "thinking")
+        .map(frame_shape)
+        .collect();
+    let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+    let performed = format!("{BASE_PERFORMED} session one is running");
+    assert_eq!(
+        shapes,
+        [
+            (
+                "instructions".to_owned(),
+                None,
+                Some(BASE_ACTIONS_AVAILABLE.to_owned()),
+                names.clone()
+            ),
+            (
+                "commentary".to_owned(),
+                Some("d-0".to_owned()),
+                Some(BASE_REFUSED.to_owned()),
+                names.clone()
+            ),
+            (
+                "commentary".to_owned(),
+                Some("d-1".to_owned()),
+                Some(performed),
+                names
+            ),
+        ]
+    );
+    hang_up(&scene);
+    scene.stop_host().await;
+}
+
+/// A sentence with its summary is at most 500 UTF-8 bytes on a managed control: one of exactly 500 is
+/// written, and one of 501 is refused by this device before anything is written to the socket, and
+/// the control goes on taking what follows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_sentence_over_500_bytes_is_refused_before_the_socket_and_the_control_goes_on() {
+    let mut scene = delegating().await;
+    calling(&scene).await;
+    chatter(&scene).await;
+    let room = 500 - BASE_PERFORMED.len() - 1;
+    the_host_reports(&scene, "a".repeat(room));
+    let end = speak(&scene, 6_000, "what is the status");
+    ask(&scene, "d-1", end - 200).await;
+    row_reaching(&scene, "d-1", "performed").await;
+    let exactly = format!("{BASE_PERFORMED} {}", "a".repeat(room));
+    assert_eq!(exactly.len(), 500);
+    scene
+        .stand_in
+        .control()
+        .until("the service read the 500 bytes", |report| {
+            report.frames.iter().any(|frame| frame.contains(&exactly))
+        })
+        .await;
+
+    the_host_reports(&scene, "b".repeat(room + 1));
+    let again = speak(&scene, 12_000, "what is the status");
+    ask(&scene, "d-2", again - 200).await;
+    row_reaching(&scene, "d-2", "performed").await;
+    // A request after it is written: the control was not ended by the refusal.
+    the_host_reports(&scene, "session two is running".to_owned());
+    let third = speak(&scene, 18_000, "what is the status");
+    ask(&scene, "d-3", third - 200).await;
+    row_reaching(&scene, "d-3", "performed").await;
+    scene
+        .stand_in
+        .control()
+        .until("the service read the next sentence", |report| {
+            report
+                .frames
+                .iter()
+                .any(|frame| frame.contains("session two is running"))
+        })
+        .await;
+
+    let frames = frames_of(&scene);
+    assert!(
+        frames
+            .iter()
+            .all(|frame| !frame.to_string().contains(&"b".repeat(20))),
+        "nothing of the 501 bytes was written: {frames:?}"
+    );
+    let for_d2 = frames
+        .iter()
+        .filter(|frame| frame["delegationId"] == "d-2")
+        .count();
+    assert_eq!(for_d2, 0, "no frame for the refused sentence: {frames:?}");
+    assert!(
+        told_of(&scene, "d-2").is_empty(),
+        "the service was told nothing for it"
+    );
+    hang_up(&scene);
+    scene.stop_host().await;
+}

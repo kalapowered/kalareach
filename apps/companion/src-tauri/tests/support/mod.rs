@@ -1213,6 +1213,8 @@ struct LinkState {
     /// What to do to the host's next answer that is a challenge for a spoken request's
     /// confirmation, once: the host answers, and the caller is handed the answer as this changed it.
     altering_challenge: Option<ChallengeChange>,
+    /// A change to make to the next result that says a request was performed, once.
+    altering_performed: Option<ChallengeChange>,
     /// The parameters of the latest `voice.delegate` sent, which a change to a challenge is made
     /// beside: what the digest it carries is computed over.
     delegate_params: Option<kr_protocol::voice::VoiceDelegateParams>,
@@ -1401,6 +1403,21 @@ impl LinkControl {
         + 'static,
     ) {
         self.state.lock().expect("the record").altering_challenge = Some(Arc::new(change));
+    }
+
+    /// Changes the next result that says a spoken request was performed, once, before the caller
+    /// reads it: the host performed what it performed and the caller is handed `change` of its
+    /// result, given the parameters of the request it answers.
+    pub fn change_the_next_performed_result(
+        &self,
+        change: impl Fn(
+            &mut kr_protocol::voice::VoiceDelegateResult,
+            &kr_protocol::voice::VoiceDelegateParams,
+        ) + Send
+        + Sync
+        + 'static,
+    ) {
+        self.state.lock().expect("the record").altering_performed = Some(Arc::new(change));
     }
 
     /// Answers the next `voice.delegate` with a receipt for its action, as a host that held the
@@ -1678,22 +1695,56 @@ impl LinkControl {
         &self,
         response: &kr_protocol::envelope::Response,
     ) -> Option<kr_protocol::envelope::Response> {
+        self.result_changed(
+            response,
+            |outcome| {
+                matches!(
+                    outcome,
+                    kr_protocol::voice::VoiceDelegationOutcome::ConfirmationRequired { .. }
+                )
+            },
+            |state| state.altering_challenge.take(),
+        )
+    }
+
+    /// What the next performed result is to be changed to, taking it, when `response` carries one.
+    fn performed_changed(
+        &self,
+        response: &kr_protocol::envelope::Response,
+    ) -> Option<kr_protocol::envelope::Response> {
+        self.result_changed(
+            response,
+            |outcome| {
+                matches!(
+                    outcome,
+                    kr_protocol::voice::VoiceDelegationOutcome::Performed { .. }
+                )
+            },
+            |state| state.altering_performed.take(),
+        )
+    }
+
+    /// `response` with the result of a spoken request changed by the change `take` takes, when the
+    /// result's outcome is one `wanted` accepts and a change is waiting.
+    fn result_changed(
+        &self,
+        response: &kr_protocol::envelope::Response,
+        wanted: fn(&kr_protocol::voice::VoiceDelegationOutcome) -> bool,
+        take: fn(&mut LinkState) -> Option<ChallengeChange>,
+    ) -> Option<kr_protocol::envelope::Response> {
         let kr_protocol::envelope::Outcome::Ok(value) = &response.outcome else {
             return None;
         };
         let mut result: kr_protocol::voice::VoiceDelegateResult = value.to_typed().ok()?;
-        if !matches!(
-            result.outcome,
-            kr_protocol::voice::VoiceDelegationOutcome::ConfirmationRequired { .. }
-        ) {
+        if !wanted(&result.outcome) {
             return None;
         }
         let (change, params) = {
             let mut state = self.state.lock().expect("the record");
-            (
-                state.altering_challenge.take()?,
-                state.delegate_params.clone()?,
-            )
+            if state.delegate_params.is_none() {
+                return None;
+            }
+            (take(&mut state)?, state.delegate_params.clone()?)
         };
         change(&mut result, &params);
         let mut response = response.clone();
@@ -2218,6 +2269,7 @@ impl kr_client::transport::ControlTransport for Tapped {
                         None => match self
                             .control
                             .challenge_changed(&response)
+                            .or_else(|| self.control.performed_changed(&response))
                             .or_else(|| self.control.session_read_changed(&response))
                         {
                             Some(changed) => ControlFrame::Response(changed),
