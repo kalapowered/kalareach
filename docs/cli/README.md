@@ -2934,12 +2934,13 @@ host.
 ## `kr host repair-grants`
 
 A grants row that this build cannot read gives no authority, and the owner's revocation of a device
-marks each such row revoked. This command removes them, once the host is stopped. `kr doctor` names
+marks each such row revoked. This command removes them while the host is stopped. `kr doctor` names
 the damage in its `grants-readable` check, by each row's place and what is wrong with it.
 
 ```sh
 kr host repair-grants                          # lists the rows and the live grants it would withdraw; changes nothing
 kr host repair-grants --apply                  # copies the registry, removes the rows, withdraws the grants below them
+kr host repair-grants --json                   # writes one document for the run in place of the lines
 kr host repair-grants --undo <copy>            # lists what putting the copy back would make live; changes nothing
 kr host repair-grants --undo <copy> --apply    # puts the copy back
 ```
@@ -2956,10 +2957,20 @@ chain of parents forms a loop), cancels the open invitations of the rows it remo
 fence debt, which the host pays when it starts. It never re-keys a row, rewrites a record or widens
 a grant. The copy stays until the person removes it.
 
+With `--json`, each run writes one document that states what its lines state. A preview, or a run
+with nothing to repair, holds `ok`, `applied`, `nothing_to_repair`, `unreadable_rows` (each with
+`place`, `cause` and `key`, which is null when the key is not a grant identifier) and
+`grants_to_withdraw`. A repair that changes the registry holds `copy`, `folder`, `removed_rows`,
+`withdrawn_grants` and `fence_owed` in place of those two lists. `--undo` holds `grants_live_again`,
+and `--undo --apply` holds `ok` and `applied`. A refusal is the usual failure document.
+
 `--undo <copy> --apply` puts the copy back as the registry. Everything written to the registry after
-the copy was made is lost. It is refused when the host has run since the copy was made, when the
-copy was not made from this environment's registry, when the registry's write-ahead log cannot be
-taken in, and when a file from an earlier undo stands in the way.
+the copy was made is lost. It is refused when the copy cannot be read as a registry of this build,
+when the host has run since the copy was made, when the copy was not made from this environment's
+registry, when the registry's write-ahead log cannot be taken in, when a file from an earlier undo
+stands in the way, and when the registry cannot be replaced. If the registry was replaced and its
+folder could not be synced to disk, the command says so and fails: the registry is the copy, and the
+earlier registry may come back if the computer stops before the disk writes the folder.
 
 ## `kr host import-journals`
 
