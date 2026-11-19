@@ -348,6 +348,67 @@ describe("the phone's composer and the conversation it writes to (KR-REQ-13.12)"
     expect(await screen.findByText('The conversation changed outside this host.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   })
+
+  // What the host writes in the refusal of an agent that two packages recognise equally well.
+  const TIE =
+    'it was not launched through the integration, and openai.codex and acme.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+
+  it("says why no package takes a prompt, in the host's own words, as the desktop does (KR-REQ-12.23)", async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          sessionAgents: async (...args) => {
+            const read = await port.sessionAgents(...args)
+            const instances = read.instances.instances.map((each) => ({
+              ...each,
+              plugin_id: null,
+              refusal: TIE
+            }))
+            return { ...read, instances: { ...read.instances, instances } }
+          }
+        }}
+      >
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Find why the reconnect test is flaky.')
+    await person.type(screen.getByLabelText('Message this session'), 'go on')
+    expect(
+      await screen.findByText(`No package is bound to this agent. The host says ${TIE}.`)
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.queryByText('No agent is running in this session.')).toBeNull()
+  })
+
+  it('says no package recognised an agent that the host said nothing of', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    render(
+      <AppProvider
+        port={{
+          ...port,
+          sessionAgents: async (...args) => {
+            const read = await port.sessionAgents(...args)
+            const instances = read.instances.instances.map((each) => ({
+              ...each,
+              plugin_id: null,
+              refusal: null
+            }))
+            return { ...read, instances: { ...read.instances, instances } }
+          }
+        }}
+      >
+        <OnSession sessionId={SESSION_MAIN} />
+      </AppProvider>
+    )
+    await screen.findByText('Find why the reconnect test is flaky.')
+    await person.type(screen.getByLabelText('Message this session'), 'go on')
+    expect(await screen.findByText('No package recognised this agent.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
 })
 
 describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {

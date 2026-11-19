@@ -33,7 +33,13 @@ import { useSessionOpening } from '../../app/opening'
 import { useHeldConnection } from '../../app/rights'
 import { AttachmentPaths } from '../../components/AttachmentPaths'
 import { AttachmentThumb } from '../../components/AttachmentThumb'
-import { attachOffer, composerOffers, subjectOf, withheldTotal } from '../../model/agent'
+import {
+  attachOffer,
+  composerInstance,
+  composerOffers,
+  subjectOf,
+  withheldTotal
+} from '../../model/agent'
 import type { ConversationItem } from '../../model/conversation'
 import { claimWasLost, keptEntry } from '../../model/draft-book'
 import { entryLabel, nodeKindLabel } from '../../model/entry-label'
@@ -329,11 +335,12 @@ export function MobileSession({
         ? { offered: false, reason: 'Nothing more can be sent to this session from here.' }
         : composerOffers({
             known: session.agent.instances !== null,
+            instance: composerInstance(session.agent.instances, liveInstance),
             binding: liveBinding,
             capabilities,
             rights: rights === null ? null : new Set(rights)
           }).submit,
-    [over, session.agent.instances, liveBinding, capabilities, rights]
+    [over, session.agent.instances, liveInstance, liveBinding, capabilities, rights]
   )
 
   /**

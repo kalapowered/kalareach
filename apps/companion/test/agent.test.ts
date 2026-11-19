@@ -23,6 +23,7 @@ import {
   attachOffer,
   bindingStateOf,
   COMPOSER_CAPABILITIES,
+  composerInstance,
   composerOffers,
   foldWithheld,
   drawnUnder,
@@ -157,6 +158,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
   it('offers every action when the capability, the right and the binding allow it', () => {
     const offers = composerOffers({
       known: true,
+      instance: null,
       binding: binding(),
       capabilities: capabilities(),
       rights: EVERY_RIGHT
@@ -165,25 +167,27 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
   })
 
   it('offers nothing before the capability records are read', () => {
-    const offers = composerOffers({ known: true, binding: binding(), capabilities: null, rights: EVERY_RIGHT })
+    const offers = composerOffers({ known: true, instance: null, binding: binding(), capabilities: null, rights: EVERY_RIGHT })
     for (const offer of Object.values(offers)) expect(offer.offered).toBe(false)
   })
 
   it('offers nothing while no agent is running, and claims none before the agent is read', () => {
     const none = composerOffers({
       known: true,
+      instance: null,
       binding: null,
       capabilities: capabilities(),
       rights: EVERY_RIGHT
     })
     expect(none.submit.reason).toBe('No agent is running in this session.')
-    const unread = composerOffers({ known: false, binding: null, capabilities: null, rights: null })
+    const unread = composerOffers({ known: false, instance: null, binding: null, capabilities: null, rights: null })
     expect(unread.submit).toEqual({ offered: false, reason: 'Reading this session’s agent…' })
   })
 
   it('offers nothing while the binding is unverified, in the host’s words where it gave any', () => {
     const suspended = composerOffers({
       known: true,
+      instance: null,
       binding: binding({
         rich_mutations_suspended: true,
         suspension_reason: 'The conversation changed outside this host.'
@@ -197,6 +201,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
     })
     const silent = composerOffers({
       known: true,
+      instance: null,
       binding: binding({ rich_mutations_suspended: true }),
       capabilities: capabilities(),
       rights: EVERY_RIGHT
@@ -207,6 +212,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
   it('offers steering and interrupting only while a turn is running', () => {
     const idle = composerOffers({
       known: true,
+      instance: null,
       binding: binding({ turn_id: null }),
       capabilities: capabilities(),
       rights: EVERY_RIGHT
@@ -219,6 +225,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
   it('offers queueing and steering only where the upstream does, in its own words', () => {
     const offers = composerOffers({
       known: true,
+      instance: null,
       binding: binding(),
       capabilities: capabilities({
         'agent.prompt.queue': record('agent.prompt.queue', 'incompatible', 'This upstream has no queue.')
@@ -232,6 +239,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
   it('offers nothing this device was not granted, and nothing before it is told what it may do', () => {
     const viewer = composerOffers({
       known: true,
+      instance: null,
       binding: binding(),
       capabilities: capabilities(),
       rights: new Set(['session.view'])
@@ -239,6 +247,7 @@ describe('what the composer offers (KR-REQ-13.12, 11.03)', () => {
     expect(viewer.submit).toEqual({ offered: false, reason: 'This device was not granted this.' })
     const untold = composerOffers({
       known: true,
+      instance: null,
       binding: binding(),
       capabilities: capabilities(),
       rights: null
@@ -573,5 +582,49 @@ describe('a control says why it asks nothing of an agent no package is bound to 
     const call = pressed(adopted({ refusal: ADOPTED }))
     expect(call.kind).toBe('call')
     expect(call.kind === 'call' ? call.params.plugin_id : null).toBe('openai.codex')
+  })
+
+  describe("and the composer's actions say it in the same words", () => {
+    const offered = (agent: AgentInstanceSummary, held: AgentBindingState | null) =>
+      composerOffers({
+        known: true,
+        instance: agent,
+        binding: held,
+        capabilities: capabilities(),
+        rights: EVERY_RIGHT
+      })
+
+    it("offers nothing to a tie and gives the host's own words, whether or not a binding was read", () => {
+      const tied = adopted({ plugin_id: null, refusal: TIE })
+      const words = `No package is bound to this agent. The host says ${TIE}.`
+      for (const held of [null, binding()]) {
+        for (const offer of Object.values(offered(tied, held))) {
+          expect(offer).toEqual({ offered: false, reason: words })
+        }
+      }
+      expect(because(pressed(tied))).toBe(words)
+    })
+
+    it('says no package recognised an agent that the host said nothing of', () => {
+      for (const offer of Object.values(offered(adopted({ plugin_id: null, refusal: null }), null))) {
+        expect(offer).toEqual({ offered: false, reason: 'No package recognised this agent.' })
+      }
+    })
+
+    it('offers what an agent its package is bound to may do, whatever its adoption refuses', () => {
+      for (const offer of Object.values(offered(adopted({ refusal: ADOPTED }), binding()))) {
+        expect(offer).toEqual({ offered: true, reason: null })
+      }
+    })
+  })
+})
+
+describe('the instance the composer speaks to (KR-REQ-12.23)', () => {
+  it('is the instance the session reads, from the instances it lists', () => {
+    const listed = [instance('a', '1'), instance('b', '2')]
+    expect(composerInstance(listed, 'b')?.application_instance_id).toBe('b')
+    expect(composerInstance(listed, 'c')).toBeNull()
+    expect(composerInstance(listed, null)).toBeNull()
+    expect(composerInstance(null, 'a')).toBeNull()
   })
 })
