@@ -652,6 +652,10 @@ pub struct WorkerService {
     /// compiled away in every shipped build.
     #[cfg(feature = "testing")]
     upstream_deadline_ms: std::sync::atomic::AtomicU64,
+    /// Ends the wait of an admitted operation for its upstream as its deadline ends it, at a moment
+    /// that this host's own tests choose. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    upstream_wait_ended: tokio::sync::Notify,
     /// A pause in the binding of a question's or an alert's source to the session, which this
     /// host's own tests arm to stand a caller there while a keystroke arrives. It is compiled
     /// away in every shipped build.
@@ -1239,6 +1243,8 @@ impl WorkerService {
             upstream_deadline_ms: std::sync::atomic::AtomicU64::new(
                 u64::try_from(UPSTREAM_SUBMIT_DEADLINE.as_millis()).unwrap_or(u64::MAX),
             ),
+            #[cfg(feature = "testing")]
+            upstream_wait_ended: tokio::sync::Notify::new(),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
@@ -2259,6 +2265,18 @@ impl WorkerService {
             u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::Release,
         );
+    }
+
+    /// Ends the wait of the admitted operation for its upstream as its deadline ends it: the caller
+    /// is told what a deadline tells, and what waited is dropped, while whatever thread the
+    /// operation already has goes on.
+    ///
+    /// It exists so that this host's own tests can end the wait when a thread of the operation
+    /// stands where they put it, with the deadline set so long that it cannot pass first. The end
+    /// is kept for the next wait if none is waiting. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn end_upstream_waits_for_tests(&self) {
+        self.upstream_wait_ended.notify_one();
     }
 
     /// How long an admitted operation has to reach its upstream.
@@ -7146,7 +7164,15 @@ impl WorkerService {
             handoff.admitted.action().cloned(),
             handoff.admitted.turn_id().cloned(),
         );
-        let (outcome, late) = handoff.carry(deadline).await;
+        let carried = handoff.carry(deadline);
+        // A test may end the wait before the deadline does, with the error the deadline gives.
+        #[cfg(feature = "testing")]
+        let (outcome, late) = tokio::select! {
+            done = carried => done,
+            () = self.upstream_wait_ended.notified() => (Err(unanswered()), None),
+        };
+        #[cfg(not(feature = "testing"))]
+        let (outcome, late) = carried.await;
         let settled = off_the_executor(|| {
             self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref())
         });
