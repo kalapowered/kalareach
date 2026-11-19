@@ -202,6 +202,13 @@ impl VoiceModule {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Whether the voice tick has something to watch: a call this host controls itself, or a
+    /// session on the owner's own key whose provider may have closed the call under it.
+    #[must_use]
+    pub fn needs_tick(&self) -> bool {
+        !self.host_calls.is_empty() || !self.coordinator.own_key_session_ids().is_empty()
+    }
+
     /// The calls on the owner's own key that this host controls itself.
     #[must_use]
     pub const fn host_calls(&self) -> &HostCalls {
@@ -211,13 +218,11 @@ impl VoiceModule {
     /// One pass of the voice service's own tick, at `now_ms`.
     ///
     /// While the host holds a call on the owner's own key it ends the calls that are over at their
-    /// deadline, with or without an account, and begins the closure of each call whose phone has
-    /// not been heard from for [`kr_protocol::voice_host::HOST_CLIENT_ABSENT_SECONDS`], as a stop
-    /// would (the grant first, then the provider). A host with no such call does nothing.
+    /// deadline or that the provider closed, with or without an account or a host call, and
+    /// begins the closure of each call whose phone has not been heard from for
+    /// [`kr_protocol::voice_host::HOST_CLIENT_ABSENT_SECONDS`], as a stop would (the grant first,
+    /// then the provider).
     pub async fn tick(&self, now_ms: u64) {
-        if self.host_calls.is_empty() {
-            return;
-        }
         for voice_session_id in self.host_calls.tick(now_ms).await {
             self.coordinator
                 .end_call(
@@ -237,7 +242,9 @@ impl VoiceModule {
         reason: kr_protocol::voice_host::VoiceEndReason,
         now_ms: u64,
     ) {
-        for voice_session_id in self.host_calls.voice_session_ids() {
+        // The sessions the coordinator holds, not the host calls registered so far: a session
+        // whose host call is not registered yet is ended too.
+        for voice_session_id in self.coordinator.own_key_session_ids() {
             self.coordinator
                 .end_call(voice_session_id, reason, now_ms)
                 .await;
@@ -551,7 +558,7 @@ impl VoiceModule {
                     facts: &*self.facts,
                     decided: self.facts.privacy(),
                     device_id,
-                    now_ms,
+                    clock: &self.clock,
                 };
                 call.note(
                     action_id,
@@ -670,11 +677,19 @@ impl VoiceModule {
                 let device_id = device_of(actor)?;
                 // A call the host controls itself is one whose side channel heard what the model
                 // said: an identifier it never heard is not a delegation of this call.
-                if let Ok(call) = self
+                // A session on the owner's key whose host call is gone has nothing the provider
+                // could have announced to: it is refused as an unannounced delegation is.
+                let heard = match self
                     .host_calls
                     .of_device(params.voice_session_id, device_id)
-                    && !call.announced(params.delegation_id.as_str()).await
                 {
+                    Ok(call) => call.announced(params.delegation_id.as_str()).await,
+                    Err(_) => !self
+                        .coordinator
+                        .own_key_session_ids()
+                        .contains(&params.voice_session_id),
+                };
+                if !heard {
                     return Err(voice_error(kr_voice::VoiceError::refused(
                         kr_protocol::voice::VoiceRefusal::UnannouncedDelegation,
                         "the provider never announced that delegation to this call",
@@ -736,7 +751,18 @@ struct ReadAgain<'a> {
     /// is not given.
     decided: crate::privacy::Published,
     device_id: DeviceId,
-    now_ms: u64,
+    /// Read when each check is made, so a wait before it does not leave it on the time the note
+    /// arrived at.
+    clock: &'a Clock,
+}
+
+/// Whether a receipt's action is a session read, the one kind that a repeat or a note reads
+/// again. Every other receipt goes back as it was kept, because an effect is never performed
+/// again and a closed or sent thing is not proposed again.
+pub(crate) fn rereads(kept: &kr_protocol::voice::VoiceDelegateResult) -> bool {
+    kept.action
+        .0
+        .is_some_and(|action| method_for(action) == Some(Method::SessionRead))
 }
 
 /// What the host tells a device when the read behind a note failed, by what failed: a grant or the
@@ -760,6 +786,19 @@ impl NoteSupport for ReadAgain<'_> {
     > {
         use kr_protocol::voice_host::VoiceHostRefusal;
         Box::pin(async move {
+            // A completed write is told in the receipt's own words: it is not proposed again, and
+            // a confirmed close is not asked to be confirmed a second time.
+            if record.kept.action.0.is_some() && !rereads(&record.kept) {
+                if !self.facts.unmoved(self.decided) {
+                    return Err(VoiceHostRefusal::Privacy);
+                }
+                return match &record.kept.outcome {
+                    kr_protocol::voice::VoiceDelegationOutcome::Performed { summary, .. } => {
+                        Ok(summary.clone())
+                    }
+                    _ => Err(VoiceHostRefusal::OutsideGrant),
+                };
+            }
             let again = self
                 .coordinator
                 .restate(
@@ -767,7 +806,7 @@ impl NoteSupport for ReadAgain<'_> {
                     record.delegate_action_id,
                     &record.params,
                     &record.kept,
-                    self.now_ms,
+                    self.clock.now_ms(),
                 )
                 .await
                 .map_err(|error| refusal_of_the_read(&error))?;
@@ -794,16 +833,18 @@ impl NoteSupport for ReadAgain<'_> {
     > {
         use kr_protocol::voice_host::VoiceHostRefusal;
         Box::pin(async move {
-            self.coordinator
-                .allows_restate(
-                    self.device_id,
-                    record.delegate_action_id,
-                    &record.params,
-                    &record.kept,
-                    self.now_ms,
-                )
-                .await
-                .map_err(|error| refusal_of_the_read(&error))?;
+            if record.kept.action.0.is_none() || rereads(&record.kept) {
+                self.coordinator
+                    .allows_restate(
+                        self.device_id,
+                        record.delegate_action_id,
+                        &record.params,
+                        &record.kept,
+                        self.clock.now_ms(),
+                    )
+                    .await
+                    .map_err(|error| refusal_of_the_read(&error))?;
+            }
             if self.facts.unmoved(self.decided) {
                 Ok(())
             } else {

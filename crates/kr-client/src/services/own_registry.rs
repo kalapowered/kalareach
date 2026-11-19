@@ -12,8 +12,11 @@
 
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use kr_protocol::ids::ActionId;
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use super::own_call::{LedgerError, OwnCallLedger};
 
@@ -31,7 +34,7 @@ pub enum RegistryState {
 }
 
 /// Why a start is refused.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum StartRefusal {
     /// The owner is removing the key or forgetting the calls.
     Settling,
@@ -50,12 +53,79 @@ pub enum StartRefusal {
     RecordUnreadable(LedgerError),
 }
 
+crate::debug_as_name!(StartRefusal);
+
+/// How a start that a removal waited for came out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartEnd {
+    /// The start ended and no session of the provider's is in question.
+    Ended,
+    /// The creation was never answered: the provider may or may not hold a session.
+    NeverAnswered,
+    /// A session that the fence found arriving was hung up and the provider confirmed it closed.
+    LateClosed,
+    /// A session that the fence found arriving was hung up and the provider did not confirm it.
+    LateUnconfirmed,
+}
+
+/// The record of the start in flight, made when the start is admitted, so that a removal that
+/// fences between the admission and anything the start writes still finds it.
+pub struct StartSlot {
+    pub(crate) asked: Instant,
+    epoch: u64,
+    end: Mutex<Option<StartEnd>>,
+    done: Notify,
+}
+
+impl StartSlot {
+    fn new(epoch: u64) -> Self {
+        Self {
+            asked: Instant::now(),
+            epoch,
+            end: Mutex::new(None),
+            done: Notify::new(),
+        }
+    }
+
+    pub(crate) fn finish(&self, end: StartEnd) {
+        let mut held = self.end.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.is_none() {
+            *held = Some(end);
+        }
+        drop(held);
+        self.done.notify_waiters();
+    }
+
+    pub(crate) fn ended(&self) -> Option<StartEnd> {
+        *self.end.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Resolves when the start has ended or `until` has come, whichever is first.
+    pub(crate) async fn wait_until(&self, until: Instant) -> Option<StartEnd> {
+        loop {
+            let notified = self.done.notified();
+            tokio::pin!(notified);
+            // Registered before the state is read, so a finish between the two is not missed.
+            notified.as_mut().enable();
+            if let Some(end) = self.ended() {
+                return Some(end);
+            }
+            if tokio::time::timeout_at(until, notified).await.is_err() {
+                return self.ended();
+            }
+        }
+    }
+}
+
+crate::debug_as_name!(StartSlot);
+
 /// What a start holds while it is the one start: dropping it without [`CallRegistry::running`]
 /// or [`CallRegistry::finished`] returns the registry to `Idle`.
 pub struct StartTicket {
     registry: Arc<CallRegistry>,
     epoch: u64,
     live: bool,
+    slot: Arc<StartSlot>,
 }
 
 impl StartTicket {
@@ -64,6 +134,13 @@ impl StartTicket {
     #[must_use]
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The record of this start, which the owner of the start ends with
+    /// [`CallRegistry::end_start`].
+    #[must_use]
+    pub fn slot(&self) -> Arc<StartSlot> {
+        Arc::clone(&self.slot)
     }
 }
 
@@ -80,20 +157,52 @@ impl Drop for StartTicket {
     fn drop(&mut self) {
         if self.live {
             self.registry.release(self.epoch, RegistryState::Starting);
+            self.registry.end_start(&self.slot, StartEnd::Ended);
         }
     }
 }
 
-#[derive(Debug)]
 struct Inner {
     state: RegistryState,
     epoch: u64,
+    slot: Option<Arc<StartSlot>>,
 }
+
+#[derive(Default)]
+struct Tasks {
+    running: Mutex<usize>,
+    idle: Notify,
+}
+
+/// What a task that may use the key or write a row holds while it runs. A removal waits for every
+/// token before it lets the registry go.
+pub struct TaskToken {
+    tasks: Arc<Tasks>,
+}
+
+impl Drop for TaskToken {
+    fn drop(&mut self) {
+        let mut running = self
+            .tasks
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *running = running.saturating_sub(1);
+        let none = *running == 0;
+        drop(running);
+        if none {
+            self.tasks.idle.notify_waiters();
+        }
+    }
+}
+
+crate::debug_as_name!(TaskToken);
 
 /// The registry of the host's own-key calls.
 pub struct CallRegistry {
     inner: Mutex<Inner>,
     ledger: Arc<dyn OwnCallLedger>,
+    tasks: Arc<Tasks>,
 }
 
 impl fmt::Debug for CallRegistry {
@@ -112,8 +221,10 @@ impl CallRegistry {
             inner: Mutex::new(Inner {
                 state: RegistryState::Idle,
                 epoch: 1,
+                slot: None,
             }),
             ledger,
+            tasks: Arc::new(Tasks::default()),
         })
     }
 
@@ -161,11 +272,117 @@ impl CallRegistry {
             });
         }
         inner.state = RegistryState::Starting;
+        let slot = Arc::new(StartSlot::new(inner.epoch));
+        inner.slot = Some(Arc::clone(&slot));
         Ok(StartTicket {
             registry: Arc::clone(self),
             epoch: inner.epoch,
             live: true,
+            slot,
         })
+    }
+
+    /// Runs `change` while no call is starting, running or standing, and while no start can be
+    /// admitted, because the registry's own lock is held across it. This is how the key is
+    /// replaced: no start can read the old key and have it replaced before it is done with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why a start would be refused now, and runs nothing.
+    pub fn while_idle<T>(&self, change: impl FnOnce() -> T) -> Result<T, StartRefusal> {
+        let inner = self.inner();
+        match inner.state {
+            RegistryState::Settling => return Err(StartRefusal::Settling),
+            RegistryState::Starting | RegistryState::Running => {
+                return Err(StartRefusal::InProgress);
+            }
+            RegistryState::Idle => {}
+        }
+        let rows = self.ledger.rows().map_err(StartRefusal::RecordUnreadable)?;
+        if let Some(blocking) = rows.iter().find(|row| row.state.blocks_a_start()) {
+            return Err(StartRefusal::Blocked {
+                action_id: blocking.call.action_id,
+                device_id: blocking.call.device_id.clone(),
+                asked_ms: blocking.call.asked_ms,
+            });
+        }
+        let changed = change();
+        drop(inner);
+        Ok(changed)
+    }
+
+    /// The start in flight, or the last one a fence found.
+    #[must_use]
+    pub fn slot(&self) -> Option<Arc<StartSlot>> {
+        self.inner().slot.clone()
+    }
+
+    /// Records how a start came out. A start that ends before any fence leaves no record, so a
+    /// later removal does not tell of it; one that a fence found leaves it for the settle to read.
+    pub fn end_start(&self, slot: &Arc<StartSlot>, end: StartEnd) {
+        slot.finish(end);
+        let mut inner = self.inner();
+        if inner.epoch == slot.epoch
+            && inner
+                .slot
+                .as_ref()
+                .is_some_and(|held| Arc::ptr_eq(held, slot))
+        {
+            inner.slot = None;
+        }
+    }
+
+    /// Forgets `slot` once a settle has told what became of its start, so that a later settle
+    /// with no start in flight does not tell that start's end again.
+    pub fn clear_slot(&self, slot: &Arc<StartSlot>) {
+        let mut inner = self.inner();
+        if inner
+            .slot
+            .as_ref()
+            .is_some_and(|held| Arc::ptr_eq(held, slot))
+        {
+            inner.slot = None;
+        }
+    }
+
+    /// A token for a task that may use the key or write a row until it ends.
+    #[must_use]
+    pub fn track(&self) -> TaskToken {
+        *self
+            .tasks
+            .running
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
+        TaskToken {
+            tasks: Arc::clone(&self.tasks),
+        }
+    }
+
+    /// Waits until no tracked task is left, at most `bound`. Says whether none is.
+    pub async fn quiesce(&self, bound: Duration) -> bool {
+        let until = Instant::now() + bound;
+        loop {
+            let notified = self.tasks.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if *self
+                .tasks
+                .running
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                == 0
+            {
+                return true;
+            }
+            if tokio::time::timeout_at(until, notified).await.is_err() {
+                return *self
+                    .tasks
+                    .running
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    == 0;
+            }
+        }
     }
 
     /// The start's call is running. Returns whether the ticket's epoch still owns the registry:
@@ -182,10 +399,11 @@ impl CallRegistry {
         }
     }
 
-    /// The start ended without a running call.
-    pub fn finished(&self, mut ticket: StartTicket) {
+    /// The start ended without a running call, and came out as `end`.
+    pub fn finished(&self, mut ticket: StartTicket, end: StartEnd) {
         ticket.live = false;
         self.release(ticket.epoch, RegistryState::Starting);
+        self.end_start(&ticket.slot, end);
     }
 
     /// The running call ended.
@@ -290,7 +508,7 @@ mod tests {
         }
         fn rows(&self) -> LedgerResult<Vec<CallRow>> {
             if *self.unreadable.lock().expect("the flag") {
-                return Err(LedgerError("the record is unreadable".to_owned()));
+                return Err(LedgerError::said("the record is unreadable"));
             }
             Ok(self.rows.lock().expect("the rows").clone())
         }

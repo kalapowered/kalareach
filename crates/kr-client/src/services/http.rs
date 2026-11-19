@@ -604,16 +604,8 @@ pub struct StatusAnswer {
     pub body: Result<Vec<u8>>,
 }
 
-impl fmt::Debug for StatusAnswer {
-    /// The status and whether the body was read, and nothing the service wrote.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("StatusAnswer")
-            .field("status", &self.status)
-            .field("body_read", &self.body.is_ok())
-            .finish()
-    }
-}
+// The status, and nothing the service wrote.
+crate::debug_fields!(StatusAnswer { status });
 
 /// Why a header could not be built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

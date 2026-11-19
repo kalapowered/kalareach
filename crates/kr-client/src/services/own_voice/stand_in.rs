@@ -34,7 +34,7 @@ pub const TESTING_REFUSAL: &str =
 pub static TESTING_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
 /// What the stand-in answers to a creation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum CreateScript {
     /// A status and a body.
     Answer(u16, Option<Vec<u8>>),
@@ -46,8 +46,10 @@ pub enum CreateScript {
     Held(Arc<tokio::sync::Notify>, Box<CreateScript>),
 }
 
+crate::debug_as_name!(CreateScript);
+
 /// What the stand-in answers to a hangup.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum HangupScript {
     /// A status and a body.
     Answer(u16, Option<Vec<u8>>),
@@ -55,8 +57,10 @@ pub enum HangupScript {
     Lost,
 }
 
+crate::debug_as_name!(HangupScript);
+
 /// The requests the stand-in saw.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Recorded {
     /// The key and the body of each creation.
     pub creates: Vec<(String, Value)>,
@@ -67,6 +71,8 @@ pub struct Recorded {
     /// Each command written on the side channel.
     pub commands: Vec<Value>,
 }
+
+crate::debug_as_name!(Recorded);
 
 struct Script {
     create: VecDeque<CreateScript>,
@@ -90,11 +96,7 @@ pub struct StandIn {
     state: Arc<State>,
 }
 
-impl fmt::Debug for StandIn {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(STAND_IN_MARKER)
-    }
-}
+crate::debug_as_name!(StandIn);
 
 impl Default for StandIn {
     fn default() -> Self {
@@ -127,6 +129,8 @@ impl StandIn {
     /// with `session.closed`, and hangs up with a 200.
     #[must_use]
     pub fn new() -> Self {
+        // Read at run time, so a binary that carries the stand-in carries the marker text.
+        std::hint::black_box(STAND_IN_MARKER);
         Self {
             state: Arc::new(State {
                 script: Mutex::new(Script {
@@ -377,12 +381,14 @@ impl OwnVoiceTransport for StandIn {
 }
 
 /// A key source with a key that tests set, and a count of the reads made of it.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct StaticKey {
     key: Mutex<Option<String>>,
     unreadable: Mutex<bool>,
     reads: AtomicUsize,
 }
+
+crate::debug_as_name!(StaticKey);
 
 impl StaticKey {
     /// A source holding `key`, or none.
@@ -434,11 +440,13 @@ impl OwnKeySource for StaticKey {
 }
 
 /// A record of calls in memory, with writes that can be made to fail.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct MemoryLedger {
     rows: Mutex<Vec<CallRow>>,
     fail: Mutex<Vec<&'static str>>,
 }
+
+crate::debug_as_name!(MemoryLedger);
 
 impl MemoryLedger {
     /// An empty record.
@@ -464,7 +472,7 @@ impl MemoryLedger {
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&write)
         {
-            Err(LedgerError("the record refused".to_owned()))
+            Err(LedgerError::said("the record refused"))
         } else {
             Ok(())
         }
@@ -499,7 +507,7 @@ impl OwnCallLedger for MemoryLedger {
         let row = rows
             .iter_mut()
             .find(|row| row.call.call_id == call_id && row.state == CallState::Creating)
-            .ok_or_else(|| LedgerError("no creating row".to_owned()))?;
+            .ok_or_else(|| LedgerError::said("no creating row"))?;
         row.state = CallState::Open;
         row.provider_session_id = Some(session.to_owned());
         row.provider_expires_ms = expires;
@@ -512,7 +520,7 @@ impl OwnCallLedger for MemoryLedger {
         let row = rows
             .iter_mut()
             .find(|row| row.call.call_id == call_id)
-            .ok_or_else(|| LedgerError("no row".to_owned()))?;
+            .ok_or_else(|| LedgerError::said("no row"))?;
         row.state = state;
         Ok(())
     }
@@ -523,7 +531,7 @@ impl OwnCallLedger for MemoryLedger {
         let row = rows
             .iter_mut()
             .find(|row| row.call.call_id == call_id)
-            .ok_or_else(|| LedgerError("no row".to_owned()))?;
+            .ok_or_else(|| LedgerError::said("no row"))?;
         row.state = CallState::Closed;
         row.closed_ms = Some(closed_ms);
         Ok(())

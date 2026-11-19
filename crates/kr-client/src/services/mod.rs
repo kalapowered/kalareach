@@ -185,7 +185,9 @@ pub use organisation::{
     AccountNow, IssuedLease, ManagedMembershipLeaseService, MembershipLeaseService, Token,
 };
 pub use own_call::{CallRow, CallState, LedgerError, LedgerResult, NewCall, OwnCallLedger};
-pub use own_registry::{CallRegistry, Fenced, RegistryState, StartRefusal, StartTicket};
+pub use own_registry::{
+    CallRegistry, Fenced, RegistryState, StartRefusal, StartSlot, StartTicket, TaskToken,
+};
 pub use relay::{
     ManagedRelayLeaseService, RelayAllowance, RelayGraceRemainder, RelayLeaseAnswer,
     RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayPayerAuthorisation, RelayWarning,

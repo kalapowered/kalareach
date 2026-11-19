@@ -207,7 +207,10 @@ mod tests {
     /// the code it excused.
     const NOT_AN_ANSWER: [(&str, &str); 4] = [
         // A header value this client sends, which is not JSON at all.
-        ("http.rs", "reqwest::header::HeaderValue::from_str(value)"),
+        (
+            "http.rs",
+            "reqwest::header::HeaderValue::from_str(header.value)",
+        ),
         // The sign-in this device stored.
         (
             "account.rs",

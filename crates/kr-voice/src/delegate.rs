@@ -215,6 +215,21 @@ struct Created {
     control: VoiceSessionControl,
     disclosure: Vec<String>,
     replayed: bool,
+    /// Held until the start has written the call's record or refused it, so that a provider that
+    /// keeps the start open until then does not let go while the call is half published.
+    published: Option<Published>,
+}
+
+/// Tells the provider that a start's caller is done with the call it was given.
+struct Published {
+    provider: Arc<dyn VoiceProviderService>,
+    call_id: String,
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        self.provider.start_published(&self.call_id);
+    }
 }
 
 /// What running every check produced.
@@ -548,6 +563,30 @@ impl Coordinator {
             started_at_ms: record.started_at_ms,
             closes_at_ms: record.closes_at_ms,
         })
+    }
+
+    /// The live voice sessions whose call spends the owner's own key, which a removal of that key
+    /// ends. A session counts from the moment its record is written, before any host call is
+    /// registered for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    #[must_use]
+    pub fn own_key_session_ids(&self) -> Vec<VoiceSessionId> {
+        self.state
+            .lock()
+            .expect("the coordinator's state")
+            .sessions
+            .iter()
+            .filter(|record| {
+                record
+                    .provider
+                    .as_ref()
+                    .is_some_and(|provider| provider.spends_the_owners_key())
+            })
+            .map(|record| record.voice_session_id)
+            .collect()
     }
 
     /// How many voice sessions are live.
@@ -1271,6 +1310,7 @@ impl Coordinator {
                 model: session.model,
                 disclosure: session.disclosure,
                 replayed: session.replayed,
+                published: None,
             },
             // A call on the owner's own account: the host controls it, so the device is told to
             // send its writes and heartbeats here. It is never a replay: the host minted its
@@ -1281,12 +1321,17 @@ impl Coordinator {
                 // is a call somebody is paying for: it is closed, and the start is answered as a
                 // host with no voice service is.
                 let _ = provider.close(&own.call_id).await;
+                provider.start_published(&own.call_id);
                 return Err(VoiceError::NotConfigured(NO_VOICE_SERVICE.to_owned()));
             }
             VoiceStart::StartedOwn(own) => Created {
                 control: VoiceSessionControl::Host {
                     heartbeat_seconds: HOST_HEARTBEAT_SECONDS,
                 },
+                published: Some(Published {
+                    provider: Arc::clone(&provider),
+                    call_id: own.call_id.clone(),
+                }),
                 call_id: own.call_id,
                 provider_session_id: own.provider_session_id,
                 answer_sdp: own.answer_sdp,

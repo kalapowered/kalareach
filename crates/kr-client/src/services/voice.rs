@@ -1008,19 +1008,10 @@ pub enum VoiceProviderTerms {
     OwnKey(VoiceOwnKeyTerms),
 }
 
-impl fmt::Debug for VoiceProviderTerms {
-    /// Which kind of provider it is, and none of the terms.
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unquoted => formatter.write_str("Unquoted"),
-            Self::Managed(_) => formatter.write_str("Managed(..)"),
-            Self::OwnKey(terms) => formatter.debug_tuple("OwnKey").field(terms).finish(),
-        }
-    }
-}
+crate::debug_as_name!(VoiceProviderTerms);
 
 /// What a call on the owner's own provider account would be, in this host's own words.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct VoiceOwnKeyTerms {
     /// The model the call runs on.
     pub model: String,
@@ -1029,6 +1020,8 @@ pub struct VoiceOwnKeyTerms {
     /// Whether this host holds the key a call needs. A call is not offered without it.
     pub held: bool,
 }
+
+crate::debug_fields!(VoiceOwnKeyTerms { held });
 
 /// What a provider holds between the two halves of a start.
 ///
@@ -1165,6 +1158,11 @@ pub trait VoiceProviderService: Send + Sync + fmt::Debug {
     /// Returns a transport or protocol error, or the service's refusal. A caller then does not know
     /// and holds the call open.
     fn call_is_open<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, bool>;
+
+    /// Tells the provider that its caller has published the call `call_id`, which a start gave
+    /// out, or refused it. A provider that holds the start open until then lets it go here; the
+    /// call is the caller's from this point. It does nothing for a provider that holds nothing.
+    fn start_published(&self, _call_id: &str) {}
 
     /// What this provider is, for a caller holding calls from more than one.
     ///

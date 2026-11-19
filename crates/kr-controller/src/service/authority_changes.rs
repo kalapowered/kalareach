@@ -20,7 +20,7 @@ use kr_protocol::sharing::{
     MAX_NAMED_RESOURCES, NamedApprovalPreview, NamedQuestionPreview, RoleSelection,
 };
 
-use kr_client::services::own_voice::{StoredCalls, words};
+use kr_client::services::own_voice::{Settled as StartSettled, StoredCalls, words};
 
 use crate::error::{ControllerError, Result};
 use crate::given::{Given, Recorded, Settled};
@@ -1444,19 +1444,20 @@ impl Controller {
         let registry = self.registry.lock().await;
         self.check_admission(&registry, &carried)?;
         // A key in use is not replaced: a call that is starting, running or not confirmed closed
-        // is paid for with it, and its closure needs the key that made it.
-        if self.own_voice.registry().state() != kr_client::services::RegistryState::Idle
-            || self
-                .own_voice
-                .ledger()
-                .rows()
-                .map_err(|_| refused_voice(words::RECORD_UNREADABLE))?
-                .iter()
-                .any(|row| row.state.blocks_a_start())
-        {
-            return Err(refused_voice(words::KEY_IN_USE));
-        }
-        self.voice_credentials.put(params.kind, &params.key)?;
+        // is paid for with it, and its closure needs the key that made it. The check and the
+        // write are one step under the registry's own lock, which a start takes to be admitted,
+        // so no start reads the old key and has it replaced before it is done with it.
+        let put = self
+            .own_voice
+            .registry()
+            .while_idle(|| self.voice_credentials.put(params.kind, &params.key))
+            .map_err(|refusal| match refusal {
+                kr_client::services::StartRefusal::RecordUnreadable(_) => {
+                    refused_voice(words::RECORD_UNREADABLE)
+                }
+                _ => refused_voice(words::KEY_IN_USE),
+            })?;
+        put?;
         drop(registry);
         encode(&kr_protocol::voice_credential::VoiceCredentialSetResult {
             kind: params.kind,
@@ -1487,10 +1488,24 @@ impl Controller {
         if provider.registry().fence().is_none() {
             return Err(refused_voice(words::SETTLING));
         }
+        // A start in flight is waited for first, through the publication of its call, so that the
+        // call it gives out is one the next step finds and ends.
+        let settled = provider.settle().await;
         self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
             .await;
-        let settled = provider.settle().await;
-        let left = provider.close_stored_calls().await;
+        let quiet = provider.registry().quiesce(CLEANUP_BOUND).await;
+        let left = match provider.close_stored_calls().await {
+            // A task that is still running may hold a call the record does not show yet.
+            StoredCalls::NoneLeft if !quiet => StoredCalls::NotConfirmed,
+            left => left,
+        };
+        // No stored call with a session id stands, so each was confirmed closed: a late session
+        // that was hung up is closed, whatever the start reported.
+        let settled = if left == StoredCalls::NoneLeft && settled == StartSettled::MayStillRun {
+            StartSettled::LateSessionClosed
+        } else {
+            settled
+        };
         let outcome = match left {
             StoredCalls::NoneLeft => {
                 // The admission is asked again under the registry lock, which is held across the
@@ -1534,14 +1549,15 @@ impl Controller {
         if provider.registry().fence().is_none() {
             return Err(refused_voice(words::SETTLING));
         }
-        let sessions = provider.live_sessions();
+        let settled = provider.settle().await;
         self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
             .await;
-        // One bounded best-effort hangup of each call that was live, before its record goes.
-        for session in &sessions {
+        provider.registry().quiesce(CLEANUP_BOUND).await;
+        // A call whose close was confirmed is hung up no more. One bounded best-effort hangup of
+        // each call that is still live, before its record goes.
+        for session in &provider.live_sessions() {
             let _ = provider.cleanup_hangup(session).await;
         }
-        let settled = provider.settle().await;
         let forgotten = provider.ledger().forget_all();
         provider.registry().unfence();
         let forgotten = forgotten.map_err(|_| refused_voice(words::NOT_FORGOTTEN))?;
@@ -3181,6 +3197,9 @@ fn late_start_of(
 }
 
 /// The one refusal of parameters that do not read as `voice.credential.remove`'s.
+/// How long a removal waits for the tasks of the calls it ended to finish their records.
+const CLEANUP_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
 const VOICE_REMOVE_PARAMS_REFUSAL: &str = "voice.credential.remove takes one provider: {kind: \
      openai_live}";
 

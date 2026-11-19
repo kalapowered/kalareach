@@ -605,11 +605,7 @@ fn the_working_path_is_compiled_only_under_the_testing_gate() {
         }
     }
     let stand_in = std::fs::read_to_string(format!("{base}own_voice/stand_in.rs")).expect("source");
-    assert!(
-        stand_in.contains("write!(formatter, \"{STAND_IN_MARKER}\")")
-            || stand_in.contains("write_str(STAND_IN_MARKER)")
-    );
-    assert!(format!("{:?}", StandIn::new()).contains(STAND_IN_MARKER));
+    assert!(stand_in.contains("black_box(STAND_IN_MARKER)"));
 }
 
 fn stored(world: &World, byte: u8, state: CallState, session: Option<&str>) {

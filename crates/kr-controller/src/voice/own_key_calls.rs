@@ -51,8 +51,8 @@ fn counter_of(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 
-fn refused(what: &str, error: &rusqlite::Error) -> LedgerError {
-    LedgerError(format!("the own-key call record could not {what}: {error}"))
+fn refused(words: &'static str) -> LedgerError {
+    LedgerError::said(words)
 }
 
 impl OwnKeyCalls {
@@ -149,15 +149,13 @@ impl OwnKeyCalls {
                 params![call_id],
                 |row| row.get(0),
             )
-            .map_err(|error| refused("read a row", &error))
+            .map_err(|_| refused("the own-key call record could not read a row"))
     }
 }
 
 /// The refusal for a change to a call the record has no row for, or has in another state.
-fn no_such_call(what: &str) -> LedgerError {
-    LedgerError(format!(
-        "the own-key call record has no call that {what} at this step"
-    ))
+fn no_such_call(words: &'static str) -> LedgerError {
+    LedgerError::said(words)
 }
 
 impl OwnCallLedger for OwnKeyCalls {
@@ -177,7 +175,7 @@ impl OwnCallLedger for OwnKeyCalls {
                 ],
             )
             .map(|_| ())
-            .map_err(|error| refused("write a call", &error))
+            .map_err(|_| refused("the own-key call record could not write a call"))
     }
 
     fn record_id(
@@ -198,18 +196,20 @@ impl OwnCallLedger for OwnKeyCalls {
                     provider_expires_ms.map(counter)
                 ],
             )
-            .map_err(|error| refused("write a session id", &error))?;
+            .map_err(|_| refused("the own-key call record could not write a session id"))?;
         if changed == 1 {
             Ok(())
         } else {
-            Err(no_such_call("was still being created"))
+            Err(no_such_call(
+                "the own-key call record has no call that was still being created at this step",
+            ))
         }
     }
 
     fn record_state(&self, call_id: &str, state: CallState) -> LedgerResult<()> {
         if !matches!(state, CallState::Closing | CallState::Unresolved) {
-            return Err(LedgerError(
-                "the own-key call record moves a call to closing or unresolved only".to_owned(),
+            return Err(LedgerError::said(
+                "the own-key call record moves a call to closing or unresolved only",
             ));
         }
         let changed = self
@@ -219,11 +219,13 @@ impl OwnCallLedger for OwnKeyCalls {
                  WHERE call_id = ?1 AND state IN ('open', 'closing', 'unresolved')",
                 params![call_id, state.as_str()],
             )
-            .map_err(|error| refused("write a state", &error))?;
+            .map_err(|_| refused("the own-key call record could not write a state"))?;
         if changed == 1 {
             Ok(())
         } else {
-            Err(no_such_call("holds a session and is not closed"))
+            Err(no_such_call(
+                "the own-key call record has no call that holds a session and is not closed at this step",
+            ))
         }
     }
 
@@ -235,12 +237,14 @@ impl OwnCallLedger for OwnKeyCalls {
                  WHERE call_id = ?1 AND state != 'closed'",
                 params![call_id, counter(closed_ms)],
             )
-            .map_err(|error| refused("write a closure", &error))?;
+            .map_err(|_| refused("the own-key call record could not write a closure"))?;
         // A closure written twice is one closure: the first mark stands.
         if changed == 1 || Self::stands(&connection, call_id)? {
             Ok(())
         } else {
-            Err(no_such_call("is stored"))
+            Err(no_such_call(
+                "the own-key call record has no call that is stored at this step",
+            ))
         }
     }
 
@@ -252,7 +256,7 @@ impl OwnCallLedger for OwnKeyCalls {
                         provider_expires_ms, asked_ms, closes_at_ms, closed_ms
                  FROM own_key_calls ORDER BY asked_ms, call_id",
             )
-            .map_err(|error| refused("read the calls", &error))?;
+            .map_err(|_| refused("the own-key call record could not read the calls"))?;
         let read = statement
             .query_map([], |row| {
                 Ok((
@@ -268,7 +272,7 @@ impl OwnCallLedger for OwnKeyCalls {
                     row.get::<_, Option<i64>>(9)?,
                 ))
             })
-            .map_err(|error| refused("read the calls", &error))?;
+            .map_err(|_| refused("the own-key call record could not read the calls"))?;
         let mut rows = Vec::new();
         for stored in read {
             let (
@@ -282,14 +286,11 @@ impl OwnCallLedger for OwnKeyCalls {
                 asked,
                 closes,
                 closed,
-            ) = stored.map_err(|error| refused("read a call", &error))?;
+            ) = stored.map_err(|_| refused("the own-key call record could not read a call"))?;
             // A row this build cannot read is refused whole, because a call it cannot name is one
             // it cannot end, and a count that skipped it would say there were fewer.
-            let unreadable = || {
-                LedgerError(
-                    "the own-key call record holds a call this build cannot read".to_owned(),
-                )
-            };
+            let unreadable =
+                || LedgerError::said("the own-key call record holds a call this build cannot read");
             let action_id = action
                 .parse::<Uuid>()
                 .map(ActionId::new)
@@ -319,14 +320,14 @@ impl OwnCallLedger for OwnKeyCalls {
                 params![call_id],
             )
             .map(|_| ())
-            .map_err(|error| refused("delete a call", &error))
+            .map_err(|_| refused("the own-key call record could not delete a call"))
     }
 
     fn forget_all(&self) -> LedgerResult<u64> {
         self.connection()
             .execute("DELETE FROM own_key_calls", [])
             .map(|count| count as u64)
-            .map_err(|error| refused("forget the calls", &error))
+            .map_err(|_| refused("the own-key call record could not forget the calls"))
     }
 }
 
@@ -533,7 +534,7 @@ mod tests {
             .expect("the row is changed");
 
         let error = record.rows().expect_err("the row is refused");
-        assert!(error.0.contains("cannot read"), "{error}");
+        assert!(error.to_string().contains("cannot read"), "{error}");
     }
 
     /// The record's debug form shows that it exists and no row.

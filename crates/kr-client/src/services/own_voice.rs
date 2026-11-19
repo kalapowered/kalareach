@@ -33,8 +33,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kr_protocol::delivery::SecretText;
-use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::ActionId;
+use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::{ActionId, DeviceId};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -46,7 +46,8 @@ use super::host_call::{
     WriteRefusal,
 };
 use super::own_call::{CallState, NewCall, OwnCallLedger};
-use super::own_registry::{CallRegistry, StartRefusal, StartTicket};
+pub use super::own_registry::StartEnd;
+use super::own_registry::{CallRegistry, StartRefusal, StartSlot, StartTicket, TaskToken};
 use super::voice::{
     OwnSession, StartAttempt, VOICE_OFFER_BYTES, VoiceClosure, VoiceCommand, VoiceContextFrame,
     VoiceOwnKeyTerms, VoiceProviderService, VoiceProviderTerms, VoiceRefusal, VoiceRefusalReason,
@@ -84,7 +85,7 @@ pub const RECOVERY_BOUND: Duration = Duration::from_secs(10);
 
 /// The longest a removal waits for a start in flight: the rest of the creation window and one
 /// hangup.
-pub const SETTLE_BOUND: Duration = Duration::from_secs(45);
+pub const SETTLE_BOUND: Duration = CREATION_WINDOW.saturating_add(HANGUP_BOUND);
 
 /// The code OpenAI answers a hangup for a session it does not know with.
 pub const SESSION_ID_NOT_FOUND: &str = "session_id_not_found";
@@ -206,12 +207,26 @@ pub mod words {
 
     /// A second start while an earlier call is not confirmed closed.
     #[must_use]
-    pub fn earlier_call(action: ActionId, device: &str, begun: &str) -> String {
-        format!(
-            "This host holds an earlier voice call on your OpenAI key that is not confirmed \
-             closed (action {action}, device {device}, begun at {begun}, UTC), so a second call \
-             could be charged beside it."
-        )
+    pub fn earlier_call(action: ActionId, device: &str, begun_ms: u64) -> Shown {
+        let begun = Shown::utc(begun_ms);
+        match device.parse::<DeviceId>() {
+            Ok(device) => crate::shown!(
+                "This host holds an earlier voice call on your OpenAI key that is not confirmed \
+                 closed (action {}, device {}, begun at {}, UTC), so a second call could be \
+                 charged beside it.",
+                action,
+                device,
+                begun
+            ),
+            Err(_) => crate::shown!(
+                "This host holds an earlier voice call on your OpenAI key that is not confirmed \
+                 closed (action {}, device {}, begun at {}, UTC), so a second call could be \
+                 charged beside it.",
+                action,
+                "unnamed",
+                begun
+            ),
+        }
     }
 
     /// The host holds no key for a call.
@@ -252,13 +267,7 @@ pub mod words {
 /// The time of `at_ms` in UTC, as a sentence names it.
 #[must_use]
 pub fn utc(at_ms: u64) -> String {
-    i64::try_from(at_ms)
-        .ok()
-        .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
-        .map_or_else(
-            || "an unreadable time".to_owned(),
-            |at| at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
-        )
+    Shown::utc(at_ms).into_string()
 }
 
 /* -------------------------------------------------------------------------- */
@@ -311,20 +320,20 @@ pub struct Lost;
 /// Why the side channel did not attach.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachFault {
-    /// OpenAI says that session does not exist.
-    Gone,
     /// The channel did not open.
     Unavailable,
 }
 
 /// What a side channel reads.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SocketRead {
     /// One text message.
     Text(String),
     /// The socket closed or failed.
     Closed,
 }
+
+crate::debug_as_name!(SocketRead);
 
 /// One attached side channel: text messages in both directions.
 pub trait SidebandSocket: Send {
@@ -509,6 +518,55 @@ fn command_json(frame: &VoiceContextFrame) -> Value {
     command
 }
 
+/// Whether `event` is a `session.closed` as the vendored profile defines it: every required
+/// member, each of the right kind, and no member the profile does not name.
+fn closed_event_is_valid(event: &Value) -> bool {
+    let Some(members) = event.as_object() else {
+        return false;
+    };
+    let named = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    };
+    let session_ok = members.get("session").is_some_and(|session| {
+        named(session.get("id"))
+            && named(session.get("model"))
+            && session.get("status").and_then(Value::as_str) == Some("active")
+            && session.get("expires_at").is_some_and(Value::is_number)
+    });
+    let usage_ok = members
+        .get("usage")
+        .and_then(|usage| usage.as_object())
+        .is_some_and(|usage| {
+            usage.len() == 1
+                && usage
+                    .get("seconds")
+                    .and_then(Value::as_f64)
+                    .is_some_and(|seconds| seconds >= 0.0)
+        });
+    members.keys().all(|name| {
+        matches!(
+            name.as_str(),
+            "type" | "event_id" | "client_event_id" | "reason" | "session" | "usage"
+        )
+    }) && named(members.get("event_id"))
+        && members
+            .get("client_event_id")
+            .is_none_or(|id| id.as_str().is_some_and(|id| !id.is_empty()))
+        && members
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| {
+                matches!(
+                    reason,
+                    "close_requested" | "expired" | "content" | "remote_hangup" | "connection_lost"
+                )
+            })
+        && session_ok
+        && usage_ok
+}
+
 /// What one message of the side channel came to.
 #[derive(Default)]
 struct Read {
@@ -523,19 +581,6 @@ struct Read {
 /* -------------------------------------------------------------------------- */
 /* The record of one start                                                     */
 /* -------------------------------------------------------------------------- */
-
-/// How a start that a removal waited for came out.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StartEnd {
-    /// The start ended and no session of OpenAI's is in question.
-    Ended,
-    /// The creation was never answered: OpenAI may or may not hold a session.
-    NeverAnswered,
-    /// A session that the fence found arriving was hung up and OpenAI confirmed it closed.
-    LateClosed,
-    /// A session that the fence found arriving was hung up and OpenAI did not confirm it.
-    LateUnconfirmed,
-}
 
 /// What a removal learns of the start in flight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,24 +604,13 @@ pub enum StoredCalls {
     NotConfirmed,
 }
 
-struct StartSlot {
-    asked: Instant,
-    end: Mutex<Option<StartEnd>>,
-    done: Notify,
-}
-
-impl StartSlot {
-    fn finish(&self, end: StartEnd) {
-        let mut held = self.end.lock().unwrap_or_else(PoisonError::into_inner);
-        if held.is_none() {
-            *held = Some(end);
-        }
-        drop(held);
-        self.done.notify_waiters();
-    }
-
-    fn ended(&self) -> Option<StartEnd> {
-        *self.end.lock().unwrap_or_else(PoisonError::into_inner)
+/// How a start that sent a request ends, by whether a fence found it and whether the provider
+/// confirmed the session closed.
+const fn late_end(fenced: bool, closed: bool) -> StartEnd {
+    match (fenced, closed) {
+        (true, true) => StartEnd::LateClosed,
+        (true, false) => StartEnd::LateUnconfirmed,
+        (false, _) => StartEnd::Ended,
     }
 }
 
@@ -585,8 +619,8 @@ struct OwnAttempt {
     guard: AttemptGuard,
 }
 
-/// Undoes a start that was recorded and never sent: the row is deleted, and the registry is
-/// released by the ticket's own drop.
+/// Undoes a start that was recorded and never sent: the row is marked closed and deleted, and the
+/// registry is released by the ticket's own drop.
 struct AttemptGuard {
     core: Arc<Core>,
     call: NewCall,
@@ -599,8 +633,8 @@ struct AttemptGuard {
 impl Drop for AttemptGuard {
     fn drop(&mut self) {
         if self.armed {
-            let _ = self.core.ledger.delete(&self.call.call_id);
-            self.slot.finish(StartEnd::Ended);
+            self.core.mark_closed(&self.call.call_id);
+            self.core.registry.end_start(&self.slot, StartEnd::Ended);
         }
     }
 }
@@ -619,7 +653,9 @@ struct Core {
     transport: Arc<dyn OwnVoiceTransport>,
     clock: Clock,
     calls: Mutex<HashMap<String, Arc<Shared>>>,
-    slot: Mutex<Option<Arc<StartSlot>>>,
+    /// The start whose call was handed to its caller and is not yet published or refused: the
+    /// call's name and the record of the start.
+    publication: Mutex<Option<(String, Arc<StartSlot>)>>,
     minted: AtomicU64,
 }
 
@@ -670,19 +706,20 @@ impl Core {
         }
     }
 
-    fn slot(&self) -> Option<Arc<StartSlot>> {
-        self.slot
+    /// Ends the hold on the start that gave out `call_id`, when one stands: the caller has
+    /// published the call or refused it.
+    fn publication_over(&self, call_id: Option<&str>) {
+        let mut held = self
+            .publication
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    /// Forgets `slot` once a settle has told what became of its start, so that a later settle
-    /// with no start in flight does not tell that start's end again.
-    fn clear_slot(&self, slot: &Arc<StartSlot>) {
-        let mut held = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        if held.as_ref().is_some_and(|held| Arc::ptr_eq(held, slot)) {
-            *held = None;
+            .unwrap_or_else(PoisonError::into_inner);
+        if held
+            .as_ref()
+            .is_some_and(|(held, _)| call_id.is_none_or(|call_id| call_id == held))
+            && let Some((_, slot)) = held.take()
+        {
+            drop(held);
+            self.registry.end_start(&slot, StartEnd::Ended);
         }
     }
 
@@ -709,8 +746,8 @@ impl fmt::Debug for OwnVoiceProvider {
     }
 }
 
-fn host_error(code: ErrorCode, sentence: impl Into<String>) -> ClientError {
-    ClientError::Host(ProtocolError::new(code, sentence))
+fn host_error(code: ErrorCode, sentence: &'static str) -> ClientError {
+    ClientError::refusal(code, Shown::said(sentence))
 }
 
 fn refused(reason: VoiceRefusalReason, message: String) -> VoiceStart {
@@ -743,7 +780,7 @@ impl OwnVoiceProvider {
                 transport,
                 clock,
                 calls: Mutex::new(HashMap::new()),
-                slot: Mutex::new(None),
+                publication: Mutex::new(None),
                 minted: AtomicU64::new(0),
             }),
         }
@@ -782,29 +819,20 @@ impl OwnVoiceProvider {
     /// Waits for the start in flight, if there is one, and says how it came out. The wait ends at
     /// [`SETTLE_BOUND`] after the start asked.
     pub async fn settle(&self) -> Settled {
-        let Some(slot) = self.core.slot() else {
+        let registry = &self.core.registry;
+        let Some(slot) = registry.slot() else {
             return Settled::NothingStarting;
         };
-        let end_of_wait = slot.asked + SETTLE_BOUND;
-        loop {
-            let notified = slot.done.notified();
-            tokio::pin!(notified);
-            // Registered before the state is read, so a finish between the two is not missed.
-            notified.as_mut().enable();
-            if let Some(end) = slot.ended() {
-                self.core.clear_slot(&slot);
-                return match end {
+        match slot.wait_until(slot.asked + SETTLE_BOUND).await {
+            Some(end) => {
+                registry.clear_slot(&slot);
+                match end {
                     StartEnd::Ended => Settled::NothingStarting,
                     StartEnd::LateClosed => Settled::LateSessionClosed,
                     StartEnd::NeverAnswered | StartEnd::LateUnconfirmed => Settled::MayStillRun,
-                };
+                }
             }
-            if tokio::time::timeout_at(end_of_wait, notified)
-                .await
-                .is_err()
-            {
-                return Settled::MayStillRun;
-            }
+            None => Settled::MayStillRun,
         }
     }
 
@@ -929,9 +957,9 @@ impl OwnVoiceProvider {
                 action_id,
                 device_id,
                 asked_ms,
-            } => host_error(
+            } => ClientError::refusal(
                 ErrorCode::DraftConflict,
-                words::earlier_call(action_id, &device_id, &utc(asked_ms)),
+                words::earlier_call(action_id, &device_id, asked_ms),
             ),
             StartRefusal::InProgress => {
                 // A call is starting or running. Its row says whose it is when it is written.
@@ -942,12 +970,12 @@ impl OwnVoiceProvider {
                     .ok()
                     .and_then(|rows| rows.into_iter().find(|row| row.state.blocks_a_start()));
                 match blocking {
-                    Some(row) => host_error(
+                    Some(row) => ClientError::refusal(
                         ErrorCode::DraftConflict,
                         words::earlier_call(
                             row.call.action_id,
                             &row.call.device_id,
-                            &utc(row.call.asked_ms),
+                            row.call.asked_ms,
                         ),
                     ),
                     None => host_error(ErrorCode::DraftConflict, words::ALREADY_STARTING),
@@ -965,14 +993,14 @@ impl OwnVoiceProvider {
         request: &VoiceSessionRequest,
     ) -> Result<VoiceStart> {
         let core = Arc::clone(&self.core);
-        // From here the row stays unless a rule below deletes it.
+        // From here the row stays unless a rule below closes it.
         guard.armed = false;
         let slot = Arc::clone(&guard.slot);
         let call_id = guard.call.call_id.clone();
         let attempt_id = guard.call.attempt_id.clone();
         let asked = guard.asked;
         let Some(ticket) = guard.ticket.take() else {
-            slot.finish(StartEnd::Ended);
+            core.registry.end_start(&slot, StartEnd::Ended);
             return Err(host_error(
                 ErrorCode::ResourceUnavailable,
                 words::ALREADY_STARTING,
@@ -981,11 +1009,20 @@ impl OwnVoiceProvider {
         let epoch = ticket.epoch();
         let window_end = asked + CREATION_WINDOW;
 
+        // A removal that fenced after the start was admitted has settled nothing yet: nothing is
+        // asked of the provider, and the row of a start that sent nothing is closed.
+        if core.registry.epoch() != epoch {
+            core.mark_closed(&call_id);
+            core.registry.finished(ticket, StartEnd::Ended);
+            return Ok(refused(
+                VoiceRefusalReason::ProviderRefused,
+                words::SETTLING.to_owned(),
+            ));
+        }
         let Ok(Some(key)) = core.keys.key() else {
-            // Nothing was sent: the row is deleted and the host asked for nothing.
-            let _ = core.ledger.delete(&call_id);
-            slot.finish(StartEnd::Ended);
-            core.registry.finished(ticket);
+            // Nothing was sent: the row is marked closed and the host asked for nothing.
+            core.mark_closed(&call_id);
+            core.registry.finished(ticket, StartEnd::Ended);
             return Ok(refused(
                 VoiceRefusalReason::NotConfigured,
                 words::NO_KEY.to_owned(),
@@ -1000,17 +1037,15 @@ impl OwnVoiceProvider {
 
         match classify_creation(&reply) {
             Creation::Unknown => {
-                slot.finish(StartEnd::NeverAnswered);
-                core.registry.finished(ticket);
+                core.registry.finished(ticket, StartEnd::NeverAnswered);
                 Ok(VoiceStart::CreationUnknown {
                     attempt_id: Some(attempt_id),
                     message: words::CREATION_UNKNOWN.to_owned(),
                 })
             }
             Creation::Refused { status } => {
-                let _ = core.ledger.delete(&call_id);
-                slot.finish(StartEnd::Ended);
-                core.registry.finished(ticket);
+                core.mark_closed(&call_id);
+                core.registry.finished(ticket, StartEnd::Ended);
                 let message = match status {
                     401 | 403 => words::refused_with_this_key(status),
                     other => words::not_accepted(other),
@@ -1021,38 +1056,8 @@ impl OwnVoiceProvider {
                 session_id,
                 answer_sdp,
             } => {
-                if core.registry.epoch() != epoch {
-                    // A removal fenced the registry while the creation was in flight. The session
-                    // is not adopted: it is hung up with the key still in the store.
-                    let closed = core.hang_up(&session_id).await;
-                    let _ = core.ledger.delete(&call_id);
-                    slot.finish(if closed {
-                        StartEnd::LateClosed
-                    } else {
-                        StartEnd::LateUnconfirmed
-                    });
-                    core.registry.finished(ticket);
-                    return Ok(refused(
-                        VoiceRefusalReason::ProviderRefused,
-                        words::SETTLING.to_owned(),
-                    ));
-                }
-                if Instant::now() > window_end {
-                    let closed = core.hang_up(&session_id).await;
-                    if closed {
-                        core.mark_closed(&call_id);
-                    }
-                    slot.finish(if closed {
-                        StartEnd::LateClosed
-                    } else {
-                        StartEnd::LateUnconfirmed
-                    });
-                    core.registry.finished(ticket);
-                    return Ok(refused(
-                        VoiceRefusalReason::ReadinessUnavailable,
-                        words::TOO_SLOW.to_owned(),
-                    ));
-                }
+                // The session is written down first, whatever comes next, so that a hangup the
+                // host cannot confirm leaves a row with the id and not a call nobody can name.
                 if core.ledger.record_id(&call_id, &session_id, None).is_err() {
                     // The call exists and the host cannot show it. It is closed at once; the row
                     // stays `creating` until a recognised closure is marked.
@@ -1060,15 +1065,41 @@ impl OwnVoiceProvider {
                     if closed {
                         core.mark_closed(&call_id);
                     }
-                    slot.finish(StartEnd::Ended);
-                    core.registry.finished(ticket);
+                    let fenced = core.registry.epoch() != epoch;
+                    core.registry.finished(ticket, late_end(fenced, closed));
                     return Ok(refused(
                         VoiceRefusalReason::ReadinessUnavailable,
                         words::ID_NOT_WRITTEN.to_owned(),
                     ));
                 }
-                self.attach_and_run(ticket, slot, &guard.call, session_id, answer_sdp, asked)
-                    .await
+                if core.registry.epoch() != epoch {
+                    // A removal fenced the registry while the creation was in flight. The session
+                    // is not adopted: it is hung up with the key still in the store, and the row
+                    // keeps its id unless the closure is confirmed.
+                    let closed = core.hang_up_and_mark(&call_id, &session_id).await;
+                    core.registry.finished(ticket, late_end(true, closed));
+                    return Ok(refused(
+                        VoiceRefusalReason::ProviderRefused,
+                        words::SETTLING.to_owned(),
+                    ));
+                }
+                if Instant::now() > window_end {
+                    let closed = core.hang_up_and_mark(&call_id, &session_id).await;
+                    core.registry.finished(ticket, late_end(true, closed));
+                    return Ok(refused(
+                        VoiceRefusalReason::ReadinessUnavailable,
+                        words::TOO_SLOW.to_owned(),
+                    ));
+                }
+                self.attach_and_run(
+                    ticket,
+                    &guard.call,
+                    session_id,
+                    answer_sdp,
+                    asked,
+                    window_end,
+                )
+                .await
             }
         }
     }
@@ -1076,15 +1107,16 @@ impl OwnVoiceProvider {
     async fn attach_and_run(
         &self,
         ticket: StartTicket,
-        slot: Arc<StartSlot>,
         call: &NewCall,
         session_id: String,
         answer_sdp: String,
         asked: Instant,
+        window_end: Instant,
     ) -> Result<VoiceStart> {
         let core = Arc::clone(&self.core);
         let epoch = ticket.epoch();
-        let readiness_ends = Instant::now() + READINESS_BOUND;
+        // Readiness has what is left of the creation window, and at most its own ten seconds.
+        let readiness_ends = (Instant::now() + READINESS_BOUND).min(window_end);
         let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared::new(call.call_id.clone(), session_id.clone(), tx));
         let mut task = CallTask {
@@ -1098,28 +1130,52 @@ impl OwnVoiceProvider {
             asked_request: creation_body(""),
             closed_seen: false,
             counter: 0,
+            muted: false,
+            sent: VecDeque::new(),
+            token: core.registry.track(),
         };
         let readiness = task.establish(1, readiness_ends).await;
-        if readiness.is_err() {
-            // The call exists and is not usable: it is hung up, and the row says what came of it.
-            let _ = core.hang_up_and_mark(&call.call_id, &session_id).await;
-            slot.finish(StartEnd::Ended);
-            core.registry.finished(ticket);
-            return Ok(refused(
-                VoiceRefusalReason::ReadinessUnavailable,
-                words::NOT_READY.to_owned(),
-            ));
+        match readiness {
+            Ok(()) => {}
+            Err(NotReady::Closed) => {
+                // The provider said the session closed: that is a recognised closure, so the row
+                // is marked and nothing is hung up again.
+                core.mark_closed(&call.call_id);
+                let fenced = core.registry.epoch() != epoch;
+                core.registry.finished(ticket, late_end(fenced, true));
+                return Ok(refused(
+                    VoiceRefusalReason::ReadinessUnavailable,
+                    words::NOT_READY.to_owned(),
+                ));
+            }
+            Err(_) => {
+                // The call exists and is not usable: it is hung up, and the row says what came
+                // of it.
+                let closed = core.hang_up_and_mark(&call.call_id, &session_id).await;
+                let fenced = core.registry.epoch() != epoch;
+                core.registry.finished(ticket, late_end(fenced, closed));
+                return Ok(refused(
+                    VoiceRefusalReason::ReadinessUnavailable,
+                    words::NOT_READY.to_owned(),
+                ));
+            }
         }
+        let slot = ticket.slot();
         if !core.registry.running(ticket) {
             // A fence came between: this call is not the registry's. It is closed at once.
-            let _ = core.hang_up_and_mark(&call.call_id, &session_id).await;
-            slot.finish(StartEnd::Ended);
+            let closed = core.hang_up_and_mark(&call.call_id, &session_id).await;
+            core.registry.end_start(&slot, late_end(true, closed));
             return Ok(refused(
                 VoiceRefusalReason::ProviderRefused,
                 words::SETTLING.to_owned(),
             ));
         }
-        slot.finish(StartEnd::Ended);
+        // The start is not over until its caller has published the call or refused it: a removal
+        // that fences now waits for that, so it finds the call it must end.
+        *core
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((call.call_id.clone(), slot));
         shared.set_state(SidebandState::Ready);
         core.calls
             .lock()
@@ -1206,13 +1262,8 @@ impl VoiceProviderService for OwnVoiceProvider {
             core.ledger
                 .begin(&call)
                 .map_err(|_| host_error(ErrorCode::ResourceUnavailable, words::NOT_WRITTEN_DOWN))?;
-            let asked = Instant::now();
-            let slot = Arc::new(StartSlot {
-                asked,
-                end: Mutex::new(None),
-                done: Notify::new(),
-            });
-            *core.slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&slot));
+            let slot = ticket.slot();
+            let asked = slot.asked;
             Ok(StartAttempt::holding(OwnAttempt {
                 guard: AttemptGuard {
                     core: Arc::clone(core),
@@ -1296,6 +1347,10 @@ impl VoiceProviderService for OwnVoiceProvider {
         })
     }
 
+    fn start_published(&self, call_id: &str) {
+        self.core.publication_over(Some(call_id));
+    }
+
     fn call_is_open<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, bool> {
         Box::pin(async move {
             Ok(self
@@ -1346,14 +1401,7 @@ struct Shared {
     tx: mpsc::UnboundedSender<Task>,
 }
 
-impl fmt::Debug for Shared {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OwnSideband")
-            .field("state", &self.state())
-            .finish_non_exhaustive()
-    }
-}
+crate::debug_as_name!(Shared);
 
 impl Shared {
     fn new(call_id: String, session_id: String, tx: mpsc::UnboundedSender<Task>) -> Self {
@@ -1489,7 +1537,6 @@ enum Outcome {
 /// What readiness did not get.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NotReady {
-    Gone,
     Unavailable,
     Different,
     Closed,
@@ -1506,6 +1553,10 @@ struct CallTask {
     asked_request: Value,
     closed_seen: bool,
     counter: u64,
+    /// Whether the model's input audio is muted, as the provider last said.
+    muted: bool,
+    /// Held while this task runs, so that a removal waits for it before the key goes.
+    token: TaskToken,
 }
 
 async fn next_message(socket: &mut Option<Box<dyn SidebandSocket>>) -> SocketRead {
@@ -1533,6 +1584,11 @@ impl CallTask {
         revision: u64,
         ends: Instant,
     ) -> std::result::Result<(), NotReady> {
+        // A task of an older epoch attaches nothing and sends no probe: the registry is no longer
+        // the one that started it.
+        if self.core.registry.epoch() != self.epoch {
+            return Err(NotReady::Unavailable);
+        }
         let key = match self.core.keys.key() {
             Ok(Some(key)) => key,
             _ => return Err(NotReady::Unavailable),
@@ -1545,7 +1601,6 @@ impl CallTask {
         drop(key);
         let socket = match attached {
             Ok(Ok(socket)) => socket,
-            Ok(Err(AttachFault::Gone)) => return Err(NotReady::Gone),
             Ok(Err(AttachFault::Unavailable)) | Err(_) => return Err(NotReady::Unavailable),
         };
         self.socket = Some(socket);
@@ -1576,11 +1631,18 @@ impl CallTask {
         // The probe restates the mute state rather than changing it, and is answered under its
         // own identifier.
         let probe_id = self.event_id("probe");
-        let probe = json!({ "type": "session.input_audio.unmute", "event_id": probe_id });
-        let sent = match self.socket.as_mut() {
-            Some(socket) => socket.send(probe.to_string()).await,
-            None => false,
+        let kind = if self.muted {
+            "session.input_audio.mute"
+        } else {
+            "session.input_audio.unmute"
         };
+        let probe = json!({ "type": kind, "event_id": probe_id });
+        let sent = self
+            .send_within(
+                probe.to_string(),
+                ends.saturating_duration_since(Instant::now()),
+            )
+            .await;
         if !sent {
             return Err(NotReady::Unavailable);
         }
@@ -1602,6 +1664,17 @@ impl CallTask {
         })
         .await
         .map_err(|_| NotReady::Unanswered)?
+    }
+
+    /// Writes one message, and gives up when the write is not done within `bound`: a channel that
+    /// takes no write is a lost channel.
+    async fn send_within(&mut self, text: String, bound: Duration) -> bool {
+        match self.socket.as_mut() {
+            Some(socket) => tokio::time::timeout(bound, socket.send(text))
+                .await
+                .unwrap_or(false),
+            None => false,
+        }
     }
 
     async fn socket_next(&mut self) -> SocketRead {
@@ -1632,7 +1705,7 @@ impl CallTask {
                 .map(str::to_owned)
         };
         match value.get("type").and_then(Value::as_str) {
-            Some("session.closed") => Read {
+            Some("session.closed") if closed_event_is_valid(&value) => Read {
                 closed: true,
                 ..Read::default()
             },
@@ -1666,12 +1739,17 @@ impl CallTask {
                 Read::default()
             }
             Some(
-                "session.input_audio.muted"
+                kind @ ("session.input_audio.muted"
                 | "session.input_audio.unmuted"
                 | "session.instructions.appended"
                 | "session.thinking.appended"
-                | "session.commentary.appended",
+                | "session.commentary.appended"),
             ) => {
+                match kind {
+                    "session.input_audio.muted" => self.muted = true,
+                    "session.input_audio.unmuted" => self.muted = false,
+                    _ => {}
+                }
                 let acknowledged = acknowledged();
                 if let Some(id) = &acknowledged {
                     self.shared.emit(HostCallEvent::WriteAcknowledged {
@@ -1710,6 +1788,7 @@ impl CallTask {
     }
 
     async fn run(mut self) {
+        let mut reply_to = None;
         let outcome = loop {
             let wake = tokio::select! {
                 biased;
@@ -1720,9 +1799,8 @@ impl CallTask {
             match wake {
                 Wake::Deadline | Wake::Task(None) => break self.close().await,
                 Wake::Task(Some(Task::Close { reply })) => {
-                    let outcome = self.close().await;
-                    let _ = reply.send(!matches!(outcome, Outcome::Unconfirmed));
-                    break outcome;
+                    reply_to = Some(reply);
+                    break self.close().await;
                 }
                 Wake::Task(Some(Task::Write {
                     revision,
@@ -1749,7 +1827,13 @@ impl CallTask {
                 }
             }
         };
+        let confirmed = !matches!(outcome, Outcome::Unconfirmed);
+        // The row, the registry and the call's name are settled before the closer is answered, so
+        // an owner that waits for the close finds the record as the close left it.
         self.finish(outcome).await;
+        if let Some(reply) = reply_to {
+            let _ = reply.send(confirmed);
+        }
     }
 
     async fn write(
@@ -1770,10 +1854,14 @@ impl CallTask {
         if self.core.registry.epoch() != self.epoch {
             return Err(WriteRefusal::NotReady);
         }
-        let Some(socket) = self.socket.as_mut() else {
+        if self.socket.is_none() {
             return Err(WriteRefusal::Lost);
-        };
-        if socket.send(command_json(frame).to_string()).await {
+        }
+        let bound = DRAIN_BOUND.min(self.deadline.saturating_duration_since(Instant::now()));
+        if self
+            .send_within(command_json(frame).to_string(), bound)
+            .await
+        {
             Ok(())
         } else {
             Err(WriteRefusal::Lost)
@@ -1798,7 +1886,8 @@ impl CallTask {
                     return None;
                 }
                 Err(NotReady::Closed) => return Some(Outcome::ProviderClosed),
-                Err(NotReady::Gone) => return Some(Outcome::HostClosed),
+                // A fence ends the recovery: the call is hung up with the key that is still held.
+                Err(_) if self.core.registry.epoch() != self.epoch => break,
                 Err(_) if Instant::now() >= ends => break,
                 Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
             }
@@ -1825,10 +1914,7 @@ impl CallTask {
         if self.socket.is_some() {
             let id = self.event_id("close");
             let command = json!({ "type": "session.close", "event_id": id });
-            let sent = match self.socket.as_mut() {
-                Some(socket) => socket.send(command.to_string()).await,
-                None => false,
-            };
+            let sent = self.send_within(command.to_string(), DRAIN_BOUND).await;
             if sent {
                 let drained = tokio::time::timeout(DRAIN_BOUND, async {
                     loop {
@@ -1876,6 +1962,7 @@ impl CallTask {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(call_id);
+        core.publication_over(Some(call_id));
     }
 }
 
@@ -1891,14 +1978,7 @@ pub struct OpenAiLiveTransport {
     proxy: Option<kr_transport::config::ProxyUrl>,
 }
 
-impl fmt::Debug for OpenAiLiveTransport {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("OpenAiLiveTransport")
-            .field("origin", &OPENAI_ORIGIN)
-            .finish_non_exhaustive()
-    }
-}
+crate::debug_as_name!(OpenAiLiveTransport);
 
 impl OpenAiLiveTransport {
     /// A transport to [`OPENAI_ORIGIN`], through `proxy` when the host's configuration names one.
@@ -2055,10 +2135,9 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
                 },
             )
             .await
-            .map_err(|failure| match failure {
-                crate::wss::Failure::Refused { status: 404, .. } => AttachFault::Gone,
-                _ => AttachFault::Unavailable,
-            })?;
+            // A refused upgrade carries no recognised closure, so none of its statuses ends a
+            // call: a 404 from a proxy or a route this host does not know is not OpenAI's word.
+            .map_err(|_| AttachFault::Unavailable)?;
             Ok(Box::new(WebSocketSideband { socket }) as Box<dyn SidebandSocket>)
         })
     }

@@ -140,10 +140,15 @@ impl Controller {
     /// Closes the calls this host controls itself before the daemon exits, within a bound. A
     /// crash, a sleep or a lost network leaves their records for the next start to reconcile.
     pub async fn close_host_calls_for_stop(&self) {
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(25),
-            self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::Stop),
-        )
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(25), async {
+            self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::Stop)
+                .await;
+            // The calls' tasks have finished their records before the daemon exits.
+            self.own_voice
+                .registry()
+                .quiesce(std::time::Duration::from_secs(20))
+                .await;
+        })
         .await;
     }
 
@@ -762,7 +767,8 @@ impl Controller {
         // or not the link it was asked on is still there to carry it.
         if matches!(
             method,
-            Method::VoiceDelegate
+            Method::VoiceStart
+                | Method::VoiceDelegate
                 | Method::VoiceStop
                 | Method::VoiceGrant
                 | Method::VoiceControl
@@ -787,7 +793,7 @@ impl Controller {
     /// It holds the daemon weakly, and only while it reads the clock.
     fn keep_voice_ticking(self: &Arc<Self>) {
         let module = Arc::clone(self.voice());
-        if module.host_calls().is_empty() || !module.claim_tick() {
+        if !module.needs_tick() || !module.claim_tick() {
             return;
         }
         let daemon = Arc::downgrade(self);
@@ -800,10 +806,10 @@ impl Controller {
                     return;
                 };
                 module.tick(now_ms).await;
-                if module.host_calls().is_empty() {
+                if !module.needs_tick() {
                     module.release_tick();
                     // A call registered after the last look still needs the tick.
-                    if module.host_calls().is_empty() || !module.claim_tick() {
+                    if !module.needs_tick() || !module.claim_tick() {
                         return;
                     }
                 }
@@ -1002,15 +1008,15 @@ impl Controller {
         // A read that recorded no action is one this host cannot say what it read: it is not given
         // back as kept, because it may carry content, and not read again, because nothing says
         // what to read.
-        let Some(action) = receipt.action.0 else {
+        if receipt.action.0.is_none() {
             return Err(ControllerError::Uncertain {
                 detail:
                     "that delegation was performed, and this host did not record what it read, \
                          so it is neither given again nor read again"
                         .to_owned(),
             });
-        };
-        if crate::voice::method_for(action) != Some(Method::SessionRead) {
+        }
+        if !crate::voice::rereads(&receipt) {
             return Ok(answered);
         }
         self.voice()

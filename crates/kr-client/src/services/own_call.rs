@@ -13,6 +13,8 @@ use std::fmt;
 
 use kr_protocol::ids::ActionId;
 
+use crate::shown::Shown;
+
 /// Where one own-key call stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CallState {
@@ -67,7 +69,7 @@ impl CallState {
 }
 
 /// What the host writes down when it is about to ask the provider for a call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NewCall {
     /// The host's own name for the call, minted before the provider is asked.
     pub call_id: String,
@@ -83,8 +85,14 @@ pub struct NewCall {
     pub closes_at_ms: u64,
 }
 
+crate::debug_fields!(NewCall {
+    action_id,
+    asked_ms,
+    closes_at_ms
+});
+
 /// One stored call.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CallRow {
     /// What the host wrote down before it asked.
     pub call: NewCall,
@@ -99,17 +107,26 @@ pub struct CallRow {
     pub closed_ms: Option<u64>,
 }
 
-/// A refusal of the ledger's store, in words that carry nothing the row held.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LedgerError(pub String);
+crate::debug_fields!(CallRow {
+    state,
+    provider_expires_ms,
+    closed_ms
+});
 
-impl fmt::Display for LedgerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+/// A refusal of the ledger's store, in words of this program that carry nothing the row held.
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct LedgerError(Shown);
+
+impl LedgerError {
+    /// A refusal that says `words` and nothing else.
+    #[must_use]
+    pub const fn said(words: &'static str) -> Self {
+        Self(Shown::said(words))
     }
 }
 
-impl std::error::Error for LedgerError {}
+crate::debug_as_display!(LedgerError);
 
 /// What the ledger answers.
 pub type LedgerResult<T> = std::result::Result<T, LedgerError>;

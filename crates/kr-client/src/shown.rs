@@ -142,6 +142,21 @@ impl Shown {
         Self::decided(format!("{value:016x}"))
     }
 
+    /// A time given in milliseconds since the epoch, as `YYYY-MM-DD HH:MM:SS` in UTC; a time
+    /// that cannot be read says so.
+    #[must_use]
+    pub fn utc(at_ms: u64) -> Self {
+        Self::decided(
+            i64::try_from(at_ms)
+                .ok()
+                .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+                .map_or_else(
+                    || "an unreadable time".to_owned(),
+                    |at| at.strftime("%Y-%m-%d %H:%M:%S").to_string(),
+                ),
+        )
+    }
+
     /// Text a reducer or a door in this file has already decided may be said.
     fn decided(text: String) -> Self {
         Self(Cow::Owned(text))
