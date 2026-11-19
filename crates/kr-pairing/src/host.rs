@@ -1486,13 +1486,18 @@ pub fn recover_commitment(
     store.commitment(invitation_id)
 }
 
-/// Answers a candidate that asks what became of a pairing, after the host restarted.
+/// Answers a candidate that asks what became of a pairing, once the host has lost the invitation
+/// object.
 ///
-/// The candidate proves the endpoint its own bundle declared, which is what identifies it: the
-/// commitment records that key, so the answer reaches the paired device and nobody else. The
-/// attempt identity is checked when the candidate has one and is not required: a direct candidate
-/// whose `pair.redeem` response was lost never learnt it, because that identity is the host's, and
-/// it is still the device that paired. A short-code candidate always has one, because it made it.
+/// The commitment is in the store and outlives a restart; which connection proved the candidate is
+/// kept in memory only. The candidate proves the endpoint its own bundle declared, which is what
+/// identifies it: the commitment records that key. The answer goes only to the connection that
+/// proved the candidate, so it reaches the paired device and nobody else; after a restart no
+/// connection is marked as having proved it, and the device learns what became of it by connecting
+/// as the paired device it became. The attempt identity is checked when the candidate has one and
+/// is not required: a direct candidate whose `pair.redeem` response was lost never learnt it,
+/// because that identity is the host's, and it is still the device that paired. A short-code
+/// candidate always has one, because it made it.
 ///
 /// Only a committed pairing is recoverable this way. The endpoint a candidate authenticated with
 /// lives in the invitation object the restart lost, so for anything else there is nothing to tell

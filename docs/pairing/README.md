@@ -78,11 +78,12 @@ than allowed to undo the faster one's lock, spent guess or consumption.
 
 A restart loses the invitation object but not a completed pairing. The device record, the grant
 and the owner's proof are in the store under the invitation identity, so a host that comes back
-answers the retry and tells that candidate, on its own endpoint and on the connection that carried
-its proof, that it is paired. No other connection is told, even one from the same endpoint: the host
-keeps which connection proved each committed candidate in memory only, so after a restart none is,
-and a device that was committed on a connection it no longer holds learns it by connecting as the
-identity derived for it. The endpoint is what identifies a candidate throughout; the attempt
+still holds the commitment. The connection that proved each committed candidate is kept in memory
+only, and only that connection is told that the candidate is paired; no other connection is told,
+even one from the same endpoint. After a restart no connection is marked as having proved a
+candidate, so a device that was committed on a connection it no longer holds learns it by
+connecting as the identity derived for it, which proves its paired key. The endpoint is what
+identifies a candidate throughout; the attempt
 identity is checked when the asker has one and
 is never required, because a direct candidate whose redemption response was lost never learnt it:
 that identity is the host's, while a short-code candidate makes its own. A host answers nothing
