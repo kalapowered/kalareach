@@ -468,8 +468,11 @@ async fn a_publication_the_proxy_refuses_ends_the_endpoint_with_no_verdict_set_b
         .expect("a proxy address")
         .with_login(login.clone());
     let mut settings = config(&relay, proxy_url, trusting(&[]));
-    settings.discovery.pkarr_publisher_url =
-        Some(format!("https://{target}").parse().expect("a Pkarr server address"));
+    settings.discovery.pkarr_publisher_url = Some(
+        format!("https://{target}")
+            .parse()
+            .expect("a Pkarr server address"),
+    );
     let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
     let (endpoint, closer) = bind_network(&settings, &identity)
         .await
@@ -478,7 +481,10 @@ async fn a_publication_the_proxy_refuses_ends_the_endpoint_with_no_verdict_set_b
 
     // The endpoint publishes once it has a home relay, which it reaches through the front. The
     // publication's own `CONNECT` is the only request that names the Pkarr server.
-    until("the publication reaches the proxy", || asked_to(&proxy, &target)).await;
+    until("the publication reaches the proxy", || {
+        asked_to(&proxy, &target)
+    })
+    .await;
     let publication: Vec<_> = proxy
         .calls()
         .into_iter()
@@ -488,7 +494,10 @@ async fn a_publication_the_proxy_refuses_ends_the_endpoint_with_no_verdict_set_b
         publication.iter().all(|call| call.login == Login::Right),
         "the publication carried the login: {publication:?}"
     );
-    until("the verdict the publication set", || login.stopped().is_some()).await;
+    until("the verdict the publication set", || {
+        login.stopped().is_some()
+    })
+    .await;
     assert_eq!(login.stopped(), Some(StopKind::Refused));
     until("the end of the endpoint", || guard.proxy_closed()).await;
     assert!(closer.closed() && endpoint.is_closed());
