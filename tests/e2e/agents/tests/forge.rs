@@ -205,6 +205,108 @@ fn a_backend_that_never_answers_is_bounded_and_the_real_launcher_runs() {
     assert_eq!(out.trim(), "real:launch -- /bin/true true --flag");
 }
 
+impl Scene {
+    /// [`Scene::run`] where the helper must end within `limit`: it is ended at the limit, and none is
+    /// returned, where it has not.
+    fn run_within(
+        &self,
+        registration: &Path,
+        arguments: &[&str],
+        limit: std::time::Duration,
+    ) -> Option<(i32, String, String)> {
+        let mut child = Command::new(self.root.join("b/kr-hook"))
+            .args(arguments)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("KALAREACH_E2E_FORGE_ROOT", &self.root)
+            .env("KR_REGISTRATION", registration)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the forging launcher runs");
+        let started = std::time::Instant::now();
+        while child.try_wait().expect("the helper's state").is_none() {
+            if started.elapsed() >= limit {
+                child.kill().expect("the helper ended");
+                child.wait().expect("the helper reaped");
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let output = child.wait_with_output().expect("the helper's output");
+        Some((
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ))
+    }
+}
+
+/// The longest the helper may take over a presentation that does not complete: its own bound, five
+/// seconds, and the time the real launcher takes to start.
+const WITHIN: std::time::Duration = std::time::Duration::from_secs(9);
+
+/// A backend that answers one byte at a time, never a whole line, cannot hold the launch past the
+/// helper's bound for the whole answer: the bound is not renewed by each byte.
+#[test]
+fn a_backend_that_answers_a_byte_at_a_time_is_bounded_as_a_whole_and_the_real_launcher_runs() {
+    let scene = Scene::new(false);
+    let listener = scene.listener.try_clone().expect("the listener");
+    let backend = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("a presentation");
+        let mut sent = 0;
+        // One byte every half second, for as long as the helper reads: far past its bound.
+        while sent < 60 && stream.write_all(b"x").is_ok() {
+            sent += 1;
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        sent
+    });
+    let ran = scene.run_within(&scene.registration(), &LAUNCH, WITHIN);
+    assert!(
+        ran.is_some(),
+        "the helper ended within {WITHIN:?} of a backend that answers a byte at a time"
+    );
+    let (code, out, error) = ran.expect("asserted above");
+    assert_eq!(code, 0, "{error}");
+    assert!(error.contains("no answer"), "{error}");
+    assert_eq!(out.trim(), "real:launch -- /bin/true true --flag");
+    let sent = backend.join().expect("the backend");
+    assert!(
+        sent < 60,
+        "the helper stopped reading: {sent} bytes were taken"
+    );
+}
+
+/// An endpoint whose queue of connections is full is waited for within the helper's bound, and the
+/// real launcher runs all the same: a connection that waits without end does not hold the launch.
+#[test]
+fn an_endpoint_whose_queue_is_full_is_bounded_and_the_real_launcher_runs() {
+    let scene = Scene::new(false);
+    let socket = scene.root.join("launch/sock");
+    // More connections than any queue holds, none of them accepted: the ones past the queue wait
+    // (or are refused, where the system refuses at once), and those threads end with the scene.
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    for _ in 0..400 {
+        let (socket, held) = (socket.clone(), std::sync::Arc::clone(&held));
+        std::thread::spawn(move || {
+            if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) {
+                held.lock().expect("the held streams").push(stream);
+            }
+        });
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let ran = scene.run_within(&scene.registration(), &LAUNCH, WITHIN);
+    assert!(
+        ran.is_some(),
+        "the helper ended within {WITHIN:?} of an endpoint whose queue is full"
+    );
+    let (code, out, error) = ran.expect("asserted above");
+    assert_eq!(code, 0, "{error}");
+    assert!(error.contains("no answer"), "{error}");
+    assert_eq!(out.trim(), "real:launch -- /bin/true true --flag");
+}
+
 /// The directory this test program's own build put its programs in, the real launcher among them.
 fn built_directory() -> PathBuf {
     let mut directory = std::env::current_exe().expect("the test program");

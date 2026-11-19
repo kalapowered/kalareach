@@ -21,7 +21,7 @@ mod forge {
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt as _;
     use std::path::{Component, Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 
@@ -31,7 +31,8 @@ mod forge {
     const REGISTRATION_VARIABLE: &str = "KR_REGISTRATION";
     /// The launch record's name beside the registration.
     const RECORD_FILE: &str = "launch";
-    /// The bound on each wait on the backend.
+    /// The bound on the whole presentation to the backend: the connection, the frame and the
+    /// answer together, a clock that starts before the connection is made.
     const BOUND: Duration = Duration::from_secs(5);
     /// The longest launch record read.
     const RECORD_AT_MOST: usize = 64 * 1024;
@@ -233,18 +234,41 @@ mod forge {
         line.extend_from_slice(br#"","#);
         line.extend_from_slice(rest.get(1..).unwrap_or_default());
         line.extend_from_slice(b"}\n");
-        let mut stream = UnixStream::connect(&endpoint)
-            .map_err(|error| Failure::Stream(format!("the endpoint is not reached: {error}")))?;
-        stream
-            .set_read_timeout(Some(BOUND))
-            .and_then(|()| stream.set_write_timeout(Some(BOUND)))
-            .map_err(|error| Failure::Stream(error.to_string()))?;
-        stream
-            .write_all(&line)
-            .map_err(|error| Failure::Stream(format!("the frame is not written: {error}")))?;
+        let deadline = Instant::now() + BOUND;
+        let mut stream = connect_within(&endpoint, deadline)?;
+        let left = |what: &str| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| Failure::Stream(format!("{what} is not done within {BOUND:?}")))
+        };
+        let mut written = 0;
+        while written < line.len() {
+            stream
+                .set_write_timeout(Some(left("the frame")?))
+                .map_err(|error| Failure::Stream(error.to_string()))?;
+            match stream.write(&line[written..]) {
+                Ok(0) => {
+                    return Err(Failure::Stream(
+                        "the frame is not written: closed".to_owned(),
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(error) => {
+                    return Err(Failure::Stream(format!(
+                        "the frame is not written: {error}"
+                    )));
+                }
+            }
+        }
         let mut answer = Vec::new();
         let mut byte = [0_u8; 1];
         while answer.len() < 4096 {
+            // The time left of the whole bound, so that a backend that answers a byte at a time
+            // cannot hold the launch past it.
+            stream
+                .set_read_timeout(Some(left("the answer")?))
+                .map_err(|error| Failure::Stream(error.to_string()))?;
             match stream.read(&mut byte) {
                 Ok(0) => break,
                 Ok(_) if byte[0] == b'\n' => break,
@@ -256,6 +280,26 @@ mod forge {
         }
         let admitted = String::from_utf8_lossy(&answer).contains("\"admitted\":true");
         Ok((admitted, identity.pid.get(), identity.start_value.get()))
+    }
+
+    /// Connects to `endpoint` by `deadline`: a connection to a socket whose queue is full can wait
+    /// without end, so it is made on a thread of its own and waited for until the deadline.
+    fn connect_within(endpoint: &Path, deadline: Instant) -> Result<UnixStream, Failure> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let endpoint = endpoint.to_owned();
+        std::thread::spawn(move || {
+            let _ = sender.send(UnixStream::connect(endpoint));
+        });
+        let left = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(left) {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(error)) => Err(Failure::Stream(format!(
+                "the endpoint is not reached: {error}"
+            ))),
+            Err(_) => Err(Failure::Stream(format!(
+                "the endpoint is not reached within {BOUND:?}"
+            ))),
+        }
     }
 
     pub fn main() -> std::process::ExitCode {
