@@ -3593,14 +3593,16 @@ async fn a_heartbeat_after_a_stop_is_answered_from_the_final_status_and_the_othe
     assert_eq!(
         state,
         VoiceHostCallState::Closed {
-            reason: VoiceEndReason::Stop
+            reason: VoiceEndReason::Stop,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed
         }
     );
     let ended = news.last().expect("the ended item");
     assert_eq!(
         ended.item,
         VoiceNewsItem::Ended {
-            reason: VoiceEndReason::Stop
+            reason: VoiceEndReason::Stop,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed
         }
     );
     // Nothing else is taken for a call that ended.
@@ -3730,7 +3732,8 @@ async fn a_phone_not_heard_from_for_two_minutes_has_its_call_closed_by_the_hosts
     assert_eq!(
         state,
         VoiceHostCallState::Closed {
-            reason: VoiceEndReason::Silence
+            reason: VoiceEndReason::Silence,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Confirmed
         }
     );
 }
@@ -3833,13 +3836,15 @@ async fn a_failed_revocation_keeps_the_call_closing_until_the_threshold_then_tel
     assert_eq!(
         state,
         VoiceHostCallState::Closed {
-            reason: VoiceEndReason::Silence
+            reason: VoiceEndReason::Silence,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Unconfirmed
         }
     );
     assert!(matches!(
         news.last().map(|item| &item.item),
         Some(VoiceNewsItem::Ended {
-            reason: VoiceEndReason::Silence
+            reason: VoiceEndReason::Silence,
+            provider_close: kr_protocol::voice_host::VoiceProviderClose::Unconfirmed
         })
     ));
 

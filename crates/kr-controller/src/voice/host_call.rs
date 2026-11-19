@@ -30,6 +30,7 @@ use kr_protocol::voice_host::{
     HOST_PERFORMED_WORDS_BYTES, HostNote, NotePhase, VoiceContextSendParams,
     VoiceContextSendResult, VoiceContextState, VoiceContextStop, VoiceControlResult,
     VoiceEndReason, VoiceHostCallState, VoiceHostRefusal, VoiceNews, VoiceNewsItem, VoiceNote,
+    VoiceProviderClose,
 };
 use tokio::time::Instant;
 
@@ -66,6 +67,8 @@ pub struct FinalStatus {
     pub device_id: DeviceId,
     /// What ended the call.
     pub reason: VoiceEndReason,
+    /// Whether the provider's close of the call was confirmed.
+    pub provider_close: VoiceProviderClose,
     /// The news the device had not acknowledged, at most [`HOST_NEWS_LIMIT`].
     pub news: Vec<VoiceNews>,
     /// The sequence number of the last item, including the `ended` one.
@@ -205,12 +208,20 @@ struct SendProgress {
     in_flight: bool,
 }
 
-/// The reason a side channel's own end gives.
-const fn reason_of(end: SidebandEnd) -> VoiceEndReason {
+/// What a side channel's own end says: the reason, and whether the provider's close is confirmed.
+/// The provider's own word that the call closed, and a hang-up the provider confirmed, are
+/// confirmations; a channel that was lost and then hung up is not.
+const fn closing_of(end: SidebandEnd) -> (VoiceEndReason, VoiceProviderClose) {
     match end {
-        SidebandEnd::ProviderClosed => VoiceEndReason::ProviderClosed,
-        SidebandEnd::HostClosed => VoiceEndReason::Stop,
-        SidebandEnd::Lost => VoiceEndReason::SidebandLost,
+        SidebandEnd::ProviderClosed => (
+            VoiceEndReason::ProviderClosed,
+            VoiceProviderClose::Confirmed,
+        ),
+        SidebandEnd::HostClosed => (VoiceEndReason::Stop, VoiceProviderClose::Confirmed),
+        SidebandEnd::Lost => (
+            VoiceEndReason::SidebandLost,
+            VoiceProviderClose::Unconfirmed,
+        ),
     }
 }
 
@@ -507,6 +518,7 @@ impl HostCalls {
             VoiceControlResult::Heartbeat {
                 state: VoiceHostCallState::Closed {
                     reason: status.reason,
+                    provider_close: status.provider_close,
                 },
                 remaining_seconds: 0,
                 news,
@@ -712,29 +724,37 @@ impl HostCall {
                 return;
             }
             let mut wake = false;
-            let reason = match (state.ended, end) {
+            let (reason, provider_close) = match (state.ended, end) {
                 (Some(recorded), Some(end))
                     if recorded.reason == VoiceEndReason::ProviderClosed =>
                 {
-                    reason_of(end)
+                    closing_of(end)
                 }
-                (Some(recorded), _) => recorded.reason,
+                (Some(recorded), Some(end)) => (recorded.reason, closing_of(end).1),
+                (Some(recorded), None) => (recorded.reason, VoiceProviderClose::Unconfirmed),
                 (None, Some(end)) => {
-                    let reason = reason_of(end);
+                    let closing = closing_of(end);
                     let at_ms = state.last_beat_ms;
-                    Self::note_end(&mut state, reason, at_ms);
+                    Self::note_end(&mut state, closing.0, at_ms);
                     wake = true;
-                    reason
+                    closing
                 }
                 (None, None) => return,
             };
             let at_ms = state.ended.map_or(0, |recorded| recorded.at_ms);
-            Self::push_news(&mut state, VoiceNewsItem::Ended { reason });
+            Self::push_news(
+                &mut state,
+                VoiceNewsItem::Ended {
+                    reason,
+                    provider_close,
+                },
+            );
             let kept = Kept {
                 status: FinalStatus {
                     voice_session_id: self.voice_session_id,
                     device_id: self.device_id,
                     reason,
+                    provider_close,
                     news: state.news.iter().cloned().collect(),
                     last_seq: state.next_seq - 1,
                 },
@@ -794,6 +814,7 @@ impl HostCall {
                 result: VoiceControlResult::Heartbeat {
                     state: VoiceHostCallState::Closed {
                         reason: status.reason,
+                        provider_close: status.provider_close,
                     },
                     remaining_seconds: 0,
                     news: status
@@ -2377,14 +2398,16 @@ mod tests {
         assert_eq!(
             state,
             VoiceHostCallState::Closed {
-                reason: VoiceEndReason::Deadline
+                reason: VoiceEndReason::Deadline,
+                provider_close: VoiceProviderClose::Confirmed
             }
         );
         assert_eq!(remaining_seconds, 0);
         assert_eq!(
             news.last().map(|item| item.item.clone()),
             Some(VoiceNewsItem::Ended {
-                reason: VoiceEndReason::Deadline
+                reason: VoiceEndReason::Deadline,
+                provider_close: VoiceProviderClose::Confirmed
             })
         );
         // Acknowledging the ended item is the last the host keeps of the call.
@@ -2460,7 +2483,8 @@ mod tests {
         assert_eq!(
             state,
             VoiceHostCallState::Closed {
-                reason: VoiceEndReason::ProviderClosed
+                reason: VoiceEndReason::ProviderClosed,
+                provider_close: VoiceProviderClose::Confirmed
             }
         );
         assert_eq!(calls.kept_final_statuses(), 1);
@@ -3193,10 +3217,17 @@ mod tests {
         sideband.tell(HostCallEvent::State(SidebandState::Closed(end)));
     }
 
-    fn ended_item(reason: VoiceEndReason, seq: u64) -> VoiceNews {
+    fn ended_item(
+        reason: VoiceEndReason,
+        provider_close: VoiceProviderClose,
+        seq: u64,
+    ) -> VoiceNews {
         VoiceNews {
             seq: U64::new(seq),
-            item: VoiceNewsItem::Ended { reason },
+            item: VoiceNewsItem::Ended {
+                reason,
+                provider_close,
+            },
         }
     }
 
@@ -3330,7 +3361,8 @@ mod tests {
         assert_eq!(
             state,
             VoiceHostCallState::Closed {
-                reason: VoiceEndReason::Revocation
+                reason: VoiceEndReason::Revocation,
+                provider_close: VoiceProviderClose::Unconfirmed
             }
         );
         assert_eq!(FINAL_STATUS_CLOSE_WAIT_MS, 60_000);
@@ -3347,10 +3379,15 @@ mod tests {
             calls.heartbeat(voice_session(1), device(7), 0, OPENED + 2_000),
             VoiceControlResult::Heartbeat {
                 state: VoiceHostCallState::Closed {
-                    reason: VoiceEndReason::Stop
+                    reason: VoiceEndReason::Stop,
+                    provider_close: VoiceProviderClose::Confirmed
                 },
                 remaining_seconds: 0,
-                news: vec![ended_item(VoiceEndReason::Stop, 1)],
+                news: vec![ended_item(
+                    VoiceEndReason::Stop,
+                    VoiceProviderClose::Confirmed,
+                    1
+                )],
                 dropped: false,
             }
         );
@@ -3390,10 +3427,15 @@ mod tests {
             beat(2, t0 + 60_000),
             VoiceControlResult::Heartbeat {
                 state: VoiceHostCallState::Closed {
-                    reason: VoiceEndReason::Revocation
+                    reason: VoiceEndReason::Revocation,
+                    provider_close: VoiceProviderClose::Unconfirmed
                 },
                 remaining_seconds: 0,
-                news: vec![ended_item(VoiceEndReason::Revocation, 1)],
+                news: vec![ended_item(
+                    VoiceEndReason::Revocation,
+                    VoiceProviderClose::Unconfirmed,
+                    1
+                )],
                 dropped: false,
             }
         );
@@ -3418,7 +3460,8 @@ mod tests {
         assert_eq!(
             state,
             VoiceHostCallState::Closed {
-                reason: VoiceEndReason::SidebandLost
+                reason: VoiceEndReason::SidebandLost,
+                provider_close: VoiceProviderClose::Unconfirmed
             }
         );
     }
@@ -3441,7 +3484,14 @@ mod tests {
         assert_eq!(calls.len(), 0);
         assert_eq!(calls.kept_final_statuses(), 1);
         let (_, _, news, _) = heartbeat(&calls, 0, OPENED + 1_000);
-        assert_eq!(news, vec![ended_item(VoiceEndReason::SidebandLost, 1)]);
+        assert_eq!(
+            news,
+            vec![ended_item(
+                VoiceEndReason::SidebandLost,
+                VoiceProviderClose::Unconfirmed,
+                1
+            )]
+        );
     }
 
     #[tokio::test]
@@ -3464,7 +3514,8 @@ mod tests {
         assert_eq!(
             state,
             VoiceHostCallState::Closed {
-                reason: VoiceEndReason::Deadline
+                reason: VoiceEndReason::Deadline,
+                provider_close: VoiceProviderClose::Confirmed
             }
         );
     }
@@ -3481,7 +3532,8 @@ mod tests {
         assert_eq!(
             state,
             VoiceHostCallState::Closed {
-                reason: VoiceEndReason::Deadline
+                reason: VoiceEndReason::Deadline,
+                provider_close: VoiceProviderClose::Unconfirmed
             }
         );
         assert_eq!(
@@ -3599,7 +3651,8 @@ mod tests {
         assert_eq!(
             state,
             VoiceHostCallState::Closed {
-                reason: VoiceEndReason::SidebandLost
+                reason: VoiceEndReason::SidebandLost,
+                provider_close: VoiceProviderClose::Unconfirmed
             }
         );
     }
@@ -3626,10 +3679,15 @@ mod tests {
             calls.heartbeat(voice_session(1), device(7), 0, OPENED + 2_000),
             VoiceControlResult::Heartbeat {
                 state: VoiceHostCallState::Closed {
-                    reason: VoiceEndReason::Stop
+                    reason: VoiceEndReason::Stop,
+                    provider_close: VoiceProviderClose::Confirmed
                 },
                 remaining_seconds: 0,
-                news: vec![ended_item(VoiceEndReason::Stop, 1)],
+                news: vec![ended_item(
+                    VoiceEndReason::Stop,
+                    VoiceProviderClose::Confirmed,
+                    1
+                )],
                 dropped: false,
             }
         );
@@ -3649,10 +3707,15 @@ mod tests {
             call.heartbeat(0, OPENED + 2_000).result,
             VoiceControlResult::Heartbeat {
                 state: VoiceHostCallState::Closed {
-                    reason: VoiceEndReason::SidebandLost
+                    reason: VoiceEndReason::SidebandLost,
+                    provider_close: VoiceProviderClose::Unconfirmed
                 },
                 remaining_seconds: 0,
-                news: vec![ended_item(VoiceEndReason::SidebandLost, 1)],
+                news: vec![ended_item(
+                    VoiceEndReason::SidebandLost,
+                    VoiceProviderClose::Unconfirmed,
+                    1
+                )],
                 dropped: false,
             }
         );
@@ -3672,5 +3735,127 @@ mod tests {
             !call.state().back_owed,
             "nothing is owed to a call that ended"
         );
+    }
+
+    /// Every `provider_close` word a result carries, read from its wire form, in the order the
+    /// wire form lists its members.
+    fn provider_closes(result: &VoiceControlResult) -> Vec<String> {
+        fn walk(value: &serde_json::Value, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(members) => {
+                    for (name, member) in members {
+                        match (name.as_str(), member) {
+                            ("provider_close", serde_json::Value::String(word)) => {
+                                found.push(word.clone());
+                            }
+                            _ => walk(member, found),
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        walk(
+            &serde_json::to_value(result).expect("a result serialises"),
+            &mut found,
+        );
+        found
+    }
+
+    /// Both places that carry the word, the `ended` item and the `closed` state, carry the same.
+    fn the_word_of(result: &VoiceControlResult) -> String {
+        let words = provider_closes(result);
+        assert_eq!(
+            words.len(),
+            2,
+            "the ended item and the closed state: {words:?}"
+        );
+        assert_eq!(words[0], words[1]);
+        words[0].clone()
+    }
+
+    #[test]
+    fn every_end_reason_is_told_with_the_confirmation_of_the_close() {
+        for reason in [
+            VoiceEndReason::Stop,
+            VoiceEndReason::Deadline,
+            VoiceEndReason::Revocation,
+            VoiceEndReason::Silence,
+            VoiceEndReason::CredentialRemoved,
+        ] {
+            for (end, word) in [
+                (SidebandEnd::HostClosed, "confirmed"),
+                (SidebandEnd::Lost, "unconfirmed"),
+            ] {
+                let (calls, _call, sideband) = held();
+                calls.end(voice_session(1), reason, OPENED + 3_000);
+                close(&sideband, end);
+                let answer = calls.heartbeat(voice_session(1), device(7), 0, OPENED + 4_000);
+                let (state, ..) = match &answer {
+                    VoiceControlResult::Heartbeat { state, .. } => (*state, ()),
+                    other => panic!("a heartbeat answer: {other:?}"),
+                };
+                assert!(
+                    matches!(state, VoiceHostCallState::Closed { reason: told, .. } if told == reason),
+                    "{reason:?} {end:?}: {state:?}"
+                );
+                assert_eq!(the_word_of(&answer), word, "{reason:?} {end:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_channel_that_ends_the_call_alone_tells_its_own_confirmation() {
+        for (end, reason, word) in [
+            (
+                SidebandEnd::ProviderClosed,
+                VoiceEndReason::ProviderClosed,
+                "confirmed",
+            ),
+            (SidebandEnd::HostClosed, VoiceEndReason::Stop, "confirmed"),
+            (
+                SidebandEnd::Lost,
+                VoiceEndReason::SidebandLost,
+                "unconfirmed",
+            ),
+        ] {
+            let (calls, _call, sideband) = held();
+            close(&sideband, end);
+            let answer = calls.heartbeat(voice_session(1), device(7), 0, OPENED + 2_000);
+            assert!(
+                matches!(&answer, VoiceControlResult::Heartbeat { state: VoiceHostCallState::Closed { reason: told, .. }, .. } if *told == reason),
+                "{end:?}: {answer:?}"
+            );
+            assert_eq!(the_word_of(&answer), word, "{end:?}");
+        }
+        // An end the coordinator recorded as the provider's close takes the channel's word.
+        let (calls, _call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::Lost));
+        calls.end(
+            voice_session(1),
+            VoiceEndReason::ProviderClosed,
+            OPENED + 3_000,
+        );
+        let answer = calls.heartbeat(voice_session(1), device(7), 0, OPENED + 4_000);
+        assert_eq!(the_word_of(&answer), "unconfirmed");
+    }
+
+    /// A close that is never reported is told as not confirmed, whatever the reason.
+    #[tokio::test]
+    async fn a_timed_out_close_is_told_unconfirmed() {
+        for reason in [VoiceEndReason::Revocation, VoiceEndReason::ProviderClosed] {
+            let (calls, _call, _sideband) = held();
+            let t0 = OPENED + 3_000;
+            calls.end(voice_session(1), reason, t0);
+            assert!(calls.tick(t0 + 60_000).await.is_empty());
+            let answer = calls.heartbeat(voice_session(1), device(7), 0, t0 + 60_001);
+            assert!(
+                matches!(&answer, VoiceControlResult::Heartbeat { state: VoiceHostCallState::Closed { reason: told, .. }, .. } if *told == reason),
+                "{answer:?}"
+            );
+            assert_eq!(the_word_of(&answer), "unconfirmed", "{reason:?}");
+        }
     }
 }
