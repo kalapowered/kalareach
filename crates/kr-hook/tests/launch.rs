@@ -226,6 +226,10 @@ struct Shell {
     view: Option<View>,
     /// The admitted connector's package hash.
     package_digest: kr_protocol::scalars::Digest256,
+    /// Whether the connector's package passed the worker's check and is admitted. A shell built
+    /// for a case that expects the installation says so in its own body; every other shell
+    /// asserts it when it is built.
+    installed: bool,
     /// The forwarder the installation registers, which a package that installs no bridge of its
     /// own has its hooks run.
     registered: PathBuf,
@@ -284,7 +288,28 @@ impl Shell {
         package: impl FnOnce(&Path, &Path) -> kr_worker::broker::connectors::ConnectorSource,
         viewed: bool,
     ) -> Self {
-        Self::registering(command, package, viewed, false)
+        Self::registering(command, package, viewed, false).expecting_the_installation()
+    }
+
+    /// Returns this shell after asserting that its connector is installed.
+    fn expecting_the_installation(self) -> Self {
+        assert!(self.installed, "the connector is installed");
+        self
+    }
+
+    /// A shell whose connector is a Gemini CLI package written for launch variables: its table
+    /// declares `GEMINI_CLI_NO_RELAUNCH` set to `1`. Whether the package is installed is the
+    /// case's to assert.
+    fn gemini_declaring() -> Self {
+        Self::registering(
+            "gemini",
+            |store, forwarder| {
+                fixture::package(store, forwarder, &fixture::Shape::gemini_cli_declaring())
+                    .expect("the package is written")
+            },
+            false,
+            false,
+        )
     }
 
     /// A shell whose connector installs no bridge of its own and whose installation registers a
@@ -307,6 +332,7 @@ impl Shell {
             false,
             true,
         )
+        .expecting_the_installation()
     }
 
     fn registering(
@@ -358,14 +384,17 @@ impl Shell {
         );
         // The connector is admitted, as the control daemon hands it over, and a launch binds it.
         let admissions = kr_worker::broker::catalogue::Admissions::new();
-        let _ = kr_worker::broker::catalogue::testing::admit(
-            &admissions,
-            &sources,
-            &broker,
-            vec![kr_worker::broker::catalogue::testing::admitted(&source)],
-            1,
-        );
-        assert!(sources.for_command(command).is_some());
+        let installed = kr_worker::broker::catalogue::testing::checked(&source).is_ok();
+        if installed {
+            let _ = kr_worker::broker::catalogue::testing::admit(
+                &admissions,
+                &sources,
+                &broker,
+                vec![kr_worker::broker::catalogue::testing::admitted(&source)],
+                1,
+            );
+            assert!(sources.for_command(command).is_some());
+        }
         // The host tree itself, so a backend's socket path stays inside the bound it has on macOS.
         let runtime_dir = placed.host.root().to_path_buf();
         let mut backends = CommandBackends::new(
@@ -411,6 +440,7 @@ impl Shell {
             generation: std::sync::atomic::AtomicU64::new(1),
             view,
             package_digest,
+            installed,
             registered,
         }
     }
@@ -1428,6 +1458,115 @@ fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_variable() {
     assert_eq!(report["variable"], "none");
     assert_eq!(report["relaunch"], "false", "the person's own value");
     drop(listener);
+}
+
+/// KR-REQ-12.20: an integrated launch of a package that declares its variable in its connector table
+/// runs with the declared value, in place of whatever the person's own environment held. The
+/// package declares `1`, which the compiled pair does not hold, so only the declaration permits it.
+#[test]
+fn kr_req_12_20_a_declared_variable_reaches_the_program_through_a_committed_launch() {
+    let shell = Shell::gemini_declaring();
+    assert!(
+        shell.installed,
+        "a package that declares its variable is installed"
+    );
+    for (own, name) in [(None, "declared-absent"), (Some("0"), "declared-zero")] {
+        let answer = shell.establish_gemini();
+        let exported: Vec<&str> = answer
+            .environment
+            .iter()
+            .map(|variable| variable.name.as_str())
+            .collect();
+        assert_eq!(
+            exported,
+            ["KR_REGISTRATION"],
+            "the shell exports the registration alone"
+        );
+        let own: Vec<(&str, &str)> = own
+            .map(|value| ("GEMINI_CLI_NO_RELAUNCH", value))
+            .into_iter()
+            .collect();
+        let child = shell.launch_as_the_shell_does(&answer, &gemini_typed(), name, &own);
+        let report = shell.report(name);
+        assert_eq!(
+            report["registered"], "yes",
+            "{name}: the launch was committed"
+        );
+        assert_eq!(
+            report["relaunch"], "1",
+            "{name}: the program runs with the declared value"
+        );
+        let (status, said) = finish(child);
+        assert!(status.success(), "{name}: {said}");
+    }
+}
+
+/// KR-REQ-12.20: a launch that runs as typed keeps the person's own value of a variable the package
+/// declares, or its absence, whether the backend refused the launch or the record was refused.
+#[test]
+fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_variable() {
+    let shell = Shell::gemini_declaring();
+    assert!(
+        shell.installed,
+        "a package that declares its variable is installed"
+    );
+    for (own, name, expected) in [
+        (Some("0"), "declared-refused-own", "0"),
+        (None, "declared-refused-absent", "unset"),
+    ] {
+        // Another credential: the backend refuses the launch.
+        let answer = shell.establish_gemini();
+        std::fs::write(
+            Shell::directory(&answer).join("credential"),
+            "05".repeat(32),
+        )
+        .expect("the credential is replaced");
+        let own: Vec<(&str, &str)> = own
+            .map(|value| ("GEMINI_CLI_NO_RELAUNCH", value))
+            .into_iter()
+            .collect();
+        let _ = finish(shell.launch_as_the_shell_does(&answer, &gemini_typed(), name, &own));
+        let report = shell.report(name);
+        assert_eq!(report["registered"], "no", "{name}");
+        assert_eq!(report["variable"], "none", "{name}");
+        assert_eq!(
+            report["relaunch"], expected,
+            "{name}: the person's own environment"
+        );
+    }
+}
+
+/// KR-REQ-12.20: a launch record that names a variable of the launcher's own (`KR_` names are the
+/// worker's) is refused, the program runs as typed, and no variable the record names reaches it.
+/// The package check refuses such a declaration first; this is the launcher's own defence.
+#[test]
+fn kr_req_12_20_a_launch_record_naming_a_reserved_variable_is_refused() {
+    let shell = Shell::gemini();
+    let directory = private(&shell, "reserved");
+    let endpoint = directory.join("e.sock");
+    let answer = hand_made_backend_declaring(
+        &shell,
+        &directory,
+        &endpoint,
+        0,
+        0,
+        &[("KR_SESSION", "1"), ("GEMINI_CLI_NO_RELAUNCH", "1")],
+    );
+    let (_, said) =
+        finish(shell.launch_as_the_shell_does(&answer, &gemini_typed(), "reserved", &[]));
+    assert!(
+        said.contains(
+            "the backend's launch record cannot be read (the launch record names \"KR_SESSION\", \
+             which is not a variable a launch sets), so the program runs as typed"
+        ),
+        "{said}"
+    );
+    let report = shell.report("reserved");
+    assert_eq!(report["registered"], "no");
+    assert_eq!(
+        report["relaunch"], "unset",
+        "no variable the record names reaches the program"
+    );
 }
 
 /// KR-REQ-12.07: a launcher that goes away after its admission and before it says it is going

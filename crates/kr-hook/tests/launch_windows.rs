@@ -112,6 +112,10 @@ struct Shell {
     job: SessionJob,
     /// A file the launchers it starts wait for before they start their program, where it is set.
     barrier: std::sync::Mutex<Option<PathBuf>>,
+    /// Whether the connector's package passed the worker's check and is admitted. A shell built
+    /// for a case that expects the installation says so in its own body; every other shell
+    /// asserts it when it is built.
+    installed: bool,
     // Declared last: the directory is removed after every field above has let go of its files.
     placed: Placed,
 }
@@ -119,6 +123,24 @@ struct Shell {
 impl Shell {
     fn new() -> Self {
         Self::build(|source, _| source, &[], 0)
+    }
+
+    /// Returns this shell after asserting that its connector is installed.
+    fn expecting_the_installation(self) -> Self {
+        assert!(self.installed, "the connector is installed");
+        self
+    }
+
+    /// A shell whose package is a Gemini CLI package written for launch variables: its table
+    /// declares `GEMINI_CLI_NO_RELAUNCH` set to `1`. Whether the package is installed is the
+    /// case's to assert.
+    fn declaring_variables() -> Self {
+        Self::build_shaped(
+            |source, _| source,
+            fixture::Shape::gemini_cli_declaring(),
+            &[],
+            0,
+        )
     }
 
     /// A shell whose program is `bytes` long, written new so that the system has not seen it: the
@@ -166,6 +188,7 @@ impl Shell {
             &[],
             0,
         )
+        .expecting_the_installation()
     }
 
     /// Builds a shell whose package declares `flags` and is written, then handed to `installed`
@@ -176,6 +199,7 @@ impl Shell {
         padding: u64,
     ) -> Self {
         Self::build_shaped(installed, fixture::Shape::gemini_cli(flags), flags, padding)
+            .expecting_the_installation()
     }
 
     /// As [`Self::build`], for a package of the shape `shape`, which declares `flags`.
@@ -214,14 +238,17 @@ impl Shell {
         );
         // The connector is admitted, as the control daemon hands it over, and a launch binds it.
         let admissions = kr_worker::broker::catalogue::Admissions::new();
-        let _ = kr_worker::broker::catalogue::testing::admit(
-            &admissions,
-            &sources,
-            &broker,
-            vec![kr_worker::broker::catalogue::testing::admitted(&source)],
-            1,
-        );
-        assert!(sources.for_command("gemini").is_some());
+        let installed = kr_worker::broker::catalogue::testing::checked(&source).is_ok();
+        if installed {
+            let _ = kr_worker::broker::catalogue::testing::admit(
+                &admissions,
+                &sources,
+                &broker,
+                vec![kr_worker::broker::catalogue::testing::admitted(&source)],
+                1,
+            );
+            assert!(sources.for_command("gemini").is_some());
+        }
         let backends = Arc::new(CommandBackends::new(
             Arc::clone(&broker),
             CommandBackendsConfig {
@@ -251,6 +278,7 @@ impl Shell {
             generation: std::sync::atomic::AtomicU64::new(1),
             job: SessionJob::create().expect("a job for what this shell starts"),
             barrier: std::sync::Mutex::new(None),
+            installed,
         }
     }
 
@@ -662,6 +690,104 @@ fn kr_req_12_07_a_launch_the_backend_refuses_runs_as_typed() {
     let mut again = shell.launch(&answer, "again", &[]);
     let report = shell.report_from("again", &mut again);
     assert_eq!(report["relaunch"], "true");
+}
+
+/// KR-REQ-12.20: an integrated launch of a package that declares its variable in its connector table
+/// runs with the declared value, in place of whatever the person's own environment held. The
+/// package declares `1`, which the compiled pair does not hold, so only the declaration permits it.
+#[test]
+fn kr_req_12_20_a_declared_variable_reaches_the_program_through_a_committed_launch() {
+    let shell = Shell::declaring_variables();
+    assert!(
+        shell.installed,
+        "a package that declares its variable is installed"
+    );
+    for (own, name) in [(None, "declared-absent"), (Some("0"), "declared-zero")] {
+        let answer = shell.establish();
+        let own: Vec<(&str, &str)> = own
+            .map(|value| ("GEMINI_CLI_NO_RELAUNCH", value))
+            .into_iter()
+            .collect();
+        let mut launcher = shell.launch(&answer, name, &own);
+        let report = shell.report_from(name, &mut launcher);
+        assert_eq!(
+            report["relaunch"], "1",
+            "{name}: the program runs with the declared value"
+        );
+        assert_eq!(
+            PathBuf::from(&report["variable"]),
+            Shell::registration(&answer),
+            "{name}: and the launch was committed"
+        );
+    }
+}
+
+/// KR-REQ-12.20: a launch the backend refuses runs as typed and keeps the person's own value of a
+/// variable the package declares. Here the argument vector the launcher presents is not the one the
+/// backend answered.
+#[test]
+fn kr_req_12_20_an_as_typed_run_keeps_the_person_s_own_value_of_a_declared_variable() {
+    let shell = Shell::declaring_variables();
+    assert!(
+        shell.installed,
+        "a package that declares its variable is installed"
+    );
+    let answer = shell.establish();
+    let mut typed = shell.typed();
+    typed.push("another".to_owned());
+    let mut launcher = shell.launcher(
+        &shell.executable.clone(),
+        &typed,
+        &answer,
+        "declared-typed",
+        &[("GEMINI_CLI_NO_RELAUNCH", "0")],
+        shell.placed.host.root(),
+    );
+    let report = shell.report_from("declared-typed", &mut launcher);
+    assert_eq!(
+        report["relaunch"], "0",
+        "the program ran in the person's own environment: {report:?}"
+    );
+    assert!(
+        !Shell::registration(&answer).exists(),
+        "and nothing was registered for it"
+    );
+}
+
+/// KR-REQ-12.20: a launch record that names a variable of the launcher's own (`KR_` names are the
+/// worker's) is refused, the program runs as typed, and no variable the record names reaches it.
+/// The package check refuses such a declaration first; this is the launcher's own defence.
+#[test]
+fn kr_req_12_20_a_launch_record_naming_a_reserved_variable_is_refused() {
+    let shell = Shell::new();
+    let answer = shell.establish();
+    let directory = Shell::registration(&answer)
+        .parent()
+        .expect("the backend's directory")
+        .to_path_buf();
+    let mut record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(directory.join("launch")).expect("the launch record"),
+    )
+    .expect("a record");
+    record["variables"] = serde_json::json!([
+        { "name": "KR_SESSION", "value": "1" },
+        { "name": "GEMINI_CLI_NO_RELAUNCH", "value": "1" },
+    ]);
+    std::fs::write(
+        directory.join("launch"),
+        serde_json::to_vec(&record).expect("a record encodes"),
+    )
+    .expect("the record is replaced");
+    let mut launcher = shell.launch(&answer, "reserved", &[]);
+    let report = shell.report_from("reserved", &mut launcher);
+    assert_ne!(
+        report["relaunch"], "1",
+        "no variable the record names reaches the program: {report:?}"
+    );
+    assert!(
+        !Shell::registration(&answer).exists(),
+        "and nothing was registered for it"
+    );
 }
 
 /// The launcher played by a process of its own, which this test controls over its standard input
