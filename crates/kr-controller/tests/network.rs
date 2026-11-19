@@ -765,6 +765,17 @@ async fn redeem(
         status.status
     );
     connection.close(0u32.into(), b"paired");
+    // The identity it became is the one derived from its invitation and its authorisation key, so
+    // the device connects under the identity it computed.
+    assert_eq!(
+        confirmed.device_id,
+        kr_pairing::identity::committed_device_id(
+            invited.invitation_id,
+            &device.keys.public_keys().authorisation,
+        )
+        .expect("an identity"),
+        "the device was committed under the identity derived for it"
+    );
     daemon
         .network
         .devices()

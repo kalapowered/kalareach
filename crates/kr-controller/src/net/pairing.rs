@@ -1916,10 +1916,11 @@ fn malformed(error: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::new(ErrorCode::InvalidArgument, error.to_string())
 }
 
-/// Returns the device and grant identities a new pairing is committed under.
+/// Returns the grant identities a new pairing is committed under.
 ///
-/// Both are minted by the host: a candidate cannot choose the identity its record will have, and
-/// the grant is issued at the authority revision in force when it is written.
+/// The grant's identity is minted by the host, and the grant is issued at the authority revision in
+/// force when it is written. The device's identity is not minted: the pairing derives it from the
+/// invitation and the candidate's authorisation key, so a candidate cannot choose it either.
 ///
 /// # Errors
 ///
@@ -1931,7 +1932,6 @@ pub fn fresh_identities(
     Ok(GrantIdentities {
         grant_id: GrantId::new(kr_ipc::new_uuid()),
         issuer_device_id,
-        recipient_device_id: DeviceId::new(kr_ipc::new_uuid()),
         authority_revision,
     })
 }

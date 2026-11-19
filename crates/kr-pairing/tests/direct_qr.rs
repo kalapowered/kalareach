@@ -14,6 +14,7 @@ use kr_pairing::direct::{
 };
 use kr_pairing::grants::{GrantIdentities, GrantKind};
 use kr_pairing::host::{HostIdentity, OwnerApproval, OwnerContext};
+use kr_pairing::identity::committed_device_id;
 use kr_pairing::platform::{InvitationState, TestClock, TestInvitationStore, TestLivePeer};
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
@@ -171,7 +172,6 @@ impl Harness {
         GrantIdentities {
             grant_id: GrantId::new(Uuid::from_bytes([8; 16])),
             issuer_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
-            recipient_device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
             authority_revision: AuthorityRevision::new(1),
         }
     }
@@ -350,6 +350,15 @@ fn a_complete_direct_pairing_commits_the_device_and_the_proposed_grant() {
         harness.identity().device_id
     );
     assert_eq!(committed.grant.recipient_device_id, committed.device_id);
+    assert_eq!(
+        committed.device_id,
+        committed_device_id(
+            committed.invitation_id,
+            &harness.client_keys.public_keys().authorisation
+        )
+        .expect("an identity"),
+        "the device identity is derived from the invitation and the candidate's key"
+    );
     assert_eq!(
         committed
             .client_bundle

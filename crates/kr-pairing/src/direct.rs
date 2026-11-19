@@ -35,6 +35,7 @@ use crate::confirm::ConfirmationLedger;
 use crate::error::{PairingError, Result};
 use crate::grants::{self, GrantIdentities, GrantKind};
 use crate::host::{HostIdentity, IssueTerms, OwnerApproval, OwnerContext};
+use crate::identity::committed_device_id;
 use crate::platform::{
     InvitationRecord, InvitationState, InvitationStore, LivePeer, PairingClock, PairingCommitment,
     TransitionOutcome, require_completed_handshake,
@@ -427,18 +428,23 @@ impl<S: InvitationStore, C: PairingClock> DirectInvitation<S, C> {
             &self.proposed_grant,
             approved.action_digest(),
         )?;
+        let device_id = committed_device_id(
+            self.record.invitation_id,
+            &candidate.transcript.client_keys.authorisation,
+        )?;
         let grant = grants::issue_grant(
             self.proposed_grant.clone(),
             self.grant_kind,
             self.clock.wall_clock_ms(),
             identities,
+            device_id,
             parent,
         )?;
 
         let commitment = PairingCommitment {
             invitation_id: self.record.invitation_id,
             attempt_id: candidate.attempt_id,
-            device_id: identities.recipient_device_id,
+            device_id,
             grant,
             client_keys: candidate.transcript.client_keys,
             client_bundle: Some(candidate.client_bundle.clone()),
