@@ -10,6 +10,7 @@
 //! package establishes provenance, not safety, and this module is where the safety part happens.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::path::Path;
 
 use cap_fs_ext::{DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _};
@@ -352,19 +353,54 @@ pub struct Validated {
     pub report: Report,
 }
 
+/// The names one directory lists, in the order its listing gives them.
+type Names = Box<dyn Iterator<Item = std::io::Result<OsString>>>;
+
+/// How the scan lists a directory.
+type Listing<'a> = &'a dyn Fn(&Dir) -> std::io::Result<Names>;
+
+/// A directory's own listing: its entries in the order the file system gives them, one at a time.
+fn listed_by_the_file_system(directory: &Dir) -> std::io::Result<Names> {
+    Ok(Box::new(
+        directory
+            .entries()?
+            .map(|entry| entry.map(|entry| entry.file_name())),
+    ))
+}
+
 /// Validates a package directory.
 ///
 /// Nothing in the directory is executed. Symbolic links are rejected rather than followed, so a
 /// package cannot reach outside itself by pointing at something.
 #[must_use]
 pub fn validate_package_directory(directory: &Path) -> Validated {
+    validate(directory, &listed_by_the_file_system)
+}
+
+/// Validates a package directory, with the names each directory lists put in the order `order`
+/// gives, so that a test sets the order the scan meets the files in and no file system's own
+/// order decides what the test shows.
+#[cfg(feature = "testing")]
+#[must_use]
+pub fn validate_package_directory_in_order(
+    directory: &Path,
+    order: &dyn Fn(&mut Vec<OsString>),
+) -> Validated {
+    validate(directory, &|listed| {
+        let mut names = listed_by_the_file_system(listed)?.collect::<std::io::Result<Vec<_>>>()?;
+        order(&mut names);
+        Ok(Box::new(names.into_iter().map(Ok)))
+    })
+}
+
+fn validate(directory: &Path, listing: Listing<'_>) -> Validated {
     let mut report = Report::default();
     let Some(Scanned {
         files,
         manifests,
         shell_forms,
         sources,
-    }) = scan(directory, &mut report)
+    }) = scan(directory, listing, &mut report)
     else {
         return Validated {
             package: None,
@@ -505,7 +541,7 @@ fn installed_sources(manifest: &[u8]) -> BTreeSet<String> {
         .collect()
 }
 
-fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
+fn scan(directory: &Path, listing: Listing<'_>, report: &mut Report) -> Option<Scanned> {
     // The walk is anchored to a directory handle. Every open below resolves inside that handle, so
     // a link, an absolute path or a `..` cannot reach outside the package, and a directory replaced
     // during the walk cannot redirect a read: the handle refers to the directory that was opened,
@@ -533,7 +569,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
     let mut total: u64 = 0;
     let mut queue: Vec<(Dir, Vec<String>)> = vec![(root, Vec::new())];
     while let Some((current, prefix)) = queue.pop() {
-        let entries = match current.entries() {
+        let entries = match listing(&current) {
             Ok(entries) => entries,
             Err(error) => {
                 report.push(Finding::new(
@@ -547,26 +583,18 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
         // that the files its recipe installs are known when the others are read and are the ones
         // kept. Its entry is found by a lookup: the listing is never held whole.
         let manifest_first = if prefix.is_empty() {
-            current.entries().ok().and_then(|mut listing| {
-                listing.find(|entry| {
-                    entry
-                        .as_ref()
-                        .is_ok_and(|entry| entry.file_name() == MANIFEST_FILE)
-                })
+            listing(&current).ok().and_then(|mut names| {
+                names.find(|name| name.as_ref().is_ok_and(|name| name == MANIFEST_FILE))
             })
         } else {
             None
         };
         let found = manifest_first.is_some();
-        let later = entries.filter(move |entry| {
-            !(found
-                && entry
-                    .as_ref()
-                    .is_ok_and(|entry| entry.file_name() == MANIFEST_FILE))
-        });
-        for entry in manifest_first.into_iter().chain(later) {
-            let entry = match entry {
-                Ok(entry) => entry,
+        let later = entries
+            .filter(move |name| !(found && name.as_ref().is_ok_and(|name| name == MANIFEST_FILE)));
+        for name in manifest_first.into_iter().chain(later) {
+            let name_os = match name {
+                Ok(name) => name,
                 Err(error) => {
                     report.push(Finding::new(
                         FindingCode::DirectoryUnreadable,
@@ -575,7 +603,6 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     return None;
                 }
             };
-            let name_os = entry.file_name();
             let Some(name) = name_os.to_str().map(str::to_owned) else {
                 report.push(Finding::at(
                     FindingCode::NameNotUtf8,
