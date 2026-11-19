@@ -1229,6 +1229,26 @@ fn job_names(workflow: &str) -> Vec<String> {
 /// The scripts a macOS job runs that start a daemon and sessions, besides every `cargo test`.
 const SCRIPTS_THAT_START_A_DAEMON: [&str; 2] = ["scripts/end-to-end.sh", "scripts/performance.sh"];
 
+/// Whether `line` runs `cargo test`, with or without a toolchain selector (`cargo +stable test`), at
+/// the start of the line or inside a command substitution or an assignment.
+fn runs_cargo_test(line: &str) -> bool {
+    line.match_indices("cargo").any(|(at, word)| {
+        let mut words = line[at + word.len()..].split_whitespace();
+        let command = match words.next() {
+            Some(first) if first.starts_with('+') => words.next(),
+            first => first,
+        };
+        line[at + word.len()..].starts_with(char::is_whitespace)
+            && command.is_some_and(|command| {
+                command.strip_prefix("test").is_some_and(|rest| {
+                    !rest.starts_with(|next: char| {
+                        next.is_alphanumeric() || next == '-' || next == '_'
+                    })
+                })
+            })
+    })
+}
+
 /// The jobs of `workflow` that can run on macOS and run tests: the runner is a macOS one, or
 /// `matrix.` something while the job's own matrix names a macOS one, and a step runs `cargo test` in
 /// any form (a package, a target, a filter, one inside a command substitution) or one of
@@ -1248,7 +1268,7 @@ fn macos_jobs_that_run_tests(workflow: &str) -> Vec<String> {
             on_macos
                 && steps_of(&text).iter().any(|step| {
                     step.lines().any(|line| {
-                        without_comment(line).contains("cargo test")
+                        runs_cargo_test(without_comment(line))
                             || SCRIPTS_THAT_START_A_DAEMON
                                 .iter()
                                 .any(|tool| starts(line, tool))
@@ -1325,6 +1345,8 @@ fn the_macos_selection_finds_every_form_of_a_test_run_and_the_job_that_does_not_
         "cargo test --locked --workspace",
         "cases=\"$(cargo test --locked -p x -- --list)\"",
         "KR_CASE=\"$id\" cargo test --locked -p x --test y",
+        "cargo +stable test --locked -p kr-cli",
+        "cases=\"$(cargo +1.90.0 test --locked -p x -- --list)\"",
         "bash scripts/end-to-end.sh",
         "bash scripts/performance.sh",
     ] {
@@ -1355,7 +1377,19 @@ fn the_macos_selection_finds_every_form_of_a_test_run_and_the_job_that_does_not_
             "cargo test --locked -p x",
         ),
         workflow("", "macos-15", "", "cargo build --locked --workspace"),
+        workflow(
+            "",
+            "macos-15",
+            "",
+            "cargo +stable build --locked --workspace",
+        ),
         workflow("", "macos-15", "", "echo done # cargo test is not run here"),
+        workflow(
+            "",
+            "macos-15",
+            "",
+            "echo done # cargo +stable test is not run here",
+        ),
     ] {
         assert!(macos_jobs_that_run_tests(&other).is_empty(), "{other}");
     }
