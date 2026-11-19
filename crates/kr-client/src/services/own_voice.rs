@@ -49,10 +49,12 @@ use super::own_call::{CallState, NewCall, OwnCallLedger};
 pub use super::own_registry::StartEnd;
 use super::own_registry::{CallRegistry, StartRefusal, StartSlot, StartTicket, TaskToken};
 use super::voice::{
-    OwnSession, StartAttempt, VOICE_OFFER_BYTES, VoiceClosure, VoiceCommand, VoiceContextFrame,
-    VoiceOwnKeyTerms, VoiceProviderService, VoiceProviderTerms, VoiceRefusal, VoiceRefusalReason,
-    VoiceSessionRequest, VoiceStart,
+    OwnSession, StartAttempt, VOICE_CONTROL_FRAME_BYTES, VOICE_OFFER_BYTES, VoiceClosure,
+    VoiceCommand, VoiceContextFrame, VoiceOwnKeyTerms, VoiceProviderService, VoiceProviderTerms,
+    VoiceRefusal, VoiceRefusalReason, VoiceSessionRequest, VoiceStart,
 };
+use super::voice_control::ControlTimings;
+use super::voice_pacing::Pacer;
 use crate::error::{ClientError, Result};
 use crate::shown::Shown;
 
@@ -1419,6 +1421,9 @@ struct Shared {
     session_id: String,
     inner: Mutex<Inner>,
     heard_wake: Notify,
+    /// When each command the provider counts was written, for the whole call: the one history that
+    /// the context sender, a mute, a note and a probe are all held to.
+    pacer: Mutex<Pacer>,
     tx: mpsc::UnboundedSender<Task>,
 }
 
@@ -1426,6 +1431,7 @@ crate::debug_as_name!(Shared);
 
 impl Shared {
     fn new(call_id: String, session_id: String, tx: mpsc::UnboundedSender<Task>) -> Self {
+        let timings = ControlTimings::default();
         Self {
             call_id,
             session_id,
@@ -1437,8 +1443,13 @@ impl Shared {
                 unknown_events: 0,
             }),
             heard_wake: Notify::new(),
+            pacer: Mutex::new(Pacer::new(timings.burst_window, timings.minute_window)),
             tx,
         }
+    }
+
+    fn pacer(&self) -> std::sync::MutexGuard<'_, Pacer> {
+        self.pacer.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn inner(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -1503,6 +1514,10 @@ impl HostCallControl for Shared {
             }
             answer.await.unwrap_or(Err(WriteRefusal::Lost))
         })
+    }
+
+    fn next_write_at(&self) -> Option<Instant> {
+        self.pacer().next_at(Instant::now())
     }
 
     fn heard(&self, delegation_id: &str) -> Option<u64> {
@@ -1667,6 +1682,7 @@ impl CallTask {
         if !sent {
             return Err(NotReady::Unavailable);
         }
+        self.shared.pacer().record(&probe_id, Instant::now());
         tokio::time::timeout_at(ends, async {
             loop {
                 match self.socket_next().await {
@@ -1773,6 +1789,7 @@ impl CallTask {
                 }
                 let acknowledged = acknowledged();
                 if let Some(id) = &acknowledged {
+                    self.shared.pacer().acknowledged(id, Instant::now());
                     self.shared.emit(HostCallEvent::WriteAcknowledged {
                         write_id: id.clone(),
                     });
@@ -1878,11 +1895,20 @@ impl CallTask {
         if self.socket.is_none() {
             return Err(WriteRefusal::Lost);
         }
+        let text = command_json(frame).to_string();
+        if text.len() > VOICE_CONTROL_FRAME_BYTES {
+            return Err(WriteRefusal::TooLarge);
+        }
+        // Every command but the close is counted, in the one history of the call.
+        let counted = !matches!(frame.command, VoiceCommand::Close);
+        if counted && self.shared.pacer().next_at(Instant::now()).is_some() {
+            return Err(WriteRefusal::Rate);
+        }
         let bound = DRAIN_BOUND.min(self.deadline.saturating_duration_since(Instant::now()));
-        if self
-            .send_within(command_json(frame).to_string(), bound)
-            .await
-        {
+        if self.send_within(text, bound).await {
+            if counted {
+                self.shared.pacer().record(&frame.id, Instant::now());
+            }
             Ok(())
         } else {
             Err(WriteRefusal::Lost)

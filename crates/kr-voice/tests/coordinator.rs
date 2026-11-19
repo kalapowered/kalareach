@@ -1523,6 +1523,10 @@ impl kr_client::services::host_call::HostCallControl for StillSideband {
         Box::pin(async { Ok(()) })
     }
 
+    fn next_write_at(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
     fn heard(&self, _delegation_id: &str) -> Option<u64> {
         None
     }

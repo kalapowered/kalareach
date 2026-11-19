@@ -19,8 +19,7 @@ use kr_client::services::host_call::{
     HostCallControl, HostCallEvent, SidebandEnd, SidebandState, WriteRefusal,
 };
 use kr_client::services::voice::{VoiceCommand, VoiceContextFrame};
-use kr_client::services::voice_control::ControlTimings;
-use kr_client::services::voice_pacing::{MAX_START_APPENDS, Pacer, call_start_appends};
+use kr_client::services::voice_pacing::{MAX_START_APPENDS, call_start_appends};
 use kr_protocol::ids::{ActionId, DeviceId, VoiceSessionId};
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::voice::{
@@ -749,6 +748,8 @@ impl HostCall {
                 WriteRefusal::NotReady | WriteRefusal::Stale => VoiceHostRefusal::NotReady,
                 WriteRefusal::ProviderRefused => VoiceHostRefusal::ProviderRefused,
                 WriteRefusal::Lost => VoiceHostRefusal::SidebandLost,
+                WriteRefusal::Rate => VoiceHostRefusal::Rate,
+                WriteRefusal::TooLarge => VoiceHostRefusal::TooLarge,
             })
     }
 
@@ -798,6 +799,10 @@ impl HostCall {
     /// seconds, or that it has not.
     pub async fn heard(&self, delegation_id: &str, now_ms: u64) -> VoiceControlResult {
         self.phone_is_back(now_ms).await;
+        // Bound to a call that is ready and within its deadline, as a write is.
+        if let Err(reason) = self.writable(now_ms) {
+            return refused(reason);
+        }
         match self
             .control
             .heard_within(delegation_id, Duration::from_millis(HOST_HEARD_WAIT_MS))
@@ -1108,21 +1113,20 @@ impl HostCall {
         support: Arc<dyn SendSupport>,
         revision: u64,
     ) {
-        let timings = ControlTimings::default();
-        let mut pacer = Pacer::new(timings.burst_window, timings.minute_window);
         let delegation_id = params
             .delegation_id
             .0
             .as_ref()
             .map(|id| id.as_str().to_owned());
         let mut stopped = None;
-        for text in &appends {
+        let mut next = 0;
+        while let Some(text) = appends.get(next) {
             loop {
                 if let Some(stop) = self.send_stop(revision, support.now_ms()) {
                     stopped = Some(stop);
                     break;
                 }
-                let Some(at) = pacer.next_at(Instant::now()) else {
+                let Some(at) = self.control.next_write_at() else {
                     break;
                 };
                 tokio::select! {
@@ -1152,14 +1156,19 @@ impl HostCall {
             if let Err(refusal) = written {
                 self.state().acks.remove(&id);
                 stopped = Some(match refusal {
-                    WriteRefusal::ProviderRefused => VoiceContextStop::ProviderRefused,
+                    // Another command of the call took the pace first: the append waits for it
+                    // again, and everything that allows it is looked at again.
+                    WriteRefusal::Rate => continue,
+                    WriteRefusal::ProviderRefused | WriteRefusal::TooLarge => {
+                        VoiceContextStop::ProviderRefused
+                    }
                     WriteRefusal::NotReady | WriteRefusal::Stale | WriteRefusal::Lost => {
                         VoiceContextStop::SidebandLost
                     }
                 });
                 break;
             }
-            pacer.record(&id, Instant::now());
+            next += 1;
             let answer = self.acknowledged(&id, revision, &*support).await;
             let mut state = self.state();
             state.acks.remove(&id);
@@ -1250,6 +1259,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use kr_client::services::host_call::{HostCallListener, HostFuture};
+    use kr_client::services::voice_control::ControlTimings;
+    use kr_client::services::voice_pacing::Pacer;
     use kr_protocol::voice::VoiceDelegationId;
 
     use super::*;
@@ -1267,10 +1278,12 @@ mod tests {
         listener: Mutex<Option<HostCallListener>>,
         revision: AtomicU64,
         refuses: std::sync::atomic::AtomicBool,
+        pacer: Mutex<Pacer>,
     }
 
     impl Sideband {
         fn new() -> Arc<Self> {
+            let timings = ControlTimings::default();
             Arc::new(Self {
                 state: Mutex::new(SidebandState::Ready),
                 heard: Mutex::new(BTreeMap::new()),
@@ -1280,6 +1293,7 @@ mod tests {
                 listener: Mutex::new(None),
                 revision: AtomicU64::new(1),
                 refuses: std::sync::atomic::AtomicBool::new(false),
+                pacer: Mutex::new(Pacer::new(timings.burst_window, timings.minute_window)),
             })
         }
 
@@ -1313,6 +1327,10 @@ mod tests {
             let from = usize::try_from(self.acknowledged.swap(ids.len() as u64, Ordering::SeqCst))
                 .expect("a count");
             for id in &ids[from..] {
+                self.pacer
+                    .lock()
+                    .expect("the pacer")
+                    .acknowledged(id, Instant::now());
                 self.tell(HostCallEvent::WriteAcknowledged {
                     write_id: id.clone(),
                 });
@@ -1350,6 +1368,13 @@ mod tests {
                 if self.refuses.load(Ordering::SeqCst) {
                     return Err(WriteRefusal::ProviderRefused);
                 }
+                if self.next_write_at().is_some() {
+                    return Err(WriteRefusal::Rate);
+                }
+                self.pacer
+                    .lock()
+                    .expect("the pacer")
+                    .record(&frame.id, Instant::now());
                 self.ids.lock().expect("ids").push(frame.id.clone());
                 self.written.lock().expect("written").push((
                     frame.command,
@@ -1358,6 +1383,13 @@ mod tests {
                 ));
                 Ok(())
             })
+        }
+
+        fn next_write_at(&self) -> Option<Instant> {
+            self.pacer
+                .lock()
+                .expect("the pacer")
+                .next_at(Instant::now())
         }
 
         fn heard(&self, delegation_id: &str) -> Option<u64> {
@@ -2460,6 +2492,57 @@ mod tests {
             write_id: acknowledged,
         });
         assert_eq!(heartbeat(&calls, 1, 12_000).2.len(), 0);
+    }
+
+    /// `heard` is bound to a call that is ready and within its deadline, as a write is: a call that
+    /// is recovering or past its deadline answers a refusal, not what it heard.
+    #[tokio::test]
+    async fn heard_is_refused_unless_the_call_is_ready_and_within_its_deadline() {
+        let (_calls, call, sideband) = held();
+        sideband.hear("d1", 1_234);
+        sideband.set(SidebandState::Recovering);
+        assert_eq!(
+            call.heard("d1", 5_000).await,
+            VoiceControlResult::Refused {
+                reason: VoiceHostRefusal::NotReady
+            }
+        );
+        sideband.set(SidebandState::Ready);
+        assert_eq!(
+            call.heard("d1", CLOSES).await,
+            VoiceControlResult::Refused {
+                reason: VoiceHostRefusal::Closing
+            }
+        );
+        assert_eq!(
+            call.heard("d1", 5_000).await,
+            VoiceControlResult::Heard {
+                offset_ms: U64::new(1_234)
+            }
+        );
+    }
+
+    /// A mute meets the pace the context send holds the call to, because the call keeps one
+    /// history for every command the provider counts.
+    #[tokio::test(start_paused = true)]
+    async fn a_mute_meets_the_pace_the_context_send_holds_the_call_to() {
+        let (_calls, call, sideband) = held();
+        let _ = call
+            .send_context(action(5), send_params(), Support::of(14), OPENED + 1_000)
+            .await;
+        for _ in 0..10 {
+            settle().await;
+            sideband.acknowledge_all();
+        }
+        settle().await;
+        assert_eq!(sideband.written().len(), 10, "the burst");
+        assert_eq!(
+            call.mute(action(6), true, OPENED + 2_000).await,
+            VoiceControlResult::Refused {
+                reason: VoiceHostRefusal::Rate
+            }
+        );
+        assert_eq!(sideband.written().len(), 10, "the mute was not written");
     }
 
     #[tokio::test]

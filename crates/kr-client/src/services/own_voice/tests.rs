@@ -938,3 +938,61 @@ async fn a_slot_a_normal_end_leaves_is_not_told_by_a_later_settle() {
     );
     assert_eq!(states(&world), [CallState::Creating]);
 }
+
+/// Every command the provider counts goes through the call's one pace, the readiness probe
+/// among them, and a refused write names the moment the next may go; a frame whose JSON is over
+/// the most one message takes is refused at the writer.
+#[tokio::test(start_paused = true)]
+async fn every_counted_command_meets_one_pace_and_a_frame_over_the_limit_is_refused_at_the_writer()
+{
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world
+        .provider
+        .host_control(&own.call_id)
+        .expect("a side channel");
+    let thinking = |id: &str| {
+        VoiceContextFrame::new(id, VoiceCommand::Thinking, None, Some("x".to_owned()))
+            .expect("a frame")
+    };
+    let burst = usize::try_from(crate::services::voice::VOICE_CONTEXT_BURST).expect("a count");
+    let mut admitted = 0;
+    loop {
+        match control.write(1, thinking(&format!("w-{admitted}"))).await {
+            Ok(()) => admitted += 1,
+            Err(WriteRefusal::Rate) => break,
+            other => panic!("a write is admitted or meets the pace: {other:?}"),
+        }
+        assert!(admitted <= burst, "the pace stops the writes");
+    }
+    assert_eq!(
+        admitted,
+        burst - 1,
+        "the readiness probe was counted against the burst"
+    );
+    assert!(control.next_write_at().is_some());
+    let mute = VoiceContextFrame::new("m-1", VoiceCommand::Mute, None, None).expect("a frame");
+    assert_eq!(
+        control.write(1, mute.clone()).await,
+        Err(WriteRefusal::Rate),
+        "a mute meets the pace the appends hold the call to"
+    );
+
+    let timings = crate::services::voice_control::ControlTimings::default();
+    tokio::time::advance(timings.burst_window + Duration::from_secs(1)).await;
+    assert_eq!(control.next_write_at(), None);
+    assert_eq!(control.write(1, mute).await, Ok(()));
+
+    let long = VoiceContextFrame::new(
+        "long-1",
+        VoiceCommand::Thinking,
+        Some("d".repeat(5_000)),
+        Some("x".to_owned()),
+    )
+    .expect("a frame");
+    assert_eq!(
+        control.write(1, long).await,
+        Err(WriteRefusal::TooLarge),
+        "the writer refuses a message over the limit"
+    );
+}

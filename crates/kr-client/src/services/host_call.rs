@@ -54,6 +54,11 @@ pub enum WriteRefusal {
     ProviderRefused,
     /// The channel was lost between taking the frame and writing it.
     Lost,
+    /// The call is at the rate the provider holds it to: the write waits for
+    /// [`HostCallControl::next_write_at`].
+    Rate,
+    /// The frame, as it is written, is over the most the provider takes in one message.
+    TooLarge,
 }
 
 /// Something the provider's side channel reports to the host's call object.
@@ -120,6 +125,11 @@ pub trait HostCallControl: Send + Sync + fmt::Debug {
         revision: u64,
         frame: VoiceContextFrame,
     ) -> HostFuture<'a, std::result::Result<(), WriteRefusal>>;
+
+    /// When the next counted write may go: `None` now, or the moment it may. One history serves
+    /// every command of the call that the provider counts, whoever sends it, and a write made
+    /// before this moment is refused with [`WriteRefusal::Rate`].
+    fn next_write_at(&self) -> Option<tokio::time::Instant>;
 
     /// Where in the call the provider announced `delegation_id`, when it did.
     fn heard(&self, delegation_id: &str) -> Option<u64>;

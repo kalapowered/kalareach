@@ -215,6 +215,10 @@ impl kr_client::services::host_call::HostCallControl for StandInSideband {
         Box::pin(async { Ok(()) })
     }
 
+    fn next_write_at(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+
     fn heard(&self, delegation_id: &str) -> Option<u64> {
         self.heard
             .lock()

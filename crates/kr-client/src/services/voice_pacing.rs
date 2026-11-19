@@ -142,6 +142,15 @@ impl Pacer {
         wait.filter(|until| *until > now)
     }
 
+    /// Counts the request `id` again from `now` when it is counted already, and leaves the history
+    /// as it is when it is not: the moment its acceptance arrived is the service's own, and a
+    /// request that was never counted has none.
+    pub fn acknowledged(&mut self, id: &str, now: Instant) {
+        if self.sent.iter().any(|(counted, _)| counted == id) {
+            self.record(id, now);
+        }
+    }
+
     /// Counts the request `id` from `now`. A request already counted is counted from `now`
     /// instead: the service counts it once. The moment of a write is earlier than the service's
     /// own, so a request is counted again from the moment its acceptance arrives, which is later,
