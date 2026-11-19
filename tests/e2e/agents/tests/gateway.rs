@@ -5296,8 +5296,12 @@ fn gateway_an_agent_that_rewrote_the_hosts_state_is_not_obeyed_when_the_host_is_
 /// start the agent again, as a line typed again is. Returns the text the second start ended in, and
 /// whether the case's program ever ran. The first start is the control: it went through the same
 /// check over the files as they were placed.
-fn an_agent_replaces_a_placed_file_and_is_started_again(replaced: &str) -> (String, bool) {
+fn an_agent_replaces_a_placed_file_and_is_started_again(
+    replaced: &str,
+    forge: bool,
+) -> (String, bool) {
     an_agent_leaves_a_change_and_is_started_again(
+        forge,
         &|ctx, program, _| {
             let place = ctx.run.root().join(replaced);
             format!(
@@ -5321,11 +5325,13 @@ fn an_agent_replaces_a_placed_file_and_is_started_again(replaced: &str) -> (Stri
 
 /// A stand-in agent that, once it has started, runs the program `script` writes (given the context,
 /// the case's own program that leaves a mark, and the case's scratch directory outside the run);
-/// `changed` then asserts that the program did its change; the host is asked to start the agent
+/// with `forge` the run holds the forging launcher where the worker gives the shell its launcher,
+/// with the real one beside it; `changed` then asserts that the program did its change; the host is asked to start the agent
 /// again, as a line typed again is. Returns the text the second start ended in, and whether the
 /// case's program ever ran. The first start is the control: it went through the same checks over
 /// the run as it was placed.
 fn an_agent_leaves_a_change_and_is_started_again(
+    forge: bool,
     script: &dyn Fn(&Context, &Path, &Path) -> String,
     changed: &dyn Fn(&Context, &Path),
 ) -> (String, bool) {
@@ -5358,6 +5364,7 @@ fn an_agent_leaves_a_change_and_is_started_again(
         Run::start("gateway-replaces"),
         runtime(),
     );
+    ctx.forge = forge;
     ctx.place();
     let leave = scratch.join("leave.sh");
     std::fs::write(&leave, script(&ctx, &program, &scratch))
@@ -5366,10 +5373,16 @@ fn an_agent_leaves_a_change_and_is_started_again(
         std::fs::set_permissions(file, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("executable");
     }
+    let mut more = vec![("STAND_IN_LEAVE", leave.display().to_string())];
+    if forge {
+        // The root every path the forging launcher reads must lie below.
+        let root = std::fs::canonicalize(ctx.run.root()).expect("the run's directory");
+        more.push(("KALAREACH_E2E_FORGE_ROOT", root.display().to_string()));
+    }
     let session = Session::open_with(
         &ctx,
         "answer-when-released,keep-reading,stay,leave-a-host",
-        &[("STAND_IN_LEAVE", leave.display().to_string())],
+        &more,
     );
     let first = session.starts_the_agent(&[], None, &[]);
     changed(&ctx, &scratch);
@@ -5391,7 +5404,7 @@ fn an_agent_leaves_a_change_and_is_started_again(
 /// the start is refused before the line is typed.
 #[test]
 fn gateway_a_launcher_the_agent_replaced_is_not_run_by_the_next_start() {
-    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("b/kr-hook");
+    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("b/kr-hook", false);
     if said.is_empty() {
         return;
     }
@@ -5402,11 +5415,28 @@ fn gateway_a_launcher_the_agent_replaced_is_not_run_by_the_next_start() {
     assert!(!ran, "the program the replaced launcher names ran");
 }
 
+/// The real launcher that sits beside the forging one, replaced by a link after the first start, is
+/// not run by the next start either: the forging launcher runs it in place, so a replaced file there
+/// would run the program the link names. The start is refused before the line is typed.
+#[test]
+fn gateway_a_real_launcher_the_agent_replaced_beside_the_forging_one_is_not_run_by_the_next_start()
+{
+    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("b/h/kr-hook", true);
+    if said.is_empty() {
+        return;
+    }
+    assert!(
+        said.contains(ISOLATION_UNPROVEN) && said.contains("symbolic link"),
+        "the next start was refused as a replaced file: {said}"
+    );
+    assert!(!ran, "the program the replaced real launcher names ran");
+}
+
 /// The stand-in the shell finds by name, replaced by a link after the first start, is not run by the
 /// next start either.
 #[test]
 fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
-    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("t/codex");
+    let (said, ran) = an_agent_replaces_a_placed_file_and_is_started_again("t/codex", false);
     if said.is_empty() {
         return;
     }
@@ -5424,6 +5454,7 @@ fn gateway_a_stand_in_the_agent_replaced_is_not_run_by_the_next_start() {
 #[test]
 fn gateway_a_work_directory_the_agent_moved_out_of_the_run_is_not_started_in_by_the_next_start() {
     let (said, _) = an_agent_leaves_a_change_and_is_started_again(
+        false,
         &|ctx, _, scratch| {
             let work = ctx.run.work();
             format!(
