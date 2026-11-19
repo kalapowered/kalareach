@@ -66,6 +66,12 @@ pub const ARRIVALS: &[Arrival] = &[
         sdk_version: "0.1.8",
         carried_by: |table| table.get("hook_events").is_some(),
     },
+    Arrival {
+        definition: "ConnectorManifest",
+        member: "placement",
+        sdk_version: "0.1.9",
+        carried_by: |table| table.get("placement").is_some(),
+    },
 ];
 
 /// The table as the package contract carries it.

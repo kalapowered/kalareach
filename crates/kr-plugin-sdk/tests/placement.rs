@@ -1,0 +1,578 @@
+//! A package declares where its bridge's files are placed. These cases state the member in the
+//! connector table of a whole package directory and run the package check every host, publisher
+//! and pipeline runs, and check the placement type and its engine directly.
+
+use std::path::{Path, PathBuf};
+
+use kr_plugin_sdk::digest::PayloadDigest;
+use kr_plugin_sdk::placement::{Placement, PlacementRefusal, Shape};
+use kr_plugin_sdk::schema::package_contract;
+use kr_plugin_sdk::validate::{FindingCode, Validated, validate_package_directory};
+use kr_plugin_sdk::version::SDK_VERSION;
+use serde_json::{Value, json};
+
+const CLAUDE_FIXTURE: &str = include_str!("fixtures/placement_claude_code.json");
+const GEMINI_FIXTURE: &str = include_str!("fixtures/placement_gemini_cli.json");
+
+fn bundled(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../bundled-plugins/targets/packages/kalareach")
+        .join(name)
+        .join("0.5.0")
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("a directory");
+    for entry in std::fs::read_dir(from).expect("lists") {
+        let entry = entry.expect("an entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("a type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copies");
+        }
+    }
+}
+
+/// The bundled Gemini CLI package under a fresh directory, with `sdk_range` as its range and
+/// `table` applied to its connector table, its payload record brought up to the changed file.
+fn gemini_package(sdk_range: &str, table: impl FnOnce(&mut Value)) -> Validated {
+    let home = tempfile::tempdir().expect("a directory");
+    let directory = home.path().join("package");
+    copy_tree(&bundled("gemini-cli"), &directory);
+    let manifest_path = directory.join("plugin.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("reads")).expect("JSON");
+    manifest["sdk_range"] = json!(sdk_range);
+    let path = directory.join("connector.json");
+    let mut connector: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("reads")).expect("JSON");
+    table(&mut connector);
+    let bytes = serde_json::to_vec_pretty(&connector).expect("writes");
+    std::fs::write(&path, &bytes).expect("writes");
+    let record = manifest["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .iter_mut()
+        .find(|payload| payload["path"] == "connector.json")
+        .expect("the connector payload");
+    record["digest"] = json!(PayloadDigest::of(&bytes).to_string());
+    record["size_bytes"] = json!(bytes.len().to_string());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("writes"),
+    )
+    .expect("writes");
+    validate_package_directory(&directory)
+}
+
+fn claude() -> Value {
+    serde_json::from_str(CLAUDE_FIXTURE).expect("the fixture is JSON")
+}
+
+fn gemini() -> Value {
+    serde_json::from_str(GEMINI_FIXTURE).expect("the fixture is JSON")
+}
+
+fn placement(value: &Value) -> Placement {
+    serde_json::from_value(value.clone()).expect("a placement")
+}
+
+fn refused(placement: &Placement, refusal: PlacementRefusal) {
+    assert!(
+        placement
+            .refusals()
+            .iter()
+            .any(|found| found.refusal == refusal),
+        "{} is not among {:?}",
+        refusal.name(),
+        placement.refusals()
+    );
+}
+
+fn refused_with(edit: impl FnOnce(&mut Value), refusal: PlacementRefusal) {
+    let mut table = claude();
+    edit(&mut table);
+    refused(&placement(&table), refusal);
+}
+
+fn stated_by_package(placement: &Value) -> Validated {
+    gemini_package(">=0.1.9, <0.2.0", |table| {
+        table["placement"] = placement.clone();
+    })
+}
+
+#[test]
+fn a_package_may_declare_the_gemini_cli_placement_and_the_check_accepts_it() {
+    let validated = stated_by_package(&gemini());
+    assert!(
+        validated.report.is_valid(),
+        "{:?}",
+        validated.report.findings
+    );
+    assert!(validated.package.is_some_and(|package| {
+        package
+            .connector
+            .is_some_and(|table| table.placement.is_some())
+    }));
+}
+
+#[test]
+fn the_default_placements_equal_the_fixtures_a_package_may_copy() {
+    assert_eq!(
+        serde_json::to_value(Placement::claude_code()).unwrap(),
+        claude()
+    );
+    assert_eq!(
+        serde_json::to_value(Placement::gemini_cli()).unwrap(),
+        gemini()
+    );
+    assert!(Placement::claude_code().refusals().is_empty());
+    assert!(Placement::gemini_cli().refusals().is_empty());
+    assert_eq!(Placement::for_label("Quill CLI"), None);
+}
+
+#[test]
+fn a_placement_directory_with_a_parent_component_is_refused_by_name() {
+    refused_with(
+        |table| table["directory"] = json!(["..", ".claude"]),
+        PlacementRefusal::DirectoryNotPlain,
+    );
+    refused_with(
+        |table| table["directory"] = json!([".claude", "."]),
+        PlacementRefusal::DirectoryNotPlain,
+    );
+}
+
+#[test]
+fn a_placement_directory_that_is_absolute_is_refused_by_name() {
+    refused_with(
+        |table| table["directory"] = json!(["/etc"]),
+        PlacementRefusal::DirectoryNotPlain,
+    );
+    refused_with(
+        |table| table["directory"] = json!(["C:"]),
+        PlacementRefusal::DirectoryNotPlain,
+    );
+}
+
+#[test]
+fn a_placement_directory_with_a_separator_is_refused_by_name() {
+    refused_with(
+        |table| table["directory"] = json!([".claude/skills"]),
+        PlacementRefusal::DirectoryNotPlain,
+    );
+    refused_with(
+        |table| table["directory"] = json!(["a\\b"]),
+        PlacementRefusal::DirectoryNotPlain,
+    );
+    refused_with(
+        |table| table["directory"] = json!([""]),
+        PlacementRefusal::DirectoryNotPlain,
+    );
+}
+
+#[test]
+fn a_placement_directory_deeper_than_three_is_refused_by_name() {
+    refused_with(
+        |table| table["directory"] = json!(["a", "b", "c", "d"]),
+        PlacementRefusal::DirectoryTooDeep,
+    );
+    refused_with(
+        |table| table["directory"] = json!([]),
+        PlacementRefusal::DirectoryTooDeep,
+    );
+}
+
+#[test]
+fn a_placement_whose_label_names_a_default_must_declare_its_directory() {
+    let mut elsewhere = claude();
+    elsewhere["directory"] = json!([".claude-elsewhere"]);
+    let elsewhere = placement(&elsewhere);
+    assert!(
+        elsewhere
+            .refusals_for_label("Claude Code")
+            .iter()
+            .any(|found| found.refusal == PlacementRefusal::DirectoryNotTheLabels)
+    );
+    let mut area = claude();
+    area["area"] = json!("plugins");
+    assert!(
+        placement(&area)
+            .refusals_for_label("Claude Code")
+            .iter()
+            .any(|found| found.refusal == PlacementRefusal::DirectoryNotTheLabels)
+    );
+    let mut unchecked = claude();
+    unchecked.as_object_mut().unwrap().remove("one_per_name");
+    assert!(
+        placement(&unchecked)
+            .refusals_for_label("Claude Code")
+            .iter()
+            .any(|found| found.refusal == PlacementRefusal::DirectoryNotTheLabels)
+    );
+    assert!(
+        Placement::claude_code()
+            .refusals_for_label("Claude Code")
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_placement_in_a_compiled_directory_must_be_under_that_label() {
+    let own = Placement::claude_code();
+    let found = own.refusals_for_label("Quill CLI");
+    assert!(
+        found
+            .iter()
+            .any(|found| found.refusal == PlacementRefusal::DirectoryNotTheLabels),
+        "{found:?}"
+    );
+    let mut quill = claude();
+    quill["directory"] = json!([".quill"]);
+    assert!(placement(&quill).refusals_for_label("Quill CLI").is_empty());
+}
+
+#[test]
+fn a_placement_tail_that_is_not_plain_is_refused_by_name() {
+    for tail in [
+        "../x.json",
+        "/x.json",
+        "a/b/c/d.json",
+        "a\\b.json",
+        "",
+        "a//b.json",
+    ] {
+        refused_with(
+            |table| table["files"][0]["tail"] = json!(tail),
+            PlacementRefusal::TailNotPlain,
+        );
+    }
+}
+
+#[test]
+fn a_placement_with_a_repeated_tail_is_refused_by_name() {
+    refused_with(
+        |table| table["files"][1]["tail"] = json!(".claude-plugin/plugin.json"),
+        PlacementRefusal::TailDuplicate,
+    );
+}
+
+#[test]
+fn a_placement_with_no_file_or_nine_files_is_refused_by_name() {
+    refused_with(|table| table["files"] = json!([]), PlacementRefusal::NoFile);
+    refused_with(
+        |table| {
+            let file = table["files"][2].clone();
+            let mut files = Vec::new();
+            for number in 0..9 {
+                let mut next = file.clone();
+                next["tail"] = json!(format!("hooks/{number}.json"));
+                files.push(next);
+            }
+            table["files"] = json!(files);
+        },
+        PlacementRefusal::NoFile,
+    );
+}
+
+#[test]
+fn a_placement_shape_deeper_than_eight_is_refused_by_name() {
+    refused_with(
+        |table| {
+            let mut shape = json!({ "kind": "boolean" });
+            for _ in 0..9 {
+                shape = json!({ "kind": "array", "items": shape });
+            }
+            table["files"][0]["shape"] = shape;
+        },
+        PlacementRefusal::ShapeTooDeep,
+    );
+}
+
+#[test]
+fn a_placement_with_a_command_form_and_no_command_kind_is_refused_by_name() {
+    refused_with(
+        |table| {
+            table["files"] = json!([{
+                "tail": ".claude-plugin/plugin.json",
+                "shape": table["files"][0]["shape"],
+            }]);
+        },
+        PlacementRefusal::ShapeHasNoCommand,
+    );
+}
+
+#[test]
+fn a_placement_with_a_repeated_shape_member_is_refused_by_name() {
+    refused_with(
+        |table| {
+            let members = table["files"][0]["shape"]["members"]
+                .as_array_mut()
+                .unwrap();
+            let again = members[0].clone();
+            members.push(again);
+        },
+        PlacementRefusal::ShapeMemberDuplicate,
+    );
+}
+
+#[test]
+fn a_placement_with_text_that_names_a_place_is_refused_by_name() {
+    for text in ["/etc/passwd", "a\\b", "c:", "~", "$HOME", "`id`", ".", ".."] {
+        refused_with(
+            |table| {
+                table["files"][0]["shape"]["members"][1]["shape"] =
+                    json!({ "kind": "exact", "value": text });
+            },
+            PlacementRefusal::TextNamesAPlace,
+        );
+        refused_with(
+            |table| table["files"][0]["shape"]["members"][1]["name"] = json!(text),
+            PlacementRefusal::TextNamesAPlace,
+        );
+    }
+}
+
+#[test]
+fn a_name_check_that_names_no_manifest_with_a_directory_name_is_refused_by_name() {
+    refused_with(
+        |table| table["one_per_name"]["manifest"] = json!("hooks/hooks.json"),
+        PlacementRefusal::NameCheckBad,
+    );
+}
+
+#[test]
+fn a_placement_that_declares_an_enabling_key_a_last_file_or_a_path_prefix_is_refused_as_an_unknown_member()
+ {
+    for (member, value) in [
+        (
+            "enabling",
+            json!(["settings.json", "enabledPlugins.", "@skills-dir"]),
+        ),
+        ("last", json!(".gemini-extension-install.json")),
+    ] {
+        let mut table = claude();
+        table[member] = value;
+        assert!(
+            serde_json::from_value::<Placement>(table.clone()).is_err(),
+            "{member} is an unknown member"
+        );
+        let validated = stated_by_package(&table);
+        assert!(!validated.report.is_valid());
+    }
+    let mut prefix = gemini();
+    prefix["files"][0]["shape"]["members"][1]["shape"] =
+        json!({ "kind": "record_path", "prefix": "/dev/null/" });
+    assert!(serde_json::from_value::<Placement>(prefix).is_err());
+}
+
+#[test]
+fn a_placement_over_sixteen_kib_is_refused_by_name() {
+    refused_with(
+        |table| {
+            let members: Vec<Value> = (0..400)
+                .map(|number| {
+                    json!({
+                        "name": format!("member{number:04}xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+                        "shape": { "kind": "boolean" },
+                    })
+                })
+                .collect();
+            table["files"][0]["shape"]["members"] = json!(members);
+        },
+        PlacementRefusal::TooLarge,
+    );
+}
+
+#[test]
+fn a_table_that_declares_a_placement_is_refused_by_the_package_check_by_name() {
+    let mut table = gemini();
+    table["directory"] = json!(["..", ".gemini"]);
+    let validated = stated_by_package(&table);
+    assert!(validated.report.findings.iter().any(|finding| {
+        finding.code == FindingCode::ConnectorTableInvalid
+            && finding
+                .detail
+                .contains(PlacementRefusal::DirectoryNotPlain.name())
+    }));
+    let mut elsewhere = gemini();
+    elsewhere["directory"] = json!([".gemini-elsewhere"]);
+    let validated = stated_by_package(&elsewhere);
+    assert!(validated.report.findings.iter().any(|finding| {
+        finding.code == FindingCode::ConnectorTableInvalid
+            && finding
+                .detail
+                .contains(PlacementRefusal::DirectoryNotTheLabels.name())
+    }));
+}
+
+#[test]
+fn the_arrival_table_lists_placement_at_the_sdk_version() {
+    assert_eq!(SDK_VERSION, "0.1.9");
+    let contract = package_contract();
+    let listed: Vec<&Value> = contract["arrivals"]
+        .as_array()
+        .expect("a table")
+        .iter()
+        .filter(|entry| entry["member"] == "placement")
+        .collect();
+    assert_eq!(
+        listed,
+        [&json!({
+            "definition": "ConnectorManifest",
+            "member": "placement",
+            "sdk_version": "0.1.9",
+        })]
+    );
+}
+
+#[test]
+fn a_package_that_uses_placement_needs_an_sdk_range_from_its_arrival() {
+    let refused = gemini_package(">=0.1.8, <0.2.0", |table| {
+        table["placement"] = gemini();
+    });
+    assert!(
+        refused.report.findings.iter().any(|finding| {
+            finding.code == FindingCode::ConnectorTableInvalid && finding.detail.contains("0.1.9")
+        }),
+        "{:?}",
+        refused.report.findings
+    );
+    let accepted = gemini_package(">=0.1.9, <0.2.0", |table| {
+        table["placement"] = gemini();
+    });
+    assert!(accepted.report.is_valid(), "{:?}", accepted.report.findings);
+}
+
+#[test]
+fn the_two_connector_tables_keep_their_bytes_with_no_placement() {
+    for name in ["gemini-cli", "claude-code"] {
+        let bytes = std::fs::read(bundled(name).join("connector.json")).expect("reads");
+        let table: kr_plugin_sdk::connector::ConnectorManifest =
+            serde_json::from_slice(&bytes).expect("a table");
+        assert!(table.placement.is_none());
+        let written = serde_json::to_value(&table).expect("writes");
+        assert_eq!(written, serde_json::from_slice::<Value>(&bytes).unwrap());
+        assert!(written.get("placement").is_none());
+    }
+}
+
+/// The six registration files the bundled packages install, each read under its default
+/// placement for the folder the package installs into.
+fn bundled_files(name: &str, label: &str) -> Vec<(String, Value)> {
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(bundled(name).join("plugin.json")).unwrap()).unwrap();
+    assert_eq!(manifest["native_bridge"]["application"], label);
+    manifest["native_bridge"]["install"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|step| step["type"] == "install_file")
+        .map(|step| {
+            let destination = step["destination"].as_str().unwrap();
+            let bytes =
+                std::fs::read(bundled(name).join(step["source"].as_str().unwrap())).unwrap();
+            (
+                destination.to_owned(),
+                serde_json::from_slice(&bytes).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn the_default_placements_accept_the_bundled_registration_files() {
+    for (name, label) in [("claude-code", "Claude Code"), ("gemini-cli", "Gemini CLI")] {
+        let placement = Placement::for_label(label).expect("a default");
+        let files = bundled_files(name, label);
+        assert_eq!(files.len(), 3);
+        for (destination, value) in files {
+            let rest = destination
+                .strip_prefix(&format!("{}/", placement.area))
+                .unwrap();
+            let (folder, tail) = rest.split_once('/').unwrap();
+            placement
+                .check_file(tail, folder, &value)
+                .unwrap_or_else(|why| panic!("{destination}: {why}"));
+        }
+    }
+}
+
+#[test]
+fn a_registration_string_that_names_a_place_is_refused_whatever_the_shape() {
+    let placement = Placement::gemini_cli();
+    let (_, hooks) = bundled_files("gemini-cli", "Gemini CLI")
+        .into_iter()
+        .find(|(destination, _)| destination.ends_with("hooks/hooks.json"))
+        .unwrap();
+    let handler = |value: &Value| value["hooks"]["SessionStart"][0]["hooks"][0].clone();
+    assert!(handler(&hooks).is_object());
+    for text in ["/", "\\", ":", "~", "$", "`", ".", ".."] {
+        let mut in_a_value = hooks.clone();
+        in_a_value["hooks"]["SessionStart"][0]["matcher"] = json!(format!("a{text}b"));
+        let mut in_a_name = hooks.clone();
+        in_a_name["hooks"]["SessionStart"][0]["hooks"][0]["name"] = json!(format!("a{text}b"));
+        let mut in_a_key = hooks.clone();
+        let events = in_a_key["hooks"].as_object_mut().unwrap();
+        let group = events.remove("SessionStart").unwrap();
+        events.insert(format!("Event{text}"), group);
+        let mut lone = hooks.clone();
+        lone["hooks"]["SessionStart"][0]["matcher"] = json!(text);
+        let mut cases = vec![in_a_value, in_a_name, in_a_key];
+        if text == "." || text == ".." {
+            cases = vec![lone];
+        }
+        for value in cases {
+            assert!(
+                placement
+                    .check_file("hooks/hooks.json", "kalareach", &value)
+                    .is_err(),
+                "{text:?} passed in {value}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_string_like_a_dot_in_a_longer_name_is_not_a_place() {
+    let placement = Placement::gemini_cli();
+    let (_, hooks) = bundled_files("gemini-cli", "Gemini CLI")
+        .into_iter()
+        .find(|(destination, _)| destination.ends_with("hooks/hooks.json"))
+        .unwrap();
+    let mut value = hooks;
+    value["hooks"]["SessionStart"][0]["matcher"] = json!(".*");
+    placement
+        .check_file("hooks/hooks.json", "kalareach", &value)
+        .expect("a pattern with a dot in it is not a lone dot");
+}
+
+#[test]
+fn the_record_path_is_the_one_text_the_walk_lets_through() {
+    let placement = Placement::gemini_cli();
+    let record = json!({ "type": "local", "source": "/dev/null/kalareach" });
+    placement
+        .check_file(".gemini-extension-install.json", "kalareach", &record)
+        .expect("the record path");
+    let other = json!({ "type": "local", "source": "/dev/null/other" });
+    assert!(
+        placement
+            .check_file(".gemini-extension-install.json", "kalareach", &other)
+            .is_err()
+    );
+    let (_, mut manifest) = bundled_files("gemini-cli", "Gemini CLI")
+        .into_iter()
+        .find(|(destination, _)| destination.ends_with("gemini-extension.json"))
+        .unwrap();
+    manifest["description"] = json!("/dev/null/kalareach");
+    assert!(
+        placement
+            .check_file("gemini-extension.json", "kalareach", &manifest)
+            .is_err()
+    );
+    assert!(matches!(
+        placement.shape_of(".gemini-extension-install.json"),
+        Some(shape @ Shape::Object { .. }) if shape.holds_record_path()
+    ));
+}

@@ -112,6 +112,7 @@ pub mod limits;
 pub mod matching;
 pub mod package;
 pub mod paths;
+pub mod placement;
 pub mod plugin;
 pub mod predicate;
 pub mod presentation;

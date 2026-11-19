@@ -1,0 +1,105 @@
+{
+  "directory": [
+    ".gemini"
+  ],
+  "area": "extensions",
+  "files": [
+    {
+      "tail": ".gemini-extension-install.json",
+      "shape": {
+        "kind": "object",
+        "members": [
+          {
+            "name": "type",
+            "required": true,
+            "shape": {
+              "kind": "exact",
+              "value": "local"
+            }
+          },
+          {
+            "name": "source",
+            "required": true,
+            "shape": {
+              "kind": "record_path"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "tail": "gemini-extension.json",
+      "shape": {
+        "kind": "object",
+        "members": [
+          {
+            "name": "name",
+            "required": true,
+            "shape": {
+              "kind": "directory_name"
+            }
+          },
+          {
+            "name": "version",
+            "shape": {
+              "kind": "text",
+              "max_bytes": 4096
+            }
+          },
+          {
+            "name": "description",
+            "shape": {
+              "kind": "text",
+              "max_bytes": 4096
+            }
+          }
+        ]
+      }
+    },
+    {
+      "tail": "hooks/hooks.json",
+      "shape": {
+        "kind": "object",
+        "members": [
+          {
+            "name": "hooks",
+            "required": true,
+            "shape": {
+              "kind": "map",
+              "values": {
+                "kind": "array",
+                "items": {
+                  "kind": "object",
+                  "members": [
+                    {
+                      "name": "matcher",
+                      "shape": {
+                        "kind": "text",
+                        "max_bytes": 4096
+                      }
+                    },
+                    {
+                      "name": "hooks",
+                      "required": true,
+                      "shape": {
+                        "kind": "array",
+                        "items": {
+                          "kind": "command_handler"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "command_form": "line",
+  "one_per_name": {
+    "manifest": "gemini-extension.json",
+    "skips_hidden": false
+  }
+}
