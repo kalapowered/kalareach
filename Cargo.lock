@@ -5299,6 +5299,7 @@ dependencies = [
  "kr-protocol",
  "kr-test-artifacts",
  "kr-transport",
+ "netwatch",
  "rcgen",
  "reqwest",
  "rustls-pki-types",
