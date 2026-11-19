@@ -56,6 +56,7 @@ import {
   actionableApprovals,
   attachOffer,
   bindingStateOf,
+  composerInstance,
   composerOffers,
   drawnUnder,
   invocationOf,
@@ -325,11 +326,12 @@ export function Conversation({
     () =>
       composerOffers({
         known: agent.instances !== null,
+        instance: composerInstance(agent.instances, agent.instance),
         binding: agent.binding,
         capabilities: agent.capabilities,
         rights: rights === null ? null : new Set(rights)
       }),
-    [agent.instances, agent.binding, agent.capabilities, rights]
+    [agent.instances, agent.instance, agent.binding, agent.capabilities, rights]
   )
   // A file needs the host on this computer and the rights, and nothing of the agent.
   const fileOffer = useMemo(

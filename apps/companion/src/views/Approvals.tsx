@@ -197,6 +197,7 @@ export function ApprovalRequests({
         const decoding = inspection.decoding
         const offer = composerOffers({
           known: true,
+          instance: null,
           binding: facts.binding,
           capabilities: capabilityRecords(facts.capabilities.records),
           rights: rights === null ? null : new Set(rights)

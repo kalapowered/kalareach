@@ -101,6 +101,19 @@ export function drawnUnder(
 }
 
 /**
+ * Why nothing that needs a package can be asked of an agent no package is bound to.
+ *
+ * The host adopts an agent that two or more packages recognise equally well bound to none of them,
+ * and says why in the instance's refusal: those are its words to show, as it wrote them. An
+ * instance with no package and no refusal was recognised by none.
+ */
+export function unboundBecause(instance: AgentInstanceSummary): string {
+  return instance.refusal === null
+    ? 'No package recognised this agent.'
+    : `No package is bound to this agent. The host says ${instance.refusal}.`
+}
+
+/**
  * Builds the call a control makes, from what this view has read of the session's agent.
  *
  * The call names the package that recognised the agent, the control's registered action, and the
@@ -146,15 +159,7 @@ export function invocationOf(
     }
   }
   if (instance.plugin_id === null) {
-    // The host adopts an agent that two packages recognise equally well bound to neither, and says
-    // why in the instance's refusal: those are its words to show, as it wrote them.
-    return {
-      kind: 'cannot',
-      because:
-        instance.refusal === null
-          ? 'No package recognised this agent.'
-          : `No package is bound to this agent. The host says ${instance.refusal}.`
-    }
+    return { kind: 'cannot', because: unboundBecause(instance) }
   }
   if (input !== null) {
     return { kind: 'cannot', because: input }
@@ -290,6 +295,14 @@ export interface Offer {
   readonly reason: string | null
 }
 
+/** The instance the composer speaks to, as the session's instances list it, or null. */
+export function composerInstance(
+  instances: readonly AgentInstanceSummary[] | null,
+  id: string | null
+): AgentInstanceSummary | null {
+  return instances?.find((each) => each.application_instance_id === id) ?? null
+}
+
 /** What the composer offers for the live instance. */
 export type ComposerOffers = Readonly<Record<keyof typeof COMPOSER_CAPABILITIES, Offer>>
 
@@ -297,6 +310,8 @@ export type ComposerOffers = Readonly<Record<keyof typeof COMPOSER_CAPABILITIES,
 export interface ComposerFacts {
   /** Whether the session's agent has been read at all. */
   readonly known: boolean
+  /** The live instance the composer speaks to, or null where none was read or none is live. */
+  readonly instance: AgentInstanceSummary | null
   /** The binding in force, or null before one has been read or when no agent is live. */
   readonly binding: AgentBindingState | null
   /** The instance's capability records, or null before they have been read. */
@@ -311,19 +326,24 @@ const OFFERED: Offer = { offered: true, reason: null }
  * What the composer offers, action by action.
  *
  * An action is offered only when its capability is usable now, this device holds the right it
- * needs, and the binding is one the host has verified. Steering and interrupting also need a turn
- * to be running, since each names that turn. A fact nobody has told this device is not a fact it
+ * needs, and the binding is one the host has verified. An instance that no package is bound to
+ * offers nothing, and says why in the host's words. Steering and interrupting also need a turn to
+ * be running, since each names that turn. A fact nobody has told this device is not a fact it
  * guesses: until the capability records are read and the connection has said what it may do,
  * nothing is offered.
  */
 export function composerOffers({
   known,
+  instance,
   binding,
   capabilities,
   rights
 }: ComposerFacts): ComposerOffers {
   const offer = (action: keyof typeof COMPOSER_CAPABILITIES): Offer => {
     if (!known) return { offered: false, reason: 'Reading this session’s agent…' }
+    if (instance !== null && instance.plugin_id === null) {
+      return { offered: false, reason: unboundBecause(instance) }
+    }
     if (binding === null) return { offered: false, reason: 'No agent is running in this session.' }
     if (binding.rich_mutations_suspended) {
       return {

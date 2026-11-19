@@ -171,6 +171,7 @@ function cancellationFrom(
   if (read.binding.turn_id === null) return { turn: null, because: NO_TURN_WORDS }
   const offer = composerOffers({
     known: true,
+    instance: null,
     binding: read.binding,
     capabilities: read.capabilities,
     rights: rights === null ? null : new Set(rights)
