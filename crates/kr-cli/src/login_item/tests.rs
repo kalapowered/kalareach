@@ -20,8 +20,8 @@ const OLD: &str = "old bytes\n";
 const NEW: &str = "new bytes\n";
 
 struct Tree {
-    dir: PrivateTempDir,
     kind: Kind,
+    dir: PrivateTempDir,
 }
 
 impl Tree {
