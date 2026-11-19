@@ -586,6 +586,51 @@ async fn one_connection_carries_one_session() {
     serving.abort();
 }
 
+/// KR-REQ-11.44: the transport a client dials reports whether its host states that it writes the
+/// placement reading under its own label, read from the capabilities the host selected in its
+/// hello: a host built as this release builds one selects it, and a host whose hello offers none
+/// does not, so a device takes the label in a statement for the host's only from the first.
+#[tokio::test]
+async fn a_dialled_transport_reports_whether_the_host_states_the_placement_reading() {
+    use kr_client::transport::ControlTransport as _;
+    let client = side(2, false).await;
+    let current = side(1, true).await;
+    let mut previous = side(3, true).await;
+    Arc::get_mut(&mut previous.identity)
+        .expect("a new identity has one owner")
+        .capabilities = std::iter::empty().collect();
+    let serving = [
+        spawn_host(
+            &current,
+            client.record,
+            Arc::new(HostScript::default()),
+            None,
+        ),
+        spawn_host(
+            &previous,
+            client.record,
+            Arc::new(HostScript::default()),
+            None,
+        ),
+    ];
+
+    assert!(
+        dial(&client, &current)
+            .await
+            .host_states_placement_reading(),
+        "the host selected the capability"
+    );
+    assert!(
+        !dial(&client, &previous)
+            .await
+            .host_states_placement_reading(),
+        "the host selected none"
+    );
+    for task in serving {
+        task.abort();
+    }
+}
+
 #[tokio::test]
 async fn a_read_returns_a_typed_result_and_a_mutation_returns_what_settled_it() {
     let host = side(1, true).await;
