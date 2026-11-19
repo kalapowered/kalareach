@@ -620,6 +620,28 @@ impl Shared {
             .is_some_and(|paired| pairing_holds(paired, entry) == Some(false))
     }
 
+    /// Whether the start entry `entry` is left out of what a person is shown and of what a refusal
+    /// can name: the start entries of a host that the pairings cannot tell about wait until the
+    /// check of the record is applied.
+    fn awaits_the_pairing_check(&self, entry: &OwedView) -> bool {
+        !self
+            .pairings_applied
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self
+                .pairings
+                .get()
+                .is_some_and(|paired| pairing_holds(paired, entry) != Some(true))
+    }
+
+    /// Takes out of `owed` what the page is never shown: what has lapsed, a start that is only
+    /// kept, and a start whose pairing is not told yet.
+    fn keep_what_is_shown(&self, owed: &mut Vec<OwedView>) {
+        let now = now_ms();
+        owed.retain(|each| {
+            each.until_ms > now && !each.is_hidden_start() && !self.awaits_the_pairing_check(each)
+        });
+    }
+
     /// Takes up what the file holds, if it can be read now. `None` while it cannot, and otherwise
     /// whether anything was owed or noted since the read that failed. Called with `keeping` held.
     fn take_up_unread(&self) -> Option<bool> {
@@ -735,11 +757,11 @@ impl Shared {
     ) -> std::result::Result<(), &'static str> {
         self.read_again();
         let view = self.view.lock().expect("the view lock is not poisoned");
-        match view
-            .owed
-            .iter()
-            .find(|each| each.is_start() && each.action_id.as_deref() == Some(action_id))
-        {
+        match view.owed.iter().find(|each| {
+            each.is_start()
+                && each.action_id.as_deref() == Some(action_id)
+                && !self.awaits_the_pairing_check(each)
+        }) {
             None => Err(
                 "Nothing was sent. This device no longer keeps that earlier start, so \
                          this start cannot name it.",
@@ -765,7 +787,9 @@ impl Shared {
         for id in view
             .owed
             .iter()
-            .filter(|each| each.is_start() && each.host == Some(host))
+            .filter(|each| {
+                each.is_start() && each.host == Some(host) && !self.awaits_the_pairing_check(each)
+            })
             .filter_map(|each| each.action_id.as_deref())
             .filter(|id| Some(*id) != named.as_deref())
         {
@@ -1972,10 +1996,7 @@ impl Calls {
             .clone();
         state.setting_up = busy && !state.running;
         state.ending = state.setting_up && state.ending;
-        let now = now_ms();
-        state
-            .owed
-            .retain(|owed| owed.until_ms > now && !owed.is_hidden_start());
+        shared.keep_what_is_shown(&mut state.owed);
         let remembered = shared
             .note
             .lock()
@@ -2409,32 +2430,62 @@ mod tests {
         );
     }
 
-    /// A launch that cannot tell how a host is paired keeps the host's entries, and removes them
-    /// at the first use after it can tell; a host the device is still paired with keeps its own.
+    /// A launch that cannot tell how a host is paired keeps the host's entries in the file and
+    /// shows and names none of them until it can; a host it can tell about is shown meanwhile, and
+    /// the entries of a pairing that is gone are removed at the first use after every host can be
+    /// told.
     #[test]
-    fn a_launch_that_cannot_tell_whether_a_host_is_paired_keeps_its_entries_until_it_can() {
+    fn a_launch_that_cannot_tell_how_a_host_is_paired_shows_no_entry_of_that_host_until_it_can() {
         let directory = tempfile::tempdir().expect("a folder");
         two_hosts_left_a_start_each(directory.path());
         let calls = calls_in(directory.path());
         let answer = Arc::new(std::sync::atomic::AtomicU8::new(0));
         calls.know_pairings({
             let answer = Arc::clone(&answer);
-            move |paired| match answer.load(std::sync::atomic::Ordering::SeqCst) {
-                0 => PairedNow::Unknown,
-                _ => paired_except(host(1).0)(paired),
+            move |paired| match (
+                answer.load(std::sync::atomic::Ordering::SeqCst),
+                paired == host(1).0,
+            ) {
+                (0, _) | (1, true) => PairedNow::Unknown,
+                (1, false) => PairedNow::As(paired),
+                (_, true) => PairedNow::Not,
+                (_, false) => PairedNow::As(paired),
             }
         });
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
         assert_eq!(
             actions_shown(&calls),
-            vec!["one".to_owned(), "two".to_owned()],
-            "a host that cannot be told about keeps its entries"
+            Vec::<String>::new(),
+            "no host can be told about: nothing is shown"
+        );
+        assert_eq!(shared.start_named_in(host(1), "the start one", None), None);
+        assert!(shared.earlier_start("one", host(1)).is_err());
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNKNOWN, "one"), pair(START_UNKNOWN, "two")],
+            "nothing was told, so nothing was removed"
         );
 
         answer.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            actions_shown(&calls),
+            vec!["two".to_owned()],
+            "a host that can be told about is shown while another cannot be"
+        );
+        assert_eq!(shared.start_named_in(host(1), "the start one", None), None);
+        assert_eq!(
+            shared.start_named_in(host(2), "the start two", None),
+            Some("two".to_owned())
+        );
+        assert!(shared.earlier_start("one", host(1)).is_err());
+        assert!(shared.earlier_start("two", host(2)).is_ok());
+
+        answer.store(2, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(actions_shown(&calls), vec!["two".to_owned()]);
         assert_eq!(
             file_holds(directory.path()),
-            vec![pair(START_UNKNOWN, "two")]
+            vec![pair(START_UNKNOWN, "two")],
+            "the pairing that is gone is removed once every host can be told"
         );
     }
 
