@@ -2044,7 +2044,10 @@ impl TransferService {
     /// Returns [`TransferError::WrongEnvironment`] for another environment,
     /// [`TransferError::SessionEnded`] when the draft targets a session that has ended,
     /// [`TransferError::QuotaExceeded`] when `actor` already holds `open_limit` open drafts, or
-    /// [`TransferError::StoreUnavailable`] when the write fails.
+    /// [`TransferError::StoreUnavailable`] when the write fails, or when the draft names an
+    /// application and the journal still holds sessions of an earlier build that are not settled
+    /// ([`Noting::Owed`] or [`Noting::Held`]). A repeat of a create already performed is answered
+    /// before that refusal.
     pub fn draft_create(
         &self,
         actor: &ActorId,
