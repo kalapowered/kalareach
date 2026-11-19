@@ -280,22 +280,33 @@ fn a_backend_that_answers_a_byte_at_a_time_is_bounded_as_a_whole_and_the_real_la
 
 /// An endpoint whose queue of connections is full is waited for within the helper's bound, and the
 /// real launcher runs all the same: a connection that waits without end does not hold the launch.
+/// The queue is made as short as the system allows and filled by one connection that nothing
+/// accepts: on Linux the next connection then waits, which the case shows with a connection that
+/// does not wait before it runs the helper; macOS refuses it at once, so there the case shows only
+/// that the launcher runs.
 #[test]
 fn an_endpoint_whose_queue_is_full_is_bounded_and_the_real_launcher_runs() {
     let scene = Scene::new(false);
     let socket = scene.root.join("launch/sock");
-    // More connections than any queue holds, none of them accepted: the ones past the queue wait
-    // (or are refused, where the system refuses at once), and those threads end with the scene.
-    let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    for _ in 0..400 {
-        let (socket, held) = (socket.clone(), std::sync::Arc::clone(&held));
-        std::thread::spawn(move || {
-            if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) {
-                held.lock().expect("the held streams").push(stream);
-            }
-        });
+    rustix::net::listen(&scene.listener, 0).expect("the queue is made short");
+    let held = std::os::unix::net::UnixStream::connect(&socket).expect("the first connection");
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+        let control = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a socket");
+        let address = SocketAddrUnix::new(&socket).expect("the endpoint's address");
+        assert_eq!(
+            rustix::net::connect(&control, &address),
+            Err(rustix::io::Errno::AGAIN),
+            "a second connection to the endpoint waits: its queue is full"
+        );
     }
-    std::thread::sleep(std::time::Duration::from_millis(1500));
     let ran = scene.run_within(&scene.registration(), &LAUNCH, WITHIN);
     assert!(
         ran.is_some(),
@@ -305,6 +316,7 @@ fn an_endpoint_whose_queue_is_full_is_bounded_and_the_real_launcher_runs() {
     assert_eq!(code, 0, "{error}");
     assert!(error.contains("no answer"), "{error}");
     assert_eq!(out.trim(), "real:launch -- /bin/true true --flag");
+    drop(held);
 }
 
 /// The directory this test program's own build put its programs in, the real launcher among them.
