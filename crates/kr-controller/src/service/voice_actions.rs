@@ -2155,14 +2155,17 @@ mod a_start_hold_on_clocks_moved_by_hand {
         let controller_after = Arc::downgrade(&controller);
         drop(start);
         drop(controller);
-        let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-            while controller_after.upgrade().is_some() {
-                tokio::task::yield_now().await;
+        // The daemon's own tasks let go of their handles as they run, so the count is read up to a
+        // bound; what the closure holds is never let go of by them.
+        for _ in 0..5_000 {
+            if controller_after.strong_count() == 0 {
+                break;
             }
-        })
-        .await;
-        assert!(
-            stopped.is_ok(),
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            controller_after.strong_count(),
+            0,
             "the closure keeps the controller alive after its last handle was dropped"
         );
         closure(BrokerEffect::Closed);
