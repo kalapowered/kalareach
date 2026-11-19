@@ -3685,18 +3685,14 @@ fn only_a_run_that_sets_the_account_launchd_variable_to_one_asks_for_the_account
 #[test]
 fn a_run_that_did_not_ask_for_the_accounts_launchd_gets_no_host_and_runs_no_launchctl() {
     use std::ffi::OsStr;
-    use std::os::unix::fs::PermissionsExt as _;
 
     let tree = teardown::Tree::create();
     let calls = tree.root().join("launchctl-calls");
     let stand_in = tree.root().join("launchctl");
-    std::fs::write(
+    kr_ipc::testing::place_script(
         &stand_in,
         format!("#!/bin/sh\necho \"$@\" >> '{}'\n", calls.display()),
-    )
-    .expect("a stand-in for launchctl");
-    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755))
-        .expect("the stand-in can run");
+    );
     let control = bounded(Command::new(&stand_in), STREAMS_DEADLINE).expect("the stand-in runs");
     assert!(control.status.success(), "{control:?}");
     assert!(calls.exists(), "the stand-in does not record a call");
