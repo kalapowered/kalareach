@@ -2280,20 +2280,21 @@ mod one_snapshot_of_each_bound {
         let host = DeviceId::new(kr_ipc::new_uuid());
         let now = clock.now();
 
-        // The first lease ends earlier on the continuous clock and later in UTC; the second ends
-        // last on the continuous clock.
+        // The lease of the organisation visited first ends earlier on the continuous clock and
+        // later in UTC; the other ends last on the continuous clock. They are presented in the
+        // order of their readings, which the policy's floor never lets go back.
         let (policy, ends) = host_holding(
             &clock,
             host,
             &[
-                (0x41, NOW_MS + 100_000, NOW_MS + 300_000),
                 (0x42, NOW_MS, NOW_MS),
+                (0x41, NOW_MS + 100_000, NOW_MS + 300_000),
             ],
         );
-        assert!(ends[0].0 < ends[1].0 && ends[0].1 > ends[1].1, "{ends:?}");
+        assert!(ends[1].0 < ends[0].0 && ends[1].1 > ends[0].1, "{ends:?}");
         let expected = super::LocalOwnerBound::Until {
-            continuous: ends[1].0,
-            utc_ms: ends[1].1,
+            continuous: ends[0].0,
+            utc_ms: ends[0].1,
         };
         let now_ms = NOW_MS + 300_000;
         assert_eq!(policy.local_owner_bound(host, now, now_ms), expected);

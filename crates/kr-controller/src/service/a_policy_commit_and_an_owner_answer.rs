@@ -272,7 +272,7 @@ fn a_feed_raise_a_policy_commit_and_a_clock_establishment_do_not_wait_in_a_ring(
     let (done_tx, done) = mpsc::channel::<(&'static str, bool)>();
     let wait = |arrived: tokio::sync::oneshot::Receiver<()>, what: &str| {
         rig.runtime
-            .block_on(tokio::time::timeout(BOUND, arrived))
+            .block_on(async { tokio::time::timeout(BOUND, arrived).await })
             .unwrap_or_else(|_| panic!("{what}"))
             .unwrap_or_else(|_| panic!("{what}"));
     };
