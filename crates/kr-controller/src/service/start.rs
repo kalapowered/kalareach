@@ -31,6 +31,8 @@ use super::{Clocks, Controller, net};
 use super::BlockingPause;
 #[cfg(feature = "testing")]
 use super::DeregistrationHold;
+#[cfg(test)]
+use super::OnceStep;
 #[cfg(any(feature = "testing", test))]
 use super::ReadPause;
 #[cfg(feature = "testing")]
@@ -1332,6 +1334,10 @@ impl Controller {
             before_a_reservation_is_looked_up: ReadPause::default(),
             #[cfg(test)]
             before_a_voice_change_claims: ReadPause::default(),
+            #[cfg(test)]
+            before_a_voice_claim_settles: ReadPause::default(),
+            #[cfg(test)]
+            after_a_start_reads_its_first_moment: OnceStep::default(),
             #[cfg(test)]
             place_lookup_panics: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]

@@ -179,7 +179,9 @@ async fn ask_voice_given(
 
 /// The admission a voice mutation submitted in these cases carries: a connection this host
 /// admitted, the revision in force and a deadline five minutes out.
-async fn admitted_for_five_minutes(controller: &Controller) -> crate::authority::AdmittedMutation {
+pub(super) async fn admitted_for_five_minutes(
+    controller: &Controller,
+) -> crate::authority::AdmittedMutation {
     let accepted = AcceptedDeadline {
         deadline: controller
             .clock
@@ -192,7 +194,7 @@ async fn admitted_for_five_minutes(controller: &Controller) -> crate::authority:
 }
 
 /// A voice mutation submitted under `carried`, and where its answer came from.
-async fn submitted_under(
+pub(super) async fn submitted_under(
     controller: &Arc<Controller>,
     actor_id: &kr_protocol::ids::ActorId,
     device_id: kr_protocol::ids::DeviceId,
