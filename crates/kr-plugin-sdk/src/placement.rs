@@ -271,7 +271,8 @@ pub fn declared_in(table: &[u8], application: &str) -> Result<Option<Placement>,
 }
 
 /// True for a component of a directory, an area or a tail: one to 64 bytes of ASCII letters,
-/// digits, space, `.`, `_` and `-`, not `.` or `..`, and no space at either end.
+/// digits, space, `.`, `_` and `-`, not `.` or `..`, no space at either end, no dot at the end,
+/// and not a name Windows opens as a device ([`crate::paths::windows_device`]).
 #[must_use]
 pub fn is_plain_component(component: &str) -> bool {
     !component.is_empty()
@@ -280,6 +281,8 @@ pub fn is_plain_component(component: &str) -> bool {
         && component != ".."
         && !component.starts_with(' ')
         && !component.ends_with(' ')
+        && !component.ends_with('.')
+        && crate::paths::windows_device(component).is_none()
         && component
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'.' | b'_' | b'-'))

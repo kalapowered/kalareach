@@ -231,18 +231,29 @@ fn check_segment(segment: &str) -> Result<(), PathRejection> {
             segment: segment.to_owned(),
         });
     }
-    let stem = segment
-        .split('.')
-        .next()
-        .unwrap_or(segment)
-        .to_ascii_lowercase();
-    if WINDOWS_DEVICE_NAMES.contains(&stem.as_str()) {
+    if let Some(device) = windows_device(segment) {
         return Err(PathRejection::WindowsDevice {
             segment: segment.to_owned(),
-            device: stem,
+            device,
         });
     }
     Ok(())
+}
+
+/// The Windows device a name opens, in lower case, whatever folder it is in and whatever extension
+/// follows it: the part before the first dot, without the spaces Windows drops before that dot, is
+/// one of the device names.
+#[must_use]
+pub fn windows_device(name: &str) -> Option<String> {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(' ')
+        .to_ascii_lowercase();
+    WINDOWS_DEVICE_NAMES
+        .contains(&stem.as_str())
+        .then_some(stem)
 }
 
 /// Returns true when a character may appear in a package path segment.
