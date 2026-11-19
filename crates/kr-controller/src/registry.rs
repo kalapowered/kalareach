@@ -249,6 +249,10 @@ fn immutable_uri(path: &std::path::Path) -> Option<String> {
     Some(uri)
 }
 
+/// What [`Registry::take_in_its_log`] says when a reader keeps the log from being taken in.
+pub(crate) const LOG_BUSY: &str =
+    "this database's write-ahead log could not be taken in while another connection uses it";
+
 /// Opens a SQLite file to read it alone: no lock, no log, no shared memory, and nothing made
 /// beside it. Any store's file is read this way by an update that checks what a release reads; the
 /// caller holds the lock that keeps its writer out, and has taken in what a log held
@@ -549,10 +553,7 @@ impl Registry {
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
             .map_err(ControllerError::registry)?;
         if blocked != 0 {
-            return Err(refuse(
-                "this database's write-ahead log could not be taken in while another connection uses it"
-                    .to_owned(),
-            ));
+            return Err(refuse(LOG_BUSY.to_owned()));
         }
         Ok(true)
     }

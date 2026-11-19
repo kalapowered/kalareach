@@ -1476,7 +1476,13 @@ impl GrantDirectory {
                 named_by_damage = true;
             }
         }
-        if debt.is_none() && (named_by_damage || merged.reaches_every_connection) {
+        // A repair owes one fence whenever it removes or withdraws a row, even a proposal or a voice
+        // grant that the ordinary withdrawal's rules owe nothing for.
+        if debt.is_none()
+            && (named_by_damage
+                || merged.reaches_every_connection
+                || (disposal == Disposal::Remove && !merged.revoked.is_empty()))
+        {
             debt = Some(owe_within(connection, covers, now_ms)?);
         }
         merged.debt = debt;
@@ -4741,18 +4747,25 @@ pub(crate) struct Plan {
 }
 
 /// Walks `root` and everything below it, level by level, over the readable rows by their records'
-/// parent. A row an earlier walk took is not taken again, which also ends a walk that loops.
+/// parent. A row an earlier walk took is not taken again, which also ends a walk that loops, and the
+/// walk goes down at most `levels` levels, the number of readable rows.
 fn walk_below(
     below: &BTreeMap<GrantId, Vec<&GrantRecord>>,
     root: &GrantRecord,
     taken: &mut BTreeSet<GrantId>,
+    levels: usize,
 ) -> Vec<GrantRecord> {
     let mut rows = Vec::new();
     if !taken.insert(root.grant.grant_id) {
         return rows;
     }
     let mut level = vec![root];
-    while !level.is_empty() {
+    // Each level holds rows no earlier level held, so a walk is no deeper than the readable rows
+    // are many, whatever shape they have.
+    for _ in 0..levels {
+        if level.is_empty() {
+            break;
+        }
         let mut next = Vec::new();
         for record in level {
             rows.push(record.clone());
@@ -4827,7 +4840,7 @@ pub(crate) fn plan_withdrawal(scan: &Scan, roots: Roots, scope: Scope) -> Result
         Roots::None => {}
     }
     for root in named {
-        let rows = walk_below(&below, root, &mut taken);
+        let rows = walk_below(&below, root, &mut taken, scan.readable.len());
         if !rows.is_empty() {
             plan.subtrees.push(Subtree {
                 under: root.grant.grant_id,
@@ -4857,7 +4870,7 @@ pub(crate) fn plan_withdrawal(scan: &Scan, roots: Roots, scope: Scope) -> Result
     {
         let parent = record.grant.parent_grant_id.as_ref().copied();
         if parent.is_some_and(|parent| !unplaced.contains_key(&parent)) {
-            let rows = walk_below(&below, record, &mut taken);
+            let rows = walk_below(&below, record, &mut taken, scan.readable.len());
             if !rows.is_empty() {
                 plan.subtrees.push(Subtree {
                     under: parent.unwrap_or(record.grant.grant_id),
@@ -4872,7 +4885,7 @@ pub(crate) fn plan_withdrawal(scan: &Scan, roots: Roots, scope: Scope) -> Result
         .values()
         .find(|record| !taken.contains(&record.grant.grant_id))
     {
-        let rows = walk_below(&below, record, &mut taken);
+        let rows = walk_below(&below, record, &mut taken, scan.readable.len());
         plan.subtrees.push(Subtree {
             under: record.grant.grant_id,
             unplaced: true,
