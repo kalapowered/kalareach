@@ -882,30 +882,38 @@ fn a_failed_settling_says_what_it_was_doing() {
 }
 
 /// A name under something that is not a directory is not there: a removal of a file under such
-/// a parent finds nothing to move and drops the record.
+/// a parent finds nothing to move and drops the record. The parent is the item's own directory
+/// (which opens and syncs as a file) or the folder above it (which a flush cannot open under).
 #[test]
 fn a_file_under_a_parent_that_is_not_a_directory_is_gone_and_its_removal_finishes() {
-    let (tree, _) = Tree::published();
-    let directory = tree.directory();
-    std::fs::remove_file(tree.file()).expect("the file goes");
-    std::fs::remove_dir(&directory).expect("the directory goes");
-    std::fs::write(&directory, b"a file now\n").expect("a file in its place");
-    let mut run = tree.run("", tree.record());
-    let removed = steps::run_all(&mut run, &REMOVE);
-    assert!(
-        removed.is_ok(),
-        "the removal finishes: {}",
-        removed
-            .err()
-            .map(|error| error.said().as_str().to_owned())
-            .unwrap_or_default()
-    );
-    assert!(tree.record().is_none(), "the record is dropped");
-    assert_eq!(
-        bytes(&directory).as_deref(),
-        Some(&b"a file now\n"[..]),
-        "the file that stands where the directory was is left"
-    );
+    for (name, above) in [("its directory", false), ("the directory above it", true)] {
+        let (tree, _) = Tree::published();
+        let directory = tree.directory();
+        let folder = if above {
+            directory.parent().expect("a folder above").to_owned()
+        } else {
+            directory
+        };
+        std::fs::remove_file(tree.file()).expect("the file goes");
+        std::fs::remove_dir_all(&folder).expect("the directory goes");
+        std::fs::write(&folder, b"a file now\n").expect("a file in its place");
+        let mut run = tree.run("", tree.record());
+        let removed = steps::run_all(&mut run, &REMOVE);
+        assert!(
+            removed.is_ok(),
+            "{name}: the removal finishes: {}",
+            removed
+                .err()
+                .map(|error| error.said().as_str().to_owned())
+                .unwrap_or_default()
+        );
+        assert!(tree.record().is_none(), "{name}: the record is dropped");
+        assert_eq!(
+            bytes(&folder).as_deref(),
+            Some(&b"a file now\n"[..]),
+            "{name}: the file that stands where the directory was is left"
+        );
+    }
 }
 
 fn parts<'a>(program: &'a str, runtime: &'a str, state: &'a str) -> Parts<'a> {

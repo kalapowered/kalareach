@@ -1384,6 +1384,19 @@ pub enum HostCommand {
     TerminalProfile(TerminalProfileArguments),
     /// Install, show or remove the login item that is meant to start the control daemon when you
     /// log in.
+    ///
+    /// It is a launch agent file on macOS and an autostart entry on Linux, offered apart from the
+    /// headless host `kr host startup` chooses, the shell startup entry and the terminal profile.
+    /// Nothing starts now, and a daemon that is running is never ended.
+    ///
+    /// A daemon that already serves this environment holds its lock, so the login item's daemon
+    /// exits. On macOS that login has no desktop host until the other daemon ends and you log in
+    /// again; on Linux the other daemon serves desktop workers. macOS 13 and later may list the
+    /// item under Login Items, where you can switch it off; kr cannot read that switch. On Linux
+    /// the daemon's output goes where your session sends an autostart program's, not to
+    /// controller.log, and a desktop setting that edits the file makes kr read it as changed. kr
+    /// writes the file where HOME (and XDG_CONFIG_HOME on Linux) point in the shell that runs it,
+    /// and the item keeps that shell's runtime and state directories.
     LoginItem(LoginItemArguments),
     /// Show or choose how `kr new` starts this environment's control daemon when none is running.
     Startup(StartupArguments),
@@ -1735,20 +1748,6 @@ pub struct TerminalProfileRemove {
 }
 
 /// `kr host login-item`.
-///
-/// Install, show or remove the login item that is meant to start the control daemon when you log
-/// in on macOS or Linux. It is a launch agent file on macOS and an autostart entry on Linux,
-/// offered apart from the headless host `kr host startup` chooses, the shell startup entry and the
-/// terminal profile. Nothing starts now, and a daemon that is running is never ended.
-///
-/// A daemon that already serves this environment holds its lock, so the login item's daemon exits.
-/// On macOS that login has no desktop host until the other daemon ends and you log in again; on
-/// Linux the other daemon serves desktop workers. macOS 13 and later may list the item under Login
-/// Items, where you can switch it off; kr cannot read that switch. On Linux the daemon's output
-/// goes where your session sends an autostart program's, not to controller.log, and a desktop
-/// setting that edits the file makes kr read it as changed. kr writes the file where HOME (and
-/// XDG_CONFIG_HOME on Linux) point in the shell that runs it, and the item keeps that shell's
-/// runtime and state directories.
 #[derive(Args)]
 pub struct LoginItemArguments {
     /// What to do.
