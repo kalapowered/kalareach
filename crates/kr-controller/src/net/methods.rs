@@ -126,6 +126,12 @@ impl Controller {
     /// admitted at and the deadline it was accepted with, held from the check to the end of the
     /// commit it is handed ([`Self::under_registration`]).
     ///
+    /// The guard asks the registration once as it takes the hold. A commit that waits for a lock
+    /// after that, as the establishment of the clock does for the clock trust state and the
+    /// directory's connection, asks the registration again once it holds them
+    /// ([`Self::pairing_admission`]); the hold is taken before either, in the order on
+    /// `Controller::commit_hold`.
+    ///
     /// A mutation that carries no freshness at all may be answered from what this host already
     /// holds and may not write, so its guard refuses.
     pub(crate) fn pairing_guard(
@@ -151,7 +157,7 @@ impl Controller {
         };
         Arc::new(move |commit| {
             #[cfg(test)]
-            controller.owner.pauses.after_the_connection.wait();
+            controller.owner.pauses.before_the_registration_hold.wait();
             controller
                 .under_registration(&carried, commit)
                 .and_then(|committed| committed)
@@ -323,7 +329,14 @@ impl Controller {
                 let owner = Arc::clone(&self.owner);
                 let boot = self.boot_epoch;
                 blocking(move || {
-                    owner.establish_clock(&caller, action, boot, guard.as_ref(), &copied)
+                    owner.establish_clock(
+                        &caller,
+                        action,
+                        boot,
+                        guard.as_ref(),
+                        admission.as_ref(),
+                        &copied,
+                    )
                 })
                 .await
             }
