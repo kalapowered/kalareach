@@ -238,10 +238,25 @@ impl UpstreamDispatch for RendezvousUpstream {
 }
 
 async fn host() -> Host {
+    host_over(|_| {}, None).await
+}
+
+/// Starts a worker over the journal `prepare` leaves at the journal's path.
+///
+/// A worker started `again` serves the session and the environment an earlier worker served, which
+/// is what a restart is: the same session over what the earlier one wrote, under a key of its own.
+async fn host_over(
+    prepare: impl FnOnce(&std::path::Path),
+    again: Option<(SessionId, kr_protocol::ids::EnvironmentId)>,
+) -> Host {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
-    let environment_id = temp.environment_id();
-    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let environment_id =
+        again.map_or_else(|| temp.environment_id(), |(_, environment)| environment);
+    let session_id = again.map_or_else(
+        || SessionId::new(kr_ipc::new_uuid()),
+        |(session, _)| session,
+    );
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
     let identity = Arc::new(
@@ -285,6 +300,7 @@ async fn host() -> Host {
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent).expect("the journal directory");
     }
+    prepare(&journal_path);
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
     let runtime = Arc::new(
@@ -1214,7 +1230,9 @@ fn offer_approval<U: UpstreamDispatch + 'static>(
             },
         )
         .expect("the installed tables are pinned");
-    broker
+    // The first connection of a worker is numbered one; a restarted worker numbers its own above
+    // what the one before it wrote.
+    let connection = broker
         .open_native_connection(
             instance(),
             &[9; 32],
@@ -1223,13 +1241,10 @@ fn offer_approval<U: UpstreamDispatch + 'static>(
             "1",
         )
         .expect("the native connection is authenticated");
-    broker.bind_connection_dispatch(
-        kr_protocol::ids::GatewayConnectionId::new(1),
-        upstream as Arc<dyn UpstreamDispatch>,
-    );
+    broker.bind_connection_dispatch(connection, upstream as Arc<dyn UpstreamDispatch>);
     let opaque = broker
         .forward_native(
-            kr_protocol::ids::GatewayConnectionId::new(1),
+            connection,
             br#"{"id":11,"method":"session/request_permission"}"#,
             TimestampMs::new(2),
         )
@@ -4027,6 +4042,198 @@ async fn an_uncertain_answer_to_one_approval_does_not_hold_back_the_answer_to_an
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "both answers went to the transport"
+    );
+}
+
+/// A worker whose transport took the answer to one approval and never acknowledged it, so that
+/// the answer is uncertain: the worker, the answer, and the approval it was to.
+async fn a_worker_with_an_uncertain_approval_answer()
+-> (Host, MutationRequest, kr_protocol::ids::PendingResourceId) {
+    let host = host().await;
+    let (_never, waiting) = tokio::sync::oneshot::channel::<()>();
+    register(&host, None);
+    let resource_id = offer_approval(
+        &host,
+        Arc::new(WaitingUpstream {
+            release: std::sync::Mutex::new(Some(waiting)),
+            carried: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    let mut client = cli(&host).await;
+    let lost = approval_mutation(&client, &host, 73, resource_id);
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, lost.clone()),
+    )
+    .await
+    .expect("the caller is answered at the deadline");
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer nobody acknowledged is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut client, lost.action_id).await.state,
+        ReceiptState::Unknown
+    );
+    (host, lost, resource_id)
+}
+
+/// What a worker that selected an approval answer's subject by the target alone stored for `answer`.
+///
+/// That selector named no parameter and no precondition, and a request's preconditions are empty,
+/// so the subject it stored is the one a request with no parameters has now.
+fn subject_stored_by_the_target_alone(answer: &MutationRequest) -> Digest256 {
+    kr_protocol::action::subject_digest(&MutationRequest {
+        params: ParamsValue::empty(),
+        ..answer.clone()
+    })
+    .expect("a subject digest")
+}
+
+/// Copies the journal at `from` to `to`, as it stands on disk, and returns the actor that wrote the
+/// receipt of `action_id`. When `subject` is given, the receipt's subject in the copy is replaced
+/// by it.
+fn copy_of_the_journal(
+    from: &std::path::Path,
+    to: &std::path::Path,
+    action_id: ActionId,
+    subject: Option<Digest256>,
+) -> kr_protocol::ids::ActorId {
+    let source = rusqlite::Connection::open(from).expect("the journal opens");
+    source
+        .execute(
+            "VACUUM INTO ?1",
+            rusqlite::params![to.to_str().expect("a path")],
+        )
+        .expect("the journal is copied");
+    let copy = rusqlite::Connection::open(to).expect("the copy opens");
+    let key = action_id.get().as_bytes().to_vec();
+    if let Some(subject) = subject {
+        let changed = copy
+            .execute(
+                "UPDATE receipts SET subject_digest = ?2 WHERE action_id = ?1",
+                rusqlite::params![key, subject.as_bytes().as_slice()],
+            )
+            .expect("the subject is replaced");
+        assert_eq!(changed, 1, "the receipt of the answer is in the copy");
+    }
+    let actor: String = copy
+        .query_row(
+            "SELECT actor_id FROM receipts WHERE action_id = ?1",
+            rusqlite::params![key],
+            |row| row.get(0),
+        )
+        .expect("the receipt's actor");
+    kr_protocol::ids::ActorId::new(actor).expect("an actor")
+}
+
+/// KR-REQ-23.24 and KR-REQ-11.27: a worker restarted over an uncertain approval answer that an
+/// earlier worker stored under the target alone still answers the exact retry from its receipt,
+/// refuses a second answer to the same approval, and admits the answer to another approval.
+///
+/// The earlier selector's record is made from what a worker writes now: the receipt's subject is
+/// replaced by the one the earlier selector computed. The broker's record of the uncertain approval
+/// does not depend on the selector, so it is the one the worker wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restarted_worker_over_an_answer_stored_under_the_earlier_subject_admits_another_approval()
+ {
+    let (earlier, lost, lost_resource) = a_worker_with_an_uncertain_approval_answer().await;
+    let from = earlier.journal_path.clone();
+    let stored = subject_stored_by_the_target_alone(&lost);
+    let lost_id = lost.action_id;
+    let host = host_over(
+        |to| {
+            copy_of_the_journal(&from, to, lost_id, Some(stored));
+        },
+        Some((earlier.session_id, earlier.environment_id)),
+    )
+    .await;
+    drop(earlier);
+
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let fresh = offer_approval(&host, Arc::clone(&upstream));
+    let mut client = cli(&host).await;
+
+    // The exact retry is answered from the receipt the earlier worker kept, which still says the
+    // outcome is unknown.
+    let replayed = send(&mut client, lost.clone()).await;
+    assert!(
+        matches!(replayed, Outcome::Ok(_)),
+        "the exact retry is answered from the retained receipt: {replayed:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, lost_id).await.state,
+        ReceiptState::Unknown
+    );
+
+    // A second answer to the same approval, under a fresh identifier, is not the retry. The
+    // broker refuses it because the approval is already uncertain, and nothing goes to the
+    // transport.
+    let again = approval_mutation(&client, &host, 75, lost_resource);
+    let refused = send(&mut client, again).await;
+    let Outcome::Error(error) = refused else {
+        panic!("an approval that is already uncertain is not answered again: {refused:?}");
+    };
+    assert_eq!(error.code, ErrorCode::QuestionResolved);
+
+    // The answer to another approval is not held back by the earlier worker's record.
+    let answer = approval_mutation(&client, &host, 76, fresh);
+    let answer_id = answer.action_id;
+    let outcome = send(&mut client, answer).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "an answer stored under the earlier subject stands in the way of another approval: {outcome:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, answer_id).await.state,
+        ReceiptState::Applied
+    );
+    assert_eq!(
+        state_of(&host, fresh),
+        kr_protocol::gateway::PendingState::Resolved
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "only the answer to the other approval went to the transport"
+    );
+}
+
+/// KR-REQ-23.24: a journal a worker wrote under the subject that names the approval, read under
+/// the subject an earlier worker asks by, holds nothing back; it holds back only the retry of its
+/// own answer.
+///
+/// An earlier worker over such a journal opens it without a schema step. Its lookup is by the
+/// target alone, which no row of the newer worker carries, so it does not see the uncertain answer;
+/// the broker's record of the approval is what refuses the second answer to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lookup_of_an_earlier_worker_finds_no_uncertain_answer_a_later_worker_stored() {
+    let (host, lost, _resource) = a_worker_with_an_uncertain_approval_answer().await;
+    let copy = kr_ipc::testing::TempHost::create();
+    let path = copy.root().join("journal.db");
+    let actor = copy_of_the_journal(&host.journal_path, &path, lost.action_id, None);
+    let journal = kr_worker::journal::Journal::open(&path).expect("the journal opens");
+
+    let found = |subject| {
+        journal
+            .uncertain_for_subject(&actor, Method::AgentApprovalRespond, subject)
+            .expect("reads")
+            .map(|(action_id, _)| action_id)
+    };
+    assert_eq!(
+        found(kr_protocol::action::subject_digest(&lost).expect("a subject digest")),
+        Some(lost.action_id),
+        "the retry of the answer meets the answer"
+    );
+    assert_eq!(
+        found(subject_stored_by_the_target_alone(&lost)),
+        None,
+        "the subject an earlier worker looks up finds no row of this one"
     );
 }
 
