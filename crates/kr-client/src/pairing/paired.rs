@@ -136,7 +136,7 @@ impl PairedHost {
             host_keys: self.host_keys,
             host_endpoint_id: self.host_endpoint_id,
             network_config: self.network_config.clone(),
-            organisation: self.proposed_grant.organisation.clone(),
+            organisation: self.proposed_grant.organisation,
         }
     }
 
@@ -219,7 +219,7 @@ impl PendingAttempt {
             host_keys: self.host_keys,
             host_endpoint_id: self.host_endpoint_id,
             network_config: self.network_config.clone(),
-            organisation: self.proposed_grant.organisation.clone(),
+            organisation: self.proposed_grant.organisation,
         }
     }
 }

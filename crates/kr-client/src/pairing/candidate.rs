@@ -530,7 +530,7 @@ impl Pairing {
         };
         let outcome = match recorded {
             Some(host) if host.host_endpoint_id == pending.host_endpoint_id => self
-                .confirm_committed(Known::Told(host), &pending, progress, None)
+                .confirm_committed(Known::Told(Box::new(host)), &pending, progress, None)
                 .await
                 .and_then(Confirmed::into_paired)
                 .map_err(|failure| failure.or_tries(pending.tries_left)),
@@ -1028,7 +1028,7 @@ impl Pairing {
                         .confirm_committed(Known::Derived, &pending, progress, reserve)
                         .await?
                     {
-                        Confirmed::Paired(host) => return Ok(host),
+                        Confirmed::Paired(host) => return Ok(*host),
                         Confirmed::NotReached => {
                             lost_recoveries += 1;
                             progress.send_replace(awaiting(&pending));
@@ -1260,7 +1260,7 @@ impl Pairing {
         // The record first: a device that stops between the two keeps both, and resuming then
         // reaches the host through the record rather than as a candidate it no longer is.
         self.hosts.record(host.clone())?;
-        self.confirm_committed(Known::Told(host), pending, progress, None)
+        self.confirm_committed(Known::Told(Box::new(host)), pending, progress, None)
             .await
             .and_then(Confirmed::into_paired)
     }
@@ -1387,7 +1387,7 @@ impl Pairing {
                 }
             };
             let mut host = match known {
-                Known::Told(host) => host,
+                Known::Told(host) => *host,
                 Known::Derived => {
                     let host = PairedHost {
                         host_device_id: pending.host_device_id,
@@ -1434,7 +1434,7 @@ impl Pairing {
             progress.send_replace(AttemptState::Paired {
                 host: HostView::of(&host),
             });
-            return Ok(Confirmed::Paired(host));
+            return Ok(Confirmed::Paired(Box::new(host)));
         }
         match known {
             // The attempt is over only when its time is: the next wait asks again.
@@ -1482,7 +1482,7 @@ impl Pairing {
 enum Known {
     /// The host named the device and its grant on the connection that proved the candidate, or the
     /// record was read at a restart. The record is written.
-    Told(PairedHost),
+    Told(Box<PairedHost>),
     /// Only the identity the device derived for itself is known.
     Derived,
 }
@@ -1490,7 +1490,7 @@ enum Known {
 /// How a confirmation of a commitment ended, short of failing.
 enum Confirmed {
     /// The host reported the commitment as it should and the pairing is complete.
-    Paired(PairedHost),
+    Paired(Box<PairedHost>),
     /// No connection as the device it was committed as reached the host, or the time reserved for
     /// a question ran out: the attempt goes on waiting.
     NotReached,
@@ -1501,7 +1501,7 @@ impl Confirmed {
     /// attempt itself, so nothing is left waiting here.
     fn into_paired(self) -> Result<PairedHost, PairingFailure> {
         match self {
-            Self::Paired(host) => Ok(host),
+            Self::Paired(host) => Ok(*host),
             Self::NotReached => Err(PairingFailure::new(
                 FailureKind::HostUnreachable,
                 "the host committed this device, but this device could not connect under that identity",

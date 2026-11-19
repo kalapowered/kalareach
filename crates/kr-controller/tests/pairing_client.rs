@@ -3347,8 +3347,7 @@ async fn another_endpoint_claiming_a_committed_identity_is_refused_and_learns_no
     let error = tokio::time::timeout(WATCHDOG, claimed.try_dial())
         .await
         .expect("the host answers")
-        .err()
-        .expect("the host refuses an endpoint it did not pair");
+        .expect_err("the host refuses an endpoint it did not pair");
     let told = format!("{error:?}");
     assert!(
         !told.contains(&record.device_id.to_string()),
