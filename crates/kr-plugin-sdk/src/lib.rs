@@ -119,6 +119,7 @@ pub mod predicate;
 pub mod presentation;
 pub mod scalars;
 pub mod schema;
+pub mod skill_target;
 pub mod text;
 pub mod validate;
 pub mod version;

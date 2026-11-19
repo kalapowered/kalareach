@@ -252,6 +252,7 @@ pub fn package_contract() -> Value {
                 }))
                 .collect::<Vec<_>>(),
         },
+        "skill_target_rules": crate::skill_target::rules(),
         "index_bounds": {
             "max_qualified_builds": crate::catalogue::MAX_QUALIFIED_BUILDS,
         },
