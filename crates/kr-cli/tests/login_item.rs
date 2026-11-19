@@ -1131,7 +1131,9 @@ mod written {
         );
         assert!(!ok, "install from another home is refused: {said}");
         // One document holds what the settling did and the refusal that followed it.
-        let document: serde_json::Value = serde_json::from_str(&said).expect("one document");
+        let parsed = serde_json::from_str::<serde_json::Value>(&said);
+        assert!(parsed.is_ok(), "the output is one document: {said}");
+        let document = parsed.unwrap_or_default();
         assert_eq!(document["ok"], false, "{said}");
         assert!(
             document["message"]
@@ -1418,7 +1420,9 @@ mod written {
         );
         let (ok, said, _) = said_by(&["install", "--json"]);
         assert!(!ok);
-        let document: serde_json::Value = serde_json::from_str(&said).expect("one document");
+        let parsed = serde_json::from_str::<serde_json::Value>(&said);
+        assert!(parsed.is_ok(), "the output is one document: {said}");
+        let document = parsed.unwrap_or_default();
         assert!(
             document["message"].as_str().is_some_and(|message| {
                 message.contains(" names was changed after kr wrote it, so kr does not replace it")
@@ -1464,6 +1468,10 @@ mod written {
             "{said}"
         );
         assert_eq!(std::fs::read(&item).expect("bytes"), original);
+        assert!(
+            setup.record_bytes().is_some(),
+            "the file is recorded: {said}"
+        );
         assert_eq!(setup.record()["path"], item.to_string_lossy().as_ref());
         assert!(setup.record()["pending"].is_null());
         assert_eq!(status_word(&setup), "installed");
@@ -1653,11 +1661,13 @@ mod written {
         std::fs::remove_dir(&directory).expect("the directory goes");
         std::fs::write(&directory, b"a file now\n").expect("a file in its place");
         assert_eq!(status_word(&setup), "gone");
-        let said = setup.ok("remove");
+        let (ok, said, refused) = run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
+        assert!(ok, "the removal finishes: {said}{refused}");
         assert!(setup.record_bytes().is_none(), "{said}");
         assert_eq!(
-            std::fs::read(&directory).expect("the file is left"),
-            b"a file now\n"
+            std::fs::read(&directory).ok().as_deref(),
+            Some(&b"a file now\n"[..]),
+            "the file that stands where the directory was is left"
         );
     }
 
