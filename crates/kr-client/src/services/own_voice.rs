@@ -1382,7 +1382,9 @@ impl VoiceProviderService for OwnVoiceProvider {
                     .await
                     .ok()
                     .and_then(std::result::Result::ok)
-                    .unwrap_or(false)
+                    // The task may have ended with this close still queued: its reply sender
+                    // is gone, and the record's state is the answer.
+                    .unwrap_or_else(|| shared.state_is_closed_cleanly())
                 } else {
                     shared.state_is_closed_cleanly()
                 }

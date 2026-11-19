@@ -1574,8 +1574,11 @@ async fn a_closure_queued_behind_the_probes_answer_after_a_fence_is_read_before_
 }
 
 /// A close that was written and whose drain ran out reads what the channel still holds: a closure
-/// that stands behind a long queue ends the call by the provider's word, and nothing is hung up,
-/// though a hangup would have been answered by an empty 404 and left the row unresolved.
+/// that stands behind a long queue ends the call by the provider's word, and nothing is hung up.
+///
+/// The case depends on tokio 1.53.3's cooperative task budget (`Budget(Some(128))`): the 601
+/// messages are about 4.7 times the budget, and the drain's `timeout` polls its timer outside the
+/// budget once the inner future has used it up. A tokio upgrade checks this case again.
 #[tokio::test(start_paused = true)]
 async fn a_close_whose_drain_runs_out_with_a_closure_still_queued_reads_it_and_hangs_nothing_up() {
     let world = fresh();
@@ -1930,6 +1933,39 @@ async fn a_closure_that_comes_while_the_hangup_of_a_failed_recovery_waits_is_rea
         world.ledger.rows().expect("rows").is_empty(),
         "no row stands for a call the provider closed"
     );
+}
+
+/// A close that reaches a call while its recovery runs stays unread when the recovery ends the
+/// call, and its reply sender goes with the task: the close is answered by what the record says,
+/// and a call that ended cleanly is closed.
+#[tokio::test(start_paused = true)]
+async fn a_close_that_meets_the_end_of_a_recovery_is_answered_by_the_records_state() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    // The channel is lost, and the reattachment's probe is never answered.
+    world.stand_in.acknowledge(false);
+    world.stand_in.drop_socket();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Recovering);
+    // The close is sent while the recovery runs; the recovery gives up and hangs the call up.
+    let closed = world.provider.close(&own.call_id).await;
+    assert!(
+        closed.is_ok(),
+        "a close met by the end of the call is answered by the record's state"
+    );
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::HostClosed)
+    );
+    assert_eq!(
+        world.stand_in.recorded().hangups.len(),
+        1,
+        "the call is hung up once"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
 }
 
 /// A mute the provider refused took no effect: the recovery's probe does not restate it.
