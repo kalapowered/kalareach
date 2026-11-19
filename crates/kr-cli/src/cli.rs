@@ -1401,6 +1401,10 @@ pub enum HostCommand {
     /// Bring this environment's journals that are older than this build migrates forward, once,
     /// while its control daemon is stopped.
     ImportJournals,
+    /// Remove this environment's grants rows that this build cannot read and withdraw the live
+    /// grants below them, while its control daemon is stopped, or put back the copy of the
+    /// registry a repair made. Without `--apply` it lists what it would do and changes nothing.
+    RepairGrants(RepairGrantsArguments),
     /// Put a first release into this user's store of releases and make it current. Run it as the
     /// unpacked release's own kr.
     Install(InstallArguments),
@@ -1629,6 +1633,18 @@ pub struct NetworkArguments {
     /// Take out the settings a join writes. The rest of the document stays as it is.
     #[arg(long)]
     pub clear: bool,
+}
+
+/// `kr host repair-grants`.
+#[derive(Args)]
+pub struct RepairGrantsArguments {
+    /// Make the change. Without it, the command lists what it would do and changes nothing.
+    #[arg(long)]
+    pub apply: bool,
+    /// Put back the copy of the registry that an earlier repair made, given as the path of the
+    /// copy file the repair printed.
+    #[arg(long, value_name = "COPY")]
+    pub undo: Option<std::path::PathBuf>,
 }
 
 /// `kr host startup`.

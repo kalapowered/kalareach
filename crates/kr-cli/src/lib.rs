@@ -84,6 +84,7 @@ pub mod privacy;
 pub mod project;
 pub mod question;
 pub mod render;
+pub mod repair;
 pub mod report;
 pub mod resolve;
 pub mod service_manager;

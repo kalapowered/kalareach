@@ -30,6 +30,7 @@ worker directly for what a session owns.
 | `kr host network` | — | Show which network and services this host selects, join the service that publishes a description of itself, or leave it |
 | `kr host descriptions` | — | Show what session descriptions offer on this host, turn them on or off, and fetch the model's files |
 | `kr host import-journals` | — | Bring this environment's journals that are older than this build migrates forward, once, while its daemon is stopped |
+| `kr host repair-grants` | — | Remove the grants rows this build cannot read and withdraw the live grants below them, or put back the copy a repair made, while its daemon is stopped |
 | `kr host install` | — | Put a first release into this user's store of releases and make it current |
 | `kr host update --archive <file>` | — | Update this host to a newer release: its control daemons are handed over, and every live session keeps the release it started from |
 | `kr host rollback [--to <release>]` | — | Go back to an older release this host keeps: its control daemons are handed over as an update hands them over, and every live session keeps the release it started from |
@@ -2929,6 +2930,36 @@ both in full.
 The requirement covers what the guest asks for under its pairing, such as accepting an offered
 session. A share is personal, and answers to a lease only on an exclusively organisation-managed
 host.
+
+## `kr host repair-grants`
+
+A grants row that this build cannot read gives no authority, and the owner's revocation of a device
+marks each such row revoked. This command removes them, once the host is stopped. `kr doctor` names
+the damage in its `grants-readable` check, by each row's place and what is wrong with it.
+
+```sh
+kr host repair-grants                          # lists the rows and the live grants it would withdraw; changes nothing
+kr host repair-grants --apply                  # copies the registry, removes the rows, withdraws the grants below them
+kr host repair-grants --undo <copy>            # lists what putting the copy back would make live; changes nothing
+kr host repair-grants --undo <copy> --apply    # puts the copy back
+```
+
+It works on the environment's own files, so it runs only while the control daemon is stopped: it
+holds the environment's lock, and is refused while the daemon, an update, an import or another
+repair holds it. It reads the registry as it is and never migrates it: a registry of another schema
+version, or with a grants table of another shape, is refused and left as it was.
+
+`--apply` first writes a copy of the registry in a new private folder beside it, and makes the copy
+durable before it changes the registry. It then removes every row that cannot be read, revokes every
+live grant that traces to no root (each hangs below a row that cannot be read or is missing, or its
+chain of parents forms a loop), cancels the open invitations of the rows it removes, and writes one
+fence debt, which the host pays when it starts. It never re-keys a row, rewrites a record or widens
+a grant. The copy stays until the person removes it.
+
+`--undo <copy> --apply` puts the copy back as the registry. Everything written to the registry after
+the copy was made is lost. It is refused when the host has run since the copy was made, when the
+copy was not made from this environment's registry, when the registry's write-ahead log cannot be
+taken in, and when a file from an earlier undo stands in the way.
 
 ## `kr host import-journals`
 

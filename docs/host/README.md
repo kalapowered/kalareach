@@ -9811,3 +9811,24 @@ no cursor of another life of the host is read as one of this instance's, and no 
 twice within it. A cursor is the reader's: `agent.snapshot` takes the node a reader wants next, the
 last one it consumed plus one, and the host keeps no cursor for a reader. A range that was evicted
 rebuilds from what is verifiably retained and says there is a gap.
+
+## Grants rows that cannot be read
+
+A grants row whose key does not name the grant it holds, whose record does not decode, whose
+recipient or parent column does not match its record, or which holds a value of the wrong type in
+a column is judged once, in one place, and gives no authority on any path. A device's own
+`grant.revoke` and the voice stop withdraw the readable subtree they name and nothing more. The
+owner's revocation of a device or of a grant withdraws every grant it can read, including each
+live grant that traces to no root, and marks each row it cannot read revoked, so that the release
+before this one reads none of them as live; a row whose `revoked_at_ms` holds a value that is not
+an integer is replaced by an integer mark. A row that names no grant fences the whole host. One
+fence debt is written in the same transaction as the withdrawal, and a repeat writes nothing.
+
+An authority-feed request is carried out whatever the damage: a named grant whose row cannot be
+read is marked with what hangs below it, and every target of a request is attempted whatever an
+earlier one returned. The `grants-readable` check of `host.doctor` names each damaged row by its
+place and class, with no identifier, because paired devices read the doctor too; a revocation that
+marks rows or withdraws unplaced grants writes one line to the host's log with the counts.
+`kr host repair-grants` removes the rows, and its limits are in `docs/cli/README.md`. A row whose
+`expired_at_ms` is not an integer can be read by this build and is refused at the standing
+decision that needs it; the doctor does not judge that column.
