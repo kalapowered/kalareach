@@ -116,7 +116,10 @@ async fn a_device_that_revokes_is_told_of_the_workers_of_its_own_sessions_only()
 }
 
 /// A `grant.revoke` of `grant_id` under a fresh action.
-fn revoke_request(temp: &kr_ipc::testing::TempHost, grant_id: GrantId) -> MutationRequest {
+pub(super) fn revoke_request(
+    temp: &kr_ipc::testing::TempHost,
+    grant_id: GrantId,
+) -> MutationRequest {
     MutationRequest {
         request_id: RequestId::new(1),
         method: Method::GrantRevoke.into(),

@@ -6125,3 +6125,97 @@ async fn a_device_revoke_beside_another_devices_damaged_row_withdraws_the_grant_
         .expect("the row reads");
     assert!(marked, "the damaged row is marked revoked");
 }
+
+/// The owner's `grant.revoke` through the method, with the admission a real caller carries.
+async fn grant_revoke_method(
+    host: &Serving,
+    action: u8,
+    grant: GrantId,
+) -> Result<kr_protocol::sharing::RevocationResult, kr_protocol::error::ProtocolError> {
+    let mut client = host.client().await;
+    let mutation = client
+        .compose(
+            Method::GrantRevoke,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([action; 16])),
+            kr_protocol::envelope::ActionTarget::environment(host.temp.environment_id()),
+            &kr_protocol::sharing::GrantRevokeParams { grant_id: grant },
+        )
+        .await
+        .expect("the revocation is composed");
+    client
+        .repeat(&mutation)
+        .await
+        .expect("the daemon answers")
+        .map(|value| value.to_typed().expect("a revocation result"))
+}
+
+/// A device whose row names another device in its recipient column is still revoked by the method,
+/// with its record marked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_row_names_another_device_in_its_column_is_still_revoked_through_the_method()
+{
+    let host = Serving::start().await;
+    let device = device_id(0xda);
+    host.controller
+        .devices()
+        .commit(&paired_record(device))
+        .expect("a paired device");
+    let held = Grant {
+        recipient_device_id: device,
+        ..grant(0x4b, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    host.controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()), || Ok(()))
+        .expect("written");
+    registry_statement(
+        &host,
+        &format!(
+            "UPDATE grants SET recipient_device_id = X'{}' WHERE grant_id = {};",
+            "ee".repeat(16),
+            key_literal(held.grant_id)
+        ),
+    );
+    device_revoke_method(&host, 0x73, device)
+        .await
+        .expect("a row whose column names another device does not stop the revocation");
+    assert!(
+        host.controller
+            .devices()
+            .record_for_device(device)
+            .expect("the directory reads")
+            .expect("the device is recorded")
+            .revoked_at_ms
+            .is_some(),
+        "the device is revoked"
+    );
+}
+
+/// The owner's `grant.revoke` beside a row that names no grant ends the owner's own connection
+/// with the fence of the whole host, and is still answered: the proof of the withdrawal tells the
+/// local door to answer before its own connection is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owners_grant_revoke_beside_a_row_with_no_name_is_answered() {
+    let host = Serving::start().await;
+    let held = grant(0x4c, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    let other = grant(0x4d, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    for row in [&held, &other] {
+        host.controller
+            .sharing()
+            .grants()
+            .issue(&record(row.clone()), || Ok(()))
+            .expect("written");
+    }
+    registry_statement(
+        &host,
+        &format!(
+            "UPDATE grants SET grant_id = X'00', grant = X'00' WHERE grant_id = {};",
+            key_literal(other.grant_id)
+        ),
+    );
+    let answer = grant_revoke_method(&host, 0x74, held.grant_id)
+        .await
+        .expect("the revocation is answered, not left unknown");
+    assert!(answer.revoked_grants.contains(&held.grant_id));
+}

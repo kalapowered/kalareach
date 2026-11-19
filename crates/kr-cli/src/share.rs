@@ -1445,9 +1445,10 @@ async fn revoke(
     let grant_id: GrantId = crate::daemon::identifier(&arguments.grant, "a grant")?;
     let mut host = Host::open(paths, &arguments.selector, build_id).await?;
     // The list says which session the grant is over, and that the host holds it. A host that
-    // cannot decide where one grant that expires stands refuses the whole list, and revoking takes
-    // authority away whatever the clock says, so the revocation goes on by the identifier alone:
-    // the host refuses it if it holds no such grant.
+    // cannot decide where one grant that expires stands, or cannot read one of its grants rows,
+    // refuses the whole list, and revoking takes authority away whatever the clock says and
+    // whichever row cannot be read, so the revocation goes on by the identifier alone: the host
+    // refuses it if it holds no such grant.
     let session_id = match host.grants(None, true).await {
         Ok(known) => {
             let Some(entry) = known
@@ -1470,7 +1471,9 @@ async fn revoke(
         Err(CliError::Refused(refusal))
             if matches!(
                 refusal.code,
-                ErrorCode::ClockUntrusted | ErrorCode::StorageUnavailable
+                ErrorCode::ClockUntrusted
+                    | ErrorCode::StorageUnavailable
+                    | ErrorCode::InvalidArgument
             ) =>
         {
             report::say(&shown!(

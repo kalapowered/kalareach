@@ -80,6 +80,7 @@ mod rendezvous;
 mod resources;
 mod restored_policy;
 pub use self::restored_policy::OwedWrite;
+mod grants_check;
 mod revocation;
 mod routes;
 mod standing;
@@ -1926,6 +1927,12 @@ mod a_refusal_the_feed_raises_after_admission;
 
 #[cfg(test)]
 mod a_policy_commit_and_an_owner_answer;
+
+#[cfg(test)]
+mod a_feed_request_beside_a_row_that_cannot_be_read;
+
+#[cfg(test)]
+mod a_revocation_beside_a_row_that_cannot_be_read;
 
 #[cfg(test)]
 mod a_revocation_without_an_admission_that_meets_a_registration;
