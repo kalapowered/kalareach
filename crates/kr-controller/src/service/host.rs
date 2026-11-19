@@ -237,6 +237,9 @@ impl Controller {
         // registration under the revision it was admitted at, then the deadline.
         // The admissions are read once more here, after the checks that read the file system, so a
         // package or a grant that changed while they ran refuses the request before the marker.
+        #[cfg(feature = "testing")]
+        self.catalogue
+            .reach(crate::catalogue::TestingPoint::FileChecks);
         crate::agent_tools::declared::admissions_held_until_registration(
             read_at,
             DOCTOR_READS.as_secs(),

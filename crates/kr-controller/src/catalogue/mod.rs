@@ -306,6 +306,9 @@ pub enum TestingPoint {
     /// Each commit a change of the catalogue makes, inside the admission it runs under, which
     /// holds the change's registration standing until the commit is over.
     Commit,
+    /// An installation for a declared word has read the agent's files, and is about to read the
+    /// admissions once more, before it registers.
+    FileChecks,
 }
 
 /// A hook a test runs at each [`TestingPoint`].
@@ -624,6 +627,15 @@ impl CatalogueModule {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Runs the hook a test set, if any, for a computation of a service that holds a point of its
+    /// own.
+    #[cfg(feature = "testing")]
+    pub(crate) fn reach(&self, point: TestingPoint) {
+        if let Some(hook) = self.testing_hook() {
+            (hook.0)(point);
+        }
     }
 
     /// Runs `hook` at each [`TestingPoint`] a computation of this module reaches.

@@ -322,6 +322,86 @@ async fn a_change_of_the_admissions_while_the_packages_are_read_refuses_before_t
     assert!(no_marker_was_written(&host));
 }
 
+/// KR-REQ-11.01: a grant or a package that changes after the host has checked the agent's files
+/// for a declared word, and before it registers the action, refuses the request before the
+/// dispatch marker: the admissions are read once more at the end, so nothing was changed and the
+/// exact retry is asked again. The same request once the admissions stand still installs the skill.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_of_the_admissions_after_the_files_are_checked_refuses_before_the_marker() {
+    use kr_controller::catalogue::TestingPoint;
+    let host = host().await;
+    admit_declaring(&host, "amp");
+    let (reached, reached_at) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let armed = std::sync::atomic::AtomicBool::new(true);
+    host._controller.catalogue().at_testing_point(move |point| {
+        if point == TestingPoint::FileChecks
+            && armed.swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = reached.send(());
+            let _ = released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(std::time::Duration::from_secs(30));
+        }
+    });
+
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let target = ActionTarget::environment(host.environment_id);
+    let params = install_for_amp(&host);
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let asked = tokio::spawn({
+        let (target, params) = (target.clone(), params.clone());
+        async move {
+            client
+                .mutate(Method::AgentToolsInstall, action_id, target, &params)
+                .await
+                .expect("the call reaches the daemon")
+        }
+    });
+    let held = tokio::task::spawn_blocking(move || {
+        reached_at
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .is_ok()
+    })
+    .await
+    .expect("the wait ends");
+    assert!(held, "the checks of the agent's files were reached");
+    raise_the_admission_revision(&host).await;
+    release.send(()).expect("the checks are released");
+
+    let refused = asked
+        .await
+        .expect("the request ends")
+        .expect_err("the request is refused");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert_eq!(
+        refused.message,
+        "the packages this host admits changed while this request was read; ask again"
+    );
+    assert!(no_marker_was_written(&host));
+    let skills = host._temp.root().join("project/.amp");
+    assert!(!skills.exists(), "nothing is written in the project");
+
+    // The admissions stand still now: the same request is carried out.
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let again = client
+        .mutate(Method::AgentToolsInstall, action_id, target, &params)
+        .await
+        .expect("the call reaches the daemon");
+    assert!(again.is_ok(), "the exact retry is carried out: {again:?}");
+    assert!(
+        skills.join("skills/kalareach-contact/SKILL.md").is_file(),
+        "the skill is installed"
+    );
+}
+
 /// Writes the package a test admits for the word `word`: the example connector with a skill target
 /// for the project scope (the skills folder `.amp/skills` only) and the capability requested, its
 /// manifest's digest of the table brought up to date. Returns its source as the admissions name it.
