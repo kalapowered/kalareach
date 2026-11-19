@@ -715,6 +715,18 @@ fn derive(
 pub mod testing {
     use super::*;
 
+    /// The package check of a package a test wrote, as the worker makes it at each read, with its
+    /// result handed over: a case that expects the package to pass says so in its own body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal the check gave.
+    pub fn checked(
+        source: &ConnectorSource,
+    ) -> Result<kr_plugin_sdk::package::Package, crate::broker::connectors::ConnectorRefusal> {
+        InstalledConnector::check(&source.package_dir, source.package_digest)
+    }
+
     /// What an installation hands over for one package a test wrote: its identity read from its
     /// verified manifest, and its grants, its bridge and its builds as the source names them.
     ///

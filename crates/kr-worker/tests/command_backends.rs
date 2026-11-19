@@ -17,7 +17,7 @@ use kr_protocol::scalars::Uuid;
 use kr_protocol::session::CommandIntegration;
 use kr_worker::broker::Broker;
 use kr_worker::broker::commands::{CommandBackends, CommandBackendsConfig, EstablishRequest};
-use kr_worker::broker::connectors::{ConnectorSources, fixture};
+use kr_worker::broker::connectors::{ConnectorRefusal, ConnectorSource, ConnectorSources, fixture};
 use kr_worker::persistence::JournalHealth;
 
 fn session() -> SessionId {
@@ -151,6 +151,21 @@ impl Setup {
         executable: &[&str],
         adjust: impl FnOnce(CommandBackendsConfig) -> CommandBackendsConfig,
     ) -> Self {
+        let (setup, refused) = Self::installing(shape, executable, adjust);
+        assert!(
+            refused.is_empty(),
+            "the connector is installed: {refused:?}"
+        );
+        setup
+    }
+
+    /// The same, and the packages the store refused with what it said, asserting nothing: a case
+    /// that expects the installation states its own expectation.
+    fn installing(
+        shape: &fixture::Shape,
+        executable: &[&str],
+        adjust: impl FnOnce(CommandBackendsConfig) -> CommandBackendsConfig,
+    ) -> (Self, Vec<(ConnectorSource, ConnectorRefusal)>) {
         let directory = private_directory("kcb");
         let bin = directory.join("bin");
         std::fs::create_dir_all(&bin).expect("a bin directory");
@@ -172,10 +187,7 @@ impl Setup {
         let store = directory.join("store");
         std::fs::create_dir_all(&store).expect("a store");
         let source = fixture::package(&store, &launcher, shape).expect("the package");
-        assert!(
-            sources.replace(vec![source]).is_empty(),
-            "the connector is installed"
-        );
+        let refused = sources.replace(vec![source]);
         // The case's own directory, so a backend's socket path stays inside the bound it has on
         // macOS: the session root and the backend's directory add two short levels below it.
         let runtime = directory.clone();
@@ -196,13 +208,16 @@ impl Setup {
             config,
             tokio::runtime::Handle::current(),
         );
-        Self {
-            directory,
-            backends,
-            broker,
-            executable,
-            runtime,
-        }
+        (
+            Self {
+                directory,
+                backends,
+                broker,
+                executable,
+                runtime,
+            },
+            refused,
+        )
     }
 
     fn integration() -> CommandIntegration {
@@ -835,6 +850,42 @@ fn recorded_variables(answer: &kr_protocol::root::CommandBackend) -> Vec<(String
             )
         })
         .collect()
+}
+
+/// KR-REQ-12.20: a package that declares the variable its integration sets, in the `launch_variables`
+/// member of its connector table, is installed, and a launch of it records exactly the declared
+/// pair for the launcher and exports nothing but the registration.
+#[tokio::test]
+async fn a_launch_of_a_package_that_declares_a_variable_carries_it_in_the_launch_record_and_nothing_else()
+ {
+    let (setup, refused) = Setup::installing(
+        &fixture::Shape::gemini_cli_declaring(),
+        &["bin", "gemini"],
+        |config| config,
+    );
+    assert!(
+        refused.is_empty(),
+        "a package that declares its variable is installed: {refused:?}"
+    );
+    let answer = setup
+        .backends
+        .establish(&request(
+            &setup,
+            &invocation_adding(&["gemini"], &[]),
+            &gemini(&[]),
+            1,
+        ))
+        .expect("a backend is established");
+    let exported: Vec<&str> = answer
+        .environment
+        .iter()
+        .map(|variable| variable.name.as_str())
+        .collect();
+    assert_eq!(exported, ["KR_REGISTRATION"]);
+    assert_eq!(
+        recorded_variables(&answer),
+        [("GEMINI_CLI_NO_RELAUNCH".to_owned(), "1".to_owned())]
+    );
 }
 
 /// KR-REQ-12.07, KR-REQ-12.20: a package that declares flags and a variable establishes with both:
