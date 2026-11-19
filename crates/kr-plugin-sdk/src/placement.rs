@@ -43,8 +43,13 @@ pub const MAX_COMPONENT_BYTES: usize = 64;
 
 /// Most characters the host's reading of a placement may have: the text with every field at its
 /// largest (eight tails of three 64-byte components, a three-component directory, a 64-byte area,
-/// a 64-byte application label, a 128-byte folder name, the key and the record clause).
-pub const MAX_PLACEMENT_STATEMENT_CHARS: usize = 3_746;
+/// a 128-byte folder name and the record clause) for the one label whose reading holds a key
+/// sentence, Claude Code's, with the key it adds. Any other label has no key sentence and a
+/// reading at most 64-byte-label long, which is shorter.
+pub const MAX_PLACEMENT_STATEMENT_CHARS: usize = 3_587;
+
+/// The label whose application reads a configuration key that enables a plugin.
+pub const KEYED_LABEL: &str = "Claude Code";
 
 /// Most bytes the value may take when it is written as JSON.
 pub const MAX_SERIALISED_BYTES: usize = 16 * 1024;
@@ -188,6 +193,8 @@ pub enum PlacementRefusal {
     NoFile,
     /// A file's shape has a root that is not an object or a map.
     FileNotAnObject,
+    /// A recipe adds a configuration key that is not the one the label's application reads.
+    KeyNotTheLabels,
     /// A shape nests deeper than eight.
     ShapeTooDeep,
     /// An object shape names a member twice.
@@ -219,6 +226,7 @@ impl PlacementRefusal {
             Self::TailDuplicate => "placement.tail_duplicate",
             Self::NoFile => "placement.no_file",
             Self::FileNotAnObject => "placement.file_not_an_object",
+            Self::KeyNotTheLabels => "placement.key_not_the_labels",
             Self::ShapeTooDeep => "placement.shape_too_deep",
             Self::ShapeMemberDuplicate => "placement.shape_member_duplicate",
             Self::ShapeHasNoCommand => "placement.shape_has_no_command",
@@ -652,31 +660,32 @@ impl Placement {
                 ),
             ));
         }
-        let folder = bridge
-            .install
-            .iter()
-            .find_map(|step| match step {
-                crate::plugin::BridgeStep::InstallFile { destination, .. } => destination
-                    .as_str()
-                    .strip_prefix(self.area.as_str())
-                    .and_then(|rest| rest.strip_prefix('/'))
-                    .and_then(|rest| rest.split_once('/'))
-                    .map(|(folder, _)| folder.to_owned()),
-                crate::plugin::BridgeStep::AddConfigurationKey { .. } => None,
-            })
-            .unwrap_or_default();
+        if let Some(refusal) = key_refusals(bridge, self.area.as_str()).into_iter().next() {
+            return Err(refusal);
+        }
+        let folder = plugin_folder(bridge, self.area.as_str())
+            .unwrap_or_default()
+            .to_owned();
         let directory = self.directory_path();
         let tails: Vec<&str> = self
             .files
             .iter()
             .map(|placed| placed.tail.as_str())
             .collect();
-        let key = bridge.install.iter().find_map(|step| match step {
-            crate::plugin::BridgeStep::AddConfigurationKey { file, key, .. } => Some(format!(
-                "It also sets {key} to true in {directory}/{file}, and keeps your other \
-                     settings in that file. "
-            )),
-            crate::plugin::BridgeStep::InstallFile { .. } => None,
+        // Only the label's one enabling key is written, by the rule that holds every other key
+        // refused above: no words of the recipe's are quoted.
+        let key = Self::enabling_key(application, &folder).filter(|_| {
+            bridge
+                .install
+                .iter()
+                .any(|step| matches!(step, crate::plugin::BridgeStep::AddConfigurationKey { .. }))
+        });
+        let key = key.map(|enabling| {
+            format!(
+                "It also sets {} to true in {directory}/{}, and keeps your other settings in \
+                 that file. ",
+                enabling.key, enabling.file
+            )
         });
         let record = self
             .files
@@ -740,6 +749,84 @@ impl Placement {
         shape.check(value, folder, self.command_form)?;
         shape.text_refusal(value).map_or(Ok(()), Err)
     }
+}
+
+/// The one configuration key a bridge adds, and where.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnablingKey {
+    /// The configuration file under the application's directory.
+    pub file: &'static str,
+    /// The key path.
+    pub key: String,
+    /// The value written, as JSON text.
+    pub value: &'static str,
+}
+
+impl Placement {
+    /// The one configuration key a bridge for `application` may add for the plugin folder
+    /// `folder`: Claude Code's `enabledPlugins.<folder>@skills-dir`, set to `true` in
+    /// `settings.json`, where the folder is a name of ASCII letters, digits, hyphens and
+    /// underscores. No other label has one. The package check, the catalogue, the installation
+    /// statement and the controller read the key through this function alone.
+    #[must_use]
+    pub fn enabling_key(application: &str, folder: &str) -> Option<EnablingKey> {
+        let plain = !folder.is_empty()
+            && folder
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+        (application == KEYED_LABEL && plain).then(|| EnablingKey {
+            file: "settings.json",
+            key: format!("enabledPlugins.{folder}@skills-dir"),
+            value: "true",
+        })
+    }
+}
+
+/// The plugin folder a recipe installs its first file into under `area`.
+fn plugin_folder<'a>(bridge: &'a crate::plugin::NativeBridge, area: &str) -> Option<&'a str> {
+    bridge.install.iter().find_map(|step| match step {
+        crate::plugin::BridgeStep::InstallFile { destination, .. } => destination
+            .as_str()
+            .strip_prefix(area)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(folder, _)| folder),
+        crate::plugin::BridgeStep::AddConfigurationKey { .. } => None,
+    })
+}
+
+/// Every step of a recipe that adds a configuration key other than the one [`Placement::enabling_key`]
+/// gives for the recipe's application and its plugin folder under `area`, in the recipe's order.
+/// The refusal quotes nothing the recipe says.
+#[must_use]
+pub fn key_refusals(bridge: &crate::plugin::NativeBridge, area: &str) -> Vec<PlacementError> {
+    let application = bridge.application.as_str();
+    let enabling = Placement::enabling_key(application, plugin_folder(bridge, area).unwrap_or(""));
+    bridge
+        .install
+        .iter()
+        .filter_map(|step| match step {
+            crate::plugin::BridgeStep::AddConfigurationKey { file, key, value } => {
+                let allowed = enabling.as_ref().is_some_and(|enabling| {
+                    file.as_str() == enabling.file
+                        && *key == enabling.key
+                        && value == enabling.value
+                });
+                (!allowed).then(|| {
+                    PlacementError::new(
+                        PlacementRefusal::KeyNotTheLabels,
+                        format!(
+                            "the recipe adds a configuration key that is not the one this host \
+                             reads for {application:?}: a bridge may add only Claude Code's key \
+                             enabledPlugins.<the plugin's folder>@skills-dir, set to true in \
+                             settings.json"
+                        ),
+                    )
+                })
+            }
+            crate::plugin::BridgeStep::InstallFile { .. } => None,
+        })
+        .collect()
 }
 
 impl Shape {
