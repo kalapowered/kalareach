@@ -5749,3 +5749,220 @@ async fn kr_req_10_51_an_answering_action_is_held_to_the_callers_history() {
     .expect("a history that reaches back to the request answers it");
     assert_eq!(carried(), 2, "the reached approval's answer was carried");
 }
+
+/// The six methods whose parameters name the application instance they act on.
+const INSTANCE_METHODS: [Method; 6] = [
+    Method::AgentPromptSubmit,
+    Method::AgentPromptQueue,
+    Method::AgentTurnSteer,
+    Method::AgentTurnCancel,
+    Method::AgentApprovalRespond,
+    Method::PluginActionInvoke,
+];
+
+/// One call of `method` on the suite's instance at binding revision 1, whose envelope names the
+/// same instance and revision as its parameters.
+fn instance_mutation(
+    client: &LocalClient,
+    host: &Host,
+    method: Method,
+    request_id: u64,
+) -> MutationRequest {
+    let about = || AgentMutationTarget {
+        subject: subject(host.session_id, instance()),
+        binding_revision: AgentBindingRevision::new(1),
+    };
+    let turn = || kr_protocol::ids::AgentTurnId::new("turn-1").expect("valid");
+    // The prompt's envelope, whose target is the one every call here names, with the method and
+    // parameters of the call.
+    let sent = |params: ParamsValue| {
+        let mut mutation = prompt_mutation(client, host, request_id);
+        mutation.method = method.into();
+        mutation.params = params;
+        mutation
+    };
+    match method {
+        Method::AgentPromptSubmit | Method::AgentPromptQueue => {
+            let mut mutation = prompt_mutation(client, host, request_id);
+            mutation.method = method.into();
+            mutation
+        }
+        Method::AgentTurnSteer => sent(
+            ParamsValue::from_typed(&kr_protocol::agent::AgentSteerParams {
+                target: about(),
+                turn_id: turn(),
+                text: PromptText::new("go on").expect("valid"),
+            })
+            .expect("encodes"),
+        ),
+        Method::AgentTurnCancel => sent(
+            ParamsValue::from_typed(&kr_protocol::agent::AgentCancelParams {
+                target: about(),
+                turn_id: turn(),
+            })
+            .expect("encodes"),
+        ),
+        Method::AgentApprovalRespond => approval_mutation(
+            client,
+            host,
+            request_id,
+            kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([0x5a; 16])),
+        ),
+        Method::PluginActionInvoke => refresh_invocation(
+            host,
+            request_id,
+            client.action_window().action_window_id.clone(),
+        ),
+        other => panic!(
+            "{} names no application instance in its parameters",
+            other.as_str()
+        ),
+    }
+}
+
+/// How many receipts the journal holds for `action_id`.
+fn receipts_of(host: &Host, action_id: ActionId) -> i64 {
+    rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal opens")
+        .query_row(
+            "SELECT count(*) FROM receipts WHERE action_id = ?1",
+            rusqlite::params![action_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the receipts are counted")
+}
+
+/// KR-REQ-23.30: a method that acts on an application instance is refused before anything is
+/// recorded when its envelope names no instance, or names a binding revision other than the one
+/// its parameters name. The envelope's target is part of the subject an uncertain outcome holds
+/// back, so an envelope that names less or other than the parameters would let a retry leave that
+/// subject while the parameters, which the broker admits from, still name the same instance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_30_an_envelope_that_names_no_instance_or_another_revision_is_refused_before_admission()
+ {
+    let host = host().await;
+    register(&host, None);
+    let (_bound, _packages) = bind_the_example(&host);
+    let mut client = cli(&host).await;
+    for (index, method) in INSTANCE_METHODS.into_iter().enumerate() {
+        let request_id = 300 + 10 * index as u64;
+
+        let mut bare = instance_mutation(&client, &host, method, request_id);
+        bare.target.application_instance_id = Nullable::null();
+        bare.target.agent_binding_revision = Nullable::null();
+        let bare_id = bare.action_id;
+        let outcome = send(&mut client, bare).await;
+        let Outcome::Error(refused) = outcome else {
+            panic!(
+                "{}: an envelope with no instance is refused: {outcome:?}",
+                method.as_str()
+            );
+        };
+        assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+        assert!(
+            refused.message.contains(&format!(
+                "{} names the application instance it acts on",
+                method.as_str()
+            )),
+            "{}: {}",
+            method.as_str(),
+            refused.message
+        );
+        assert_eq!(
+            receipts_of(&host, bare_id),
+            0,
+            "nothing was recorded for it"
+        );
+
+        let mut moved = instance_mutation(&client, &host, method, request_id + 1);
+        moved.target.agent_binding_revision = Nullable::some(AgentBindingRevision::new(2));
+        let moved_id = moved.action_id;
+        let outcome = send(&mut client, moved).await;
+        let Outcome::Error(refused) = outcome else {
+            panic!(
+                "{}: another revision is refused: {outcome:?}",
+                method.as_str()
+            );
+        };
+        assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+        assert!(
+            refused.message.contains(
+                "this request names one binding revision in its envelope and another in its \
+                 parameters"
+            ),
+            "{}: {}",
+            method.as_str(),
+            refused.message
+        );
+        assert_eq!(
+            receipts_of(&host, moved_id),
+            0,
+            "nothing was recorded for it"
+        );
+    }
+}
+
+/// KR-REQ-23.30 and KR-REQ-23.24: a retry of an action whose outcome is uncertain does not leave
+/// its subject by naming another binding revision in its envelope or none at all. The action is
+/// admitted with an envelope that agrees with its parameters, and its outcome is left uncertain.
+/// The control, a fresh identifier with the same target, is held back. Each retry, a fresh
+/// identifier with another revision and a fresh identifier with no instance, is refused before
+/// anything is recorded for it, so neither reaches the broker, which admits from the parameters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_30_a_retry_of_an_uncertain_action_cannot_leave_its_subject_by_its_envelope() {
+    let host = host().await;
+    register(&host, None);
+    let (_bound, _packages) = bind_the_example(&host);
+    let mut client = cli(&host).await;
+    let window = client.action_window().action_window_id.clone();
+    let call = |request_id: u64| refresh_invocation(&host, request_id, window.clone());
+
+    let first = call(180);
+    let first_id = first.action_id;
+    assert!(
+        matches!(send(&mut client, first).await, Outcome::Ok(_)),
+        "the call whose envelope names what its parameters name is admitted"
+    );
+    rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal opens")
+        .execute(
+            "UPDATE receipts SET state = 'unknown' WHERE action_id = ?1",
+            rusqlite::params![first_id.get().as_bytes().as_slice()],
+        )
+        .expect("the receipt is left uncertain");
+
+    let control = call(181);
+    let control_id = control.action_id;
+    let outcome = send(&mut client, control).await;
+    let Outcome::Error(held) = outcome else {
+        panic!("the same target under a fresh identifier is held back: {outcome:?}");
+    };
+    assert_eq!(held.code, ErrorCode::DraftConflict, "{}", held.message);
+    assert_eq!(
+        receipts_of(&host, control_id),
+        0,
+        "the held call was never recorded"
+    );
+
+    let mut another_revision = call(182);
+    another_revision.target.agent_binding_revision = Nullable::some(AgentBindingRevision::new(2));
+    let mut no_instance = call(183);
+    no_instance.target.application_instance_id = Nullable::null();
+    no_instance.target.agent_binding_revision = Nullable::null();
+    for (retry, what) in [
+        (another_revision, "a fresh identifier with another revision"),
+        (no_instance, "a fresh identifier with no instance"),
+    ] {
+        let retry_id = retry.action_id;
+        let outcome = send(&mut client, retry).await;
+        let Outcome::Error(refused) = outcome else {
+            panic!("{what} is not admitted: {outcome:?}");
+        };
+        assert_eq!(
+            refused.code,
+            ErrorCode::InvalidArgument,
+            "{what}: {refused:?}"
+        );
+        assert_eq!(receipts_of(&host, retry_id), 0, "{what} was never recorded");
+    }
+}
