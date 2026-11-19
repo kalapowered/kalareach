@@ -49,7 +49,7 @@ impl crate::account::Calls for VoiceCalls {
     fn open(&self) -> bool {
         self.module
             .upgrade()
-            .is_some_and(|module| module.coordinator().calls_open())
+            .is_some_and(|module| module.coordinator().account_calls_open())
     }
 
     fn end_those_that_are_over(

@@ -1755,6 +1755,34 @@ async fn a_call_the_host_ends_for_silence_is_told_as_silence_revoked_and_closed_
     assert_eq!(closed(&provider).len(), 1);
 }
 
+/// A call on the owner's own key does not hold an account change, in the part that holds live calls
+/// and in the part that holds the closes, and the general sweep still ends it at its deadline; a
+/// managed call holds the account as before.
+#[tokio::test]
+async fn an_own_key_call_does_not_hold_an_account_change_and_the_general_sweep_still_ends_it() {
+    let (coordinator, _authority, provider, _session) = own_call_started().await;
+    assert_eq!(coordinator.live_sessions(), 1);
+    assert!(
+        !coordinator.account_calls_open(),
+        "a live call on the owner's key is not bound to the account"
+    );
+    assert_eq!(coordinator.end_calls_that_are_over(610_000).await, 1);
+    assert_eq!(coordinator.live_sessions(), 0);
+    assert_eq!(
+        provider.closed.lock().expect("what was closed").len(),
+        1,
+        "the sweep closed the call at its provider"
+    );
+    assert!(!coordinator.account_calls_open());
+
+    let fixture = fixture();
+    let _ = started(&fixture, None).await;
+    assert!(
+        fixture.coordinator.account_calls_open(),
+        "a managed call holds the account"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The fixture
 // ---------------------------------------------------------------------------------------------
@@ -2900,7 +2928,7 @@ async fn a_start_the_broker_refuses_on_the_account_holds_no_call() {
             ),
         }
         assert!(
-            !fixture.coordinator.calls_open(),
+            !fixture.coordinator.account_calls_open(),
             "{said}: a refused start holds no call"
         );
         assert_eq!(
@@ -3109,7 +3137,7 @@ async fn a_call_that_is_over_keeps_its_session_while_its_grant_cannot_be_revoked
     );
     assert_eq!(fixture.coordinator.live_sessions(), 1, "still known");
     assert!(fixture.broker.closed().is_empty(), "the call is still open");
-    assert!(fixture.coordinator.calls_open());
+    assert!(fixture.coordinator.account_calls_open());
 
     assert_eq!(
         fixture
@@ -3173,13 +3201,13 @@ async fn a_stop_does_not_wait_for_a_slow_broker_past_the_time_a_phone_gives_it()
     assert!(!stopped.broker_notified, "the service has not confirmed");
     assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
     assert!(
-        fixture.coordinator.calls_open(),
+        fixture.coordinator.account_calls_open(),
         "the close is still going on"
     );
 
     fixture.broker.release_closes();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while fixture.coordinator.calls_open() {
+        while fixture.coordinator.account_calls_open() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
@@ -3199,7 +3227,7 @@ async fn a_call_is_over_at_its_deadline_without_its_device() {
     // Started at 10 000 for 600 seconds.
     let deadline = 610_000;
 
-    assert!(fixture.coordinator.calls_open());
+    assert!(fixture.coordinator.account_calls_open());
     fixture.broker.answers_holds(ServiceHolds::Unreachable);
     assert_eq!(
         fixture
@@ -3209,11 +3237,11 @@ async fn a_call_is_over_at_its_deadline_without_its_device() {
         0,
         "a service that cannot be asked leaves the call open"
     );
-    assert!(fixture.coordinator.calls_open());
+    assert!(fixture.coordinator.account_calls_open());
     assert_eq!(fixture.coordinator.live_sessions(), 1);
 
     assert!(
-        fixture.coordinator.calls_open(),
+        fixture.coordinator.account_calls_open(),
         "a call past its deadline is open until its record has been ended"
     );
     assert_eq!(
@@ -3222,7 +3250,10 @@ async fn a_call_is_over_at_its_deadline_without_its_device() {
     );
     assert_eq!(fixture.coordinator.live_sessions(), 0);
     assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
-    assert!(!fixture.coordinator.calls_open(), "its close has been told");
+    assert!(
+        !fixture.coordinator.account_calls_open(),
+        "its close has been told"
+    );
 
     // The device's own stop, arriving late, finds nothing left to stop.
     let error = fixture
@@ -3253,12 +3284,12 @@ async fn a_call_the_service_ended_is_over_before_its_deadline() {
 
     assert_eq!(fixture.coordinator.end_calls_that_are_over(20_000).await, 0);
     assert_eq!(fixture.broker.asked(), vec!["call-managed".to_owned()]);
-    assert!(fixture.coordinator.calls_open());
+    assert!(fixture.coordinator.account_calls_open());
     assert_eq!(fixture.authority.revocations(), revoked_before);
 
     fixture.broker.answers_holds(ServiceHolds::Over);
     assert_eq!(fixture.coordinator.end_calls_that_are_over(21_000).await, 1);
-    assert!(!fixture.coordinator.calls_open());
+    assert!(!fixture.coordinator.account_calls_open());
     assert_eq!(fixture.coordinator.live_sessions(), 0);
     assert_eq!(
         fixture.authority.revocations(),

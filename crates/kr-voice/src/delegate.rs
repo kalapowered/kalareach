@@ -41,7 +41,7 @@
 //! And nothing reads an admission as execution. A host that accepted a proposal without performing
 //! it answers [`VoiceDelegationOutcome::Admitted`], never `Performed`.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kr_client::services::voice::{
@@ -302,11 +302,19 @@ struct State {
     ///
     /// A start asks the broker between reading a device's authority and recording what came back,
     /// and that wait is the window two starts can cross in. A device is in this set for the whole
-    /// of its own start, so the second one is answered rather than run beside the first.
-    starting: BTreeSet<DeviceId>,
-    /// How many calls this host is ending at the broker: counted under the lock that removed their
-    /// records, so a call is never between being recorded and being ended without being counted.
+    /// of its own start, so the second one is answered rather than run beside the first. Each is
+    /// kept with whether its provider's call is bound to the account.
+    starting: BTreeMap<DeviceId, bool>,
+    /// How many calls bound to the account this host is ending at the provider: counted under the
+    /// lock that removed their records, so a call is never between being recorded and being ended
+    /// without being counted. A call on the owner's own key is not counted.
     closing: usize,
+}
+
+/// Whether the call a provider carries is bound to the account the host is signed in under. A call
+/// whose provider is not known is taken to be.
+fn is_account_bound(provider: Option<&Arc<dyn VoiceProviderService>>) -> bool {
+    provider.is_none_or(|provider| provider.account_bound())
 }
 
 /// A call's close at the broker, held for as long as it runs, and counted from the moment the call's
@@ -557,7 +565,7 @@ impl Coordinator {
             .len()
     }
 
-    /// Whether any call can still need the account it was made under: one that is live, one whose
+    /// Whether any call bound to the account can still need the account it was made under: one that is live, one whose
     /// start is waiting on the broker, one that is being ended at the broker, and a replayed one
     /// this host has yet to close.
     ///
@@ -572,12 +580,18 @@ impl Coordinator {
     /// Panics when a thread holding the coordinator's lock panicked, which would mean the
     /// coordinator's own state is no longer known.
     #[must_use]
-    pub fn calls_open(&self) -> bool {
+    pub fn account_calls_open(&self) -> bool {
         let state = self.state.lock().expect("the coordinator's state");
-        !state.sessions.is_empty()
-            || !state.starting.is_empty()
+        state
+            .sessions
+            .iter()
+            .any(|record| is_account_bound(record.provider.as_ref()))
+            || state.starting.values().any(|bound| *bound)
             || state.closing > 0
-            || !state.deferred.is_empty()
+            || state
+                .deferred
+                .iter()
+                .any(|ending| is_account_bound(ending.provider.as_ref()))
     }
 
     /// Ends the live calls that are over without their device, and returns how many it ended.
@@ -797,7 +811,7 @@ impl Coordinator {
         // holding this coordinator's own lock across them is what makes the replacement atomic:
         // two changes arriving at once cannot each read the same standing grant, withdraw it and
         // leave two replacements standing. The broker is told afterwards, outside the lock.
-        let (written, ending, ended_sessions) = {
+        let (written, ending, ended_sessions, bound) = {
             let mut state = self.state.lock().expect("the coordinator's state");
             // Inside the lock, and immediately before the write. Waiting for this lock is the last
             // thing this change does, and an authority change whose admitted lifetime ran out
@@ -844,12 +858,16 @@ impl Coordinator {
                     }
                 }
             }
-            state.closing += ending.len();
-            (written, ending, ended_sessions)
+            let bound = ending
+                .iter()
+                .filter(|ending| is_account_bound(ending.provider.as_ref()))
+                .count();
+            state.closing += bound;
+            (written, ending, ended_sessions, bound)
         };
         let _closing = Closing {
             state: Arc::clone(&self.state),
-            count: ending.len(),
+            count: bound,
         };
         // Outside the lock, and after the authority is already gone: a call whose grant this
         // change withdrew is finalised rather than left metering until its own deadline. Each is
@@ -1116,7 +1134,7 @@ impl Coordinator {
         // authority and recording the call that came back, and two starts crossing in that window
         // can each decide about a call the other is about to bind. The second is told that one is
         // already running, which is what it would be told a moment later anyway.
-        let Some(_gate) = self.begin_start(device_id) else {
+        let Some(_gate) = self.begin_start(device_id, provider.account_bound()) else {
             return Ok(VoiceStartResult {
                 outcome: VoiceStartOutcome::Unavailable {
                     reason: "session_in_progress".to_owned(),
@@ -1429,12 +1447,16 @@ impl Coordinator {
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
-    fn begin_start(&self, device_id: DeviceId) -> Option<StartGate<'_>> {
+    fn begin_start(&self, device_id: DeviceId, account_bound: bool) -> Option<StartGate<'_>> {
         let mut state = self.state.lock().expect("the coordinator's state");
-        state.starting.insert(device_id).then(|| StartGate {
-            state: &self.state,
-            device_id,
-        })
+        state
+            .starting
+            .insert(device_id, account_bound)
+            .is_none()
+            .then(|| StartGate {
+                state: &self.state,
+                device_id,
+            })
     }
 
     /// Refuses a change whose admission no longer stands before it reaches its write, with the
@@ -1463,10 +1485,10 @@ impl Coordinator {
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
     async fn close_deferred(&self) {
-        let closing: Vec<Ending> = {
+        let (closing, bound): (Vec<Ending>, usize) = {
             let mut state = self.state.lock().expect("the coordinator's state");
             if !state.starting.is_empty() || state.deferred.is_empty() {
-                Vec::new()
+                (Vec::new(), 0)
             } else {
                 let held: Vec<(String, Option<String>)> = state
                     .sessions
@@ -1496,13 +1518,17 @@ impl Coordinator {
                         })
                     })
                     .collect();
-                state.closing += closing.len();
-                closing
+                let bound = closing
+                    .iter()
+                    .filter(|ending| is_account_bound(ending.provider.as_ref()))
+                    .count();
+                state.closing += bound;
+                (closing, bound)
             }
         };
         let _closing = Closing {
             state: Arc::clone(&self.state),
-            count: closing.len(),
+            count: bound,
         };
         for ending in &closing {
             if let Some(provider) = ending.provider.as_ref() {
@@ -1538,7 +1564,7 @@ impl Coordinator {
                     .as_ref()
                     .is_some_and(|held| held.provider() == theirs)
         });
-        let others_starting = state.starting.iter().any(|starting| *starting != device_id);
+        let others_starting = state.starting.keys().any(|starting| *starting != device_id);
         !held && !others_starting
     }
 
@@ -1656,12 +1682,13 @@ impl Coordinator {
         let mut state = self.state.lock().expect("the coordinator's state");
         let record = state.sessions.stop(voice_session_id, device_id)?;
         state.ledger.forget_session(voice_session_id);
-        state.closing += 1;
+        let bound = usize::from(is_account_bound(record.provider.as_ref()));
+        state.closing += bound;
         Ok((
             record,
             Closing {
                 state: Arc::clone(&self.state),
-                count: 1,
+                count: bound,
             },
         ))
     }
