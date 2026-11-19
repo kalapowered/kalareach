@@ -174,6 +174,19 @@ fn the_start_tests_the_proxy_with_the_first_address_it_can_serve() {
         Nullable::some(kr_client::services::account::ACCOUNT_ORIGIN.to_owned());
     with_origins.storage.origin = Nullable::some("https://storage.example.com".to_owned());
     assert_eq!(of(&with_origins), target("storage.example.com", 443));
+
+    // A plain-`http` origin is never a target: the next `https` origin is taken, and a document
+    // that names only plain-`http` origins has no target.
+    let mut plain = started(NetworkSelection::default());
+    plain.authority.origin = Nullable::some("http://127.0.0.1:8080".to_owned());
+    plain.mailbox.origin = Nullable::some("http://mailbox.example.com".to_owned());
+    assert_eq!(of(&plain), None, "plain-http origins alone give no target");
+    plain.storage.origin = Nullable::some("https://storage.example.com".to_owned());
+    assert_eq!(
+        of(&plain),
+        target("storage.example.com", 443),
+        "an https origin after plain-http origins is taken"
+    );
 }
 
 /// KR-REQ-10.02: the check says what the proxy answered, as a state; a refused login sets the
