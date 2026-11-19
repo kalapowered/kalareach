@@ -351,6 +351,11 @@ pub struct OwnerAuthority {
     /// every shipped build.
     #[cfg(feature = "testing")]
     inside_the_record: crate::service::ThreadPause,
+    /// Where this host's own tests stop a request for an owner confirmation after every lookup of
+    /// its action and before it takes the challenges' lock, so that a copy of the action can be
+    /// recorded in that wait. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    before_the_challenges: crate::service::ThreadPause,
 }
 
 /// What decides whether the controlling terminal can confirm the end of exclusive management.
@@ -493,6 +498,16 @@ impl OwnerAuthority {
         self.inside_the_record.arm()
     }
 
+    /// Arms the pause the next request for an owner confirmation stops at after every lookup of its
+    /// action, before it takes the challenges' lock. Returns the end that says it has arrived, and
+    /// the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub(crate) fn pause_before_the_challenges(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.before_the_challenges.arm()
+    }
+
     /// Builds the service for one host.
     #[must_use]
     pub fn new(
@@ -516,6 +531,8 @@ impl OwnerAuthority {
             pauses: EstablishPauses::default(),
             #[cfg(feature = "testing")]
             inside_the_record: crate::service::ThreadPause::default(),
+            #[cfg(feature = "testing")]
+            before_the_challenges: crate::service::ThreadPause::default(),
         }
     }
 
@@ -767,10 +784,13 @@ impl OwnerAuthority {
                     }
                 )
                 && self.recovery_open()?);
+        #[cfg(feature = "testing")]
+        self.before_the_challenges.wait();
         let mut state = self.state();
         // Asked under the lock every challenge is issued under, so two copies of one request meet
-        // here and the second is given the challenge the first recorded.
-        if let Some(requested) = self.requested(caller, action) {
+        // here and the second is given the challenge the first recorded. The copy is answered from
+        // the guard this holds: the lock is not taken again.
+        if let Some(requested) = self.requested_in(&mut state, caller, action) {
             return noted_as_a_copy(requested, copied);
         }
         self.sweep(&mut state);
@@ -1070,12 +1090,36 @@ impl OwnerAuthority {
         caller: &Caller,
         action: (ActionId, Digest256),
     ) -> Option<Result<OwnerConfirmationRequestResult>> {
+        self.requested_answering(caller, action, |request| self.answer_requested(request))
+    }
+
+    /// [`Self::requested`] for a caller that holds the challenges' lock, which `state` is: the
+    /// answer is given from that guard, and the lock is not taken again.
+    fn requested_in(
+        &self,
+        state: &mut Challenges,
+        caller: &Caller,
+        action: (ActionId, Digest256),
+    ) -> Option<Result<OwnerConfirmationRequestResult>> {
+        self.requested_answering(caller, action, |request| {
+            self.answer_requested_in(state, request)
+        })
+    }
+
+    /// The challenge an action recorded, given to `answer`, and the refusal an action recorded for
+    /// another payload or another subject is owed.
+    fn requested_answering(
+        &self,
+        caller: &Caller,
+        action: (ActionId, Digest256),
+        answer: impl FnOnce(OwnerConfirmationRequest) -> Result<OwnerConfirmationRequestResult>,
+    ) -> Option<Result<OwnerConfirmationRequestResult>> {
         let subject = match self.rows.answered(&caller.actor_id, action.0, action.1)? {
             Ok(subject) => subject,
             Err(error) => return Some(Err(error)),
         };
         Some(match subject {
-            ActionSubject::Requested(request) => self.answer_requested(*request),
+            ActionSubject::Requested(request) => answer(*request),
             _ => Err(another_subject()),
         })
     }
@@ -1089,10 +1133,19 @@ impl OwnerAuthority {
         &self,
         request: OwnerConfirmationRequest,
     ) -> Result<OwnerConfirmationRequestResult> {
+        let mut state = self.state();
+        self.answer_requested_in(&mut state, request)
+    }
+
+    /// [`Self::answer_requested`] for a caller that holds the challenges' lock, which `state` is.
+    fn answer_requested_in(
+        &self,
+        state: &mut Challenges,
+        request: OwnerConfirmationRequest,
+    ) -> Result<OwnerConfirmationRequestResult> {
         let mut initial_bootstrap = self.enrolment()? == HostEnrolment::InitialBootstrap;
         if !initial_bootstrap {
-            let mut state = self.state();
-            self.sweep(&mut state);
+            self.sweep(state);
             if let Some(entry) = state
                 .entries
                 .get(request.confirmation_id.get().as_bytes())

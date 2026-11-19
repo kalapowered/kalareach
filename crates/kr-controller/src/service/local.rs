@@ -563,6 +563,16 @@ impl Controller {
         self.owner.pause_inside_the_record()
     }
 
+    /// Arms the pause the next request for an owner confirmation stops at after every lookup of its
+    /// action, before it takes the challenges' lock. Returns the end that says it has arrived, and
+    /// the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_before_the_challenges_of_a_confirmation(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        self.owner.pause_before_the_challenges()
+    }
+
     /// Arms the pause the next frame written to a local connection stops at once the local owner's
     /// lease has been read, before the footing's question. Returns the end that says the frame has
     /// arrived, and the end that lets it go. The pause fires once.
