@@ -83,7 +83,10 @@ pub struct LocalIdentity {
 
 impl LocalIdentity {
     /// Builds an identity that offers exactly this build's protocol version, capabilities,
-    /// extensions and default limits.
+    /// extensions and default limits. The one capability it offers is the statement of the
+    /// placement reading: a host built from this identity writes the reading under its own label
+    /// and refuses the label in a publisher's words, and a device that is told so on a link takes
+    /// the label as the host's ([`kr_protocol::confirmation::PLACEMENT_READING_CAPABILITY`]).
     #[must_use]
     pub fn new(
         device_id: DeviceId,
@@ -98,7 +101,11 @@ impl LocalIdentity {
             endpoint_id,
             authorisation,
             build_id,
-            capabilities: CanonicalSet::new(),
+            capabilities: CapabilityId::new(
+                kr_protocol::confirmation::PLACEMENT_READING_CAPABILITY,
+            )
+            .into_iter()
+            .collect(),
             max_receive: ReceiveLimits::default(),
             supported_versions: kr_protocol::hello::supported_versions(),
             extensions: extension::implemented(),
