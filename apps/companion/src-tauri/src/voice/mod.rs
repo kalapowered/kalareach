@@ -362,6 +362,13 @@ pub(crate) struct Shared {
     /// comes, and an entry the file holds for it is not taken up. A start made after the host is
     /// paired again has a later number, so it is kept as any other.
     forgotten: Mutex<Vec<(kr_protocol::ids::DeviceId, u64)>>,
+    /// Where the application says whether this device is still paired with a host. The removal of
+    /// a pairing is written before an unpairing is reported, so it outlives a launch whatever
+    /// happened to this record: a start entry for a host that is no longer paired is not shown and
+    /// not kept, the first time it can be told.
+    pairings: std::sync::OnceLock<Pairings>,
+    /// Whether the start entries of the record were checked against the pairings once.
+    pairings_applied: std::sync::atomic::AtomicBool,
     /// Whether spoken delegations are handed to the host: a case's choice, where a case can make one.
     #[cfg(any(test, feature = "testing", debug_assertions))]
     accept: std::sync::atomic::AtomicBool,
@@ -555,16 +562,66 @@ impl Shared {
     /// was owed or noted meanwhile, so that nothing owed in this launch waits for the next one.
     /// Every use of the record starts here.
     pub(crate) fn read_again(&self) {
-        if !self.unread.load(std::sync::atomic::Ordering::SeqCst) {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let unchecked = self.pairings.get().is_some() && !self.pairings_applied.load(SeqCst);
+        if !self.unread.load(SeqCst) && !unchecked {
             return;
         }
         let _ordered = self
             .keeping
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.take_up_unread() == Some(true) {
+        let took = self.take_up_unread();
+        // What an unpairing left in the file is removed before anything is shown, and the removal
+        // is written. The entries of a file that could not be read yet are checked as they are
+        // taken up.
+        let dropped = took.is_some() && self.drop_unpaired();
+        if took == Some(true) || dropped {
             self.write_kept();
         }
+    }
+
+    /// Takes the start entries of hosts that this device no longer pairs with out of what is
+    /// owed, and says whether any went. A host that the application cannot tell about yet keeps
+    /// its entries, and the check is made again at the next use. Called with `keeping` held and
+    /// nothing unread.
+    fn drop_unpaired(&self) -> bool {
+        let Some(paired) = self.pairings.get() else {
+            return false;
+        };
+        let mut every_host_known = true;
+        let dropped = {
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            let held = view.owed.len();
+            view.owed.retain(|each| {
+                let Some((host, _)) = each.host.filter(|_| each.is_start()) else {
+                    return true;
+                };
+                match paired(host) {
+                    Some(false) => false,
+                    Some(true) => true,
+                    None => {
+                        every_host_known = false;
+                        true
+                    }
+                }
+            });
+            view.owed.len() != held
+        };
+        if every_host_known {
+            self.pairings_applied
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        dropped
+    }
+
+    /// Whether the application says this device no longer pairs with `host`.
+    fn is_unpaired(&self, host: kr_protocol::ids::DeviceId) -> bool {
+        self.pairings
+            .get()
+            .and_then(|paired| paired(host))
+            .is_some_and(|paired| !paired)
     }
 
     /// Takes up what the file holds, if it can be read now. `None` while it cannot, and otherwise
@@ -582,7 +639,8 @@ impl Shared {
         let mut changed = false;
         let mut before = before;
         {
-            // A host forgotten while the file could not be read: what the file holds for it goes.
+            // A host forgotten while the file could not be read, or one this device no longer
+            // pairs with: what the file holds for it goes.
             let forgotten = self
                 .forgotten
                 .lock()
@@ -590,9 +648,9 @@ impl Shared {
             let held = before.owed.len();
             before.owed.retain(|each| {
                 !(each.is_start()
-                    && each
-                        .host
-                        .is_some_and(|(id, _)| forgotten.iter().any(|(gone, _)| *gone == id)))
+                    && each.host.is_some_and(|(id, _)| {
+                        forgotten.iter().any(|(gone, _)| *gone == id) || self.is_unpaired(id)
+                    }))
             });
             changed |= before.owed.len() != held;
         }
@@ -1343,6 +1401,10 @@ impl Shared {
     }
 }
 
+/// Says whether this device is still paired with a host, and nothing while the application cannot
+/// tell.
+pub type Pairings = Arc<dyn Fn(kr_protocol::ids::DeviceId) -> Option<bool> + Send + Sync>;
+
 /// The voice calls of this application.
 pub struct Calls {
     shared: Option<Arc<Shared>>,
@@ -1406,6 +1468,8 @@ impl Calls {
                 keeping: Mutex::new(()),
                 standing: Mutex::new(None),
                 forgotten: Mutex::new(Vec::new()),
+                pairings: std::sync::OnceLock::new(),
+                pairings_applied: std::sync::atomic::AtomicBool::new(false),
                 #[cfg(any(test, feature = "testing", debug_assertions))]
                 accept: std::sync::atomic::AtomicBool::new(ACCEPT_HOST_DELEGATIONS),
                 #[cfg(any(test, feature = "testing"))]
@@ -1839,6 +1903,19 @@ impl Calls {
             })
     }
 
+    /// Tells these calls where to ask whether this device is still paired with a host. The removal
+    /// of a pairing is written before an unpairing is reported, so a start entry of a host that is
+    /// no longer paired goes the first time the record is used, even when the unpairing could not
+    /// change the file. Said once; a second answer is ignored.
+    pub fn know_pairings(
+        &self,
+        paired: impl Fn(kr_protocol::ids::DeviceId) -> Option<bool> + Send + Sync + 'static,
+    ) {
+        if let Some(shared) = &self.shared {
+            let _ = shared.pairings.set(Arc::new(paired));
+        }
+    }
+
     /// This device stops pairing with the host `host`: what it keeps of the starts it sent there
     /// goes. The host's own state is not touched, and nothing is said about whether a call ended.
     pub fn forget_starts_of(&self, host: kr_protocol::ids::DeviceId) {
@@ -2162,6 +2239,145 @@ mod tests {
             file_holds(directory.path()),
             vec![pair(START_UNANSWERED, "two")],
             "the host's entry is not back, and the file says so"
+        );
+    }
+
+    /// The entries two hosts left in the file: one start each that the page shows.
+    fn two_hosts_left_a_start_each(directory: &std::path::Path) {
+        Kept::at(directory)
+            .write(&KeptVoice {
+                owed: vec![
+                    entry(START_UNKNOWN, "one", host(1)),
+                    entry(START_UNKNOWN, "two", host(2)),
+                ],
+                note: None,
+            })
+            .expect("the file is written");
+    }
+
+    /// The actions of the start entries the page is shown, after the use of the record that every
+    /// reader starts with.
+    fn actions_shown(calls: &Calls) -> Vec<String> {
+        calls
+            .state(None)
+            .owed
+            .into_iter()
+            .filter_map(|each| each.action_id)
+            .collect()
+    }
+
+    /// Unpairing while the file cannot be read, and a process that ends before any write can be
+    /// made: the next launch finds the host unpaired, and the host's entry is neither shown nor
+    /// kept. The removal of the pairing was written before the unpairing was reported, so it is
+    /// what outlives the launch.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_forgotten_while_the_file_cannot_be_read_stays_forgotten_after_a_restart() {
+        let directory = tempfile::tempdir().expect("a folder");
+        two_hosts_left_a_start_each(directory.path());
+        let file = directory.path().join("voice-kept.json");
+        std::fs::rename(&file, directory.path().join("voice-kept.locked")).expect("put aside");
+        std::os::unix::fs::symlink(&file, &file).expect("a link that cannot be opened");
+        {
+            let calls = calls_in(directory.path());
+            calls.forget_starts_of(host(1).0);
+            // The process ends here: nothing was written, and what was kept is not known.
+        }
+        std::fs::remove_file(&file).expect("the link goes");
+        std::fs::rename(directory.path().join("voice-kept.locked"), &file).expect("unlocked");
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNKNOWN, "one"), pair(START_UNKNOWN, "two")],
+            "no write was made before the process ended"
+        );
+
+        let fresh = calls_in(directory.path());
+        fresh.know_pairings(|paired| Some(paired != host(1).0));
+        assert_eq!(
+            actions_shown(&fresh),
+            vec!["two".to_owned()],
+            "the unpaired host's entry is not shown by the launch that follows"
+        );
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNKNOWN, "two")],
+            "and the removal is written"
+        );
+    }
+
+    /// Unpairing while the cleanup cannot be written, and a process that ends before any write is
+    /// made: the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_forgotten_while_the_cleanup_cannot_be_written_stays_forgotten_after_a_restart() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("a folder");
+        two_hosts_left_a_start_each(directory.path());
+        {
+            let calls = calls_in(directory.path());
+            // The folder takes no new file, so the file cannot be replaced.
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500))
+                .expect("the folder is made read-only");
+            let probe = directory.path().join("probe");
+            if std::fs::File::create(&probe).is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                    .expect("the folder is made writable again");
+                eprintln!("the folder's mode does not bind this user: the write cannot fail");
+                return;
+            }
+            calls.forget_starts_of(host(1).0);
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("the folder is made writable again");
+            // The process ends here.
+        }
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNKNOWN, "one"), pair(START_UNKNOWN, "two")],
+            "the cleanup was not written"
+        );
+
+        let fresh = calls_in(directory.path());
+        fresh.know_pairings(|paired| Some(paired != host(1).0));
+        assert_eq!(
+            actions_shown(&fresh),
+            vec!["two".to_owned()],
+            "the unpaired host's entry is not shown by the launch that follows"
+        );
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNKNOWN, "two")],
+            "and the removal is written"
+        );
+    }
+
+    /// A launch that cannot tell whether a host is paired keeps the host's entries, and removes them
+    /// at the first use after it can tell; a host the device is still paired with keeps its own.
+    #[test]
+    fn a_launch_that_cannot_tell_whether_a_host_is_paired_keeps_its_entries_until_it_can() {
+        let directory = tempfile::tempdir().expect("a folder");
+        two_hosts_left_a_start_each(directory.path());
+        let calls = calls_in(directory.path());
+        let answer = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        calls.know_pairings({
+            let answer = Arc::clone(&answer);
+            move |paired| match answer.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => None,
+                _ => Some(paired != host(1).0),
+            }
+        });
+        assert_eq!(
+            actions_shown(&calls),
+            vec!["one".to_owned(), "two".to_owned()],
+            "a host that cannot be told about keeps its entries"
+        );
+
+        answer.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(actions_shown(&calls), vec!["two".to_owned()]);
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNKNOWN, "two")]
         );
     }
 

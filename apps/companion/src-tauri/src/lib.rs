@@ -276,20 +276,24 @@ fn voice_calls(app: &tauri::AppHandle) -> voice::Calls {
     use tauri::Manager as _;
 
     match voice::Service::managed() {
-        Ok(service) => voice::Calls::on_phone(
-            Arc::new(NativeCalls::new(PluginCommands::new(app.clone()))),
-            verify::pairing_ceremony(app),
-            service,
-            voice::Timings::default(),
-            // What a call left owed, and the note, are kept in the application's own directory.
-            match app.path().app_data_dir() {
-                Ok(directory) => voice::Kept::at(directory),
-                Err(error) => {
-                    tracing::warn!(%error, "this device has no place to keep what a voice call left owed");
-                    voice::Kept::nowhere()
-                }
-            },
-        ),
+        Ok(service) => {
+            let calls = voice::Calls::on_phone(
+                Arc::new(NativeCalls::new(PluginCommands::new(app.clone()))),
+                verify::pairing_ceremony(app),
+                service,
+                voice::Timings::default(),
+                // What a call left owed, and the note, are kept in the application's own directory.
+                match app.path().app_data_dir() {
+                    Ok(directory) => voice::Kept::at(directory),
+                    Err(error) => {
+                        tracing::warn!(%error, "this device has no place to keep what a voice call left owed");
+                        voice::Kept::nowhere()
+                    }
+                },
+            );
+            calls.know_pairings(hosts::pairing_known(app.clone()));
+            calls
+        }
         Err(error) => {
             tracing::warn!(%error, "this device cannot reach the voice service, so it holds no call");
             voice::Calls::absent()
