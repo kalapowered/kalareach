@@ -1052,20 +1052,12 @@ impl Owner {
             }
             Err(error) => {
                 host.session.settle(action_id).await;
-                let conflict = is_hold_refusal(&error);
-                if conflict || sent_nothing(&error) {
-                    // The start never reached the host's hold: it leaves no entry, and the
-                    // earlier starts stay as they were.
-                    self.shared.answered(self.id);
-                } else {
-                    // Any other answer proves nothing about the hold, so the start stays, hidden.
-                    self.shared.settle_start(
-                        self.id,
-                        None,
-                        Some(OwedView::start_kept(action_id, &host)),
-                        None,
-                    );
-                }
+                let conflict = record_failed_start(
+                    &self.shared,
+                    self.id,
+                    &error,
+                    OwedView::start_kept(action_id, &host),
+                );
                 self.stop_native(HostEnd::NotNeeded).await;
                 return Err(self.refused_start(&host, error, earlier, conflict));
             }
@@ -2992,6 +2984,27 @@ enum Reached {
 #[derive(serde::Serialize)]
 struct Supersedes {
     supersedes_action_id: ActionId,
+}
+
+/// Records a start whose send ended in `error` before the host answered it, and says whether the
+/// host refused it at its hold.
+///
+/// A refusal at the hold and an error that says no byte left this device both mean that the start
+/// never reached the hold: it leaves no entry, and the earlier starts stay as they were. Any other
+/// answer proves nothing about the hold, so the start stays, hidden, as `kept`.
+pub(super) fn record_failed_start(
+    shared: &Shared,
+    owner: u64,
+    error: &ClientError,
+    kept: OwedView,
+) -> bool {
+    let conflict = is_hold_refusal(error);
+    if conflict || sent_nothing(error) {
+        shared.answered(owner);
+    } else {
+        shared.settle_start(owner, None, Some(kept), None);
+    }
+    conflict
 }
 
 /// Whether the host refused the start at its hold on this device's earlier start.
