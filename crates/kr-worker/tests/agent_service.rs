@@ -5270,3 +5270,48 @@ async fn kr_req_12_18_the_same_request_answered_twice_is_refused_before_its_mark
         "no frame came between the first answer and the other request's"
     );
 }
+
+/// KR-REQ-12.18: only a channel's own end is let go of. A prompt that went to a typed upstream and
+/// was never answered is unknown for good in the same way, and it still holds the next prompt of
+/// its subject: nothing second reaches the upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_a_typed_prompt_that_ended_unknown_still_holds_the_next_prompt() {
+    let host = host().await;
+    register(&host, None);
+    let transport = real_transport(&host).await;
+    let read = Arc::clone(&transport.read);
+    let mut client = cli(&host).await;
+
+    let first = prompt_mutation(&client, &host, 71);
+    let first_id = first.action_id;
+    let outcome = tokio::time::timeout(LIVENESS_DEADLINE, send(&mut client, first))
+        .await
+        .expect("the worker answers within its own deadline");
+    let Outcome::Error(failure) = outcome else {
+        panic!("an operation nobody acknowledged is not a success: {outcome:?}");
+    };
+    assert_eq!(failure.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut client, first_id).await.state,
+        ReceiptState::Unknown
+    );
+
+    let second = prompt_mutation(&client, &host, 72);
+    let outcome = tokio::time::timeout(LIVENESS_DEADLINE, send(&mut client, second))
+        .await
+        .expect("the worker answers");
+    let Outcome::Error(held) = outcome else {
+        panic!("a prompt after an outcome nobody can establish is held back: {outcome:?}");
+    };
+    assert_eq!(
+        held.code,
+        ErrorCode::DraftConflict,
+        "a typed upstream's unknown outcome holds the next prompt of its subject"
+    );
+    let carried = read
+        .lock()
+        .expect("the record is not poisoned")
+        .matches("session/prompt")
+        .count();
+    assert_eq!(carried, 1, "nothing second reached the upstream");
+}
