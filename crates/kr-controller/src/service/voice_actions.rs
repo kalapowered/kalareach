@@ -1806,13 +1806,13 @@ mod a_start_hold_on_clocks_moved_by_hand {
     /// reading by the armed thread, which is after the start's first reading of `continuous` and
     /// before the write lock.
     fn clocks_that_move_at_a_reading(
-        continuous: &kr_transport::clock::ManualClock,
+        continuous: Arc<dyn kr_transport::clock::ContinuousClock>,
         wall_ms: u64,
         at_the_reading: impl Fn() + Send + Sync + 'static,
     ) -> (Armed, crate::service::Clocks) {
         let armed: Armed = Arc::new(std::sync::Mutex::new(None));
         let clocks = crate::service::Clocks {
-            continuous: Arc::new(continuous.clone()),
+            continuous,
             wall: {
                 let armed = Arc::clone(&armed);
                 crate::service::WallClock::from_fn(move || {
@@ -1836,6 +1836,64 @@ mod a_start_hold_on_clocks_moved_by_hand {
         (armed, clocks)
     }
 
+    /// A continuous clock that, from the moment it is armed, asks a third connection to the record
+    /// of holds for the write lock at each reading, waits no time for it, and keeps the answer:
+    /// the code of the refusal, or none when the lock was free.
+    #[derive(Debug)]
+    struct ProbingClock {
+        inner: kr_transport::clock::ManualClock,
+        record: std::path::PathBuf,
+        armed: std::sync::atomic::AtomicBool,
+        answers: std::sync::Mutex<Vec<Option<rusqlite::ErrorCode>>>,
+    }
+
+    impl ProbingClock {
+        fn over(inner: &kr_transport::clock::ManualClock, record: std::path::PathBuf) -> Arc<Self> {
+            Arc::new(Self {
+                inner: inner.clone(),
+                record,
+                armed: std::sync::atomic::AtomicBool::new(false),
+                answers: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn arm(&self, armed: bool) {
+            self.armed.store(armed, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn answers(&self) -> Vec<Option<rusqlite::ErrorCode>> {
+            self.answers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl kr_transport::clock::ContinuousClock for ProbingClock {
+        fn now(&self) -> kr_transport::clock::ContinuousInstant {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                let probe = rusqlite::Connection::open(&self.record).expect("a third connection");
+                probe
+                    .busy_timeout(std::time::Duration::ZERO)
+                    .expect("no wait for the lock");
+                let asked = probe.execute_batch("BEGIN IMMEDIATE");
+                let answer = match asked {
+                    Ok(()) => {
+                        probe.execute_batch("ROLLBACK").expect("the lock is let go");
+                        None
+                    }
+                    Err(rusqlite::Error::SqliteFailure(refused, _)) => Some(refused.code),
+                    Err(other) => panic!("the probe failed in another way: {other}"),
+                };
+                self.answers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(answer);
+            }
+            kr_transport::clock::ContinuousClock::now(&self.inner)
+        }
+    }
+
     fn arm_for_this_thread(armed: &Armed) {
         *armed
             .lock()
@@ -1843,10 +1901,11 @@ mod a_start_hold_on_clocks_moved_by_hand {
     }
 
     /// Another connection to the record of holds that takes its write lock now, waits for the
-    /// message the returned sender sends, runs `then`, and lets the lock go.
+    /// message the returned sender sends, runs `then`, lets the lock go, and says so on `ended`.
     fn another_writer_of_the_holds(
         temp: &kr_ipc::testing::TempHost,
         then: impl FnOnce() + Send + 'static,
+        ended: std::sync::mpsc::Sender<()>,
     ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
         let path = temp
             .environment()
@@ -1865,6 +1924,7 @@ mod a_start_hold_on_clocks_moved_by_hand {
             connection
                 .execute_batch("ROLLBACK")
                 .expect("the other writer lets the record go");
+            let _ = ended.send(());
         });
         held_rx.recv().expect("the record is held");
         (release, writer)
@@ -1886,35 +1946,80 @@ mod a_start_hold_on_clocks_moved_by_hand {
     /// Both waits before the lock count toward the start's moment: the continuous clock moves
     /// four seconds while the start reads the settled wall clock, and four more while another
     /// writer holds the record. The moment is the wall reading plus eight seconds, and the time to
-    /// send counts from the reading once the lock is held.
+    /// send counts from the reading once the lock is held: the other writer has let go before the
+    /// first reading that follows, and a third connection that asks for the lock at that reading,
+    /// and waits no time for it, is refused as busy.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_moment_of_a_start_counts_the_wait_for_the_floor_and_the_wait_for_the_lock() {
         let temp = kr_ipc::testing::TempHost::create();
         let continuous = kr_transport::clock::ManualClock::new();
+        let probe = ProbingClock::over(
+            &continuous,
+            temp.environment()
+                .state_dir()
+                .join(crate::voice_start_holds::VOICE_START_HOLDS_RECORD),
+        );
         let wall_ms = kr_ipc::now_ms().get();
         let release: Release = Arc::new(std::sync::Mutex::new(None));
-        let (armed, clocks) = clocks_that_move_at_a_reading(&continuous, wall_ms, {
-            let (continuous, release) = (continuous.clone(), Arc::clone(&release));
-            move || {
-                continuous.advance(std::time::Duration::from_secs(4));
-                let_the_writer_go(&release);
-            }
-        });
+        let ended: Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let (armed, clocks) = clocks_that_move_at_a_reading(
+            Arc::clone(&probe) as Arc<dyn kr_transport::clock::ContinuousClock>,
+            wall_ms,
+            {
+                let (continuous, release, ended, probe) = (
+                    continuous.clone(),
+                    Arc::clone(&release),
+                    Arc::clone(&ended),
+                    Arc::clone(&probe),
+                );
+                move || {
+                    continuous.advance(std::time::Duration::from_secs(4));
+                    let_the_writer_go(&release);
+                    // The other writer has let the record go before any later reading is probed,
+                    // so a busy answer to the probe is the start's own lock.
+                    if let Some(ended) = ended
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .take()
+                    {
+                        ended.recv().expect("the other writer let go");
+                    }
+                    probe.arm(true);
+                }
+            },
+        );
         let controller = daemon_on_clocks_to_move(&temp, clocks).await;
-        let (writer_release, writer) = another_writer_of_the_holds(&temp, {
-            let continuous = continuous.clone();
-            move || continuous.advance(std::time::Duration::from_secs(4))
-        });
+        let (writer_ended, writer_ends) = std::sync::mpsc::channel::<()>();
+        let (writer_release, writer) = another_writer_of_the_holds(
+            &temp,
+            {
+                let continuous = continuous.clone();
+                move || continuous.advance(std::time::Duration::from_secs(4))
+            },
+            writer_ended,
+        );
         *release
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer_release);
+        *ended
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer_ends);
         let (start, _) =
             start_of(&controller, action(1), std::time::Duration::from_secs(600)).await;
         arm_for_this_thread(&armed);
         start.before_the_broker(600).expect("admitted");
+        probe.arm(false);
         writer.join().expect("the other writer ran");
         let row = standing(&controller);
         assert_eq!(row.asked_ms, wall_ms + 8_000, "both waits count");
+        let answers = probe.answers();
+        assert_eq!(
+            answers.first(),
+            Some(&Some(rusqlite::ErrorCode::DatabaseBusy)),
+            "the first reading of the continuous clock after the other writer let go was made while \
+             the write lock was free: {answers:?}"
+        );
         let limit = std::time::Duration::from_millis(crate::voice_start_holds::SEND_LIMIT_MS);
         assert_eq!(
             start.send_by(),
@@ -1933,16 +2038,18 @@ mod a_start_hold_on_clocks_moved_by_hand {
         let continuous = kr_transport::clock::ManualClock::new();
         let wall_ms = kr_ipc::now_ms().get();
         let release: Release = Arc::new(std::sync::Mutex::new(None));
-        let (armed, clocks) = clocks_that_move_at_a_reading(&continuous, wall_ms, {
-            let (continuous, release) = (continuous.clone(), Arc::clone(&release));
-            move || {
-                // The admission's deadline is a minute out, and it passes during the wait.
-                continuous.advance(std::time::Duration::from_secs(61));
-                let_the_writer_go(&release);
-            }
-        });
+        let (armed, clocks) =
+            clocks_that_move_at_a_reading(Arc::new(continuous.clone()), wall_ms, {
+                let (continuous, release) = (continuous.clone(), Arc::clone(&release));
+                move || {
+                    // The admission's deadline is a minute out, and it passes during the wait.
+                    continuous.advance(std::time::Duration::from_secs(61));
+                    let_the_writer_go(&release);
+                }
+            });
         let controller = daemon_on_clocks_to_move(&temp, clocks).await;
-        let (writer_release, writer) = another_writer_of_the_holds(&temp, || ());
+        let (writer_release, writer) =
+            another_writer_of_the_holds(&temp, || (), std::sync::mpsc::channel().0);
         *release
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer_release);
@@ -1958,8 +2065,13 @@ mod a_start_hold_on_clocks_moved_by_hand {
         let refused = start
             .still_admitted()
             .expect_err("the check before the service sees the admission over");
-        assert_ne!(refused.code, ErrorCode::StorageUnavailable, "{refused}");
-        assert_ne!(refused.code, ErrorCode::DraftConflict, "{refused}");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains("the deadline this action was admitted under passed"),
+            "the refusal says the admission's deadline passed: {refused}"
+        );
         assert_eq!(standing(&controller).action, action(1), "the row stands");
         // Nothing was asked, so the effect ends the row, and the claim's settlement deletes it.
         start.after_the_broker(BrokerEffect::NotAsked);
@@ -2157,7 +2269,7 @@ mod a_start_hold_on_clocks_moved_by_hand {
         drop(controller);
         // The daemon's own tasks let go of their handles as they run, so the count is read up to a
         // bound; what the closure holds is never let go of by them.
-        for _ in 0..5_000 {
+        for _ in 0..120_000 {
             if controller_after.strong_count() == 0 {
                 break;
             }
