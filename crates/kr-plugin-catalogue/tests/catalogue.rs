@@ -2947,6 +2947,11 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_never_reaches_a_statement() {
     }
 }
 
+/// How the refusal of a key that is not the label's begins: the package is not one this host will
+/// install, and the refusal's own name follows.
+const KEY_REFUSAL_WORDS: &str =
+    "is not a package this host will install: placement.key_not_the_labels";
+
 /// KR-REQ-11.44: the key rule holds for a release that declares no placement: a recipe that adds
 /// a configuration key that is not the label's is refused before any statement, as it is where a
 /// table declares one, and the label's own key is not refused for want of a declared area.
@@ -2978,7 +2983,8 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_is_refused_where_no_placement
         .await;
         assert!(
             matches!(&refusal, Err(CatalogueError::UnsafePackage { detail })
-                if detail.contains("placement.key_not_the_labels")
+                if detail.contains(KEY_REFUSAL_WORDS)
+                    && !detail.contains("cannot be read to describe it")
                     && !detail.contains("Runs nothing")),
             "{what}: {refusal:?}"
         );
@@ -3022,7 +3028,8 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_is_refused_where_no_table_is_
     let other = statement_of_edited(words, false, claude("enabledPlugins.other@skills-dir")).await;
     assert!(
         matches!(&other, Err(CatalogueError::UnsafePackage { detail })
-            if detail.contains("placement.key_not_the_labels")),
+            if detail.contains(KEY_REFUSAL_WORDS)
+                && !detail.contains("cannot be read to describe it")),
         "another plugin's folder: {other:?}"
     );
 
@@ -3040,7 +3047,8 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_is_refused_where_no_table_is_
     .await;
     assert!(
         matches!(&unkeyed, Err(CatalogueError::UnsafePackage { detail })
-            if detail.contains("placement.key_not_the_labels")),
+            if detail.contains(KEY_REFUSAL_WORDS)
+                && !detail.contains("cannot be read to describe it")),
         "a label that has no key of its own: {unkeyed:?}"
     );
 }

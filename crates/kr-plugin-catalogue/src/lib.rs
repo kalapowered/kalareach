@@ -2495,7 +2495,9 @@ impl Catalogue {
                 .into_iter()
                 .next()
             {
-                Some(refusal) => Err(unsafe_package(refusal.to_string())),
+                Some(refusal) => Err(CatalogueError::UnsafePackage {
+                    detail: format!("{subject} is not a package this host will install: {refusal}"),
+                }),
                 None => Ok(()),
             }
         };
