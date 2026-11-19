@@ -444,6 +444,9 @@ fn field(printed: &str, name: &str) -> String {
 #[cfg(target_os = "macos")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_on_macos_is_a_per_user_launchd_job_in_its_own_directory() {
+    if kr_ipc::testing::account_launchd::stands_down("a launchd job") {
+        return;
+    }
     let uid = kr_ipc::paths::current_uid();
     let graphical = kr_ipc::testing::account_launchd::command(&["print", &format!("gui/{uid}")])
         .output()
