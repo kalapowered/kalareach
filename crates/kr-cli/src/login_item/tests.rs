@@ -891,9 +891,15 @@ fn a_file_under_a_parent_that_is_not_a_directory_is_gone_and_its_removal_finishe
     std::fs::remove_dir(&directory).expect("the directory goes");
     std::fs::write(&directory, b"a file now\n").expect("a file in its place");
     let mut run = tree.run("", tree.record());
-    steps::run_all(&mut run, &REMOVE).unwrap_or_else(|error| {
-        panic!("the removal finishes: {}", error.said().as_str());
-    });
+    let removed = steps::run_all(&mut run, &REMOVE);
+    assert!(
+        removed.is_ok(),
+        "the removal finishes: {}",
+        removed
+            .err()
+            .map(|error| error.said().as_str().to_owned())
+            .unwrap_or_default()
+    );
     assert!(tree.record().is_none(), "the record is dropped");
     assert_eq!(
         bytes(&directory).as_deref(),
