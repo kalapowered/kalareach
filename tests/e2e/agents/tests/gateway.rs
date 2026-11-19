@@ -5416,6 +5416,11 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
                 after.listed.agent_resources.cursor, before.listed.agent_resources.cursor,
                 "the same position in the broker's stream"
             );
+            assert_eq!(
+                after.listed.agent_resources.continue_after,
+                before.listed.agent_resources.continue_after,
+                "the same end of the resource page"
+            );
             assert_eq!(after.binding, before.binding, "the same binding");
             assert_eq!(
                 after.identity, before.identity,
