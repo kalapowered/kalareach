@@ -1728,7 +1728,7 @@ describe('the rate a start accepts', () => {
   // device kept of the starts before it: the screen reads what the device keeps again.
   it('shows what the device keeps after a start answered with a changed rate', async () => {
     const user = userEvent.setup()
-    const { controls, port } = start((controls) => {
+    const { controls } = start((controls) => {
       controls.oweVoice({
         kind: 'start_unknown',
         action_id: 'an-old-start',
@@ -1738,14 +1738,8 @@ describe('the rate a start accepts', () => {
     })
     await waitForChoice()
     expect(await screen.findByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
-    // The host's hold took the start and the device removed the older notice: the answer carries
+    // The host's hold takes the start and the device removes the older notice: the answer carries
     // the rate, and what the device keeps afterwards no longer holds the notice.
-    const answered = port.voiceStart.bind(port)
-    vi.mocked(port.voiceStart).mockImplementationOnce(async (...args) => {
-      const outcome = await answered(...args)
-      controls.removeOwedVoiceStarts()
-      return outcome
-    })
     controls.changeVoiceRate('2026-10-b', '3')
 
     await user.click(screen.getByRole('button', { name: 'Start voice session' }))
