@@ -57,6 +57,9 @@ pub(super) struct ClientParts<'a> {
     /// What the relay lease service asks before it sends a request for a new lease, when this host
     /// reads the signed release matrix.
     pub release_gate: Option<Arc<kr_client::services::matrix::ReleaseGate>>,
+    /// The daemon's own continuous clock. The voice broker reads a start's send limit on it, so
+    /// the limit the admission set and the check before the write count from one anchor.
+    pub continuous: Arc<dyn kr_transport::clock::ContinuousClock>,
 }
 
 /// The origin a selection of the configuration document names, or why it cannot be used.
@@ -113,7 +116,8 @@ impl Controller {
                 parts.release_gate.clone(),
             )?);
         }
-        clients.managed_inference = Self::managed_voice_provider(started, parts.account);
+        clients.managed_inference =
+            Self::managed_voice_provider(started, parts.account, &parts.continuous);
         Ok(clients)
     }
 
@@ -127,6 +131,7 @@ impl Controller {
     fn managed_voice_provider(
         started: &Started,
         account: &Arc<HostAccount>,
+        continuous: &Arc<dyn kr_transport::clock::ContinuousClock>,
     ) -> Option<Arc<dyn ManagedVoiceService>> {
         let origin = started.voice.broker_origin()?;
         let unavailable = |reason: &dyn std::fmt::Display| {
@@ -151,9 +156,14 @@ impl Controller {
             proxy,
             crate::managed_transport::VOICE_DEADLINES,
         ));
-        crate::voice::VoiceModule::managed_provider(origin, transport, account.tokens_for(origin))
-            .inspect_err(|error| origin_unusable(error))
-            .ok()
+        crate::voice::VoiceModule::managed_provider(
+            origin,
+            transport,
+            account.tokens_for(origin),
+            Arc::clone(continuous),
+        )
+        .inspect_err(|error| origin_unusable(error))
+        .ok()
     }
 
     /// The service clients this daemon holds, for a suite that calls them as the daemon's own code

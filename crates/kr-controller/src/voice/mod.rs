@@ -133,7 +133,9 @@ impl VoiceModule {
     }
 
     /// Builds the managed broker client for the origin the configuration document names,
-    /// presenting the account token `tokens` holds for it.
+    /// presenting the account token `tokens` holds for it. `continuous` is the clock a start's
+    /// send limit is read on: the daemon's own, so that the limit the admission sets and the check
+    /// before the write count from one anchor.
     ///
     /// # Errors
     ///
@@ -143,8 +145,11 @@ impl VoiceModule {
         origin: &str,
         http: Arc<dyn ServiceHttp>,
         tokens: Arc<dyn kr_client::services::AccountTokenSource>,
+        continuous: Arc<dyn kr_transport::clock::ContinuousClock>,
     ) -> std::result::Result<Arc<dyn ManagedVoiceService>, kr_client::ClientError> {
-        Ok(Arc::new(ManagedVoiceBroker::new(origin, http, tokens)?))
+        Ok(Arc::new(
+            ManagedVoiceBroker::new(origin, http, tokens)?.with_continuous_clock(continuous),
+        ))
     }
 
     /// Replaces the provider this service brokers through.
@@ -557,8 +562,13 @@ mod tests {
             }
             accepted += 1;
             assert!(
-                VoiceModule::managed_provider(origin, Arc::new(NoExchange), Arc::new(NoToken))
-                    .is_ok(),
+                VoiceModule::managed_provider(
+                    origin,
+                    Arc::new(NoExchange),
+                    Arc::new(NoToken),
+                    Arc::new(kr_transport::clock::SystemContinuousClock::new()),
+                )
+                .is_ok(),
                 "{origin} validated and the managed broker refused it"
             );
             assert!(

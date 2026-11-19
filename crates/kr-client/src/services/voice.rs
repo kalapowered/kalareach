@@ -45,6 +45,9 @@ use std::sync::Arc;
 use kr_protocol::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 
+pub use kr_transport::clock::{ContinuousClock, ContinuousInstant};
+
+use super::SendGate;
 use super::ServiceFuture;
 use super::account::AccountTokenSource;
 pub use super::{ServiceHttp, ServiceHttpAnswer};
@@ -173,6 +176,14 @@ pub struct VoiceSessionRequest {
     /// is no longer current with the rate as it is now ([`VoiceStart::RateChanged`]). A request
     /// that names none is refused here, before it is sent.
     pub expected_rate_version: Option<String>,
+    /// The latest instant at which this request may still be written, on the clock the broker was
+    /// given ([`ManagedVoiceBroker::with_continuous_clock`]).
+    ///
+    /// The broker checks it after its own preparation (the account token, and the transport's
+    /// setup) and immediately before the write, and sends nothing when the instant has been
+    /// reached. `None` sets no limit. A limit on a broker that has no clock sends nothing: a limit
+    /// that cannot be read is not one that has been kept.
+    pub send_by: Option<ContinuousInstant>,
 }
 
 impl fmt::Debug for VoiceSessionRequest {
@@ -186,6 +197,7 @@ impl fmt::Debug for VoiceSessionRequest {
                 "expected_rate_version",
                 &self.expected_rate_version.as_ref().map(|_| "<present>"),
             )
+            .field("send_by", &self.send_by)
             .field("offer_sdp_bytes", &self.offer_sdp.len())
             .finish_non_exhaustive()
     }
@@ -1134,6 +1146,9 @@ pub struct ManagedVoiceBroker {
     origin: String,
     http: Arc<dyn ServiceHttp>,
     tokens: Arc<dyn AccountTokenSource>,
+    /// The clock a request's `send_by` is read on. A broker that has none sends no request that
+    /// names a limit.
+    clock: Option<Arc<dyn ContinuousClock>>,
 }
 
 impl fmt::Debug for ManagedVoiceBroker {
@@ -1192,7 +1207,18 @@ impl ManagedVoiceBroker {
             origin,
             http,
             tokens,
+            clock: None,
         })
+    }
+
+    /// Gives the broker the continuous clock that a request's `send_by` is read on.
+    ///
+    /// It has to be the clock the limit was taken from: two clocks have two anchors, and an instant
+    /// of one means nothing on the other.
+    #[must_use]
+    pub fn with_continuous_clock(mut self, clock: Arc<dyn ContinuousClock>) -> Self {
+        self.clock = Some(clock);
+        self
     }
 
     /// The origin this client addresses.
@@ -1248,6 +1274,18 @@ impl ManagedVoiceBroker {
     }
 }
 
+/// The refusal for a start whose send limit was reached before its request was written. Nothing
+/// was sent; the person's next start can work.
+fn not_sent_in_time() -> ClientError {
+    ClientError::refusal(
+        ErrorCode::UpstreamUnavailable,
+        Shown::said(
+            "Nothing was started. This host waited too long before it could ask the voice \
+             service, so it did not ask. A later start can work.",
+        ),
+    )
+}
+
 impl ManagedVoiceService for ManagedVoiceBroker {
     fn metadata(&self) -> ServiceFuture<'_, Option<VoiceMetadata>> {
         Box::pin(async move {
@@ -1276,7 +1314,30 @@ impl ManagedVoiceService for ManagedVoiceBroker {
             // Read rather than classified into an error: a creation has three outcomes and two of
             // them arrive as refusals on this wire. Turning an unknown creation into an error here
             // would leave a caller with a failure it might retry.
-            let answer = self.exchange(VOICE_SESSIONS_PATH, body).await?;
+            let Some(by) = request.send_by else {
+                let answer = self.exchange(VOICE_SESSIONS_PATH, body).await?;
+                return Ok(read_start_answer(&answer));
+            };
+            // The token step runs to its end and is never timed: a token request that is stopped
+            // part way can leave a refresh that the service made and this host did not keep. The
+            // limit is checked after it, and after the transport's own setup, immediately before
+            // the write. A limit that is reached sends nothing.
+            let Some(clock) = self.clock.clone() else {
+                return Err(not_sent_in_time());
+            };
+            let authorisation = self.authorisation().await?;
+            let url = format!("{}{VOICE_SESSIONS_PATH}", self.origin);
+            let gate = SendGate { by, clock };
+            let answer = self
+                .http
+                .post_json_by(
+                    &url,
+                    &body,
+                    &[("authorization", authorisation.as_str())],
+                    &gate,
+                )
+                .await?
+                .ok_or_else(not_sent_in_time)?;
             Ok(read_start_answer(&answer))
         })
     }
@@ -1699,11 +1760,12 @@ mod tests {
             reasoning_budget_minor: Some(500),
             device_id: Some("44444444-4444-4444-4444-444444444444".to_owned()),
             expected_rate_version: Some("2026-09-a".to_owned()),
+            send_by: None,
         };
         renders_only(
             &request,
             &format!(
-                r#"VoiceSessionRequest{{duration_seconds:300,expected_rate_version:Some("<present>"),offer_sdp_bytes:{},..}}"#,
+                r#"VoiceSessionRequest{{duration_seconds:300,expected_rate_version:Some("<present>"),send_by:None,offer_sdp_bytes:{},..}}"#,
                 offer.len()
             ),
         );
@@ -2482,7 +2544,164 @@ mod tests {
             reasoning_budget_minor: None,
             device_id: None,
             expected_rate_version: version.map(str::to_owned),
+            send_by: None,
         }
+    }
+
+    /// A token source that moves a manual clock by `moves` while it runs, and counts the steps it
+    /// finished.
+    #[derive(Debug)]
+    struct ClockMovingToken {
+        clock: kr_transport::clock::ManualClock,
+        moves: std::time::Duration,
+        finished: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AccountTokenSource for ClockMovingToken {
+        fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+            Box::pin(async move {
+                self.clock.advance(self.moves);
+                self.finished
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                AccountToken::new("a-voice-token")
+            })
+        }
+    }
+
+    /// A start request whose limit is `seconds` after the clock's present reading.
+    fn limited_request(
+        clock: &kr_transport::clock::ManualClock,
+        seconds: u64,
+    ) -> VoiceSessionRequest {
+        let mut request = start_request(Some("2026-09-a"));
+        request.send_by = clock
+            .now()
+            .checked_add(std::time::Duration::from_secs(seconds));
+        request
+    }
+
+    fn broker_on(
+        service: &Arc<Scripted>,
+        tokens: Arc<dyn AccountTokenSource>,
+        clock: Option<&kr_transport::clock::ManualClock>,
+    ) -> ManagedVoiceBroker {
+        let broker = ManagedVoiceBroker::new(
+            "https://reach.example",
+            Arc::clone(service) as Arc<dyn ServiceHttp>,
+            tokens,
+        )
+        .expect("a broker client");
+        match clock {
+            Some(clock) => broker.with_continuous_clock(Arc::new(clock.clone())),
+            None => broker,
+        }
+    }
+
+    fn created() -> serde_json::Value {
+        serde_json::json!({ "ok": false, "error": { "code": "ANYTHING" } })
+    }
+
+    /// The token step runs to its end and the limit is checked after it: a start whose token step
+    /// outlasts the limit posts nothing, and the token step is not cut short.
+    #[tokio::test]
+    async fn a_request_past_its_send_limit_posts_nothing() {
+        let clock = kr_transport::clock::ManualClock::new();
+        let token = Arc::new(ClockMovingToken {
+            clock: clock.clone(),
+            moves: std::time::Duration::from_secs(31),
+            finished: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let service = Scripted::answering([(200, created())]);
+        let broker = broker_on(&service, token.clone(), Some(&clock));
+        let error = broker
+            .start(&limited_request(&clock, 30))
+            .await
+            .expect_err("the limit passed during the token step");
+        assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+        assert!(
+            service.sent().is_empty(),
+            "nothing was posted after the limit"
+        );
+        assert_eq!(
+            token.finished.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the token step ran to its end and was not cut short"
+        );
+    }
+
+    /// The limit is on the continuous clock: tokio's own time stands still here and the clock the
+    /// broker was given passes the limit.
+    #[tokio::test(start_paused = true)]
+    async fn a_continuous_clock_past_the_limit_with_tokio_time_still_sends_nothing() {
+        let clock = kr_transport::clock::ManualClock::new();
+        let service = Scripted::answering([(200, created())]);
+        let broker = broker_on(&service, Arc::new(Token), Some(&clock));
+        let request = limited_request(&clock, 30);
+        clock.advance(std::time::Duration::from_secs(31));
+        let error = broker
+            .start(&request)
+            .await
+            .expect_err("the continuous clock is past the limit");
+        assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+        assert!(service.sent().is_empty());
+    }
+
+    /// A limit that is reached at the instant it names is passed.
+    #[tokio::test]
+    async fn a_zero_window_sends_nothing() {
+        let clock = kr_transport::clock::ManualClock::new();
+        let service = Scripted::answering([(200, created())]);
+        let broker = broker_on(&service, Arc::new(Token), Some(&clock));
+        let error = broker
+            .start(&limited_request(&clock, 0))
+            .await
+            .expect_err("a window of zero is passed");
+        assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+        assert!(service.sent().is_empty());
+    }
+
+    /// A limit that no clock can read is not one that has been kept.
+    #[tokio::test]
+    async fn a_limit_on_a_broker_with_no_clock_sends_nothing() {
+        let clock = kr_transport::clock::ManualClock::new();
+        let service = Scripted::answering([(200, created())]);
+        let broker = broker_on(&service, Arc::new(Token), None);
+        let error = broker
+            .start(&limited_request(&clock, 30))
+            .await
+            .expect_err("a broker with no clock cannot keep a limit");
+        assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+        assert!(service.sent().is_empty());
+    }
+
+    /// A start that is released one second inside its limit is posted once.
+    #[tokio::test]
+    async fn a_request_inside_its_limit_posts_once() {
+        let clock = kr_transport::clock::ManualClock::new();
+        let token = Arc::new(ClockMovingToken {
+            clock: clock.clone(),
+            moves: std::time::Duration::from_secs(29),
+            finished: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let service = Scripted::answering([(200, created())]);
+        let broker = broker_on(&service, token, Some(&clock));
+        broker
+            .start(&limited_request(&clock, 30))
+            .await
+            .expect("a start inside its limit is sent");
+        assert_eq!(service.sent().len(), 1);
+    }
+
+    /// A request with no limit is posted as it always was, with or without a clock.
+    #[tokio::test]
+    async fn a_request_with_no_limit_posts_as_before() {
+        let service = Scripted::answering([(200, created())]);
+        let broker = broker_on(&service, Arc::new(Token), None);
+        broker
+            .start(&start_request(Some("2026-09-a")))
+            .await
+            .expect("a start with no limit is sent");
+        assert_eq!(service.sent().len(), 1);
     }
 
     /// KR-REQ-15.19: the terms a person is shown come from the service's own read, asked with the

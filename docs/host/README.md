@@ -7910,6 +7910,36 @@ the client's. A client that does not replace an action by itself is what keeps t
 Reading what the earlier action did is a repeat of it, which carries the request: no read names a
 share's claim, since no record of one holds the method it was made under.
 
+A `voice.start` under a fresh action is refused with `DRAFT_CONFLICT` while an earlier start from the
+same paired device may still have a call running. Before the host asks the managed voice service for
+a call, it writes one row for the device (the action, the moment it read the start and the moment the
+hold ends) in `voice-start-holds.sqlite3`, beside the other stores, and the row survives a restart. An
+unnamed start, or one that names another action, is refused while the row stands, in words that name
+the standing action and say when the hold ends by this host's clock; the refusal is kept as that
+action's answer, so a repeat of it is told the same and asks nothing. A start that names the standing
+action in `supersedes_action_id` is admitted and replaces the row. The refusal is also given when the row
+could not be written, with its own words, and then nothing is asked of the service. The row ends when
+the start's effect shows that no call of it can still be running unreconciled (the service was not
+asked, refused, or created nothing; the call is bound to a voice session; a live session already
+holds it; or this host closed it and the service confirmed it) and the claim the start answers under
+has settled, in either order. An outcome that may have been carried out and is not known, a close the
+service did not confirm, and an answer that could not be kept leave the row. The bound is the managed
+service's voice limit: the row ends after the call's length (at most 1,800 seconds, the service's own
+maximum) and 120 seconds, which are the 30 seconds a start may wait before its request is written, the
+50 seconds the exchange may take and 40 seconds for the difference between this host's clock and the
+service's. A creation the service itself lost, and a request the network delivers after the host
+stopped waiting, are not covered by it. The 30 seconds are enforced: the broker client reads them on the
+continuous clock, after the account token and the transport are ready and immediately before it writes
+the request, and a start that has run out of them sends nothing and is refused `UPSTREAM_UNAVAILABLE`;
+a suspend during the connection itself can still delay the write. The times are on the host's settled
+clock: a forward step of the wall clock ends a hold early, and a backward step lengthens it in real
+time, because the settled clock does not move back. An earlier release never opens the file, so a
+rollback loses the holds, and a row that a rollback leaves behind, for a start the earlier release has
+since answered, is held until its end or until a start names it. This differs from the worker's rule
+above: the host cannot show that a person read the earlier result, so naming the action is the
+caller's statement that it did, and the hold ends by a bound as well as by an effect. The share
+paragraphs above are unchanged.
+
 No attempt takes over a claim, however long ago it was written: an attempt that is still running is
 not known to have stopped, and one that stopped may already have reached its effect. So a retry
 cannot perform a withdrawal a second time or start a second metered call, and an action identifier

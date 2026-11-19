@@ -1164,6 +1164,9 @@ pub struct Controller {
     checks: std::sync::Mutex<capability_checks::Checks>,
     /// What this host answered to requests for the checks, kept for 30 days.
     capability_answers: crate::capability_answers::Record,
+    /// The hold one device's voice start leaves while its outcome may be unknown, which survives a
+    /// restart.
+    voice_start_holds: Arc<crate::voice_start_holds::Record>,
     /// The sleep assertion this daemon holds, where it holds one, and whether a review of it is
     /// running.
     inhibitor: Mutex<Inhibitor>,
@@ -1304,6 +1307,21 @@ impl Controller {
     #[must_use]
     pub fn continuous_now(&self) -> kr_transport::clock::ContinuousInstant {
         self.clock.now()
+    }
+
+    /// The record of the holds that voice starts leave, for a suite that reads or breaks it.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn voice_start_holds(&self) -> &Arc<crate::voice_start_holds::Record> {
+        &self.voice_start_holds
+    }
+
+    /// The daemon's own continuous clock, for a suite that attaches a broker of its own and has to
+    /// give it the clock a start's send limit is read on.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn continuous_clock(&self) -> Arc<dyn ContinuousClock> {
+        Arc::clone(&self.clock)
     }
 
     /// Returns the environment's directories.

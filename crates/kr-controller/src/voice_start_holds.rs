@@ -20,6 +20,7 @@ use kr_protocol::ids::{ActionId, ActorId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::{ControllerError, Result};
+use crate::managed_transport::VOICE_DEADLINES;
 
 /// The file the hold lives in.
 pub const VOICE_START_HOLDS_RECORD: &str = "voice-start-holds.sqlite3";
@@ -29,6 +30,97 @@ pub const SCHEMA_VERSION: i64 = 1;
 
 /// The oldest schema version this build opens: it reads no other.
 pub const OLDEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
+
+/// The longest a managed call lasts, in seconds, whatever length the start asked for.
+///
+/// The managed service refuses a longer request and fixes a call's end from the moment it first
+/// reads the request, so a call this host's start made ends within this many seconds of that
+/// reading. It is the managed service's limit: a path to a provider of the person's own would state
+/// its own limit and its own test beside this one.
+pub const VOICE_CALL_LIMIT_SECONDS: u64 = 1_800;
+
+/// How long a start may wait before its request is written, in milliseconds: the limit the broker
+/// client enforces on the continuous clock.
+pub const SEND_LIMIT_MS: u64 = 30_000;
+
+/// How long the exchange with the managed service may take, in milliseconds: the host's own total
+/// deadline for it, so a change of the deadlines moves the bound with it.
+pub const POST_LIMIT_MS: u64 = VOICE_DEADLINES.total.as_millis() as u64;
+
+/// The difference allowed between this host's clock and the managed service's, in milliseconds. An
+/// assumption the bound rests on, not a measurement.
+pub const SKEW_MS: u64 = 40_000;
+
+/// What the bound adds to the length of the call: the send limit, the exchange and the skew.
+pub const HOLD_ALLOWANCE_MS: u64 = SEND_LIMIT_MS + POST_LIMIT_MS + SKEW_MS;
+
+/// The moment a start read at `asked_ms` for `duration_seconds` stops holding its device: after
+/// the request is read, the call lasts at most the voice limit, and the allowance covers what comes
+/// before the service reads the request.
+#[must_use]
+pub fn hold_ends_ms(asked_ms: u64, duration_seconds: u32) -> u64 {
+    let call = u64::from(duration_seconds).min(VOICE_CALL_LIMIT_SECONDS) * 1_000;
+    asked_ms
+        .saturating_add(call)
+        .saturating_add(HOLD_ALLOWANCE_MS)
+}
+
+/// The words of the host's refusal of a start while an earlier one holds the device. `named` is the
+/// action the start named, when it named one. The same words are read by the companion, which finds
+/// the standing action in them, and are pinned by one fixture both read.
+#[must_use]
+pub fn hold_words(held: &Row, named: Option<ActionId>) -> String {
+    let begun = utc_text(held.asked_ms);
+    let clear = utc_text(held.ends_ms.div_ceil(1_000).saturating_mul(1_000));
+    let action = held.action;
+    match named {
+        None => format!(
+            "Nothing was started. This host still holds an earlier voice start from this device \
+             (action {action}, begun at {begun} by this host's clock), so a call from it may \
+             still be running. A second start could be a second charged call. This hold does not \
+             stop a start that names action {action}, or a start made at or after {clear} by \
+             this host's clock."
+        ),
+        Some(other) => format!(
+            "Nothing was started. This start names action {other}. This host holds an earlier \
+             voice start from this device under action {action}, begun at {begun} by this host's \
+             clock, so a call from it may still be running. This hold does not stop a start that \
+             names action {action}, or a start made at or after {clear} by this host's clock."
+        ),
+    }
+}
+
+/// The words of the refusal of a start whose hold could not be written.
+pub const HOLD_NOT_RECORDED_WORDS: &str = "Nothing was started. This host could not record the \
+    start before asking the voice service, so it did not ask. A later start can work.";
+
+/// A moment as `YYYY-MM-DD HH:MM:SS UTC`.
+fn utc_text(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    let days = i64::try_from(seconds / 86_400).unwrap_or(i64::MAX / 2);
+    let in_day = seconds % 86_400;
+    // The civil date of a day count from 1970-01-01 (the proleptic Gregorian calendar).
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        in_day / 3_600,
+        in_day % 3_600 / 60,
+        in_day % 60
+    )
+}
 
 /// The hold one device's start left.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,6 +229,10 @@ impl Record {
 
     /// Decides whether the start of `action` by `actor` is admitted, and writes its row when it is.
     ///
+    /// `at_the_lock` gives the start's `(asked_ms, ends_ms)` and is called once, after the write
+    /// lock is held, so that the moment it reads includes every wait for the lock. `bound_passed`
+    /// is asked about a standing row's end with the `asked_ms` of this start.
+    ///
     /// One immediate transaction on one connection. A row that stands for `actor` holds the device
     /// unless `supersedes` names its action, or `bound_passed` says that the row's end has passed
     /// by the host's own decision; then the start's row replaces it. Rows past their end are
@@ -152,9 +248,8 @@ impl Record {
         actor: ActorId,
         action: ActionId,
         supersedes: Option<ActionId>,
-        asked_ms: u64,
-        ends_ms: u64,
-        bound_passed: &dyn Fn(u64) -> Result<bool>,
+        at_the_lock: &dyn Fn() -> (u64, u64),
+        bound_passed: &dyn Fn(u64, u64) -> Result<bool>,
         floor_covers: &dyn Fn(u64) -> bool,
     ) -> Result<Decision> {
         let mut connection = self
@@ -164,6 +259,7 @@ impl Record {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ControllerError::registry)?;
+        let (asked_ms, ends_ms) = at_the_lock();
         let standing: Option<(String, i64, i64)> = transaction
             .query_row(
                 "SELECT action_id, asked_ms, ends_ms FROM voice_start_holds WHERE actor_id = ?1",
@@ -174,7 +270,7 @@ impl Record {
             .map_err(ControllerError::registry)?;
         if let Some((standing_action, standing_asked, standing_ends)) = standing {
             let names_it = supersedes.is_some_and(|named| named.to_string() == standing_action);
-            if !names_it && !bound_passed(moment(standing_ends))? {
+            if !names_it && !bound_passed(moment(standing_ends), asked_ms)? {
                 if let Ok(held) = standing_action.parse::<ActionId>() {
                     return Ok(Decision::Held(Row {
                         action: held,
@@ -287,7 +383,7 @@ mod tests {
         ActionId::new(Uuid::from_bytes([n; 16]))
     }
 
-    fn never(_: u64) -> Result<bool> {
+    fn never(_: u64, _: u64) -> Result<bool> {
         Ok(false)
     }
 
@@ -302,7 +398,7 @@ mod tests {
     fn a_new_store_is_created_at_version_1_and_keeps_its_rows_across_a_reopen() {
         let (directory, record) = open();
         let admitted = record
-            .begin(actor(1), action(1), None, 10, 100, &never, &|_| false)
+            .begin(actor(1), action(1), None, &|| (10, 100), &never, &|_| false)
             .expect("begin");
         assert_eq!(admitted, Decision::Admitted);
         drop(record);
@@ -358,25 +454,24 @@ mod tests {
     fn begin_replaces_a_standing_row_only_for_its_named_action() {
         let (_directory, record) = open();
         record
-            .begin(actor(1), action(1), None, 10, 100, &never, &|_| false)
+            .begin(actor(1), action(1), None, &|| (10, 100), &never, &|_| false)
             .expect("the first start");
 
         let unnamed = record
-            .begin(actor(1), action(2), None, 20, 200, &never, &|_| false)
+            .begin(actor(1), action(2), None, &|| (20, 200), &never, &|_| false)
             .expect("begin");
         let misnamed = record
             .begin(
                 actor(1),
                 action(2),
                 Some(action(9)),
-                20,
-                200,
+                &|| (20, 200),
                 &never,
                 &|_| false,
             )
             .expect("begin");
         let other_device = record
-            .begin(actor(2), action(3), None, 20, 200, &never, &|_| false)
+            .begin(actor(2), action(3), None, &|| (20, 200), &never, &|_| false)
             .expect("begin");
 
         let held = Decision::Held(Row {
@@ -401,8 +496,7 @@ mod tests {
                 actor(1),
                 action(2),
                 Some(action(1)),
-                20,
-                200,
+                &|| (20, 200),
                 &never,
                 &|_| false,
             )
@@ -422,7 +516,7 @@ mod tests {
     fn a_row_past_its_end_is_no_hold() {
         let (_directory, record) = open();
         record
-            .begin(actor(1), action(1), None, 10, 100, &never, &|_| false)
+            .begin(actor(1), action(1), None, &|| (10, 100), &never, &|_| false)
             .expect("the first start");
 
         let later = record
@@ -430,9 +524,8 @@ mod tests {
                 actor(1),
                 action(2),
                 None,
-                200,
-                300,
-                &|ends| Ok(ends <= 150),
+                &|| (200, 300),
+                &|ends, _| Ok(ends <= 150),
                 &|_| false,
             )
             .expect("begin");
@@ -445,15 +538,14 @@ mod tests {
     fn end_names_the_action() {
         let (_directory, record) = open();
         record
-            .begin(actor(1), action(1), None, 10, 100, &never, &|_| false)
+            .begin(actor(1), action(1), None, &|| (10, 100), &never, &|_| false)
             .expect("the first start");
         record
             .begin(
                 actor(1),
                 action(2),
                 Some(action(1)),
-                20,
-                200,
+                &|| (20, 200),
                 &never,
                 &|_| false,
             )
@@ -477,14 +569,16 @@ mod tests {
     fn the_sweep_deletes_only_rows_the_floor_on_disk_covers() {
         let (_directory, record) = open();
         record
-            .begin(actor(2), action(5), None, 10, 100, &never, &|_| false)
+            .begin(actor(2), action(5), None, &|| (10, 100), &never, &|_| false)
             .expect("a row that ends early");
         record
-            .begin(actor(3), action(6), None, 10, 1_000, &never, &|_| false)
+            .begin(actor(3), action(6), None, &|| (10, 1_000), &never, &|_| {
+                false
+            })
             .expect("a row that ends late");
 
         record
-            .begin(actor(1), action(1), None, 500, 600, &never, &|ends| {
+            .begin(actor(1), action(1), None, &|| (500, 600), &never, &|ends| {
                 ends <= 500
             })
             .expect("begin");
@@ -492,5 +586,46 @@ mod tests {
         assert_eq!(record.standing(actor(2)).expect("reads"), None);
         assert!(record.standing(actor(3)).expect("reads").is_some());
         assert!(record.standing(actor(1)).expect("reads").is_some());
+    }
+
+    /// The host's words are the sentences of the fixture the companion reads too: whole-sentence
+    /// equality at a fixed clock, with the clear time rounded up to the next second.
+    #[test]
+    fn the_refusal_words_are_the_sentences_of_the_fixture() {
+        let fixture = include_str!("../tests/fixtures/voice_hold_refusals.txt");
+        let line = |name: &str| {
+            fixture
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+                .unwrap_or_else(|| panic!("the fixture has a line for {name}"))
+        };
+        let held = Row {
+            action: action(1),
+            asked_ms: 1_700_000_000_000,
+            ends_ms: 1_700_000_130_500,
+        };
+        let named = action(9);
+        let render = |template: &str| {
+            template
+                .replace("{A}", &held.action.to_string())
+                .replace("{B}", &named.to_string())
+                .replace("{T0}", "2023-11-14 22:13:20 UTC")
+                .replace("{T1}", "2023-11-14 22:15:31 UTC")
+        };
+        assert_eq!(hold_words(&held, None), render(line("unnamed")));
+        assert_eq!(hold_words(&held, Some(named)), render(line("named")));
+        assert_eq!(HOLD_NOT_RECORDED_WORDS, line("unrecorded"));
+        assert_eq!(utc_text(0), "1970-01-01 00:00:00 UTC");
+    }
+
+    /// The bound is the call's length, held to the voice limit, and the allowance: the send limit,
+    /// the exchange and the skew.
+    #[test]
+    fn a_requested_length_above_the_voice_limit_is_held_to_it_and_a_shorter_one_sets_the_bound() {
+        assert_eq!(POST_LIMIT_MS, 50_000);
+        assert_eq!(HOLD_ALLOWANCE_MS, 120_000);
+        assert_eq!(hold_ends_ms(1_000, 7_200), 1_000 + 1_800_000 + 120_000);
+        assert_eq!(hold_ends_ms(1_000, 600), 1_000 + 600_000 + 120_000);
+        assert_eq!(hold_ends_ms(u64::MAX - 5, 600), u64::MAX);
     }
 }

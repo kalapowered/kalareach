@@ -182,7 +182,7 @@ pub use organisation::{
 pub use relay::{
     ManagedRelayLeaseService, RelayAllowance, RelayGraceRemainder, RelayLeaseAnswer,
     RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayPayerAuthorisation, RelayWarning,
-    ServiceHttp, ServiceHttpAnswer, ServiceSigner,
+    SendGate, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
 };
 pub use storage::{
     ArchiveAnswer, BackupState, ManagedStorageService, NewUpload, ObjectDeleted, ObjectRange,

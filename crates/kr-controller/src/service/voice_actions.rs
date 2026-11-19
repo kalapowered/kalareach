@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::error::ProtocolError;
-use kr_protocol::ids::{ActorId, AuthorityRevision, SessionId};
+use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use kr_protocol::voice::{VoiceDelegateResult, VoiceDelegationOutcome};
@@ -667,7 +667,27 @@ impl Controller {
         // owes a fence it could not raise, whether the connection's registration still stands
         // under the revision the mutation was admitted at, and whether the deadline has passed on
         // this daemon's own continuous clock.
-        let admission = Arc::new(VoiceAdmission::new(Arc::clone(self), carried));
+        // A start names the earlier start it supersedes, when it names one. The key is read before
+        // anything is claimed: a key that is not an action identifier is the caller's mistake, and
+        // nothing is held for it.
+        let start = if method == Method::VoiceStart {
+            Some(StartHold {
+                row: Arc::new(AttemptRow::new(
+                    Arc::clone(&self.voice_start_holds),
+                    actor_id.clone(),
+                    mutation.action_id,
+                )),
+                supersedes: supersession_named_by(&mutation.expected)?,
+                send_by: std::sync::Mutex::new(None),
+            })
+        } else {
+            None
+        };
+        let mut admission = VoiceAdmission::new(Arc::clone(self), carried);
+        if let Some(start) = start {
+            admission = admission.for_a_start(start);
+        }
+        let admission = Arc::new(admission);
         // What this host already holds about this action, if anything. Answered before the claim,
         // so a retry of a completed change is its own result rather than a conflict, and one whose
         // first attempt is running or ended unrecorded is told so rather than performed.
@@ -785,6 +805,9 @@ impl Controller {
         // Recorded before the hold goes, so a retry finds the answer rather than a claim with
         // neither an answer nor an attempt behind it.
         self.settle_claim(&hold, &outcome)?;
+        // Whatever the claim recorded, and only now: the hold's row ends when its start's effect is
+        // known and its claim is settled, in either order.
+        admission.settled();
         drop(hold);
         outcome
     }
@@ -1128,6 +1151,115 @@ impl ClaimedRoute for DeviceRoute {
 pub(super) struct VoiceAdmission {
     controller: Arc<Controller>,
     carried: crate::authority::AdmittedMutation,
+    /// What a start owes the hold store; nothing for any other voice change.
+    start: Option<StartHold>,
+}
+
+/// What one voice start keeps for the hold store while it runs.
+struct StartHold {
+    row: Arc<AttemptRow>,
+    /// The earlier start the request names, when it names one.
+    supersedes: Option<ActionId>,
+    /// The instant by which the request has to be written, once the hold is written.
+    send_by: std::sync::Mutex<Option<kr_transport::clock::ContinuousInstant>>,
+}
+
+/// The row one voice start writes before it asks the managed service, and the one gate that ends it.
+///
+/// It holds the store and two identifiers, never the controller, so a closure that captures it does
+/// not keep a stopped controller alive. The row ends when both have happened, in either order: the
+/// start's effect says that no call of it can still be running unreconciled, and the claim the
+/// start answers under has settled. A claim that could not settle (the answer could not be kept)
+/// leaves the row standing whatever the effect said.
+pub(super) struct AttemptRow {
+    holds: Arc<crate::voice_start_holds::Record>,
+    actor: ActorId,
+    action: ActionId,
+    gate: std::sync::Mutex<RowGate>,
+}
+
+#[derive(Default)]
+struct RowGate {
+    ended: bool,
+    settled: bool,
+    deleted: bool,
+}
+
+impl AttemptRow {
+    fn new(holds: Arc<crate::voice_start_holds::Record>, actor: ActorId, action: ActionId) -> Self {
+        Self {
+            holds,
+            actor,
+            action,
+            gate: std::sync::Mutex::new(RowGate::default()),
+        }
+    }
+
+    /// The start's effect says that no call of it can still be running unreconciled.
+    pub(super) fn ended(&self) {
+        self.advance(|gate| gate.ended = true);
+    }
+
+    /// The claim the start answers under has settled, whatever it recorded.
+    pub(super) fn settled(&self) {
+        self.advance(|gate| gate.settled = true);
+    }
+
+    fn advance(&self, step: impl FnOnce(&mut RowGate)) {
+        let run = {
+            let mut gate = self
+                .gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            step(&mut gate);
+            let due = gate.ended && gate.settled && !gate.deleted;
+            gate.deleted |= due;
+            due
+        };
+        if run {
+            // The delete waits for the store, so it runs where a wait is allowed.
+            let delete = || {
+                if let Err(error) = self.holds.end(self.actor.clone(), self.action) {
+                    // The row stays until its end or a start that names it.
+                    eprintln!("kr-controller: a voice start's hold could not be ended: {error}");
+                }
+            };
+            if tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+                runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            }) {
+                tokio::task::block_in_place(delete);
+            } else {
+                delete();
+            }
+        }
+    }
+}
+
+/// The earlier start a voice start names in its preconditions, when it names one.
+///
+/// # Errors
+///
+/// Returns an invalid-argument refusal when the key is present and is not an action identifier.
+fn supersession_named_by(expected: &ParamsValue) -> Result<Option<ActionId>> {
+    let kr_cbor::CanonicalValue::Map(map) = expected.as_value() else {
+        return Ok(None);
+    };
+    for (key, value) in map.entries() {
+        if key.as_str() != kr_protocol::action::SUPERSEDES_ACTION_KEY {
+            continue;
+        }
+        if matches!(value, kr_cbor::CanonicalValue::Null) {
+            return Err(ControllerError::InvalidArgument(format!(
+                "the precondition {key} names an earlier start and then says nothing about it"
+            )));
+        }
+        return kr_protocol::wire::from_value::<ActionId>(value)
+            .map(Some)
+            .map_err(|error| {
+                ControllerError::InvalidArgument(format!("the precondition {key}: {error}"))
+            });
+    }
+    Ok(None)
 }
 
 impl VoiceAdmission {
@@ -1138,6 +1270,21 @@ impl VoiceAdmission {
         Self {
             controller,
             carried,
+            start: None,
+        }
+    }
+
+    /// Makes this the admission of a voice start, which writes its hold before the service is
+    /// asked.
+    fn for_a_start(mut self, start: StartHold) -> Self {
+        self.start = Some(start);
+        self
+    }
+
+    /// The claim this admission's start answers under has settled.
+    pub(super) fn settled(&self) {
+        if let Some(start) = &self.start {
+            start.row.settled();
         }
     }
 
@@ -1169,6 +1316,142 @@ impl kr_voice::Admission for VoiceAdmission {
 
     fn connection(&self) -> Option<kr_protocol::ids::ConnectionId> {
         Some(self.carried.connection_id)
+    }
+
+    /// Writes the start's hold, or refuses the start in the hold's own words.
+    ///
+    /// The readings come in this order, so that every wait before the write lock counts toward the
+    /// start's moment and none of it extends the time the start has to send: the continuous clock;
+    /// the settled wall clock, which can wait for the policy lock and the floor's write; the write
+    /// lock; and the continuous clock again, once the lock is held. The start's moment is the wall
+    /// reading plus what the continuous clock counted between the first and the last of them.
+    fn before_the_broker(&self, duration_seconds: u32) -> std::result::Result<(), ProtocolError> {
+        use crate::voice_start_holds::{Decision, SEND_LIMIT_MS, hold_ends_ms, hold_words};
+        use kr_protocol::error::ErrorCode;
+        use kr_protocol::grant::GrantExpiry;
+        use kr_protocol::scalars::TimestampMs;
+
+        let Some(start) = &self.start else {
+            return Ok(());
+        };
+        let controller = &self.controller;
+        let first = controller.clock.now();
+        let wall = controller.settled_now_ms();
+        let at_the_lock = std::cell::Cell::new(first);
+        let moments = || {
+            let now = controller.clock.now();
+            at_the_lock.set(now);
+            let waited =
+                u64::try_from(now.saturating_duration_since(first).as_millis()).unwrap_or(u64::MAX);
+            let asked = wall.saturating_add(waited);
+            (asked, hold_ends_ms(asked, duration_seconds))
+        };
+        let grants = controller.sharing.grants();
+        // The clock floor's own refusal (storage, or a clock whose continuity is lost) goes back
+        // unchanged: it is never the hold's words.
+        let floor_refusal = std::cell::RefCell::new(None);
+        let bound_passed = |ends: u64, asked: u64| {
+            grants
+                .bound_passed(
+                    GrantExpiry::At {
+                        expires_at_ms: TimestampMs::new(ends),
+                    },
+                    asked,
+                )
+                .map_err(|refusal| {
+                    *floor_refusal.borrow_mut() = Some(refusal);
+                    ControllerError::registry("the clock floor could not decide the hold")
+                })
+        };
+        let floor_covers = |ends: u64| {
+            grants.floor_on_disk_covers(GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(ends),
+            })
+        };
+        let begin = || {
+            start.row.holds.begin(
+                start.row.actor.clone(),
+                start.row.action,
+                start.supersedes,
+                &moments,
+                &bound_passed,
+                &floor_covers,
+            )
+        };
+        // The write waits for the store, up to its busy timeout, so it runs where a wait is allowed.
+        let decided = if tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        }) {
+            tokio::task::block_in_place(begin)
+        } else {
+            begin()
+        };
+        match decided {
+            Ok(Decision::Admitted) => {
+                let limit = std::time::Duration::from_millis(SEND_LIMIT_MS);
+                let by = at_the_lock.get().checked_add(limit);
+                // A request written after the admission's own deadline would make a call that the
+                // second check then closes, so the limit is bounded by that deadline too.
+                let by = match (by, self.carried.deadline) {
+                    (Some(by), Some(deadline)) => Some(by.min(deadline)),
+                    (by, _) => by,
+                };
+                *start
+                    .send_by
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = by;
+                Ok(())
+            }
+            Ok(Decision::Held(held)) => Err(ProtocolError::new(
+                ErrorCode::DraftConflict,
+                hold_words(&held, start.supersedes),
+            )),
+            Err(error) => {
+                if let Some(refusal) = floor_refusal.into_inner() {
+                    return Err(refusal.to_protocol_error());
+                }
+                // A failed commit can leave the row on disk, and nothing was asked: the row ends
+                // when the claim settles. The delete names the action, so it harms nothing when
+                // the row is absent.
+                start.row.ended();
+                eprintln!("kr-controller: a voice start's hold could not be written: {error}");
+                Err(ProtocolError::new(
+                    ErrorCode::StorageUnavailable,
+                    crate::voice_start_holds::HOLD_NOT_RECORDED_WORDS.to_owned(),
+                ))
+            }
+        }
+    }
+
+    fn after_the_broker(&self, effect: kr_voice::BrokerEffect) {
+        use kr_voice::BrokerEffect::{
+            Bound, Closed, Deferred, Handed, NotAsked, Open, Refused, Unknown,
+        };
+        if let Some(start) = &self.start {
+            match effect {
+                NotAsked | Refused | Bound | Handed | Closed => start.row.ended(),
+                Unknown | Open | Deferred => {}
+            }
+        }
+    }
+
+    fn send_by(&self) -> Option<kr_transport::clock::ContinuousInstant> {
+        *self
+            .start
+            .as_ref()?
+            .send_by
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn deferred(&self) -> Option<kr_voice::AfterDeferred> {
+        use kr_voice::BrokerEffect::{Closed, Handed};
+        let row = Arc::clone(&self.start.as_ref()?.row);
+        Some(Box::new(move |effect| {
+            if matches!(effect, Handed | Closed) {
+                row.ended();
+            }
+        }))
     }
 }
 

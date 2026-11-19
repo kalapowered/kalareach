@@ -377,7 +377,68 @@ pub trait Admission: Send + Sync + fmt::Debug {
     fn connection(&self) -> Option<kr_protocol::ids::ConnectionId> {
         None
     }
+
+    /// Called once by a voice start, after its own checks and before the managed service is asked.
+    /// An error stops the start there: nothing is asked and nothing else of the admission is
+    /// called, so the host's own words reach the caller as they are.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal when the service may not be asked.
+    fn before_the_broker(
+        &self,
+        _duration_seconds: u32,
+    ) -> std::result::Result<(), kr_protocol::error::ProtocolError> {
+        Ok(())
+    }
+
+    /// Called once by a voice start that called `before_the_broker` successfully, with what its
+    /// request to the service came to. Never called when `before_the_broker` was not.
+    fn after_the_broker(&self, _effect: BrokerEffect) {}
+
+    /// The latest instant at which the start's request may still be written, on the continuous
+    /// clock the managed service client was given. Read once, immediately before the request is
+    /// built. `None` sets no limit, as for a caller with no window of its own.
+    fn send_by(&self) -> Option<crate::broker::ContinuousInstant> {
+        None
+    }
+
+    /// What to run when a replayed call this start could not close or hand over is resolved
+    /// later, by another start. `None` leaves nothing to run.
+    fn deferred(&self) -> Option<AfterDeferred> {
+        None
+    }
 }
+
+/// What a start's request to the managed service came to, as far as this host can know it.
+///
+/// The host ends the record it wrote before the request only when the effect says that no call of
+/// this attempt can still be running unreconciled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrokerEffect {
+    /// The service was not asked: a check after `before_the_broker` refused the start.
+    NotAsked,
+    /// The request was not carried out, or the service answered and created nothing: the client
+    /// sent nothing, refused before any byte left, or the service refused the start.
+    Refused,
+    /// The request may have been carried out, and no call is known: the outcome is unknown.
+    Unknown,
+    /// A call exists and this host holds it: it is bound to a voice session that `voice.stop` ends.
+    Bound,
+    /// The service answered with a call that a live session on this host already holds.
+    Handed,
+    /// A call was created and this host closed it, and the service confirmed the close.
+    Closed,
+    /// A call was created and this host could not confirm that it closed.
+    Open,
+    /// The service answered with a call that another start may be about to bind, so the call is
+    /// resolved later and its closure runs then.
+    Deferred,
+}
+
+/// What a start leaves to run when its deferred call is resolved, with the effect the call came
+/// to: [`BrokerEffect::Handed`], [`BrokerEffect::Closed`] or [`BrokerEffect::Open`].
+pub type AfterDeferred = Box<dyn FnOnce(BrokerEffect) + Send>;
 
 /// An admission that never runs out, for a caller with no window of its own.
 #[derive(Clone, Copy, Debug)]

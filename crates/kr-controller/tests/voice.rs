@@ -3235,7 +3235,8 @@ async fn a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate
         Arc::clone(&service) as Arc<dyn ServiceHttp>,
         Arc::new(VoiceToken),
     )
-    .expect("a broker client");
+    .expect("a broker client")
+    .with_continuous_clock(host.controller().continuous_clock());
     host.controller()
         .voice()
         .attach_provider(Some(Arc::new(broker) as Arc<dyn ManagedVoiceService>));
@@ -3376,4 +3377,366 @@ async fn a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate
     assert_eq!(sent[1].1["expectedRateVersion"], "2026-09-a");
     assert_eq!(sent[2].1["expectedRateVersion"], "2026-10-b");
     host.stop().await;
+}
+
+/// A host with a paired device that holds a voice grant, a prepared call, and the managed service
+/// scripted on its wire. The host's broker client, the daemon and the device's connection are real.
+struct HoldWorld {
+    host: net_support::Host,
+    _device: net_support::Device,
+    session: kr_client::session::Session,
+    environment_id: EnvironmentId,
+    device_id: DeviceId,
+    params: VoiceStartParams,
+    service: Arc<ScriptedService>,
+}
+
+fn the_services_terms() -> serde_json::Value {
+    serde_json::json!({"ok": true, "data": {
+        "enabled": true,
+        "model": "gpt-live-1",
+        "disclosure": ["Audio travels directly between this device and the provider."],
+        "admissionNote": "The model received this context.",
+        "delegationNote": "Submit the delegation to the host over the device connection.",
+        "alternatives": ["The coding agent already running on the host."],
+        "rate": quoted("2026-09-a", "2"),
+        "maximumSessionSeconds": 1800,
+        "minimumRequestSeconds": 60,
+        "heartbeatSeconds": 20,
+        "contextBytes": 500
+    }})
+}
+
+/// The service's answer when its own answer to a start is lost on the way: a gateway's 504.
+fn a_start_whose_answer_is_lost() -> (&'static str, u16, serde_json::Value) {
+    ("/api/voice/sessions", 504, serde_json::Value::Null)
+}
+
+/// The service's answer to a start under a rate that is no longer current: nothing was created.
+fn a_start_under_a_changed_rate() -> (&'static str, u16, serde_json::Value) {
+    (
+        "/api/voice/sessions",
+        409,
+        serde_json::json!({"ok": false, "error": {
+            "code": "CONFLICT",
+            "reason": "rate_changed",
+            "message": "The rate for managed voice changed after it was shown.",
+            "rate": quoted("2026-10-b", "3")
+        }}),
+    )
+}
+
+/// The service's answer to a start that made a call.
+fn a_start_that_made_a_call(call: &str) -> (&'static str, u16, serde_json::Value) {
+    (
+        "/api/voice/sessions",
+        200,
+        serde_json::json!({"ok": true, "data": {
+            "callId": call,
+            "attemptId": "attempt-1",
+            "providerSessionId": "sess_1",
+            "answerSdp": "v=0\r\n",
+            "model": "gpt-live-1",
+            "closesAt": "2026-09-23T13:30:00Z",
+            "reservationEndsAt": "2026-09-23T13:30:15Z",
+            "controlPath": format!("/api/voice/sessions/{call}/control"),
+            "heartbeatSeconds": 20,
+            "sidebandReady": true,
+            "hold": {"reservationId": "hold-1", "reserved": "600", "ceiling": "1800",
+                     "deadline": "2026-09-23T13:30:15Z"},
+            "reasoningHold": null,
+            "rate": quoted("2026-09-a", "2"),
+            "latency": {"creationToAnswerMs": 300, "sidebandReadyMs": 100},
+            "replayed": false,
+            "disclosure": ["Audio travels directly between this device and the provider."]
+        }}),
+    )
+}
+
+impl HoldWorld {
+    async fn with(starts: Vec<(&'static str, u16, serde_json::Value)>) -> Self {
+        let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
+        let host = net_support::Host::start(&owner).await;
+        let (device, session) = net_support::paired_device(
+            &host,
+            &owner,
+            &[ActionRight::SessionView, ActionRight::AgentPrompt],
+        )
+        .await;
+        let environment_id = host.environment_id;
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut script = vec![("/api/voice/metadata", 200, the_services_terms())];
+        script.extend(starts);
+        let service = ScriptedService::answering(script);
+        // The broker reads the send limit on the daemon's own continuous clock.
+        let broker = ManagedVoiceBroker::new(
+            "https://reach.example",
+            Arc::clone(&service) as Arc<dyn ServiceHttp>,
+            Arc::new(VoiceToken),
+        )
+        .expect("a broker client")
+        .with_continuous_clock(host.controller().continuous_clock());
+        host.controller()
+            .voice()
+            .attach_provider(Some(Arc::new(broker) as Arc<dyn ManagedVoiceService>));
+        let device_id = host
+            .controller()
+            .devices()
+            .devices()
+            .expect("the device directory answers")
+            .into_iter()
+            .find(|record| {
+                let owner = host.owner.as_ref().map(|owner| owner.device_id);
+                record.is_paired() && owner != Some(record.device_id)
+            })
+            .expect("the paired device")
+            .device_id;
+        let _: kr_protocol::voice::VoiceGrantResult = remote_voice(
+            &session,
+            environment_id,
+            Method::VoiceGrant,
+            &VoiceGrantParams {
+                device_id,
+                session_ids: [session_id].into_iter().collect(),
+                actions: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the voice grant is written")
+        .to_typed()
+        .expect("a voice grant result");
+        let prepared: VoicePrepareResult = session
+            .read(
+                Method::VoicePrepare,
+                &VoicePrepareParams {
+                    session_ids: [session_id].into_iter().collect(),
+                    selected: CanonicalSet::from_iter([]),
+                },
+            )
+            .await
+            .expect("the host answers what a call would be");
+        let params = VoiceStartParams {
+            session_ids: [session_id].into_iter().collect(),
+            offer_sdp: "v=0\r\no=- 7 7 IN IP4 127.0.0.1\r\n".to_owned(),
+            duration_seconds: 600,
+            reasoning_budget_minor: Nullable::null(),
+            prepared: prepared.prepared,
+            expected_rate_version: Nullable::some("2026-09-a".to_owned()),
+        };
+        Self {
+            host,
+            _device: device,
+            session,
+            environment_id,
+            device_id,
+            params,
+            service,
+        }
+    }
+
+    /// A start under a fresh action, naming `earlier` when it is given.
+    async fn start(
+        &self,
+        earlier: Option<ActionId>,
+    ) -> std::result::Result<kr_client::session::Settled, kr_client::error::ClientError> {
+        let expected = match earlier {
+            Some(action) => {
+                kr_protocol::envelope::ParamsValue::from_typed(&std::collections::BTreeMap::from([
+                    (kr_protocol::action::SUPERSEDES_ACTION_KEY, action),
+                ]))
+                .expect("the precondition encodes")
+            }
+            None => kr_protocol::envelope::ParamsValue::empty(),
+        };
+        self.session
+            .mutate(
+                Method::VoiceStart,
+                ActionTarget::environment(self.environment_id),
+                None,
+                &expected,
+                &self.params,
+                NETWORK_LIFETIME,
+            )
+            .await
+    }
+
+    /// How many requests for a call reached the service.
+    fn calls_asked(&self) -> usize {
+        self.service
+            .sent()
+            .iter()
+            .filter(|(path, _)| path == "/api/voice/sessions")
+            .count()
+    }
+
+    /// The hold this device's start left, when one stands.
+    fn hold(&self) -> Option<kr_controller::voice_start_holds::Row> {
+        self.host
+            .controller()
+            .voice_start_holds()
+            .standing(kr_transport::listener::device_principal(&self.device_id))
+            .expect("the record reads")
+    }
+}
+
+/// KR-REQ-23.24: a start whose outcome the host could not learn holds the device. A fresh start is
+/// refused in the hold's words, names the standing action, and asks the service nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_creation_unknown_holds_the_device_and_a_fresh_start_asks_the_broker_nothing() {
+    let world = HoldWorld::with(vec![
+        a_start_whose_answer_is_lost(),
+        a_start_that_made_a_call("call-1"),
+    ])
+    .await;
+    let answered = world.start(None).await.expect("the host answers");
+    let result: kr_protocol::voice::VoiceStartResult = answered
+        .result()
+        .cloned()
+        .expect("a result")
+        .to_typed()
+        .expect("a start result");
+    assert!(
+        matches!(result.outcome, VoiceStartOutcome::CreationUnknown { .. }),
+        "{:?}",
+        result.outcome
+    );
+    // The row names the action of the start that left it.
+    let first = world
+        .hold()
+        .expect("the unknown start left its hold")
+        .action;
+
+    let refused = world
+        .start(None)
+        .await
+        .expect_err("a fresh start is refused while the hold stands");
+    assert_eq!(refused.code(), kr_protocol::error::ErrorCode::DraftConflict);
+    let words = refused.to_string();
+    assert!(
+        words.contains("Nothing was started. This host still holds an earlier voice start"),
+        "{words}"
+    );
+    assert!(words.contains(&first.to_string()), "{words}");
+    assert_eq!(world.calls_asked(), 1, "the refused start asked nothing");
+    assert_eq!(world.hold().expect("still held").action, first);
+}
+
+/// KR-REQ-23.24: a start that names another action is refused with both in its words, and a start
+/// that names the standing action is admitted, replaces the row, and ends it when its call is bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_names_the_earlier_action_is_admitted_and_a_bound_call_ends_the_hold() {
+    let world = HoldWorld::with(vec![
+        a_start_whose_answer_is_lost(),
+        a_start_that_made_a_call("call-2"),
+    ])
+    .await;
+    world.start(None).await.expect("the host answers");
+    let first = world
+        .hold()
+        .expect("the unknown start left its hold")
+        .action;
+    let stranger = ActionId::new(kr_ipc::new_uuid());
+
+    let misnamed = world
+        .start(Some(stranger))
+        .await
+        .expect_err("a start that names another action is refused");
+    let words = misnamed.to_string();
+    assert_eq!(
+        misnamed.code(),
+        kr_protocol::error::ErrorCode::DraftConflict
+    );
+    assert!(
+        words.contains(&format!("This start names action {stranger}")),
+        "{words}"
+    );
+    assert!(words.contains(&first.to_string()), "{words}");
+    assert_eq!(world.calls_asked(), 1);
+
+    let named = world
+        .start(Some(first))
+        .await
+        .expect("a start that names the standing action is admitted");
+    let result: kr_protocol::voice::VoiceStartResult = named
+        .result()
+        .cloned()
+        .expect("a result")
+        .to_typed()
+        .expect("a start result");
+    assert!(
+        matches!(result.outcome, VoiceStartOutcome::Started { .. }),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(world.calls_asked(), 2);
+    assert_eq!(
+        world.hold(),
+        None,
+        "a call that is bound ends the row its start wrote"
+    );
+}
+
+/// KR-REQ-23.24: an answer that says nothing was created leaves no hold, so the next start asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_definite_refusal_leaves_no_hold() {
+    let world = HoldWorld::with(vec![
+        a_start_under_a_changed_rate(),
+        a_start_whose_answer_is_lost(),
+    ])
+    .await;
+    let refused = world.start(None).await.expect("the host answers");
+    let result: kr_protocol::voice::VoiceStartResult = refused
+        .result()
+        .cloned()
+        .expect("a result")
+        .to_typed()
+        .expect("a start result");
+    assert!(
+        matches!(result.outcome, VoiceStartOutcome::RateChanged { .. }),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(
+        world.hold(),
+        None,
+        "nothing was created and nothing is held"
+    );
+
+    world.start(None).await.expect("the next start is admitted");
+    assert_eq!(world.calls_asked(), 2, "the next start reached the service");
+}
+
+/// KR-REQ-23.24: a hold that cannot be written refuses the start before the service is asked, in
+/// the host's own words and under the storage code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hold_that_cannot_be_written_refuses_the_start_before_the_broker() {
+    let world = HoldWorld::with(vec![a_start_whose_answer_is_lost()]).await;
+    {
+        let file = world
+            .host
+            .controller()
+            .paths()
+            .state_dir()
+            .join(kr_controller::voice_start_holds::VOICE_START_HOLDS_RECORD);
+        rusqlite::Connection::open(file)
+            .expect("the record opens")
+            .execute_batch("DROP TABLE voice_start_holds")
+            .expect("the table goes");
+    }
+    let refused = world
+        .start(None)
+        .await
+        .expect_err("a start whose hold cannot be written is refused");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::StorageUnavailable
+    );
+    assert!(
+        refused.to_string().contains(
+            "Nothing was started. This host could not record the start before asking the \
+             voice service, so it did not ask. A later start can work."
+        ),
+        "{refused}"
+    );
+    assert_eq!(world.calls_asked(), 0, "the service was not asked");
 }

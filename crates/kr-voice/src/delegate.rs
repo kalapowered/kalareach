@@ -123,8 +123,8 @@ enum PlanFor {
     Description,
 }
 use crate::seams::{
-    ActionSubmitter, Admission, ContextRequest, ContextSource, Replaced, Revoked, Unbounded,
-    VoiceAuthority,
+    ActionSubmitter, Admission, AfterDeferred, BrokerEffect, ContextRequest, ContextSource,
+    Replaced, Revoked, Unbounded, VoiceAuthority,
 };
 use crate::session::{NewVoiceSession, VoiceSessionRecord, VoiceSessions};
 
@@ -196,6 +196,27 @@ struct Intent {
 struct Ending {
     call_id: String,
     provider: Option<Arc<dyn ManagedVoiceService>>,
+    /// What the starts that replayed this call run once it is resolved.
+    afterwards: Vec<Callback>,
+}
+
+/// What a deferred call's start runs when the call is resolved.
+struct Callback(AfterDeferred);
+
+impl std::fmt::Debug for Callback {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<callback>")
+    }
+}
+
+/// Whether a replayed call is one this host may close, one a session holds, or one that waits.
+enum Replayed {
+    /// Nothing holds the call and no other device's start could.
+    Closable,
+    /// A live voice session on this host holds the call.
+    Held,
+    /// Another device's start is in flight and may be about to hold the call.
+    Waiting,
 }
 
 /// What running every check produced.
@@ -696,6 +717,7 @@ impl Coordinator {
                         ending.push(Ending {
                             call_id,
                             provider: ended.provider,
+                            afterwards: Vec::new(),
                         });
                     }
                 }
@@ -710,7 +732,7 @@ impl Coordinator {
         // Outside the lock, and after the authority is already gone: a call whose grant this
         // change withdrew is finalised rather than left metering until its own deadline. Each is
         // closed through the provider that created it.
-        for ending in &ending {
+        for ending in ending {
             if let Some(provider) = ending.provider.as_ref() {
                 self.close_unbound(provider, &ending.call_id).await;
             }
@@ -984,6 +1006,44 @@ impl Coordinator {
                 },
             });
         }
+        // Asked before the host writes anything for this start, and again after: the first check
+        // keeps a start whose window is already over from leaving a record, and the second one,
+        // which stands immediately before the broker is asked, covers what the record's write
+        // waited for.
+        Self::still_admitted(admission)?;
+        admission
+            .before_the_broker(params.duration_seconds)
+            .map_err(VoiceError::Host)?;
+        let (answer, effect) = self
+            .ask_the_broker(
+                call,
+                &provider,
+                device_id,
+                params,
+                closes_at_ms,
+                now_ms,
+                admission,
+            )
+            .await;
+        admission.after_the_broker(effect);
+        answer
+    }
+
+    /// Asks the broker for the call, writes its grant, and says what came of it.
+    ///
+    /// Every exit names its effect, so the host that wrote a record before this point learns, for
+    /// each way a start can end, whether a call of this attempt can still be running.
+    #[allow(clippy::too_many_arguments)]
+    async fn ask_the_broker(
+        &self,
+        call: PlannedCall,
+        provider: &Arc<dyn ManagedVoiceService>,
+        device_id: DeviceId,
+        params: &VoiceStartParams,
+        closes_at_ms: u64,
+        now_ms: u64,
+        admission: &dyn Admission,
+    ) -> (Result<VoiceStartResult>, BrokerEffect) {
         let PlannedCall {
             standing,
             planned,
@@ -991,6 +1051,17 @@ impl Coordinator {
             ..
         } = call;
 
+        // Asked immediately before the broker, after the reads above, because creating the call
+        // is the first thing a start does that costs anything: a call created for a start the
+        // host then refuses is a metered call nobody can use, and closing it afterwards is only
+        // attempted. The same check runs again once the broker has answered, before the call's
+        // grant is written.
+        if let Err(error) = Self::still_admitted(admission) {
+            return (Err(error), BrokerEffect::NotAsked);
+        }
+        // No `await` stands between the check above, the reading of the send limit and the call:
+        // the limit is the instant by which the request has to be written, and it is carried to
+        // the write as an instant.
         let request = kr_client::services::voice::VoiceSessionRequest {
             offer_sdp: params.offer_sdp.clone(),
             host_id: self.environment_id.to_string(),
@@ -1001,60 +1072,83 @@ impl Coordinator {
             // the rate it would charge now, so the comparison is its to make; this host only
             // makes sure the version that reaches it is the one the device named.
             expected_rate_version: params.expected_rate_version.0.clone(),
+            send_by: admission.send_by(),
         };
-        // Asked immediately before the broker, after the reads above, because creating the call
-        // is the first thing a start does that costs anything: a call created for a start the
-        // host then refuses is a metered call nobody can use, and closing it afterwards is only
-        // attempted. The same check runs again once the broker has answered, before the call's
-        // grant is written.
-        Self::still_admitted(admission)?;
-        let outcome = provider.start(&request).await?;
+        let outcome = match provider.start(&request).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Whether the request may have been carried out is the code's category: an error
+                // of the category that says dispatch may have occurred leaves the outcome unknown,
+                // and every other code is the client's own refusal or a failure before any byte
+                // was written. A refusal code alone cannot say whether a call was closed, so this
+                // is the only place a code is read for an effect.
+                let effect = if error.code().retry_category()
+                    == kr_protocol::error::RetryCategory::OutcomeUnknown
+                {
+                    BrokerEffect::Unknown
+                } else {
+                    BrokerEffect::Refused
+                };
+                return (Err(error.into()), effect);
+            }
+        };
 
         let session = match outcome {
             VoiceStart::CreationUnknown {
                 attempt_id,
                 message,
             } => {
-                return Ok(VoiceStartResult {
-                    outcome: VoiceStartOutcome::CreationUnknown {
-                        attempt_id: attempt_id.unwrap_or_default(),
-                        message,
-                    },
-                });
+                return (
+                    Ok(VoiceStartResult {
+                        outcome: VoiceStartOutcome::CreationUnknown {
+                            attempt_id: attempt_id.unwrap_or_default(),
+                            message,
+                        },
+                    }),
+                    BrokerEffect::Unknown,
+                );
             }
             VoiceStart::RateChanged { rate, message, .. } => {
                 // Nothing was created, so there is nothing to close and no grant to write. The
                 // person is shown the rate as it is now and decides again.
-                return Ok(VoiceStartResult {
-                    outcome: match protocol_rate(&rate) {
-                        Some(rate) => VoiceStartOutcome::RateChanged { rate, message },
-                        None => VoiceStartOutcome::Unavailable {
-                            reason: "rate_changed".to_owned(),
-                            message,
-                            alternatives: vec![
-                                "Read the terms again before starting a voice session.".to_owned(),
-                            ],
+                return (
+                    Ok(VoiceStartResult {
+                        outcome: match protocol_rate(&rate) {
+                            Some(rate) => VoiceStartOutcome::RateChanged { rate, message },
+                            None => VoiceStartOutcome::Unavailable {
+                                reason: "rate_changed".to_owned(),
+                                message,
+                                alternatives: vec![
+                                    "Read the terms again before starting a voice session."
+                                        .to_owned(),
+                                ],
+                            },
                         },
-                    },
-                });
+                    }),
+                    BrokerEffect::Refused,
+                );
             }
             VoiceStart::Refused(refusal) => {
-                return Ok(VoiceStartResult {
-                    outcome: VoiceStartOutcome::Unavailable {
-                        reason: refusal.reason.as_str().to_owned(),
-                        message: refusal.message.clone(),
-                        alternatives: if refusal.alternatives.is_empty() {
-                            vec![
-                                "A provider credential of your own, which uses no managed credit."
-                                    .to_owned(),
-                                "The agent already running in the session, reached by typing."
-                                    .to_owned(),
-                            ]
-                        } else {
-                            refusal.alternatives.clone()
+                return (
+                    Ok(VoiceStartResult {
+                        outcome: VoiceStartOutcome::Unavailable {
+                            reason: refusal.reason.as_str().to_owned(),
+                            message: refusal.message.clone(),
+                            alternatives: if refusal.alternatives.is_empty() {
+                                vec![
+                                    "A provider credential of your own, which uses no managed \
+                                     credit."
+                                        .to_owned(),
+                                    "The agent already running in the session, reached by typing."
+                                        .to_owned(),
+                                ]
+                            } else {
+                                refusal.alternatives.clone()
+                            },
                         },
-                    },
-                });
+                    }),
+                    BrokerEffect::Refused,
+                );
             }
             VoiceStart::Started(session) => session,
         };
@@ -1068,38 +1162,41 @@ impl Coordinator {
             // voice session is running under is that session's, and closing it here would end a
             // call this host has just told the caller to go on using; a call another start is
             // still waiting on is one that start will bind or close itself.
-            if self.may_close_replayed(&session.call_id, &provider, device_id) {
-                self.close_unbound(&provider, &session.call_id).await;
-            } else {
-                // Another start is still waiting on the broker and may be about to bind this
-                // call. It is remembered rather than dropped, and closed once no start is left
-                // that could hold it.
-                let mut state = self.state.lock().expect("the coordinator's state");
-                let theirs = provider.provider();
-                if !state.deferred.iter().any(|held| {
-                    held.call_id == session.call_id
-                        && held
-                            .provider
-                            .as_ref()
-                            .is_some_and(|held| held.provider() == theirs)
-                }) {
-                    state.deferred.push(Ending {
-                        call_id: session.call_id.clone(),
-                        provider: Some(Arc::clone(&provider)),
-                    });
+            let effect = match self.replayed_standing(&session.call_id, provider, device_id) {
+                Replayed::Closable => {
+                    if self.close_unbound(provider, &session.call_id).await {
+                        BrokerEffect::Closed
+                    } else {
+                        BrokerEffect::Open
+                    }
                 }
-            }
-            return Ok(VoiceStartResult {
-                outcome: VoiceStartOutcome::Unavailable {
-                    reason: "session_in_progress".to_owned(),
-                    message: "A managed call for this account is already running. Use the call \
-                              this device already holds, or stop it first."
-                        .to_owned(),
-                    alternatives: vec![
-                        "Stop the call this device already holds and start a new one.".to_owned(),
-                    ],
-                },
-            });
+                Replayed::Held => {
+                    self.remember_deferred(&session.call_id, provider, None);
+                    BrokerEffect::Handed
+                }
+                Replayed::Waiting => {
+                    // Another start is still waiting on the broker and may be about to bind this
+                    // call. It is remembered rather than dropped, and closed once no start is
+                    // left that could hold it; the start's closure waits with it.
+                    self.remember_deferred(&session.call_id, provider, admission.deferred());
+                    BrokerEffect::Deferred
+                }
+            };
+            return (
+                Ok(VoiceStartResult {
+                    outcome: VoiceStartOutcome::Unavailable {
+                        reason: "session_in_progress".to_owned(),
+                        message: "A managed call for this account is already running. Use the \
+                                  call this device already holds, or stop it first."
+                            .to_owned(),
+                        alternatives: vec![
+                            "Stop the call this device already holds and start a new one."
+                                .to_owned(),
+                        ],
+                    },
+                }),
+                effect,
+            );
         }
 
         // Everything after this can fail, and a failure leaves a metered call running that no
@@ -1107,8 +1204,8 @@ impl Coordinator {
         let voice_session_id = match new_identity() {
             Ok(identity) => VoiceSessionId::new(identity),
             Err(error) => {
-                self.close_unbound(&provider, &session.call_id).await;
-                return Err(error);
+                let effect = self.closed_or_open(provider, &session.call_id).await;
+                return (Err(error), effect);
             }
         };
         // The child grant and the record of the call it belongs to are written together, under the
@@ -1123,8 +1220,8 @@ impl Coordinator {
             // lifetime the host accepted.
             if let Err(error) = Self::still_admitted(admission) {
                 drop(state);
-                self.close_unbound(&provider, &session.call_id).await;
-                return Err(error);
+                let effect = self.closed_or_open(provider, &session.call_id).await;
+                return (Err(error), effect);
             }
             let current = self.authority.standing_voice_grant(device_id);
             match current {
@@ -1143,7 +1240,7 @@ impl Coordinator {
                                     parent_grant_id: standing.grant_id,
                                     session_ids: session_ids.clone(),
                                     call_id: Some(session.call_id.clone()),
-                                    provider: Some(Arc::clone(&provider)),
+                                    provider: Some(Arc::clone(provider)),
                                     started_at_ms: now_ms,
                                     closes_at_ms,
                                     disclosure: session.disclosure.clone(),
@@ -1163,44 +1260,100 @@ impl Coordinator {
             // The voice grant this call was planned under is not the one this device holds any
             // more. Nothing was written, so nothing has to be unwound but the call itself.
             Ok(None) => {
-                self.close_unbound(&provider, &session.call_id).await;
-                return Ok(VoiceStartResult {
-                    outcome: VoiceStartOutcome::Unavailable {
-                        reason: "voice_grant_changed".to_owned(),
-                        message: "this device's voice grant changed while the call was being \
-                                  created, so the call was not kept. Start it again."
-                            .to_owned(),
-                        alternatives: vec!["Start the voice session again.".to_owned()],
-                    },
-                });
+                let effect = self.closed_or_open(provider, &session.call_id).await;
+                return (
+                    Ok(VoiceStartResult {
+                        outcome: VoiceStartOutcome::Unavailable {
+                            reason: "voice_grant_changed".to_owned(),
+                            message: "this device's voice grant changed while the call was being \
+                                      created, so the call was not kept. Start it again."
+                                .to_owned(),
+                            alternatives: vec!["Start the voice session again.".to_owned()],
+                        },
+                    }),
+                    effect,
+                );
             }
             Err(error) => {
-                self.close_unbound(&provider, &session.call_id).await;
-                return Err(error);
+                let effect = self.closed_or_open(provider, &session.call_id).await;
+                return (Err(error), effect);
             }
         };
 
-        Ok(VoiceStartResult {
-            outcome: VoiceStartOutcome::Started {
-                session: Box::new(VoiceSessionDescriptor {
-                    voice_session_id,
-                    grant_id: written.grant_id,
-                    statement: VoiceGrantStatement::of(&planned.plan.actions),
-                    session_ids,
-                    call_id: session.call_id.clone(),
-                    provider_session_id: session.provider_session_id.clone(),
-                    answer_sdp: session.answer_sdp.clone(),
-                    model: session.model.clone(),
-                    control_path: session.control_path.clone(),
-                    broker_origin: self.broker_origin.clone(),
-                    heartbeat_seconds: session.heartbeat_seconds,
-                    closes_at_ms: TimestampMs::new(closes_at_ms),
-                    // The service's own words for this call, carried as they came. A host copy put
-                    // in their place would be a second statement of what the operator can see.
-                    disclosure: session.disclosure.clone(),
-                }),
-            },
-        })
+        (
+            Ok(VoiceStartResult {
+                outcome: VoiceStartOutcome::Started {
+                    session: Box::new(VoiceSessionDescriptor {
+                        voice_session_id,
+                        grant_id: written.grant_id,
+                        statement: VoiceGrantStatement::of(&planned.plan.actions),
+                        session_ids,
+                        call_id: session.call_id.clone(),
+                        provider_session_id: session.provider_session_id.clone(),
+                        answer_sdp: session.answer_sdp.clone(),
+                        model: session.model.clone(),
+                        control_path: session.control_path.clone(),
+                        broker_origin: self.broker_origin.clone(),
+                        heartbeat_seconds: session.heartbeat_seconds,
+                        closes_at_ms: TimestampMs::new(closes_at_ms),
+                        // The service's own words for this call, carried as they came. A host
+                        // copy put in their place would be a second statement of what the
+                        // operator can see.
+                        disclosure: session.disclosure.clone(),
+                    }),
+                },
+            }),
+            BrokerEffect::Bound,
+        )
+    }
+
+    /// Closes a call this host created and could not keep, and says whether the service confirmed
+    /// the close: a close that failed leaves a call whose end is not confirmed.
+    async fn closed_or_open(
+        &self,
+        provider: &Arc<dyn ManagedVoiceService>,
+        call_id: &str,
+    ) -> BrokerEffect {
+        if self.close_unbound(provider, call_id).await {
+            BrokerEffect::Closed
+        } else {
+            BrokerEffect::Open
+        }
+    }
+
+    /// Remembers a replayed call that this host has neither closed nor seen held, with what its
+    /// start runs when the call is resolved.
+    ///
+    /// Devices that replay one call share one entry, and no closure is dropped: a closure joins
+    /// the entry that already holds the call, whichever start made it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    fn remember_deferred(
+        &self,
+        call_id: &str,
+        provider: &Arc<dyn ManagedVoiceService>,
+        closure: Option<AfterDeferred>,
+    ) {
+        let mut state = self.state.lock().expect("the coordinator's state");
+        let theirs = provider.provider();
+        let afterwards = closure.map(Callback).into_iter().collect::<Vec<_>>();
+        if let Some(held) = state.deferred.iter_mut().find(|held| {
+            held.call_id == call_id
+                && held
+                    .provider
+                    .as_ref()
+                    .is_some_and(|held| held.provider() == theirs)
+        }) {
+            held.afterwards.extend(afterwards);
+        } else {
+            state.deferred.push(Ending {
+                call_id: call_id.to_owned(),
+                provider: Some(Arc::clone(provider)),
+                afterwards,
+            });
+        }
     }
 
     /// Marks one device as starting, when it is not already.
@@ -1231,16 +1384,22 @@ impl Coordinator {
         admission.still_admitted().map_err(VoiceError::Host)
     }
 
-    /// Closes the replayed calls this host deferred, now that nothing may be about to bind them.
+    /// Closes the replayed calls this host deferred, now that nothing may be about to bind them,
+    /// and runs what the starts that deferred them left to run.
+    ///
+    /// An entry is resolved once: its call is closed once, and then each closure that joined it
+    /// runs once with the one effect. A call that a live session holds is handed over and not
+    /// closed. The closures run after the coordinator's lock is released, because what they do
+    /// waits on the host's own store.
     ///
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
     async fn close_deferred(&self) {
-        let closing: Vec<Ending> = {
+        let (closing, handed): (Vec<Ending>, Vec<Ending>) = {
             let mut state = self.state.lock().expect("the coordinator's state");
             if !state.starting.is_empty() || state.deferred.is_empty() {
-                Vec::new()
+                (Vec::new(), Vec::new())
             } else {
                 let held: Vec<(String, Option<String>)> = state
                     .sessions
@@ -1258,34 +1417,43 @@ impl Coordinator {
                 // and everything else is closed here, each through the provider that created it.
                 // A call is the pair of its identifier and that provider, because two providers
                 // can name a call the same thing.
-                let closing: Vec<Ending> = std::mem::take(&mut state.deferred)
-                    .into_iter()
-                    .filter(|ending| {
-                        !held.iter().any(|(call_id, provider)| {
-                            call_id == &ending.call_id
-                                && match (provider.as_ref(), ending.provider.as_ref()) {
-                                    (Some(held), Some(theirs)) => held == &theirs.provider(),
-                                    _ => false,
-                                }
-                        })
-                    })
-                    .collect();
+                let (handed, closing): (Vec<Ending>, Vec<Ending>) =
+                    std::mem::take(&mut state.deferred)
+                        .into_iter()
+                        .partition(|ending| {
+                            held.iter().any(|(call_id, provider)| {
+                                call_id == &ending.call_id
+                                    && match (provider.as_ref(), ending.provider.as_ref()) {
+                                        (Some(held), Some(theirs)) => held == &theirs.provider(),
+                                        _ => false,
+                                    }
+                            })
+                        });
                 state.closing += closing.len();
-                closing
+                (closing, handed)
             }
         };
         let _closing = Closing {
             state: Arc::clone(&self.state),
             count: closing.len(),
         };
-        for ending in &closing {
-            if let Some(provider) = ending.provider.as_ref() {
-                self.close_unbound(provider, &ending.call_id).await;
+        for ending in handed {
+            for Callback(closure) in ending.afterwards {
+                closure(BrokerEffect::Handed);
+            }
+        }
+        for ending in closing {
+            let effect = match ending.provider.as_ref() {
+                Some(provider) => self.closed_or_open(provider, &ending.call_id).await,
+                None => BrokerEffect::Open,
+            };
+            for Callback(closure) in ending.afterwards {
+                closure(effect);
             }
         }
     }
 
-    /// Whether a replayed call is one this host may close.
+    /// Where a replayed call stands: closable, held by a live session, or waiting.
     ///
     /// Both questions are answered in one critical section, because a start records its session
     /// under the same lock: a call is left alone when a live voice session holds it, and when
@@ -1294,12 +1462,12 @@ impl Coordinator {
     /// # Panics
     ///
     /// Panics when a thread holding the coordinator's lock panicked.
-    fn may_close_replayed(
+    fn replayed_standing(
         &self,
         call_id: &str,
         provider: &Arc<dyn ManagedVoiceService>,
         device_id: DeviceId,
-    ) -> bool {
+    ) -> Replayed {
         let state = self.state.lock().expect("the coordinator's state");
         // A call belongs to the provider that created it. Two providers can name a call the same
         // thing, and two clients of one provider are the same provider, so what identifies a call
@@ -1313,7 +1481,13 @@ impl Coordinator {
                     .is_some_and(|held| held.provider() == theirs)
         });
         let others_starting = state.starting.iter().any(|starting| *starting != device_id);
-        !held && !others_starting
+        if held {
+            Replayed::Held
+        } else if others_starting {
+            Replayed::Waiting
+        } else {
+            Replayed::Closable
+        }
     }
 
     /// Ends a call this host could not bind to a voice session.
@@ -1321,8 +1495,9 @@ impl Coordinator {
     /// Told, not waited on, and a service that cannot be reached is not an error the caller sees:
     /// the caller's own answer is already decided, and the service's deadline closes the call in
     /// any case. The failure is reported ([`Self::report_unclosed_calls_to`]) and nothing else
-    /// changes. Nothing here retries creation.
-    async fn close_unbound(&self, provider: &Arc<dyn ManagedVoiceService>, call_id: &str) {
+    /// changes. Nothing here retries creation. The answer says whether the service confirmed the
+    /// close, for a caller that has to know whether a call can still be running.
+    async fn close_unbound(&self, provider: &Arc<dyn ManagedVoiceService>, call_id: &str) -> bool {
         if let Err(error) = provider.close(call_id).await {
             let report = Arc::clone(&self.unclosed.lock().expect("the coordinator's reporter"));
             report(&UnclosedCall {
@@ -1330,7 +1505,9 @@ impl Coordinator {
                 provider: provider.provider(),
                 error: error.to_string(),
             });
+            return false;
         }
+        true
     }
 
     /* ---------------------------------------------------------------- */

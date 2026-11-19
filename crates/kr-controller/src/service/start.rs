@@ -870,6 +870,7 @@ impl Controller {
                 release_gate: release_matrix
                     .as_ref()
                     .map(crate::release_matrix::ReleaseMatrixRuntime::gate),
+                continuous: Arc::clone(&clock),
             },
         )?;
         let (backup_runtime, relay_parts, backup_production) = match storage_parts {
@@ -999,6 +1000,9 @@ impl Controller {
         // formats do not depend on the configuration.
         let mailbox_record = crate::mailbox_reader::record::Record::open(setup.paths.state_dir())?;
         let capability_answers = crate::capability_answers::Record::open(setup.paths.state_dir())?;
+        let voice_start_holds = Arc::new(crate::voice_start_holds::Record::open(
+            setup.paths.state_dir(),
+        )?);
         let mailbox_reader = match started.authority.origin() {
             None => None,
             Some(origin) => {
@@ -1434,6 +1438,7 @@ impl Controller {
             }),
             checks: std::sync::Mutex::new(super::capability_checks::Checks::new()),
             capability_answers,
+            voice_start_holds,
             inhibitor: Mutex::new(Inhibitor::new()),
             demand_scan: Mutex::new(DemandScan::default()),
             metrics: Arc::new(kr_protocol::metrics::Recorder::new(

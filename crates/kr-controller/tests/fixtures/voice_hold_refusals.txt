@@ -1,0 +1,8 @@
+# The words of the host's refusals of a voice start, one per line as `name: sentence`.
+# {A} is the standing action, {B} the action the start named, {T0} the moment the standing start was
+# read and {T1} the moment the hold stops, both as `YYYY-MM-DD HH:MM:SS UTC`.
+# The host's cases and the companion's cases both read this file: the companion finds the standing
+# action in these words, so a change here has to change both.
+unnamed: Nothing was started. This host still holds an earlier voice start from this device (action {A}, begun at {T0} by this host's clock), so a call from it may still be running. A second start could be a second charged call. This hold does not stop a start that names action {A}, or a start made at or after {T1} by this host's clock.
+named: Nothing was started. This start names action {B}. This host holds an earlier voice start from this device under action {A}, begun at {T0} by this host's clock, so a call from it may still be running. This hold does not stop a start that names action {A}, or a start made at or after {T1} by this host's clock.
+unrecorded: Nothing was started. This host could not record the start before asking the voice service, so it did not ask. A later start can work.
