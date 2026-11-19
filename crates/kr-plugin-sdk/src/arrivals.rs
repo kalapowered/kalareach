@@ -72,6 +72,15 @@ pub const ARRIVALS: &[Arrival] = &[
         sdk_version: "0.1.9",
         carried_by: |table| table.get("placement").is_some(),
     },
+    // A release whose `sdk_range` has a prerelease part and that sets a pair of
+    // `PERMITTED_VARIABLES` undeclared was read by a host that predates this member and is refused
+    // by a host that has it: the check cannot decide such a range, so it never gets the pair.
+    Arrival {
+        definition: "ConnectorManifest",
+        member: "launch_variables",
+        sdk_version: crate::launch_variables::ARRIVAL,
+        carried_by: |table| table.get("launch_variables").is_some(),
+    },
 ];
 
 /// The table as the package contract carries it.

@@ -42,7 +42,7 @@ fn fixtures_root() -> PathBuf {
 fn the_contract_lists_the_members_that_arrived_inside_a_level() {
     let contract = package_contract();
     assert_eq!(contract["sdk_version"], SDK_VERSION);
-    assert_eq!(SDK_VERSION, "0.1.9");
+    assert_eq!(SDK_VERSION, "0.1.10");
     assert_eq!(
         contract["arrivals"],
         json!([
@@ -61,8 +61,42 @@ fn the_contract_lists_the_members_that_arrived_inside_a_level() {
                 "member": "placement",
                 "sdk_version": "0.1.9",
             },
+            {
+                "definition": "ConnectorManifest",
+                "member": "launch_variables",
+                "sdk_version": "0.1.10",
+            },
         ])
     );
+}
+
+/// The member arrives at an SDK version above the one before it in the table, and not above the
+/// SDK this crate implements. The entry is found by the member's name, so the case reads the
+/// arrival the table states and holds no version of its own.
+#[test]
+fn the_arrival_table_lists_launch_variables_above_placement_and_not_above_the_sdk() {
+    let find = |member: &str| {
+        ARRIVALS
+            .iter()
+            .find(|arrival| arrival.definition == "ConnectorManifest" && arrival.member == member)
+    };
+    let (launch_variables, placement) = (find("launch_variables"), find("placement"));
+    assert!(
+        launch_variables.is_some(),
+        "ConnectorManifest.launch_variables is not in the arrival table"
+    );
+    assert!(
+        placement.is_some(),
+        "ConnectorManifest.placement is not in the arrival table"
+    );
+    let (Some(launch_variables), Some(placement)) = (launch_variables, placement) else {
+        return;
+    };
+    let arrives = PackageVersion::parse(launch_variables.sdk_version).expect("an exact version");
+    let before = PackageVersion::parse(placement.sdk_version).expect("an exact version");
+    let host = PackageVersion::parse(SDK_VERSION).expect("a version");
+    assert!(arrives > before, "it arrives above placement's version");
+    assert!(arrives <= host, "it arrives after this SDK");
 }
 
 /// An entry that names no optional member of a definition only the SDK has, or that arrived at a

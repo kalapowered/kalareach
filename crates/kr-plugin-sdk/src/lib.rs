@@ -108,6 +108,7 @@ pub mod identity;
 pub mod ids;
 pub mod integration;
 pub mod launch_probe;
+pub mod launch_variables;
 pub mod limits;
 pub mod matching;
 pub mod package;

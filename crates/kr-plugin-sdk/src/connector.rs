@@ -692,6 +692,18 @@ pub struct ConnectorManifest {
     /// host checks of the files and what it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<crate::placement::Placement>,
+    /// The environment variables the package's command integration sets, each by exact name and
+    /// value with the reason a reviewer reads. The rules of [`crate::launch_variables`] hold every
+    /// entry.
+    ///
+    /// A table that does not state it leaves the member out, and the integration may then set only
+    /// a pair of [`crate::integration::PERMITTED_VARIABLES`], for a release whose `sdk_range`
+    /// admits an SDK that predates the member, so a connector written before the member existed
+    /// reads and hashes exactly as it did. A package that states it declares an `sdk_range` that
+    /// admits no SDK version before [`crate::launch_variables::ARRIVAL`], and the statement the
+    /// owner confirms says that every program the command starts gets the variables too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_variables: Option<Vec<crate::launch_variables::LaunchVariable>>,
     /// Whether the connector has a tested volatile forwarding mode.
     ///
     /// Without one it is not a resilient managed gateway, so this host serves no gateway for it:
@@ -946,6 +958,7 @@ mod tests {
             operations: None,
             hook_events: None,
             placement: None,
+            launch_variables: None,
             volatile_forwarding: false,
             qualification_note: Nullable(None),
         }

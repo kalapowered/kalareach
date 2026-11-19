@@ -1033,6 +1033,16 @@
           ],
           "description": "How the forwarder reads the hook payload of the application's bridge: where the event and\nthe session are, which event names report which of five things, and where the members a\nreport carries are.\n\nA table that does not state it leaves the member out, and a bridge's forwarder then reads the\npayload as Claude Code writes it, so a connector written before the member existed reads and\nhashes exactly as it did. A package that states it declares an `sdk_range` from SDK 0.1.8."
         },
+        "launch_variables": {
+          "description": "The environment variables the package's command integration sets, each by exact name and\nvalue with the reason a reviewer reads. The rules of [`crate::launch_variables`] hold every\nentry.\n\nA table that does not state it leaves the member out, and the integration may then set only\na pair of [`crate::integration::PERMITTED_VARIABLES`], for a release whose `sdk_range`\nadmits an SDK that predates the member, so a connector written before the member existed\nreads and hashes exactly as it did. A package that states it declares an `sdk_range` that\nadmits no SDK version before [`crate::launch_variables::ARRIVAL`], and the statement the\nowner confirms says that every program the command starts gets the variables too.",
+          "items": {
+            "$ref": "#/$defs/LaunchVariable"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "manifest_version": {
           "description": "The manifest format version.",
           "format": "uint32",
@@ -2614,6 +2624,30 @@
         "mode",
         "refused_in_service_session",
         "grant_statement"
+      ],
+      "type": "object"
+    },
+    "LaunchVariable": {
+      "additionalProperties": false,
+      "description": "One environment variable a package's command integration sets, with the reason a reviewer\nreads.",
+      "properties": {
+        "name": {
+          "description": "The variable's name.",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/Summary",
+          "description": "Why the package needs the variable, in the package's own words. A reviewer reads it; the\nowner's statement does not carry it."
+        },
+        "value": {
+          "description": "The value the integration sets it to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value",
+        "reason"
       ],
       "type": "object"
     },

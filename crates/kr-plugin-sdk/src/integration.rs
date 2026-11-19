@@ -30,15 +30,18 @@
 //!   with nothing in it that a person reading the declaration could not see. A flag may hold the
 //!   forwarder's placeholder (see [`crate::forwarder`]), which the host replaces with the installed
 //!   forwarder's path, and the statement says so.
-//! * A variable is one of [`PERMITTED_VARIABLES`], by exact name and value. Reserved `KR_` values
-//!   come only from the worker, and a variable that loads code, changes a search path or chooses a
-//!   startup file changes what a program runs. No list of forbidden names can be complete, so this
-//!   list names what is permitted instead, and a new entry is a change to the package contract.
+//! * A variable is one the package declares in its connector table, by exact name and value, under
+//!   the rules of [`crate::launch_variables`], or the one pair of [`PERMITTED_VARIABLES`], for a
+//!   release that declares none and whose `sdk_range` is written in release versions only and
+//!   admits an SDK version before that declaration arrived. Reserved `KR_` values come only from
+//!   the worker. The rules are a name shape, the plugin name's first word and a floor of reserved
+//!   words; they do not establish what a variable does.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::forwarder;
+use crate::launch_variables::{ARRIVAL, LaunchPermits, LaunchVariableProblem, compiled_pairs};
 use crate::matching::MatchRule;
 use crate::text::{Summary, is_forbidden_text_char};
 
@@ -91,9 +94,17 @@ pub struct PermittedVariable {
     pub reason: &'static str,
 }
 
-/// Every environment variable a command integration may set.
+/// The environment variables a command integration may set without declaring them.
 ///
-/// Each entry is permitted for one qualified reason, with its value fixed.
+/// Each entry is permitted for one qualified reason, with its value fixed, and applies only to a
+/// release that declares no `launch_variables` and whose `sdk_range` is written in release versions
+/// only and admits an SDK version before that member arrived (see [`LaunchPermits`]). Its
+/// consumers are the releases that set a pair undeclared under such a range: today, the installed
+/// copies and the published releases of Gemini CLI 0.4.0 (`>=0.1.2, <0.2.0`) and 0.5.0
+/// (`>=0.1.3, <0.2.0`), which the seed never replaces and the worker checks again at each read.
+/// Remove an entry when no supported release's range admits an SDK version before that member
+/// arrived, or when support for those immutable releases ends. A release whose range starts at
+/// that version declares every variable it sets, these too.
 pub const PERMITTED_VARIABLES: &[PermittedVariable] = &[PermittedVariable {
     name: "GEMINI_CLI_NO_RELAUNCH",
     value: "true",
@@ -340,9 +351,9 @@ impl CommandIntegration {
     }
 
     /// Returns every way this declaration breaks the package contract, for a package with these
-    /// match rules.
+    /// match rules and these permitted variables.
     #[must_use]
-    pub fn problems(&self, match_rules: &[MatchRule]) -> Vec<String> {
+    pub fn problems(&self, match_rules: &[MatchRule], permits: &LaunchPermits) -> Vec<String> {
         let mut problems = Vec::new();
         if let Some(problem) = command_problem(&self.command) {
             problems.push(problem);
@@ -376,17 +387,17 @@ impl CommandIntegration {
                     quoted(&variable.name)
                 ));
             }
-            if permitted(variable).is_none() {
+            if !permits.allows(variable) {
                 problems.push(format!(
-                    "{}={} is not a variable a command integration may set; the permitted ones \
-                     are {}",
+                    "{}: {}={} is not a variable a command integration may set: declare it, with a \
+                     reason, in the launch_variables member of the connector table under an \
+                     sdk_range written in release versions only that admits no SDK version before \
+                     {ARRIVAL} (a release that declares none, whose sdk_range is written in \
+                     release versions only and admits an earlier SDK, may set only {})",
+                    LaunchVariableProblem::NotDeclared.name(),
                     quoted(&variable.name),
                     quoted(&variable.value),
-                    PERMITTED_VARIABLES
-                        .iter()
-                        .map(|permitted| format!("{}={}", permitted.name, quoted(permitted.value)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    compiled_pairs()
                 ));
             }
         }
@@ -519,14 +530,6 @@ fn launching_word_problem(word: &str) -> Option<String> {
     None
 }
 
-/// Returns the permitted entry a declared variable is, where it is one.
-#[must_use]
-pub fn permitted(variable: &IntegrationVariable) -> Option<&'static PermittedVariable> {
-    PERMITTED_VARIABLES
-        .iter()
-        .find(|permitted| permitted.name == variable.name && permitted.value == variable.value)
-}
-
 /// Returns why a command name is not one an integration may name, where it is not.
 fn command_problem(command: &str) -> Option<String> {
     if command.is_empty() {
@@ -593,7 +596,7 @@ fn flag_problem(flag: &str) -> Option<String> {
 ///
 /// A character the contract forbids in text (a control, zero-width or bidirectional one) or a space
 /// other than the plain one is written as its escape, so what comes back is one line.
-fn quoted(text: &str) -> String {
+pub(crate) fn quoted(text: &str) -> String {
     let json = serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"));
     let mut written = String::with_capacity(json.len());
     for character in json.chars() {
@@ -664,6 +667,15 @@ mod tests {
             launching_words: words.iter().map(|word| (*word).to_owned()).collect(),
         });
         declared
+    }
+
+    /// What a release that declares no launch variables permits, under a range written before the
+    /// member existed: the compiled pair.
+    fn permits() -> LaunchPermits<'static> {
+        LaunchPermits::for_package(
+            &crate::version::VersionRange::parse(">=0.1.2, <0.2.0").expect("a range"),
+            None,
+        )
     }
 
     fn typed(words: &[&str]) -> Vec<String> {
@@ -780,8 +792,8 @@ mod tests {
             without(&fits).chars().count() + sentence.chars().count(),
             MAX_STATEMENT_CHARS
         );
-        let problems =
-            integration("gemini", &[&fits], &[("GEMINI_CLI_NO_RELAUNCH", "true")]).problems(&rules);
+        let problems = integration("gemini", &[&fits], &[("GEMINI_CLI_NO_RELAUNCH", "true")])
+            .problems(&rules, &permits());
         assert!(
             problems.iter().all(|problem| !problem.contains(bound)),
             "{problems:?}"
@@ -789,8 +801,8 @@ mod tests {
         // Within the bound without the sentence and over it with: refused.
         let over = "x".repeat(room);
         assert_eq!(without(&over).chars().count(), MAX_STATEMENT_CHARS);
-        let problems =
-            integration("gemini", &[&over], &[("GEMINI_CLI_NO_RELAUNCH", "true")]).problems(&rules);
+        let problems = integration("gemini", &[&over], &[("GEMINI_CLI_NO_RELAUNCH", "true")])
+            .problems(&rules, &permits());
         assert!(
             problems.iter().any(|problem| problem.contains(bound)),
             "{problems:?}"
@@ -802,7 +814,7 @@ mod tests {
         let rules = [rule("kimi", &[".kimi-code", "bin"])];
         assert!(
             integration("kimi", &["--flag"], &[])
-                .problems(&rules)
+                .problems(&rules, &permits())
                 .is_empty(),
             "a rule with a directory suffix still names the executable"
         );
@@ -817,7 +829,7 @@ mod tests {
         ] {
             assert!(
                 !integration(command, &["--flag"], &[])
-                    .problems(&rules)
+                    .problems(&rules, &permits())
                     .is_empty(),
                 "{command:?} is refused"
             );
@@ -825,7 +837,7 @@ mod tests {
         let long = "k".repeat(MAX_COMMAND_BYTES + 1);
         assert!(
             !integration(&long, &["--flag"], &[])
-                .problems(&[rule(&long, &[])])
+                .problems(&[rule(&long, &[])], &permits())
                 .is_empty()
         );
     }
@@ -836,13 +848,13 @@ mod tests {
         for flag in ["", "--", "--a\nb", "--\u{202E}a", "--a\u{200B}"] {
             assert!(
                 !integration("agent", &[flag], &[])
-                    .problems(&rules)
+                    .problems(&rules, &permits())
                     .is_empty(),
                 "{flag:?} is refused"
             );
         }
         // The finding names the character a person could not see.
-        let hidden = integration("agent", &["--a\u{200B}"], &[]).problems(&rules);
+        let hidden = integration("agent", &["--a\u{200B}"], &[]).problems(&rules, &permits());
         assert_eq!(hidden.len(), 1, "{hidden:?}");
         assert!(hidden[0].contains("U+200B"), "{hidden:?}");
         // A flag has its own limit, and with the rest of the statement it has to fit what an owner
@@ -850,21 +862,25 @@ mod tests {
         let longest = "f".repeat(MAX_STATEMENT_CHARS - 200);
         assert!(
             integration("agent", &[&longest], &[])
-                .problems(&rules)
+                .problems(&rules, &permits())
                 .is_empty()
         );
         let over = "f".repeat(MAX_FLAG_BYTES + 1);
         assert!(
             !integration("agent", &[&over], &[])
-                .problems(&rules)
+                .problems(&rules, &permits())
                 .is_empty()
         );
         let most: Vec<&str> = std::iter::repeat_n("--f", MAX_FLAGS).collect();
-        assert!(integration("agent", &most, &[]).problems(&rules).is_empty());
+        assert!(
+            integration("agent", &most, &[])
+                .problems(&rules, &permits())
+                .is_empty()
+        );
         let too_many: Vec<&str> = std::iter::repeat_n("--f", MAX_FLAGS + 1).collect();
         assert!(
             !integration("agent", &too_many, &[])
-                .problems(&rules)
+                .problems(&rules, &permits())
                 .is_empty()
         );
     }
@@ -874,7 +890,7 @@ mod tests {
         let settings = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"{kr_hook}","args":["qoder-cli","hook"]}]}]}}"#;
         let rules = [rule("agent", &[])];
         let placed = integration("agent", &["--settings", settings], &[]);
-        assert!(placed.problems(&rules).is_empty());
+        assert!(placed.problems(&rules, &permits()).is_empty());
         let statement = placed.statement();
         assert!(
             statement.ends_with(
@@ -898,7 +914,7 @@ mod tests {
         ] {
             assert!(
                 !integration("agent", &[misplaced], &[])
-                    .problems(&rules)
+                    .problems(&rules, &permits())
                     .is_empty(),
                 "{misplaced:?} is refused"
             );
@@ -910,7 +926,7 @@ mod tests {
         let rules = [rule("gemini", &[])];
         assert!(
             integration("gemini", &[], &[("GEMINI_CLI_NO_RELAUNCH", "true")])
-                .problems(&rules)
+                .problems(&rules, &permits())
                 .is_empty()
         );
         for (name, value) in [
@@ -930,7 +946,7 @@ mod tests {
         ] {
             assert!(
                 !integration("gemini", &[], &[(name, value)])
-                    .problems(&rules)
+                    .problems(&rules, &permits())
                     .is_empty(),
                 "{name}={value} is refused"
             );
@@ -944,12 +960,14 @@ mod tests {
                     ("GEMINI_CLI_NO_RELAUNCH", "true")
                 ]
             )
-            .problems(&rules)
+            .problems(&rules, &permits())
             .is_empty(),
             "a variable set twice"
         );
         assert!(
-            !integration("gemini", &[], &[]).problems(&rules).is_empty(),
+            !integration("gemini", &[], &[])
+                .problems(&rules, &permits())
+                .is_empty(),
             "an integration that changes nothing"
         );
     }
@@ -967,9 +985,9 @@ mod tests {
     #[test]
     fn kr_req_12_07_a_backend_is_declared_by_arguments_one_gateway_flag_and_closed_words() {
         let rules = [rule("codex", &[])];
-        assert!(codex_like().problems(&rules).is_empty());
+        assert!(codex_like().problems(&rules, &permits()).is_empty());
         // Every way the declaration can break the contract is a finding that says which.
-        let broken = |declared: CommandIntegration| declared.problems(&rules);
+        let broken = |declared: CommandIntegration| declared.problems(&rules, &permits());
         let one_of = |problems: Vec<String>, text: &str| {
             assert!(
                 problems.iter().any(|problem| problem.contains(text)),
@@ -1210,15 +1228,15 @@ mod tests {
         let over = integration("agent", &["--a", &half, &half], &[]);
         assert!(over.statement().chars().count() > MAX_STATEMENT_CHARS);
         assert!(
-            over.problems(&rules)
+            over.problems(&rules, &permits())
                 .iter()
                 .any(|problem| problem.contains("an owner is shown whole")),
             "{:?}",
-            over.problems(&rules)
+            over.problems(&rules, &permits())
         );
         assert!(
             integration("agent", &["--a"], &[])
-                .problems(&rules)
+                .problems(&rules, &permits())
                 .is_empty()
         );
     }
