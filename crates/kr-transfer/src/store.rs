@@ -1693,9 +1693,10 @@ impl Store {
                  held by one session",
             ));
         }
-        // Last of the refusals and before the first write, so a draft that is wrong in its session
-        // is refused as that whichever application the prompt is for. The application a draft is
-        // for is fixed when it is made, so the read at the top stands for the transaction.
+        // After the refusals for the session, so a draft that is wrong in its session is refused as
+        // that whichever application the prompt is for, and before the revision check and the first
+        // write. The application a draft is for is fixed when it is made, so the read at the top
+        // stands for the transaction.
         if draft
             .application_instance_id
             .is_some_and(|written_for| written_for != application_instance_id)
