@@ -418,7 +418,10 @@ impl HeldBound {
     /// before its first read and compares the copy with [`Self::stands_in`] after it.
     #[must_use]
     pub fn published(&self) -> BoundSnapshot {
-        *self.cell.load()
+        let copied = *self.cell.load();
+        #[cfg(test)]
+        publishing::after_a_copy();
+        copied
     }
 
     /// [`Self::stands_at`], from a snapshot that [`Self::published`] copied out earlier: only
@@ -505,6 +508,7 @@ pub(crate) mod publishing {
         static BEFORE_THE_SWAP: RefCell<Option<Hook>> = RefCell::new(None);
         static AFTER_THE_SWAP: RefCell<Option<Hook>> = RefCell::new(None);
         static AFTER_A_LOAD: RefCell<Option<Hook>> = RefCell::new(None);
+        static AFTER_A_COPY: RefCell<Option<Hook>> = RefCell::new(None);
     }
 
     fn run(hook: &'static std::thread::LocalKey<RefCell<Option<Hook>>>) {
@@ -526,6 +530,10 @@ pub(crate) mod publishing {
         run(&AFTER_A_LOAD);
     }
 
+    pub(super) fn after_a_copy() {
+        run(&AFTER_A_COPY);
+    }
+
     /// Runs `hook` once, on this thread, the next time a publication has built its snapshot and
     /// not yet swapped it in.
     pub(crate) fn stop_before_the_swap(hook: impl FnMut() + 'static) {
@@ -540,6 +548,12 @@ pub(crate) mod publishing {
     /// Runs `hook` once, on this thread, the next time a reader has loaded a cell.
     pub(crate) fn stop_after_a_load(hook: impl FnMut() + 'static) {
         AFTER_A_LOAD.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Runs `hook` once, on this thread, the next time a bound's published snapshot has been copied
+    /// out.
+    pub(crate) fn stop_after_a_copy(hook: impl FnMut() + 'static) {
+        AFTER_A_COPY.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
 }
 

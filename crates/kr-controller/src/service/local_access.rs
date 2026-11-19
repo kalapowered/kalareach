@@ -373,12 +373,23 @@ impl Controller {
     /// clock now and as its cell publishes it: the end it was found to have has not come, and no
     /// renewal that started another run of the bound and no restrictive change has ended it. Takes
     /// no lock, so it may be asked inside a record's transaction.
+    ///
+    /// The cell's snapshot is copied out before either clock is read
+    /// ([`crate::grants::policy::HeldBound::published`]): loading a cell can allocate and lets go
+    /// of a reference, and a clock read before that would be older than the answer it decides.
+    /// After the copy the question only compares.
     pub(crate) fn lease_stands(&self, lease: &LeaseHeld) -> bool {
-        self.lease_is_live_until(lease.end).is_ok()
-            && lease.bound.as_ref().is_none_or(|bound| {
-                bound.stands_at(self.clock.now(), self.settled_utc_now())
-                    == crate::grants::policy::Stands::Holds
-            })
+        let published = lease.bound.as_ref().map(|bound| (bound, bound.published()));
+        if self.lease_is_live_until(lease.end).is_err() {
+            return false;
+        }
+        published.is_none_or(|(bound, published)| {
+            // The continuous clock first and the wall clock after it, as every reader of a bound
+            // reads them.
+            let now = self.clock.now();
+            let utc_ms = self.settled_utc_now();
+            bound.stands_in(&published, now, utc_ms) == crate::grants::policy::Stands::Holds
+        })
     }
 
     /// The caller a local request is decided as for pairing and owner confirmation: the host's own
