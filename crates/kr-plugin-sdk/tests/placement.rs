@@ -1222,48 +1222,193 @@ fn the_package_check_refuses_every_key_but_the_labels_one() {
     assert_eq!(named(&gemini), 1, "{:?}", gemini.report.findings);
 }
 
-/// The package check reads every file a recipe installs: a file it did not keep, because other
-/// files of the package filled its cache first, is refused and not skipped, and the same package
-/// with fewer other files, where the check keeps it, is read.
+/// The bundled Gemini CLI package under a fresh directory, `edit` applied to the directory and
+/// to the manifest before the check runs.
+fn gemini_directory(edit: impl FnOnce(&Path, &mut Value)) -> Validated {
+    let home = tempfile::tempdir().expect("a directory");
+    let directory = home.path().join("package");
+    copy_tree(&bundled("gemini-cli"), &directory);
+    let manifest_path = directory.join("plugin.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("reads")).expect("JSON");
+    edit(&directory, &mut manifest);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("writes"),
+    )
+    .expect("writes");
+    validate_package_directory(&directory)
+}
+
+/// Writes `bytes` to `name` in `directory` and declares it in `manifest` as a payload of `role`.
+fn declare_file(directory: &Path, manifest: &mut Value, name: &str, role: &str, bytes: &[u8]) {
+    std::fs::write(directory.join(name), bytes).expect("writes");
+    manifest["payloads"]
+        .as_array_mut()
+        .expect("payloads")
+        .push(json!({
+            "role": role,
+            "path": name,
+            "digest": PayloadDigest::of(bytes).to_string(),
+            "size_bytes": bytes.len().to_string(),
+        }));
+}
+
+/// Adds a step to the recipe that installs the file `source`, holding `bytes`, as `destination`.
+fn install_file(manifest: &mut Value, source: &str, destination: &str, bytes: &[u8]) {
+    manifest["native_bridge"]["install"]
+        .as_array_mut()
+        .expect("steps")
+        .push(json!({
+            "type": "install_file",
+            "source": source,
+            "destination": destination,
+            "digest": PayloadDigest::of(bytes).to_string(),
+        }));
+}
+
+/// A JSON object of exactly `size` bytes.
+fn object_of(size: usize) -> Vec<u8> {
+    let mut bytes = b"{}".to_vec();
+    bytes.resize(size, b' ');
+    bytes
+}
+
+/// The paths of the files a recipe installs that the package check says it did not read whole.
+fn unread_bridge_files(validated: &Validated) -> Vec<String> {
+    validated
+        .report
+        .findings
+        .iter()
+        .filter(|finding| {
+            finding.code == FindingCode::BridgeRecipeInvalid
+                && finding.detail.contains("was not read whole")
+        })
+        .filter_map(|finding| finding.path.clone())
+        .collect()
+}
+
+/// The package check reads every file a recipe installs, and refuses a file of the recipe that it
+/// cannot read whole instead of skipping it: a file over a mebibyte, and files that together pass
+/// the eight mebibytes the check keeps. The same package within both bounds is read.
 #[test]
 fn a_bridge_file_the_check_did_not_keep_is_refused() {
-    let unread = |pads: usize| {
-        let home = tempfile::tempdir().expect("a directory");
-        let directory = home.path().join("package");
-        copy_tree(&bundled("gemini-cli"), &directory);
-        // The cache holds 8 MiB: the other root file of the package and the pads fill it to the
-        // byte, in whatever order they are read, so no file of a folder below it is kept.
+    let hooks = |size: usize| {
+        // The recipe still names the digest of the bytes it had; only the read is under test.
+        unread_bridge_files(&gemini_directory(|directory, _| {
+            std::fs::write(directory.join("bridge/hooks.json"), object_of(size)).expect("writes");
+        }))
+    };
+    assert!(hooks(1 << 20).is_empty(), "a file of a mebibyte is kept");
+    assert_eq!(
+        hooks((1 << 20) + 1),
+        ["bridge/hooks.json"],
+        "a file over a mebibyte is refused, not skipped"
+    );
+
+    // Each extra file is the largest the check keeps; the recipe's own three are small.
+    let together = |extras: usize| {
+        unread_bridge_files(&gemini_directory(|directory, manifest| {
+            for number in 0..extras {
+                let bytes = object_of(1 << 20);
+                let source = format!("bridge/extra-{number}.json");
+                declare_file(directory, manifest, &source, "native_bridge", &bytes);
+                install_file(
+                    manifest,
+                    &source,
+                    &format!("extensions/kalareach/extra-{number}.json"),
+                    &bytes,
+                );
+            }
+        }))
+    };
+    assert!(
+        together(7).is_empty(),
+        "seven mebibytes and the three small files are kept"
+    );
+    assert!(
+        !together(9).is_empty(),
+        "nine mebibytes of the recipe's own files pass the eight the check keeps"
+    );
+}
+
+/// A package whose other files fill the check's cache first is not refused for it: the check keeps
+/// every file the recipe installs before any other file, and no other file, so a package of
+/// small files beside a bridge whose files fit is accepted, whatever its files' number and order.
+#[test]
+fn a_package_whose_other_files_fill_the_cache_first_still_has_its_bridge_files_read() {
+    let padded = gemini_directory(|directory, manifest| {
+        // The README and eight pads would fill eight mebibytes to the byte, in whatever order they
+        // were read, and the root's files are read before any file of a folder below it.
         let readme = std::fs::metadata(directory.join("README.md"))
             .expect("a file")
             .len() as usize;
-        for number in 0..pads {
-            let size = if number + 1 == pads {
+        for number in 0..8 {
+            let size = if number == 7 {
                 (1 << 20) - readme
             } else {
                 1 << 20
             };
-            std::fs::write(
-                directory.join(format!("pad-{number}.bin")),
-                vec![0_u8; size],
-            )
-            .expect("writes");
+            declare_file(
+                directory,
+                manifest,
+                &format!("pad-{number}.bin"),
+                "asset",
+                &vec![0_u8; size],
+            );
         }
-        validate_package_directory(&directory)
-            .report
-            .findings
-            .iter()
-            .filter(|finding| {
-                finding.code == FindingCode::BridgeRecipeInvalid
-                    && finding.path.as_deref() == Some("bridge/hooks.json")
-                    && finding.detail.contains("was not read whole")
-            })
-            .count()
-    };
-    assert_eq!(unread(0), 0, "the control keeps every bridge file");
+    });
+    assert!(
+        padded.report.is_valid(),
+        "the package is accepted: {:?}",
+        padded.report.findings
+    );
+}
+
+/// The files a recipe installs from the package's root are kept whatever order the directory
+/// lists its entries in: the manifest is read first, so the recipe is known when the first of
+/// them is. Files are added until the listing gives one of them before the manifest.
+#[test]
+fn a_bridge_file_at_the_root_is_kept_whatever_the_order_of_the_listing() {
+    let validated = gemini_directory(|directory, manifest| {
+        let bytes = object_of(2);
+        let listed_before_the_manifest = || {
+            let names: Vec<String> = std::fs::read_dir(directory)
+                .expect("lists")
+                .map(|entry| {
+                    entry
+                        .expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            let manifest_at = names
+                .iter()
+                .position(|name| name == "plugin.json")
+                .expect("the manifest is listed");
+            names[..manifest_at]
+                .iter()
+                .any(|name| name.starts_with("root-"))
+        };
+        let mut number = 0;
+        while !listed_before_the_manifest() {
+            assert!(number < 512, "no listing order put a root file first");
+            let name = format!("root-{number}.json");
+            declare_file(directory, manifest, &name, "native_bridge", &bytes);
+            install_file(
+                manifest,
+                &name,
+                &format!("extensions/kalareach/{name}"),
+                &bytes,
+            );
+            number += 1;
+        }
+    });
     assert_eq!(
-        unread(8),
-        1,
-        "eight other files fill the cache before the bridge's"
+        unread_bridge_files(&validated),
+        Vec::<String>::new(),
+        "every file of the recipe is read"
     );
 }
 
