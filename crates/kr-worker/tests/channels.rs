@@ -1926,13 +1926,14 @@ async fn kr_req_12_18_closing_under_a_channels_identifier_leaves_the_channel_ser
     assert!(matches!(channel.ended().await, ChannelEnd::Ended { .. }));
 }
 
-/// KR-REQ-12.09: an approval answered on a Channels channel records the provenance it reached the
-/// application by. The answer goes out through the host's own authenticated bridge, to a forwarder
-/// that nothing in the application acknowledges, so the admission records a bridge response, and
-/// the answer ends as an outcome nobody can establish. The control is the typed route: an answer
+/// KR-REQ-12.09: an approval answered on a Channels channel is admitted with the provenance it
+/// will reach the application by. The answer goes out through the host's own authenticated bridge,
+/// to a forwarder that nothing in the application acknowledges, so the admission names a bridge
+/// response, and the answer ends as an outcome nobody can establish. The service's case of the
+/// same requirement reads what the worker stored of it. The control is the typed route: an answer
 /// over a gateway connection is a typed result (kr-worker's gateway suite).
 #[tokio::test]
-async fn kr_req_12_09_a_channels_answer_records_the_authenticated_bridge_it_went_by() {
+async fn kr_req_12_09_a_channels_answer_is_admitted_as_the_authenticated_bridge_response() {
     let recorded: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/channel-frames-0.77.json"))
             .expect("the recorded frames are JSON");

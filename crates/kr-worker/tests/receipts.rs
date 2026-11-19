@@ -9522,6 +9522,7 @@ fn settled_unknown(
             phone,
             action(action_byte),
             failure,
+            kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse,
             TimestampMs::new(at_ms + 1),
         )
     } else {
@@ -9606,9 +9607,48 @@ fn a_channel_end_never_hides_another_unknown_outcome_of_the_same_subject() {
     );
 }
 
+/// KR-REQ-12.09: an answer a channel carried records the provenance it reached the application by,
+/// and the record is stored with the receipt: a journal opened again reads it, and reads none for
+/// an unknown outcome that is not a channel end.
+#[test]
+fn a_channel_end_stores_the_provenance_its_answer_went_by() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = temp
+        .environment()
+        .journal_database(SessionId::new(kr_ipc::new_uuid()));
+    {
+        let mut journal = Journal::open(&path).expect("a journal");
+        settled_unknown(&mut journal, 1, 7, true, 2_000);
+        settled_unknown(&mut journal, 2, 8, false, 4_000);
+    }
+    let journal = Journal::open(&path).expect("the journal opens again");
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(1))
+            .expect("reads"),
+        Some(kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse),
+        "the receipt of a channel's answer carries the provenance it went by"
+    );
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(2))
+            .expect("reads"),
+        None,
+        "an unknown outcome of another transport carries none"
+    );
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(3))
+            .expect("reads"),
+        None,
+        "a receipt nobody wrote has none"
+    );
+}
+
 /// KR-REQ-12.18: a journal an earlier build of this schema version wrote has no column for the
 /// mark. Opening it adds the column, keeps every unknown outcome it holds as one that stands in the
-/// way, and lets the next channel end be recorded.
+/// way and as one that records no provenance, and lets the next channel end be recorded with its
+/// provenance.
 #[test]
 fn a_journal_without_the_channel_end_column_gets_it_when_opened() {
     let temp = kr_ipc::testing::TempHost::create();
@@ -9622,7 +9662,7 @@ fn a_journal_without_the_channel_end_column_gets_it_when_opened() {
     {
         let connection = rusqlite::Connection::open(&path).expect("the file opens");
         connection
-            .execute_batch("ALTER TABLE receipts DROP COLUMN channel_end;")
+            .execute_batch("ALTER TABLE receipts DROP COLUMN channel_provenance;")
             .expect("the column is gone, as an earlier build left the table");
     }
 
@@ -9632,10 +9672,24 @@ fn a_journal_without_the_channel_end_column_gets_it_when_opened() {
         Some(action(1)),
         "an unknown outcome an earlier build recorded still stands in the way"
     );
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(1))
+            .expect("reads"),
+        None,
+        "an unknown outcome an earlier build recorded names no provenance"
+    );
     settled_unknown(&mut journal, 2, 8, true, 4_000);
     assert_eq!(
         held_by(&journal, 8),
         None,
         "the column is there, and a channel end recorded in it does not hold"
+    );
+    assert_eq!(
+        journal
+            .channel_end_provenance(&actor("device:phone"), action(2))
+            .expect("reads"),
+        Some(kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse),
+        "and the provenance is recorded with it"
     );
 }

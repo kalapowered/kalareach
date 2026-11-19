@@ -19,6 +19,7 @@
 use kr_protocol::action::{
     ActionObservation, ObservationProvenance, ObservedResult, PossiblyExecutedAction,
 };
+use kr_protocol::broker::ActionProvenance;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, ActorId, RequestId};
 use kr_protocol::method::{Method, MethodName, MethodVersion};
@@ -485,7 +486,7 @@ impl Journal {
     fn create_current_schema(&self) -> Result<()> {
         create_current_objects(&self.connection).map_err(|error| faulted(&self.health, error))?;
         self.add_delivery_generation()?;
-        self.add_channel_end()?;
+        self.add_channel_provenance()?;
         Ok(())
     }
 
@@ -834,19 +835,19 @@ impl Journal {
         Ok(())
     }
 
-    /// Adds the column that records a receipt as a channel end to a journal an earlier build of
-    /// this schema version wrote without it.
+    /// Adds the column that records a receipt as a channel end, with the provenance the channel's
+    /// answer reached the application by, to a journal an earlier build of this schema version
+    /// wrote without it.
     ///
-    /// Nought is true of every receipt such a journal holds: before the column existed a channel's
-    /// completed write settled as applied, so no receipt ended as a channel end, and every unknown
-    /// receipt it has is one a later receipt may still settle and holds back a fresh request as it
-    /// always did.
+    /// Every receipt such a journal holds has none. Before the column existed, what a channel left
+    /// unknown could not be told from the unknown outcome of any other transport, so each of those
+    /// receipts keeps the hold it always had on a fresh request for its subject.
     ///
     /// This runs outside the ladder, every time the journal is opened, and raises no version: a
-    /// build that reads the journal afterwards finds a column with a default and does not mind it,
-    /// which a version it refuses to read would not allow. Remove it once no supported upgrade
+    /// build that reads the journal afterwards finds a column that may be null and does not mind
+    /// it, which a version it refuses to read would not allow. Remove it once no supported upgrade
     /// starts from a journal written without the column.
-    fn add_channel_end(&self) -> Result<()> {
+    fn add_channel_provenance(&self) -> Result<()> {
         let mut statement = self
             .connection
             .prepare("SELECT name FROM pragma_table_info('receipts')")
@@ -856,7 +857,7 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         let mut present = false;
         for column in columns {
-            if column.map_err(|error| faulted(&self.health, error))? == "channel_end" {
+            if column.map_err(|error| faulted(&self.health, error))? == "channel_provenance" {
                 present = true;
             }
         }
@@ -865,9 +866,7 @@ impl Journal {
             return Ok(());
         }
         self.connection
-            .execute_batch(
-                "ALTER TABLE receipts ADD COLUMN channel_end INTEGER NOT NULL DEFAULT 0;",
-            )
+            .execute_batch("ALTER TABLE receipts ADD COLUMN channel_provenance TEXT;")
             .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
@@ -1709,16 +1708,18 @@ impl Journal {
         error: Option<ProtocolError>,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
-        self.settle_marked(actor_id, action_id, state, result, error, false, now_ms)
+        self.settle_marked(actor_id, action_id, state, result, error, None, now_ms)
     }
 
     /// Settles an operation a channel carried as `unknown`, and records that this is where the
-    /// operation ended for good.
+    /// operation ended for good, with the provenance it reached the application by.
     ///
     /// A channel confirms nothing and says nothing later, so nothing will ever change what this
     /// receipt says. The mark is what tells it from the `unknown` of any other transport, which a
     /// later receipt can still settle: a fresh request for the same subject is not held back by it
     /// ([`Self::uncertain_for_subject`]), and every other unknown receipt holds as it always did.
+    /// The provenance is written in the same transaction, because an action records how it reached
+    /// the application whatever became of it ([`Self::channel_end_provenance`]).
     ///
     /// # Errors
     ///
@@ -1728,6 +1729,7 @@ impl Journal {
         actor_id: ActorId,
         action_id: ActionId,
         error: ProtocolError,
+        provenance: ActionProvenance,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
         self.settle_marked(
@@ -1736,9 +1738,42 @@ impl Journal {
             ReceiptState::Unknown,
             None,
             Some(error),
-            true,
+            Some(provenance),
             now_ms,
         )
+    }
+
+    /// Returns the provenance a channel's answer was recorded with, when the receipt ended as a
+    /// channel end, and `None` for every other receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails or the stored provenance is
+    /// not one this build writes.
+    pub fn channel_end_provenance(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+    ) -> Result<Option<ActionProvenance>> {
+        let stored: Option<Option<String>> = self
+            .connection
+            .query_row(
+                "SELECT channel_provenance FROM receipts WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| faulted(&self.health, error))?;
+        stored
+            .flatten()
+            .map(|text| {
+                ActionProvenance::ALL
+                    .iter()
+                    .copied()
+                    .find(|provenance| provenance.as_str() == text)
+                    .ok_or_else(|| self.corrupt("a stored action provenance is not one this build writes"))
+            })
+            .transpose()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1749,7 +1784,7 @@ impl Journal {
         state: ReceiptState,
         result: Option<&[u8]>,
         error: Option<ProtocolError>,
-        channel_end: bool,
+        channel_provenance: Option<ActionProvenance>,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
         let mut receipt = self
@@ -1769,7 +1804,7 @@ impl Journal {
         transaction
             .execute(
                 "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
-                     error_message = ?7, updated_at_ms = ?8, channel_end = ?9
+                     error_message = ?7, updated_at_ms = ?8, channel_provenance = ?9
                  WHERE actor_id = ?1 AND action_id = ?2",
                 params![
                     receipt.actor_id.as_str(),
@@ -1783,7 +1818,7 @@ impl Journal {
                         .map(|error| error.code.as_str().to_owned()),
                     receipt.error.as_ref().map(|error| error.message.clone()),
                     i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
-                    i64::from(channel_end),
+                    channel_provenance.map(ActionProvenance::as_str),
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
@@ -2938,12 +2973,12 @@ impl Journal {
     /// has no result to show a caller before a fresh request.
     const IN_THE_WAY: &'static str = "(SELECT actor_id, action_id, revision, intent, rowid AS rid
                 FROM receipts
-                WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3 AND channel_end = 0
+                WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3 AND channel_provenance IS NULL
               UNION ALL
               SELECT actor_id, action_id, revision, intent, rowid AS rid
                 FROM receipts
                 WHERE actor_id = ?1 AND subject_digest IS NULL AND state = ?3 AND method = ?4
-                  AND channel_end = 0
+                  AND channel_provenance IS NULL
              ) AS r";
 
     /// Orders the receipts selected as `r` with the state `?3` newest first: the receipt whose
@@ -5087,7 +5122,7 @@ pub(crate) fn create_current_objects(connection: &Connection) -> rusqlite::Resul
                      error_message        TEXT,
                      created_at_ms        INTEGER NOT NULL,
                      updated_at_ms        INTEGER NOT NULL,
-                     channel_end          INTEGER NOT NULL DEFAULT 0,
+                     channel_provenance   TEXT,
                      PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);

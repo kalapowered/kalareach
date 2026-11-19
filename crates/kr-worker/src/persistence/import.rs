@@ -214,7 +214,7 @@ pub fn import_journal(path: impl AsRef<Path>) -> Result<Imported, ImportRefusal>
              ALTER TABLE receipts ADD COLUMN subject_digest BLOB;
              ALTER TABLE receipts ADD COLUMN created_boot BLOB;
              ALTER TABLE receipts ADD COLUMN created_continuous_ms INTEGER;
-             ALTER TABLE receipts ADD COLUMN channel_end INTEGER NOT NULL DEFAULT 0;",
+             ALTER TABLE receipts ADD COLUMN channel_provenance TEXT;",
         )
         .map_err(unreadable)?;
     create_current_objects(&transaction).map_err(unreadable)?;

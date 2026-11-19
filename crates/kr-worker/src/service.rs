@@ -7149,15 +7149,21 @@ impl WorkerService {
         let deadline = tokio::time::Instant::now() + self.upstream_deadline();
         let mut handoff = pending.handoff;
         let claim = handoff.claim.take();
-        let (revision, operation, action, turn_id) = (
+        let (revision, operation, action, turn_id, provenance) = (
             handoff.admitted.binding_revision(),
             handoff.admitted.operation(),
             handoff.admitted.action().cloned(),
             handoff.admitted.turn_id().cloned(),
+            handoff.admitted.provenance(),
         );
         let (outcome, late) = handoff.carry(deadline).await;
         let settled = off_the_executor(|| {
-            self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref())
+            self.settle_upstream(
+                &pending.actor_id,
+                pending.action_id,
+                provenance,
+                outcome.as_ref(),
+            )
         });
         // An outcome nobody could establish is settled by the upstream's answer if one comes
         // later, matched to the operation by the identifier it was sent under. The claim is made
@@ -7214,6 +7220,7 @@ impl WorkerService {
         &self,
         actor_id: &ActorId,
         action_id: kr_protocol::ids::ActionId,
+        provenance: kr_protocol::broker::ActionProvenance,
         outcome: std::result::Result<&ParamsValue, &WorkerError>,
     ) -> Option<kr_protocol::receipt::ReceiptState> {
         let now = kr_ipc::now_ms();
@@ -7236,12 +7243,14 @@ impl WorkerService {
                 )
             }
             // A channel took the operation and confirms nothing: the receipt is unknown for good,
-            // and says so, so that the next request for its subject is not held back by it.
+            // and says so, so that the next request for its subject is not held back by it. The
+            // provenance the answer went by is stored with it, in the same transaction.
             Err(error @ WorkerError::Broker(crate::broker::BrokerError::ChannelEnd { .. })) => {
                 journal.settle_channel_end(
                     actor_id.clone(),
                     action_id,
                     error.to_protocol_error(),
+                    provenance,
                     now,
                 )
             }

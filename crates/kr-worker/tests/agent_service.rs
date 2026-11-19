@@ -5338,6 +5338,42 @@ async fn kr_req_12_18_an_answer_still_queued_at_the_workers_bound_is_a_channel_e
     );
 }
 
+/// KR-REQ-12.09: each action records its provenance, and an answer written on a channel is one:
+/// the worker stores, with the receipt that says unknown, that the answer went by the host's own
+/// authenticated bridge. The record is read from the journal's file, as a later run reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_09_a_channels_answer_records_the_authenticated_bridge_it_went_by() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let resource_id = channel.relay(&host, "abcde").await;
+    let mut client = cli(&host).await;
+
+    let mutation = approval_mutation(&client, &host, 60, resource_id);
+    let action_id = mutation.action_id;
+    let Outcome::Error(error) = send(&mut client, mutation).await else {
+        panic!("the answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+
+    let stored: Option<String> = rusqlite::Connection::open(&host.journal_path)
+        .expect("the journal's file opens")
+        .query_row(
+            "SELECT channel_provenance FROM receipts WHERE action_id = ?1",
+            [action_id.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("the receipt is stored");
+    assert_eq!(
+        stored.as_deref(),
+        Some("authenticated_hook_response"),
+        "the provenance is stored with the receipt of the answer"
+    );
+}
+
 /// KR-REQ-12.18: after an answer ended unknown, a second answer to the same request is refused
 /// before its marker and nothing second is written; the same identifier sent again returns the
 /// retained receipt and writes nothing.
