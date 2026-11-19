@@ -503,8 +503,9 @@ pub struct Controller {
     /// # Lock order
     ///
     /// One order holds for the whole crate, and this is the place that states it. A thread that
-    /// holds a lock takes only locks of a higher number: it never takes one of a lower number,
-    /// nor the same lock again.
+    /// holds a lock takes only locks that follow it in this order: a lock of a higher number, or,
+    /// where a level names its locks in an order of their own, one named after it. It never takes
+    /// one that comes before it, nor the same lock again.
     ///
     /// 0. The outer locks of a guarded operation: the configuration edit lock, which stays held
     ///    through the acceptance of a configuration and its barrier; the restored-policy lock,
@@ -514,26 +515,38 @@ pub struct Controller {
     /// 1. The registry (the tokio lock).
     /// 2. What a service holds across a registration commit or a pairing step, and no holder of
     ///    the policy waits for: the owner challenges, the attention store, the catalogue's lock
-    ///    and its record transaction, the transfer store, the machine record's publication, the
-    ///    privacy and backup stores, the descriptions' stores, the bridge store's file lock, the
-    ///    agent tools' lock and the project writer that a project-scope change holds.
+    ///    and then its record transaction, the transfer store, the machine record's publication,
+    ///    the privacy and backup stores, the descriptions' stores, the bridge store's file lock,
+    ///    the agent tools' lock and then the project writer that a project-scope change holds.
     /// 3. This hold. Its write side is taken holding at most the locks of levels 0 and 1, and its
     ///    read side holding at most those of level 2. Both sides are one lock: a reader that
     ///    comes while a writer waits waits too, so nothing that holds the read side takes it
     ///    again or waits for a lock whose holder waits for it.
     /// 4. The policy.
-    /// 5. What a holder of the policy waits for, in this order: the rights ceiling, the grant
-    ///    store's connection (the rights ceiling is held while a debt is written there), the
-    ///    anchoring lock that serialises the deriving of an anchor, the clock trust state, the
-    ///    device directory's connection, then the connection table, on both its sides (a
-    ///    withdrawal takes the write side while it holds the policy).
+    /// 5. What a holder of the policy waits for, in this order: the rights ceiling, the anchoring
+    ///    lock that serialises the deriving of an anchor (its holder then reads the grant store
+    ///    and the clock trust state), the grant store's connection (the rights ceiling is held
+    ///    while a debt is written there), the clock trust state, then the device directory's
+    ///    connection.
     /// 6. What a commit first takes inside this hold: a service's own answers, marker, document
-    ///    or bridge store, the capability checks' lock, the descriptions' fetch state, the backup
-    ///    kit state, and the catalogue's bridge members and its record of what it wrote. No
-    ///    commit takes a lock of a lower number than this hold, or this hold again.
-    /// 7. Leaf locks, whose holder takes no other lock and waits for nothing: the debts, the
-    ///    grants' anchors (`GrantLifetimes::anchored`) and the offline anchor's cell, a
-    ///    connection's shares, and the list of connections that ended.
+    ///    or bridge store, the capability checks' lock (held across the capability answers'
+    ///    store, which comes after it), the descriptions' fetch state, the backup kit state, and
+    ///    the catalogue's bridge members and its record of what it wrote. No commit takes a lock
+    ///    of a lower number than this hold, or this hold again.
+    /// 7. The connection table, on both its sides: a withdrawal takes the write side while it
+    ///    holds the policy, and the check of a registration takes the read side under any lock
+    ///    above, a commit's own lock of level 6 among them (the capability checks' lock is held
+    ///    when a check begins its transaction).
+    /// 8. Leaf locks, whose holder takes no other lock and waits for nothing: the debts, the
+    ///    grants' anchors (`GrantLifetimes::anchored`) and their pending records
+    ///    (`GrantLifetimes::pending_stored`), the offline anchor's cell, the local access state's
+    ///    draws (`LocalAccessState::drawn`), a connection's shares, and the list of connections
+    ///    that ended.
+    ///
+    /// The write side of this hold is also tried, and never waited for, by `settle_ended` when a
+    /// holder lets go of a hold, and that holder may still hold a lock of a higher number
+    /// (challenges, a store or the policy). When the attempt succeeds, `settle_ended` takes the
+    /// connection table and then the list of connections that ended.
     ///
     /// A check that runs inside a transaction on the device directory's connection or the grant
     /// store's reads published words and takes no lock of levels 1 to 4 (`feed_refusal`, the
