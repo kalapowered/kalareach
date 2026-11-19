@@ -1290,6 +1290,29 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.44: a link's hello states that its host writes the placement reading only by the
+    /// one capability that says so: an empty selection, or one that holds other capabilities, does
+    /// not state it.
+    #[test]
+    fn a_hello_states_the_placement_reading_only_by_its_capability() {
+        use crate::ids::CapabilityId;
+        let set = |names: &[&str]| -> CanonicalSet<CapabilityId> {
+            names
+                .iter()
+                .map(|name| CapabilityId::new(*name).expect("a capability"))
+                .collect()
+        };
+        assert!(!states_placement_reading(&set(&[])));
+        assert!(!states_placement_reading(&set(&["statement.other/1"])));
+        assert!(states_placement_reading(&set(&[
+            PLACEMENT_READING_CAPABILITY
+        ])));
+        assert!(states_placement_reading(&set(&[
+            "statement.other/1",
+            PLACEMENT_READING_CAPABILITY
+        ])));
+    }
+
     fn trust_plan() -> CatalogueTrustPlan {
         CatalogueTrustPlan::of_request(
             &add_params(),
