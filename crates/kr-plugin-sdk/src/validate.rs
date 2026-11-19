@@ -26,7 +26,7 @@ use crate::connector::{
     FieldSegment, Framing, MAX_CLASSIFIED_METHODS, MAX_DECISION_VALUE_BYTES, MAX_FIELD_PATH_DEPTH,
     MAX_OBSERVED_ROUTES, MAX_REQUEST_CONDITIONS, MAX_RESPONSE_METHODS, MAX_TEMPLATE_DEPTH,
     MAX_TEMPLATE_LITERAL_BYTES, MAX_TEMPLATE_NODES, MethodClass, Observation, Operations,
-    RequestCondition, ResponseCorrelation, RouteDirection, TemplateHole,
+    RequestCondition, ResponseCorrelation, RouteDirection, TemplateHole, paths_overlap,
 };
 use crate::digest::PayloadDigest;
 use crate::effect::{
@@ -2274,28 +2274,6 @@ fn check_connector_presence(
             ),
         ));
     }
-}
-
-/// Returns true when two field paths cannot both be written into one request.
-///
-/// Two paths conflict when they name the same field, when one is inside the other, or when they
-/// disagree about what a shared prefix is. `params.0` and `params.name` need `params` to be both an
-/// array and an object, so writing both is not a thing a broker can do, and the manifest says so
-/// rather than leaving it to find out.
-fn paths_overlap(left: &FieldPath, right: &FieldPath) -> bool {
-    use crate::connector::FieldSegment;
-
-    for (one, other) in left.segments.iter().zip(&right.segments) {
-        if one == other {
-            continue;
-        }
-        return matches!(
-            (one, other),
-            (FieldSegment::Member { .. }, FieldSegment::Index { .. })
-                | (FieldSegment::Index { .. }, FieldSegment::Member { .. })
-        );
-    }
-    true
 }
 
 /// Checks one bounded field path.
