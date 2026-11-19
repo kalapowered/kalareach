@@ -185,7 +185,7 @@
       "kept": [
         "ConfigurationDocument"
       ],
-      "level": 7,
+      "level": 8,
       "near_miss": 2,
       "members": [
         {
@@ -217,6 +217,11 @@
           "member": "push",
           "level": 7,
           "digest": "d85cfb6645046ba37cb58b5264edebc3cf52a99d2897cdf7dfb9493a498fc135"
+        },
+        {
+          "member": "own_voice",
+          "level": 8,
+          "digest": "c11cc4d1a03256ef61728c777d2fa0936baa4e94af325825cc506c8ffb904b4d"
         }
       ]
     },
@@ -457,6 +462,23 @@
     },
     {
       "entry": {
+        "store": "own-key-calls",
+        "scope": "environment",
+        "path": "own-key-calls.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "own_key_call_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "b669235273cf64206125dd552515873c97bbddea8fd00177a8f1371ed2739f85",
+      "kept": [
+        "words of the states an own-key call is stored with"
+      ]
+    },
+    {
+      "entry": {
         "store": "policy-mirror",
         "scope": "environment",
         "path": "policy-mirror.cbor",
@@ -531,7 +553,7 @@
         "migrates_from": 1,
         "reads_through": 17
       },
-      "digest": "47c2087653d2b7ea38a576e7ceeb0abfea7c5e65bf22672344e95501b83282c3",
+      "digest": "04ce59d4e9fff9b92a232e574fcd6f327a283a4900c0d470ef3acc996e448dea",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -549,6 +571,8 @@
         "VoiceDelegateResult",
         "VoiceStartResult",
         "VoiceStopResult",
+        "VoiceControlResult",
+        "VoiceContextSendResult",
         "OrganisationEnrolResult",
         "OrganisationExclusiveSetResult",
         "OrganisationChangeMarker",
@@ -557,6 +581,7 @@
         "DeliveryDestinationSecretSetResult",
         "VoiceCredentialSetResult",
         "VoiceCredentialRemoveResult",
+        "VoiceCredentialForgetCallsResult",
         "EnvironmentEnrolResult",
         "EnvironmentForgetResult",
         "EnvironmentRefreshResult",
