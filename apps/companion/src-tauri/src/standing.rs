@@ -30,7 +30,7 @@ use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::{ClientError, Session};
 use kr_protocol::error::{ErrorCode, RetryCategory};
-use kr_protocol::ids::{EnvironmentId, GrantId, SessionEpoch, SessionId};
+use kr_protocol::ids::{ActionId, EnvironmentId, GrantId, SessionEpoch, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
@@ -989,6 +989,94 @@ impl PairedLinks {
                 _flight: None,
             });
         }
+    }
+
+    /// The live link of `session_id` that holds `action_id` in its book of actions not yet settled:
+    /// the link the action was answered on, for as long as that link lives.
+    ///
+    /// A screen that opens after an action was sent gets a link of its own and leaves the link the
+    /// action went on where it was, so the call that reads the action's receipt or lets it go finds
+    /// the link by the action. None when no live link of the session holds it, because the link it
+    /// went on has ended or the action is not on any book, and the call then takes the link every
+    /// call that names no opening takes.
+    pub(crate) async fn answering_link(
+        &self,
+        session_id: SessionId,
+        action_id: ActionId,
+    ) -> Option<Leased> {
+        let candidates: Vec<Leased> = {
+            let inner = self.lock();
+            let opened = inner
+                .opened
+                .get(&session_id)
+                .filter(|held| {
+                    matches!(
+                        held.standing,
+                        SessionStanding::Open { .. } | SessionStanding::Closed
+                    )
+                })
+                .and_then(|held| held.link.as_ref())
+                .map(|link| Leased {
+                    link: Arc::clone(link),
+                    _busy: None,
+                    // Taken under the same lock the leave takes the link out under.
+                    _flight: Some(Flight::enter(link)),
+                });
+            let ambient = inner
+                .ambient
+                .iter()
+                .filter(|entry| entry.session_id == session_id)
+                .filter_map(|entry| {
+                    let link = entry
+                        .held
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone()?;
+                    entry.busy.fetch_add(1, Ordering::SeqCst);
+                    Some(Leased {
+                        link,
+                        _busy: Some(Busy {
+                            busy: Arc::clone(&entry.busy),
+                            freed: Arc::clone(&self.freed),
+                        }),
+                        _flight: None,
+                    })
+                });
+            opened.into_iter().chain(ambient).collect()
+        };
+        for candidate in candidates {
+            if live(&candidate).await
+                && candidate
+                    .session
+                    .submitted_actions()
+                    .await
+                    .iter()
+                    .any(|held| held.action_id == action_id)
+            {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// The actions the ambient link of a session keeps on its book, or none when the session holds
+    /// no ambient link. For a test of what the link's book keeps.
+    #[doc(hidden)]
+    pub async fn ambient_book(&self, session_id: SessionId) -> Option<Vec<ActionId>> {
+        let link = self
+            .lock()
+            .ambient
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .and_then(|entry| {
+                entry
+                    .held
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            })?;
+        let book = link.session.submitted_actions().await;
+        Some(book.into_iter().map(|held| held.action_id).collect())
     }
 
     /// The share an opening runs under, for a raw terminal view opened under it, or the words for

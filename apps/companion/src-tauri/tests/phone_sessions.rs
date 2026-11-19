@@ -820,12 +820,15 @@ async fn kr_req_12_18_a_paired_host_reads_and_releases_an_action_on_the_ambient_
     );
 
     // The receipt is read with the session named and no opening: on the link the prompt used.
-    let read = companion
-        .call(
-            "action_read",
-            json!({ "params": { "action_id": action_id, "session_id": session.to_string() } }),
-        )
-        .expect("a paired host's receipt is read on the session's ambient link");
+    let read = companion.call(
+        "action_read",
+        json!({ "params": { "action_id": action_id, "session_id": session.to_string() } }),
+    );
+    assert!(
+        read.is_ok(),
+        "a paired host's receipt is read on the session's ambient link: {read:?}"
+    );
+    let read = read.expect("checked above");
     assert_eq!(read["receipt"]["state"], "unknown", "{read}");
 
     // The release goes to the same link, and lets go of that action alone.
@@ -872,6 +875,95 @@ async fn kr_req_12_18_a_paired_host_reads_and_releases_an_action_on_the_ambient_
             .as_str()
             .is_some_and(|words| words.contains("no receipt")),
         "the application refused it, not the worker: {unnamed}"
+    );
+
+    upstream.release();
+    adopted.stop().await;
+}
+
+/// KR-REQ-12.18 and section 9: over a paired host a receipt is read and an action released on the
+/// link the action was answered on, for as long as that link lives, and a screen that opens after
+/// the answer does not take them. The prompt goes with no screen open, so on the session's ambient
+/// link. The session's screen opens afterwards and has a link of its own with an empty book. The
+/// receipt is read and the action released with no opening, and the ambient link's book is the one
+/// that empties, while the screen link's book stays as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_12_18_a_paired_host_reads_and_releases_an_action_on_the_link_that_answered_it_when_a_screen_opens_later()
+ {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(net_support::worker::HeldUpstream::default());
+    let instance = worker.register_agent_on(Arc::clone(&upstream) as _);
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let companion = &phone.companion;
+    use tauri::Manager as _;
+    let state = companion.app.state::<companion_tauri::AppState>();
+
+    let sent = companion
+        .call(
+            "agent_prompt_submit",
+            json!({ "params": prompt(session, instance, "never answered") }),
+        )
+        .expect("an outcome nobody can establish is an answer with its action");
+    let action_id = sent["action_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the answer names the action: {sent}"))
+        .to_owned();
+    assert_eq!(
+        state
+            .paired_links()
+            .ambient_book(session)
+            .await
+            .map(|book| book.len()),
+        Some(1),
+        "the prompt is in the ambient link's book"
+    );
+
+    // The screen opens after the answer: its link is another, and its book is empty.
+    open(companion, session, None, "screen").expect("the session opens");
+    assert_eq!(
+        state.paired_links().unresolved(session, "screen").await,
+        Some(0),
+        "the screen's link holds nothing"
+    );
+
+    // The receipt is read with the session named and no opening, on the link the prompt went on.
+    let read = companion.call(
+        "action_read",
+        json!({ "params": { "action_id": action_id, "session_id": session.to_string() } }),
+    );
+    assert!(
+        read.is_ok(),
+        "the receipt is read on the link the prompt went on: {read:?}"
+    );
+    let read = read.expect("checked above");
+    assert_eq!(read["receipt"]["state"], "unknown", "{read}");
+
+    // The release goes to the same link.
+    companion
+        .call(
+            "agent_action_settle",
+            json!({ "params": { "session_id": session.to_string(), "action_id": action_id } }),
+        )
+        .expect("the link the prompt went on lets the action go");
+    assert_eq!(
+        state
+            .paired_links()
+            .ambient_book(session)
+            .await
+            .map(|book| book.len()),
+        Some(0),
+        "the release emptied the book of the link the prompt went on"
+    );
+    assert_eq!(
+        state.paired_links().unresolved(session, "screen").await,
+        Some(0),
+        "and the screen's link's book is as it was"
     );
 
     upstream.release();
