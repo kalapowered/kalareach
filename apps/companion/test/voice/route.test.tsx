@@ -1479,6 +1479,23 @@ describe('while a call is running', () => {
     expect(failed).toBe(true)
   })
 
+  // A notice with a finite end that is the only entry kept is shown until its end and then goes: the
+  // timer that reads the state at the end counts it, however old the notice is.
+  it('stops showing a lone notice with a finite end once its time has passed', async () => {
+    start((controls) => {
+      controls.oweVoice({ until_ms: Date.now() + 400 })
+    })
+    await waitForChoice()
+    expect(await screen.findByRole('status', { name: 'The last call' })).toBeInTheDocument()
+
+    await waitFor(
+      () => {
+        expect(screen.queryByRole('status', { name: 'The last call' })).not.toBeInTheDocument()
+      },
+      { timeout: 6000 }
+    )
+  })
+
   // A host that is reached again settles what it was owed, while no call runs and nothing on the
   // screen has changed: the screen reads again while a revocation is owed, and stops saying it.
   it('stops saying what is owed once the device has settled it with the host', async () => {
@@ -1698,6 +1715,23 @@ describe('the rate a start accepts', () => {
       '2026-09-a',
       '2026-10-b'
     ])
+  })
+
+  // A start answered with a changed rate was taken by the host's hold, which can change what the
+  // device kept of the starts before it: the screen reads what the device keeps again.
+  it('reads what the device keeps again after a start answered with a changed rate', async () => {
+    const user = userEvent.setup()
+    const { controls, port } = start()
+    await waitForChoice()
+    const read = vi.spyOn(port, 'voiceCallState')
+    controls.changeVoiceRate('2026-10-b', '3')
+
+    await user.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'Start at the new rate' })
+
+    await waitFor(() => {
+      expect(read).toHaveBeenCalled()
+    })
   })
 
   // KR-REQ-15.19: a host that could not read the service's terms offers no start, and says why.
