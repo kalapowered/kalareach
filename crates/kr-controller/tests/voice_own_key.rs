@@ -413,10 +413,11 @@ async fn a_clean_stop_closes_the_calls_the_host_controls_at_the_provider_and_lea
 
     daemon.host.controller().close_host_calls_for_stop().await;
 
-    until("the stopped call's row is gone", || {
-        rows_of(&daemon).is_empty()
-    })
-    .await;
+    // The stop returns once the calls' tasks have finished their records.
+    assert!(
+        rows_of(&daemon).is_empty(),
+        "the stopped call's row is gone"
+    );
     let seen = daemon.stand_in.recorded();
     assert!(
         seen.commands
@@ -1578,22 +1579,22 @@ async fn an_own_voice_host_passes_assert_it_needs_no_account_and_does_not_report
         "{}: not configured",
         kr_client::services::ManagedService::ManagedInference.as_str()
     );
-    daemon.host.assert_it_needs_no_account().await;
     let before = daemon.host.managed_services().await;
     assert!(
         before.detail().contains(&not_configured),
         "managed inference is not configured before a call: {}",
         before.detail()
     );
+    daemon.host.assert_it_needs_no_account().await;
     let phone = phone(&daemon, &MANAGER).await;
     let _ = started(phone.start().await);
-    daemon.host.assert_it_needs_no_account().await;
     let during = daemon.host.managed_services().await;
     assert!(
         during.detail().contains(&not_configured),
         "managed inference is not configured while an own-key call runs: {}",
         during.detail()
     );
+    daemon.host.assert_it_needs_no_account().await;
     daemon.host.stop().await;
 }
 
