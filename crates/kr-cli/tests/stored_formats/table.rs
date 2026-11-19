@@ -943,6 +943,23 @@ pub fn table() -> Vec<Store> {
             // The answer a repeat of a request for the disclosed checks is given, kept for 30 days.
             kept: vec![protocol::<desktop::CapabilityChecks>("CapabilityChecks")],
         },
+        // The hold a device's voice start leaves while its outcome may be unknown. A release that
+        // does not name the file never opens it, so a rollback loses the hold and an update again
+        // finds the rows the earlier release left.
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
+                "voice-start-holds",
+                StoreScope::Environment,
+                kr_controller::voice_start_holds::VOICE_START_HOLDS_RECORD,
+                sqlite_table("voice_start_holds_schema"),
+                version(kr_controller::voice_start_holds::SCHEMA_VERSION),
+                version(kr_controller::voice_start_holds::OLDEST_SCHEMA_VERSION),
+            ),
+            owned: Vec::new(),
+            kept: Vec::new(),
+        },
         // What this host read out of the test reports a workflow's suite wrote, beside the result
         // the change-set store records for the run. A release that does not name the file records
         // its results without a report and loses nothing it protected.
