@@ -492,6 +492,14 @@ impl Node {
         node
     }
 
+    /// Whether this member is read only as the contact's request identifier, which is a string
+    /// where the tool's input has one and nothing otherwise, never an error, and may be held
+    /// twice. A member that the events also read as the event, the session or any other value is
+    /// held to that stricter role: what it may hold is what that role takes.
+    fn lenient(&self) -> bool {
+        !self.slots.is_empty() && self.slots.iter().all(|slot| *slot == Slot::RequestId)
+    }
+
     fn at(&mut self, names: &[&str]) -> &mut Self {
         let mut node = self;
         for name in names {
@@ -552,17 +560,11 @@ impl Descend<'_> {
             .any(|slot| matches!(slot, Slot::Event | Slot::Thread))
     }
 
-    /// Whether this member is read as the contact's request identifier, which is a string where
-    /// the tool's input has one and nothing otherwise, and never an error.
-    fn request_id(&self) -> bool {
-        self.node.slots.contains(&Slot::RequestId)
-    }
-
-    /// A value that is not a string. The contact's request identifier takes it as no value, and
-    /// so does the contact tool's input, which is read for one member and skipped when it is not
-    /// an object; every other place the events name refuses it.
+    /// A value that is not a string. A member that is only the contact's request identifier takes
+    /// it as no value, and so does the contact tool's input, which is read for one member and
+    /// skipped when it is not an object; every other place the events name refuses it.
     fn not_a_string<E: serde::de::Error>(self, what: Unexpected<'_>) -> Result<(), E> {
-        if self.request_id() {
+        if self.node.lenient() {
             self.found.remove(&Slot::RequestId);
             return Ok(());
         }
@@ -610,8 +612,7 @@ impl<'de> Visitor<'de> for Descend<'_> {
                 map.next_value::<IgnoredAny>()?;
                 continue;
             };
-            let lenient = child.slots.contains(&Slot::RequestId);
-            if !lenient && seen.contains(&key) {
+            if !child.lenient() && seen.contains(&key) {
                 return Err(A::Error::custom(format!("duplicate field `{key}`")));
             }
             seen.push(key);
@@ -684,7 +685,7 @@ impl<'de> Visitor<'de> for Descend<'_> {
         if self.required() {
             return Err(E::invalid_type(Unexpected::Unit, &"a string"));
         }
-        if self.request_id() {
+        if self.node.lenient() {
             self.found.remove(&Slot::RequestId);
         }
         Ok(())
@@ -2142,6 +2143,82 @@ mod tests {
             ),
         ] {
             assert_eq!(read(text).tool_request_id.as_deref(), request, "{text}");
+        }
+    }
+
+    /// A map whose contact request identifier is also the place of `role`, which is `event` or
+    /// `tool_name`: the member is read by both, and the stricter one decides what it may hold.
+    fn coinciding_with(role: &str) -> HookEvents {
+        let place = |names: &[&str]| {
+            serde_json::json!({"segments": names.iter()
+                .map(|name| serde_json::json!({"type": "member", "name": name}))
+                .collect::<Vec<_>>()})
+        };
+        let shared = place(&["tool_input", "request_id"]);
+        let events: HookEvents = serde_json::from_value(serde_json::json!({
+            "event": if role == "event" { shared.clone() } else { place(&["hook_event_name"]) },
+            "thread": place(&["session_id"]),
+            "events": [
+                {"name": "SessionStart", "report": "session_started"},
+                {"name": "PostToolUse", "report": "tool_finished"},
+            ],
+            "details": {
+                "tool_name": if role == "tool_name" { shared } else { place(&["tool_name"]) },
+            },
+            "contact": {
+                "tool_name": "mcp__{server}__{tool}",
+                "tool_input": place(&["tool_input"]),
+                "agreeing": [],
+            },
+        }))
+        .expect("events");
+        assert_eq!(events.refusals(), Vec::new(), "{role}");
+        events
+    }
+
+    /// The request identifier's leniency (a value that is not a string, or a repeat, is no value)
+    /// belongs to a place that holds no stricter role. Where the event or the tool name is read at
+    /// the same place, a repeat or a value that is not a string is refused, as it is for any other
+    /// place, and cannot leave the first value in the role.
+    #[test]
+    fn a_place_two_roles_read_is_held_to_the_stricter_role() {
+        for (role, held, start, tail) in [
+            (
+                "event",
+                "SessionStart",
+                r#"{"session_id":"s","tool_input":{"#,
+                "}}",
+            ),
+            (
+                "tool_name",
+                "mcp__kalareach__ask_user",
+                r#"{"session_id":"s","hook_event_name":"PostToolUse","tool_input":{"#,
+                "}}",
+            ),
+        ] {
+            let events = coinciding_with(role);
+            let read =
+                |members: &str| read_input(format!("{start}{members}{tail}").as_bytes(), &events);
+            for members in [
+                format!(r#""request_id":"{held}","request_id":7"#),
+                format!(r#""request_id":"{held}","request_id":{{"a":1}}"#),
+                format!(r#""request_id":"{held}","request_id":["a"]"#),
+                format!(r#""request_id":"{held}","request_id":null"#),
+                format!(r#""request_id":"{held}","request_id":"{held}""#),
+                r#""request_id":7"#.to_owned(),
+                r#""request_id":{"a":1}"#.to_owned(),
+            ] {
+                let outcome = read(&members);
+                assert!(outcome.is_err(), "{role} {members}: {outcome:?}");
+            }
+            let alone = read(&format!(r#""request_id":"{held}""#)).expect("one string value");
+            assert_eq!(alone.tool_request_id.as_deref(), Some(held), "{role}");
+            let named = if role == "event" {
+                Some(alone.event.as_str())
+            } else {
+                alone.tool_name.as_deref()
+            };
+            assert_eq!(named, Some(held), "{role}");
         }
     }
 }
