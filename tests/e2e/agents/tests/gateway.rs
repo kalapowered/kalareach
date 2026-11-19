@@ -3141,6 +3141,11 @@ impl<'a> Session<'a> {
         }
         // From here the harness runs no `kr` and ends the host's processes by the identities it
         // recorded: the agent runs in the same account and may leave anything in the run's state.
+        // The stand-in is the harness's own program and leaves nothing: a case on it may start the
+        // daemon again.
+        if matches!(self.ctx.route, Route::StandIn) {
+            self.host.agent_is_a_stand_in();
+        }
         self.host.agent_starts();
         match &self.ctx.route {
             Route::StandIn => {

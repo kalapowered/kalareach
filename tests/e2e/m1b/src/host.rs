@@ -229,6 +229,8 @@ pub struct Host<'r> {
     control: Mutex<Option<Result<(i128, i128), String>>>,
     /// Whether the agent under test has been started ([`Host::agent_starts`]).
     agent_started: AtomicBool,
+    /// Whether the agent under test is the harness's own stand-in ([`Host::agent_is_a_stand_in`]).
+    stand_in: AtomicBool,
     /// The `kr` commands asked for after the agent under test started, each as its arguments: none
     /// is run, and the record shows that none was asked for either.
     kr_after_start: Arc<Mutex<Vec<String>>>,
@@ -289,6 +291,7 @@ impl<'r> Host<'r> {
             daemon: Mutex::new(None),
             control: Mutex::new(None),
             agent_started: AtomicBool::new(false),
+            stand_in: AtomicBool::new(false),
             kr_after_start: Arc::default(),
         };
         // The port was free when it was chosen, and it is bound when the daemon starts: other legs
@@ -334,10 +337,23 @@ impl<'r> Host<'r> {
     /// [`Self::start_daemon`], where the daemon is ready when `ready` says so within the bound it is
     /// given, not when `kr list` answers: after the agent under test has started no `kr` is run.
     ///
+    /// A daemon is started after the agent under test started only where that agent is the
+    /// harness's own stand-in ([`Host::agent_is_a_stand_in`]). The start acts on the run's tree: it
+    /// reads the address from the configuration document, opens the log by its path, and starts the
+    /// programs placed under `b/` with no check that they are the placed files, and a live agent
+    /// runs in the same account and may have changed any of them. The stand-in is the harness's own
+    /// program, which changes none.
+    ///
     /// # Panics
     ///
-    /// As [`Self::start_daemon`].
+    /// As [`Self::start_daemon`], and when the agent under test has started and is not the stand-in.
     pub fn start_daemon_ready_by(&self, ready: &dyn Fn(Duration) -> Result<(), String>) {
+        assert!(
+            !self.agent_started.load(Ordering::SeqCst) || self.stand_in.load(Ordering::SeqCst),
+            "no daemon is started after the agent under test started, unless that agent is the \
+             harness's own stand-in: the start acts on the run's tree, which a live agent may have \
+             changed"
+        );
         let kept = self
             .configured_address()
             .filter(|address| address.port() != 0);
@@ -476,6 +492,13 @@ impl<'r> Host<'r> {
     /// is stopped, and dropped, by ending what the run recorded by identity instead.
     pub fn agent_starts(&self) {
         self.agent_started.store(true, Ordering::SeqCst);
+    }
+
+    /// Says that the agent under test is the harness's own stand-in, which runs none of the run's
+    /// programs and changes nothing of its tree: only then does [`Host::start_daemon_ready_by`]
+    /// start a daemon after [`Host::agent_starts`].
+    pub fn agent_is_a_stand_in(&self) {
+        self.stand_in.store(true, Ordering::SeqCst);
     }
 
     /// The record of the `kr` commands asked for after the agent under test started, which the
@@ -1148,6 +1171,7 @@ mod shutdown_tests {
             daemon: Mutex::new(None),
             control: Mutex::new(None),
             agent_started: AtomicBool::new(false),
+            stand_in: AtomicBool::new(false),
             kr_after_start: Arc::default(),
         }
     }
@@ -1648,6 +1672,43 @@ mod shutdown_tests {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
             ["list".to_owned()]
+        );
+        drop(host);
+        drop(run);
+        std::fs::remove_dir_all(&root).expect("clean up");
+    }
+
+    /// Once a live agent has started, no daemon is started over the run's tree: the start reads the
+    /// tree and runs the programs under `b/`, which the agent may have changed.
+    #[test]
+    fn no_daemon_is_started_after_the_agent_started_unless_it_is_the_stand_in() {
+        let root = scratch("daemon-after");
+        let (run, _mark) = host_with_a_kr(&root);
+        let host = host_over(&run);
+        host.agent_starts();
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            host.start_daemon_ready_by(&|_| Ok(()));
+        }))
+        .expect_err("a start beside a live agent is refused");
+        let said = refused
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                refused
+                    .downcast_ref::<&str>()
+                    .map(|said| (*said).to_owned())
+            })
+            .unwrap_or_default();
+        assert!(
+            said.contains("unless that agent is the harness's own stand-in"),
+            "{said}"
+        );
+        assert!(
+            host.daemon
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "nothing was started"
         );
         drop(host);
         drop(run);
