@@ -330,6 +330,7 @@ describe("the owner's confirmations on a phone", () => {
     notice: null,
     statement: null,
     placement: null,
+    skill_target: null,
     reading: null,
     expires_at_ms: Date.now() + 110_000,
     checkable: true

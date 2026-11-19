@@ -614,14 +614,77 @@ async fn a_dialled_transport_reports_whether_the_host_states_the_placement_readi
         ),
     ];
 
-    assert!(
-        dial(&client, &current).await.host_readings().placement,
-        "the host selected the capability"
+    assert_eq!(
+        dial(&client, &current).await.host_readings(),
+        kr_protocol::confirmation::HostReadings {
+            placement: true,
+            skill_target: true
+        },
+        "the host selected both capabilities"
     );
     assert_eq!(
         dial(&client, &previous).await.host_readings(),
         kr_protocol::confirmation::HostReadings::default(),
         "the host selected none"
+    );
+    for task in serving {
+        task.abort();
+    }
+}
+
+/// A dialled transport reads each reading from its own capability: a host whose hello offers only
+/// the placement capability states the placement reading and not the skill-target reading, and a
+/// host whose hello offers only the skill-target capability the reverse, so a device takes the
+/// skill-target label as the host's only from a host that says so.
+#[tokio::test]
+async fn a_dialled_transport_reports_whether_the_host_states_the_skill_target_reading() {
+    use kr_client::transport::ControlTransport as _;
+    use kr_protocol::confirmation::{
+        HostReadings, PLACEMENT_READING_CAPABILITY, SKILL_TARGET_READING_CAPABILITY,
+    };
+    let offering = |name: &str| {
+        std::iter::once(kr_protocol::ids::CapabilityId::new(name).expect("a capability identifier"))
+            .collect::<kr_protocol::scalars::CanonicalSet<_>>()
+    };
+    let client = side(2, false).await;
+    let mut placement_only = side(1, true).await;
+    Arc::get_mut(&mut placement_only.identity)
+        .expect("a new identity has one owner")
+        .capabilities = offering(PLACEMENT_READING_CAPABILITY);
+    let mut skill_target_only = side(3, true).await;
+    Arc::get_mut(&mut skill_target_only.identity)
+        .expect("a new identity has one owner")
+        .capabilities = offering(SKILL_TARGET_READING_CAPABILITY);
+    let serving = [
+        spawn_host(
+            &placement_only,
+            client.record,
+            Arc::new(HostScript::default()),
+            None,
+        ),
+        spawn_host(
+            &skill_target_only,
+            client.record,
+            Arc::new(HostScript::default()),
+            None,
+        ),
+    ];
+
+    assert_eq!(
+        dial(&client, &placement_only).await.host_readings(),
+        HostReadings {
+            placement: true,
+            skill_target: false
+        },
+        "the placement capability does not state the skill-target reading"
+    );
+    assert_eq!(
+        dial(&client, &skill_target_only).await.host_readings(),
+        HostReadings {
+            placement: false,
+            skill_target: true
+        },
+        "the skill-target capability does not state the placement reading"
     );
     for task in serving {
         task.abort();

@@ -727,6 +727,7 @@ function request(overrides: Partial<ConfirmationRequest> = {}): ConfirmationRequ
     notice: null,
     statement: null,
     placement: null,
+    skill_target: null,
     reading: null,
     expires_at_ms: Date.now() + 110_000,
     checkable: true,
@@ -885,6 +886,66 @@ describe("the owner's confirmation of a repository and of an installation", () =
     expect(
       shown.compareDocumentPosition(integration) & Node.DOCUMENT_POSITION_FOLLOWING
     ).toBeTruthy()
+  })
+
+  it("captions this host's reading of a skill target as the host's, after the placement reading and before the integration reading", async () => {
+    const { controls } = start({ view: 'attention' })
+    const words = 'Adds one registration file for the application.'
+    const placement =
+      'This package places files for "Quill CLI" in a folder it chose: .quill/plugins/quill-bridge/ under your home folder, files plugin.json.'
+    const skillTarget =
+      'The package names the agent "amp" and says where the host installs the KalaReach contact skill for it, on macOS and Linux.'
+    const reading = 'Runs "codex" in KalaReach sessions with these arguments added: "--remote".'
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          request({
+            title: 'Install a plugin',
+            detail: 'Install kalareach/quill 0.3.0 from community on studio.',
+            value: null,
+            facts: [{ label: 'Plugin', value: 'kalareach/quill 0.3.0', code: true }],
+            statement: words,
+            placement,
+            skill_target: skillTarget,
+            reading
+          })
+        ]
+      })
+    })
+    const shown = await screen.findByTestId('confirmation-skill-target')
+    expect(within(shown).getByText(skillTarget).tagName).toBe('BLOCKQUOTE')
+    expect(within(shown).getByText("This host's exact reading of the skill target")).toBeInTheDocument()
+    expect(within(shown).queryByText('The publisher says')).toBeNull()
+    const publisher = screen.getByTestId('confirmation-statement')
+    expect(publisher.textContent).not.toContain('amp')
+    const placed = screen.getByTestId('confirmation-placement')
+    const integration = screen.getByTestId('confirmation-reading')
+    expect(
+      placed.compareDocumentPosition(shown) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+    expect(
+      shown.compareDocumentPosition(integration) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+  })
+
+  it('shows no skill-target caption for a request that carries no reading of one', async () => {
+    const { controls } = start({ view: 'attention' })
+    act(() => {
+      controls.setConfirmations({
+        ceremony: 'touch_id',
+        requests: [
+          request({
+            title: 'Install a plugin',
+            value: null,
+            facts: [{ label: 'Plugin', value: 'kalareach/example 0.1.0', code: true }],
+            statement: 'Adds one registration file for the application.'
+          })
+        ]
+      })
+    })
+    expect(await screen.findByTestId('confirmation-statement')).toBeInTheDocument()
+    expect(screen.queryByTestId('confirmation-skill-target')).toBeNull()
   })
 
   it('shows no statement for an installation whose release says nothing of a bridge', async () => {

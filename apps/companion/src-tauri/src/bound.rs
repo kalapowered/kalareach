@@ -324,17 +324,13 @@ impl StreamOpener for BoundOpener {
 mod tests {
     use super::*;
 
-    /// A connection that only knows when it is closed, and whether its host stated the placement
-    /// reading.
+    /// A connection that only knows when it is closed, and which readings its host stated.
     #[derive(Debug, Default)]
-    struct Closing(AtomicBool, bool);
+    struct Closing(AtomicBool, kr_protocol::confirmation::HostReadings);
 
     impl ControlTransport for Closing {
         fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
-            kr_protocol::confirmation::HostReadings {
-                placement: self.1,
-                skill_target: false,
-            }
+            self.1
         }
 
         fn connection_id(&self) -> ConnectionId {
@@ -411,7 +407,13 @@ mod tests {
     /// dropped the flag would show every statement under the publisher's caption.
     #[test]
     fn a_bound_connection_says_what_its_transport_says_of_the_hosts_reading() {
-        for says in [true, false] {
+        for (placement, skill_target) in
+            [(true, false), (false, true), (true, true), (false, false)]
+        {
+            let says = kr_protocol::confirmation::HostReadings {
+                placement,
+                skill_target,
+            };
             let (_account, status) = watch::channel(signed_in("first"));
             let inner = Arc::new(Closing(AtomicBool::new(false), says));
             let bound = BoundTransport {
@@ -423,7 +425,7 @@ mod tests {
                 ),
                 over: Arc::new(Notify::new()),
             };
-            assert_eq!(bound.host_readings().placement, says);
+            assert_eq!(bound.host_readings(), says);
         }
     }
 

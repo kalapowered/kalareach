@@ -152,11 +152,15 @@ async fn a_paired_pair_completes_the_handshake_over_loopback() {
     );
     assert_eq!(selection.boot_epoch, epochs().boot_epoch);
     assert_eq!(selection.clock_epoch, epochs().clock_epoch);
-    // Both ends are this build, which writes the placement reading under the host's own label, so
-    // the host selects the capability that says so and the device that is told takes the label as
-    // the host's.
-    assert!(
-        kr_protocol::confirmation::states_readings(&selection.capabilities).placement,
+    // Both ends are this build, which writes the placement reading and the skill-target reading
+    // under the host's own labels, so the host selects the capability that says so for each and
+    // the device that is told takes each label as the host's.
+    assert_eq!(
+        kr_protocol::confirmation::states_readings(&selection.capabilities),
+        kr_protocol::confirmation::HostReadings {
+            placement: true,
+            skill_target: true
+        },
         "{:?}",
         selection.capabilities
     );

@@ -1538,6 +1538,64 @@ mod tests {
         );
     }
 
+    /// KR-REQ-11.01: the host's reading of a skill target is the host's part of the statement,
+    /// captioned as the host's, only where the link's hello says the host writes it, and the two
+    /// readings are stated apart: a host that states the placement reading only, or neither, leaves
+    /// the skill-target text whole in the publisher's statement, where a publisher's words can hold
+    /// the label.
+    #[test]
+    fn the_skill_target_reading_is_the_hosts_part_only_where_the_host_states_it_writes_it() {
+        use kr_protocol::confirmation::{
+            HostReadings, SKILL_TARGET_STATEMENT_LABEL, install_statement,
+        };
+        let reading = "The package names the agent \"amp\".";
+        let statement = install_statement(Some(PUBLISHER), None, Some(reading), None);
+        let view_of = |readings: HostReadings| {
+            let plan = PluginInstallPlan {
+                grant: ["native_bridge.install", "skill_target.install"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                grant_statement: statement.clone(),
+                ..installation()
+            };
+            let mut listed = listed_subject(
+                Subject::PluginInstall(plan),
+                SensitiveAction::GrantExecutableCapability,
+            );
+            listed.host_readings = readings;
+            describe("a reference", "studio", &listed, NOW)
+        };
+
+        let with = view_of(HostReadings {
+            placement: false,
+            skill_target: true,
+        });
+        assert!(with.checkable);
+        assert_eq!(with.statement.as_deref(), Some(PUBLISHER));
+        assert_eq!(with.skill_target.as_deref(), Some(reading));
+
+        for readings in [
+            HostReadings::default(),
+            HostReadings {
+                placement: true,
+                skill_target: false,
+            },
+        ] {
+            let without = view_of(readings);
+            assert!(without.checkable);
+            assert_eq!(
+                without.skill_target, None,
+                "no host caption without the host's word: {readings:?}"
+            );
+            let whole = without.statement.expect("the publisher's statement");
+            assert!(
+                whole.contains(SKILL_TARGET_STATEMENT_LABEL) && whole.contains(reading),
+                "the text stays in the publisher's part: {whole}"
+            );
+        }
+    }
+
     /// KR-REQ-11.42: what a host or a publisher wrote is shown as it was written or not at all. A
     /// statement, a name or an address with a line break, a control character or a character that
     /// reorders text makes the request one this computer cannot check, so it cannot be confirmed

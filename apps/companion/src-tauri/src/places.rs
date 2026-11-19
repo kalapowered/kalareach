@@ -545,16 +545,13 @@ mod tests {
     }
 
     /// A transport that is only closed, as a connection that carries a place is, and that says
-    /// whether its host stated the placement reading.
+    /// which readings its host stated.
     #[derive(Debug)]
-    struct Closed(bool);
+    struct Closed(kr_protocol::confirmation::HostReadings);
 
     impl ControlTransport for Closed {
         fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
-            kr_protocol::confirmation::HostReadings {
-                placement: self.0,
-                skill_target: false,
-            }
+            self.0
         }
 
         fn connection_id(&self) -> ConnectionId {
@@ -803,10 +800,16 @@ mod tests {
     #[tokio::test]
     async fn a_placed_connection_says_what_its_transport_says_of_the_hosts_reading() {
         let places = Places::new(2);
-        for says in [true, false] {
-            let place = places.try_take(host(1), Kind::Other).expect("a place");
-            let connection = Placed::over(Arc::new(Closed(says)), place);
-            assert_eq!(connection.host_readings().placement, says);
+        for placement in [true, false] {
+            for skill_target in [true, false] {
+                let says = kr_protocol::confirmation::HostReadings {
+                    placement,
+                    skill_target,
+                };
+                let place = places.try_take(host(1), Kind::Other).expect("a place");
+                let connection = Placed::over(Arc::new(Closed(says)), place);
+                assert_eq!(connection.host_readings(), says);
+            }
         }
     }
 
@@ -818,7 +821,10 @@ mod tests {
         // Two places for the other kinds, and the third is the main link's.
         let first = places.try_take(host(1), Kind::Other).expect("a place");
         let second = places.try_take(host(1), Kind::Other).expect("a place");
-        let connection = Placed::over(Arc::new(Closed(false)), first);
+        let connection = Placed::over(
+            Arc::new(Closed(kr_protocol::confirmation::HostReadings::default())),
+            first,
+        );
         let waiting = tokio::spawn({
             let places = Arc::clone(&places);
             async move {
@@ -864,7 +870,7 @@ mod tests {
             "an open takes no place of its own"
         );
         let streamless = Placed::over(
-            Arc::new(Closed(false)),
+            Arc::new(Closed(kr_protocol::confirmation::HostReadings::default())),
             places.try_take(host(2), Kind::Other).expect("a place"),
         );
         assert!(
