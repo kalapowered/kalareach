@@ -1182,7 +1182,7 @@ fn outside_the_run(
 /// a listing of the processes and, for each of this user's, the path of the file it runs as the
 /// system says it (`proc_pidpath` on macOS), which reads no file under the person's agent
 /// directory. A process counts when the file name of that path or of the name its parent gave it
-/// (`argv[0]`) is the agent's ([`names_the_agent`]: `codex`, the release files `codex-<target>`, the
+/// (`argv[0]`) is the agent's (`names_the_agent`: `codex`, the release files `codex-<target>`, the
 /// desktop application's main process `Codex`, in any case). A process of the run's own, an agent
 /// it started among them, is not counted. No path is kept, so none can be said: a path under the
 /// person's agent folder would name something there, and no comparison with the folder can tell
@@ -1606,8 +1606,8 @@ fn read_files(
 }
 
 /// Reads the agent's own record: every file below `relative` in `within`, the run's directory,
-/// through directory handles with no link followed at any step ([`record_directory`],
-/// [`read_files`]), handing each file's place in the record and its content to `visit`, and returns
+/// through directory handles with no link followed at any step (`record_directory`,
+/// `read_files`), handing each file's place in the record and its content to `visit`, and returns
 /// how many files were read. A record that is not there is none (`Ok(0)`); a `within` that is not
 /// the directory `pin` names, a link anywhere in it, an entry that is neither a file nor a
 /// directory, an entry on another file system than `within` (a volume attached below the record),
@@ -1680,7 +1680,7 @@ fn read_record_within(
 }
 
 /// The identities of the turns of a record that name theirs: a UUID, or a name with the file that
-/// holds it, within the bounds of [`Limits`]. Debug shows how many there are and never a name.
+/// holds it, within the bounds of `Limits`. Debug shows how many there are and never a name.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Identities(BTreeSet<String>);
 
@@ -2016,7 +2016,7 @@ fn read_in_a_thread(
 }
 
 /// Runs `command` in a process group of its own and returns its output. The group is guarded from
-/// the moment it is spawned ([`Leader`]); it is ended whole as soon as its leader has exited or
+/// the moment it is spawned (`Leader`); it is ended whole as soon as its leader has exited or
 /// `within` has passed, while the leader is not yet reaped and its number still names the group, so
 /// that nothing the command started outlives it with the environment it was given, and no signal
 /// can reach a group that took the number since. A command that does not end within `within`, or

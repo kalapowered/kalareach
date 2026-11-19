@@ -347,7 +347,7 @@ impl Expected {
     /// list on, whose end row carries `tag`: each row carries the name's position in the shell's
     /// list, one row says how many names the shell exports, and one carries a digest of the whole
     /// sorted list, so that the parts are read as one snapshot ([`Snapshot`]). It holds no value,
-    /// refuses a shell in the states the value line refuses ([`refusal_checks`]), and unsets its own
+    /// refuses a shell in the states the value line refuses (`refusal_checks`), and unsets its own
     /// variables also where it stops part way.
     #[must_use]
     pub fn exported_line(skipped: usize, tag: usize) -> String {
