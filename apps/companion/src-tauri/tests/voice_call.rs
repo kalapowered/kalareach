@@ -2950,12 +2950,14 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
         &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the kept file"),
     )
     .expect("a file");
-    let kept = file["owed"]
+    let Some(kept) = file["owed"]
         .as_array()
         .expect("the entries")
         .iter()
         .find(|owed| owed["action_id"] == action_id.as_str())
-        .unwrap_or_else(|| panic!("the unanswered start is kept: {file}"));
+    else {
+        panic!("the unanswered start is kept: {file}");
+    };
     assert_eq!(kept["kind"], "start_unanswered", "{file}");
     // A start the host never answered has no lapse: its entry is kept to the largest instant, and a
     // read made at the instant before that still finds it.
