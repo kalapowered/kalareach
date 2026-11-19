@@ -63,6 +63,7 @@ use std::path::{Path, PathBuf};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::forwarder;
 use kr_plugin_sdk::matching::MatchRule;
+use kr_plugin_sdk::placement::Placement;
 use kr_plugin_sdk::plugin::{BridgeRemoval, BridgeStep, NativeBridge};
 use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::PluginId;
@@ -106,8 +107,9 @@ const EDIT_ATTEMPTS: usize = 3;
 pub struct BridgeHost {
     /// Where each package's journal is kept.
     pub journals: PathBuf,
-    /// The directory of each application this host applies a bridge for.
-    pub applications: Vec<ApplicationDirectory>,
+    /// The account's home directory, which every application's directory is placed under. A host
+    /// with none applies no bridge.
+    pub home: Option<PathBuf>,
     /// Where an application's executables are looked for.
     pub search_path: Vec<PathBuf>,
     /// The forwarder this installation's registrations are expected to start: the path an update
@@ -122,8 +124,8 @@ pub struct BridgeHost {
 }
 
 impl BridgeHost {
-    /// This host's own: journals in the environment's state directory, each application's
-    /// directory under the account's home, the daemon's search path, and the `kr-hook` an update
+    /// This host's own: journals in the environment's state directory, the account's home that
+    /// each application's directory is under, the daemon's search path, and the `kr-hook` an update
     /// replaces: through the store's `current` for a daemon of an installed release, so a
     /// registration keeps naming the forwarder across updates, and beside the daemon otherwise,
     /// where every packaged installation puts it.
@@ -131,9 +133,7 @@ impl BridgeHost {
     pub fn discover(state_dir: &Path) -> Self {
         Self {
             journals: state_dir.join("native-bridges"),
-            applications: files::home_directory()
-                .map(|home| application_directories(&home))
-                .unwrap_or_default(),
+            home: files::home_directory(),
             search_path: std::env::var_os("PATH")
                 .map(|path| std::env::split_paths(&path).collect())
                 .unwrap_or_default(),
@@ -142,43 +142,6 @@ impl BridgeHost {
             signed_records: Vec::new(),
         }
     }
-}
-
-/// One application's own directory, which a recipe's paths are under.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ApplicationDirectory {
-    /// The application, as a recipe names it.
-    pub application: String,
-    /// Its directory.
-    pub directory: PathBuf,
-}
-
-/// The application directories this host knows, under an account's home.
-///
-/// Claude Code's is `.claude` in the home directory, where its `settings.json` lives and its
-/// `skills/` sits: the directory it reads when `CLAUDE_CONFIG_DIR` is not set, and the one the
-/// contact skill's installation uses. The daemon's environment is not the one Claude Code runs in,
-/// so a directory that variable names elsewhere is not read from it, and does not get the bridge.
-///
-/// Gemini CLI's is `.gemini` in the home directory, where it reads `extensions/`. Its recipe's
-/// removal leaves the record of where an extension is installed in place for as long as anything
-/// else stays in the extension's directory (a rule of the host's, not of the recipe), because
-/// Gemini CLI refuses to start while such a directory has no record.
-///
-/// An application this host does not name here has no directory, and a recipe for it places
-/// nothing.
-#[must_use]
-pub fn application_directories(home: &Path) -> Vec<ApplicationDirectory> {
-    vec![
-        ApplicationDirectory {
-            application: "Claude Code".to_owned(),
-            directory: home.join(".claude"),
-        },
-        ApplicationDirectory {
-            application: "Gemini CLI".to_owned(),
-            directory: home.join(".gemini"),
-        },
-    ]
 }
 
 /// The file of an application's registration that its removal takes last, and only when nothing
@@ -215,6 +178,23 @@ pub struct BridgeTarget {
     pub match_rules: Vec<MatchRule>,
     /// The executables the package's signed qualification records name.
     pub qualified: Vec<QualifiedExecutable>,
+    /// What the package's connector table says of where its bridge is placed.
+    pub placement: Declared,
+}
+
+/// What a package's connector table says of where its bridge is placed, read once from the bytes
+/// the verified manifest pins and only after the manifest's `sdk_range` admits this host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Declared {
+    /// The package declares none, or carries no table: the layout this host holds for the
+    /// recipe's application, where it holds one.
+    Nothing,
+    /// The package declares one, and it is a placement this host may place by.
+    Placement(Box<Placement>),
+    /// The table cannot be used: its `sdk_range` excludes this host's SDK, it is not the bytes the
+    /// manifest names, it cannot be read, or its placement is refused. The bridge is refused with
+    /// this reason, and the application's layout is never taken in its place.
+    Refused(String),
 }
 
 /// What a reconciliation left.
@@ -691,9 +671,11 @@ impl NativeBridges {
     /// now keeps its application's plugins in.
     fn moved(&self, journal: &Journal) -> bool {
         journal.release.as_ref().is_some_and(|release| {
-            !self.host.applications.iter().any(|known| {
-                known.application == release.application && known.directory == release.directory
-            })
+            let Some(home) = self.host.home.as_deref() else {
+                return true;
+            };
+            Placement::for_label(&release.application)
+                .is_none_or(|layout| release.directory != home.join(layout.directory_path()))
         })
     }
 
@@ -804,23 +786,19 @@ impl NativeBridges {
         target: &BridgeTarget,
     ) -> std::result::Result<Plan, String> {
         supported_platform()?;
+        if let Declared::Refused(why) = &target.placement {
+            return Err(why.clone());
+        }
         let recipe = &target.recipe;
         let application = recipe.application.as_str();
-        let directory = self
-            .host
-            .applications
-            .iter()
-            .find(|known| known.application == application)
-            .map(|known| known.directory.clone())
-            .ok_or_else(|| {
-                format!("this host does not know where {application} keeps its plugins")
-            })?;
-        let root = Dir::open(&directory).map_err(|error| {
-            format!(
-                "{application}'s directory {} cannot be opened: {error}",
-                directory.display()
-            )
+        let layout = Placement::for_label(application).ok_or_else(|| {
+            format!("this host does not know where {application} keeps its plugins")
         })?;
+        let home = self.host.home.as_deref().ok_or_else(|| {
+            format!("this host has no home directory, so it does not know where {application} keeps its plugins")
+        })?;
+        let root = open_directory(home, &layout.directory, application, true)?;
+        let directory = root.path().to_path_buf();
         let directory_identity = root.identity();
         // A release recorded here was applied in one directory, and the one at the path now is
         // another: the record says nothing about what is in it.
@@ -2321,6 +2299,51 @@ impl NativeBridges {
 /// directory without following a link, a file is known by the device and inode a rename keeps (see
 /// [`tree`]), and a copy about to replace a document must keep its permission bits, its owners and
 /// its protection. That walk and those checks exist on macOS and Linux only.
+/// Opens the directory a placement names under the account's home: the home once, then each
+/// component of the directory from the handle held, none made. A component is opened without
+/// following a link, except the first where `follow_first` is true, which is the compiled
+/// default's own directory of a package that declares no placement: a person's dotfiles manager
+/// may keep it as a link, and the identity of what it leads to is what the journal records.
+fn open_directory(
+    home: &Path,
+    directory: &[String],
+    application: &str,
+    follow_first: bool,
+) -> std::result::Result<Dir, String> {
+    let cannot = |path: &Path, why: &dyn std::fmt::Display| {
+        format!(
+            "{application}'s directory {} cannot be opened: {why}",
+            path.display()
+        )
+    };
+    let mut current = Dir::open(home).map_err(|error| cannot(home, &error))?;
+    for (index, component) in directory.iter().enumerate() {
+        let path = current.join(component);
+        let child = if index == 0 && follow_first {
+            current.child_following(component)
+        } else {
+            current.child(component)
+        }
+        .map_err(|error| cannot(&path, &error))?;
+        current = match child {
+            Child::Directory(next) => next,
+            Child::Absent => {
+                return Err(cannot(
+                    &path,
+                    &"it is not there, and this host makes no application's directory",
+                ));
+            }
+            Child::NotADirectory => {
+                return Err(cannot(
+                    &path,
+                    &"it is a link or a file, and this host follows no link there",
+                ));
+            }
+        };
+    }
+    Ok(current)
+}
+
 fn supported_platform() -> std::result::Result<(), String> {
     // A compile-time value rather than a conditional body, so both answers are checked on every
     // platform this crate builds for.
@@ -2410,29 +2433,6 @@ fn registration(
                 "{destination} cannot be read as JSON, so what it registers cannot be checked"
             ));
         };
-        invocations(&value, destination, &mut pairs)?;
-        // Then the file's own shape, which is closed: what the commands are is read above, and
-        // what else the file asks the application to do is only what this host names for it.
-        let (directory, tail) = destination
-            .split_once('/')
-            .and_then(|(_, rest)| rest.split_once('/'))
-            .ok_or_else(|| format!("{destination} is not in a directory of its own"))?;
-        shapes::check(application, directory, tail, &value).map_err(|why| {
-            format!(
-                "{destination} is not a registration file this host permits a native bridge \
-                 for {application} to install: {why}"
-            )
-        })?;
-    }
-    let applications: BTreeSet<&str> = pairs
-        .iter()
-        .map(|(application, _)| application.as_str())
-        .collect();
-    let mut named = applications.into_iter();
-    let Some(application) = named.next() else {
-        return Ok(None);
-    };
-    if let Some(other) = named.next() {
         // A name repeated in any object is a member one reader takes and another does not: the
         // value above keeps the last of two, and an application may read the first. The file is
         // read again, exactly, before anything of it is believed.
@@ -2446,6 +2446,40 @@ fn registration(
                  registers cannot be checked: {why}"
             ));
         }
+        invocations(&value, destination, &mut pairs)?;
+        // Then the file's own shape, which is closed: what the commands are is read above, and
+        // what else the file asks the application to do is only what this host names for it.
+        let (directory, tail) = destination
+            .split_once('/')
+            .and_then(|(_, rest)| rest.split_once('/'))
+            .ok_or_else(|| format!("{destination} is not in a directory of its own"))?;
+        shapes::check(application, directory, tail, &value).map_err(|why| {
+            format!(
+                "{destination} is not a registration file this host permits a native bridge \
+                 for {application} to install: {why}"
+            )
+        })?;
+        // And last, that no name or text in it is a place: a path, an expansion or a command a
+        // program that reads the file would resolve. Only the record of where the files were
+        // installed from is let through, by the shape that holds it.
+        if let Some(why) = kr_plugin_sdk::placement::Placement::for_label(application)
+            .and_then(|placement| placement.shape_of(tail)?.text_refusal(&value))
+        {
+            return Err(format!(
+                "{destination} is not a registration file this host permits a native bridge for \
+                 {application} to install: {why}"
+            ));
+        }
+    }
+    let applications: BTreeSet<&str> = pairs
+        .iter()
+        .map(|(application, _)| application.as_str())
+        .collect();
+    let mut named = applications.into_iter();
+    let Some(application) = named.next() else {
+        return Ok(None);
+    };
+    if let Some(other) = named.next() {
         return Err(format!(
             "the registration starts the forwarder for {application} and for {other}"
         ));
@@ -2459,17 +2493,6 @@ fn registration(
                  not accept",
                 surface.as_str()
             ));
-        // And last, that no name or text in it is a place: a path, an expansion or a command a
-        // program that reads the file would resolve. Only the record of where the files were
-        // installed from is let through, by the shape that holds it.
-        if let Some(why) = kr_plugin_sdk::placement::Placement::for_label(application)
-            .and_then(|placement| placement.shape_of(tail)?.text_refusal(&value))
-        {
-            return Err(format!(
-                "{destination} is not a registration file this host permits a native bridge for \
-                 {application} to install: {why}"
-            ));
-        }
         }
     }
     Ok(Some(RecordedFacts {
