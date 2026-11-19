@@ -72,18 +72,23 @@ site crates/kr-worker/src/session.rs journal_mut &mut 1
 
 # The functions that make the time contract's writes. The full check and the second raise stand
 # with the first admission's local owner check and the writer's; the kept reading stands with the
-# contract's own functions and no other. A call from any other function of the crate fails: the
-# pass's pure readers (`pure_wall_ms`, `pure_proven_ms`, `utc_deadline_standing`) are not on this
-# list.
+# contract's own functions and no other. A call from any other function fails: the pass's pure
+# readers (`pure_wall_ms`, `pure_proven_ms`, `utc_deadline_standing`) are not on this list. The
+# contract takes its readings in `take`, a function that the contract's module alone can call
+# and that several other functions of this crate share the name of: its callers are `caller` rows,
+# which read the file of the contract only, where the other makers of the reading are `only`
+# rows, which read the whole crate.
 only check_utc_deadline crates/kr-worker/src/local_gate.rs check 1
 only check_utc_deadline crates/kr-worker/src/runtime.rs start_and_say_if_the_shell_ended 1
 only settled_utc_ms crates/kr-worker/src/local_gate.rs check 1
-only wall_reading crates/kr-worker/src/action/time.rs sample 1
-only wall_reading crates/kr-worker/src/action/time.rs observe 1
+caller take crates/kr-worker/src/action/time.rs sample 1
+caller take crates/kr-worker/src/action/time.rs observe 1
+caller take crates/kr-worker/src/action/time.rs retrust 1
+caller take crates/kr-worker/src/action/time.rs follow_the_owner 1
+caller take crates/kr-worker/src/action/time.rs checkpoint_at 1
+caller take crates/kr-worker/src/action/time.rs wall_reading 1
 only wall_reading crates/kr-worker/src/action/time.rs proven_wall_ms 1
-only wall_reading crates/kr-worker/src/action/time.rs retrust 2
-only wall_reading crates/kr-worker/src/action/time.rs follow_the_owner 1
-only wall_reading crates/kr-worker/src/action/time.rs checkpoint_at 1
+only wall_reading crates/kr-worker/src/action/time.rs retrust 1
 only wall_reading crates/kr-worker/src/action/time.rs tombstone 1
 only proven_wall_ms crates/kr-worker/src/action/time.rs settled_utc_ms 1
 only proven_wall_ms crates/kr-worker/src/action/time.rs check_utc_deadline 1
