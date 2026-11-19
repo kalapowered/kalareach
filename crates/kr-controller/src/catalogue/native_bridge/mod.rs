@@ -50,7 +50,6 @@
 mod check;
 mod journal;
 pub(crate) mod json;
-mod shapes;
 mod tree;
 
 /// The shape a package's native-bridge journal is written in, recorded in it as `version`. A
@@ -154,10 +153,16 @@ impl BridgeHost {
 /// the directory when it is the last thing in it. A recipe's removal steps each delete a file that
 /// still holds its bytes and cannot say that, so the host does.
 fn keeps_while_others_remain(application: &str, path: &str) -> bool {
-    application == "Gemini CLI"
-        && path.rsplit_once('/').is_some_and(|(directory, name)| {
-            name == GEMINI_RECORD && directory.starts_with("extensions/")
-        })
+    path.split_once('/')
+        .and_then(|(area, rest)| rest.split_once('/').map(|(_, tail)| (area, tail)))
+        .is_some_and(|(area, tail)| record_kept_last(application, area) == Some(tail))
+}
+
+/// The tail of an application's registration whose removal is the last, where the application has
+/// one: for a label and the area its plugins are placed in, and the whole tail under the plugin's
+/// folder, never only the last component of a path.
+fn record_kept_last(application: &str, area: &str) -> Option<&'static str> {
+    (application == "Gemini CLI" && area == "extensions").then_some(GEMINI_RECORD)
 }
 
 /// The name of the file that says where a Gemini CLI extension is installed.
@@ -667,15 +672,27 @@ impl NativeBridges {
         }
     }
 
-    /// True when the journal's release was applied in another directory than the one this host
-    /// now keeps its application's plugins in.
-    fn moved(&self, journal: &Journal) -> bool {
+    /// True when the journal's release was applied in another directory than the one the wanted
+    /// target resolves to: the directory its declared placement names, or the one this host keeps
+    /// its application's plugins in where it declares none. With no target (a removal), the
+    /// directory this host keeps the release's own application's plugins in.
+    fn moved(&self, journal: &Journal, wanted: Option<&BridgeTarget>) -> bool {
         journal.release.as_ref().is_some_and(|release| {
             let Some(home) = self.host.home.as_deref() else {
                 return true;
             };
-            Placement::for_label(&release.application)
-                .is_none_or(|layout| release.directory != home.join(layout.directory_path()))
+            let resolved = match wanted {
+                Some(target) => match &target.placement {
+                    Declared::Placement(placement) => Some(placement.directory_path()),
+                    Declared::Nothing => Placement::for_label(&target.recipe.application)
+                        .map(|layout| layout.directory_path()),
+                    Declared::Refused(_) => None,
+                },
+                None => {
+                    Placement::for_label(&release.application).map(|layout| layout.directory_path())
+                }
+            };
+            resolved.is_none_or(|directory| release.directory != home.join(directory))
         })
     }
 
@@ -698,7 +715,7 @@ impl NativeBridges {
         // a directory this host no longer keeps its application's plugins in, is taken out before
         // another is applied.
         let removing = journal.state == State::Removing
-            || (!journal.changes.is_empty() && (!same || self.moved(&journal)));
+            || (!journal.changes.is_empty() && (!same || self.moved(&journal, wanted)));
         if removing {
             self.undo(&mut journal)?;
         }
@@ -786,18 +803,32 @@ impl NativeBridges {
         target: &BridgeTarget,
     ) -> std::result::Result<Plan, String> {
         supported_platform()?;
-        if let Declared::Refused(why) = &target.placement {
-            return Err(why.clone());
-        }
         let recipe = &target.recipe;
         let application = recipe.application.as_str();
-        let layout = Placement::for_label(application).ok_or_else(|| {
-            format!("this host does not know where {application} keeps its plugins")
-        })?;
+        // The layout is the package's declared placement, or the one this host holds for the
+        // application's label where the package declares none; a table that cannot be used is
+        // refused and never replaced by the label's layout.
+        let held;
+        let (layout, declared): (&Placement, bool) = match &target.placement {
+            Declared::Refused(why) => return Err(why.clone()),
+            Declared::Placement(placement) => (&**placement, true),
+            Declared::Nothing => {
+                held = Placement::for_label(application).ok_or_else(|| {
+                    format!("this host does not know where {application} keeps its plugins")
+                })?;
+                (&held, false)
+            }
+        };
         let home = self.host.home.as_deref().ok_or_else(|| {
             format!("this host has no home directory, so it does not know where {application} keeps its plugins")
         })?;
-        let root = open_directory(home, &layout.directory, application, true)?;
+        // A link is followed at the first component of a compiled default's directory only for a
+        // package that declares no placement: an explicit declaration that copies a default is
+        // opened by plain components like any other.
+        let root = open_directory(home, &layout.directory, application, !declared)?;
+        if declared {
+            not_another_labels_directory(home, &root, application)?;
+        }
         let directory = root.path().to_path_buf();
         let directory_identity = root.identity();
         // A release recorded here was applied in one directory, and the one at the path now is
@@ -845,9 +876,9 @@ impl NativeBridges {
         // What a recipe may place is a closed set this host names for the application: the
         // registration files in one directory of the application's own, and the one key that
         // enables them. Nothing else a bridge adds can hold a command, so none is left unread.
-        permitted(recipe)?;
-        place_is_free(&root, journal, recipe)?;
-        let facts = registration(&sources, &forwarder, recipe.application.as_str())?;
+        permitted(recipe, layout)?;
+        place_is_free(&root, journal, recipe, layout, declared)?;
+        let facts = registration(&sources, &forwarder, layout, declared, application)?;
         // What is written is the template with the forwarder's path where the package names the
         // forwarder, and it is that file's bytes the journal knows the file by from here on: the
         // recipe's digests name the template, which is what the package's hash signs.
@@ -2293,12 +2324,6 @@ impl NativeBridges {
     }
 }
 
-/// Refuses on the platform where this host does not change an application's directory.
-///
-/// Every name a recipe writes, reads or removes is reached from one handle on the application's
-/// directory without following a link, a file is known by the device and inode a rename keeps (see
-/// [`tree`]), and a copy about to replace a document must keep its permission bits, its owners and
-/// its protection. That walk and those checks exist on macOS and Linux only.
 /// Opens the directory a placement names under the account's home: the home once, then each
 /// component of the directory from the handle held, none made. A component is opened without
 /// following a link, except the first where `follow_first` is true, which is the compiled
@@ -2344,6 +2369,37 @@ fn open_directory(
     Ok(current)
 }
 
+/// Refuses a declared placement whose opened directory is the directory this host keeps another
+/// label's plugins in. The two are compared by the identity of what was opened, so a spelling of
+/// the same directory (another case on a volume that ignores it) is the same directory.
+fn not_another_labels_directory(
+    home: &Path,
+    root: &Dir,
+    application: &str,
+) -> std::result::Result<(), String> {
+    for (label, default) in Placement::defaults() {
+        if label == application {
+            continue;
+        }
+        if let Ok(other) = open_directory(home, &default.directory, label, true)
+            && other.identity().same_object(&root.identity())
+        {
+            return Err(format!(
+                "{} is the directory this host keeps {label}'s plugins in, so it does not permit \
+                 a native bridge for {application} to be placed in it",
+                root.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses on the platform where this host does not change an application's directory.
+///
+/// Every name a recipe writes, reads or removes is reached from one handle on the application's
+/// directory without following a link, a file is known by the device and inode a rename keeps (see
+/// [`tree`]), and a copy about to replace a document must keep its permission bits, its owners and
+/// its protection. That walk and those checks exist on macOS and Linux only.
 fn supported_platform() -> std::result::Result<(), String> {
     // A compile-time value rather than a conditional body, so both answers are checked on every
     // platform this crate builds for.
@@ -2421,6 +2477,8 @@ fn removal_of(recipe: &NativeBridge) -> std::result::Result<Vec<Removal>, String
 fn registration(
     sources: &[(String, Vec<u8>)],
     forwarder: &Path,
+    layout: &Placement,
+    declared: bool,
     application: &str,
 ) -> std::result::Result<Option<RecordedFacts>, String> {
     let mut pairs = BTreeSet::new();
@@ -2446,30 +2504,24 @@ fn registration(
                  registers cannot be checked: {why}"
             ));
         }
-        invocations(&value, destination, &mut pairs)?;
-        // Then the file's own shape, which is closed: what the commands are is read above, and
-        // what else the file asks the application to do is only what this host names for it.
-        let (directory, tail) = destination
+        // The commands first, whatever shape the placement declares for the file: a declared
+        // member named `command` cannot hide one. The bare forwarder name is read only for the
+        // two compiled layouts, which the installed packages were written for.
+        invocations(&value, destination, &mut pairs, !declared)?;
+        // Then the file's own shape, which is closed, and last that no name or text in it is a
+        // place: a path, an expansion or a command a program that reads the file would resolve.
+        // Only the record of where the files were installed from is let through, by the shape that
+        // holds it.
+        let (folder, tail) = destination
             .split_once('/')
             .and_then(|(_, rest)| rest.split_once('/'))
             .ok_or_else(|| format!("{destination} is not in a directory of its own"))?;
-        shapes::check(application, directory, tail, &value).map_err(|why| {
+        layout.check_file(tail, folder, &value).map_err(|why| {
             format!(
                 "{destination} is not a registration file this host permits a native bridge \
                  for {application} to install: {why}"
             )
         })?;
-        // And last, that no name or text in it is a place: a path, an expansion or a command a
-        // program that reads the file would resolve. Only the record of where the files were
-        // installed from is let through, by the shape that holds it.
-        if let Some(why) = kr_plugin_sdk::placement::Placement::for_label(application)
-            .and_then(|placement| placement.shape_of(tail)?.text_refusal(&value))
-        {
-            return Err(format!(
-                "{destination} is not a registration file this host permits a native bridge for \
-                 {application} to install: {why}"
-            ));
-        }
     }
     let applications: BTreeSet<&str> = pairs
         .iter()
@@ -2528,7 +2580,11 @@ fn invocations(
     value: &serde_json::Value,
     destination: &str,
     pairs: &mut BTreeSet<(String, BridgeSurface)>,
+    bare_allowed: bool,
 ) -> std::result::Result<(), String> {
+    // The word that starts the forwarder: the placeholder, and the bare name only where the
+    // caller reads the packages that were written before the placeholder.
+    let starts = |word: &str| word == forwarder::PLACEHOLDER || (bare_allowed && word == "kr-hook");
     match value {
         serde_json::Value::Object(members) => {
             // Every command a registration runs is the forwarder, and in a form this host reads: its
@@ -2556,7 +2612,7 @@ fn invocations(
                 }
                 // The bare name is what the packages written before the placeholder register; it
                 // is read until no catalogue holds one, and then only the placeholder is.
-                let surface = if command == "kr-hook" || command == forwarder::PLACEHOLDER {
+                let surface = if starts(command) {
                     let arguments = members.get("args").and_then(serde_json::Value::as_array);
                     let words: Vec<&str> = arguments
                         .map(|arguments| {
@@ -2583,13 +2639,13 @@ fn invocations(
                     }
                     let words: Vec<&str> = command.split(' ').collect();
                     match words.as_slice() {
-                        ["kr-hook" | forwarder::PLACEHOLDER, application, "hook"]
-                            if plain_word(application) =>
+                        [first, application, "hook"]
+                            if starts(first) && plain_word(application) =>
                         {
                             (*application, BridgeSurface::Hook)
                         }
-                        ["kr-hook" | forwarder::PLACEHOLDER, application, "channel"]
-                            if plain_word(application) =>
+                        [first, application, "channel"]
+                            if starts(first) && plain_word(application) =>
                         {
                             (*application, BridgeSurface::Channel)
                         }
@@ -2610,13 +2666,13 @@ fn invocations(
                     ));
                 }
                 if name != "command" {
-                    invocations(nested, destination, pairs)?;
+                    invocations(nested, destination, pairs, bare_allowed)?;
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                invocations(item, destination, pairs)?;
+                invocations(item, destination, pairs, bare_allowed)?;
             }
         }
         serde_json::Value::String(text) if text.contains(forwarder::PLACEHOLDER) => {
@@ -2633,50 +2689,31 @@ fn invocations(
 /// of entry it is, its name, the command, its arguments and its time limit.
 const COMMAND_MEMBERS: [&str; 5] = ["type", "name", "command", "args", "timeout"];
 
-/// What a native bridge for an application may place, as a closed table this host names.
+/// What a native bridge may place under a placement: the registration files the placement lists,
+/// each once, in `<area>/<name>/`, and, for Claude Code alone, the one configuration key that
+/// enables them.
 ///
-/// A bridge installs exactly the registration files its application reads from one directory of
-/// its own, `<root>/<name>/<tail>` for each tail the table lists, and may add the one configuration
-/// key that enables them where the application has one, `enabledPlugins.<name>@skills-dir` set to
+/// A bridge installs exactly the files of the placement's `files` in one folder of the placement's
+/// area, `<area>/<name>/<tail>` for each tail, and may add the one configuration key that enables
+/// them where the application has one: Claude Code's `enabledPlugins.<name>@skills-dir` set to
 /// `true` in `settings.json`, for the same `<name>`. A destination or a key that is not on the
 /// table is refused, so a bridge never installs a settings document of its own and adds no value
 /// that can hold a command. Whether the directory and the name are free is `place_is_free`'s. A
 /// name in another case is another name here: it is refused.
-fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
-    struct Layout {
-        root: &'static str,
-        tails: &'static [&'static str],
-        enabling: Option<(&'static str, &'static str, &'static str)>,
-        /// The tail whose removal is the recipe's last: [`keeps_while_others_remain`].
-        last: Option<&'static str>,
-    }
-    let layout = match recipe.application.as_str() {
-        "Claude Code" => Layout {
-            root: "skills",
-            tails: &[
-                ".claude-plugin/plugin.json",
-                ".mcp.json",
-                "hooks/hooks.json",
-            ],
-            enabling: Some(("settings.json", "enabledPlugins.", "@skills-dir")),
-            last: None,
-        },
-        "Gemini CLI" => Layout {
-            root: "extensions",
-            tails: &[
-                ".gemini-extension-install.json",
-                "gemini-extension.json",
-                "hooks/hooks.json",
-            ],
-            enabling: None,
-            last: Some(GEMINI_RECORD),
-        },
-        other => {
-            return Err(format!(
-                "this host does not name what a native bridge for {other} may place"
-            ));
-        }
-    };
+fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(), String> {
+    let area = layout.area.as_str();
+    let tails: Vec<&str> = layout
+        .files
+        .iter()
+        .map(|placed| placed.tail.as_str())
+        .collect();
+    // Only the key of the label that has one: a placement for another label adds no key.
+    let enabling = (recipe.application == "Claude Code").then_some((
+        "settings.json",
+        "enabledPlugins.",
+        "@skills-dir",
+    ));
+    let last = record_kept_last(&recipe.application, area);
     let application = &recipe.application;
     let mut name: Option<&str> = None;
     let mut placed_tails: Vec<&str> = Vec::new();
@@ -2687,26 +2724,24 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
             {
                 let destination = destination.as_str();
                 let placed = destination
-                    .strip_prefix(layout.root)
+                    .strip_prefix(area)
                     .and_then(|rest| rest.strip_prefix('/'))
                     .and_then(|rest| rest.split_once('/'))
-                    .filter(|(directory, tail)| {
-                        plain_name(directory) && layout.tails.contains(tail)
-                    });
+                    .filter(|(directory, tail)| plain_name(directory) && tails.contains(tail));
                 let Some((directory, _)) = placed else {
                     return Err(format!(
                         "the recipe installs {destination}, which this host does not permit a \
                          native bridge for {application} to install: it installs {}/<name>/ with \
                          {} and nothing else",
-                        layout.root,
-                        layout.tails.join(", ")
+                        area,
+                        tails.join(", ")
                     ));
                 };
                 if name.is_some_and(|first| first != directory) {
                     return Err(format!(
                         "the recipe installs into more than one directory under {}/, which this \
                          host does not permit a native bridge for {application} to do",
-                        layout.root
+                        area
                     ));
                 }
                 name = Some(directory);
@@ -2717,7 +2752,7 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
     // Every file of the registration, and each once: an application reads the files beside the
     // ones a recipe leaves out, and a directory that holds another manifest or server file is
     // not one this host has checked.
-    for tail in layout.tails {
+    for tail in &tails {
         let times = placed_tails
             .iter()
             .filter(|destination| destination.ends_with(&format!("/{tail}")))
@@ -2739,7 +2774,7 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
             }
         }
     }
-    if let Some(record) = layout.last {
+    if let Some(record) = last {
         let last_removed = match recipe.remove.last() {
             Some(BridgeRemoval::RemoveFile { destination, .. }) => {
                 destination.as_str().rsplit_once('/').map(|(_, name)| name)
@@ -2756,7 +2791,7 @@ fn permitted(recipe: &NativeBridge) -> std::result::Result<(), String> {
     }
     for step in &recipe.install {
         if let BridgeStep::AddConfigurationKey { file, key, value } = step {
-            let enabled = layout.enabling.is_some_and(|(document, prefix, suffix)| {
+            let enabled = enabling.is_some_and(|(document, prefix, suffix)| {
                 file.as_str() == document
                     && value == "true"
                     && key
@@ -2798,12 +2833,10 @@ fn place_is_free(
     root: &Dir,
     journal: &Journal,
     recipe: &NativeBridge,
+    layout: &Placement,
+    declared: bool,
 ) -> std::result::Result<(), String> {
     let application = &recipe.application;
-    let (manifest, skips_hidden) = match application.as_str() {
-        "Claude Code" => (".claude-plugin/plugin.json", true),
-        _ => ("gemini-extension.json", false),
-    };
     let Some((area, name)) = recipe.install.iter().find_map(|step| match step {
         BridgeStep::InstallFile { destination, .. } => destination
             .as_str()
@@ -2843,17 +2876,36 @@ fn place_is_free(
                 BridgeStep::AddConfigurationKey { .. } => None,
             })
             .collect();
-        if !made
-            && !holds_only(existing.path(), "", &registration)
+        if !made {
+            // A package that declares its own placement installs only into a folder this host
+            // made: whatever stands there is the person's, whatever it holds. The compiled
+            // layouts keep what the installed packages were written for: a folder that holds
+            // only this registration is taken.
+            if declared {
+                return Err(format!(
+                    "{path} is already there and this host did not make it, so it does not permit \
+                     a native bridge for {application} placed by its package's own declaration \
+                     to install into it: {application} would enable everything in it with the \
+                     registration"
+                ));
+            }
+            if !holds_only(existing.path(), "", &registration)
                 .map_err(|error| format!("{path} cannot be read: {error}"))?
-        {
-            return Err(format!(
-                "{path} is already there with content that is not this registration, so this host \
-                 does not permit a native bridge for {application} to install into it: \
-                 {application} would enable everything in it with the registration"
-            ));
+            {
+                return Err(format!(
+                    "{path} is already there with content that is not this registration, so this \
+                     host does not permit a native bridge for {application} to install into it: \
+                     {application} would enable everything in it with the registration"
+                ));
+            }
         }
     }
+    // An application that keeps one plugin for each name says which manifest holds the name and
+    // whether it reads a hidden folder; one that does not has nothing more to compare.
+    let Some(check) = layout.one_per_name.as_ref() else {
+        return Ok(());
+    };
+    let (manifest, skips_hidden) = (check.manifest.as_str(), check.skips_hidden);
     let own = own.as_ref().map(Dir::identity);
     let listing = std::fs::read_dir(areas.path())
         .map_err(|error| format!("{area} cannot be listed: {error}"))?;
@@ -3675,6 +3727,34 @@ mod tests {
             );
         } else {
             answer.expect("changes are made here");
+        }
+    }
+
+    /// The record that Gemini CLI needs for as long as anything else of the registration stays is
+    /// kept last for its label, in its area and as the whole tail under the plugin's folder: no
+    /// other label, area, nested tail or file is held back for it.
+    #[test]
+    fn the_record_is_kept_last_only_for_its_label_its_area_and_its_whole_tail() {
+        let record = ".gemini-extension-install.json";
+        assert!(keeps_while_others_remain(
+            "Gemini CLI",
+            &format!("extensions/kalareach/{record}")
+        ));
+        for (application, path) in [
+            ("Claude Code", format!("extensions/kalareach/{record}")),
+            ("Quill CLI", format!("extensions/kalareach/{record}")),
+            ("Gemini CLI", format!("skills/kalareach/{record}")),
+            ("Gemini CLI", format!("extensions/kalareach/hooks/{record}")),
+            ("Gemini CLI", format!("extensions/{record}")),
+            (
+                "Gemini CLI",
+                "extensions/kalareach/hooks/hooks.json".to_owned(),
+            ),
+        ] {
+            assert!(
+                !keeps_while_others_remain(application, &path),
+                "{application}: {path}"
+            );
         }
     }
 }
