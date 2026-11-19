@@ -3201,6 +3201,49 @@ impl AccountTokenSource for VoiceToken {
     }
 }
 
+/// A voice token source whose step waits for the test once it is armed, and says when it began: the
+/// time a start spends getting its token, which the send limit counts.
+#[derive(Debug, Default)]
+struct HeldToken {
+    armed: std::sync::atomic::AtomicBool,
+    began: tokio::sync::Notify,
+    released: tokio::sync::Notify,
+}
+
+impl HeldToken {
+    /// Holds the token step of every start from now on.
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Lets every token step through again.
+    fn disarm(&self) {
+        self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Waits until a token step has begun and is being held.
+    async fn began(&self) {
+        self.began.notified().await;
+    }
+
+    /// Lets the held token step finish.
+    fn release(&self) {
+        self.released.notify_one();
+    }
+}
+
+impl AccountTokenSource for HeldToken {
+    fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async move {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                self.began.notify_one();
+                self.released.notified().await;
+            }
+            AccountToken::new("a-voice-token")
+        })
+    }
+}
+
 fn quoted(version: &str, per_second: &str) -> serde_json::Value {
     serde_json::json!({
         "version": version,
@@ -3454,6 +3497,7 @@ struct HoldWorld {
     device_id: DeviceId,
     params: VoiceStartParams,
     service: Arc<ScriptedService>,
+    token: Arc<HeldToken>,
 }
 
 fn the_services_terms() -> serde_json::Value {
@@ -3600,7 +3644,8 @@ impl HoldWorld {
         } else {
             ScriptedService::answering(script)
         };
-        Self::attach_broker(&host, &service);
+        let token = Arc::new(HeldToken::default());
+        Self::attach_broker(&host, &service, &token);
         let device_id = host
             .controller()
             .devices()
@@ -3653,16 +3698,21 @@ impl HoldWorld {
             device_id,
             params,
             service,
+            token,
         }
     }
 
     /// Gives the daemon's voice service a broker client over `service`. The broker reads the send
     /// limit on the daemon's own continuous clock.
-    fn attach_broker(host: &net_support::Host, service: &Arc<ScriptedService>) {
+    fn attach_broker(
+        host: &net_support::Host,
+        service: &Arc<ScriptedService>,
+        token: &Arc<HeldToken>,
+    ) {
         let broker = ManagedVoiceBroker::new(
             "https://reach.example",
             Arc::clone(service) as Arc<dyn ServiceHttp>,
-            Arc::new(VoiceToken),
+            Arc::clone(token) as Arc<dyn AccountTokenSource>,
         )
         .expect("a broker client")
         .with_continuous_clock(host.controller().continuous_clock());
@@ -3681,10 +3731,11 @@ impl HoldWorld {
             device_id,
             params,
             service,
+            token,
         } = self;
         drop(session);
         let host = host.restart().await;
-        Self::attach_broker(&host, &service);
+        Self::attach_broker(&host, &service, &token);
         let record = host.record_of(device_id);
         let session = net_support::connect(&host, &device, &record).await;
         Self {
@@ -3695,6 +3746,7 @@ impl HoldWorld {
             device_id,
             params,
             service,
+            token,
         }
     }
 
@@ -4301,4 +4353,53 @@ async fn the_hold_ends_at_its_end_and_not_before() {
     ));
     assert_eq!(world.calls_asked(), 2);
     assert_eq!(world.hold(), None);
+}
+
+/// KR-REQ-23.24: the send limit is counted on the daemon's continuous clock from the moment the hold
+/// is written, and a start whose token step runs past it sends nothing, is refused, and leaves no
+/// hold. A start whose token step ends a second before the limit sends its request once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_whose_token_step_passes_the_send_limit_sends_nothing() {
+    for (moves_by, posts) in [(31, 0_usize), (29, 1)] {
+        let (moved, clocks) = net_support::Moved::standing();
+        let world = HoldWorld::on_clocks(vec![a_start_that_made_a_call("call-1")], clocks).await;
+        world.token.arm();
+        let (answered, ()) = tokio::join!(world.start(None), async {
+            world.token.began().await;
+            moved.advance(std::time::Duration::from_secs(moves_by));
+            world.token.release();
+        });
+        assert_eq!(
+            world.calls_asked(),
+            posts,
+            "{moves_by} s into the token step"
+        );
+        if posts == 0 {
+            let refused = answered.expect_err("a start that ran out of its send time is refused");
+            assert_eq!(
+                refused.code(),
+                kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                "{refused}"
+            );
+            assert_eq!(
+                world.hold(),
+                None,
+                "a start that sent nothing leaves no hold"
+            );
+            // The next start has all its time again, and the service is asked once.
+            world.token.disarm();
+            let next = world.start(None).await.expect("the next start is admitted");
+            assert!(matches!(
+                outcome_of(&next),
+                VoiceStartOutcome::Started { .. }
+            ));
+            assert_eq!(world.calls_asked(), 1);
+        } else {
+            let sent = answered.expect("a start inside its send time is sent");
+            assert!(matches!(
+                outcome_of(&sent),
+                VoiceStartOutcome::Started { .. }
+            ));
+        }
+    }
 }
