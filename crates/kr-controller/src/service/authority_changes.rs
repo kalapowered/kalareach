@@ -1485,7 +1485,12 @@ impl Controller {
         // Settle before delete: nothing starts, the calls this host controls end, a start in
         // flight is waited for, and each stored call is closed with the key still in the store.
         let provider = &self.own_voice;
-        if provider.registry().fence().is_none() {
+        if provider
+            .registry()
+            .fence_after_reconcile(kr_client::services::own_voice::SETTLE_BOUND)
+            .await
+            .is_none()
+        {
             return Err(refused_voice(words::STILL_CLOSING));
         }
         // A start in flight is waited for first, through the publication of its call, so that the
@@ -1546,7 +1551,12 @@ impl Controller {
             self.check_admission(&registry, &carried)?;
         }
         let provider = &self.own_voice;
-        if provider.registry().fence().is_none() {
+        if provider
+            .registry()
+            .fence_after_reconcile(kr_client::services::own_voice::SETTLE_BOUND)
+            .await
+            .is_none()
+        {
             return Err(refused_voice(words::STILL_CLOSING));
         }
         let settled = provider.settle().await;

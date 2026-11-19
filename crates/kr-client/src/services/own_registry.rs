@@ -166,6 +166,8 @@ struct Inner {
     state: RegistryState,
     epoch: u64,
     slot: Option<Arc<StartSlot>>,
+    /// Whether the fence that is held is the start-time reconcile's, which a removal waits for.
+    reconciling: bool,
 }
 
 #[derive(Default)]
@@ -203,6 +205,8 @@ pub struct CallRegistry {
     inner: Mutex<Inner>,
     ledger: Arc<dyn OwnCallLedger>,
     tasks: Arc<Tasks>,
+    /// Told whenever a fence ends.
+    unfenced: Notify,
 }
 
 impl fmt::Debug for CallRegistry {
@@ -222,9 +226,11 @@ impl CallRegistry {
                 state: RegistryState::Idle,
                 epoch: 1,
                 slot: None,
+                reconciling: false,
             }),
             ledger,
             tasks: Arc::new(Tasks::default()),
+            unfenced: Notify::new(),
         })
     }
 
@@ -424,6 +430,16 @@ impl CallRegistry {
     /// A fence is held until [`unfence`](Self::unfence). A second fence while one is held is
     /// refused with `None`, so two removals do not settle at once.
     pub fn fence(&self) -> Option<Fenced> {
+        self.take_fence(false)
+    }
+
+    /// The fence of the start-time reconcile: as [`fence`](Self::fence), and a removal waits for
+    /// it instead of being refused ([`fence_after_reconcile`](Self::fence_after_reconcile)).
+    pub fn fence_for_reconcile(&self) -> Option<Fenced> {
+        self.take_fence(true)
+    }
+
+    fn take_fence(&self, reconciling: bool) -> Option<Fenced> {
         let mut inner = self.inner();
         if inner.state == RegistryState::Settling {
             return None;
@@ -431,10 +447,32 @@ impl CallRegistry {
         let before = inner.state;
         inner.state = RegistryState::Settling;
         inner.epoch += 1;
+        inner.reconciling = reconciling;
         Some(Fenced {
             before,
             epoch: inner.epoch,
         })
+    }
+
+    /// Fences for a removal or a forget: as [`fence`](Self::fence), except that the fence of the
+    /// start-time reconcile is waited for, for at most `bound`, and taken once it ends. A fence
+    /// that another removal holds, or a reconcile that outlasts the bound, gives `None`.
+    pub async fn fence_after_reconcile(&self, bound: Duration) -> Option<Fenced> {
+        let end = tokio::time::Instant::now() + bound;
+        loop {
+            let notified = self.unfenced.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(fenced) = self.fence() {
+                return Some(fenced);
+            }
+            if !self.inner().reconciling {
+                return None;
+            }
+            if tokio::time::timeout_at(end, notified).await.is_err() {
+                return None;
+            }
+        }
     }
 
     /// Ends a fence: the registry is idle and starts are taken again.
@@ -442,7 +480,10 @@ impl CallRegistry {
         let mut inner = self.inner();
         if inner.state == RegistryState::Settling {
             inner.state = RegistryState::Idle;
+            inner.reconciling = false;
         }
+        drop(inner);
+        self.unfenced.notify_waiters();
     }
 }
 
@@ -522,6 +563,55 @@ mod tests {
 
     /// One start at a time: the first is the start, the second is told one is in progress, and a
     /// start that ended without a call frees the next.
+    /// A removal that meets the start-time reconcile waits for it, within a bound, and then holds
+    /// the fence itself; a fence another removal holds, and a reconcile that outlasts the bound,
+    /// are not waited for.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_waits_for_the_start_time_reconcile_and_for_no_other_fence() {
+        let registry = CallRegistry::new(Arc::new(Rows::default()));
+        let reconcile = registry
+            .fence_for_reconcile()
+            .expect("the reconcile fences");
+        let waiting = {
+            let registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                registry
+                    .fence_after_reconcile(Duration::from_secs(45))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiting.is_finished(),
+            "the removal waits for the reconcile"
+        );
+        registry.unfence();
+        let fenced = waiting
+            .await
+            .expect("the task ends")
+            .expect("the removal fences once the reconcile ended");
+        assert_eq!(registry.state(), RegistryState::Settling);
+        assert!(fenced.epoch > reconcile.epoch);
+
+        assert!(
+            registry
+                .fence_after_reconcile(Duration::from_secs(45))
+                .await
+                .is_none(),
+            "a fence another removal holds is refused at once"
+        );
+        registry.unfence();
+
+        assert!(registry.fence_for_reconcile().is_some());
+        assert!(
+            registry
+                .fence_after_reconcile(Duration::from_secs(1))
+                .await
+                .is_none(),
+            "a reconcile that outlasts the bound is not waited for longer"
+        );
+    }
+
     #[test]
     fn a_second_start_is_refused_while_one_is_starting_or_running_and_a_dropped_ticket_frees_it() {
         let registry = CallRegistry::new(Arc::new(Rows::default()));

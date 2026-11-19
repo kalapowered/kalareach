@@ -925,9 +925,10 @@ impl OwnVoiceProvider {
 
     /// Closes what an earlier run left, with starts refused while it does (the sentence a start is
     /// told is the one of a removal in progress). A removal that holds the fence already does its
-    /// own closing, so this one does nothing then.
+    /// own closing, so this one does nothing then; a removal that arrives meanwhile waits for this
+    /// one.
     pub async fn reconcile_at_start(&self) {
-        let Some(_fence) = self.core.registry.fence() else {
+        let Some(_fence) = self.core.registry.fence_for_reconcile() else {
             return;
         };
         self.reconcile().await;
