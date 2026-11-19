@@ -1027,6 +1027,72 @@ async fn a_mailbox_that_cannot_be_reached_is_shown_and_read_again() {
     assert_eq!(rig.check().await.status, DoctorStatus::Ok);
 }
 
+/// A transport whose proxy's login stops every request before it is sent, and that counts the
+/// requests it was asked for.
+#[derive(Debug, Default)]
+struct StoppedByTheLogin {
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+impl ServiceHttp for StoppedByTheLogin {
+    fn post_json<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: &'a [u8],
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Err(kr_client::error::ClientError::ProxyLogin(
+                kr_transport::proxy::ProxyLoginKind::Refused,
+            ))
+        })
+    }
+}
+
+/// KR-REQ-10.02: a reader whose request the proxy's login stopped parks until the daemon ends: its
+/// first pass asks the transport once, and the reader asks for no wait, so no timer ends it and no
+/// second pass is made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_02_a_reader_the_proxy_login_stopped_parks_with_no_timer_after_one_request() {
+    let rig = Rig::start().await;
+    let timer = HeldTimer::held();
+    let transport = Arc::new(StoppedByTheLogin::default());
+    let gateway = GatewayOrigin::new(rig.served.origin()).expect("an origin");
+    let state = kr_ipc::testing::PrivateTempDir::create();
+    let reader = MailboxReader::new(
+        MailboxClient::new(
+            gateway.clone(),
+            Arc::clone(&transport) as Arc<dyn ServiceHttp>,
+            Arc::new(Installation(rig.host_keys.authorisation.clone())),
+        ),
+        &gateway,
+        rig.host_keys.stored_envelope.clone(),
+        kr_controller::mailbox_reader::record::Record::open(state.path()).expect("a record"),
+        Arc::clone(&timer) as _,
+    );
+    let mut passes = reader.passes();
+    let controller = rig.host.controller();
+    reader.run(controller, Arc::clone(controller.devices()));
+    within("the first pass finishes", async {
+        while *passes.borrow_and_update() == 0 {
+            passes.changed().await.expect("the reader is running");
+        }
+    })
+    .await;
+    assert!(
+        timer.asked_for().is_empty(),
+        "the reader asked for a wait after a stop that no timer mends: {:?}",
+        timer.asked_for()
+    );
+    assert_eq!(
+        transport.asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first pass asked the transport once"
+    );
+    assert_eq!(*reader.passes().borrow(), 1, "no second pass was made");
+}
+
 /// KR-REQ-17.48: a service with no managed capacity for a new mailbox says so with the delay it
 /// asks for and the alternatives that still work, and `kr doctor` says it as a limit of the
 /// service and not a fault of this host, in each of the three forms a list takes: every
