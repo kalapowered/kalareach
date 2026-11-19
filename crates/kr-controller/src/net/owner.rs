@@ -716,6 +716,15 @@ impl OwnerAuthority {
             self.endpoint(),
         )
         .map_err(refusal)?;
+        // The caller's scope is read again here, after the wait for the lock every challenge is
+        // issued under: the lease the door found can end in the waits before it, and the refusal is
+        // the door's own. It is not read inside the transaction that records the request. A policy
+        // commit holds the policy's lock while it writes to that record, so a request that held the
+        // record while it waited for the policy would wait for a commit that waits for the record.
+        let now = caller.decided_now();
+        if !now.may_confirm_display(&resolved.display) {
+            return Err(now.refusal_to_confirm());
+        }
         // The admission is asked inside the transaction that records the request, after every wait
         // before it; nothing is issued unless that record is written.
         let recorded = self.rows.record_requested(
@@ -1160,16 +1169,6 @@ impl OwnerAuthority {
         if !caller.may_confirm_display(&entry.display) {
             return Err(caller.refusal_to_confirm());
         }
-        // The caller's scope is read again where the admission is asked: the lease the door found
-        // can end while the challenges' lock and the record's lock are waited for.
-        let display = entry.display.clone();
-        let admission = || {
-            let now = caller.decided_now();
-            if !now.may_confirm_display(&display) {
-                return Err(now.refusal_to_confirm());
-            }
-            admission()
-        };
         let signer = self.signer_for(caller, proof, entry, enrolment, params)?;
         verify_confirmation(&self.clock, &entry.request, proof, &signer, enrolment)
             .map_err(refusal)?;
@@ -1178,6 +1177,13 @@ impl OwnerAuthority {
             return Err(confirmation_required(
                 "that challenge has already been answered with another proof",
             ));
+        }
+        // The caller's scope is read again here, after the waits for the challenges' lock: the
+        // lease the door found can end in them, and the refusal is the door's own. It is not read
+        // inside the transaction that records the answer, for the reason it is not in a request's.
+        let now = caller.decided_now();
+        if !now.may_confirm_display(&entry.display) {
+            return Err(now.refusal_to_confirm());
         }
         // The admission is asked inside the transaction that records the answer, after every wait
         // before it.
@@ -1190,7 +1196,7 @@ impl OwnerAuthority {
                 subject: ActionSubject::Completed(proof.request.confirmation_id),
             },
             kr_ipc::now_ms(),
-            &admission,
+            admission,
         )?;
         if let Some(entry) = state.entries.get_mut(&key) {
             entry.answer = Some(Answer {
