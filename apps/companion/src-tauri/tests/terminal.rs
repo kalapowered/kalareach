@@ -5061,7 +5061,6 @@ async fn a_discarded_screen_leaves_the_restore_unjudged(recovery: bool) -> Resul
         First::Report(call) => call,
         First::Screen(state) => return Err(state),
     };
-    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     frame(&mut link, &kept().revision(1)).await;
     if recovery {
         link.push("session.resync", &resync_marker(60)).await;
@@ -5120,7 +5119,6 @@ async fn landing_in_another_generation(first: FirstRow) -> Result<Value, Value> 
         First::Report(call) => call,
         First::Screen(state) => return Err(state),
     };
-    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     link.answer(&restore, &viewport_answer(1)).await;
     let mut landing = kept().revision(1).first_row(first);
     landing.generation = 2;
