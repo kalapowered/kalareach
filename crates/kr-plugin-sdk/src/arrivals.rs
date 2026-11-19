@@ -45,20 +45,28 @@ pub struct Arrival {
 }
 
 /// Every member that arrived inside a level, in the order it did.
-pub const ARRIVALS: &[Arrival] = &[Arrival {
-    definition: "SelectionRoute",
-    member: "hidden_when",
-    sdk_version: "0.1.7",
-    carried_by: |table| {
-        table["observation"]["selections"]
-            .as_array()
-            .is_some_and(|routes| {
-                routes
-                    .iter()
-                    .any(|route| route.get("hidden_when").is_some())
-            })
+pub const ARRIVALS: &[Arrival] = &[
+    Arrival {
+        definition: "SelectionRoute",
+        member: "hidden_when",
+        sdk_version: "0.1.7",
+        carried_by: |table| {
+            table["observation"]["selections"]
+                .as_array()
+                .is_some_and(|routes| {
+                    routes
+                        .iter()
+                        .any(|route| route.get("hidden_when").is_some())
+                })
+        },
     },
-}];
+    Arrival {
+        definition: "ConnectorManifest",
+        member: "hook_events",
+        sdk_version: "0.1.8",
+        carried_by: |table| table.get("hook_events").is_some(),
+    },
+];
 
 /// The table as the package contract carries it.
 #[must_use]

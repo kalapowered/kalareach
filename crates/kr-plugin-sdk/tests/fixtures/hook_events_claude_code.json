@@ -1,0 +1,141 @@
+{
+  "event": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "hook_event_name"
+      }
+    ]
+  },
+  "thread": {
+    "segments": [
+      {
+        "type": "member",
+        "name": "session_id"
+      }
+    ]
+  },
+  "events": [
+    {
+      "name": "SessionStart",
+      "report": "session_started",
+      "continued_by": "compact"
+    },
+    {
+      "name": "SessionEnd",
+      "report": "session_ended"
+    },
+    {
+      "name": "PostToolUse",
+      "report": "tool_finished"
+    },
+    {
+      "name": "PostToolUseFailure",
+      "report": "tool_failed"
+    },
+    {
+      "name": "Notification",
+      "report": "notification"
+    }
+  ],
+  "details": {
+    "start_source": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "source"
+        }
+      ]
+    },
+    "end_reason": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "reason"
+        }
+      ]
+    },
+    "tool_name": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "tool_name"
+        }
+      ]
+    },
+    "notification_kind": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "notification_type"
+        }
+      ]
+    },
+    "notification_text": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "message"
+        }
+      ]
+    }
+  },
+  "contact": {
+    "tool_name": "mcp__{server}__{tool}",
+    "tool_input": {
+      "segments": [
+        {
+          "type": "member",
+          "name": "tool_input"
+        }
+      ]
+    },
+    "agreeing": [
+      {
+        "place": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "mcp_server"
+            },
+            {
+              "type": "member",
+              "name": "name"
+            }
+          ]
+        },
+        "names": "server"
+      },
+      {
+        "place": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "mcp_context"
+            },
+            {
+              "type": "member",
+              "name": "server_name"
+            }
+          ]
+        },
+        "names": "server"
+      },
+      {
+        "place": {
+          "segments": [
+            {
+              "type": "member",
+              "name": "mcp_context"
+            },
+            {
+              "type": "member",
+              "name": "tool_name"
+            }
+          ]
+        },
+        "names": "tool"
+      }
+    ]
+  }
+}

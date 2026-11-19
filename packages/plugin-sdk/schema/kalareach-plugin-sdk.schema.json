@@ -1007,6 +1007,17 @@
           "$ref": "#/$defs/Framing",
           "description": "How messages are separated."
         },
+        "hook_events": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HookEvents"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the forwarder reads the hook payload of the application's bridge: where the event and\nthe session are, which event names report which of five things, and where the members a\nreport carries are.\n\nA table that does not state it leaves the member out, and a bridge's forwarder then reads the\npayload as Claude Code writes it, so a connector written before the member existed reads and\nhashes exactly as it did. A package that states it declares an `sdk_range` from SDK 0.1.8."
+        },
         "manifest_version": {
           "description": "The manifest format version.",
           "format": "uint32",
@@ -2069,6 +2080,227 @@
             "max_message_bytes"
           ],
           "type": "object"
+        }
+      ]
+    },
+    "HookAgreed": {
+      "description": "Which name an agreeing member holds.",
+      "oneOf": [
+        {
+          "const": "server",
+          "description": "The MCP server's name.",
+          "type": "string"
+        },
+        {
+          "const": "tool",
+          "description": "The tool's own name on that server.",
+          "type": "string"
+        }
+      ]
+    },
+    "HookAgreement": {
+      "additionalProperties": false,
+      "description": "A member that names the contact skill's server or tool, and which one.",
+      "properties": {
+        "names": {
+          "$ref": "#/$defs/HookAgreed",
+          "description": "Which of the two it names."
+        },
+        "place": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the payload names it."
+        }
+      },
+      "required": [
+        "place",
+        "names"
+      ],
+      "type": "object"
+    },
+    "HookContact": {
+      "additionalProperties": false,
+      "description": "How the application names the contact skill's tool and the request it asked.",
+      "properties": {
+        "agreeing": {
+          "description": "The other members the application names the server or the tool by. When the payload holds\none of them, it has to agree with the contact skill's own name.",
+          "items": {
+            "$ref": "#/$defs/HookAgreement"
+          },
+          "type": "array"
+        },
+        "tool_input": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the tool's input object is. The request identifier is its member `request_id`."
+        },
+        "tool_name": {
+          "description": "How the application spells the tool's name at the `tool_name` place: plain characters and\nthe words `{server}` and `{tool}`, which the host expands to the contact skill's server\nname and tool name before it compares for equality.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_name",
+        "tool_input"
+      ],
+      "type": "object"
+    },
+    "HookDetails": {
+      "additionalProperties": false,
+      "description": "The places of the members a report carries, each optional.",
+      "properties": {
+        "end_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why a session ended."
+        },
+        "notification_kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which notification this is."
+        },
+        "notification_text": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The notification's text."
+        },
+        "start_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How a session started."
+        },
+        "tool_name": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FieldPath"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tool that ran."
+        }
+      },
+      "type": "object"
+    },
+    "HookEvent": {
+      "additionalProperties": false,
+      "description": "One event name and what it reports.",
+      "properties": {
+        "continued_by": {
+          "description": "The start source that makes this a continuation of the thread already selected, for a\nsession start.\n\nA start whose source reads as this one goes on in the same thread; every other start is a\nnew selection. It needs the `start_source` place.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The name the application gives the event.",
+          "type": "string"
+        },
+        "report": {
+          "$ref": "#/$defs/HookReport",
+          "description": "What the forwarder reports for it."
+        }
+      },
+      "required": [
+        "name",
+        "report"
+      ],
+      "type": "object"
+    },
+    "HookEvents": {
+      "additionalProperties": false,
+      "description": "What a hook's payload means, for one application.",
+      "properties": {
+        "contact": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HookContact"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the application names the contact skill's tool, for a package that reports it."
+        },
+        "details": {
+          "$ref": "#/$defs/HookDetails",
+          "default": {},
+          "description": "The members a report carries."
+        },
+        "event": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the payload names the event."
+        },
+        "events": {
+          "description": "The event names the forwarder reports, one to thirty-two, each with what it reports. An\nevent not named here is answered and reports nothing.",
+          "items": {
+            "$ref": "#/$defs/HookEvent"
+          },
+          "type": "array"
+        },
+        "thread": {
+          "$ref": "#/$defs/FieldPath",
+          "description": "Where the payload names the session, which KalaReach binds as the thread."
+        }
+      },
+      "required": [
+        "event",
+        "thread",
+        "events"
+      ],
+      "type": "object"
+    },
+    "HookReport": {
+      "description": "The five things the forwarder reports. The worker reads these and no others.",
+      "oneOf": [
+        {
+          "const": "session_started",
+          "description": "A session started: a thread is selected, or continued.",
+          "type": "string"
+        },
+        {
+          "const": "session_ended",
+          "description": "A session ended: the thread is ended.",
+          "type": "string"
+        },
+        {
+          "const": "tool_finished",
+          "description": "A tool finished.",
+          "type": "string"
+        },
+        {
+          "const": "tool_failed",
+          "description": "A tool failed.",
+          "type": "string"
+        },
+        {
+          "const": "notification",
+          "description": "The application raised a notification.",
+          "type": "string"
         }
       ]
     },

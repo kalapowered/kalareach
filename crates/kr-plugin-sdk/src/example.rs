@@ -592,6 +592,7 @@ pub fn example_connector_table() -> crate::connector::ConnectorManifest {
         decision_response: None,
         observation: None,
         operations: None,
+        hook_events: None,
         volatile_forwarding: false,
         qualification_note: Nullable(Some(summary(
             "Qualified against example-agent 1.2.0 with the published protocol reference",

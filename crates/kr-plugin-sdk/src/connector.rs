@@ -672,6 +672,15 @@ pub struct ConnectorManifest {
     /// cancellation of its own to the application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operations: Option<Operations>,
+    /// How the forwarder reads the hook payload of the application's bridge: where the event and
+    /// the session are, which event names report which of five things, and where the members a
+    /// report carries are.
+    ///
+    /// A table that does not state it leaves the member out, and a bridge's forwarder then reads the
+    /// payload as Claude Code writes it, so a connector written before the member existed reads and
+    /// hashes exactly as it did. A package that states it declares an `sdk_range` from SDK 0.1.8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_events: Option<crate::hook_events::HookEvents>,
     /// Whether the connector has a tested volatile forwarding mode.
     ///
     /// Without one it is not a resilient managed gateway, so this host serves no gateway for it:
@@ -924,6 +933,7 @@ mod tests {
             decision_response: None,
             observation: None,
             operations: None,
+            hook_events: None,
             volatile_forwarding: false,
             qualification_note: Nullable(None),
         }

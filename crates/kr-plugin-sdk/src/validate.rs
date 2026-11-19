@@ -448,6 +448,7 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
     );
     if let Some(connector) = &connector {
         check_connector(connector, &mut report);
+        check_hook_events(&manifest, connector, &mut report);
     }
 
     let package = presentation.map(|presentation| Package {
@@ -1007,6 +1008,35 @@ fn check_closed_vocabularies(value: &serde_json::Value, report: &mut Report) {
                 format!("{capability} is not a capability a package may request"),
             ));
         }
+    }
+}
+
+/// Refuses a table whose hook events the forwarder, the worker or the package could not read, and
+/// one that declares them for a package that starts no forwarder.
+///
+/// The worker and the forwarder call the same check on the value, so what passes here is what both
+/// accept.
+fn check_hook_events(manifest: &PluginManifest, connector: &ConnectorManifest, report: &mut Report) {
+    let Some(events) = &connector.hook_events else {
+        return;
+    };
+    for refusal in events.refusals() {
+        report.push(Finding::at(
+            FindingCode::ConnectorTableInvalid,
+            CONNECTOR_FILE,
+            refusal.to_string(),
+        ));
+    }
+    if !manifest.native_bridge.is_present() && manifest.command_integration.is_none() {
+        report.push(Finding::at(
+            FindingCode::ConnectorTableInvalid,
+            CONNECTOR_FILE,
+            format!(
+                "{}: the package declares hook events and starts no forwarder, so nothing reads \
+                 them: it has neither a native bridge nor a command integration",
+                crate::hook_events::HookEventsRefusal::NoForwarder.name()
+            ),
+        ));
     }
 }
 
