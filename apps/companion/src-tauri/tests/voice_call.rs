@@ -87,6 +87,7 @@ use kr_protocol::voice::{
     VoiceAction, VoiceActionPlan, VoiceConfirmationRequest, VoiceDelegateParams,
     VoiceDelegateResult, VoiceDelegationId, VoiceDelegationOutcome,
 };
+use kr_protocol::voice_host::VoiceNote;
 use net_support::Host;
 use serde_json::json;
 use support::call::{OFFER, ScriptedCalls};
@@ -263,7 +264,17 @@ struct Scene {
     link: Arc<LinkControl>,
     /// The person's side of the ceremony: what they do when asked, and what they were asked.
     ceremony: Arc<ScriptedCeremony>,
+    /// OpenAI as the host reaches it, when the host's voice provider is its owner's own key.
+    openai: Option<OpenAi>,
+    /// Held while the daemon runs, so that the provider keeps reaching OpenAI by the stand-in.
+    _placed: Option<kr_controller::voice::own_key_hooks::Placed>,
 }
+
+/// The stand-in for OpenAI that a host on its owner's own key reaches.
+type OpenAi = kr_client::services::own_voice::stand_in::StandIn;
+
+/// The key the host holds for its own-key calls.
+const OWN_KEY: &str = "kr-test-voice-key-held-01234567890";
 
 impl Scene {
     fn host(&self) -> &Host {
@@ -382,10 +393,24 @@ impl Scene {
         state
     }
 
+    /// Asks for a start on the host owner's own key the way the page does: no rate is named.
+    fn own_start_request(&self, prepared: &serde_json::Value) -> serde_json::Value {
+        json!({
+            "subject": {},
+            "provider": "own_key",
+            "sessionIds": [self.session],
+            "durationSeconds": 1800,
+            "reasoningBudgetMinor": null,
+            "prepared": prepared["prepared"],
+            "expectedRateVersion": null,
+        })
+    }
+
     /// Asks for a start the way the page does, after reading what a call would be.
     fn start_request(&self, prepared: &serde_json::Value) -> serde_json::Value {
         json!({
             "subject": {},
+            "provider": "managed",
             "sessionIds": [self.session],
             "durationSeconds": 600,
             "reasoningBudgetMinor": null,
@@ -416,6 +441,9 @@ impl Scene {
 struct Standing {
     rights: Vec<ActionRight>,
     voice_actions: serde_json::Value,
+    /// OpenAI as the host reaches it, for a host whose voice provider is its owner's own key and
+    /// which holds one.
+    own_key: Option<OpenAi>,
 }
 
 impl Default for Standing {
@@ -423,6 +451,7 @@ impl Default for Standing {
         Self {
             rights: vec![ActionRight::SessionView, ActionRight::AgentPrompt],
             voice_actions: serde_json::Value::Null,
+            own_key: None,
         }
     }
 }
@@ -534,7 +563,54 @@ async fn scene_replacing(
     replacing: impl FnOnce(Service) -> Service,
 ) -> Scene {
     let stand_in = StandIn::start().await;
-    let (host, owner, workers) = if sessions == 0 {
+    let mut placed = None;
+    let (host, owner, workers) = if let Some(openai) = &standing.own_key {
+        let owner = DeviceKeys::generate().expect("owner keys");
+        let (host, hooks) = Host::start_with_own_voice(&owner, Arc::new(openai.clone())).await;
+        placed = Some(hooks);
+        // The sessions a host runs are adopted when it starts again over a tree that holds their
+        // workers, as for every host a case gives real sessions.
+        let (host, workers) = if sessions == 0 {
+            (host, Vec::new())
+        } else {
+            let stopped = host.shut_down().await;
+            let mut workers = Vec::new();
+            for display in 1..=sessions {
+                workers.push(
+                    net_support::worker::Worker::start_reserved(stopped.tree(), display).await,
+                );
+            }
+            let settings = stopped.settings().clone();
+            let host = stopped.start(settings).await;
+            let adopted = net_support::worker::Adopted {
+                host,
+                owner: owner.clone(),
+                workers,
+            };
+            for worker in &adopted.workers {
+                adopted.until_adopted(worker).await;
+            }
+            (adopted.host, adopted.workers)
+        };
+        let held = host
+            .client()
+            .await
+            .mutate(
+                HostMethod::VoiceCredentialSet,
+                kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                kr_protocol::envelope::ActionTarget::environment(host.environment_id),
+                &kr_protocol::voice_credential::VoiceCredentialSetParams {
+                    kind: kr_protocol::voice_credential::VoiceCredentialKind::OpenaiLive,
+                    key: kr_protocol::delivery::SecretText::new(OWN_KEY).expect("a key"),
+                },
+            )
+            .await;
+        assert!(
+            matches!(held, Ok(Ok(_))),
+            "the host holds the owner's key: {held:?}"
+        );
+        (host, owner, workers)
+    } else if sessions == 0 {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = Host::start_with_document(&owner, &document_naming(stand_in.origin())).await;
         (host, owner, Vec::new())
@@ -630,6 +706,8 @@ async fn scene_replacing(
         workers,
         link,
         ceremony,
+        openai: standing.own_key.clone(),
+        _placed: placed,
     };
     tokio::time::timeout(WATCHDOG, async {
         loop {
@@ -3609,6 +3687,7 @@ impl companion_tauri::voice::HostReach for FailsWhenTold {
 /// What a start asks for, as the page asks for it.
 fn request_of(scene: &Scene, prepared: &serde_json::Value) -> companion_tauri::voice::StartRequest {
     companion_tauri::voice::StartRequest {
+        provider: companion_tauri::voice::CallProvider::Managed,
         session_ids: vec![scene.session.parse().expect("a session")],
         duration_seconds: 600,
         reasoning_budget_minor: None,
@@ -7754,5 +7833,586 @@ async fn a_session_number_read_for_another_session_is_not_put_to_the_person() {
     assert_eq!(at_the_host(&scene), 1, "no signature was sent");
     assert!(!scene.is_closed().await);
     hang_up(&scene);
+    scene.stop_host().await;
+}
+
+// -------------------------------------------------------------------------------------------------
+// A call on the host owner's own key
+//
+// The host holds the owner's OpenAI key and reaches OpenAI by a stand-in for it; the phone is paired
+// as a manager of the host and holds no account. Its control of the call is the host's methods, and
+// the managed voice service stand-in beside it records anything the phone asks of it.
+// -------------------------------------------------------------------------------------------------
+
+/// What a phone is paired to do when it may spend the host's key.
+const MANAGER: [ActionRight; 3] = [
+    ActionRight::SessionView,
+    ActionRight::AgentPrompt,
+    ActionRight::HostManage,
+];
+
+/// What a person is told when a call on the host's key has ended on this phone and the host has not
+/// confirmed that it closed the call.
+const LEFT_TO_HOST_WORDS: &str = "The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it.";
+
+/// Timings under which the phone's heartbeat to the host is quick.
+fn own_timings() -> Timings {
+    Timings {
+        host_beat: Some(Duration::from_millis(40)),
+        host_within: WATCHDOG,
+        ..quick()
+    }
+}
+
+/// A host on its owner's own key over one real session, and a phone with no account that manages it.
+async fn own_scene(timings: Timings) -> Scene {
+    own_scene_signed_in(timings, None).await
+}
+
+/// As [`own_scene`], for a phone whose account holds `signed_in`.
+async fn own_scene_signed_in(timings: Timings, signed_in: Option<IssuedGrant>) -> Scene {
+    scene_replacing(
+        timings,
+        signed_in,
+        None,
+        HttpDeadlines::default(),
+        1,
+        Standing {
+            rights: MANAGER.to_vec(),
+            own_key: Some(OpenAi::new()),
+            ..Standing::default()
+        },
+        |service| service,
+    )
+    .await
+}
+
+/// What a start on the host's own key asks for.
+fn own_request_of(
+    scene: &Scene,
+    prepared: &serde_json::Value,
+) -> companion_tauri::voice::StartRequest {
+    companion_tauri::voice::StartRequest {
+        provider: companion_tauri::voice::CallProvider::OwnKey,
+        session_ids: vec![scene.session.parse().expect("a session")],
+        duration_seconds: 1800,
+        reasoning_budget_minor: None,
+        prepared: serde_json::from_value(prepared["prepared"].clone()).expect("a digest"),
+        expected_rate_version: None,
+        subject: companion_tauri::target::Subject::default(),
+    }
+}
+
+/// What the host wrote to the provider's side channel.
+fn written(scene: &Scene) -> Vec<serde_json::Value> {
+    scene
+        .openai
+        .as_ref()
+        .expect("an own-key scene")
+        .recorded()
+        .commands
+}
+
+/// The commands of `kind` the host wrote: each one's text and the delegation it names.
+fn written_of(scene: &Scene, kind: &str) -> Vec<(String, Option<String>)> {
+    written(scene)
+        .into_iter()
+        .filter(|command| command["type"] == kind)
+        .map(|command| {
+            (
+                command["content"].as_str().unwrap_or_default().to_owned(),
+                command["delegation_id"].as_str().map(str::to_owned),
+            )
+        })
+        .collect()
+}
+
+/// Waits until the host has written a command of `kind` that `wanted` accepts.
+async fn until_written(
+    scene: &Scene,
+    kind: &str,
+    wanted: impl Fn(&(String, Option<String>)) -> bool,
+) {
+    tokio::time::timeout(WATCHDOG, async {
+        while !written_of(scene, kind).iter().any(&wanted) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the host never wrote that {kind}: {:?}", written(scene)));
+}
+
+/// Waits until the phone has sent the host `count` more heartbeats than it had sent when this was
+/// called: what a case that proves something did not happen waits on, in place of a delay.
+async fn until_more_heartbeats(scene: &Scene, count: usize) -> bool {
+    let target = scene.link.sent(HostMethod::VoiceControl) + count;
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.link.sent(HostMethod::VoiceControl) < target {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Whether the phone asked the managed voice service or the account for anything: the service saw
+/// no request and no control, and the account's token source was never used to refresh.
+fn what_reached_kalareach(scene: &Scene) -> (usize, usize, usize) {
+    (
+        scene.stand_in.seen().len(),
+        scene.stand_in.control().report().upgrades.len(),
+        scene.service.refreshes.load(Ordering::SeqCst),
+    )
+}
+
+/// The delegation event the provider sends on the host's side channel.
+fn provider_delegation(id: &str, offset_ms: u64) -> serde_json::Value {
+    json!({
+        "type": "session.delegation.created",
+        "event_id": format!("event_{id}"),
+        "offset_ms": offset_ms,
+        "delegation": { "id": id, "type": "delegation", "target": "client" },
+    })
+}
+
+/// A start on the host's own key with no account signed in on the phone runs a whole call: the
+/// control is the host's, the host writes the model's sentences from the notes the phone sends, the
+/// opening context goes by the host's sender, a mute reaches the provider, and the end revokes the
+/// grant at the host. Nothing is asked of the managed service or of an account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_with_no_account_signed_in_runs_a_whole_own_key_call() {
+    let mut scene = own_scene(own_timings()).await;
+    let prepared = scene.prepared().await;
+    assert_eq!(prepared["provider"]["own_key"]["held"], true, "{prepared}");
+    assert!(
+        prepared["provider"].get("managed").is_none(),
+        "no managed terms: {prepared}"
+    );
+
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(
+        answer.is_ok(),
+        "an own-key call starts on a phone with no account: {answer:?}"
+    );
+    let started = answer.unwrap_or_default();
+    let session = &started["value"]["outcome"]["started"]["session"];
+    assert!(
+        session["control"]["host"]["heartbeat_seconds"].is_number(),
+        "the host controls the call: {started}"
+    );
+    assert_eq!(
+        session["answer_sdp"], "",
+        "the provider's answer is native code's"
+    );
+
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    // The phone told the host which sentence the model is owed; the host wrote its words.
+    until_written(&scene, "session.instructions.append", |(content, _)| {
+        content == VoiceNote::HostActionsUnavailable.words()
+    })
+    .await;
+    // The opening context went by the host's sender: the phone asked for it once.
+    until_written(&scene, "session.thinking.append", |_| true).await;
+    assert_eq!(scene.link.sent(HostMethod::VoiceContextSend), 1);
+    assert_eq!(
+        scene.link.sent(HostMethod::VoiceContext),
+        0,
+        "the phone reads no selection of its own: the host sends it"
+    );
+
+    // A delegation the host's own side channel heard is answered to the model once, by a note.
+    let openai = scene.openai.clone().expect("an own-key scene");
+    openai.event(&provider_delegation("d-1", 500));
+    until_written(
+        &scene,
+        "session.commentary.append",
+        |(content, delegation)| {
+            content == VoiceNote::NothingWasDone.words() && delegation.as_deref() == Some("d-1")
+        },
+    )
+    .await;
+    assert!(
+        until_more_heartbeats(&scene, 4).await,
+        "the phone keeps sending the host its heartbeat"
+    );
+    assert_eq!(
+        written_of(&scene, "session.commentary.append").len(),
+        1,
+        "the delegation is answered once: {:?}",
+        written(&scene)
+    );
+
+    // The person's mute is advice to the provider, written by the host.
+    let muted = scene
+        .call(
+            "voice_set_muted",
+            json!({ "what": "microphone", "muted": true }),
+        )
+        .unwrap_or_default();
+    assert_eq!(muted["capture"], "muted_by_person");
+    assert!(
+        scene
+            .platform
+            .commands()
+            .contains(&"mute:Microphone:true".to_owned())
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while !written(&scene)
+            .iter()
+            .any(|command| command["type"] == "session.input_audio.mute")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the host wrote the mute to the provider");
+
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("the end", |state| state["ended"]["cause"] == "requested")
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    assert_eq!(
+        what_reached_kalareach(&scene),
+        (0, 0, 0),
+        "the managed service and the account were asked for nothing"
+    );
+    scene.stop_host().await;
+}
+
+/// An owner that fails after the descriptor was received, on a phone with no account and on one
+/// signed in, leaves a call on the host's key to the host when the host does not answer the stop: no
+/// token is used and nothing goes to the managed service, the closing sentence is shown, and the
+/// revocation owed toward the host stands, bounded by when the grant ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_does_not_confirm_a_close_leaves_an_own_key_call_to_the_host_and_sends_nothing_to_kalareach()
+ {
+    for signed_in in [None, Some(phone_grant(PHONE_TOKEN, 0))] {
+        let signed = signed_in.is_some();
+        let mut scene = own_scene_signed_in(own_timings(), signed_in).await;
+        let prepared = scene.prepared().await;
+        let reach = failing_reach(&scene, FailsAt::Pairing, 0);
+        let calls = scene.phone.companion.app.state::<Calls>();
+        let started = calls
+            .start(
+                own_request_of(&scene, &prepared),
+                Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+                Arc::clone(&scene.tokens),
+            )
+            .await;
+        assert!(
+            matches!(started, Ok(companion_tauri::voice::Started::Result(_))),
+            "an own-key call starts (signed in: {signed})"
+        );
+        scene
+            .state_where("a running call", |state| state["running"] == true)
+            .await;
+        // The host revokes the grant, and its answer is lost: the phone cannot say the host closed
+        // the call.
+        scene.link.lose_the_answer_to(Some(HostMethod::VoiceStop));
+        reach.told.store(1, Ordering::SeqCst);
+
+        let ended = scene
+            .state_where("the owner's failure", |state| {
+                state["ended"]["cause"] == "owner_failed" && state["setting_up"] == false
+            })
+            .await;
+        assert_eq!(
+            ended["ended"]["broker"], "left_to_host",
+            "(signed in: {signed}) {ended}"
+        );
+        assert_eq!(ended["ended"]["words"], LEFT_TO_HOST_WORDS, "{ended}");
+        assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+        let owed: Vec<&serde_json::Value> = ended["owed"]
+            .as_array()
+            .map(|owed| owed.iter().collect())
+            .unwrap_or_default();
+        let kinds: Vec<&str> = owed
+            .iter()
+            .filter_map(|entry| entry["kind"].as_str())
+            .collect();
+        assert!(
+            kinds.contains(&"revocation"),
+            "the revocation owed toward the host is kept: {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"host_close") && !kinds.contains(&"service_close"),
+            "the notice states the host's rule and no voice service's closure: {kinds:?}"
+        );
+        let grant_ends = owed
+            .iter()
+            .find(|entry| entry["kind"] == "revocation")
+            .map_or(0, |entry| milliseconds(&entry["until_ms"]));
+        assert!(
+            grant_ends > now_ms(),
+            "the revocation owed stands until the grant ends, not before"
+        );
+        assert_eq!(
+            what_reached_kalareach(&scene),
+            (0, 0, 0),
+            "the managed service and the account were asked for nothing (signed in: {signed})"
+        );
+        scene.stop_host().await;
+    }
+}
+
+/// A change of account does not end a call on the host's key: no account pays for it or controls
+/// it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_account_change_does_not_end_an_own_key_call() {
+    let mut scene = own_scene_signed_in(own_timings(), Some(phone_grant(PHONE_TOKEN, 3600))).await;
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    scene
+        .tokens
+        .sign_out(|| Ok::<(), std::convert::Infallible>(()))
+        .await
+        .expect("the phone signs out")
+        .expect("a check that always stands");
+    let beating = until_more_heartbeats(&scene, 6).await;
+
+    let state = scene.state();
+    assert_eq!(state["running"], true, "the call runs on: {state}");
+    assert!(beating, "the phone keeps sending the host its heartbeat");
+    assert!(state["ended"].is_null(), "no end: {state}");
+    assert_eq!(scene.platform.count("stop"), 0, "the media is not stopped");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The person's mute and the hang-up are native code's and the host's own: a control whose answers
+/// do not come leaves both working.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_mute_and_closure_survive_a_host_control_failure() {
+    let mut scene = own_scene(own_timings()).await;
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    scene
+        .link
+        .lose_the_answer_to(Some(HostMethod::VoiceControl));
+    assert!(
+        until_more_heartbeats(&scene, 4).await,
+        "the phone goes on sending heartbeats the host does not answer"
+    );
+
+    let muted = scene
+        .call(
+            "voice_set_muted",
+            json!({ "what": "microphone", "muted": true }),
+        )
+        .unwrap_or_default();
+    assert_eq!(muted["capture"], "muted_by_person", "{muted}");
+    assert!(
+        scene
+            .platform
+            .commands()
+            .contains(&"mute:Microphone:true".to_owned())
+    );
+
+    scene.link.lose_the_answer_to(None);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("the end", |state| state["ended"]["cause"] == "requested")
+        .await;
+    assert_eq!(ended["ended"]["closed_locally"], true, "{ended}");
+    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    assert!(
+        scene.link.sent(HostMethod::VoiceStop) >= 1,
+        "the host was asked to revoke the grant"
+    );
+    scene.stop_host().await;
+}
+
+/// A host path that is lost: two heartbeats without an answer are told to the person, and a host
+/// not heard from for the host's absent bound ends the call on this device, which stops its media
+/// and shows the closing sentence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_ends_its_media() {
+    let timings = Timings {
+        host_miss: Duration::from_millis(150),
+        host_silent: Duration::from_secs(3),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    scene
+        .link
+        .lose_the_answer_to(Some(HostMethod::VoiceControl));
+    let told = scene
+        .state_where("the notice of two beats unanswered", |state| {
+            state["problems"]
+                .as_array()
+                .is_some_and(|problems| problems.iter().any(|each| each["kind"] == "host_path"))
+        })
+        .await;
+    let notice = told["problems"]
+        .as_array()
+        .and_then(|problems| problems.iter().find(|each| each["kind"] == "host_path"))
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        notice["words"],
+        "The host could not be reached. So it is not known whether the host still has the call."
+    );
+    assert_eq!(told["running"], true, "the call is not ended by two misses");
+
+    scene.link.lose_the_answer_to(None);
+    let ended = scene
+        .state_where("the end", |state| state["ended"]["cause"] == "host_silent")
+        .await;
+    assert_eq!(ended["ended"]["words"], LEFT_TO_HOST_WORDS, "{ended}");
+    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    scene.stop_host().await;
+}
+
+/// The unknown-start notice of a call on the host's key names the charge, and the notice for a call
+/// left to the host states the host's own rule and not a closing time of the voice service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_unresolved_notice_for_an_own_key_call_does_not_use_closes_at_ms_as_a_closure_boundary_and_the_unknown_start_notice_names_the_charge()
+ {
+    let mut scene = own_scene(Timings {
+        start_within: Duration::from_millis(400),
+        repeat_delays: [Duration::from_millis(50); 3],
+        ..own_timings()
+    })
+    .await;
+    let prepared = scene.prepared().await;
+    // The host takes the start and its answer is lost on every connection: the start is unknown.
+    scene.link.lose_the_answer_to(Some(HostMethod::VoiceStart));
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "the start's end is told: {answer:?}");
+    let state = scene
+        .state_where("the unknown start owed", |state| {
+            state["owed"]
+                .as_array()
+                .is_some_and(|owed| owed.iter().any(|each| each["kind"] == "start_unknown"))
+        })
+        .await;
+    let owed = state["owed"]
+        .as_array()
+        .and_then(|owed| owed.iter().find(|each| each["kind"] == "start_unknown"))
+        .cloned()
+        .unwrap_or_default();
+    let words = owed["words"].as_str().unwrap_or_default();
+    assert!(
+        words.contains("the call runs on your OpenAI account and OpenAI may charge you"),
+        "{owed}"
+    );
+    assert!(
+        !words.contains("voice service"),
+        "no voice service is named for an own-key call: {owed}"
+    );
+    scene.stop_host().await;
+}
+
+/// A start on the host's own key asks the host to keep it acceptable for at least 45 seconds: the
+/// creation may take 30 and a hang-up 15 more, so an admission that lapsed before the provider
+/// answered would leave a call nobody asked for. The case reads the time to live the start asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_own_key_start_asks_a_time_to_live_of_at_least_45_seconds() {
+    let mut scene = own_scene(own_timings()).await;
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    let asked = scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .start_ttls_asked();
+    assert_eq!(asked.len(), 1, "one start was composed: {asked:?}");
+    assert!(
+        asked[0] >= 45_000,
+        "the start asked to stay acceptable for {} ms",
+        asked[0]
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// A call on the host's own key whose spoken delegation the host's own side channel heard: the phone
+/// asks the host whether it heard it, the host answers with the offset, the delegation is judged as
+/// any is, and when this device would not hand it over the model is told by a note the host writes
+/// for that delegation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_spoken_delegation_on_an_own_key_call_is_heard_by_the_host_and_a_refusal_is_noted_for_it()
+{
+    let mut scene = own_scene(delegating_timings()).await;
+    scene
+        .phone
+        .companion
+        .app
+        .state::<Calls>()
+        .accept_host_delegations(true);
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    scene.platform.show_progress_age(Some(10));
+
+    // The first sentence of the call comes to nothing: the model delegates it, and it is refused
+    // as the first of the call. The host's side channel hears the delegation first, as it does
+    // from the provider, and the device's own data channel delivers it after.
+    speak(&scene, 0, "hello there");
+    let openai = scene.openai.clone().expect("an own-key scene");
+    openai.event(&provider_delegation("d-0", 200));
+    let heard = scene.phone.companion.app.state::<Calls>();
+    tokio::time::timeout(WATCHDOG, async {
+        while !heard.has_read_announcement("d-0", 200) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the phone reads the host's news of the delegation");
+    scene.platform.tell_provider(&delegation_event("d-0", 200));
+
+    let row = row_reaching(&scene, "d-0", "refused").await;
+    assert_eq!(row["cause"], "first_fragment", "{row}");
+    until_written(
+        &scene,
+        "session.commentary.append",
+        |(content, delegation)| {
+            content == VoiceNote::DelegationRefused.words() && delegation.as_deref() == Some("d-0")
+        },
+    )
+    .await;
+    assert_eq!(at_the_host(&scene), 0, "nothing was handed to the host");
+    assert!(
+        scene.link.sent(HostMethod::VoiceControl) >= 3,
+        "the host was asked about the delegation and told its note"
+    );
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.stop_host().await;
 }
