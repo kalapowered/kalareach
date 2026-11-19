@@ -1849,7 +1849,10 @@ impl Broker {
     /// # Errors
     ///
     /// Returns whatever the transport refuses, after leaving the resource uncertain: the marker is
-    /// committed, so asking again could apply the answer twice.
+    /// committed, so asking again could apply the answer twice. The exception is a refusal that
+    /// proves nothing was queued ([`BrokerError::proven_unsent`]): the claim is given back with its
+    /// marker cleared, so the resource is answerable again and asking again is safe, unless the
+    /// store cannot record the give-back, which leaves the resource uncertain.
     pub fn record_approval(
         &self,
         admitted: &MutationAdmission,
