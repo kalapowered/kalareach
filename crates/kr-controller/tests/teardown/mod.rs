@@ -1093,7 +1093,7 @@ fn remove_launchd_job(label: &str) -> Vec<String> {
                 continue;
             }
         }
-        let removal = run_bounded(kr_ipc::testing::account_launchd::command(&[
+        let removal = run_bounded(&mut kr_ipc::testing::account_launchd::command(&[
             "bootout", &target,
         ]));
         match loaded(&target) {
@@ -1417,7 +1417,7 @@ fn remove_jobs(_tree: &TempHost) -> Vec<String> {
 fn loaded(target: &str) -> Result<bool, String> {
     const NO_SUCH_DOMAIN: i32 = 112;
     const NOT_LOADED: i32 = 113;
-    let status = run_bounded(kr_ipc::testing::account_launchd::command(&[
+    let status = run_bounded(&mut kr_ipc::testing::account_launchd::command(&[
         "print", target,
     ]))?;
     match status.code() {
