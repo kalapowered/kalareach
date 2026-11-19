@@ -7807,6 +7807,65 @@ async fn a_suite_that_writes_only_its_declared_output_still_attests_the_version(
     host.clients.abort();
 }
 
+/// The command of the suite that shows its shell's environment: it writes its home and its search
+/// path, one to a line, to the file `written`, whose path is quoted for the shell that reads it.
+#[cfg(unix)]
+fn the_command_that_writes_its_environment_to(written: &Path) -> String {
+    format!(
+        "printf '%s\\n%s\\n' \"$HOME\" \"$PATH\" > {}",
+        kr_worker::testing::shell_quoted(written)
+    )
+}
+
+/// The text of a startup file that appends the name it was read as and the home it was read under
+/// to the file `record`, whose path is quoted for the shell that reads it.
+#[cfg(unix)]
+fn the_startup_file_that_records_into(name: &str, record: &Path) -> String {
+    format!(
+        "echo \"{name} $HOME\" >> {}\n",
+        kr_worker::testing::shell_quoted(record)
+    )
+}
+
+/// The shell texts of the two cases that follow, run with a folder whose name holds a quote and a
+/// space, write where they were told to: each reads the path as one word.
+#[cfg(unix)]
+#[test]
+fn the_shell_texts_of_the_environment_cases_read_a_path_with_a_quote_and_a_space() {
+    let temp = teardown::Tree::create();
+    let folder = temp.root().join("it's a folder");
+    std::fs::create_dir(&folder).expect("a folder whose name holds a quote and a space");
+    let shell = |text: &str| {
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", text])
+            .env("HOME", "/home with a space")
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("a shell");
+        assert!(output.status.success(), "{text}: {output:?}");
+    };
+
+    let written = folder.join("shell environment");
+    shell(&the_command_that_writes_its_environment_to(&written));
+    assert_eq!(
+        std::fs::read_to_string(&written).expect("the command wrote its environment"),
+        "/home with a space\n/usr/bin:/bin\n"
+    );
+
+    let record = folder.join("startup read.log");
+    let startup = folder.join("startup file");
+    std::fs::write(
+        &startup,
+        the_startup_file_that_records_into(".profile", &record),
+    )
+    .expect("a startup file");
+    shell(&format!(". {}", kr_worker::testing::shell_quoted(&startup)));
+    assert_eq!(
+        std::fs::read_to_string(&record).expect("the startup file recorded its read"),
+        ".profile /home with a space\n"
+    );
+}
+
 /// A suite's command runs in a shell that the worker starts with `-c`: not as a login shell and not
 /// as an interactive one, so it reads no startup file. What it shows is that the environment the
 /// daemon gives a session reaches the command: its home is one the case made inside its own tree,
@@ -7822,10 +7881,7 @@ async fn a_suites_shell_has_a_home_inside_the_cases_own_tree() {
     let temp = teardown::Tree::create();
     let root = temp.root().to_path_buf();
     let written = root.join("shell-environment");
-    let command = format!(
-        "printf '%s\\n%s\\n' \"$HOME\" \"$PATH\" > '{}'",
-        written.display()
-    );
+    let command = the_command_that_writes_its_environment_to(&written);
     let host = working_host_with_suites_in(
         temp,
         &[("environment", command.as_str(), &[])],
@@ -7900,11 +7956,8 @@ async fn a_login_shell_of_a_workflows_session_reads_the_startup_files_of_the_cas
     for name in STARTUP_RECORDERS {
         let file = home.join(name);
         std::fs::create_dir_all(file.parent().expect("a folder")).expect("a folder in the tree");
-        std::fs::write(
-            &file,
-            format!("echo \"{name} $HOME\" >> '{}'\n", record.display()),
-        )
-        .expect("a recorder in the tree");
+        std::fs::write(&file, the_startup_file_that_records_into(name, &record))
+            .expect("a recorder in the tree");
     }
     let mut control = client(&host).await;
     host.issue(grant_id(190), &[ActionRight::SessionCreate]);
