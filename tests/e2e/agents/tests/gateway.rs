@@ -89,7 +89,6 @@
 #![cfg(unix)]
 
 use std::io::Read as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -278,6 +277,9 @@ struct Real {
     /// The agent's configuration files as the harness wrote them, by their place below the run's
     /// directory, each recorded with its stamp and digest when it was written.
     configured: std::sync::Mutex<Vec<PathBuf>>,
+    /// The session's variables as they stood when the configuration was written, before the
+    /// agent's first start: what every later read of them returns.
+    prepared: std::sync::Mutex<Option<Vec<(String, String)>>>,
 }
 
 impl Route {
@@ -331,6 +333,7 @@ impl Route {
             person,
             placed: std::sync::OnceLock::new(),
             configured: std::sync::Mutex::new(Vec::new()),
+            prepared: std::sync::Mutex::new(None),
         }))
     }
 }
@@ -371,7 +374,14 @@ impl Real {
     /// the ones it sets itself. What the session's shell really holds of it is read at its prompt
     /// before the first typing ([`Person::reads_the_environment`]), a moment before the agent reads
     /// it, and nothing later.
-    fn variables(&self, host: &Host<'_>, shell: &shells::ManagedShell) -> Vec<(String, String)> {
+    ///
+    /// This is the one write of the configuration files: it runs once, before the agent's first
+    /// start, and keeps the list it returns ([`Real::variables`]).
+    fn prepare_variables(
+        &self,
+        host: &Host<'_>,
+        shell: &shells::ManagedShell,
+    ) -> Vec<(String, String)> {
         let mut variables = session_variables(host, shell, &self.build.environment, closed_port());
         for name in ["USER", "LOGNAME"] {
             if let Ok(value) = std::env::var(name) {
@@ -422,7 +432,25 @@ impl Real {
         variables.retain(|(existing, _)| existing != &config.variable);
         variables.push((config.variable.clone(), directory.display().to_string()));
         let _ = self.build.without_provider_keys(&mut variables);
+        let mut prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            prepared.is_none(),
+            "the configuration is written once, before the agent's first start"
+        );
+        *prepared = Some(variables.clone());
         variables
+    }
+
+    /// The list [`Real::prepare_variables`] returned, with nothing written.
+    fn variables(&self) -> Vec<(String, String)> {
+        self.prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the configuration was prepared before the agent's first start")
     }
 
     /// Fails the case when the agent would not have its updates and installs switched off: the
@@ -915,8 +943,9 @@ impl Context {
         )
     }
 
-    /// The environment every `kr` the case runs is given.
-    fn variables(&self, host: &Host<'_>) -> Vec<(String, String)> {
+    /// The environment every `kr` the case runs before the agent's first start is given, and the
+    /// one write of the agent's configuration files (real route).
+    fn prepare_variables(&self, host: &Host<'_>) -> Vec<(String, String)> {
         match &self.route {
             Route::StandIn => {
                 let mut variables = host.variables();
@@ -932,7 +961,16 @@ impl Context {
                 ));
                 variables
             }
-            Route::Real(real) => real.variables(host, &self.shell),
+            Route::Real(real) => real.prepare_variables(host, &self.shell),
+        }
+    }
+
+    /// The same environment as [`Context::prepare_variables`] returned, with nothing written: the
+    /// stand-in route's list is computed again, a real route's is the one kept.
+    fn variables(&self, host: &Host<'_>) -> Vec<(String, String)> {
+        match &self.route {
+            Route::StandIn => self.prepare_variables(host),
+            Route::Real(real) => real.variables(),
         }
     }
 
@@ -1309,9 +1347,18 @@ struct Person {
 impl Person {
     /// Enters a managed shell with `kr new` on a terminal of its own, and waits for its prompt. The
     /// session is created with the harness's variables and `given`, the case's own.
-    fn enters(ctx: &Context, host: &Host<'_>, given: &[(String, String)]) -> Self {
+    fn enters(
+        ctx: &Context,
+        host: &Host<'_>,
+        given: &[(String, String)],
+        known: &[SessionId],
+    ) -> Self {
         let home = ctx.run.home();
-        let mut variables = ctx.variables(host);
+        let mut variables = if known.is_empty() {
+            ctx.prepare_variables(host)
+        } else {
+            ctx.variables(host)
+        };
         variables.extend(given.iter().cloned());
         let expected = ctx.expects(host, &variables);
         std::fs::write(home.join(".zshrc"), ZSHRC).expect("writes the startup file");
@@ -1352,12 +1399,25 @@ impl Person {
         let _ =
             window.wait_for_screen(PROMPT.trim_end(), "the managed shell reads at the terminal");
         let sessions = host.live_sessions();
-        assert_eq!(sessions.len(), 1, "one live session: {sessions:?}");
-        let session_id: SessionId = sessions[0]["session_id"]
-            .as_str()
-            .expect("a session identifier")
-            .parse()
-            .expect("a session identifier");
+        assert_eq!(
+            sessions.len(),
+            known.len() + 1,
+            "one live session more than the {} known: {sessions:?}",
+            known.len()
+        );
+        let added: Vec<SessionId> = sessions
+            .iter()
+            .map(|session| {
+                session["session_id"]
+                    .as_str()
+                    .expect("a session identifier")
+                    .parse()
+                    .expect("a session identifier")
+            })
+            .filter(|id| !known.contains(id))
+            .collect();
+        assert_eq!(added.len(), 1, "one session the entry added: {sessions:?}");
+        let session_id = added[0];
         Self {
             window,
             session_id,
@@ -1849,31 +1909,41 @@ fn answered_since(before: &[String], after: &[String], sum: &str) -> bool {
         .any(|row| shows_sum(row, sum))
 }
 
-/// A named pipe in the run's own directory: a command that writes to it waits there until the case
-/// reads, so the case holds a turn open for as long as it needs, and reads what the command wrote.
-struct Fifo(PathBuf);
+/// A named pipe in the run's working directory: a command that writes to it waits there until the
+/// case reads, so the case holds a turn open for as long as it needs, and reads what the command
+/// wrote. It is made before the agent first starts, through the working directory's held handle
+/// (the harness writes nothing through a path of the run after that), and its reader is opened
+/// through the same handle with no link followed at its name, on the object that was made.
+struct Fifo {
+    name: String,
+    made: (u64, u64),
+}
 
 impl Fifo {
-    /// Makes the pipe at `path`.
-    fn made_at(path: PathBuf) -> Self {
-        let made = std::process::Command::new("/usr/bin/mkfifo")
-            .arg(&path)
-            .status()
-            .expect("mkfifo starts");
-        assert!(made.success(), "mkfifo {} exited {made}", path.display());
-        Self(path)
+    /// Makes the pipe `name` in the working directory.
+    fn made_in(ctx: &Context, name: &str) -> Self {
+        let made = ctx
+            .work
+            .as_ref()
+            .expect("the working directory was recorded")
+            .make_fifo(ctx.run.root(), ctx.run.pin(), name)
+            .unwrap_or_else(|why| panic!("the case's pipe: {why}"));
+        Self {
+            name: name.to_owned(),
+            made,
+        }
     }
 
     /// Opens the pipe for reading without waiting for a writer, which lets a command blocked on
     /// opening it for writing go on. The reader stays open, so that a second run of the command,
     /// which would block on opening the pipe, finds it open and writes: what it wrote is read too.
-    fn reader(&self) -> FifoReader {
-        let flags = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).expect("a flag");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(flags)
-            .open(&self.0)
-            .unwrap_or_else(|error| panic!("the case's pipe cannot be opened: {error}"));
+    fn reader(&self, ctx: &Context) -> FifoReader {
+        let file = ctx
+            .work
+            .as_ref()
+            .expect("the working directory was recorded")
+            .open_fifo_for_reading(ctx.run.root(), ctx.run.pin(), &self.name, self.made)
+            .unwrap_or_else(|why| panic!("the case's pipe cannot be opened: {why}"));
         FifoReader {
             file,
             text: Vec::new(),
@@ -1919,9 +1989,20 @@ fn command(tools: &Path) -> String {
     )
 }
 
-/// The file that lets the stand-in's terminal go on.
+/// The file that lets the stand-in's terminal go on, in the working directory.
 fn release_of(ctx: &Context) -> PathBuf {
-    ctx.run.root().join("release")
+    ctx.run.work().join("release")
+}
+
+/// Lets the stand-in's terminal go on: the file [`release_of`] names is created through the working
+/// directory's held handle, by exclusive creation with no link followed at its name, so a file or a
+/// link the agent left there refuses the release and nothing is written through it.
+fn releases(ctx: &Context) {
+    ctx.work
+        .as_ref()
+        .expect("the working directory was recorded")
+        .create_new(ctx.run.root(), ctx.run.pin(), "release", b"go")
+        .unwrap_or_else(|why| panic!("the release: {why}"));
 }
 
 /// The file the stand-in's server notes the frames it received in.
@@ -2070,7 +2151,7 @@ impl<'a> Session<'a> {
     fn open_with(ctx: &'a Context, variants: &str, more: &[(&str, String)]) -> Self {
         let host = ctx.host();
         let (device, paired, remote) = ctx.pair(&host);
-        let person = Person::enters(ctx, &host, &ctx.stand_in_variables(variants, more));
+        let person = Person::enters(ctx, &host, &ctx.stand_in_variables(variants, more), &[]);
         Self {
             ctx,
             host,
@@ -2680,6 +2761,9 @@ fn gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt() {
         TEST,
         "answer-when-released,keep-reading,ping-when-released,stay",
         |ctx, session| {
+            // The pipe is made before the agent first starts: nothing is written through a path of
+            // the run after that.
+            let pipe = matches!(ctx.route, Route::Real(_)).then(|| Fifo::made_in(ctx, "f"));
             let instance = session.starts_the_agent(&[], None, &[]);
             match &ctx.route {
                 Route::StandIn => {
@@ -2716,7 +2800,7 @@ fn gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt() {
                     // The command writes to a pipe, so it waits to be read: the turn stays open
                     // until the case reads, whatever the terminal does with its prompt meanwhile.
                     let mark = mark();
-                    let pipe = Fifo::made_at(ctx.run.work().join("f"));
+                    let pipe = pipe.expect("the real route made its pipe before the start");
                     let command = format!("echo {mark} > {}", ctx.run.work().join("f").display());
                     assert!(
                         real.account
@@ -2780,7 +2864,7 @@ fn gateway_a_device_answers_an_approval_and_the_terminal_closes_its_prompt() {
                     // The reader is opened now, and stays open until the turn has ended: a run of
                     // the command is a line in the pipe, and a second run would find the pipe open
                     // and write its line too.
-                    let mut reader = pipe.reader();
+                    let mut reader = pipe.reader(ctx);
                     let started = Instant::now();
                     loop {
                         reader.poll();
@@ -2832,7 +2916,7 @@ fn gateway_the_terminal_shows_a_turn_the_host_started() {
                         session.binding_until(instance, "the stream names the turn", |binding| {
                             names(binding, "thread-1", Some("turn-1"))
                         });
-                    std::fs::write(release_of(ctx), b"go").expect("the release");
+                    releases(ctx);
                     let idle = session.binding_until(instance, "the turn ends", |binding| {
                         names(binding, "thread-1", None)
                     });
@@ -3063,7 +3147,7 @@ fn gateway_the_binding_changes_its_thread_only_where_the_terminal_starts_resumes
                         session.binding_until(instance, "the stream names the thread", |binding| {
                             names(binding, "thread-1", Some("turn-1"))
                         });
-                    std::fs::write(release_of(ctx), b"go").expect("the release");
+                    releases(ctx);
                     let idle = session.binding_until(instance, "the turn ends", |binding| {
                         names(binding, "thread-1", None)
                     });
@@ -3226,7 +3310,7 @@ fn gateway_a_whole_session_names_no_method_the_table_does_not_list() {
                         session.binding_until(instance, "the stream names the turn", |binding| {
                             names(binding, "thread-1", Some("turn-1"))
                         });
-                    std::fs::write(release_of(ctx), b"go").expect("the release");
+                    releases(ctx);
                     session.binding_until(instance, "the turn ends", |binding| {
                         names(binding, "thread-1", None)
                     })
