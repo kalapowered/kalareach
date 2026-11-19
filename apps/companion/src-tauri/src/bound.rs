@@ -205,6 +205,10 @@ impl Drop for BoundTransport {
 }
 
 impl ControlTransport for BoundTransport {
+    fn host_states_placement_reading(&self) -> bool {
+        self.binding.inner.host_states_placement_reading()
+    }
+
     fn connection_id(&self) -> ConnectionId {
         self.binding.inner.connection_id()
     }
@@ -320,11 +324,16 @@ impl StreamOpener for BoundOpener {
 mod tests {
     use super::*;
 
-    /// A connection that only knows when it is closed.
+    /// A connection that only knows when it is closed, and whether its host stated the placement
+    /// reading.
     #[derive(Debug, Default)]
-    struct Closing(AtomicBool);
+    struct Closing(AtomicBool, bool);
 
     impl ControlTransport for Closing {
+        fn host_states_placement_reading(&self) -> bool {
+            self.1
+        }
+
         fn connection_id(&self) -> ConnectionId {
             unreachable!("the connection is only asked whether it ended")
         }
@@ -393,6 +402,26 @@ mod tests {
             "the account left, and the connection is not ended"
         );
         assert!(inner.0.load(Ordering::SeqCst), "the connection was closed");
+    }
+
+    /// A bound connection says what the transport under it says of its host's hello: a wrapper that
+    /// dropped the flag would show every statement under the publisher's caption.
+    #[test]
+    fn a_bound_connection_says_what_its_transport_says_of_the_hosts_reading() {
+        for says in [true, false] {
+            let (_account, status) = watch::channel(signed_in("first"));
+            let inner = Arc::new(Closing(AtomicBool::new(false), says));
+            let bound = BoundTransport {
+                binding: Binding::new(
+                    inner as Arc<dyn ControlTransport>,
+                    "first".to_owned(),
+                    status,
+                    Arc::new(|| Ok(())),
+                ),
+                over: Arc::new(Notify::new()),
+            };
+            assert_eq!(bound.host_states_placement_reading(), says);
+        }
     }
 
     /// Opens of a data stream, counted: the inner connection is reached only when the opener lets
