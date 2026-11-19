@@ -80,22 +80,6 @@ impl Daemon {
         Self(Some(child))
     }
 
-    /// Waits until the daemon's process ends by itself, and says how. The wait ends at the
-    /// watchdog, which fails the case.
-    async fn ended(&mut self) -> std::process::ExitStatus {
-        let child = self.0.as_mut().expect("a running daemon");
-        tokio::time::timeout(Duration::from_secs(120), async {
-            loop {
-                if let Some(status) = child.try_wait().expect("the daemon's state") {
-                    return status;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("the daemon's process ended")
-    }
-
     /// Ends the daemon and waits for it.
     fn stop(&mut self) {
         if let Some(mut child) = self.0.take() {
@@ -206,22 +190,6 @@ async fn unused_origin() -> (String, String) {
         format!("https://127.0.0.1:{port}"),
         format!("127.0.0.1:{port}"),
     )
-}
-
-/// Polls the diagnostics until the network check's detail holds `phrase`, and returns it. The wait
-/// ends at the watchdog, which fails the case.
-async fn until_the_detail_says(host: &kr_ipc::testing::TempHost, phrase: &str) -> String {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        loop {
-            let said = network_detail(host).await;
-            if said.contains(phrase) {
-                return said;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("the diagnostics never said {phrase:?}"))
 }
 
 /// Keeps `user:PASSWORD` as the login this host holds for `proxy`, in the file store the daemon
@@ -631,7 +599,17 @@ async fn a_request_the_proxy_refuses_without_a_word_is_found_by_the_recheck_at_i
             origin.as_str(),
         )],
     );
-    let said = until_the_detail_says(&host, "the proxy refused the login this host holds").await;
+    let said = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let said = network_detail(&host).await;
+            if said.contains("the proxy refused the login this host holds") {
+                return said;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the diagnostics said that the proxy refused the login");
     assert!(
         said.contains("this host starts no new request through the proxy"),
         "{said}"
@@ -690,7 +668,17 @@ async fn a_wrong_login_is_sent_once_although_the_release_matrix_is_configured() 
             origin.as_str(),
         )],
     );
-    let said = until_the_detail_says(&host, "the proxy refused the login this host holds").await;
+    let said = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let said = network_detail(&host).await;
+            if said.contains("the proxy refused the login this host holds") {
+                return said;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the diagnostics said that the proxy refused the login");
     for _ in 0..2 {
         network_detail(&host).await;
     }
@@ -720,7 +708,17 @@ async fn a_trust_anchor_that_cannot_be_read_ends_the_start_with_its_own_error_an
     store_login(&host, &proxy, "user", PASSWORD);
 
     let mut daemon = Daemon::start(&host);
-    let status = daemon.ended().await;
+    let status = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let child = daemon.0.as_mut().expect("a running daemon");
+            if let Some(status) = child.try_wait().expect("the daemon's state") {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the daemon's process ended with the anchors' error");
     assert!(!status.success(), "the start ended in failure: {status}");
     let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
     assert!(

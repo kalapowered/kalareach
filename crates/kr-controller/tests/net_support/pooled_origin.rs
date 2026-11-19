@@ -26,6 +26,16 @@ pub struct PooledOrigin {
 impl PooledOrigin {
     /// Starts the origin behind `acceptor`.
     pub async fn start(acceptor: TlsAcceptor) -> Self {
+        Self::answering(
+            acceptor,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await
+    }
+
+    /// Starts the origin behind `acceptor`, answering every request with `answer`, whole.
+    pub async fn answering(acceptor: TlsAcceptor, answer: Vec<u8>) -> Self {
+        let answer = Arc::new(answer);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("a port");
@@ -36,6 +46,7 @@ impl PooledOrigin {
             while let Ok((stream, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
                 let counted = Arc::clone(&counted);
+                let answer = Arc::clone(&answer);
                 tokio::spawn(async move {
                     let Ok(mut stream) = acceptor.accept(stream).await else {
                         return;
@@ -50,11 +61,7 @@ impl PooledOrigin {
                             }
                         }
                         counted.fetch_add(1, Ordering::SeqCst);
-                        if stream
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                            .await
-                            .is_err()
-                        {
+                        if stream.write_all(&answer).await.is_err() {
                             return;
                         }
                     }

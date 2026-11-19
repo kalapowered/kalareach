@@ -4672,6 +4672,7 @@ dependencies = [
  "tokio-websockets",
  "toml_edit 0.25.15+spec-1.1.0",
  "tough",
+ "tracing",
  "url",
 ]
 

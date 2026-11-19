@@ -1103,3 +1103,126 @@ async fn the_request_goes_through_the_proxy_the_document_names_and_never_round_i
         "the request did not go round the proxy"
     );
 }
+
+/// The sentence that says a login goes in clear to a proxy whose address is `http`.
+const IN_CLEAR: &str = "the login is sent in clear to the proxy";
+
+/// The words of a command that needs the daemon when none runs.
+const NO_DAEMON: &str = "no KalaReach host is running for this environment";
+
+/// A login file in the tree: one line of a user name, a colon and a password.
+fn login_file(tree: &Tree) -> PathBuf {
+    let path = tree.temp.root().join("login");
+    std::fs::write(&path, b"user:p4ss-planted-2e8a\n").expect("a login file");
+    path
+}
+
+/// KR-REQ-10.02: `kr host network --proxy-login` reads the document and the file before it asks the
+/// daemon for anything. A document that names no proxy ends the command naming `network.proxy_url`;
+/// a document that names a proxy, with no daemon running, ends it with the daemon's own words; and
+/// the clear-text sentence is said for an `http` proxy, not for an `https` one, and not in JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stored_login_names_the_proxy_the_document_holds_and_says_when_it_goes_in_clear() {
+    let run = |document: Value, json: bool| {
+        let tree = Tree::create();
+        tree.write_document(&document);
+        let file = login_file(&tree);
+        let file = file.to_string_lossy().into_owned();
+        let arguments = [
+            "host",
+            "network",
+            "--proxy-login",
+            "--proxy-credential-file",
+            &file,
+        ];
+        let output = if json {
+            tree.kr_json(&arguments).0
+        } else {
+            tree.kr(&arguments)
+        };
+        assert!(!output.status.success(), "{}", said(&output));
+        let said = said(&output);
+        assert!(
+            !said.contains("p4ss-planted-2e8a"),
+            "the command printed the login: {said}"
+        );
+        said
+    };
+    let naming =
+        |proxy: &str| json!({ "version": 3, "revision": 1, "network": { "proxy_url": proxy } });
+
+    let none = run(json!({ "version": 3, "revision": 1 }), false);
+    assert!(
+        none.contains("name the proxy in network.proxy_url first"),
+        "{none}"
+    );
+    assert!(
+        !none.contains(NO_DAEMON),
+        "the daemon was not asked: {none}"
+    );
+
+    let clear = run(naming("http://proxy.example.com:3128"), false);
+    assert!(clear.contains(IN_CLEAR), "{clear}");
+    assert!(clear.contains(NO_DAEMON), "{clear}");
+    assert!(
+        clear.find(IN_CLEAR) < clear.find(NO_DAEMON),
+        "the clear-text sentence comes before the daemon is asked: {clear}"
+    );
+
+    let secure = run(naming("https://proxy.example.com:3128"), false);
+    assert!(!secure.contains(IN_CLEAR), "{secure}");
+    assert!(secure.contains(NO_DAEMON), "{secure}");
+
+    let machine = run(naming("http://proxy.example.com:3128"), true);
+    assert!(
+        !machine.contains(IN_CLEAR),
+        "a machine reader is given no sentence: {machine}"
+    );
+}
+
+/// KR-REQ-10.02: a join that is given a login file says that the login goes in clear to an `http`
+/// proxy before it sends anything, names `network.proxy_url` when the document names none, and says
+/// nothing of the kind for an `https` proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_join_with_a_login_file_says_when_it_goes_in_clear_before_it_sends() {
+    let service = format!("http://127.0.0.1:{}", closed_port());
+    let run = |document: Value| {
+        let tree = Tree::create();
+        tree.write_document(&document);
+        let file = login_file(&tree);
+        let file = file.to_string_lossy().into_owned();
+        let output = tree.kr(&[
+            "host",
+            "network",
+            "--join",
+            "--service",
+            &service,
+            "--unsigned",
+            "--proxy-credential-file",
+            &file,
+        ]);
+        assert!(!output.status.success(), "{}", said(&output));
+        let said = said(&output);
+        assert!(
+            !said.contains("p4ss-planted-2e8a"),
+            "the command printed the login: {said}"
+        );
+        said
+    };
+    let naming =
+        |proxy: &str| json!({ "version": 3, "revision": 1, "network": { "proxy_url": proxy } });
+
+    let none = run(json!({ "version": 3, "revision": 1 }));
+    assert!(
+        none.contains("name the proxy in network.proxy_url first"),
+        "{none}"
+    );
+    assert!(
+        run(naming("http://proxy.example.com:3128")).contains(IN_CLEAR),
+        "an http proxy is told the login goes in clear"
+    );
+    assert!(
+        !run(naming("https://proxy.example.com:3128")).contains(IN_CLEAR),
+        "an https proxy is not"
+    );
+}

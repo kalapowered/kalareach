@@ -435,6 +435,9 @@ impl Drop for StopOnDrop {
 #[path = "../../kr-client/tests/support/connect_proxy.rs"]
 mod connect_proxy;
 #[cfg(test)]
+#[path = "../../kr-controller/tests/net_support/pooled_origin.rs"]
+mod pooled_origin;
+#[cfg(test)]
 #[path = "../tests/support/tls.rs"]
 #[allow(dead_code)]
 mod tls;
@@ -744,6 +747,118 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 port: 9
             })
+        );
+    }
+
+    /// A Pkarr publication that a server redirects from an address the proxy tunnels to an address
+    /// it refuses in words no library reads (`HTTP/1.0 407`) fails at the second address, and the
+    /// address queued for the proxy's re-check is the second, not the first. The first hop is
+    /// written the login and the second is written the same login by the same writer.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pkarr_redirect_to_a_failing_address_is_rechecked_at_that_address() {
+        let authority = tls::Authority::new("a pkarr origin authority");
+        let proxy = ConnectProxy::authenticating_in_http10("user", "password", "Basic").await;
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let second_port = second.local_addr().expect("an address").port();
+        drop(second);
+        proxy.refuse_target(&format!("127.0.0.1:{second_port}"));
+        let first = super::pooled_origin::PooledOrigin::answering(
+            tokio_rustls::TlsAcceptor::from(authority.server_config("127.0.0.1")),
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: https://127.0.0.1:{second_port}/key\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes(),
+        )
+        .await;
+        let login = login("password");
+        let url = proxy
+            .url
+            .parse::<ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let builder = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .tls_backend_preconfigured(
+                (*tls::client_config(std::slice::from_ref(&authority.der))).clone(),
+            );
+        let client = proxy::proxied(builder, &url)
+            .expect("a proxy the library takes")
+            .build()
+            .expect("a client");
+
+        let request = client
+            .put(format!("https://127.0.0.1:{}/key", first.port))
+            .build()
+            .expect("a request");
+        let failed = send(&client, Some(&url), request)
+            .await
+            .expect_err("the second address is refused");
+        assert!(
+            !matches!(failed, PkarrError::ProxyLogin(_)),
+            "the library has no word for the refusal: {failed}"
+        );
+        assert_eq!(first.requests(), 1, "the first address answered once");
+        assert!(
+            login.stopped().is_none(),
+            "no verdict was set by the refusal"
+        );
+        let suspected = login
+            .suspicion()
+            .take()
+            .expect("the failed request queued an address");
+        assert_eq!(
+            suspected.port, second_port,
+            "the address queued is the one that failed, not the one that answered"
+        );
+    }
+
+    /// A Pkarr client writes the login to an `https` proxy only after the proxy's certificate has
+    /// been verified: a proxy whose certificate is not trusted reads no byte of a request, and one
+    /// that is trusted is written the login once.
+    ///
+    /// This is a guard: the library's own order of writes holds it, and the proxy's received bytes
+    /// are the evidence.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pkarr_client_writes_the_login_to_an_https_proxy_only_after_tls() {
+        let authority = tls::Authority::new("a proxy authority");
+        let acceptor = tokio_rustls::TlsAcceptor::from(authority.server_config("127.0.0.1"));
+        let proxy =
+            ConnectProxy::authenticating_over_tls(acceptor, "user", "password", "Basic").await;
+        let login = login("password");
+        let url = proxy
+            .url
+            .parse::<ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let client_trusting = |roots: &[Vec<u8>]| {
+            let builder = reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .tls_backend_preconfigured((*tls::client_config(roots)).clone());
+            proxy::proxied(builder, &url)
+                .expect("a proxy the library takes")
+                .build()
+                .expect("a client")
+        };
+
+        let untrusting = client_trusting(&[]);
+        get(&untrusting, &url, "https://127.0.0.1:9/key")
+            .await
+            .expect_err("a proxy that is not trusted");
+        assert_eq!(proxy.bytes_read(), 0, "no byte reached an untrusted proxy");
+        assert!(proxy.logins().is_empty());
+
+        let trusting = client_trusting(std::slice::from_ref(&authority.der));
+        let _ = get(&trusting, &url, "https://127.0.0.1:9/key").await;
+        assert_eq!(
+            proxy.logins(),
+            vec![Login::Right],
+            "the trusted proxy was written the login once"
         );
     }
 }

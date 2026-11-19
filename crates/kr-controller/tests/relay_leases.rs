@@ -5591,3 +5591,35 @@ async fn a_device_that_is_refused_free_capacity_is_handed_its_own_wait() {
     assert!((1..=90).contains(&wait), "{wait}");
     assert_eq!(told_paths(&failure), STAND_IN_PATHS);
 }
+
+/// KR-REQ-10.02: a host whose endpoint is configured with a proxy that holds a login, and a front
+/// for it, takes a pairing as any other host does: a device's direct dial is answered while the
+/// login stands. After the proxy's refusal the host's endpoint is closed, by design, and nothing
+/// answers a dial, so a pairing is a case of the time before the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_with_a_login_front_pairs_a_device_while_the_login_stands() {
+    let proxy = connect_proxy::ConnectProxy::tunnelling().await;
+    let login = kr_transport::proxy::ProxyCredential::new(
+        kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+        kr_crypto::secret::SecretVec::new(b"password".to_vec()),
+    )
+    .expect("a login");
+    let through = proxy
+        .url
+        .parse::<kr_transport::config::ProxyUrl>()
+        .expect("a proxy address")
+        .with_login(login);
+    let tls = kr_controller::service::net::proxy_login::proxy_tls(&[]).expect("verification");
+    let mut config = net_support::loopback();
+    config.login_front = Some(kr_transport::front::FrontOpener(Arc::new(
+        kr_client::tunnel::ProxyTunnels::new(through.clone(), tls),
+    )));
+    config.proxy_url = Some(through);
+    let rig = Rig::start_over(true, 8 * 1024 * 1024, config, None).await;
+    // The pairing ends only when the device's dial is answered and the grant is committed.
+    let (_device, _record) = rig.pairs().await;
+    assert!(
+        !rig.endpoint().is_closed(),
+        "the host's endpoint is open while the login stands"
+    );
+}

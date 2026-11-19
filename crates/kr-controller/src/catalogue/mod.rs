@@ -3880,4 +3880,122 @@ mod proxy_login_gate {
         );
         assert_eq!(proxy.logins(), vec![Login::Right], "no further connection");
     }
+
+    /// A client of the catalogue's kind that trusts `authority`, through the proxy that holds the
+    /// login, and the egress over the same proxy.
+    fn standing(
+        proxy: &ConnectProxy,
+        authority: &super::tls::Authority,
+    ) -> (ProxyCredential, reqwest::Client, LoginEgress) {
+        let login = ProxyCredential::new(
+            SecretVec::new(b"user".to_vec()),
+            SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login");
+        let url = proxy
+            .url
+            .parse::<kr_transport::config::ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let client = kr_transport::proxy::proxied(
+            reqwest::Client::builder().tls_backend_preconfigured(
+                (*super::tls::client_config(std::slice::from_ref(&authority.der))).clone(),
+            ),
+            &url,
+        )
+        .expect("a proxy the library takes")
+        .build()
+        .expect("a client");
+        (login, client, LoginEgress { proxy: url })
+    }
+
+    /// KR-REQ-10.02: the catalogue follows a redirect through the proxy for ten hops and no more,
+    /// and a hop to a plain `http` address is refused at the hop with the sentence, so the origin
+    /// reads one request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_catalogues_egress_follows_ten_hops_and_refuses_a_hop_to_plain_http() {
+        let authority = super::tls::Authority::new("a repository authority");
+        let acceptor = tokio_rustls::TlsAcceptor::from(authority.server_config("127.0.0.1"));
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let (_login, client, egress) = standing(&proxy, &authority);
+
+        let to_http = super::pooled_origin::PooledOrigin::answering(
+            acceptor.clone(),
+            b"HTTP/1.1 302 Found\r\nLocation: http://repo.example/index\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+        )
+        .await;
+        let request = client
+            .get(format!("https://127.0.0.1:{}/index", to_http.port))
+            .build()
+            .expect("a request");
+        let Err(EgressError::Refused(said)) = egress.execute(&client, request).await else {
+            panic!("a hop to plain http is refused");
+        };
+        assert_eq!(said, ProxyLoginKind::ClearTextTarget.clause());
+        assert_eq!(to_http.requests(), 1, "the first hop was answered, no more");
+
+        let endless = super::pooled_origin::PooledOrigin::answering(
+            acceptor,
+            b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        )
+        .await;
+        let request = client
+            .get(format!("https://127.0.0.1:{}/index", endless.port))
+            .build()
+            .expect("a request");
+        assert!(
+            egress.execute(&client, request).await.is_err(),
+            "a redirect with no end is refused"
+        );
+        assert_eq!(
+            endless.requests(),
+            11,
+            "the first request and ten followed hops, and no eleventh"
+        );
+    }
+
+    /// KR-REQ-10.02: a redirect from an address the proxy tunnels to an address it refuses in
+    /// words no library reads is rechecked at the address that failed, the second, and not at the
+    /// first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_redirect_to_a_failing_target_is_rechecked_at_that_target() {
+        let authority = super::tls::Authority::new("a repository authority");
+        let proxy = ConnectProxy::authenticating_in_http10("user", "password", "Basic").await;
+        let (login, client, egress) = standing(&proxy, &authority);
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let second_port = second.local_addr().expect("an address").port();
+        drop(second);
+        proxy.refuse_target(&format!("127.0.0.1:{second_port}"));
+        let first = super::pooled_origin::PooledOrigin::answering(
+            tokio_rustls::TlsAcceptor::from(authority.server_config("127.0.0.1")),
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: https://127.0.0.1:{second_port}/index\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes(),
+        )
+        .await;
+        let request = client
+            .get(format!("https://127.0.0.1:{}/index", first.port))
+            .build()
+            .expect("a request");
+
+        assert!(
+            egress.execute(&client, request).await.is_err(),
+            "the second address is refused"
+        );
+        assert_eq!(first.requests(), 1, "the first address answered once");
+        let suspected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            login.suspicion().wait_take(),
+        )
+        .await
+        .expect("the failed request queued an address to check");
+        assert_eq!(
+            suspected.port, second_port,
+            "the address to check is the one that failed, not the one that answered"
+        );
+    }
 }
