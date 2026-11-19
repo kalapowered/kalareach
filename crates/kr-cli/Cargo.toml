@@ -21,7 +21,9 @@ path = "src/bin/kr-attach-guard.rs"
 # network, so it runs only where asked: `cargo test -p kr-cli --features upgrade-suite --test upgrade -- --nocapture`,
 # which also shows the release the cases inside the level chose, or that they had none, and on
 # Windows `--test upgrade_windows`. On macOS set KR_ALLOW_ACCOUNT_LAUNCHD=1 for the upgrade suite: it
-# starts a daemon and a session, which load a job into the account's own launchd.
+# starts a daemon and a session, which load a job into the account's own launchd. Without it on
+# macOS every case that builds the release before fails at `Previous::built`, by design: the suite
+# is a release check that must not pass with nothing tested.
 upgrade-suite = []
 
 # A `launchctl` command that changes the manager is refused when the run did not ask for the
