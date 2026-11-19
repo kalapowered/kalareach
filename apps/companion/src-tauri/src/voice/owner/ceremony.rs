@@ -66,17 +66,17 @@ pub(super) struct Sealing {
     pub(super) until: Instant,
 }
 
-/// What the model is told of a confirmation that was stopped, for `why`.
-fn dropped_words(why: Why) -> &'static str {
+/// The sentence the model is told of a confirmation that was stopped, for `why`.
+fn dropped_note(why: Why) -> VoiceNote {
     match why {
-        Why::LateFragment => VoiceNote::DelegationLate.words(),
-        Why::NotConfirmed => VoiceNote::DelegationNotConfirmed.words(),
-        Why::NoCeremony => VoiceNote::DelegationNoCeremony.words(),
-        Why::ChallengeMismatch => VoiceNote::DelegationChallengeMismatch.words(),
-        Why::ConfirmationExpired => VoiceNote::DelegationConfirmationExpired.words(),
-        Why::SessionNotNamed => VoiceNote::DelegationSessionNotNamed.words(),
-        why if why.taints() => VoiceNote::SpeechTainted.words(),
-        _ => VoiceNote::DelegationConfirmationDropped.words(),
+        Why::LateFragment => VoiceNote::DelegationLate,
+        Why::NotConfirmed => VoiceNote::DelegationNotConfirmed,
+        Why::NoCeremony => VoiceNote::DelegationNoCeremony,
+        Why::ChallengeMismatch => VoiceNote::DelegationChallengeMismatch,
+        Why::ConfirmationExpired => VoiceNote::DelegationConfirmationExpired,
+        Why::SessionNotNamed => VoiceNote::DelegationSessionNotNamed,
+        why if why.taints() => VoiceNote::SpeechTainted,
+        _ => VoiceNote::DelegationConfirmationDropped,
     }
 }
 
@@ -94,7 +94,7 @@ impl Owner {
             // not take the confirmation. The person is not asked a second time.
             self.unsettled.remove(id);
             self.set_row(id, "host_refused", Some("confirmation_not_taken"));
-            self.tell_delegation(id, VoiceNote::DelegationHostRefused.words().to_owned());
+            self.tell_delegation(id, VoiceNote::DelegationHostRefused);
             return;
         }
         if self.confirming.contains_key(id) {
@@ -151,7 +151,7 @@ impl Owner {
         let (shared, open) = (Arc::clone(&self.shared), Arc::new(AtomicBool::new(true)));
         let still_open = Arc::clone(&open);
         self.set_row(id, "confirmation_required", None);
-        self.tell_delegation(id, VoiceNote::DelegationConfirmation.words().to_owned());
+        self.tell_delegation(id, VoiceNote::DelegationConfirmation);
         self.confirming.insert(
             id.to_owned(),
             Confirming {
@@ -475,6 +475,6 @@ impl Owner {
     /// The delegation `id` was dropped before a signed request was sent, for `why`.
     fn cancel_row(&self, id: &str, why: Why) {
         self.set_row(id, "cancelled", Some(why.word()));
-        self.tell_delegation(id, dropped_words(why).to_owned());
+        self.tell_delegation(id, dropped_note(why));
     }
 }
