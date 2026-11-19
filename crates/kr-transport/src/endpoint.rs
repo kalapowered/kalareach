@@ -2298,4 +2298,80 @@ mod tests {
         );
         assert_eq!(closer.steps(), ["gate", "close", "front"]);
     }
+
+    /// KR-REQ-10.02: once the proxy stops taking the login, the guard closes the endpoint, and
+    /// nothing is sent after: with the real close held at the gate the endpoint is open but the
+    /// verdict already refuses every request at admission, and after the release the end is
+    /// complete and the front is gone.
+    #[tokio::test]
+    async fn a_login_the_proxy_stops_taking_closes_the_endpoint_and_nothing_is_sent_after() {
+        struct NoTunnels;
+        impl crate::front::TunnelOpener for NoTunnels {
+            fn open<'a>(
+                &'a self,
+                _host: &'a str,
+                _port: u16,
+            ) -> futures::future::BoxFuture<
+                'a,
+                std::result::Result<crate::front::Tunnel, crate::front::TunnelRefusal>,
+            > {
+                Box::pin(async { Err(crate::front::TunnelRefusal::Failed) })
+            }
+        }
+        let identity = TransportIdentityKeyPair::generate().expect("a transport identity");
+        let login = crate::proxy::ProxyCredential::new(
+            kr_crypto::secret::SecretVec::new(b"user".to_vec()),
+            kr_crypto::secret::SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login");
+        let proxy: crate::config::ProxyUrl = "https://proxy.example:3128".parse().expect("a proxy");
+        let proxy = proxy.with_login(login.clone());
+        let config = EndpointConfig {
+            relay_urls: vec!["https://relay.example./".parse().expect("a relay")],
+            proxy_url: Some(proxy.clone()),
+            login_front: Some(crate::front::FrontOpener(std::sync::Arc::new(NoTunnels))),
+            ..EndpointConfig::default()
+        };
+        let (endpoint, closer) = bind_network(&config, &identity)
+            .await
+            .expect("a network endpoint");
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let closer = closer.with_gate({
+            let (gate, entered) = (
+                std::sync::Arc::clone(&gate),
+                std::sync::Arc::clone(&entered),
+            );
+            Box::new(move || {
+                Box::pin(async move {
+                    entered.notify_one();
+                    gate.notified().await;
+                })
+            })
+        });
+        let address = closer.front_address().expect("a front");
+        let guard = guard_proxy(&closer, &login);
+        let target: url::Url = "https://pkarr.example/".parse().expect("an address");
+        assert!(crate::proxy::admit(Some(&proxy), &target).is_ok());
+
+        login.refuse(crate::proxy::StopKind::Refused);
+        entered.notified().await;
+        assert!(
+            !guard.proxy_closed() && !endpoint.is_closed(),
+            "the end is not complete while the close is held"
+        );
+        assert_eq!(
+            crate::proxy::admit(Some(&proxy), &target),
+            Err(crate::proxy::ProxyLoginKind::Refused),
+            "a request is refused at admission while the close is held"
+        );
+        gate.notify_one();
+        closer.close().await;
+        assert!(guard.proxy_closed() && endpoint.is_closed());
+        assert!(
+            tokio::net::TcpStream::connect(address).await.is_err(),
+            "the front is gone once the end is complete"
+        );
+        assert_eq!(closer.steps(), ["gate", "close", "front"]);
+    }
 }

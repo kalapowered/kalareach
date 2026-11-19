@@ -536,6 +536,73 @@ mod tests {
         assert_eq!(proxy.bytes_read(), 0);
     }
 
+    /// A `407` that the origin answers inside a tunnel that opened is the origin's own status: the
+    /// verdict on the login stays clear, and the next request is sent as before.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_407_from_the_origin_inside_a_tunnel_sets_no_verdict() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let authority = tls::Authority::new("a pkarr origin authority");
+        let acceptor = tokio_rustls::TlsAcceptor::from(authority.server_config("127.0.0.1"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a port");
+        let port = listener.local_addr().expect("an address").port();
+        let origin = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let mut head = Vec::new();
+                    let mut chunk = [0_u8; 512];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        match stream.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => head.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"origin\"\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        let _stop = StopOnDrop(origin);
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let login = login("password");
+        let url = proxy
+            .url
+            .parse::<ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let builder = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .tls_backend_preconfigured((*tls::client_config(&[authority.der.clone()])).clone());
+        let client = proxy::proxied(builder, &url)
+            .expect("a proxy the library takes")
+            .build()
+            .expect("a client");
+        let address = format!("https://127.0.0.1:{port}/key");
+        for _ in 0..2 {
+            let answered = get(&client, &url, &address)
+                .await
+                .expect("the origin's own answer");
+            assert_eq!(answered.status().as_u16(), 407);
+            assert_eq!(login.stopped(), None, "the origin's 407 is not the proxy's");
+        }
+        assert!(
+            proxy.logins().iter().all(|login| *login == Login::Right),
+            "{:?}",
+            proxy.logins()
+        );
+    }
+
     /// A refusal the library cannot name, an `HTTP/1.0 407`, is a failed request that queues the
     /// target the failed hop named for the one re-check.
     ///
