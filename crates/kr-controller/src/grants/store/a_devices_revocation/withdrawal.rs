@@ -54,7 +54,12 @@ fn a_device_revocation_beside_a_damaged_row_withdraws_the_devices_grants_and_wha
         held(3, None, OTHER_DEVICE),
     ]);
     mark_unreadable(&store, 3);
-    let revocation = owner_revokes(&store, DEVICE);
+    let revocation = match store.revoke_device(device_of(DEVICE), 5_000, || Ok(()), None) {
+        Ok(revocation) => revocation,
+        Err(error) => {
+            panic!("the owner's revocation is not refused for a row it cannot read: {error}")
+        }
+    };
     assert!(!live(&store, 1) && !live(&store, 2));
     assert!(
         !live(&store, 3),
@@ -178,6 +183,117 @@ fn a_live_grant_below_a_revoked_unplaced_row_is_withdrawn() {
         by_parent,
         Some(id_of(1).get().as_bytes().to_vec()),
         "the walk starts at the revoked top, which is withdrawn under the parent its record names"
+    );
+}
+
+/// A live grant that no row places stands above a revoked middle row, and a live grant below that:
+/// the walk goes through the revoked row as a child, so the live grant below it is withdrawn too.
+#[test]
+fn a_live_unplaced_top_above_a_revoked_middle_row_is_withdrawn_with_what_hangs_below() {
+    let store = store_written_by_hand(&[
+        held(10, Some(9), OTHER_DEVICE),
+        held(11, Some(10), OTHER_DEVICE),
+        held(12, Some(11), OTHER_DEVICE),
+    ]);
+    run(
+        &store,
+        &format!(
+            "UPDATE grants SET revoked_at_ms = 9 WHERE grant_id = {};",
+            key(11)
+        ),
+    );
+    let scan = store.in_transaction(scan_all).expect("the scan reads");
+    let planned = match plan_withdrawal(&scan, Roots::None, Scope::Host) {
+        Ok(plan) => plan,
+        Err(error) => panic!("the plan is made: {error}"),
+    };
+    assert_eq!(
+        planned.subtrees.len(),
+        1,
+        "one subtree: the walk goes through the revoked row"
+    );
+    let taken: Vec<GrantId> = planned
+        .subtrees
+        .iter()
+        .flat_map(|subtree| subtree.rows.iter().map(|row| row.grant.grant_id))
+        .collect();
+    assert_eq!(
+        taken,
+        [id_of(10), id_of(11), id_of(12)],
+        "the whole subtree, through the revoked middle row, each row once"
+    );
+    owner_revokes(&store, DEVICE);
+    assert!(!live(&store, 10), "the live top is withdrawn");
+    assert!(
+        !live(&store, 12),
+        "the live grant below the revoked row is withdrawn"
+    );
+    assert_eq!(
+        revoked_at(&store, 11),
+        Some(9),
+        "the revoked row keeps its own moment"
+    );
+    let by_parent: Option<Vec<u8>> = one(
+        &store,
+        &format!(
+            "SELECT revoked_by_parent FROM grants WHERE grant_id = {}",
+            key(12)
+        ),
+    );
+    assert_eq!(
+        by_parent,
+        Some(id_of(9).get().as_bytes().to_vec()),
+        "the descendant is withdrawn under the parent that the top's record names"
+    );
+}
+
+/// A voice grant is stopped by the grant's own holder, in the subtree scope: a damaged row of
+/// another device is not marked, an unplaced grant of another device stays live, and nothing is
+/// owed.
+#[test]
+fn a_voice_stop_beside_a_damaged_row_withdraws_only_its_grant_and_writes_no_debt() {
+    let store = store_written_by_hand(&[
+        held(1, None, DEVICE),
+        held(2, None, OTHER_DEVICE),
+        held(3, Some(9), OTHER_DEVICE),
+    ]);
+    mark_unreadable(&store, 2);
+    let mut voice = record_of(&Node {
+        number: 1,
+        parent: None,
+        holder: DEVICE,
+    });
+    voice.grant.actions = [ActionRight::VoiceUse].into_iter().collect();
+    let encoded = kr_cbor::to_canonical_vec(&voice.grant).expect("the grant encodes");
+    store
+        .in_transaction(|connection| {
+            connection
+                .execute(
+                    "UPDATE grants SET grant = ?1 WHERE grant_id = ?2",
+                    params![encoded, id_of(1).get().as_bytes().as_slice()],
+                )
+                .map(drop)
+                .map_err(ControllerError::registry)
+        })
+        .expect("the voice grant is written");
+    let revocation = match store.revoke(id_of(1), 5_000, || Ok(())) {
+        Ok(revocation) => revocation,
+        Err(error) => panic!("a voice stop is not refused for a row beside it: {error}"),
+    };
+    assert_eq!(revocation.revoked, vec![id_of(1)], "only its own grant");
+    assert!(!live(&store, 1));
+    assert!(revocation.debt.is_none(), "a voice grant owes no fence");
+    assert!(!revocation.reaches_every_connection);
+    assert_eq!(revocation.marked, 0);
+    assert_eq!(debts(&store), 0, "no debt row is written");
+    assert_eq!(
+        revoked_at(&store, 2),
+        None,
+        "the damaged row of another device is not marked"
+    );
+    assert!(
+        live(&store, 3),
+        "another device's unplaced grant stays live"
     );
 }
 
@@ -437,9 +553,10 @@ fn a_person_revoking_a_grant_beside_a_damaged_row_withdraws_it_and_what_hangs_be
         held(3, None, OTHER_DEVICE),
     ]);
     mark_unreadable(&store, 3);
-    let revocation = store
-        .revoke_claimed(id_of(1), Scope::Host, 5_000, || Ok(()), None)
-        .expect("the owner's revocation is not refused");
+    let revocation = match store.revoke_claimed(id_of(1), Scope::Host, 5_000, || Ok(()), None) {
+        Ok(revocation) => revocation,
+        Err(error) => panic!("the owner's revocation is not refused: {error}"),
+    };
     assert_eq!(revocation.revoked, vec![id_of(1), id_of(2)]);
     assert!(!live(&store, 3));
 }
@@ -459,9 +576,12 @@ fn a_revocation_of_a_named_grant_whose_row_is_damaged_marks_it_and_withdraws_wha
         } else {
             mark_unreadable(&store, 1);
         }
-        let revocation = store
-            .revoke_claimed(id_of(1), Scope::Host, 5_000, || Ok(()), None)
-            .expect("a named row that cannot be read is marked");
+        let revocation = match store.revoke_claimed(id_of(1), Scope::Host, 5_000, || Ok(()), None) {
+            Ok(revocation) => revocation,
+            Err(error) => panic!(
+                "a named row that cannot be read is marked (by decoded id: {by_decoded_id}): {error}"
+            ),
+        };
         assert!(
             revocation.marked == 1 && !live(&store, 2),
             "by decoded id: {by_decoded_id}"
