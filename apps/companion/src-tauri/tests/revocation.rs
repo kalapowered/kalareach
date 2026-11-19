@@ -2678,8 +2678,8 @@ struct TellsNotShown {
 }
 
 impl kr_client::transport::ControlTransport for TellsNotShown {
-    fn host_states_placement_reading(&self) -> bool {
-        self.inner.host_states_placement_reading()
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+        self.inner.host_readings()
     }
 
     fn connection_id(&self) -> kr_protocol::ids::ConnectionId {

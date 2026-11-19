@@ -615,15 +615,12 @@ async fn a_dialled_transport_reports_whether_the_host_states_the_placement_readi
     ];
 
     assert!(
-        dial(&client, &current)
-            .await
-            .host_states_placement_reading(),
+        dial(&client, &current).await.host_readings().placement,
         "the host selected the capability"
     );
-    assert!(
-        !dial(&client, &previous)
-            .await
-            .host_states_placement_reading(),
+    assert_eq!(
+        dial(&client, &previous).await.host_readings(),
+        kr_protocol::confirmation::HostReadings::default(),
         "the host selected none"
     );
     for task in serving {
@@ -3467,8 +3464,8 @@ struct HeldWrite {
 }
 
 impl kr_client::transport::ControlTransport for HeldWrite {
-    fn host_states_placement_reading(&self) -> bool {
-        false
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+        kr_protocol::confirmation::HostReadings::default()
     }
 
     fn connection_id(&self) -> kr_protocol::ids::ConnectionId {

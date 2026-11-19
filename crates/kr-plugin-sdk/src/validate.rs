@@ -1201,40 +1201,55 @@ fn check_placement(
 ///
 /// The statement is composed as the host composes it for a grant that holds every capability it
 /// has a part for: the publisher's words of the bridge, the host's reading of the placement the
-/// table declares and the host's reading of the command integration, or its words that the
-/// package declares none. Each part may meet its own limit and the three together may not.
+/// table declares, its reading of the skill target the table declares and its reading of the
+/// command integration, or its words that the package declares none. Each part may meet its own
+/// limit and the parts together may not.
 fn check_statement(
     manifest: &PluginManifest,
     connector: Option<&ConnectorManifest>,
     report: &mut Report,
 ) {
-    let Some(bridge) = manifest.native_bridge.0.as_ref() else {
+    let bridge = manifest.native_bridge.0.as_ref();
+    let target = connector
+        .and_then(|table| table.skill_target.as_ref())
+        .filter(|_| manifest.requests(PluginCapability::SkillTargetInstall));
+    if bridge.is_none() && target.is_none() {
         return;
-    };
-    let placement = connector
-        .and_then(|table| table.placement.as_ref())
-        .and_then(|placement| placement.statement(bridge).ok());
+    }
+    let placement = bridge.and_then(|bridge| {
+        connector
+            .and_then(|table| table.placement.as_ref())
+            .and_then(|placement| placement.statement(bridge).ok())
+    });
+    let reading = target.map(crate::skill_target::SkillTarget::statement);
     let integration = manifest.command_integration.as_ref().map_or_else(
         || crate::integration::NO_INTEGRATION_STATEMENT.to_owned(),
         crate::integration::CommandIntegration::statement,
     );
     let whole = kr_protocol::confirmation::install_statement(
-        Some(bridge.grant_statement.as_str()),
+        bridge.map(|bridge| bridge.grant_statement.as_str()),
         placement.as_deref(),
+        reading.as_deref(),
         Some(integration.as_str()),
     );
     let length = whole.map_or(0, |text| text.chars().count());
     if length > kr_protocol::confirmation::STATEMENT_CHARS {
-        report.push(Finding::at(
-            FindingCode::BridgeRecipeInvalid,
-            MANIFEST_FILE,
-            format!(
-                "the host's whole statement of this package, with the publisher's words, its \
-                 reading of the placement and its reading of the command integration, is {length} \
-                 characters; the host shows an owner a statement of at most {} characters",
-                kr_protocol::confirmation::STATEMENT_CHARS
-            ),
-        ));
+        let detail = format!(
+            "the host's whole statement of this package, with the publisher's words, its \
+             reading of the placement, its reading of the skill target and its reading of the \
+             command integration, is {length} characters; the host shows an owner a statement \
+             of at most {} characters",
+            kr_protocol::confirmation::STATEMENT_CHARS
+        );
+        report.push(if target.is_some() {
+            Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                format!("skill_target.statement_too_long: {detail}"),
+            )
+        } else {
+            Finding::at(FindingCode::BridgeRecipeInvalid, MANIFEST_FILE, detail)
+        });
     }
 }
 
@@ -1802,32 +1817,19 @@ fn check_answer(
 
 /// Checks a native bridge recipe against the payloads the package declares.
 fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut Report) {
-    // An owner reads the bridge's own words beside the host's reading of a command integration,
-    // told apart by the host's label, so the publisher cannot write that label.
-    if bridge
-        .grant_statement
-        .as_str()
-        .contains(kr_protocol::confirmation::INTEGRATION_STATEMENT_LABEL)
-    {
-        report.push(Finding::at(
-            FindingCode::BridgeRecipeInvalid,
-            MANIFEST_FILE,
-            "the bridge's statement holds the words the host writes before its own reading of a \
-             command integration",
-        ));
-    }
-    // The same holds for the label the host writes before its own reading of a placement.
-    if bridge
-        .grant_statement
-        .as_str()
-        .contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL)
-    {
-        report.push(Finding::at(
-            FindingCode::BridgeRecipeInvalid,
-            MANIFEST_FILE,
-            "the bridge's statement holds the words the host writes before its own reading of a \
-             placement",
-        ));
+    // An owner reads the bridge's own words beside the host's readings, told apart by the host's
+    // labels, so the publisher cannot write one of them. The labels are one list.
+    for (label, reading) in kr_protocol::confirmation::HOST_STATEMENT_LABELS {
+        if bridge.grant_statement.as_str().contains(label) {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                MANIFEST_FILE,
+                format!(
+                    "the bridge's statement holds the words the host writes before its own \
+                     reading of a {reading}"
+                ),
+            ));
+        }
     }
     if bridge.install.is_empty() {
         report.push(Finding::at(

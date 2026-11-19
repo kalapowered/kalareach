@@ -2502,7 +2502,9 @@ async fn statement_of(words: &str, integration: bool) -> CatalogueResult<Option<
 /// declares none is told so in the reading.
 #[tokio::test]
 async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
-    use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, split_install_statement};
+    use kr_protocol::confirmation::{
+        HostReadings, INTEGRATION_STATEMENT_LABEL, split_install_statement,
+    };
     let words = "Changes one setting of the example agent.";
     let grant = ["native_bridge.install", "command_integration.launch"].map(str::to_owned);
 
@@ -2511,7 +2513,7 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         .await
         .expect("the manifest the index pins is read")
         .expect("a statement");
-    let parts = split_install_statement(&grant, &shown, false);
+    let parts = split_install_statement(&grant, &shown, HostReadings::default());
     assert_eq!(parts.publisher, Some(words));
     assert!(
         parts
@@ -2536,7 +2538,7 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
         .expect("the manifest the index pins is read")
         .expect("a statement");
     assert!(
-        split_install_statement(&grant, &none, false)
+        split_install_statement(&grant, &none, HostReadings::default())
             .reading
             .is_some_and(|reading| reading.contains("declares no command integration")),
         "{none}"

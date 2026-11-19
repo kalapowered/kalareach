@@ -1300,7 +1300,7 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
     };
     let composed = |manifest: &Value| {
         let (words, reading, integration) = parts(manifest);
-        install_statement(Some(&words), Some(&reading), Some(&integration))
+        install_statement(Some(&words), Some(&reading), None, Some(&integration))
             .expect("a statement")
             .chars()
             .count()

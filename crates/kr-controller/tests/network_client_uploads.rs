@@ -160,8 +160,8 @@ impl StreamOpener for CountingOpener {
 }
 
 impl ControlTransport for Counted {
-    fn host_states_placement_reading(&self) -> bool {
-        false
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+        kr_protocol::confirmation::HostReadings::default()
     }
 
     fn connection_id(&self) -> ConnectionId {

@@ -1282,6 +1282,7 @@ impl OwnerDevice {
                         .iter()
                         .any(|name| name == "native_bridge.install")
                         .then_some(PLACEMENT_READING),
+                    None,
                     params
                         .grant
                         .iter()

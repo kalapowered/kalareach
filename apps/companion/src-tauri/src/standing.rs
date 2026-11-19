@@ -1629,8 +1629,8 @@ pub(crate) mod tests {
     struct Silent(ConnectionId);
 
     impl ControlTransport for Silent {
-        fn host_states_placement_reading(&self) -> bool {
-            false
+        fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+            kr_protocol::confirmation::HostReadings::default()
         }
 
         fn connection_id(&self) -> ConnectionId {

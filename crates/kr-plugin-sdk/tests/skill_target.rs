@@ -391,3 +391,127 @@ fn the_compiled_documents_meet_the_rules_the_host_checks() {
         }
     }
 }
+
+/// The host's reading of a declaration, written from the approved sentences, for three
+/// declarations: a user scope with no document, a project scope with a document and a deadline, and
+/// both scopes with a document that other agents also read.
+#[test]
+fn the_host_reading_of_a_declared_skill_target_is_the_text_the_owner_confirms() {
+    let target = |value: Value| -> SkillTarget { serde_json::from_value(value).expect("a target") };
+    let opening = "The package names the agent \"amp\" and says where the host installs the KalaReach \
+                   contact skill for it, on macOS and Linux. Installing this package does not install \
+                   the skill, and the host starts no process when a person who manages this host \
+                   installs it.";
+    let closing = |scopes: &str| {
+        format!(
+            "The host keeps the other settings in each configuration file, follows no link below \
+             the home folder or the project folder, and replaces no skill file and no entry named \
+             kalareach that it did not write. It does not check which program reads these places or \
+             how it uses their contents, and another program's own settings may be among them. kr \
+             skill remove --agent amp {scopes}, with --project-dir for a project, takes out only \
+             what this host wrote and finds unchanged, also after this package is gone, and reports \
+             what it leaves in place. Removing the package does not remove the skill."
+        )
+    };
+
+    let user_only = target(json!({
+        "word": "amp",
+        "user": { "skills": [".amp", "skills"] }
+    }));
+    assert_eq!(
+        user_only.statement(),
+        format!(
+            "{opening} For the user scope, kr skill install --agent amp --scope user makes the host \
+             write its own files SKILL.md, TOOLS.md and manifest.json into \
+             .amp/skills/kalareach-contact/ under the home folder of the account that runs this \
+             host. The host adds no server entry for this scope. {}",
+            closing("--scope user")
+        )
+    );
+
+    let with_deadline = target(json!({
+        "word": "amp",
+        "project": {
+            "skills": [".amp", "skills"],
+            "configuration": {
+                "path": [".amp", "mcp.json"],
+                "format": "json_command_args",
+                "shared": false,
+                "deadline": { "field": "timeout", "unit": "milliseconds" }
+            }
+        }
+    }));
+    assert_eq!(
+        with_deadline.statement(),
+        format!(
+            "{opening} For a project, kr skill install --agent amp --scope project --project-dir \
+             with the project folder makes the host write its own files SKILL.md, TOOLS.md and \
+             manifest.json into .amp/skills/kalareach-contact/ under that project folder, and adds \
+             one entry named kalareach to .amp/mcp.json under that folder, as mcpServers.kalareach \
+             of a JSON file, with a command and its arguments. The entry starts kr with the \
+             arguments agent-tools --stdio and sets timeout to 660000 (milliseconds) and \
+             KR_TOOL_DEADLINE_MS to 660000. {}",
+            closing("--scope project")
+        )
+    );
+
+    let shared = target(json!({
+        "word": "amp",
+        "user": { "skills": [".amp", "skills"] },
+        "project": {
+            "skills": [".amp", "skills"],
+            "configuration": {
+                "path": [".mcp.json"],
+                "format": "json_command_args",
+                "shared": true
+            }
+        }
+    }));
+    let text = shared.statement();
+    assert!(
+        text.contains(
+            "The package says that other agents also read .mcp.json, so the entry there is the same \
+             for every installation that writes it and sets no time limit, and the host removes it \
+             only when no other installation of this host still claims it."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.ends_with(&closing("--scope user or --scope project")),
+        "{text}"
+    );
+}
+
+/// The longest reading is the maximum the whole statement is budgeted with: a word and three
+/// components of the longest length in each scope, the longest field name, over every format,
+/// every way of sharing and every deadline.
+#[test]
+fn the_skill_target_reading_at_its_longest_is_its_maximum() {
+    use kr_plugin_sdk::skill_target::MAX_SKILL_TARGET_STATEMENT_CHARS;
+    let component = "a".repeat(64);
+    let places: Vec<Value> = vec![json!(component); 3];
+    let mut longest = 0;
+    for format in ["codex_toml", "json_command_args", "json_local_command_list"] {
+        for shared in [true, false] {
+            for deadline in [
+                None,
+                Some(json!({ "field": "f".repeat(32), "unit": "seconds" })),
+                Some(json!({ "field": "f".repeat(32), "unit": "milliseconds" })),
+            ] {
+                let mut configuration = json!({
+                    "path": places, "format": format, "shared": shared
+                });
+                if let Some(deadline) = deadline {
+                    configuration["deadline"] = deadline;
+                }
+                let location = json!({ "skills": places, "configuration": configuration });
+                let target: SkillTarget = serde_json::from_value(json!({
+                    "word": "a".repeat(32), "user": location, "project": location
+                }))
+                .expect("a target");
+                longest = longest.max(target.statement().chars().count());
+            }
+        }
+    }
+    assert_eq!(longest, MAX_SKILL_TARGET_STATEMENT_CHARS);
+}

@@ -71,8 +71,8 @@ struct Lossy {
 }
 
 impl ControlTransport for Lossy {
-    fn host_states_placement_reading(&self) -> bool {
-        self.inner.host_states_placement_reading()
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+        self.inner.host_readings()
     }
 
     fn connection_id(&self) -> ConnectionId {
