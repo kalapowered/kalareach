@@ -2267,13 +2267,15 @@ impl WorkerService {
         );
     }
 
-    /// Ends the wait of the admitted operation for its upstream as its deadline ends it: the caller
-    /// is told what a deadline tells, and what waited is dropped, while whatever thread the
-    /// operation already has goes on.
+    /// Ends one wait of the admitted operation for its upstream as its deadline ends it before the
+    /// call is made: the caller is told what a deadline tells, and what waited is dropped, while
+    /// whatever thread the operation already has goes on. A deadline that passes after the call is
+    /// made also hands on the late reply to be watched for; this end does not.
     ///
-    /// It exists so that this host's own tests can end the wait when a thread of the operation
-    /// stands where they put it, with the deadline set so long that it cannot pass first. The end
-    /// is kept for the next wait if none is waiting. It is compiled away in every shipped build.
+    /// It exists so that this host's own tests can end the wait before the call is made, when a
+    /// thread of the operation stands where they put it, with the deadline set so long that it
+    /// cannot pass first. The end is kept for the next wait if none is waiting. It is compiled away
+    /// in every shipped build.
     #[cfg(feature = "testing")]
     pub fn end_upstream_waits_for_tests(&self) {
         self.upstream_wait_ended.notify_one();
