@@ -10482,7 +10482,7 @@ impl<F: FnMut()> Drop for OnDrop<F> {
 #[test]
 fn an_exchange_under_a_bearer_never_leaves_for_a_gateway_taken_out_of_the_list_but_a_revocation_does()
  {
-    use kr_client::services::{ServiceHeader, ServiceHttp};
+    use kr_client::services::ServiceHttp;
     use kr_controller::push::credentials::CredentialRenewal;
     use kr_controller::push::gateways::{AllowedGateways, GatedTransports};
     use kr_controller::push::sender::{GatewaySenders, HostSigner, SenderRevocation};
