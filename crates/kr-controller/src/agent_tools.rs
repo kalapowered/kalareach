@@ -4273,34 +4273,41 @@ mod tests {
             );
         }
         let request = params(amp(), InstallScope::User);
-        for (what, folder, document, repairable) in [
+        let first = ([".amp", "skills"], [".amp", "mcp.json"]);
+        for (what, skills, document, repairable) in [
             (
                 "the skills folder, with a file to repair",
-                ".AMP",
-                "mcp.json",
+                [".amp", "Skills"],
+                first.1,
                 true,
             ),
             (
                 "the skills folder, with nothing to repair",
-                ".AMP",
-                "mcp.json",
+                [".amp", "Skills"],
+                first.1,
                 false,
             ),
-            ("the document", ".amp", "MCP.json", false),
+            ("the document", first.0, [".amp", "MCP.json"], false),
+            (
+                "the folder of both, with a file to repair",
+                [".AMP", "skills"],
+                [".AMP", "mcp.json"],
+                true,
+            ),
         ] {
             let tree = Tree::create();
-            let declaring = |folder: &str, document: &str| {
+            let declaring = |skills: [&str; 2], document: [&str; 2]| {
                 tree.installer().with_declaration(
                     Some(declared(
                         Some(json!({
-                            "path": [folder, document], "format": "json_command_args", "shared": false
+                            "path": document, "format": "json_command_args", "shared": false
                         })),
-                        &[folder, "skills"],
+                        &skills,
                     )),
                     Vec::new(),
                 )
             };
-            declaring(".amp", "mcp.json")
+            declaring(first.0, first.1)
                 .install(&request)
                 .expect("installs");
             if repairable {
@@ -4312,14 +4319,14 @@ mod tests {
                     files_under(&tree.home()),
                     format!(
                         "{:?}",
-                        declaring(".amp", "mcp.json")
+                        declaring(first.0, first.1)
                             .recorded(&request)
                             .expect("reads")
                     ),
                 )
             };
             let before = state();
-            let refused = declaring(folder, document)
+            let refused = declaring(skills, document)
                 .install(&request)
                 .expect_err(what);
             let ControllerError::InvalidArgument(said) = &refused else {
@@ -4331,9 +4338,9 @@ mod tests {
                 "{what}: {said}"
             );
             assert!(state() == before, "{what}: the files and the record stay");
-            if tells_case_apart && folder != ".amp" {
+            if tells_case_apart && skills != first.0 {
                 assert!(
-                    !tree.home().join(folder).exists(),
+                    !tree.home().join(skills[0]).join(skills[1]).exists(),
                     "{what}: nothing is made under the other spelling"
                 );
             }
@@ -4359,9 +4366,11 @@ mod tests {
         );
         let layout = other.layout(&request).expect("a layout");
         let recorded = other.recorded(&request).expect("reads");
-        other
-            .moved_place(&request, &layout, recorded.as_ref())
-            .expect("another executable is not another place");
+        let moved = other.moved_place(&request, &layout, recorded.as_ref());
+        assert!(
+            moved.is_ok(),
+            "another executable is not another place: {moved:?}"
+        );
     }
 
     /// A record of version 1 and one of version 2 are read through one reader, as the same shape.
