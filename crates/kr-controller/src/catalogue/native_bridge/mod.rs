@@ -2807,7 +2807,10 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
     for tail in &tails {
         // The complete tail after `<area>/<name>/` is compared: another tail that ends the same
         // way is another file.
-        let times = placed_tails.iter().filter(|placed| **placed == *tail).count();
+        let times = placed_tails
+            .iter()
+            .filter(|placed| **placed == *tail)
+            .count();
         match times {
             1 => {}
             0 => {
@@ -2852,7 +2855,9 @@ fn permitted(recipe: &NativeBridge, layout: &Placement) -> std::result::Result<(
             let enabled = name
                 .and_then(|folder| Placement::enabling_key(recipe.application.as_str(), folder))
                 .is_some_and(|enabling| {
-                    file.as_str() == enabling.file && *key == enabling.key && value == enabling.value
+                    file.as_str() == enabling.file
+                        && *key == enabling.key
+                        && value == enabling.value
                 });
             if !enabled {
                 return Err(format!(

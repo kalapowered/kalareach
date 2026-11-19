@@ -2648,7 +2648,12 @@ async fn placed_statement_granted(
     let generation = Generation::build(
         home.path(),
         GenerationSpec {
-            package: Some(placing_package_edited(packages.path(), name, edit, edit_manifest)),
+            package: Some(placing_package_edited(
+                packages.path(),
+                name,
+                edit,
+                edit_manifest,
+            )),
             drop_payload: withhold_table.then(|| "connector.json".to_owned()),
             ..GenerationSpec::default()
         },
@@ -2857,7 +2862,8 @@ async fn a_whole_statement_longer_than_the_bound_is_refused() {
         "the control is within the bound: {}",
         shown.chars().count()
     );
-    let refusal = placed_statement_granted("claude-code", claude, with_filler(3500), false, both).await;
+    let refusal =
+        placed_statement_granted("claude-code", claude, with_filler(3500), false, both).await;
     assert!(
         matches!(&refusal, Err(CatalogueError::UnsafePackage { detail })
             if detail.contains("whole statement is longer")),
@@ -2914,7 +2920,10 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_never_reaches_a_statement() {
     for (what, key) in [
         ("the integration label inside a key", integration),
         ("the placement label inside a key", placement),
-        ("another plugin's folder", "enabledPlugins.other@skills-dir".to_owned()),
+        (
+            "another plugin's folder",
+            "enabledPlugins.other@skills-dir".to_owned(),
+        ),
     ] {
         let refusal = placed_statement_edited(
             "claude-code",

@@ -505,10 +505,7 @@ fn a_placement_file_whose_root_is_not_an_object_or_a_map_is_refused_by_name() {
         );
     }
     for (what, root) in [
-        (
-            "an object",
-            json!({ "kind": "object", "members": [] }),
-        ),
+        ("an object", json!({ "kind": "object", "members": [] })),
         (
             "a map",
             json!({ "kind": "map", "values": { "kind": "boolean" } }),
@@ -976,7 +973,10 @@ fn the_longest_reading_of_a_placement_is_the_bound() {
     let longest = placement
         .statement(&recipe("Claude Code", true))
         .expect("the longest reading is within the bound");
-    assert!(longest.contains("It also sets enabledPlugins."), "the key sentence is in it");
+    assert!(
+        longest.contains("It also sets enabledPlugins."),
+        "the key sentence is in it"
+    );
     assert_eq!(
         longest.chars().count(),
         kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS,
@@ -1049,29 +1049,69 @@ fn a_key_that_is_not_the_labels_one_is_refused_before_a_statement_is_made() {
     let integration = format!("x {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
     let placement_label = format!("x {PLACEMENT_STATEMENT_LABEL} Reads nothing.");
     let cases: Vec<(&str, &str, Option<Value>)> = vec![
-        ("a free sentence", "Claude Code", Some(key_step("settings.json", "Runs nothing.", "true"))),
-        ("the integration label", "Claude Code", Some(key_step("settings.json", &integration, "true"))),
-        ("the placement label", "Claude Code", Some(key_step("settings.json", &placement_label, "true"))),
-        ("another plugin's folder", "Claude Code", Some(key_step("settings.json", "enabledPlugins.other@skills-dir", "true"))),
-        ("another file", "Claude Code", Some(key_step("other.json", exact, "true"))),
-        ("another value", "Claude Code", Some(key_step("settings.json", exact, "false"))),
-        ("a value with a space", "Claude Code", Some(key_step("settings.json", exact, "true "))),
-        ("another label", "Gemini CLI", Some(key_step("settings.json", exact, "true"))),
+        (
+            "a free sentence",
+            "Claude Code",
+            Some(key_step("settings.json", "Runs nothing.", "true")),
+        ),
+        (
+            "the integration label",
+            "Claude Code",
+            Some(key_step("settings.json", &integration, "true")),
+        ),
+        (
+            "the placement label",
+            "Claude Code",
+            Some(key_step("settings.json", &placement_label, "true")),
+        ),
+        (
+            "another plugin's folder",
+            "Claude Code",
+            Some(key_step(
+                "settings.json",
+                "enabledPlugins.other@skills-dir",
+                "true",
+            )),
+        ),
+        (
+            "another file",
+            "Claude Code",
+            Some(key_step("other.json", exact, "true")),
+        ),
+        (
+            "another value",
+            "Claude Code",
+            Some(key_step("settings.json", exact, "false")),
+        ),
+        (
+            "a value with a space",
+            "Claude Code",
+            Some(key_step("settings.json", exact, "true ")),
+        ),
+        (
+            "another label",
+            "Gemini CLI",
+            Some(key_step("settings.json", exact, "true")),
+        ),
     ];
     for (what, label, step) in cases {
         let found = Placement::claude_code().statement(&claude_recipe(label, step));
         let error = found.expect_err(what);
         assert_eq!(error.refusal, PlacementRefusal::KeyNotTheLabels, "{what}");
         assert!(
-            !error.to_string().contains("Runs nothing") && !error.to_string().contains("Reads nothing"),
+            !error.to_string().contains("Runs nothing")
+                && !error.to_string().contains("Reads nothing"),
             "{what}: the refusal quotes the recipe: {error}"
         );
     }
     // A key with no file of the plugin's folder beside it has no folder to enable.
     let mut bridge = serde_json::to_value(claude_recipe("Claude Code", None)).expect("a value");
     bridge["install"] = json!([key_step("settings.json", exact, "true")]);
-    let bridge: kr_plugin_sdk::plugin::NativeBridge = serde_json::from_value(bridge).expect("a recipe");
-    let error = Placement::claude_code().statement(&bridge).expect_err("no folder");
+    let bridge: kr_plugin_sdk::plugin::NativeBridge =
+        serde_json::from_value(bridge).expect("a recipe");
+    let error = Placement::claude_code()
+        .statement(&bridge)
+        .expect_err("no folder");
     assert_eq!(error.refusal, PlacementRefusal::KeyNotTheLabels);
 }
 
@@ -1105,8 +1145,11 @@ fn package_edited(
         .expect("the connector payload");
     record["digest"] = json!(PayloadDigest::of(&bytes).to_string());
     record["size_bytes"] = json!(bytes.len().to_string());
-    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&plugin).expect("writes"))
-        .expect("writes");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&plugin).expect("writes"),
+    )
+    .expect("writes");
     validate_package_directory(&directory)
 }
 
@@ -1123,7 +1166,9 @@ fn the_package_check_refuses_every_key_but_the_labels_one() {
             .iter()
             .filter(|finding| {
                 finding.code == FindingCode::BridgeRecipeInvalid
-                    && finding.detail.contains(PlacementRefusal::KeyNotTheLabels.name())
+                    && finding
+                        .detail
+                        .contains(PlacementRefusal::KeyNotTheLabels.name())
             })
             .count()
     };
@@ -1132,7 +1177,10 @@ fn the_package_check_refuses_every_key_but_the_labels_one() {
     let claude_table = |table: &mut Value| table["placement"] = claude();
     let words = format!("x {INTEGRATION_STATEMENT_LABEL} Runs nothing.");
     for (what, key) in [
-        ("another folder", "enabledPlugins.other@skills-dir".to_owned()),
+        (
+            "another folder",
+            "enabledPlugins.other@skills-dir".to_owned(),
+        ),
         ("a free sentence", "Runs nothing.".to_owned()),
         ("the integration label", words),
     ] {
@@ -1140,18 +1188,34 @@ fn the_package_check_refuses_every_key_but_the_labels_one() {
             manifest["native_bridge"]["install"][3]["key"] = json!(key);
         };
         let undeclared = package_edited("claude-code", edit, |_| {});
-        assert_eq!(named(&undeclared), 1, "{what}, no declaration: {:?}", undeclared.report.findings);
+        assert_eq!(
+            named(&undeclared),
+            1,
+            "{what}, no declaration: {:?}",
+            undeclared.report.findings
+        );
         assert!(!undeclared.report.is_valid(), "{what}");
         let declared = package_edited("claude-code", edit, claude_table);
-        assert_eq!(named(&declared), 1, "{what}, declared: {:?}", declared.report.findings);
+        assert_eq!(
+            named(&declared),
+            1,
+            "{what}, declared: {:?}",
+            declared.report.findings
+        );
         assert!(!declared.report.is_valid(), "{what}");
     }
     // A label with no key of its own adds none.
     let gemini = package_edited(
         "gemini-cli",
         |manifest| {
-            let install = manifest["native_bridge"]["install"].as_array_mut().expect("steps");
-            install.push(key_step("settings.json", "enabledPlugins.kalareach@skills-dir", "true"));
+            let install = manifest["native_bridge"]["install"]
+                .as_array_mut()
+                .expect("steps");
+            install.push(key_step(
+                "settings.json",
+                "enabledPlugins.kalareach@skills-dir",
+                "true",
+            ));
         },
         |_| {},
     );
@@ -1169,11 +1233,20 @@ fn a_bridge_file_the_check_did_not_keep_is_refused() {
         copy_tree(&bundled("gemini-cli"), &directory);
         // The cache holds 8 MiB: the other root file of the package and the pads fill it to the
         // byte, in whatever order they are read, so no file of a folder below it is kept.
-        let readme = std::fs::metadata(directory.join("README.md")).expect("a file").len() as usize;
+        let readme = std::fs::metadata(directory.join("README.md"))
+            .expect("a file")
+            .len() as usize;
         for number in 0..pads {
-            let size = if number + 1 == pads { (1 << 20) - readme } else { 1 << 20 };
-            std::fs::write(directory.join(format!("pad-{number}.bin")), vec![0_u8; size])
-                .expect("writes");
+            let size = if number + 1 == pads {
+                (1 << 20) - readme
+            } else {
+                1 << 20
+            };
+            std::fs::write(
+                directory.join(format!("pad-{number}.bin")),
+                vec![0_u8; size],
+            )
+            .expect("writes");
         }
         validate_package_directory(&directory)
             .report
@@ -1187,7 +1260,11 @@ fn a_bridge_file_the_check_did_not_keep_is_refused() {
             .count()
     };
     assert_eq!(unread(0), 0, "the control keeps every bridge file");
-    assert_eq!(unread(8), 1, "eight other files fill the cache before the bridge's");
+    assert_eq!(
+        unread(8),
+        1,
+        "eight other files fill the cache before the bridge's"
+    );
 }
 
 /// The package check composes the host's whole statement, the publisher's words, the reading of
@@ -1213,8 +1290,11 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
         let bridge: kr_plugin_sdk::plugin::NativeBridge =
             serde_json::from_value(manifest["native_bridge"].clone()).expect("a recipe");
         let integration: kr_plugin_sdk::integration::CommandIntegration =
-            serde_json::from_value(manifest["command_integration"].clone()).expect("an integration");
-        let reading = Placement::claude_code().statement(&bridge).expect("a reading");
+            serde_json::from_value(manifest["command_integration"].clone())
+                .expect("an integration");
+        let reading = Placement::claude_code()
+            .statement(&bridge)
+            .expect("a reading");
         let words = bridge.grant_statement.as_str().to_owned();
         (words, reading, integration.statement())
     };
@@ -1226,7 +1306,11 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
             .count()
     };
     let exact = 1 + (STATEMENT_CHARS - composed(&with_filler(1)));
-    assert_eq!(composed(&with_filler(exact)), STATEMENT_CHARS, "the longest that fits");
+    assert_eq!(
+        composed(&with_filler(exact)),
+        STATEMENT_CHARS,
+        "the longest that fits"
+    );
     let (words, reading, integration) = parts(&with_filler(exact + 1));
     assert!(words.chars().count() <= kr_plugin_sdk::text::Summary::LIMIT);
     assert!(reading.chars().count() <= kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS);
@@ -1246,7 +1330,11 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
             .map(|finding| finding.detail.clone())
             .collect::<Vec<_>>()
     };
-    assert!(whole(exact).is_empty(), "the longest that fits is accepted: {:?}", whole(exact));
+    assert!(
+        whole(exact).is_empty(),
+        "the longest that fits is accepted: {:?}",
+        whole(exact)
+    );
     let over = whole(exact + 1);
     assert_eq!(over.len(), 1, "one character more is refused: {over:?}");
     assert!(over[0].contains("5055 characters"), "{over:?}");

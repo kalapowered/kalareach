@@ -6227,7 +6227,9 @@ fn a_declared_placement_places_a_registration_for_an_application_the_host_does_n
         .reconcile(&quill_id(), Some(&undeclared))
         .expect("reconciles");
     assert!(
-        refusal_of(&settled).is_some_and(|reason| reason.contains("does not know where Quill CLI keeps its plugins")),
+        refusal_of(&settled).is_some_and(
+            |reason| reason.contains("does not know where Quill CLI keeps its plugins")
+        ),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -6279,7 +6281,9 @@ fn a_declared_placement_registers_the_forwarder_by_the_placeholder_only() {
         .reconcile(&quill_id(), Some(&site.declared()))
         .expect("reconciles");
     assert!(
-        refusal_of(&settled).is_some_and(|reason| reason.contains("starts the forwarder with arguments it does not accept")),
+        refusal_of(&settled).is_some_and(
+            |reason| reason.contains("starts the forwarder with arguments it does not accept")
+        ),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -6343,7 +6347,10 @@ fn a_declared_directory_that_is_a_link_at_any_component_is_refused() {
         .bridges()
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
-    assert!(refusal_of(&settled).is_some_and(|reason| reason.contains("it is not there")), "{settled:?}");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains("it is not there")),
+        "{settled:?}"
+    );
     assert_eq!(site.tree(), before, "the directory is not made");
 }
 
@@ -6436,7 +6443,10 @@ fn a_declared_placement_adds_only_the_labels_own_key() {
         .bridges()
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
-    assert!(refusal_of(&settled).is_some_and(|reason| reason.contains(UNPERMITTED_KEY)), "{settled:?}");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains(UNPERMITTED_KEY)),
+        "{settled:?}"
+    );
     assert_eq!(site.tree(), before, "nothing was written");
 
     let site = Site::new();
@@ -6477,7 +6487,10 @@ fn a_declared_placement_installs_only_into_a_folder_this_host_made() {
         .bridges()
         .reconcile(&quill_id(), Some(&site.declared()))
         .expect("reconciles");
-    assert!(refusal_of(&settled).is_some_and(|reason| reason.contains("did not make it")), "{settled:?}");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains("did not make it")),
+        "{settled:?}"
+    );
     assert_eq!(site.tree(), before, "nothing was written");
 
     let site = QuillSite::new();
@@ -6500,7 +6513,10 @@ fn a_declared_placement_installs_only_into_a_folder_this_host_made() {
             Some(&second),
         )
         .expect("reconciles");
-    assert!(refusal_of(&settled).is_some_and(|reason| reason.contains("did not make it")), "{settled:?}");
+    assert!(
+        refusal_of(&settled).is_some_and(|reason| reason.contains("did not make it")),
+        "{settled:?}"
+    );
     assert_eq!(
         site.tree(),
         placed,
@@ -6517,8 +6533,11 @@ fn a_declared_name_check_refuses_another_folder_of_the_same_name() {
     let beside = |site: &QuillSite, name: &str| {
         let folder = site.application().join("plugins/other");
         std::fs::create_dir_all(&folder).expect("a folder");
-        std::fs::write(folder.join("plugin.json"), format!("{{\"name\": \"{name}\"}}\n"))
-            .expect("a manifest");
+        std::fs::write(
+            folder.join("plugin.json"),
+            format!("{{\"name\": \"{name}\"}}\n"),
+        )
+        .expect("a manifest");
     };
     let site = QuillSite::new();
     beside(&site, "quill-bridge");
@@ -6561,7 +6580,8 @@ fn a_declared_placement_in_another_labels_directory_is_refused() {
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
     assert!(
-        refusal_of(&settled).is_some_and(|reason| reason.contains("keeps Claude Code's plugins in")),
+        refusal_of(&settled)
+            .is_some_and(|reason| reason.contains("keeps Claude Code's plugins in")),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -6570,8 +6590,11 @@ fn a_declared_placement_in_another_labels_directory_is_refused() {
     // placement names `dotfiles/claude`. What was opened is the same directory.
     let site = QuillSite::new();
     std::fs::create_dir_all(site.home().join("dotfiles/claude/plugins")).expect("the real one");
-    std::os::unix::fs::symlink(site.home().join("dotfiles/claude"), site.home().join(".claude"))
-        .expect("the person's link");
+    std::os::unix::fs::symlink(
+        site.home().join("dotfiles/claude"),
+        site.home().join(".claude"),
+    )
+    .expect("the person's link");
     let before = site.tree();
     let release = site.release(
         "kalareach/quill",
@@ -6583,7 +6606,8 @@ fn a_declared_placement_in_another_labels_directory_is_refused() {
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
     assert!(
-        refusal_of(&settled).is_some_and(|reason| reason.contains("keeps Claude Code's plugins in")),
+        refusal_of(&settled)
+            .is_some_and(|reason| reason.contains("keeps Claude Code's plugins in")),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
@@ -6705,9 +6729,10 @@ fn a_gemini_cli_record_in_a_nested_place_is_not_the_record() {
         for step in recipe[list].as_array_mut().expect("steps") {
             let destination = step["destination"].as_str().expect("a path").to_owned();
             if destination.ends_with("/.gemini-extension-install.json") {
-                step["destination"] = serde_json::json!(
-                    destination.replace("/.gemini-extension-install.json", "/hooks/.gemini-extension-install.json")
-                );
+                step["destination"] = serde_json::json!(destination.replace(
+                    "/.gemini-extension-install.json",
+                    "/hooks/.gemini-extension-install.json"
+                ));
             }
         }
     }
@@ -6862,7 +6887,8 @@ fn a_declared_shape_cannot_hide_a_command_from_the_walker() {
         .reconcile(&quill_id(), Some(&release))
         .expect("reconciles");
     assert!(
-        refusal_of(&settled).is_some_and(|reason| reason.contains("starts something other than the forwarder")),
+        refusal_of(&settled)
+            .is_some_and(|reason| reason.contains("starts something other than the forwarder")),
         "{settled:?}"
     );
     assert_eq!(site.tree(), before, "nothing was written");
