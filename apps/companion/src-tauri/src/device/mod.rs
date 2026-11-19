@@ -514,13 +514,24 @@ impl Device {
     ///
     /// Returns a local failure when the records could not be read.
     pub fn is_paired_with(&self, host: DeviceId) -> Result<bool> {
+        Ok(self.paired_as(host)?.is_some())
+    }
+
+    /// The identity the host `host` gave this device in the pairing this computer holds with it, if
+    /// it holds one. A host that is paired again gives the device another.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the records could not be read.
+    pub fn paired_as(&self, host: DeviceId) -> Result<Option<DeviceId>> {
         Ok(self
             .pairing
             .hosts
             .list()
             .map_err(|failure| failed(&failure))?
             .iter()
-            .any(|each| each.host_device_id == host))
+            .find(|each| each.host_device_id == host)
+            .map(|each| each.device_id))
     }
 
     /// Forgets a paired host: this computer's record of it goes, and with it the choice of it, and

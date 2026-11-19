@@ -96,18 +96,27 @@ pub fn forget_host<R: Runtime>(app: &AppHandle<R>, host: &PairedHost) -> Result<
     Ok(state.connection_state())
 }
 
-/// What the voice calls ask of the pairings: whether this computer is still paired with `host`,
-/// and nothing while the records cannot be read. The pairing record is written before an
-/// unpairing is reported, so it outlives a launch whatever happened to what the calls kept.
+/// What the voice calls ask of the pairings: how this computer is paired with `host`, and nothing
+/// while the records cannot be read. The pairing record is written before an unpairing is
+/// reported, and a host paired again gives this device another identity, so it outlives a launch
+/// whatever happened to what the calls kept.
 pub fn pairing_known<R: Runtime>(
     app: AppHandle<R>,
-) -> impl Fn(kr_protocol::ids::DeviceId) -> Option<bool> + Send + Sync + 'static {
+) -> impl Fn(kr_protocol::ids::DeviceId) -> crate::voice::PairedNow + Send + Sync + 'static {
+    use crate::voice::PairedNow;
+
     move |host| {
-        app.try_state::<AppState>()?
-            .device()
-            .ok()?
-            .is_paired_with(host)
-            .ok()
+        let Some(device) = app
+            .try_state::<AppState>()
+            .and_then(|state| state.device().ok())
+        else {
+            return PairedNow::Unknown;
+        };
+        match device.paired_as(host) {
+            Ok(Some(device_id)) => PairedNow::As(device_id),
+            Ok(None) => PairedNow::Not,
+            Err(_) => PairedNow::Unknown,
+        }
     }
 }
 

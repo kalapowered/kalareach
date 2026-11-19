@@ -4258,6 +4258,7 @@ async fn a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_oth
             host_reference: "a-host".to_owned(),
             host_name: "A host".to_owned(),
             host: Some(host),
+            pairing: None,
         }
     };
     let this_host = (host.host_device_id, connection.environment_id());
@@ -4382,6 +4383,7 @@ async fn a_host_that_holds_no_such_call_settles_what_was_owed_to_it() {
         host_reference: "a-host".to_owned(),
         host_name: "A host".to_owned(),
         host: Some((host.host_device_id, connection.environment_id())),
+        pairing: None,
     };
     let directory = scene.phone.data.path().join("relaunch");
     Kept::at(&directory)
@@ -4479,6 +4481,7 @@ async fn a_refusal_that_is_not_the_typed_reason_stays_owed_until_the_host_revoke
         host_reference: "a-host".to_owned(),
         host_name: "A host".to_owned(),
         host: Some(this_host),
+        pairing: None,
     };
     let directory = scene.phone.data.path().join("relaunch-refused");
     Kept::at(&directory)
@@ -5316,6 +5319,7 @@ fn owed_to(
         host_reference: "a-host".to_owned(),
         host_name: "A host".to_owned(),
         host: Some(host),
+        pairing: None,
     }
 }
 
