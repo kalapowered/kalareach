@@ -123,6 +123,16 @@ const SAME: &[Same] = &[
                  nothing it reads or writes changes, and the rules by which a sentence is read \
                  are as that level has them.",
     },
+    Same {
+        root: "the envelope a worker checks",
+        digest: "670be1d3a4a028b44f5f5fbc5c7cb20eeed1398c6fef1ef521d2fffa69934143",
+        reason: "The session is now the caller's: the check takes it as a parameter, held across \
+                 the envelope's checks, where it took the session itself for the read of the \
+                 session's identifier and epoch and let it go. No check changed. The environment, \
+                 the session, the epoch, the resources and the grant are asked in the same order \
+                 of the same values, so what a worker of the retained level accepts and refuses \
+                 for an envelope is as that level has it.",
+    },
 ];
 
 /// The rules of the surface, as the roots the walker follows them from:
