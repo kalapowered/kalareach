@@ -2408,6 +2408,15 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         },
     },
     IgnoredRun {
+        package: "kr-ipc",
+        target: "--test account_launchd",
+        cases: &["a_shipped_program_holds_none_of_the_launchd_refusal"],
+        runs: Runs::Command {
+            file: "scripts/shipped-hold-gate.sh",
+            line: "KR_SHIPPED_HELD=\"$held\" KR_SHIPPED_PROGRAMS=\"$shipped\" cargo test --locked -p kr-ipc --test account_launchd -- --ignored --exact a_shipped_program_holds_none_of_the_launchd_refusal --nocapture",
+        },
+    },
+    IgnoredRun {
         package: "kr-controller",
         target: "--test descriptions",
         cases: &[],

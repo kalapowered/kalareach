@@ -580,13 +580,11 @@ jobs:
 
       # The programs a release ships hold none of the refusal that test builds carry for the
       # account's own launchd: each is built alone, in a target directory of its own, as a release
-      # tree builds it (the debug profile holds the same features and builds in far less time), and
-      # its bytes are searched, after the test programs that carry the refusal are shown to hold it.
+      # tree builds it, and the whole workspace is built in the release profile too, and the bytes
+      # of both are searched, after the test programs that carry the refusal are shown to hold it.
       - name: The programs a release ships hold no launchd refusal
         if: ${{ !cancelled() }}
-        timeout-minutes: 90
-        env:
-          KR_SHIPPED_PROFILE: debug
+        timeout-minutes: 150
         run: bash scripts/shipped-hold-gate.sh
 
       # What the disk had left once the build and every check above it were done, beside the
@@ -3196,6 +3194,16 @@ jobs:
         continue-on-error: true
         timeout-minutes: 2
         run: bash scripts/disk-report.sh end "the release build"
+
+      # The programs a release ships for this platform hold none of the refusal that test builds
+      # carry for the account's own launchd, read in the release build of the workspace above and in
+      # each program built alone, as the Linux job reads them for its platform.
+      - name: The programs a release ships hold no launchd refusal
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
+        timeout-minutes: 90
+        env:
+          KR_SHIPPED_WORKSPACE_TARGET: ${{ github.workspace }}/target
+        run: bash scripts/shipped-hold-gate.sh
 
       # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
       # in a release build, each figure printed with the conditions it was taken under. This runner
