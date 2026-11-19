@@ -26,7 +26,9 @@ const NEWER_RELEASE: &str = "0.156.1";
 
 /// Whether this program is the newer build of the source: the second `[[bin]]` of the package.
 #[cfg(unix)]
-const NEWER: bool = matches!(option_env!("CARGO_BIN_NAME"), Some("codex-stand-in-newer"));
+fn newer() -> bool {
+    option_env!("CARGO_BIN_NAME") == Some("codex-stand-in-newer")
+}
 
 #[cfg(unix)]
 mod contract;
@@ -54,7 +56,7 @@ async fn main() {
     {
         ["--version"] => println!(
             "codex-cli {}",
-            if NEWER {
+            if newer() {
                 NEWER_RELEASE
             } else {
                 contract::RELEASE
@@ -64,7 +66,7 @@ async fn main() {
         // gateway, so the shell runs it with nothing after its name): it says so and stays until
         // it is ended, which keeps its image and its place in the process table for a case to look
         // at.
-        [] if NEWER => run_as_typed(),
+        [] if newer() => run_as_typed(),
         // What an agent that rewrites its own configuration at a start does: a line is added to the
         // `config.toml` that `CODEX_HOME` names.
         ["--rewrite-config"] => rewrite_config(),
