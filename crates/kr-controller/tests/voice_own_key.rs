@@ -1393,10 +1393,17 @@ async fn a_clean_stop_fences_the_registry_before_it_ends_the_calls_and_admits_no
         let controller = Arc::clone(daemon.host.controller());
         tokio::spawn(async move { controller.close_host_calls_for_stop().await })
     };
-    until("the stop has fenced the registry", || {
-        the_registry_is(&daemon, RegistryState::Settling)
-    })
-    .await;
+    // The stop fences the registry before it ends the call, whose close is held.
+    let began = std::time::Instant::now();
+    while !the_registry_is(&daemon, RegistryState::Settling)
+        && began.elapsed() < Duration::from_secs(20)
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the stop fences the registry while it ends the call"
+    );
     assert!(
         rows_of(&daemon).len() == 1 && !stopping.is_finished(),
         "the call is still closing"

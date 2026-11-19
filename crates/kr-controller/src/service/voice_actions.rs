@@ -1402,6 +1402,22 @@ mod tests {
         }
     }
 
+    /// The live voice grants a device holds in the host's own store.
+    fn live_voice_grants(
+        controller: &crate::service::Controller,
+        device: kr_protocol::ids::DeviceId,
+    ) -> usize {
+        controller
+            .sharing()
+            .grants()
+            .records_for_device(device)
+            .expect("the store answers")
+            .into_iter()
+            .filter(|record| record.is_active() && record.revoked_at_ms.is_none())
+            .filter(|record| record.grant.permits(ActionRight::VoiceUse))
+            .count()
+    }
+
     /// The account's callback ends the calls bound to the account and no other: a call on the
     /// owner's own key is the voice tick's, so the callback leaves it standing when the service
     /// says it is over, and the general sweep then ends it.
@@ -1443,6 +1459,10 @@ mod tests {
         .await;
         let coordinator = controller.voice().coordinator();
         assert_eq!(coordinator.live_sessions(), 2);
+        // The baselines are read once both calls stand: each call made a standing voice grant of
+        // its own device's, which the end of a call leaves.
+        let managed_grants = live_voice_grants(&controller, managed_device.device_id);
+        let own_grants = live_voice_grants(&controller, own_device.device_id);
 
         let callback = super::VoiceCalls {
             module: Arc::downgrade(controller.voice()),
@@ -1456,12 +1476,27 @@ mod tests {
         );
         assert_eq!(managed.closed(), 1, "the account's call ended");
         assert_eq!(own.closed(), 0, "the own-key call was not closed");
+        assert_eq!(
+            live_voice_grants(&controller, managed_device.device_id),
+            managed_grants - 1,
+            "the account call's grant is revoked"
+        );
+        assert_eq!(
+            live_voice_grants(&controller, own_device.device_id),
+            own_grants,
+            "the own-key call keeps its grant"
+        );
 
         coordinator
             .end_calls_that_are_over(controller.settled_now_ms())
             .await;
         assert_eq!(coordinator.live_sessions(), 0);
         assert_eq!(own.closed(), 1, "the general sweep ends the own-key call");
+        assert_eq!(
+            live_voice_grants(&controller, own_device.device_id),
+            own_grants - 1,
+            "the sweep revokes the own-key call's grant"
+        );
     }
 
     /// A call on the owner's own key that the provider closed, with no host call registered for
@@ -1493,6 +1528,7 @@ mod tests {
         let coordinator = module.coordinator();
         assert!(module.host_calls().is_empty());
         assert_eq!(coordinator.live_sessions(), 1);
+        let grants = live_voice_grants(&controller, device.device_id);
         assert!(
             module.needs_tick(),
             "a call the coordinator holds on the owner's own key needs the tick"
@@ -1501,6 +1537,11 @@ mod tests {
         module.tick(controller.settled_now_ms()).await;
         assert_eq!(coordinator.live_sessions(), 0);
         assert_eq!(own.closed(), 1);
+        assert_eq!(
+            live_voice_grants(&controller, device.device_id),
+            grants - 1,
+            "the call's grant is revoked"
+        );
         assert!(!module.needs_tick(), "nothing is left to watch");
     }
 }
