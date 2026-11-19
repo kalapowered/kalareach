@@ -63,6 +63,8 @@ fn caller() -> kr_worker::broker::Caller {
     kr_worker::broker::Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
         grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
     }
 }
 

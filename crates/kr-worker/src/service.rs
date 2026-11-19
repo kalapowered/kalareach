@@ -10666,6 +10666,8 @@ impl WorkerService {
             // identity the listener authenticated, and naming a grant nothing issued would be a
             // fact this host cannot check written into a token.
             grant_id: caller.grant_id.as_ref().copied(),
+            ingress: caller.ingress,
+            device_id: caller.device_id.as_ref().copied(),
         }
     }
 

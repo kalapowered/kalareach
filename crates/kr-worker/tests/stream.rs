@@ -287,6 +287,8 @@ impl World {
         kr_worker::broker::Caller {
             actor_id: kr_protocol::ids::ActorId::new("owner").expect("an actor"),
             grant_id: None,
+            ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+            device_id: None,
         }
     }
 

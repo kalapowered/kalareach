@@ -4895,17 +4895,33 @@ async fn an_answer_is_not_inserted_into_the_thread_the_agent_selected_after_aski
     .expect("encodes");
     let outcome = send(&mut client, prompt).await;
     assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
-    assert_eq!(
-        upstream.carried(),
-        vec![(
-            Some(thread),
+    let carried = upstream.carried();
+    let [
+        (
+            sent_to,
             UpstreamBody::Prompt {
-                draft_id: None,
-                text: Some(PROMPT.to_owned()),
-            }
-        )],
-        "the person's prompt is the one request the new thread was sent"
+                draft_id,
+                text,
+                sender,
+            },
+        ),
+    ] = carried.as_slice()
+    else {
+        panic!("the person's prompt is the one request the new thread was sent: {carried:?}");
+    };
+    assert_eq!(sent_to.as_ref(), Some(&thread));
+    assert_eq!(*draft_id, None);
+    assert_eq!(text.as_deref(), Some(PROMPT));
+    // The sender is what the host verified of the local caller: its operating-system identity,
+    // entering by local IPC, with no device and no grant.
+    assert!(
+        sender.actor_id.as_str().starts_with("local:"),
+        "{:?}",
+        sender.actor_id
     );
+    assert_eq!(sender.ingress, kr_protocol::actor::ActorIngress::LocalIpc);
+    assert_eq!(sender.device_id, None);
+    assert_eq!(sender.grant_id, None);
 
     // The fixture's shell ends only on end of input, on a signal or when the session closes it, and
     // nothing in this case sends the first two: the session is closed, and the case returns once the

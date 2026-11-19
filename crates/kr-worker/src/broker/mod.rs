@@ -59,6 +59,7 @@ pub mod capability;
 pub mod catalogue;
 #[cfg(feature = "testing")]
 pub mod channel_fixture;
+pub mod channel_prompt;
 pub mod channels;
 pub mod commands;
 pub mod component;

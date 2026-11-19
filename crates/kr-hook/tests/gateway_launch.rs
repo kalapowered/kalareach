@@ -385,6 +385,8 @@ fn kr_req_11_27_an_approval_the_terminal_left_unanswered_is_settled_when_its_con
             &kr_worker::broker::Caller {
                 actor_id: kr_protocol::ids::ActorId::new("device-1").expect("an actor"),
                 grant_id: None,
+                ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                device_id: None,
             },
             &kr_protocol::agent::AgentApprovalRespondParams {
                 target: kr_protocol::agent::AgentMutationTarget {
@@ -1344,6 +1346,8 @@ fn kr_req_11_33_a_rich_answer_to_an_approval_a_gateway_served_terminal_was_asked
             &kr_worker::broker::Caller {
                 actor_id: ActorId::new("owner").expect("an actor"),
                 grant_id: None,
+                ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                device_id: None,
             },
             &AgentApprovalRespondParams {
                 target: AgentMutationTarget {

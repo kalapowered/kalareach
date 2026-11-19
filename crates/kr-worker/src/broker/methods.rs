@@ -88,6 +88,8 @@ pub enum UpstreamBody {
         draft_id: Option<kr_protocol::ids::DraftId>,
         /// The text, when the prompt travels inline.
         text: Option<String>,
+        /// Who sent it, as the host verified it.
+        sender: crate::broker::channel_prompt::PromptSender,
     },
     /// Steering text for the turn the request names.
     Steer {
@@ -1028,6 +1030,10 @@ pub struct Caller {
     /// authenticated, and section 23 leaves its grant null. Manufacturing one to fill the field
     /// would name a grant nothing issued.
     pub grant_id: Option<GrantId>,
+    /// Where the request entered the host, as the host verified it.
+    pub ingress: kr_protocol::actor::ActorIngress,
+    /// The paired device the request came from, when it came from one.
+    pub device_id: Option<kr_protocol::ids::DeviceId>,
 }
 
 impl Broker {
@@ -1280,6 +1286,7 @@ impl Broker {
             UpstreamBody::Prompt {
                 draft_id: params.draft_id.as_ref().copied(),
                 text: params.text.as_ref().map(|text| text.as_str().to_owned()),
+                sender: crate::broker::channel_prompt::PromptSender::of(caller),
             },
             now,
         )?;
