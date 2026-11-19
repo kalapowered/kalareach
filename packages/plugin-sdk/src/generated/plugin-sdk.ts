@@ -306,6 +306,7 @@ export type Predicate1 =
         | 'native_bridge.install'
         | 'command_integration.launch'
         | 'launch.probe'
+        | 'skill_target.install'
       op: 'capability'
       /**
        * The state it must be in.
@@ -429,6 +430,7 @@ export type Predicate =
         | 'native_bridge.install'
         | 'command_integration.launch'
         | 'launch.probe'
+        | 'skill_target.install'
       op: 'capability'
       /**
        * The state it must be in.
@@ -773,6 +775,7 @@ export type PluginCapability =
   | 'native_bridge.install'
   | 'command_integration.launch'
   | 'launch.probe'
+  | 'skill_target.install'
 /**
  * A fact about the current presentation that a control can depend on.
  */
@@ -1227,6 +1230,7 @@ export interface CapabilityRequest {
     | 'native_bridge.install'
     | 'command_integration.launch'
     | 'launch.probe'
+    | 'skill_target.install'
   /**
    * Why the package needs it. Shown in the installation grant.
    */
@@ -2675,6 +2679,7 @@ export interface Control {
           | 'native_bridge.install'
           | 'command_integration.launch'
           | 'launch.probe'
+          | 'skill_target.install'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2841,6 +2846,7 @@ export interface Control {
           | 'native_bridge.install'
           | 'command_integration.launch'
           | 'launch.probe'
+          | 'skill_target.install'
         op: 'capability'
         /**
          * The state it must be in.
@@ -2993,6 +2999,7 @@ export interface Control1 {
           | 'native_bridge.install'
           | 'command_integration.launch'
           | 'launch.probe'
+          | 'skill_target.install'
         op: 'capability'
         /**
          * The state it must be in.
@@ -3159,6 +3166,7 @@ export interface Control1 {
           | 'native_bridge.install'
           | 'command_integration.launch'
           | 'launch.probe'
+          | 'skill_target.install'
         op: 'capability'
         /**
          * The state it must be in.
@@ -3299,6 +3307,7 @@ export interface Control2 {
           | 'native_bridge.install'
           | 'command_integration.launch'
           | 'launch.probe'
+          | 'skill_target.install'
         op: 'capability'
         /**
          * The state it must be in.
@@ -3465,6 +3474,7 @@ export interface Control2 {
           | 'native_bridge.install'
           | 'command_integration.launch'
           | 'launch.probe'
+          | 'skill_target.install'
         op: 'capability'
         /**
          * The state it must be in.
@@ -3605,6 +3615,7 @@ export interface Control3 {
           | 'native_bridge.install'
           | 'command_integration.launch'
           | 'launch.probe'
+          | 'skill_target.install'
         op: 'capability'
         /**
          * The state it must be in.
@@ -3771,6 +3782,7 @@ export interface Control3 {
           | 'native_bridge.install'
           | 'command_integration.launch'
           | 'launch.probe'
+          | 'skill_target.install'
         op: 'capability'
         /**
          * The state it must be in.

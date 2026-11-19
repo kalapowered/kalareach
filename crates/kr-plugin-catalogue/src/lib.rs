@@ -1487,6 +1487,18 @@ impl Catalogue {
         let home = self.root.clone();
         let began_on = enrolled.enrolment.root.clone();
         let accepted_targets = verified.accepted_targets(&enrolled.enrolment.targets_url)?;
+        // A document that lists a release requesting the skill-target capability is one a build
+        // before that capability cannot read, so the store's format is raised before the document
+        // is written and not by the row that names it: a store that is rolled back to such a build
+        // must be refused as soon as the document can be there.
+        if verified.index.entries.iter().any(|entry| {
+            entry
+                .capabilities
+                .iter()
+                .any(|request| request.capability == PluginCapability::SkillTargetInstall)
+        }) {
+            self.db.raise_format()?;
+        }
         // The index is written whole and flushed before the row that names it commits, in a
         // commit of its own: a document nothing names yet is what a later failure leaves behind,
         // and the receipt says so.

@@ -116,8 +116,8 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
         .expect("the ceiling is an array");
     assert_eq!(ceiling.len(), 3);
 
-    // Every release that asks for a native bridge or a command integration is the owner's to
-    // confirm, and the contract says so for each capability.
+    // Every release that asks for a native bridge, a command integration, a launch probe or a skill
+    // target is the owner's to confirm, and the contract says so for each capability.
     let confirmed: Vec<&str> = contract["capabilities"]
         .as_array()
         .expect("the capabilities are an array")
@@ -130,7 +130,8 @@ fn the_contract_table_carries_the_limits_and_the_vocabularies() {
         [
             "native_bridge.install",
             "command_integration.launch",
-            "launch.probe"
+            "launch.probe",
+            "skill_target.install"
         ]
     );
 
