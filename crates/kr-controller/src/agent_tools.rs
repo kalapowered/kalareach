@@ -302,6 +302,8 @@ pub struct Installer {
     home: PathBuf,
     /// Where this host records what it installed.
     records: PathBuf,
+    /// The folders this host keeps for its own files, which a declared place may not be inside.
+    host_folders: Vec<PathBuf>,
     /// The command an agent runs to reach the tools.
     executable: String,
     /// The skill target the one admitted package that names the requested word declares, which the
@@ -319,6 +321,7 @@ impl Installer {
     #[must_use]
     pub fn new(home: PathBuf, records: PathBuf, executable: String) -> Self {
         Self {
+            host_folders: declared::default_host_folders(&home, &records),
             home,
             records,
             executable,
@@ -326,6 +329,15 @@ impl Installer {
             known: Vec::new(),
             fs: Fs::Paths,
         }
+    }
+
+    /// Returns this installer refusing the places inside `folders` besides the four the host
+    /// keeps by default: its state, runtime, store and configuration folders as the host resolved
+    /// them for this process, wherever a variable put them.
+    #[must_use]
+    pub fn with_host_folders(mut self, folders: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.host_folders.extend(folders);
+        self
     }
 
     /// Returns this installer holding the declaration the service resolved for a request, and the
@@ -811,11 +823,27 @@ impl Installer {
             .iter()
             .map(|(name, _)| layout.skills.join(name))
             .collect();
+        // The folders as they are written and as the file system reaches them, and each place as it
+        // is written and as the selected root's actual location reaches it: a root or a folder
+        // that is a link into one of the host's folders is one of them.
+        let folders: Vec<PathBuf> = self
+            .host_folders
+            .iter()
+            .flat_map(|folder| [folder.clone(), declared::resolved(folder)])
+            .collect();
         for place in std::iter::once(layout.skills.as_path())
             .chain(files.iter().map(PathBuf::as_path))
             .chain(documents.iter().copied())
         {
-            if declared::inside_host_folders(&self.home, &self.records, place) {
+            let reached = match &self.fs {
+                Fs::Walk(walk) => walk.reached_by(place),
+                Fs::Paths | Fs::Absent(_) => None,
+            };
+            if declared::inside_host_folders(&folders, place)
+                || reached
+                    .as_deref()
+                    .is_some_and(|reached| declared::inside_host_folders(&folders, reached))
+            {
                 return Err(ControllerError::PermissionDenied {
                     detail: HOST_FOLDER.replace("{place}", &display(place)),
                 });
@@ -3972,12 +4000,12 @@ mod tests {
             "{message}"
         );
 
-        let removed = gone
-            .remove(&params(amp(), InstallScope::User))
-            .expect("removes");
+        let removed = gone.remove(&params(amp(), InstallScope::User));
         assert!(
-            !removed.removed.is_empty(),
-            "the record is what the removal works from"
+            removed
+                .as_ref()
+                .is_ok_and(|removed| !removed.removed.is_empty()),
+            "the record is what the removal works from, with no package: {removed:?}"
         );
         assert!(!tree.home().join(".amp/skills").join(SKILL_NAME).exists());
     }
@@ -4106,20 +4134,25 @@ mod tests {
             );
             let installer = tree.installer().with_declaration(Some(target), Vec::new());
             let request = params(amp(), InstallScope::User);
-            installer.install(&request).expect("installs");
-            let again = installer.install(&request).expect("installs again");
+            let installed = installer.install(&request);
             assert!(
-                again.already_installed,
-                "{format} in {name}: the entry reads back as written"
+                installed.is_ok(),
+                "{format} in {name}: the entry is written and read back by its key: {installed:?}"
             );
-            let removed = installer.remove(&request).expect("removes");
+            let again = installer.install(&request);
             assert!(
-                removed.removed.iter().any(|operation| matches!(
-                    operation,
-                    ChangeOperation::AddConfigurationEntry { .. }
-                )),
-                "{format} in {name}: {:?}",
-                removed.retained
+                again.as_ref().is_ok_and(|again| again.already_installed),
+                "{format} in {name}: the entry reads back as written: {again:?}"
+            );
+            let removed = installer.remove(&request);
+            assert!(
+                removed
+                    .as_ref()
+                    .is_ok_and(|removed| removed.removed.iter().any(|operation| matches!(
+                        operation,
+                        ChangeOperation::AddConfigurationEntry { .. }
+                    ))),
+                "{format} in {name}: the entry is removed by its key: {removed:?}"
             );
         }
     }
@@ -4133,6 +4166,44 @@ mod tests {
             "the packages this host admits changed while this request was read; ask again";
         assert_eq!(declared::admissions_held(7, Some(8)), Err(refusal));
         assert_eq!(declared::admissions_held(7, None), Err(refusal));
+    }
+
+    /// KR-REQ-11.01: the last read of the admissions, which comes after every check that reads the
+    /// file system, refuses a request whose admissions changed while those checks ran, and a
+    /// revision that cannot be read then; the same revision passes; and a word the host compiles in
+    /// was read under none, so nothing is read for it.
+    #[tokio::test]
+    async fn admissions_that_change_during_the_file_system_checks_refuse_the_request() {
+        let refusal =
+            "the packages this host admits changed while this request was read; ask again";
+        let live = std::cell::Cell::new(7_u64);
+        let read_at = Some(live.get());
+        // The checks that read the file system run, and the admissions change while they do.
+        let checks = || live.set(8);
+        checks();
+        assert_eq!(
+            declared::admissions_held_until_registration(read_at, async { Some(live.get()) }).await,
+            Err(refusal),
+            "a revision that moved during the checks"
+        );
+        live.set(7);
+        assert_eq!(
+            declared::admissions_held_until_registration(read_at, async { Some(live.get()) }).await,
+            Ok(()),
+            "admissions that stood still"
+        );
+        assert_eq!(
+            declared::admissions_held_until_registration(read_at, async { None }).await,
+            Err(refusal),
+            "a revision that cannot be read in time"
+        );
+        assert_eq!(
+            declared::admissions_held_until_registration(None, async {
+                panic!("a word read under no revision asks for none")
+            })
+            .await,
+            Ok(())
+        );
     }
 
     /// KR-REQ-11.01: the host reads the table of an admitted package for a declared word only where
@@ -4239,12 +4310,13 @@ mod tests {
     #[test]
     fn a_declared_word_is_refused_on_windows_by_name_and_not_elsewhere() {
         assert!(declared::platform_refusal(false).is_none());
-        let refusal = declared::platform_refusal(true).expect("a refusal");
         assert_eq!(
-            refusal,
-            "this host installs the contact skill for an agent that a package names on macOS and \
-             Linux only; on Windows it installs it for codex, claude-code, opencode, gemini-cli, \
-             kimi-code-cli and qoder-cli"
+            declared::platform_refusal(true),
+            Some(
+                "this host installs the contact skill for an agent that a package names on macOS \
+                 and Linux only; on Windows it installs it for codex, claude-code, opencode, \
+                 gemini-cli, kimi-code-cli and qoder-cli"
+            )
         );
     }
 
@@ -4255,6 +4327,7 @@ mod tests {
     fn a_declared_place_inside_each_of_the_hosts_own_folders_is_refused() {
         let home = Path::new("/home/someone");
         let records = Path::new("/home/someone/.local/state/kalareach/agent-tools");
+        let folders = declared::default_host_folders(home, records);
         for inside in [
             "/home/someone/.local/state/kalareach/x",
             "/home/someone/.cache/kalareach/run",
@@ -4263,13 +4336,13 @@ mod tests {
             "/home/someone/.Config/KalaReach/x",
         ] {
             assert!(
-                declared::inside_host_folders(home, records, Path::new(inside)),
+                declared::inside_host_folders(&folders, Path::new(inside)),
                 "{inside}"
             );
         }
         for outside in ["/home/someone/.config/other/x", "/home/someone/.amp/skills"] {
             assert!(
-                !declared::inside_host_folders(home, records, Path::new(outside)),
+                !declared::inside_host_folders(&folders, Path::new(outside)),
                 "{outside}"
             );
         }
@@ -4297,6 +4370,95 @@ mod tests {
                 "{folder:?}: nothing is written"
             );
         }
+    }
+
+    /// KR-REQ-11.01: the folders the host resolved for itself are its own wherever a variable put
+    /// them: a place inside its state, runtime, store or configuration folder is refused by name
+    /// when the variable that chose it moved the folder from its default, and a place beside it is
+    /// not.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_place_inside_a_host_folder_that_a_variable_moved_is_refused() {
+        // The folder each variable chose, under the home folder, and where a package might declare.
+        for (variable, inside) in [
+            ("XDG_STATE_HOME", [".kr-state", "kalareach"].as_slice()),
+            (
+                "XDG_RUNTIME_DIR",
+                [".kr-run", "kalareach", "sockets"].as_slice(),
+            ),
+            (
+                "XDG_DATA_HOME",
+                [".kr-data", "kalareach", "host"].as_slice(),
+            ),
+            ("XDG_CONFIG_HOME", [".kr-config", "kalareach"].as_slice()),
+        ] {
+            let tree = Tree::create();
+            let home = tree.home();
+            let folders = declared::resolved_host_folders(
+                &home.join(".kr-state/kalareach"),
+                &home.join(".kr-run/kalareach"),
+                Some(home.join(".kr-data/kalareach/host")),
+                Some(home.join(".kr-config/kalareach")),
+            );
+            let installer = |place: &[&str]| {
+                tree.installer()
+                    .with_host_folders(folders.clone())
+                    .with_declaration(Some(declared(None, place)), Vec::new())
+            };
+            let refused = installer(inside).install(&params(amp(), InstallScope::User));
+            let Err(ControllerError::PermissionDenied { detail }) = refused else {
+                panic!("{variable}: a refusal by name: {refused:?}");
+            };
+            assert!(
+                detail.contains("is inside a folder this host keeps for its own files"),
+                "{variable}: {detail}"
+            );
+            assert!(
+                !home.join(inside[0]).exists(),
+                "{variable}: nothing is written"
+            );
+            // The control: a folder beside the host's is the package's to name.
+            let beside = [inside[0], "other"];
+            let installed = installer(&beside).install(&params(amp(), InstallScope::User));
+            assert!(
+                installed.is_ok(),
+                "{variable}: a place beside it installs: {installed:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01: a selected project root that is a link into one of the host's folders is one
+    /// of them, so a place below it is refused although no component of its name says so, and
+    /// nothing is written where the link leads.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_root_that_links_into_a_host_folder_is_refused() {
+        use std::os::unix::fs::symlink;
+        let tree = Tree::create();
+        let host_folder = tree.home().join(".kr-state").join("kalareach");
+        std::fs::create_dir_all(&host_folder).expect("the host's folder");
+        let project = tree.root.join("project");
+        symlink(&host_folder, &project).expect("a link");
+        let mut target = declared(None, &[".amp", "skills"]);
+        target.project = target.user.clone();
+        let refused = tree
+            .installer()
+            .with_host_folders([host_folder.clone()])
+            .with_declaration(Some(target), Vec::new())
+            .install(&project_params(amp(), &project))
+            .expect_err("a root inside a host folder");
+        let ControllerError::PermissionDenied { detail } = refused else {
+            panic!("a refusal by name: {refused}");
+        };
+        assert!(
+            detail.contains("is inside a folder this host keeps for its own files"),
+            "{detail}"
+        );
+        assert_eq!(
+            std::fs::read_dir(&host_folder).expect("the folder").count(),
+            0,
+            "nothing is written where the link leads"
+        );
     }
 
     /// KR-REQ-11.01: a link at any component of a declared place is refused before the first

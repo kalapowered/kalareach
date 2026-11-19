@@ -105,8 +105,8 @@ impl Controller {
         }
         // A word the host does not compile in is resolved to the one admitted package that
         // declares it, here, after the lock and the look at what the host holds, and never before.
-        let installer = match self.resolve_declared(installer, &params, method).await {
-            Ok(installer) => installer,
+        let (installer, read_at) = match self.resolve_declared(installer, &params, method).await {
+            Ok(resolved) => resolved,
             Err(refusal) => return Given::fresh(Err(refusal)),
         };
         // What either change can refuse without touching anything, refused here: the platform, the
@@ -135,7 +135,7 @@ impl Controller {
         }
         Given::fresh(
             self.install_or_remove(
-                actor_id, mutation, method, carried, &params, &installer, &digest,
+                actor_id, mutation, method, carried, &params, &installer, &digest, read_at,
             )
             .await,
         )
@@ -155,6 +155,7 @@ impl Controller {
         params: &kr_protocol::skill::AgentToolsParams,
         installer: &crate::agent_tools::Installer,
         digest: &kr_protocol::scalars::Digest256,
+        read_at: Option<u64>,
     ) -> Result<ParamsValue> {
         // A change carrying no freshness at all is refused. This path answers its own retained
         // actions above, so anything still travelling is a first admission, and a first admission
@@ -199,6 +200,16 @@ impl Controller {
         // withdrawing a registration waits for it. The answer is the check every service asks from
         // inside its work: a fence this host owes and could not raise, the connection's
         // registration under the revision it was admitted at, then the deadline.
+        // The admissions are read once more here, after the checks that read the file system, so a
+        // package or a grant that changed while they ran refuses the request before the marker.
+        crate::agent_tools::declared::admissions_held_until_registration(read_at, async {
+            self.catalogue
+                .admission_revision_within(tokio::time::Instant::now() + DOCTOR_READS)
+                .await
+                .ok()
+        })
+        .await
+        .map_err(|refusal| ControllerError::InvalidArgument(refusal.to_owned()))?;
         self.under_registration(&carried, || {
             installer.mark_dispatching(actor_id, mutation.action_id, digest)
         })??;
@@ -220,26 +231,28 @@ impl Controller {
     /// compile in: the one admitted package, whose current admission's effective grants hold
     /// `skill_target.install`, whose verified connector table declares the word. A removal that
     /// has a record resolves no package: the record's operations alone decide. The admission
-    /// revision is read again at the end, so a grant or a package that changed while the packages
-    /// were read refuses the request before the dispatch marker; the time between that read and
-    /// the registration is the window that is left.
+    /// revision is read again at the end, and the revision the packages were read under comes back
+    /// with the installer to be read once more just before the registration, so a grant or a
+    /// package that changed while the packages were read, or while the file system was checked,
+    /// refuses the request before the dispatch marker; the time between that last read and the
+    /// registration is the window that is left. A word read under no revision comes back with none.
     async fn resolve_declared(
         &self,
         installer: crate::agent_tools::Installer,
         params: &kr_protocol::skill::AgentToolsParams,
         method: Method,
-    ) -> Result<crate::agent_tools::Installer> {
+    ) -> Result<(crate::agent_tools::Installer, Option<u64>)> {
         use crate::agent_tools::declared::{
             Declaration, admissions_held, holding_the_capability, platform_refusal, served,
         };
         if params.agent.compiled().is_some() {
-            return Ok(installer);
+            return Ok((installer, None));
         }
         if let Some(refusal) = platform_refusal(cfg!(windows)) {
             return Err(ControllerError::InvalidArgument(refusal.to_owned()));
         }
         if method == Method::AgentToolsRemove && installer.holds_record(params)? {
-            return Ok(installer);
+            return Ok((installer, None));
         }
         let unread = || {
             ControllerError::InvalidArgument(
@@ -284,6 +297,9 @@ impl Controller {
         });
         let declared = served(params.agent.as_str(), &declarations)
             .map_err(ControllerError::InvalidArgument)?;
+        // Read again here, so a change while the packages were read is refused before the checks
+        // that read the file system are spent on it; the same revision is read once more just
+        // before the registration.
         let now = self
             .catalogue
             .admission_revision_within(tokio::time::Instant::now() + DOCTOR_READS)
@@ -291,12 +307,38 @@ impl Controller {
             .ok();
         admissions_held(snapshot.revision, now)
             .map_err(|refusal| ControllerError::InvalidArgument(refusal.to_owned()))?;
-        Ok(installer.with_declaration(declared, known))
+        Ok((
+            installer.with_declaration(declared, known),
+            Some(snapshot.revision),
+        ))
     }
 
     /// Returns the installer, which keeps this host's record of what it wrote.
     pub(super) fn installer(&self) -> Result<crate::agent_tools::Installer> {
-        crate::agent_tools::Installer::discover(self.paths.state_dir())
+        Ok(
+            crate::agent_tools::Installer::discover(self.paths.state_dir())?
+                .with_host_folders(self.host_folders()),
+        )
+    }
+
+    /// The folders this host keeps for its own files, as it resolved them for this process.
+    fn host_folders(&self) -> Vec<std::path::PathBuf> {
+        use kr_protocol::hostinfo::configuration;
+
+        let mut folders = crate::agent_tools::declared::resolved_host_folders(
+            self.paths.state_root(),
+            self.paths.runtime_root(),
+            kr_ipc::install::Store::default_root(),
+            configuration::user_folder(),
+        );
+        // This environment's own configuration document is in its folder wherever that is.
+        let document = configuration::document_path(
+            self.paths.state_dir(),
+            self.paths.state_root(),
+            self.paths.environment_id(),
+        );
+        folders.extend(document.parent().map(std::path::Path::to_path_buf));
+        folders
     }
 
     pub(super) async fn host_info(self: &Arc<Self>) -> Result<HostInfoResult> {

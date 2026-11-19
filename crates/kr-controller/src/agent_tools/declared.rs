@@ -1,7 +1,7 @@
 //! Which package, if any, an agent word that the host does not compile in is declared by, and the
 //! places a declaration may not name.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use kr_plugin_sdk::skill_target::{COMPILED_WORDS, SkillTarget};
 
@@ -80,13 +80,27 @@ const ADMISSIONS_MOVED: &str =
     "the packages this host admits changed while this request was read; ask again";
 
 /// Whether the admissions are the ones the packages were read under: `now` is the revision read
-/// again just before the dispatch marker, none where it could not be read in time. A request
-/// whose admissions moved is refused before the marker; what is left is the time between this
-/// read and the registration of the action.
+/// again just before the registration of the action, none where it could not be read in time. A
+/// request whose admissions moved is refused before the marker; what is left is the time between
+/// this read and the registration.
 pub(crate) fn admissions_held(read_at: u64, now: Option<u64>) -> Result<(), &'static str> {
     match now {
         Some(revision) if revision == read_at => Ok(()),
         _ => Err(ADMISSIONS_MOVED),
+    }
+}
+
+/// The last check of a declared word's request, run after every check that reads the file system
+/// and immediately before the action is registered: the revision the packages were read under,
+/// `read_at`, against the revision `reread` reads now. A word the host compiles in was read under
+/// none, so `reread` is not asked for it.
+pub(crate) async fn admissions_held_until_registration(
+    read_at: Option<u64>,
+    reread: impl std::future::Future<Output = Option<u64>>,
+) -> Result<(), &'static str> {
+    match read_at {
+        Some(read_at) => admissions_held(read_at, reread.await),
+        None => Ok(()),
     }
 }
 
@@ -100,11 +114,73 @@ pub(crate) fn platform_refusal(on_windows: bool) -> Option<&'static str> {
     )
 }
 
-/// True when `place` is inside a folder this host keeps for itself: its state folder and the
-/// folders the host finds under the home folder. ASCII case is ignored, so a file system that
-/// does not tell `Kalareach` from `kalareach` is not a way round.
+/// The folders this host keeps for itself under the home folder when nothing moves them, and the
+/// folder its records are in: the four defaults of its state, runtime, store and configuration.
 #[must_use]
-pub(crate) fn inside_host_folders(home: &Path, records: &Path, place: &Path) -> bool {
+pub(crate) fn default_host_folders(home: &Path, records: &Path) -> Vec<PathBuf> {
+    let mut folders: Vec<PathBuf> = [
+        ".local/state/kalareach",
+        ".cache/kalareach/run",
+        ".local/share/kalareach/host",
+        ".config/kalareach",
+    ]
+    .iter()
+    .map(|folder| home.join(folder))
+    .collect();
+    if let Some(state) = records.parent() {
+        folders.push(state.to_path_buf());
+    }
+    folders
+}
+
+/// The folders this host keeps for its own files as it resolved them for this process, wherever
+/// a variable put them: its state root, its runtime root, its store, and the folder of its
+/// configuration where the platform keeps one apart from the state.
+#[must_use]
+pub(crate) fn resolved_host_folders(
+    state_root: &Path,
+    runtime_root: &Path,
+    store: Option<PathBuf>,
+    configuration: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut folders = vec![state_root.to_path_buf()];
+    folders.push(runtime_root.to_path_buf());
+    folders.extend(store);
+    folders.extend(configuration);
+    folders
+}
+
+/// `path` as the file system reaches it: the part of it that exists with every link resolved, and
+/// the rest as written. A host folder that is not there yet, or a place that is not, still has the
+/// location it will have.
+#[must_use]
+pub(crate) fn resolved(path: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        if let Ok(canonical) = std::fs::canonicalize(existing) {
+            return missing
+                .iter()
+                .rev()
+                .fold(canonical, |reached, name: &&std::ffi::OsStr| {
+                    reached.join(name)
+                });
+        }
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                existing = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// True when `place` is inside one of `folders`, the folders this host keeps for its own files.
+/// ASCII case is ignored, so a file system that does not tell `Kalareach` from `kalareach` is not a
+/// way round.
+#[must_use]
+pub(crate) fn inside_host_folders(folders: &[PathBuf], place: &Path) -> bool {
     let components = |path: &Path| -> Vec<String> {
         path.components()
             .filter_map(|component| match component {
@@ -114,19 +190,8 @@ pub(crate) fn inside_host_folders(home: &Path, records: &Path, place: &Path) -> 
             .collect()
     };
     let place = components(place);
-    let mut folders: Vec<Vec<String>> = [
-        ".local/state/kalareach",
-        ".cache/kalareach/run",
-        ".local/share/kalareach/host",
-        ".config/kalareach",
-    ]
-    .iter()
-    .map(|folder| components(&home.join(folder)))
-    .collect();
-    if let Some(state) = records.parent() {
-        folders.push(components(state));
-    }
     folders
         .iter()
-        .any(|folder| !folder.is_empty() && place.starts_with(folder))
+        .map(|folder| components(folder))
+        .any(|folder| !folder.is_empty() && place.starts_with(&folder))
 }

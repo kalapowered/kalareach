@@ -42,6 +42,8 @@ pub(crate) enum Expect {
 pub(crate) struct Anchor {
     root: Dir,
     path: PathBuf,
+    /// Where the root is, with every link on the way to it resolved, as it was when it was opened.
+    actual: PathBuf,
 }
 
 /// A place below the root, split into the folders on the way and the last name.
@@ -56,13 +58,35 @@ impl Anchor {
     /// own layout.
     pub(crate) fn open(root: &Path) -> Result<Option<Self>> {
         match Dir::open(root) {
-            Ok(handle) => Ok(Some(Self {
-                root: handle,
-                path: root.to_path_buf(),
-            })),
+            Ok(handle) => {
+                let actual = std::fs::canonicalize(root).map_err(storage)?;
+                // The location found is the folder that was opened, or the root moved in between
+                // and nothing below it is trusted.
+                let there = Dir::open(&actual).map_err(storage)?;
+                if there.identity() != handle.identity() {
+                    return Err(refused(format!(
+                        "{} changed while it was opened, so it is not written under",
+                        root.display()
+                    )));
+                }
+                Ok(Some(Self {
+                    root: handle,
+                    path: root.to_path_buf(),
+                    actual,
+                }))
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(storage(error)),
         }
+    }
+
+    /// Where `path`, a place below the selected root, is as the file system reaches it: the root's
+    /// actual location with the place's own components after it, or none for a path outside the
+    /// root.
+    pub(crate) fn reached_by(&self, path: &Path) -> Option<PathBuf> {
+        path.strip_prefix(&self.path)
+            .ok()
+            .map(|below| self.actual.join(below))
     }
 
     /// True when `path` is the selected root itself.

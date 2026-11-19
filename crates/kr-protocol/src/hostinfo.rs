@@ -1596,6 +1596,21 @@ pub mod configuration {
         state_dir.join(FILE_NAME)
     }
 
+    /// The folder every environment of this user keeps its configuration under, apart from the
+    /// state: `$XDG_CONFIG_HOME/kalareach` on Linux, or `~/.config/kalareach` where that variable
+    /// is not set. Where the platform keeps the configuration with the state there is none.
+    #[must_use]
+    pub fn user_folder() -> Option<std::path::PathBuf> {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            linux_config_root()
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            None
+        }
+    }
+
     #[cfg(all(unix, not(target_os = "macos")))]
     fn linux_config_root() -> Option<std::path::PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
