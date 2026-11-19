@@ -2512,7 +2512,8 @@ impl Store {
                     row.text,
                     as_i64(row.created_at_ms.get()),
                     as_i64(row.updated_at_ms.get()),
-                    row.agent_binding_revision.map(|value| as_i64(value.get())),
+                    row.agent_binding_revision
+                        .map(|value| identity_sql(value.get())),
                 ],
             )
             .map_err(TransferError::store)?;
@@ -2558,7 +2559,7 @@ impl Store {
                         updated_at_ms: timestamp(row.get(10)?),
                         agent_binding_revision: row
                             .get::<_, Option<i64>>(11)?
-                            .map(|value| AgentBindingRevision::new(from_i64(value))),
+                            .map(|value| AgentBindingRevision::new(identity_from_sql(value))),
                     })
                 },
             )
@@ -3924,11 +3925,13 @@ const fn from_i64(value: i64) -> u64 {
     if value < 0 { 0 } else { value as u64 }
 }
 
-/// Stores a filesystem identity as a signed integer without losing a bit.
+/// Stores a value that is compared for equality as a signed integer without losing a bit: a
+/// filesystem identity, or the binding revision a draft was written under.
 ///
-/// A device number or an inode uses the whole `u64` range, so the saturating conversion counts use
-/// for byte lengths would turn a valid identity into `i64::MAX` and make it compare unequal after a
-/// restart. The reinterpretation round-trips exactly.
+/// A device number or an inode uses the whole `u64` range, and a binding revision may too, so the
+/// saturating conversion counts use for byte lengths would turn a valid value into `i64::MAX` and
+/// make it compare unequal after a restart, or equal to another value. The reinterpretation
+/// round-trips exactly.
 const fn identity_sql(value: u64) -> i64 {
     value as i64
 }
@@ -4391,6 +4394,92 @@ mod tests {
             .expect("the row exists");
 
         assert_eq!(read.payload_identity, Some(extreme));
+    }
+
+    #[test]
+    fn a_binding_revision_survives_the_whole_range_of_the_journal() {
+        // A binding revision uses the whole `u64` range and is compared for equality. SQLite
+        // stores signed integers, so a conversion that clamps would keep two revisions above the
+        // signed maximum as the same value, and one that wraps to zero would lose them: each
+        // value must come back as itself after a reopen, be sent under itself, and be refused
+        // under every other value at the edges.
+        let application = ApplicationInstanceId::new(Uuid::from_bytes([0x0A; 16]));
+        let session = SessionId::new(Uuid::from_bytes([7; 16]));
+        let draft_id = DraftId::new(Uuid::from_bytes([3; 16]));
+        let signed_max = i64::MAX.unsigned_abs();
+        let edges = [
+            signed_max - 1,
+            signed_max,
+            signed_max + 1,
+            signed_max + 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for written in [signed_max, signed_max + 1, u64::MAX] {
+            let directory = tempfile::tempdir().expect("a temporary directory");
+            let path = directory.path().join("transfers.sqlite");
+            {
+                let mut store = Store::open(&path, environment()).expect("opens");
+                store
+                    .insert_draft(
+                        &DraftRow {
+                            draft_id,
+                            environment_id: environment(),
+                            actor_id: actor(),
+                            device_id: None,
+                            session_id: None,
+                            application_instance_id: Some(application),
+                            agent_binding_revision: Some(AgentBindingRevision::new(written)),
+                            revision: DraftRevision::new(1),
+                            state: DraftState::Open,
+                            text: "an edge".to_owned(),
+                            created_at_ms: TimestampMs::new(1000),
+                            updated_at_ms: TimestampMs::new(1000),
+                        },
+                        None,
+                        None,
+                    )
+                    .expect("writes");
+            }
+
+            let mut store = Store::open(&path, environment()).expect("reopens");
+            let kept = store
+                .draft(draft_id)
+                .expect("reads the draft")
+                .expect("the draft was kept");
+            assert_eq!(
+                kept.agent_binding_revision,
+                Some(AgentBindingRevision::new(written)),
+                "the revision {written} comes back as itself"
+            );
+            let prompt = |store: &mut Store, revision: u64| {
+                store.record_prompt(
+                    draft_id,
+                    session,
+                    application,
+                    AgentBindingRevision::new(revision),
+                    TimestampMs::new(2000),
+                )
+            };
+            for other in edges
+                .into_iter()
+                .chain([0, 1])
+                .filter(|other| *other != written)
+            {
+                let refused = prompt(&mut store, other)
+                    .expect_err("a draft is not sent under a revision that differs by any amount");
+                assert!(
+                    matches!(&refused, TransferError::DraftConflict { detail }
+                        if detail.contains(&format!("written under binding revision {written}"))),
+                    "{written} under {other}: {refused:?}"
+                );
+            }
+            let sent = prompt(&mut store, written);
+            assert!(
+                sent.is_ok(),
+                "the revision {written} records the draft: {sent:?}"
+            );
+        }
     }
 
     #[test]
