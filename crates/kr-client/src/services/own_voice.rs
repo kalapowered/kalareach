@@ -2336,7 +2336,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for HoldWrites<S> {
     }
 }
 
-struct WebSocketSideband<S> {
+struct WebSocketSideband<S = crate::wss::Io> {
     socket: tokio_websockets::WebSocketStream<HoldWrites<S>>,
     /// Messages a read ahead took, in the order they came, and not yet handed on. A closing
     /// frame or a failure the read ahead met is the last of them.
@@ -2525,7 +2525,8 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
             // A refused upgrade carries no recognised closure, so none of its statuses ends a
             // call: a 404 from a proxy or a route this host does not know is not OpenAI's word.
             .map_err(|_| AttachFault::Unavailable)?;
-            Ok(Box::new(WebSocketSideband::new(socket)) as Box<dyn SidebandSocket>)
+            Ok(Box::new(WebSocketSideband::<crate::wss::Io>::new(socket))
+                as Box<dyn SidebandSocket>)
         })
     }
 }
