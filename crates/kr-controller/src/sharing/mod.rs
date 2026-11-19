@@ -647,12 +647,13 @@ impl SharingService {
     pub fn revoke(
         &self,
         grant_id: GrantId,
+        scope: crate::grants::Scope,
         now_ms: u64,
         still_admitted: impl FnOnce() -> Result<()>,
         claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<GrantRevocation> {
         self.grants
-            .revoke_claimed(grant_id, now_ms, still_admitted, claim)
+            .revoke_claimed(grant_id, scope, now_ms, still_admitted, claim)
     }
 
     /// Lists the grants one issuer may see.

@@ -857,7 +857,7 @@ async fn a_revocation_names_every_held_grant_of_its_subtree_including_one_revoke
     // The child's revocation has committed and has not published its debt.
     controller
         .sharing()
-        .revoke(child, 2_000, || Ok(()), None)
+        .revoke(child, crate::grants::Scope::Host, 2_000, || Ok(()), None)
         .expect("the child is revoked");
 
     let before = revision(&controller).await;

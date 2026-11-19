@@ -81,6 +81,12 @@ impl Controller {
         claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
+        // The owner's revocation takes what traces to no root and marks what cannot be read; a
+        // paired device's takes the subtree it names and nothing else.
+        let scope = match audience {
+            Audience::Host => crate::grants::Scope::Host,
+            Audience::Device => crate::grants::Scope::Subtree,
+        };
         // The revocation writes its own fence debt inside the same transaction that revokes the
         // rows, so a failure afterwards leaves a record a retry can see. Nothing newly revoked is
         // not the same as nothing owed.
@@ -94,12 +100,15 @@ impl Controller {
                 self.check_admission(&registry, carried)?;
                 self.sharing.revoke(
                     grant_id,
+                    scope,
                     now_ms,
                     || self.check_admission(&registry, carried),
                     claim,
                 )?
             }
-            None => self.sharing.revoke(grant_id, now_ms, || Ok(()), claim)?,
+            None => self
+                .sharing
+                .revoke(grant_id, scope, now_ms, || Ok(()), claim)?,
         };
         let own = self.publish_debts(&Self::under_the_grants(&revocation));
         self.complete_revocation(
@@ -139,7 +148,9 @@ impl Controller {
     fn for_the_device_grants(
         revocation: &crate::grants::GrantRevocation,
     ) -> Vec<(crate::grants::store::DebtId, Reach)> {
-        if revocation.reached_holding_leases.len() < kr_protocol::worker::MAX_REVISION_REACH_NAMES {
+        if revocation.reached_holding_leases.len() < kr_protocol::worker::MAX_REVISION_REACH_NAMES
+            && !revocation.reaches_every_connection
+        {
             Self::under_the_grants(revocation)
         } else {
             revocation
@@ -164,6 +175,9 @@ impl Controller {
             .debt
             .into_iter()
             .map(|debt| {
+                if revocation.reaches_every_connection {
+                    return (debt, Reach::Host);
+                }
                 (
                     debt,
                     Reach::Grants {
@@ -271,7 +285,7 @@ impl Controller {
             // withdrew nothing — the paired device whose grant lives in its pairing record — then
             // the record below is the whole withdrawal, nothing is committed, and each wait
             // between here and it gets its own check.
-            let withdrew = !revocation.revoked.is_empty();
+            let withdrew = !revocation.revoked.is_empty() || revocation.debt.is_some();
             if !withdrew {
                 self.still_admitted(Some(&*registry), carried)?;
             }

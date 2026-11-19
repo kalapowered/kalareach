@@ -1107,7 +1107,13 @@ fn an_invitation_is_single_use_and_expires() {
     // Withdrawing an invitation is revoking the proposal it carries: the invitation says what
     // became of it, and nothing is left to fence because nothing was ever active.
     let withdrawn = service
-        .revoke(third.grant.grant_id, NOW + 5, || Ok(()), None)
+        .revoke(
+            third.grant.grant_id,
+            kr_controller::grants::Scope::Host,
+            NOW + 5,
+            || Ok(()),
+            None,
+        )
         .expect("withdrawn");
     assert_eq!(
         withdrawn.debt, None,
@@ -1621,7 +1627,13 @@ fn a_delegation_narrows_what_the_issuer_holds() {
 
     // Revoking the owner takes the delegation with it.
     let revocation = service
-        .revoke(owner.grant.grant_id, NOW + 10, || Ok(()), None)
+        .revoke(
+            owner.grant.grant_id,
+            kr_controller::grants::Scope::Host,
+            NOW + 10,
+            || Ok(()),
+            None,
+        )
         .expect("revoked");
     assert!(revocation.revoked.contains(&narrower.grant.grant_id));
 }

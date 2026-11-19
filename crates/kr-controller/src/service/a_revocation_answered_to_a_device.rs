@@ -182,7 +182,13 @@ async fn a_retry_of_an_unfinished_revocation_is_told_what_its_actor_may_know() {
         };
         controller
             .sharing()
-            .revoke(share.grant_id, now_ms + 1, || Ok(()), Some(&hold))
+            .revoke(
+                share.grant_id,
+                crate::grants::Scope::Subtree,
+                now_ms + 1,
+                || Ok(()),
+                Some(&hold),
+            )
             .expect("the share is withdrawn beside the claim");
         drop(hold);
 
