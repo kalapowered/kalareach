@@ -9291,11 +9291,12 @@ impl WorkerService {
                 if let Some(registered) = registered.as_ref() {
                     Self::check_action_rights(caller, &params.action, &registered.rights)?;
                     // A call names a pending request only when its action answers one. The rule
-                    // stands here, before a route is chosen, because the broker's own action
-                    // check is reached by every route but the presentation one: it runs on the
-                    // write path, and a presentation action is a read. One call here covers the
-                    // presentation, answer, host cancellation and component routes, on both passes
-                    // of a component action, before any of them reads the resource.
+                    // stands here, before a route is chosen, so that every route refuses it the
+                    // same way and none reads the resource first. The presentation and host
+                    // cancellation routes each refused a resource in their own words, and the
+                    // component route had no such rule. One call here covers the presentation,
+                    // answer, host cancellation and component routes, on both passes of a
+                    // component action.
                     crate::broker::Broker::check_resource_named(registered, &params)?;
                 }
                 // An action that answers a pending request through the connector table's decision
@@ -9396,18 +9397,6 @@ impl WorkerService {
                     &params,
                     kr_ipc::now_ms(),
                 )?;
-                // An answer names the pending resource it resolves. The broker checks that
-                // resource here with the checks its approval transaction makes: its owner, that
-                // it is still open, its deadline, its interpretation and everything the claim
-                // rechecks. A call naming a resource this instance cannot answer is then refused
-                // for that resource's own reason before anything is marked.
-                if let Some(resource_id) = params.resource_id.as_ref() {
-                    self.broker.check_resource_answerable(
-                        &params.target,
-                        *resource_id,
-                        kr_ipc::now_ms(),
-                    )?;
-                }
                 // An action the package's component prepares. Preparing it is a call to another
                 // process, so it is not made here, inside the boundary: this pass finds the action
                 // fit to be prepared and hands it back with the receipt still `accepted`, and the

@@ -3554,8 +3554,8 @@ async fn a_resource_named_on_an_action_that_answers_no_request_is_refused_before
 }
 
 /// KR-REQ-11.47: the rule that a call names a resource only for an action that answers one stands
-/// before every route, the presentation route included, which the broker's write-path check never
-/// reaches: a presentation action that names a pending resource is refused with the rule's own
+/// before every route, the presentation route included, which refused a resource in words of its
+/// own: a presentation action that names a pending resource is refused with the rule's own
 /// sentence, before the route that carries it out, and its receipt is a rejection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resource_named_on_a_presentation_action_is_refused_by_the_rule_before_its_route() {
@@ -4969,8 +4969,9 @@ async fn an_uncertain_action_of_a_replaced_package_does_not_hold_the_same_named_
         refresh_invocation_with(&host, request_id, window.clone(), plugin, Nullable::null())
     };
 
-    // The first package's action runs, and its outcome is left uncertain on disk, as a worker that
-    // stopped before it learned the outcome leaves it.
+    // The first package's action runs, and the case writes its receipt as uncertain. A
+    // presentation action never becomes uncertain in production; the hold reads only that state
+    // and the subject, so this is all the control and the retry below need.
     let uncertain = call(150, "kalareach/example-declarative");
     let uncertain_id = uncertain.action_id;
     assert!(
