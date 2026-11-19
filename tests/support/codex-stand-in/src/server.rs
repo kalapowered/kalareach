@@ -196,8 +196,10 @@ impl Server {
     /// session has no group to end, and ending it first is what leaves nothing for it to start.
     async fn finish(&mut self) -> ! {
         // Said first, where a test that wants to know the server ended its commands itself, and
-        // was not killed before it could, reads it.
-        eprintln!("stand-in: ending its commands");
+        // was not killed before it could, reads it. A reader that has gone does not stop the
+        // server before it ends them.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "stand-in: ending its commands");
         for started in &mut self.commands {
             let leader = started.child.id().and_then(|pid| i32::try_from(pid).ok());
             let _ = started.child.start_kill();
