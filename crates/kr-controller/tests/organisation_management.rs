@@ -2767,6 +2767,122 @@ async fn a_confirmation_answer_whose_owner_lease_ends_after_the_door_decided_it_
     finished.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// KR-REQ-17.54: the owner at the host asks for the confirmation of an invitation under a live
+/// lease, and the lease ends while the request's admission waits for the connection table inside
+/// the transaction that records it: the lease is asked after the admission, so the refusal is the
+/// door's own and no challenge is recorded. The control: where the lease stands, the challenge is
+/// recorded and listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_request_whose_owner_lease_ends_in_its_admission_records_no_challenge() {
+    let finished = ending_the_run_where_it_stops("the request stops inside the record");
+    for ends in [false, true] {
+        let fixture = Fixture::start().await;
+        let environment = fixture.host.environment_id;
+        let owner = OwnerDevice::of(&fixture).await;
+        let raw = a_host_whose_local_owner_holds_a_lease_of_ten_seconds(&fixture, &owner).await;
+        let mut client = fixture.host.client().await;
+        let (arrived, release) = fixture
+            .host
+            .controller()
+            .pause_inside_the_record_of_a_confirmation();
+        let asking =
+            tokio::spawn(
+                async move { calls::request(environment, &mut client, an_invitation()).await },
+            );
+        arrives(arrived, "the request reaches the record").await;
+        let (in_the_admission, release_the_admission) =
+            fixture.host.controller().pause_before_the_last_fence_read();
+        release.send(()).expect("the request goes on");
+        arrives(in_the_admission, "the request reaches its admission").await;
+        if ends {
+            fixture.pass(Duration::from_secs(11));
+        }
+        release_the_admission
+            .send(())
+            .expect("the admission goes on");
+        let asked = asking.await.expect("the request is answered");
+        let listed = pending_on(&raw).await.pending;
+        if ends {
+            let refused = asked.expect_err("a request whose lease ended in its admission");
+            let at_the_door = the_door_refusal_after_the_lease_ended(&fixture).await;
+            assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+            assert_eq!(
+                refused.message, at_the_door.message,
+                "the door's own words for that subject"
+            );
+            assert!(listed.is_empty(), "no challenge was recorded: {listed:?}");
+        } else {
+            asked.expect("the challenge is recorded where the lease stands");
+            assert_eq!(listed.len(), 1, "the control's challenge is listed");
+        }
+        raw.close();
+        fixture.host.stop().await;
+    }
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// KR-REQ-17.54: the owner at the host answers a challenge for an invitation with an owner
+/// device's proof under a live lease, and the lease ends while the answer's admission waits for the
+/// connection table inside the transaction that records it. The host refuses it with the door's
+/// words for that subject and records no answer: the same proof, sent again once a lease stands, is
+/// accepted. The control: where the lease stands, the answer is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmation_answer_whose_owner_lease_ends_in_its_admission_records_no_answer() {
+    let finished = ending_the_run_where_it_stops("the answer stops inside the record");
+    for ends in [false, true] {
+        let fixture = Fixture::start().await;
+        let environment = fixture.host.environment_id;
+        let owner = OwnerDevice::of(&fixture).await;
+        let raw = a_host_whose_local_owner_holds_a_lease_of_ten_seconds(&fixture, &owner).await;
+        let mut client = fixture.host.client().await;
+        let challenge = calls::request(environment, &mut client, an_invitation())
+            .await
+            .expect("the leased owner asks for the confirmation of an invitation");
+        let (proof, presented) =
+            calls::sign(&challenge.request, &Signer::OwnerDevice(&fixture.owner));
+        let (arrived, release) = fixture
+            .host
+            .controller()
+            .pause_inside_the_record_of_a_confirmation();
+        let answering = tokio::spawn({
+            let proof = proof.clone();
+            async move { calls::complete(environment, &mut client, proof, presented).await }
+        });
+        arrives(arrived, "the answer reaches the record").await;
+        let (in_the_admission, release_the_admission) =
+            fixture.host.controller().pause_before_the_last_fence_read();
+        release.send(()).expect("the answer goes on");
+        arrives(in_the_admission, "the answer reaches its admission").await;
+        if ends {
+            fixture.pass(Duration::from_secs(11));
+        }
+        release_the_admission
+            .send(())
+            .expect("the admission goes on");
+        let answered = answering.await.expect("the answer is told");
+        if ends {
+            let refused = answered.expect_err("an answer whose lease ended in its admission");
+            let at_the_door = the_door_refusal_after_the_lease_ended(&fixture).await;
+            assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+            assert_eq!(
+                refused.message, at_the_door.message,
+                "the door's own words for that subject"
+            );
+            // Nothing was recorded: a lease that stands again lets the same proof be answered.
+            fixture.lease_the_local_owner().await;
+            let mut again = fixture.host.client().await;
+            calls::complete(environment, &mut again, proof, presented)
+                .await
+                .expect("the proof is accepted where no answer was recorded");
+        } else {
+            answered.expect("the answer is recorded where the lease stands");
+        }
+        raw.close();
+        fixture.host.stop().await;
+    }
+    finished.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// A request for an owner confirmation records its challenge in a transaction that holds the
 /// record's lock, and a policy commit holds the policy's lock across its writes to the same
 /// record. A commit that takes the policy's lock while a request is inside the record neither
