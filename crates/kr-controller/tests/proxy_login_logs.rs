@@ -50,7 +50,6 @@ static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static DIRECTIVES: AtomicBool = AtomicBool::new(false);
 
 /// A subscriber that keeps every event it is let to see in memory.
-#[derive(Default)]
 struct Capture;
 
 struct Fields(String);
@@ -204,7 +203,7 @@ fn needles(secret: &str) -> Vec<(&'static str, String)> {
 /// either one's Basic form.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_log_holds_the_login_once_the_directives_are_applied() {
-    let installed = tracing::subscriber::set_global_default(Capture::default());
+    let installed = tracing::subscriber::set_global_default(Capture);
     installed.expect("this suite installs the only subscriber of its process");
     let relay = LocalRelay::spawn().await;
     let proxy = ConnectProxy::authenticating(USER, PASSWORD, "Basic realm=\"x\"").await;

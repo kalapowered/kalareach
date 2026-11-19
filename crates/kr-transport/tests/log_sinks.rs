@@ -67,7 +67,7 @@ fn approved() -> Vec<(&'static str, String, usize)> {
             "kr-controller/tests/proxy_login_logs.rs",
             concat!(
                 "let installed = tracing::subscriber::set_",
-                "global_default(Capture::default());"
+                "global_default(Capture);"
             )
             .to_owned(),
             1,
