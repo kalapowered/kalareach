@@ -216,8 +216,21 @@ impl Volume {
 
 impl Drop for Volume {
     fn drop(&mut self) {
-        if self.attached {
-            let _ = detach(&self.at);
+        if !self.attached {
+            return;
+        }
+        if let Err(said) = detach(&self.at) {
+            let report = format!(
+                "the filesystem attached at {} was not detached: {said}",
+                self.at.display()
+            );
+            // A second panic while the first unwinds would abort the whole test binary, so a case
+            // that has already failed says it here instead.
+            if std::thread::panicking() {
+                eprintln!("{report}");
+            } else {
+                panic!("{report}");
+            }
         }
     }
 }
@@ -463,4 +476,45 @@ fn disk_in(listing: &str, at: &Path) -> Option<String> {
             .collect();
         (!number.is_empty()).then(|| format!("/dev/disk{number}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Volume;
+
+    /// What a panic said, as text.
+    fn said(panic: &(dyn std::any::Any + Send)) -> String {
+        panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// A filesystem that does not come off fails the case that attached it, and a case that is
+    /// already failing says so on standard error and ends with its own failure.
+    #[test]
+    fn a_volume_that_does_not_detach_fails_the_case_that_attached_it() {
+        // Nothing is attached at this directory, so there is nothing to take off.
+        let nothing = crate::testing::PrivateTempDir::create();
+        let ended = std::panic::catch_unwind(|| {
+            drop(Volume {
+                at: nothing.path().to_path_buf(),
+                attached: true,
+            });
+        });
+        let ended = said(&*ended.expect_err("the volume fails the case that holds it"));
+        assert!(ended.contains("was not detached"), "{ended}");
+        let failing = std::panic::catch_unwind(|| {
+            let _volume = Volume {
+                at: nothing.path().to_path_buf(),
+                attached: true,
+            };
+            panic!("the case's own failure");
+        });
+        assert_eq!(
+            said(&*failing.expect_err("the case fails")),
+            "the case's own failure"
+        );
+    }
 }
