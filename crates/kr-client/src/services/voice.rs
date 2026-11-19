@@ -3067,27 +3067,18 @@ mod tests {
             );
         }
         assert!(
-            VoiceContextFrame::new(
-                "r",
-                VoiceCommand::Instructions,
-                None,
-                Some("a".repeat(VOICE_CONTEXT_BYTES))
-            )
-            .is_ok(),
+            VoiceContextFrame::new("r", VoiceCommand::Instructions, None, Some("a".repeat(500)))
+                .is_ok(),
             "exactly 500 bytes is taken"
         );
-        let refused = VoiceContextFrame::new(
-            "r",
-            VoiceCommand::Instructions,
-            None,
-            Some("a".repeat(VOICE_CONTEXT_BYTES + 1)),
-        )
-        .expect_err("501 bytes are refused");
-        assert!(
-            refused
-                .to_string()
-                .contains("an append is at most 500 UTF-8 bytes"),
-            "{refused}"
-        );
+        let refused =
+            VoiceContextFrame::new("r", VoiceCommand::Instructions, None, Some("a".repeat(501)))
+                .expect_err("501 bytes are refused");
+        let (code, message) = match refused {
+            ClientError::Host(error) => (error.code, error.message),
+            other => panic!("a refusal made here: {other}"),
+        };
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert_eq!(message, "an append is at most 500 UTF-8 bytes");
     }
 }
