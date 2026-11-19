@@ -65,16 +65,6 @@ fn assert_skipped(output: &str, names: &[&str], skipped: &str) {
     }
 }
 
-/// Asserts that the binary is unreadable, with the reader's one sentence.
-fn assert_unreadable(output: &str, names: &[&str]) {
-    let read = reading(output, names);
-    assert_eq!(
-        read.problem.as_deref(),
-        Some("a test said it returned early, and the output does not say which"),
-        "{output}"
-    );
-}
-
 /// A notice is a skip of the case it names wherever it stands in the output: inside the line the case
 /// is named on, after another case's verdict, on a line of its own, before the case's own verdict.
 #[test]
@@ -149,28 +139,28 @@ fn a_stood_down_notice_is_a_skip_of_the_case_it_names_wherever_it_stands_in_the_
 #[test]
 fn a_stood_down_notice_that_names_no_case_of_the_binary_leaves_it_unreadable() {
     let unnamed = notice("an unnamed case");
-    for (body, names) in [
+    // (g) a name that is no test of the binary.
+    let stranger = notice("not_a_test_here");
+    let outputs = [
         (
             format!("test a ... {unnamed}\nok\ntest b ... ok\n"),
             vec!["a", "b"],
         ),
         (format!("test a ... {unnamed}\nok\n"), vec!["a"]),
-    ] {
-        assert_unreadable(&binary(&body, &names), &names);
-    }
-    // (g) a name that is no test of the binary.
-    let stranger = notice("not_a_test_here");
-    assert_unreadable(
-        &binary(&format!("test a ... {stranger}\nok\n"), &["a"]),
-        &["a"],
-    );
-    assert_unreadable(
-        &binary(
-            &format!("test a ... {stranger}\nok\ntest b ... ok\n"),
-            &["a", "b"],
+        (format!("test a ... {stranger}\nok\n"), vec!["a"]),
+        (
+            format!("test a ... {stranger}\nok\ntest b ... ok\n"),
+            vec!["a", "b"],
         ),
-        &["a", "b"],
-    );
+    ];
+    for (body, names) in &outputs {
+        let output = binary(body, names);
+        assert_eq!(
+            reading(&output, names).problem.as_deref(),
+            Some("a test said it returned early, and the output does not say which"),
+            "{output}"
+        );
+    }
 }
 
 /// What a child of the case runs: a case that stands down, by the function the suites call.
