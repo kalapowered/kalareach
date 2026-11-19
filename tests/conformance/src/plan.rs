@@ -1585,7 +1585,7 @@ fn windows() -> Vec<Step> {
             ],
             "host::scripted::",
         ),
-        // The landing workflow runs these three with `--nocapture`, so that a case that could not
+        // The landing workflow runs these four with `--nocapture`, so that a case that could not
         // build what it needs says so; `--show-output` prints the same, under each test's name.
         Step::cargo(
             Group::Rust,
@@ -1608,6 +1608,20 @@ fn windows() -> Vec<Step> {
                 "--lib",
                 "--test",
                 "authority",
+            ],
+        ),
+        Step::cargo(
+            Group::Rust,
+            "the transfer service's uploads and downloads",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-transfer",
+                "--test",
+                "uploads",
+                "--test",
+                "downloads",
             ],
         ),
         // The one case that writes this machine's credential store is ignored in an ordinary run,

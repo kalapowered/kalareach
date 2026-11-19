@@ -80,6 +80,7 @@ the reference bridge over a real endpoint :: cargo test --locked -p kr-shell-int
 the repository boundary :: cargo test --locked -p kr-project --test boundary -- --show-output
 what an apply carries across :: cargo test --locked -p kr-changeset --test apply -- --show-output
 filesystem authority and access-control lists :: cargo test --locked -p kr-transfer --lib --test authority -- --show-output
+the transfer service's uploads and downloads :: cargo test --locked -p kr-transfer --test uploads --test downloads -- --show-output
 a collection key kept in this machine's credential store :: cargo test --locked -p kr-client --lib -- --ignored --exact sync::keys::tests::a_key_kept_in_the_platform_store_is_read_back_from_it_and_taken_away_again --show-output
 the persistence suite :: cargo test --locked -p kr-worker --test persistence -- --show-output
 the archive's cleanup of a crashed session :: cargo test --locked -p kr-controller --test archive -- --show-output
