@@ -467,8 +467,9 @@ impl Outcomes {
     /// Two records would otherwise share one identifier: the intent already submitted and the one
     /// arriving now. The book holds one record per action, so the first would be lost, and both
     /// requests would stay correlated to the same action, so whichever answered first would settle
-    /// the other's submission as well. Section 9 forbids forgetting an action, and an action whose
-    /// outcome is unknown or whose receipt has not finished is exactly one that must not be lost.
+    /// the other's submission as well. The book is how this client asks the host about an action,
+    /// and an action whose outcome is unknown or whose receipt has not finished is exactly one it
+    /// must still be able to ask about.
     fn refuse_replacement(&self, action_id: ActionId) -> Result<()> {
         // An action the host refused for now stays the client's to send again under its own
         // identifier: it is what the next send of it replaces.
@@ -523,8 +524,9 @@ impl Outcomes {
 
 /// How many of this client's actions may be unresolved at once.
 ///
-/// An unresolved action is one whose outcome nobody knows, and section 9 forbids forgetting one.
-/// The bound is what stops "never forget" becoming "grow for ever". A client reaches it through
+/// An unresolved action is one whose outcome this client has not seen settled, and it keeps one so
+/// that it can ask the host what became of it. The bound is what stops "keep every one" becoming
+/// "grow for ever". A client reaches it through
 /// accepted actions whose receipts have not settled as much as through a host it cannot reach, and
 /// either way submitting more would only add to the pile. A caller that knows an outcome is final
 /// frees its place with [`Session::settle`]. The actions the host refused for now
@@ -1038,7 +1040,8 @@ impl Session {
     /// must be able to ask about, and replacing it with a second set of parameters would lose that
     /// intent while leaving two requests correlated to one action, either of whose answers would
     /// then settle the other. One whose receipt this client already holds is refused for the same
-    /// reason. Section 9 forbids forgetting an action, and this is where that would happen. An
+    /// reason. The book is how this client asks the host about an action, and this is where it
+    /// would lose one. An
     /// action the host refused for now ([`Session::mutate`]) is the exception: the host decided
     /// nothing of it, and sending it again under its own identifier is how a client tries the
     /// same send again, which the host performs at most once. The same send goes out as it first
@@ -1207,7 +1210,8 @@ impl Session {
             Ok(Answer::Response(response)) => {
                 // Whether this action is settled was decided where the answer was routed, and it
                 // is not decided twice: an answer that says the outcome is unknown leaves the
-                // action on the unresolved list, and section 9 forbids forgetting one.
+                // action on the unresolved list, so that the client can ask the host what became
+                // of it.
                 match response.outcome {
                     Outcome::Error(error) => Err(refused_or_unknown(action_id, error)),
                     Outcome::Ok(value) => Ok(Settled::Result(value)),
@@ -1386,7 +1390,8 @@ impl Session {
     /// Reads what the host recorded of an action, and lets that record settle the action here.
     ///
     /// An action whose answer was lost, or whose answer said the host could not establish its
-    /// outcome, stays on the unresolved list: section 9 forbids forgetting it. A record that says
+    /// outcome, stays on the unresolved list so that the client can ask the host what became of
+    /// it, until its caller releases it ([`Session::settle`]). A record that says
     /// it was applied, refused or rejected is the host deciding what became of it, so the action
     /// leaves the list, as it would have had the answer come. A record that says less settles
     /// nothing, and an action its caller holds ([`Session::send`] and [`Session::repeat`]) stays
@@ -1413,11 +1418,11 @@ impl Session {
 
     /// Settles an action by the caller's word, once it has decided what the answers came to.
     ///
-    /// Only an action sent through [`Session::send`] or [`Session::repeat`] needs this: the
-    /// library settles every other action itself, as the host answers it.
-    ///
-    /// A caller may also release an action whose outcome the host could not establish, when it
-    /// knows that outcome is final: the transport the host used confirms nothing and will say
+    /// Two uses need this, and both are the caller's word. An action sent through
+    /// [`Session::send`] or [`Session::repeat`] is settled here, because the library settles every
+    /// other action itself, as the host answers it. And a caller may release an action whose
+    /// outcome the host could not establish, when it knows that outcome is final: the transport
+    /// the host used confirms nothing and will say
     /// nothing later, so no receipt will ever settle it. The release frees the place the action
     /// holds under [`MAX_UNRESOLVED_ACTIONS`]. The host's journal keeps the receipt as it was and
     /// still answers a repeat of the identifier with it; only this client's book lets go.
@@ -1896,9 +1901,9 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
             // A correlated answer settles the action *when it is definite*. Most are: the host
             // reached a decision about whatever the request carried, and settling it here rather
             // than in the caller means a caller that has gone away does not leave its action
-            // pending for ever. An answer that says the outcome is unknown is not a decision, and
-            // section 9 forbids forgetting one: the action stays on the unresolved list so the
-            // client can ask what became of it rather than assume. A transient refusal is not a
+            // pending for ever. An answer that says the outcome is unknown is not a decision: the
+            // action stays on the unresolved list so the client can ask what became of it rather
+            // than assume. A transient refusal is not a
             // decision either: the action stays, to be sent again under the same identifier.
             match word_of(&response) {
                 HostWord::Definite => state.outcomes.lock().await.settle(request_id),
