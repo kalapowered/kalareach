@@ -1097,6 +1097,15 @@ fn check_placement(
                         refusal.to_string(),
                     ));
                 }
+                // What an owner is shown of the placement is written from this table, so a label
+                // that cannot be quoted or a reading too long to show whole is refused here.
+                if let Err(refusal) = placement.statement(bridge) {
+                    report.push(Finding::at(
+                        FindingCode::ConnectorTableInvalid,
+                        CONNECTOR_FILE,
+                        refusal.to_string(),
+                    ));
+                }
             }
             None => report.push(Finding::at(
                 FindingCode::ConnectorTableInvalid,
@@ -1699,6 +1708,19 @@ fn check_bridge(manifest: &PluginManifest, bridge: &NativeBridge, report: &mut R
             MANIFEST_FILE,
             "the bridge's statement holds the words the host writes before its own reading of a \
              command integration",
+        ));
+    }
+    // The same holds for the label the host writes before its own reading of a placement.
+    if bridge
+        .grant_statement
+        .as_str()
+        .contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL)
+    {
+        report.push(Finding::at(
+            FindingCode::BridgeRecipeInvalid,
+            MANIFEST_FILE,
+            "the bridge's statement holds the words the host writes before its own reading of a \
+             placement",
         ));
     }
     if bridge.install.is_empty() {
