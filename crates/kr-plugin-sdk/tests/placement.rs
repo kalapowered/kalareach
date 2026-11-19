@@ -856,7 +856,7 @@ fn the_plugin_documentation_names_the_placement_declaration_and_what_is_not_plac
     let section = readme
         .split("### Placement")
         .nth(1)
-        .and_then(|rest| rest.split("\n## ").next())
+        .and_then(|rest| rest.split("\n#").next())
         .expect("the reference has a Placement section");
     for (what, words) in [
         ("the member", "`placement` member of its connector table"),
