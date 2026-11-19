@@ -3064,7 +3064,10 @@ struct Session<'a> {
 /// variant `leave-a-host` rewrites the environment's identity in the run's state and links
 /// another host's socket there, so a daemon is never started again over that tree.
 fn the_stand_in_leaves_the_runs_tree(variants: &str) -> bool {
-    !variants.split(',').any(|variant| variant == "leave-a-host")
+    !variants
+        .split(',')
+        .map(str::trim)
+        .any(|variant| variant == "leave-a-host")
 }
 
 /// Only the variants that change nothing of the run's tree allow a daemon to be started again.
@@ -3078,6 +3081,12 @@ fn a_stand_in_that_rewrites_the_runs_state_is_not_one_that_leaves_the_tree_as_it
         "answer-when-released,keep-reading,stay,leave-a-host"
     ));
     assert!(!the_stand_in_leaves_the_runs_tree("leave-a-host"));
+    assert!(!the_stand_in_leaves_the_runs_tree("stay, leave-a-host "));
+    assert!(!the_stand_in_leaves_the_runs_tree(" leave-a-host,stay"));
+    assert!(!the_stand_in_leaves_the_runs_tree(
+        "stay,\tleave-a-host\t,tick"
+    ));
+    assert!(the_stand_in_leaves_the_runs_tree(" stay , tick "));
 }
 
 /// The second person of a [`Session::open_two`], with the device's second connection.
