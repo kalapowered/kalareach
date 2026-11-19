@@ -447,21 +447,40 @@ fn whatever_the_flags_say_a_launch_admits_only_the_package_s_own_bridge() {
     assert!(connector.launch_bridge(&forwarder).is_none());
 }
 
-/// A native bridge the installation put in place for another application than the package's own is
-/// refused.
+/// KR-REQ-11.44: a native bridge the installation put in place is admitted for the application name
+/// its own registration recorded, whichever application the package's recipe is for, and the launch
+/// takes that bridge.
 #[test]
-fn an_installed_bridge_for_another_application_is_refused() {
-    let store = Store::new("elsewhere");
-    let mut source = store.package();
-    source
-        .bridge
-        .as_mut()
-        .expect("the installation put the bridge in place")
-        .application = "gemini-cli".to_owned();
-    let refusal = InstalledConnector::read(source)
-        .map(|connector| connector.plugin_id())
-        .expect_err("another application's bridge");
-    assert!(refusal.detail.contains("gemini-cli"), "{}", refusal.detail);
+fn kr_req_11_44_the_application_a_bridge_is_admitted_for_is_the_word_its_installation_recorded() {
+    for word in ["amp", "gemini-cli"] {
+        let store = Store::new("recorded");
+        let mut source = store.package();
+        source
+            .bridge
+            .as_mut()
+            .expect("the installation put the bridge in place")
+            .application = word.to_owned();
+        let connector = match InstalledConnector::read(source) {
+            Ok(connector) => connector,
+            Err(refusal) => panic!(
+                "{word}: the installed package is refused: {}",
+                refusal.detail
+            ),
+        };
+        let installed = connector.installed_bridge();
+        assert_eq!(
+            installed.as_ref().map(|bridge| bridge.application.as_str()),
+            Some(word),
+            "the installed bridge names the recorded word"
+        );
+        assert_eq!(
+            connector
+                .launch_bridge(&store.forwarder("bin/kr-hook"))
+                .map(|bridge| bridge.application),
+            Some(word.to_owned()),
+            "the launch takes that bridge"
+        );
+    }
 }
 
 /// A native bridge the package declares and the installation did not put in place leaves its

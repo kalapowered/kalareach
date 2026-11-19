@@ -236,8 +236,8 @@ impl InstalledConnector {
     /// # Errors
     ///
     /// Returns [`ConnectorRefusal`] naming the first thing that does not hold: the package carries
-    /// no table, the installation describes a native bridge the package does not declare, was not
-    /// granted or that is another application's, or its publisher is not one this host can record.
+    /// no table, the installation describes a native bridge the package does not declare or was not
+    /// granted, or its publisher is not one this host can record.
     pub fn assemble(
         source: ConnectorSource,
         package: kr_plugin_sdk::package::Package,
@@ -271,22 +271,6 @@ impl InstalledConnector {
                 return Err(ConnectorRefusal::new(format!(
                     "the native bridge installed for {plugin_id} names no application, no \
                      registration or no absolute forwarder"
-                )));
-            }
-            // A bridge admitted for a launch is for the application the package declares,
-            // whoever published the package and whatever it is called.
-            let declared = package
-                .manifest
-                .native_bridge
-                .as_ref()
-                .map(|recipe| recipe.application.as_str());
-            if declared.and_then(crate::broker::bridge::forwarder_application)
-                != Some(bridge.application.as_str())
-            {
-                return Err(ConnectorRefusal::new(format!(
-                    "the native bridge installed for {plugin_id} starts the forwarder for {:?}, \
-                     which is not the application the package declares",
-                    bridge.application
                 )));
             }
         }

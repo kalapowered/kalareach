@@ -57,26 +57,6 @@ use crate::broker::framing::Framing;
 /// bridge that is not going to send it.
 pub const BRIDGE_FRAME_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The applications this host names a native bridge for, each by the name a package's recipe gives
-/// it and the application name its forwarder reports.
-///
-/// The recipe's name is what the package declares; the forwarder's is what `kr-hook` carries in
-/// the hello of every connection its registration starts. A package, whoever publishes it and
-/// whatever it is called, may place a bridge for an application on this table and for no other,
-/// and its registration has to start the forwarder for the application it declares.
-pub const BRIDGE_APPLICATIONS: [(&str, &str); 2] =
-    [("Claude Code", "claude-code"), ("Gemini CLI", "gemini-cli")];
-
-/// Returns the application name the forwarder reports for the application a recipe declares, where
-/// the recipe's is one this host names a bridge for.
-#[must_use]
-pub fn forwarder_application(declared: &str) -> Option<&'static str> {
-    BRIDGE_APPLICATIONS
-        .iter()
-        .find(|(name, _)| *name == declared)
-        .map(|(_, reported)| *reported)
-}
-
 /// The registrations the installed forwarder, `kr-hook`, answers to: the application name it is
 /// started with, and the surface it is started for. A registration for any other pair starts a
 /// forwarder that refuses its command line, so the host places none. This stands until the
