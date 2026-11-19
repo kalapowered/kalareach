@@ -14,7 +14,7 @@
 mod teardown;
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use kr_controller::supervision::{LaunchOutcome, WorkerSupervisor};
 use kr_ipc::paths::EnvironmentPaths;
