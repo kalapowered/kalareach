@@ -704,6 +704,17 @@ pub struct ConnectorManifest {
     /// owner confirms says that every program the command starts gets the variables too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_variables: Option<Vec<crate::launch_variables::LaunchVariable>>,
+    /// The agent the package names, and where the host installs the KalaReach contact skill for it:
+    /// a word, and for the user scope, the project scope or both, a skills folder and at most one
+    /// configuration document, each below the home or the project folder. The rules of
+    /// [`crate::skill_target`] hold every part.
+    ///
+    /// A table that does not state it leaves the member out, so a connector written before the
+    /// member existed reads and hashes exactly as it did. A package that states it requests
+    /// `skill_target.install`, which the owner confirms on every release, and declares an
+    /// `sdk_range` that admits no SDK version before [`crate::skill_target::ARRIVAL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_target: Option<crate::skill_target::SkillTarget>,
     /// Whether the connector has a tested volatile forwarding mode.
     ///
     /// Without one it is not a resilient managed gateway, so this host serves no gateway for it:
@@ -959,6 +970,7 @@ mod tests {
             hook_events: None,
             placement: None,
             launch_variables: None,
+            skill_target: None,
             volatile_forwarding: false,
             qualification_note: Nullable(None),
         }

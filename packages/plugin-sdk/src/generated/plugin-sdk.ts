@@ -1574,6 +1574,18 @@ export interface ConnectorManifest {
    */
   routes: Route[]
   /**
+   * The agent the package names, and where the host installs the KalaReach contact skill for it:
+   * a word, and for the user scope, the project scope or both, a skills folder and at most one
+   * configuration document, each below the home or the project folder. The rules of
+   * [`crate::skill_target`] hold every part.
+   *
+   * A table that does not state it leaves the member out, so a connector written before the
+   * member existed reads and hashes exactly as it did. A package that states it requests
+   * `skill_target.install`, which the owner confirms on every release, and declares an
+   * `sdk_range` that admits no SDK version before [`crate::skill_target::ARRIVAL`].
+   */
+  skill_target?: SkillTarget | null
+  /**
    * How the broker reaches the upstream.
    */
   transport:
@@ -2356,6 +2368,77 @@ export interface Route {
    * The method name exactly as it appears on the wire.
    */
   wire_name: string
+}
+/**
+ * The agent a package names, and where the host installs the contact skill for it.
+ */
+export interface SkillTarget {
+  /**
+   * The places for an installation in one project's folder.
+   */
+  project?: SkillLocation | null
+  /**
+   * The places for the account's own installation.
+   */
+  user?: SkillLocation | null
+  /**
+   * The word `kr skill install --agent` takes: lower-case letters and digits in segments joined
+   * by one `-`, at most 32 bytes, not one of the six agents the host compiles in, not ending in
+   * `-user` or `-project`, and not ending in a segment of sixteen hexadecimal digits.
+   */
+  word: string
+}
+/**
+ * The places of one scope, each below the home folder or the project folder.
+ */
+export interface SkillLocation {
+  /**
+   * The configuration document the tool server's entry is added to, where there is one. A
+   * location with none installs the skill's files only.
+   */
+  configuration?: SkillConfiguration | null
+  /**
+   * The folder the skill's files go in, as plain components (one to three), the first of them
+   * hidden. The host writes `kalareach-contact` inside it.
+   */
+  skills: string[]
+}
+/**
+ * One configuration document and how the host writes its entry into it.
+ */
+export interface SkillConfiguration {
+  /**
+   * The deadline member the host writes into the entry, where the agent has one.
+   */
+  deadline?: Deadline | null
+  /**
+   * How the entry is written. A file name ending in `.toml` takes `codex_toml`, and one ending
+   * in `.json` takes the other two.
+   */
+  format: 'codex_toml' | 'json_command_args' | 'json_local_command_list'
+  /**
+   * The document, as plain components (one to three), the first of them hidden.
+   */
+  path: string[]
+  /**
+   * True when other agents read this document too, so that what the host writes there is the
+   * same for every installation and carries no deadline.
+   */
+  shared: boolean
+}
+/**
+ * The member of the entry that holds the agent's own deadline for the server.
+ */
+export interface Deadline {
+  /**
+   * The member's name: a letter, then letters, digits and `_`, at most 32 bytes, and not a member
+   * the host writes into the entry (`type`, `command`, `args`, `env`, `enabled`).
+   */
+  field: string
+  /**
+   * The unit the agent reads the member in.
+   */
+  unit: 'seconds' | 'milliseconds'
 }
 /**
  * One document node.
