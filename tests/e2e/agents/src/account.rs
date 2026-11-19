@@ -641,7 +641,7 @@ pub fn files_holding_any(root: &Path, values: &[&[u8]]) -> KeyScan {
 /// link count is not one is the same file under another name, possibly one of the person's, and is
 /// told as not scanned (which leaves the scan incomplete) and never read. The root is opened with no
 /// link followed at its last component, as a run's directory is; below it the links the harness
-/// makes ([`crate::stage::is_an_installation_link`]) are skipped, and any other link is told as not
+/// makes ([`crate::stage::installation_links`]) are skipped, and any other link is told as not
 /// scanned.
 ///
 /// # Panics
@@ -736,7 +736,7 @@ impl RunRules {
 
     /// Adds the links the pinned build makes in its own home, `home` relative to the run's
     /// directory: `home/tmp/arg0/codex-arg0<random>/<helper>` for the helpers it is known to make
-    /// ([`AGENT_HELPERS`]), when the link's own text is one of `executables`, the pinned executable
+    /// (`AGENT_HELPERS`), when the link's own text is one of `executables`, the pinned executable
     /// in the run's own installation, and nothing else. A link of any other name, in any other
     /// place, or saying anything else is counted.
     #[must_use]

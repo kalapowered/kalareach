@@ -478,7 +478,7 @@ impl Run {
     ///
     /// # Panics
     ///
-    /// Panics when no such process is in the process table within [`LIVENESS`].
+    /// Panics when no such process is in the process table within [`crate::LIVENESS`].
     #[must_use]
     pub fn worker_of(&self, session_id: &str) -> ProcessStartIdentity {
         let started = Instant::now();
@@ -773,7 +773,7 @@ impl Run {
         Ok(())
     }
 
-    /// Records the label each command line proposes ([`proposed_label`]).
+    /// Records the label each command line proposes (`proposed_label`).
     pub fn propose_jobs_from<'a>(&self, commands: impl IntoIterator<Item = &'a str>) {
         let mut labels = self
             .job_labels
@@ -1433,7 +1433,7 @@ fn parent_below(
 
 /// A directory of the run as the run placed it: its device and inode, and where below the run's
 /// directory it was. A program is started in it only through [`PlacedDirectory::place_for_a_start`],
-/// which reaches it by the walk of [`parent_below`] with no link followed and starts nothing where
+/// which reaches it by the walk of `parent_below` with no link followed and starts nothing where
 /// the directory is not the one that was placed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlacedDirectory {
@@ -1656,7 +1656,7 @@ fn directory_below(
 }
 
 /// Whether anything is at `relative` below the run's directory `root`, found by the walk of
-/// [`parent_below`] and looked at with no link followed: a link at the end is an entry, and a link
+/// `parent_below` and looked at with no link followed: a link at the end is an entry, and a link
 /// on the way, or anything else the walk refuses, is a [`Refusal`], so that nothing is looked at
 /// through it. Nothing is opened.
 ///
@@ -1671,7 +1671,7 @@ pub fn entry_below(root: &Path, pin: &RootPin, relative: &Path) -> Result<bool, 
 }
 
 /// The target of the symbolic link at `relative` below the run's directory `root`, read with no link
-/// followed, by the walk of [`parent_below`]; `Ok(None)` is a path that is not there, and an entry
+/// followed, by the walk of `parent_below`; `Ok(None)` is a path that is not there, and an entry
 /// that is no link is a [`Refusal`].
 ///
 /// # Errors
