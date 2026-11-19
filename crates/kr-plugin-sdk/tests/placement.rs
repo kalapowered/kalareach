@@ -746,3 +746,69 @@ fn the_longest_reading_of_a_placement_is_the_bound_and_one_more_is_refused() {
         "the bound is the longest reading"
     );
 }
+
+/// The plugin documentation names the placement declaration, each floor the host holds before it
+/// places a file, and what it does not check or place: each by its own words, in the section that
+/// describes the declaration and in the SDK page that dates it.
+#[test]
+fn the_plugin_documentation_names_the_placement_declaration_and_what_is_not_placed() {
+    let docs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/plugins");
+    let readme = std::fs::read_to_string(docs.join("README.md")).expect("the plugin reference");
+    let section = readme
+        .split("### Placement")
+        .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
+        .expect("the reference has a Placement section");
+    for (what, words) in [
+        ("the member", "`placement` member of its connector table"),
+        (
+            "plain components",
+            "one to three plain components under the account's home",
+        ),
+        ("no link", "follows no link in it"),
+        ("the default's link", "a person may keep as a link"),
+        (
+            "a copy of a default",
+            "package that copies a compiled default's layout",
+        ),
+        (
+            "another label's directory",
+            "the directory of another label's default is refused",
+        ),
+        (
+            "a folder the host makes",
+            "placed only into a folder the host makes",
+        ),
+        ("no repeated member", "JSON with no repeated member name"),
+        (
+            "the forwarder by its path",
+            "every member named `command` starts the forwarder",
+        ),
+        ("the placeholder", "by its placeholder"),
+        (
+            "text that names a place",
+            "a slash, a backslash, a colon, a tilde, a dollar sign or a backtick",
+        ),
+        (
+            "the residual",
+            "It does not check what the application does with the members that remain",
+        ),
+        ("the label", "The host's exact reading of the placement:"),
+        ("the range", "\">=0.1.9, <0.2.0\""),
+        ("no fallback", "never the application's own layout"),
+        (
+            "code is not placed",
+            "a placement of code waits on a ruling of its own",
+        ),
+    ] {
+        assert!(
+            section.contains(words),
+            "the Placement section does not say {what}: {words}"
+        );
+    }
+    let sdk = std::fs::read_to_string(docs.join("sdk.md")).expect("the SDK page");
+    assert!(
+        sdk.contains("The `placement` member of a connector table is in version 0.1.9."),
+        "the SDK page dates the member"
+    );
+}
