@@ -368,9 +368,10 @@ pub(crate) struct EstablishPauses {
     pub(crate) entered: std::sync::atomic::AtomicUsize,
     /// After the confirmation is chosen, before the clock is taken.
     pub(crate) before_the_transaction: SyncPause,
-    /// After the transaction has begun and holds the directory's connection, before the
-    /// registration is asked again.
-    pub(crate) after_the_connection: SyncPause,
+    /// Where the effect has been handed to its commit's guard, before the guard takes the
+    /// registration's hold, and before the clock trust state and the directory's connection are
+    /// taken.
+    pub(crate) before_the_registration_hold: SyncPause,
     /// Inside the commit's guard, after every row is written and checked, before the commit.
     pub(crate) inside_the_commit: SyncPause,
 }
@@ -1350,12 +1351,15 @@ impl OwnerAuthority {
     ///
     /// The challenges are held from the first read to the end, so two copies of one action meet
     /// at the record and the second is answered with the first's result, and a confirmation is
-    /// never spent by two effects. The transaction commits under `guarded`, which holds the
-    /// connection's registration standing through the commit. Inside it the signer's standing is
-    /// read again, a terminal proof needs the host to still have no owner, the action is claimed,
-    /// and the challenge is checked, without being consumed, to be still outstanding inside its
-    /// own deadline. A failure anywhere before the commit changes nothing and leaves the same
-    /// confirmation answered. Only after the commit is the challenge consumed from the ledger.
+    /// never spent by two effects. The whole effect runs under `guarded`, which takes the
+    /// connection's registration and holds it standing from before the clock trust state and the
+    /// directory's connection are taken to the end of the commit, and asks it once on the way in.
+    /// `admission` asks it again inside the transaction, after those waits and before anything is
+    /// written. Inside it the signer's standing is read again, a terminal proof needs the host to
+    /// still have no owner, the action is claimed, and the challenge is checked, without being
+    /// consumed, to be still outstanding inside its own deadline. A failure anywhere before the
+    /// commit changes nothing and leaves the same confirmation answered. Only after the commit is
+    /// the challenge consumed from the ledger.
     ///
     /// # Errors
     ///
@@ -1370,6 +1374,7 @@ impl OwnerAuthority {
         action: (ActionId, Digest256),
         boot: BootEpoch,
         guarded: &CommitFn,
+        admission: &dyn Fn() -> Result<()>,
         copied: &AtomicBool,
     ) -> Result<HostClockEstablishResult> {
         self.require_owner(caller)?;
@@ -1401,27 +1406,30 @@ impl OwnerAuthority {
         #[cfg(test)]
         self.pauses.before_the_transaction.wait();
         let lifetimes = self.rows.lifetimes();
-        let established = lifetimes.clock_trust().establish_with(
-            self.rows.directory(),
-            boot,
-            guarded,
-            |transaction, established| {
-                consume(
-                    transaction,
-                    lifetimes,
-                    self.rows.refusal(),
-                    &spendable.proof,
-                    "establish this host's clock",
-                    established,
-                    TerminalStanding::Bootstrap,
-                )?;
-                claim_effect(transaction, &claimed)?;
-                self.still_covers(&state, &spendable, &expectation)?;
-                #[cfg(test)]
-                self.pauses.inside_the_commit.wait();
-                Ok(())
-            },
-        );
+        let established = guarded(&mut || {
+            lifetimes.clock_trust().establish_with(
+                self.rows.directory(),
+                boot,
+                admission,
+                |transaction, established| {
+                    consume(
+                        transaction,
+                        lifetimes,
+                        self.rows.refusal(),
+                        &spendable.proof,
+                        "establish this host's clock",
+                        established,
+                        TerminalStanding::Bootstrap,
+                    )?;
+                    claim_effect(transaction, &claimed)?;
+                    self.still_covers(&state, &spendable, &expectation)?;
+                    #[cfg(test)]
+                    self.pauses.inside_the_commit.wait();
+                    Ok(())
+                },
+            )?;
+            Ok(())
+        });
         if let Err(error) = established {
             // What the attempt found owed to the record is written whether or not it committed.
             drop(state);

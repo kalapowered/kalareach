@@ -1516,12 +1516,12 @@ mod a_repeat_the_owner_authority_answers {
 
         let performed = AtomicBool::new(false);
         let first = owner
-            .establish_clock(&caller, action, boot, commit, &performed)
+            .establish_clock(&caller, action, boot, commit, &|| Ok(()), &performed)
             .expect("the clock is established");
         assert!(!performed.load(Ordering::Acquire));
         let copied = AtomicBool::new(false);
         let again = owner
-            .establish_clock(&caller, action, boot, commit, &copied)
+            .establish_clock(&caller, action, boot, commit, &|| Ok(()), &copied)
             .expect("the repeat is answered");
         assert_eq!(again, first);
         assert!(
@@ -1534,6 +1534,7 @@ mod a_repeat_the_owner_authority_answers {
             (action.0, Digest256::from_bytes([35; 32])),
             boot,
             commit,
+            &|| Ok(()),
             &reused,
         );
         assert!(is_id_conflict(&refused), "{refused:?}");

@@ -4,12 +4,13 @@
 //! lost clock continuity, and records its action, all in one transaction that commits while the
 //! connection's registration is held standing. The owner's confirmation, the registration, the
 //! fence this host may owe and the deadline the request was admitted under can each change while
-//! it waits for the clock or for the directory's connection, so these tests stop the effect at one
-//! of those waits, or inside its commit, with a pause of this host's own, change one thing, and let
-//! it go on.
+//! it waits for the clock or for the directory's connection, so these tests stop the effect before
+//! it takes either, or inside its commit, with a pause of this host's own, change one thing, and
+//! let it go on. One more case changes it after the commit's guard has asked and before the
+//! directory's connection is held, which the ask inside the transaction answers.
 
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kr_protocol::confirmation::{HostClockEstablishParams, HostClockEstablishResult};
@@ -20,6 +21,7 @@ use kr_protocol::method::Method;
 use super::an_owner_establishes_the_clock::{
     Door, code, confirmed_at, distrusting, paired, proven, registry,
 };
+use crate::service::net::devices::CommitFn;
 use crate::service::net::owner::Caller;
 
 /// Where the effect is stopped.
@@ -27,9 +29,9 @@ use crate::service::net::owner::Caller;
 enum At {
     /// After it chose the confirmation it spends, before it takes the clock and the directory.
     BeforeTheClock,
-    /// After it holds the directory's connection and its transaction, before it asks its
-    /// registration again.
-    AfterTheConnection,
+    /// After the effect is handed to its commit's guard, before the guard holds the registration
+    /// and asks it, and before the clock and the directory's connection are taken.
+    BeforeTheRegistrationHold,
 }
 
 /// What lapses while the effect waits.
@@ -56,7 +58,7 @@ async fn an_establishment_that_lapses_while_it_waits(at: At, lapse: Lapse) {
     let pauses = &controller.owner_authority().pauses;
     let (arrived, go) = match at {
         At::BeforeTheClock => pauses.before_the_transaction.arm(),
-        At::AfterTheConnection => pauses.after_the_connection.arm(),
+        At::BeforeTheRegistrationHold => pauses.before_the_registration_hold.arm(),
     };
     let attempt = tokio::spawn({
         let door = door.clone();
@@ -110,9 +112,9 @@ async fn an_establishment_that_lapses_while_it_waits(at: At, lapse: Lapse) {
 /// KR-REQ-09.19, KR-REQ-10.53: authority that lapses while an establishment waits is asked again
 /// where it commits. Waiting for the clock, a host that gains an owner no longer takes the
 /// terminal's confirmation, and a deadline that passed, a fence the host owes and a registration
-/// that was withdrawn each refuse the effect; so do the last three after the effect holds the
-/// directory's connection. Each leaves the clock distrusted and the owner's confirmation
-/// answered.
+/// that was withdrawn each refuse the effect; so do the last three when the effect waits to be
+/// handed to its guard, which asks the registration as it takes the hold. Each leaves the clock
+/// distrusted and the owner's confirmation answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn authority_that_lapses_while_the_establishment_waits_stops_it() {
     for (at, lapse) in [
@@ -120,9 +122,9 @@ async fn authority_that_lapses_while_the_establishment_waits_stops_it() {
         (At::BeforeTheClock, Lapse::TheDeadlinePasses),
         (At::BeforeTheClock, Lapse::AFenceIsOwed),
         (At::BeforeTheClock, Lapse::TheRegistrationIsWithdrawn),
-        (At::AfterTheConnection, Lapse::TheDeadlinePasses),
-        (At::AfterTheConnection, Lapse::AFenceIsOwed),
-        (At::AfterTheConnection, Lapse::TheRegistrationIsWithdrawn),
+        (At::BeforeTheRegistrationHold, Lapse::TheDeadlinePasses),
+        (At::BeforeTheRegistrationHold, Lapse::AFenceIsOwed),
+        (At::BeforeTheRegistrationHold, Lapse::TheRegistrationIsWithdrawn),
     ] {
         an_establishment_that_lapses_while_it_waits(at, lapse).await;
     }
@@ -130,12 +132,13 @@ async fn authority_that_lapses_while_the_establishment_waits_stops_it() {
 
 /// KR-REQ-09.19, KR-REQ-10.05: a confirmation has a short life on the host's own monotonic clock,
 /// and the effect asks it again where it commits. The owner's answer is chosen, the challenge runs
-/// out while the effect waits (at either wait), and the effect is refused as needing a
+/// out while the effect waits (at either stop, both before the clock and the directory are
+/// taken), and the effect is refused as needing a
 /// confirmation: nothing is written and the host still distrusts its clock. The control is a new
 /// confirmation inside its life, which establishes the clock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_confirmation_that_runs_out_while_the_establishment_waits_is_not_spent() {
-    for at in [At::BeforeTheClock, At::AfterTheConnection] {
+    for at in [At::BeforeTheClock, At::BeforeTheRegistrationHold] {
         let what = format!("{at:?}");
         let (temp, controller, ..) = distrusting().await;
         let door = Door::open(&temp, &controller).await;
@@ -144,7 +147,7 @@ async fn a_confirmation_that_runs_out_while_the_establishment_waits_is_not_spent
         let pauses = &controller.owner_authority().pauses;
         let (arrived, go) = match at {
             At::BeforeTheClock => pauses.before_the_transaction.arm(),
-            At::AfterTheConnection => pauses.after_the_connection.arm(),
+            At::BeforeTheRegistrationHold => pauses.before_the_registration_hold.arm(),
         };
         let attempt = tokio::spawn({
             let door = door.clone();
@@ -393,6 +396,11 @@ async fn two_copies_of_one_action_establish_the_clock_once() {
         revision,
         Some(door.accepted().deadline),
     );
+    let admission = controller.pairing_admission(
+        door.connection_id(),
+        revision,
+        Some(door.accepted().deadline),
+    );
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let digest = |ttl_ms: u64| {
         kr_protocol::digest::mutation_digest(
@@ -408,7 +416,12 @@ async fn two_copies_of_one_action_establish_the_clock_once() {
     };
     let boot = controller.boot_epoch;
     let establish = |ttl_ms: u64| {
-        let (owner, caller, guard) = (Arc::clone(&owner), caller.clone(), Arc::clone(&guard));
+        let (owner, caller, guard, admission) = (
+            Arc::clone(&owner),
+            caller.clone(),
+            Arc::clone(&guard),
+            Arc::clone(&admission),
+        );
         let action = (action_id, digest(ttl_ms));
         tokio::task::spawn_blocking(move || {
             owner.establish_clock(
@@ -416,6 +429,7 @@ async fn two_copies_of_one_action_establish_the_clock_once() {
                 action,
                 boot,
                 guard.as_ref(),
+                admission.as_ref(),
                 &std::sync::atomic::AtomicBool::new(false),
             )
         })
@@ -464,5 +478,98 @@ async fn two_copies_of_one_action_establish_the_clock_once() {
         spent, 1,
         "one confirmation was spent, and the second is still answered"
     );
+    assert!(proven(&controller));
+}
+
+/// KR-REQ-09.12, KR-REQ-09.19: the registration an establishment was admitted under is asked again
+/// inside the transaction, after the waits for the clock's state and the directory's connection.
+/// The commit's guard takes the hold and asks, and passes. The deadline the request was admitted
+/// under then passes while the directory's connection is held elsewhere, and the effect is refused
+/// when it gets the connection: nothing is written and the host still distrusts its clock. The
+/// control is the same confirmation, which the refusal left answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deadline_that_passes_after_the_guard_asked_stops_the_establishment_at_the_connection() {
+    // The failure bound of each wait of this case, which no sleep decides.
+    const BOUND: Duration = Duration::from_secs(60);
+
+    let (temp, controller, continuous, ..) = distrusting().await;
+    let door = Door::open(&temp, &controller).await;
+    let challenge = door.challenge().await;
+    door.answer(&challenge.request).await.expect("answered");
+
+    let owner = Arc::clone(controller.owner_authority());
+    let caller = Caller::local(door.actor_id().clone());
+    let revision = controller.admitted_revision(door.connection_id()).ok();
+    let deadline = Some(door.accepted().deadline);
+    let admission = controller.pairing_admission(door.connection_id(), revision, deadline);
+    let supplied = controller.pairing_guard(door.connection_id(), revision, deadline);
+    let (asked, asked_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go) = std::sync::mpsc::channel::<()>();
+    let (asked, go) = (Mutex::new(asked), Mutex::new(go));
+    // The supplied guard takes the hold and asks the registration, then runs what it is handed.
+    // What it is handed here says so, waits to be let go on, and then runs the effect.
+    let guard: Arc<CommitFn> = Arc::new(move |commit| {
+        supplied(&mut || {
+            asked
+                .lock()
+                .expect("the signal")
+                .send(())
+                .expect("the case is waiting");
+            go.lock()
+                .expect("the go")
+                .recv_timeout(BOUND)
+                .expect("the case lets the effect go on");
+            commit()
+        })
+    });
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let digest = kr_protocol::digest::mutation_digest(
+        &door.mutation(
+            Method::HostClockEstablish,
+            action_id,
+            30_000,
+            &HostClockEstablishParams {},
+        ),
+        door.actor_id(),
+    )
+    .expect("a digest");
+    let boot = controller.boot_epoch;
+    let attempt = tokio::task::spawn_blocking(move || {
+        owner.establish_clock(
+            &caller,
+            (action_id, digest),
+            boot,
+            guard.as_ref(),
+            admission.as_ref(),
+            &AtomicBool::new(false),
+        )
+    });
+
+    asked_rx
+        .recv_timeout(BOUND)
+        .expect("the guard took the hold and asked the registration");
+    // The connection is held here until the deadline has passed, so the effect reaches it, or
+    // waits for it, only after the registration has lapsed.
+    controller
+        .devices()
+        .with(|_| {
+            go_tx.send(()).expect("the effect goes on");
+            continuous.advance(Duration::from_secs(61));
+            Ok(())
+        })
+        .expect("the directory's connection is held");
+
+    let refused = attempt.await.expect("the effect ends");
+    assert_eq!(
+        code(refused.map_err(|error| error.to_protocol_error())),
+        ErrorCode::PermissionDenied
+    );
+    assert!(!proven(&controller), "the host still distrusts its clock");
+    assert_eq!(confirmed_at(&temp), None, "nothing was written");
+
+    let door = Door::open(&temp, &controller).await;
+    door.establish()
+        .await
+        .expect("the same confirmation establishes the clock");
     assert!(proven(&controller));
 }

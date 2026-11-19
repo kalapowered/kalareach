@@ -740,6 +740,10 @@ impl DeviceDirectory {
     /// with no record of how it was admitted, or a consumed invitation with no device. The
     /// transaction is taken `IMMEDIATE`, so its reads decide against the rows it then writes.
     ///
+    /// The connection is taken after the registration hold and the clock trust state, and before
+    /// the connection table (the lock order on `Controller::commit_hold`): a check `body` makes
+    /// reads published words and takes none of the locks that order puts before this one.
+    ///
     /// # Errors
     ///
     /// Returns whatever `body` returns, and a registry error when the transaction cannot begin or
@@ -758,48 +762,6 @@ impl DeviceDirectory {
         let value = body(&transaction)?;
         transaction.commit().map_err(ControllerError::registry)?;
         Ok(value)
-    }
-
-    /// Runs `body` inside one immediate transaction on this directory's connection, and commits
-    /// it inside `guarded`.
-    ///
-    /// `guarded` is handed the commit and runs it while it holds whatever must stay true from the
-    /// last check to the commit: an effect that is admitted by a connection's registration asks
-    /// for the registration to be held standing through the commit, so that a withdrawal is
-    /// ordered wholly before the check or wholly after the commit. The connection is taken before
-    /// `guarded` takes anything of its own, the order every write to this directory's pairing
-    /// records takes. `body` runs inside `guarded`, after the check.
-    ///
-    /// # Errors
-    ///
-    /// Returns what `guarded` and `body` return, and a registry error when the transaction cannot
-    /// begin or commit. Nothing is written unless it commits.
-    pub(crate) fn guarded_transaction<T>(
-        &self,
-        guarded: &CommitFn,
-        body: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
-    ) -> Result<T> {
-        let mut connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut transaction = Some(
-            connection
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(ControllerError::registry)?,
-        );
-        let mut body = Some(body);
-        let mut value = None;
-        guarded(&mut || {
-            let (Some(transaction), Some(body)) = (transaction.take(), body.take()) else {
-                return Err(ControllerError::registry(
-                    "a guarded transaction was committed twice",
-                ));
-            };
-            value = Some(body(&transaction)?);
-            transaction.commit().map_err(ControllerError::registry)
-        })?;
-        value.ok_or_else(|| ControllerError::registry("a guarded transaction did not commit"))
     }
 
     /// Records a completed pairing.
@@ -1628,7 +1590,7 @@ impl DeviceDirectory {
 }
 
 /// What runs a commit it is handed while it holds whatever must stay true from the last check to
-/// the commit (`DeviceDirectory::guarded_transaction`).
+/// the commit (`Controller::pairing_guard`).
 pub type CommitFn = dyn Fn(&mut dyn FnMut() -> Result<()>) -> Result<()> + Send + Sync;
 
 /// Clears the decision, both holds, and marks the moment the owner established the clock at.
