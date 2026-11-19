@@ -325,7 +325,7 @@ fn the_picker_scan_finds_a_plain_daemon_pick_and_only_that() {
     assert_eq!(found(r#"let all = ["CARGO_BIN_EXE_NAME"];"#), 0);
     assert_eq!(found(r#"let p = env!("CARGO_BIN_EXE_NAME-held");"#), 0);
     assert_eq!(found(r#"let p = beside_this_test("NAME-held");"#), 0);
-    assert_eq!(found(r#"let p = beside_this_test("kr-worker");"#), 0);
+    assert_eq!(found(r#"let p = beside_this_test("other");"#), 0);
     assert_eq!(found("// beside_this_test(\"NAME\")\nfn f() {}"), 0);
     assert_eq!(
         found(r#"fn beside_this_test(name: &str) -> PathBuf { }"#),

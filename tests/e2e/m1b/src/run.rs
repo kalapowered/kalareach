@@ -921,7 +921,7 @@ struct HeldJobs {
 
 /// Asks the service manager one question, with the answer bounded in time.
 fn launchctl(arguments: &[&str]) -> Result<std::process::Output, String> {
-    let mut command = kr_ipc::testing::account_launchd::command(arguments);
+    let command = kr_ipc::testing::account_launchd::command(arguments);
     output_within(command, SERVICE_MANAGER_BOUND)
 }
 
