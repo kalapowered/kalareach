@@ -279,13 +279,12 @@ export function useTerminalView(
     readonly sessionId: string
     readonly attempt: number
   } | null>(null)
-  // Whether this opening is asked to restore a place: the one kept when the pane was left, read as
-  // the opening begins.
-  const restoreAsked = useMemo(
-    () => showing && kept.read()?.anchor != null,
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- read afresh for each opening
-    [showing, scope, attempt, kept]
-  )
+  // The opening that was asked to restore a place: set by the opening itself, from the place it
+  // read, so it never disagrees with what the open call carried.
+  const [restoreOpening, setRestoreOpening] = useState<{
+    readonly sessionId: string
+    readonly attempt: number
+  } | null>(null)
   // The person's newest control request, with the opening it belongs to.
   const [askedControl, setAskedControl] = useState<{
     readonly sessionId: string
@@ -325,6 +324,8 @@ export function useTerminalView(
     // Read once: the place the pane was left at is this opening's to restore, and nothing it does
     // until it has a screen is a reason to ask for another.
     const restored = kept.read()
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the opening's own flag, set once from the place it read
+    setRestoreOpening(restored?.anchor != null ? { sessionId: scope, attempt } : null)
     const open: Opening = {
       place: restored ?? { anchor: null, live: null },
       liveNumber: null,
@@ -385,6 +386,8 @@ export function useTerminalView(
         (failure: unknown) => {
           if (!current) return
           open.ended = true
+          // A refused open ends the wait for the place as an ended channel does.
+          setSettledOpening({ sessionId: scope, attempt })
           stamps.current += 1
           setHeld({
             sessionId: scope,
@@ -411,6 +414,7 @@ export function useTerminalView(
         frameNow.current = null
       }
       setSettledOpening(null)
+      setRestoreOpening(null)
       // What this opening said ends with it: the next one starts from attaching. Its last frame is
       // kept, as the session's, until the next one has a screen of its own. Its moves go with it:
       // native code closed the view that would have settled them. Its control goes too: the next
@@ -654,7 +658,10 @@ export function useTerminalView(
     again,
     openingKey: `${scope}:${attempt}`,
     note: state?.state === 'showing' ? state.note : null,
-    restoring: restoreAsked && !(settledOpening?.sessionId === scope && settledOpening.attempt === attempt),
+    restoring:
+      restoreOpening?.sessionId === scope &&
+      restoreOpening.attempt === attempt &&
+      !(settledOpening?.sessionId === scope && settledOpening.attempt === attempt),
     shift: frame === null ? STILL : replay(frame, pending),
     room: frame === null || state?.state === 'ended' ? null : roomLeft(frame, pending),
     moving,

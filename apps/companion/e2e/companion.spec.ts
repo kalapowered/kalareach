@@ -449,18 +449,34 @@ test.describe('the terminal place note on a phone', () => {
         expect((inner?.x ?? 0) + (inner?.width ?? 0), `${what}: inside the window`).toBeLessThanOrEqual(360)
         expect(inner?.x ?? -1, `${what}: inside the window`).toBeGreaterThanOrEqual(0)
       }
-      for (const kind of ['gone', 'unavailable', 'different'] as const) {
-        await page.evaluate((note) => {
-          window.krTestHost?.terminalViews.at(-1)?.show(undefined, undefined, note)
-        }, kind)
-        await expect(page.getByTestId('terminal-place-note')).toHaveAttribute('data-kind', kind)
-        await fits(`${kind}, collapsed`)
+      const eachNote = async (when: string) => {
+        for (const kind of ['gone', 'unavailable', 'different'] as const) {
+          await page.evaluate((note) => {
+            window.krTestHost?.terminalViews.at(-1)?.show(undefined, undefined, note)
+          }, kind)
+          await expect(page.getByTestId('terminal-place-note')).toHaveAttribute('data-kind', kind)
+          await fits(`${kind}, ${when}`)
+        }
       }
+      await eachNote('collapsed')
+      // The badge follows the person's text size: its computed size at this scale is the scale times
+      // its size at 100%.
+      const badgeSize = () =>
+        page.getByTestId('terminal-place-note').evaluate((badge) => Number.parseFloat(getComputedStyle(badge).fontSize))
+      const scaled = await badgeSize()
+      await page.evaluate(() => {
+        document.documentElement.style.fontSize = '100%'
+      })
+      const plain = await badgeSize()
+      await page.evaluate((size) => {
+        document.documentElement.style.fontSize = size
+      }, scale)
+      expect(scaled, 'the badge grows with the text size').toBeCloseTo(plain * (Number.parseFloat(scale) / 100), 1)
       const more = page.getByRole('button', { name: 'More', exact: true })
       await expect(more).toBeVisible()
       await more.click()
       await expect(page.getByRole('button', { name: 'Less', exact: true })).toBeVisible()
-      await fits('expanded')
+      await eachNote('expanded')
       await page.screenshot({ path: shot(`terminal-note-13.03-${scale}-${test.info().project.name}`) })
     })
   }
