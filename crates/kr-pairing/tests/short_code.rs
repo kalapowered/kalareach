@@ -16,7 +16,7 @@ use kr_pairing::confirm::{
 use kr_pairing::grants::{GrantIdentities, GrantKind};
 use kr_pairing::host::{
     ApprovedCandidate, HANDSHAKE_DEADLINE_MS, HostIdentity, HostInvitation, InvitationProposal,
-    OwnerApproval, OwnerContext, StatusViewer, cancel_unfinished_invitations,
+    OwnerApproval, OwnerContext, ProvedOn, StatusViewer, cancel_unfinished_invitations,
     recover_candidate_status, recover_commitment,
 };
 use kr_pairing::identity::committed_device_id;
@@ -27,7 +27,9 @@ use kr_pairing::platform::{
 };
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
-use kr_protocol::ids::{ActorId, AuthorityRevision, DeviceId, DeviceKeyRevision, GrantId};
+use kr_protocol::ids::{
+    ActorId, AuthorityRevision, ConnectionId, DeviceId, DeviceKeyRevision, GrantId,
+};
 use kr_protocol::pairing::{
     ClientBundle, ConfirmationChannel, DeviceName, DevicePlatform, DevicePublicKeys,
     INVITATION_LIFETIME_MS, MAX_CONFIRMATION_FAILURES, NetworkConfig, OwnerConfirmationProof,
@@ -381,26 +383,68 @@ fn a_complete_pairing_commits_the_device_and_the_proposed_grant() {
         .expect("a commitment");
     assert_eq!(stored, committed);
     let peer = harness.client_peer();
-    assert!(matches!(
+    let proving = ConnectionId::new(Uuid::from_bytes([0xc1; 16]));
+    let another = ConnectionId::new(Uuid::from_bytes([0xc2; 16]));
+    let told = |peer: &TestLivePeer, proved: Option<ConnectionId>, asking: ConnectionId| {
         recover_candidate_status(
             &&harness.store,
             invitation_id,
             Some(committed.attempt_id),
-            &peer
-        ),
+            peer,
+            ProvedOn { proved, asking },
+        )
+    };
+    // The connection that proved the candidate is told what it became.
+    assert!(matches!(
+        told(&peer, Some(proving), proving),
         Ok(PairStatus::Committed { .. })
+    ));
+    // And only that connection: a second connection of the same endpoint is refused, and so is
+    // every connection once nothing remembers which one proved the candidate.
+    assert!(matches!(
+        told(&peer, Some(proving), another),
+        Err(PairingError::NotIssuingOwner)
+    ));
+    assert!(matches!(
+        told(&peer, None, proving),
+        Err(PairingError::NotIssuingOwner)
     ));
     // And only for that candidate, on its own endpoint.
     let impostor = TestLivePeer::new(EndpointKey::from_bytes([0x77; 32]));
     assert!(matches!(
-        recover_candidate_status(
-            &&harness.store,
-            invitation_id,
-            Some(committed.attempt_id),
-            &impostor
-        ),
+        told(&impostor, Some(proving), proving),
         Err(PairingError::NotIssuingOwner)
     ));
+}
+
+/// KR-REQ-10.31: a committed result is held by the connection that proved the candidate and by no
+/// other: equal connections hold it, different ones do not, and when nothing is known of the
+/// proving connection nobody does, not even a connection asking as itself.
+#[test]
+fn a_committed_result_is_held_only_by_the_proving_connection() {
+    let one = ConnectionId::new(Uuid::from_bytes([1; 16]));
+    let two = ConnectionId::new(Uuid::from_bytes([2; 16]));
+    assert!(
+        ProvedOn {
+            proved: Some(one),
+            asking: one
+        }
+        .holds()
+    );
+    assert!(
+        !ProvedOn {
+            proved: Some(one),
+            asking: two
+        }
+        .holds()
+    );
+    assert!(
+        !ProvedOn {
+            proved: None,
+            asking: one
+        }
+        .holds()
+    );
 }
 
 /// KR-REQ-10.31, KR-REQ-10.28: a successful PAKE locks the invitation to that candidate at once,

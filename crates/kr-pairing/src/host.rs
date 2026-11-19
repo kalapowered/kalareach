@@ -35,7 +35,9 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::secret::SymmetricKey;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{ActorId, AttemptId, DeviceId, DeviceKeyRevision, InvitationId};
+use kr_protocol::ids::{
+    ActorId, AttemptId, ConnectionId, DeviceId, DeviceKeyRevision, InvitationId,
+};
 use kr_protocol::pairing::{
     BundleMessageType, DevicePublicKeys, HostBundle, INVITATION_LIFETIME_MS,
     MAX_CONFIRMATION_FAILURES, NetworkConfig, OwnerConfirmationProof, OwnerConfirmationRequest,
@@ -1507,6 +1509,7 @@ pub fn recover_candidate_status(
     invitation_id: InvitationId,
     attempt_id: Option<AttemptId>,
     live_peer: &dyn LivePeer,
+    proved_on: ProvedOn,
 ) -> Result<PairStatus> {
     require_completed_handshake(live_peer)?;
     let endpoint = live_peer.live_endpoint()?;
@@ -1515,6 +1518,7 @@ pub fn recover_candidate_status(
     };
     if committed.client_keys.transport != endpoint
         || attempt_id.is_some_and(|attempt_id| committed.attempt_id != attempt_id)
+        || !proved_on.holds()
     {
         return Err(PairingError::NotIssuingOwner);
     }
@@ -1522,6 +1526,29 @@ pub fn recover_candidate_status(
         device_id: committed.device_id,
         grant_id: committed.grant.grant_id,
     })
+}
+
+/// The connection that proved a candidate, and the connection that is asking about it.
+///
+/// A committed result is told only on the connection that carried the candidate's proof. The proof
+/// was checked there, and nothing else about a connection from the same endpoint shows it is the
+/// device that was committed: a connection that cannot prove the key the device was committed
+/// under is refused, whatever endpoint it comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProvedOn {
+    /// The connection that carried the proof, when this host still knows it. After a restart, or
+    /// once the host has forgotten the invitation, it is `None` and no connection holds it.
+    pub proved: Option<ConnectionId>,
+    /// The connection that is asking.
+    pub asking: ConnectionId,
+}
+
+impl ProvedOn {
+    /// True when the asker is the connection that carried the proof.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        self.proved == Some(self.asking)
+    }
 }
 
 /// Returns 128 random bits.

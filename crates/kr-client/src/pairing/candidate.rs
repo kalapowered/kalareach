@@ -909,9 +909,9 @@ impl Pairing {
             // connection the device changes to a fresh one, which is no loss of contact and is not
             // shown as one; a connection that has no question left is let go.
             //
-            // A host that commits the device serves it no unpaired surface on a new connection, so
-            // the connection the device already has is then the only place to learn what it
-            // became. So the device changes to a fresh connection only once it has answered, and
+            // A host that commits the device tells only the connection that carried its proof what
+            // it became, so the connection the device already has is then the only place to learn
+            // it without the recovery. So the device changes to a fresh connection only once it has answered, and
             // keeps the last question on the old one while fresh connections fail, for the
             // connection's last call. Every step before the cutoff ends by the cutoff, the wait for
             // an answer and the rest after it included, so the device is free to ask that question
