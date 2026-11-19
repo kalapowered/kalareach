@@ -2881,14 +2881,33 @@ async fn a_start_whose_answer_is_lost_continues_under_the_answer_a_repeat_brings
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
     let timings = Timings {
-        host_within: Duration::from_millis(300),
+        // No bound of time decides this case: the host's answers to the first start are lost by
+        // the test's own control, its first question is held until the host has finished that
+        // start, and the later start's own answer decides what follows.
+        start_within: Duration::from_secs(600),
+        host_within: Duration::from_secs(600),
         ..asking_again()
     };
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
-    scene.stand_in.hold_creations();
+    scene.link.lose_the_answer_to(Some(HostMethod::VoiceStart));
+    scene.link.hold_request_after(1, HostMethod::VoiceStart);
 
     let asked_at = now_ms();
-    let started = scene.start().await;
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    scene.link.until_request_held().await;
+    scene
+        .link
+        .until_the_host_answers(1, HostMethod::VoiceStart)
+        .await;
+    scene.link.release_request();
+    let started = starting
+        .await
+        .expect("the start ran")
+        .expect("a call starts");
 
     assert!(
         started["value"].is_null(),
@@ -2930,10 +2949,17 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
         "{state}"
     );
 
-    // The record outlives the next call's opening, whatever that call comes to.
-    scene.stand_in.release_creations();
+    // The record outlives the next call's opening: the host has finished the first start, so the
+    // later start is answered by the host itself, and its answer is what the case waits for.
+    scene.link.lose_the_answer_to(None);
     let prepared = scene.prepared().await;
-    let _ = scene.call("voice_start", scene.start_request(&prepared));
+    let passed = scene
+        .call("voice_start", scene.start_request(&prepared))
+        .expect("the later start passes the hold");
+    assert!(
+        passed["value"]["outcome"]["started"].is_object(),
+        "{passed}"
+    );
     // A later start that passed the host's hold shows that the host read this one's request, but
     // not that it admitted it: the notice is hidden and the start is kept, so a later refusal
     // that names it can still be matched.
@@ -2981,12 +3007,31 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_names_an_earlier_start_only_when_this_device_keeps_it() {
     let timings = Timings {
-        host_within: Duration::from_millis(300),
+        // No bound of time decides this case: the host's answers to the first start are lost by
+        // the test's own control, its first question is held until the host has finished that
+        // start, and the named start's own answer decides what follows.
+        start_within: Duration::from_secs(600),
+        host_within: Duration::from_secs(600),
         ..asking_again()
     };
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
-    scene.stand_in.hold_creations();
-    let started = scene.start().await;
+    scene.link.lose_the_answer_to(Some(HostMethod::VoiceStart));
+    scene.link.hold_request_after(1, HostMethod::VoiceStart);
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    scene.link.until_request_held().await;
+    scene
+        .link
+        .until_the_host_answers(1, HostMethod::VoiceStart)
+        .await;
+    scene.link.release_request();
+    let started = starting
+        .await
+        .expect("the start ran")
+        .expect("a call starts");
     let earlier = started["action_id"]
         .as_str()
         .expect("the action")
@@ -3012,7 +3057,7 @@ async fn a_start_names_an_earlier_start_only_when_this_device_keeps_it() {
         "nothing was sent for the start that named nothing this device keeps"
     );
 
-    scene.stand_in.release_creations();
+    scene.link.lose_the_answer_to(None);
     let mut named = scene.start_request(&prepared);
     named["afterActionId"] = json!(earlier);
     let answered = scene
@@ -5248,21 +5293,46 @@ async fn an_earlier_kept_start_survives_a_later_one_declined_before_the_hold() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_the_hold_refused_whose_answer_was_lost_is_told_the_holds_refusal_when_it_asks_again()
  {
-    let mut scene = scene_with(asking_again(), Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let timings = Timings {
+        // No bound of time decides this case: the first start is answered by the host, the answer
+        // to the second start is lost by the test's own control, and its first question is held
+        // until the host has finished that start.
+        start_within: Duration::from_secs(600),
+        host_within: Duration::from_secs(600),
+        ..asking_again()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.stand_in.lose_creation_answers(true);
     let first = scene.start().await;
     let earlier = first["action_id"]
         .as_str()
         .expect("the start names its action")
         .to_owned();
+    assert_eq!(
+        scene.link.sent(HostMethod::VoiceStart),
+        1,
+        "the first start was sent once"
+    );
     // The second start reaches the host, which refuses it for the hold; the refusal is lost on the
     // way back, and the device asks again under the same action.
     scene
         .link
         .lose_only_the_answer_after(1, HostMethod::VoiceStart);
+    scene.link.hold_request_after(1, HostMethod::VoiceStart);
     let prepared = scene.prepared().await;
-    let held = scene
-        .call("voice_start", scene.start_request(&prepared))
+    let asking = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    scene.link.until_request_held().await;
+    scene
+        .link
+        .until_the_host_answers(2, HostMethod::VoiceStart)
+        .await;
+    scene.link.release_request();
+    let held = asking
+        .await
+        .expect("the start ran")
         .expect_err("the repeat is answered with the hold's refusal");
     assert_eq!(held["code"], "DRAFT_CONFLICT", "{held}");
     assert_eq!(held["start_again_for"], earlier.as_str(), "{held}");
