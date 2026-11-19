@@ -661,7 +661,7 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
             };
             let split = parts
                 .as_deref()
-                .map(|statement| split_install_statement(&grant, statement));
+                .map(|statement| split_install_statement(&grant, statement, false));
             Some(Particulars {
                 facts: installation_facts(plan)?,
                 notice: (!notices.is_empty()).then(|| notices.join(" ")),
