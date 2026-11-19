@@ -676,6 +676,12 @@ export interface FakeHostControls {
    * a host does that took the request and lost the receipt: nobody knows what became of the action.
    */
   leaveNextSendUnconfirmed(): void
+  /**
+   * Has the host answer the next approval of a package that confirms answers as a typed upstream
+   * does that took it and cannot tell what became of it: the request is held as uncertain, and the
+   * host's word is only the action's identity.
+   */
+  leaveNextApprovalUnconfirmed(): void
   /** How many composer sends the host has received, answered or held. */
   readonly submissions: number
   /** Hands the window a set of dropped files. */
@@ -1629,6 +1635,7 @@ export function fakeHost(
   let submissions = 0
   let heldSends: (() => void)[] | null = null
   let nextSendUnconfirmed = false
+  let nextApprovalUnconfirmed = false
   const readActions: string[] = []
   let releaseAttempts = 0
   let heldRelease: Promise<void> | null = null
@@ -2124,7 +2131,9 @@ export function fakeHost(
     approvalRespond: (params, opening) => {
       requireConnection()
       checkOpening('approvalRespond', params.target.subject.session_id, opening)
-      return Promise.resolve(records.respond(params))
+      const unconfirmed = nextApprovalUnconfirmed
+      nextApprovalUnconfirmed = false
+      return Promise.resolve(records.respond(params, unconfirmed))
     },
     pluginActionInvoke: (params, opening) => {
       requireConnection()
@@ -3695,6 +3704,9 @@ export function fakeHost(
     },
     leaveNextSendUnconfirmed() {
       nextSendUnconfirmed = true
+    },
+    leaveNextApprovalUnconfirmed() {
+      nextApprovalUnconfirmed = true
     },
     holdMutation() {
       const waiting: (() => void)[] = []

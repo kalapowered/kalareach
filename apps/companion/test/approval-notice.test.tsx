@@ -132,10 +132,13 @@ describe('the notice about approvals', () => {
     open((controls) => {
       controls.records.withoutCapability(SESSION_MAIN, 'agent.approval')
     }, false)
-    await screen.findByRole('tab', { name: 'Terminal' })
-    await waitFor(() => {
-      expect(screen.queryByRole('region', { name: 'Approvals' })).toBeNull()
+    // The request is read with the instance's capabilities, so once it is shown the notice has what
+    // it needs to appear, and its absence is a decision and not a page that has not read yet.
+    await screen.findByTestId('approval')
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0))
     })
+    expect(screen.queryByRole('region', { name: 'Approvals' })).toBeNull()
   })
 
   it('an_instance_that_carries_a_refusal_shows_it_in_the_notice', async () => {
