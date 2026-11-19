@@ -1244,6 +1244,33 @@ impl Account {
         root: &str,
         work: &str,
     ) -> Result<BTreeMap<String, String>, String> {
+        self.configuration_files(file, root, work, true)
+    }
+
+    /// [`Account::configuration_with_switches`] for a run that has no login: `file` holds the
+    /// switches as keys and none of the entry's own text, which names the provider the pinned build
+    /// is routed to, so a build given these files has no provider and no request of a model can
+    /// leave it. The entry's other files stay as they are.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the entry has no such file, a word has no key, or the result is not TOML.
+    pub fn configuration_without_provider(
+        &self,
+        file: &str,
+        root: &str,
+        work: &str,
+    ) -> Result<BTreeMap<String, String>, String> {
+        self.configuration_files(file, root, work, false)
+    }
+
+    fn configuration_files(
+        &self,
+        file: &str,
+        root: &str,
+        work: &str,
+        keep_the_entrys_text: bool,
+    ) -> Result<BTreeMap<String, String>, String> {
         let mut files = self
             .config_directory
             .as_ref()
@@ -1258,8 +1285,10 @@ impl Account {
         for (key, value) in self.switches_as_keys(root, work)? {
             text.push_str(&format!("{key} = {value}\n"));
         }
-        text.push('\n');
-        text.push_str(own);
+        if keep_the_entrys_text {
+            text.push('\n');
+            text.push_str(own);
+        }
         text.parse::<toml_edit::DocumentMut>()
             .map_err(|error| format!("{file} with the entry's switches is not TOML: {error}"))?;
         files.insert(file.to_owned(), text);
@@ -1895,6 +1924,42 @@ mod tests {
             "/w",
         );
         assert!(refused.expect_err("not TOML").contains("not TOML"));
+    }
+
+    /// A run with no login is given the switches as keys and none of the entry's own text, so the
+    /// build has no provider; the entry's other files stay.
+    #[test]
+    fn a_configuration_for_a_run_with_no_login_names_no_provider() {
+        let account: Account = serde_json::from_value(serde_json::json!({
+            "login": "l", "stored": "s", "home": "run", "budget": "b", "turns": 3,
+            "conversations": "sessions/{date}", "prompt_line": "p", "ready": "r",
+            "composer": "c", "submit": "\r", "clear": "x", "reply_line": "x",
+            "decision_line": "y", "busy": "b", "slash": { "input": "/p", "shows": "p" },
+            "interrupt": { "input": "e", "shows": "i" },
+            "approval": { "shows": "a", "allow": "y", "deny": "n" },
+            "resume": ["resume", "{conversation}"], "image": "paste",
+            "arguments": ["-a", "on-request"], "switches": [],
+            "config_directory": { "variable": "HOME_DIRECTORY", "files": {
+                "config.toml": "model_provider = \"local\"\n\n[model_providers.local]\nname = \"local\"\n",
+                "other.toml": "kept = true\n"
+            } }
+        }))
+        .expect("an account");
+        let with = account
+            .configuration_with_switches("config.toml", "/run", "/work")
+            .expect("a configuration");
+        assert!(with["config.toml"].contains("model_provider"), "{with:?}");
+        let without = account
+            .configuration_without_provider("config.toml", "/run", "/work")
+            .expect("a configuration with no provider");
+        let document: toml_edit::DocumentMut = without["config.toml"].parse().expect("TOML");
+        assert_eq!(document["approval_policy"].as_str(), Some("on-request"));
+        assert!(
+            document.get("model_provider").is_none() && document.get("model_providers").is_none(),
+            "the file names a provider: {}",
+            without["config.toml"]
+        );
+        assert_eq!(without["other.toml"], "kept = true\n");
     }
 
     /// The entry's switches against what the agent is given: each must be given, with its value, and
