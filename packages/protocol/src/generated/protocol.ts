@@ -3063,6 +3063,9 @@ export interface KalaReachProtocol {
   mutation_request?: MutationRequest
   named_approval_preview?: NamedApprovalPreview
   named_question_preview?: NamedQuestionPreview
+  network_proxy_login_clear_params?: NetworkProxyLoginClearParams
+  network_proxy_login_result?: NetworkProxyLoginResult
+  network_proxy_login_set_params?: NetworkProxyLoginSetParams
   node_output?: NodeOutput
   node_receipt_summary?: NodeReceiptSummary
   node_status?: NodeStatus
@@ -19376,6 +19379,8 @@ export interface MethodEntry {
     | 'delivery.destination.remove'
     | 'delivery.destination.list'
     | 'delivery.destination.secret.set'
+    | 'network.proxy_login.set'
+    | 'network.proxy_login.clear'
     | 'privacy.set'
     | 'privacy.status'
     | 'privacy.retained.delete'
@@ -19645,6 +19650,35 @@ export interface RequiredRight {
     | 'other_actor'
     | 'candidate_endpoint'
     | 'issuing_owner'
+}
+/**
+ * Parameters of `network.proxy_login.clear`.
+ */
+export interface NetworkProxyLoginClearParams {}
+/**
+ * The result of `network.proxy_login.set` and `network.proxy_login.clear`. It carries no login.
+ */
+export interface NetworkProxyLoginResult {
+  /**
+   * Whether the change applies when the daemon starts again, which it always does: a daemon
+   * that is running keeps the login it started with.
+   */
+  applies_at_next_start: boolean
+}
+/**
+ * Parameters of `network.proxy_login.set`.
+ */
+export interface NetworkProxyLoginSetParams {
+  /**
+   * The login, as a user name, a colon and a password. It splits at the first colon.
+   */
+  login: string
+  /**
+   * The proxy the login is for, as an origin: a scheme, a host and a port, with no user name,
+   * no password and nothing after them. The host uses the login only while the document names
+   * this proxy.
+   */
+  proxy: string
 }
 /**
  * One exact version of one change set.
@@ -28508,6 +28542,8 @@ export interface ServiceRequestPayload {
     | 'delivery.destination.remove'
     | 'delivery.destination.list'
     | 'delivery.destination.secret.set'
+    | 'network.proxy_login.set'
+    | 'network.proxy_login.clear'
     | 'privacy.set'
     | 'privacy.status'
     | 'privacy.retained.delete'

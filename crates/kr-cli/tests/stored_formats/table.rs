@@ -506,6 +506,8 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
             Method::DeliveryDestinationSecretSet,
             "DeliveryDestinationSecretSetResult",
         ),
+        (Method::NetworkProxyLoginSet, "NetworkProxyLoginResult"),
+        (Method::NetworkProxyLoginClear, "NetworkProxyLoginResult"),
         (Method::DevicePushRegister, "DevicePushRegisterResult"),
         (Method::OrganisationEnrol, "OrganisationEnrolResult"),
         (
@@ -538,8 +540,8 @@ pub fn table() -> Vec<Store> {
     use kr_controller::registry::LaunchPhase;
     use kr_protocol::{
         action, archive, attention, automation, catalogue, changeset, delivery, describe, desktop,
-        grant, hostinfo, identity, invitation, machine, mailbox, organisation, pairing, privacy,
-        project, push, session, sharing, skill, test_report, transfer, voice,
+        grant, hostinfo, identity, invitation, machine, mailbox, network_proxy, organisation,
+        pairing, privacy, project, push, session, sharing, skill, test_report, transfer, voice,
     };
 
     let mut stores = vec![
@@ -674,6 +676,7 @@ pub fn table() -> Vec<Store> {
                 protocol::<delivery::DeliveryDestinationSecretSetResult>(
                     "DeliveryDestinationSecretSetResult",
                 ),
+                protocol::<network_proxy::NetworkProxyLoginResult>("NetworkProxyLoginResult"),
                 protocol::<identity::EnvironmentEnrolResult>("EnvironmentEnrolResult"),
                 protocol::<identity::EnvironmentForgetResult>("EnvironmentForgetResult"),
                 protocol::<identity::EnvironmentRefreshResult>("EnvironmentRefreshResult"),

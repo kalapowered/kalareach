@@ -1342,6 +1342,12 @@ impl Controller {
                     self.delivery_destination_secret_set(mutation, carried)
                         .await
                 }
+                Method::NetworkProxyLoginSet => {
+                    self.network_proxy_login_set(mutation, carried).await
+                }
+                Method::NetworkProxyLoginClear => {
+                    self.network_proxy_login_clear(mutation, carried).await
+                }
                 Method::DeliveryDestinationConfigure => {
                     self.delivery_destination_configure(mutation, carried).await
                 }
@@ -1412,6 +1418,65 @@ impl Controller {
             recipients_can_read: kr_delivery::destination::DestinationKind::for_credential(kind)
                 .who_can_read()
                 .to_owned(),
+        })
+    }
+
+    /// Keeps the login the host's proxy asks for, in the host's secret store.
+    ///
+    /// The owner's own act at this machine, on the local socket alone. The proxy and the login are
+    /// checked for their shape, and the login goes to the store and nowhere else: not to the
+    /// registry, not to an answer, not to a log. The action is claimed and retained like every
+    /// authority change here, by a digest over the whole request, which covers a window
+    /// identifier this host never writes down. The admission is asked again under the registry
+    /// lock, which is held across the write, so a withdrawal that completes while this waited
+    /// stops it. The daemon that is running keeps the login it started with: the change is marked
+    /// for the doctor and applies at the next start.
+    async fn network_proxy_login_set(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let (item, name) = {
+            let (origin, line) = proxy_login_params(&mutation.params)?;
+            (
+                crate::service::net::proxy_login::item_bytes(&origin, line.expose()),
+                crate::service::net::proxy_login::item_name(self.paths.environment_id())
+                    .map_err(ControllerError::registry)?,
+            )
+        };
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        self.secret_store()
+            .set(&name, item.expose())
+            .map_err(ControllerError::registry)?;
+        drop(registry);
+        self.proxy_changed
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        encode(&kr_protocol::network_proxy::NetworkProxyLoginResult {
+            applies_at_next_start: true,
+        })
+    }
+
+    /// Removes the login the host's proxy asks for from the host's secret store, on the same terms
+    /// as [`Self::network_proxy_login_set`].
+    async fn network_proxy_login_clear(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        proxy_login_clear_params(&mutation.params)?;
+        let name = crate::service::net::proxy_login::item_name(self.paths.environment_id())
+            .map_err(ControllerError::registry)?;
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        self.secret_store()
+            .delete(&name)
+            .map_err(ControllerError::registry)?;
+        drop(registry);
+        self.proxy_changed
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        encode(&kr_protocol::network_proxy::NetworkProxyLoginResult {
+            applies_at_next_start: true,
         })
     }
 
@@ -3010,6 +3075,39 @@ pub(super) fn secret_params(
     params
         .to_typed()
         .map_err(|_| ControllerError::InvalidArgument(SECRET_PARAMS_REFUSAL.to_owned()))
+}
+
+/// The one refusal of parameters that do not read as `network.proxy_login.set`'s.
+const PROXY_LOGIN_PARAMS_REFUSAL: &str = "network.proxy_login.set takes the proxy as an origin \
+     with no user name or password, and a login of a user name, a colon and a password, where \
+     the user name is not empty and neither part has a control character or more than 255 bytes";
+
+/// The one refusal of parameters that do not read as `network.proxy_login.clear`'s.
+const PROXY_LOGIN_CLEAR_REFUSAL: &str = "network.proxy_login.clear takes no parameters";
+
+/// Reads the parameters of `network.proxy_login.set`: the proxy's canonical origin and the line of
+/// the login.
+///
+/// They carry a password, and a decoder's own account of what it could not read quotes what it was
+/// given, so every refusal here is one fixed sentence that repeats nothing the request carried.
+pub(super) fn proxy_login_params(
+    params: &ParamsValue,
+) -> Result<(String, kr_crypto::secret::SecretVec)> {
+    let refused = || ControllerError::InvalidArgument(PROXY_LOGIN_PARAMS_REFUSAL.to_owned());
+    let params: kr_protocol::network_proxy::NetworkProxyLoginSetParams =
+        params.to_typed().map_err(|_| refused())?;
+    let proxy: kr_transport::config::ProxyUrl = params.proxy.parse().map_err(|_| refused())?;
+    let line = kr_crypto::secret::SecretVec::new(params.login.expose().as_bytes().to_vec());
+    kr_transport::proxy::ProxyCredential::parse_line(&line).map_err(|_| refused())?;
+    Ok((proxy.to_string(), line))
+}
+
+/// Reads the parameters of `network.proxy_login.clear`, which has none.
+pub(super) fn proxy_login_clear_params(params: &ParamsValue) -> Result<()> {
+    params
+        .to_typed::<kr_protocol::network_proxy::NetworkProxyLoginClearParams>()
+        .map(|_| ())
+        .map_err(|_| ControllerError::InvalidArgument(PROXY_LOGIN_CLEAR_REFUSAL.to_owned()))
 }
 
 /// The one refusal of parameters that do not read as `delivery.destination.configure`'s.

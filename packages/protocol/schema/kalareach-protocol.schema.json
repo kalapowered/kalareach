@@ -22683,6 +22683,16 @@
           "type": "string"
         },
         {
+          "const": "network.proxy_login.set",
+          "description": "Keep a login for the given proxy in this host's secret store. No method answers it back or reads it. The daemon sends it from its next start, and only while network.proxy_url names that proxy.",
+          "type": "string"
+        },
+        {
+          "const": "network.proxy_login.clear",
+          "description": "Remove the proxy login kept in this host's secret store. The daemon that is running keeps the login it started with, and sends none from its next start.",
+          "type": "string"
+        },
+        {
           "const": "privacy.set",
           "description": "Turn privacy mode on or off for this environment, at the host itself: a paired device whose grant carries `host.manage` reads where it stands with `privacy.status`, and no paired device can turn it on or off. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
           "type": "string"
@@ -24183,6 +24193,44 @@
       "description": "One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.",
       "pattern": "^[!-~]{1,253}$",
       "type": "string"
+    },
+    "NetworkProxyLoginClearParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `network.proxy_login.clear`.",
+      "type": "object"
+    },
+    "NetworkProxyLoginResult": {
+      "additionalProperties": false,
+      "description": "The result of `network.proxy_login.set` and `network.proxy_login.clear`. It carries no login.",
+      "properties": {
+        "applies_at_next_start": {
+          "description": "Whether the change applies when the daemon starts again, which it always does: a daemon\nthat is running keeps the login it started with.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "applies_at_next_start"
+      ],
+      "type": "object"
+    },
+    "NetworkProxyLoginSetParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `network.proxy_login.set`.",
+      "properties": {
+        "login": {
+          "$ref": "#/$defs/SecretText",
+          "description": "The login, as a user name, a colon and a password. It splits at the first colon."
+        },
+        "proxy": {
+          "description": "The proxy the login is for, as an origin: a scheme, a host and a port, with no user name,\nno password and nothing after them. The host uses the login only while the document names\nthis proxy.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "proxy",
+        "login"
+      ],
+      "type": "object"
     },
     "NetworkSelection": {
       "additionalProperties": false,
@@ -45458,6 +45506,15 @@
     },
     "named_question_preview": {
       "$ref": "#/$defs/NamedQuestionPreview"
+    },
+    "network_proxy_login_clear_params": {
+      "$ref": "#/$defs/NetworkProxyLoginClearParams"
+    },
+    "network_proxy_login_result": {
+      "$ref": "#/$defs/NetworkProxyLoginResult"
+    },
+    "network_proxy_login_set_params": {
+      "$ref": "#/$defs/NetworkProxyLoginSetParams"
     },
     "node_output": {
       "$ref": "#/$defs/NodeOutput"

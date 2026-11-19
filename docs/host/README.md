@@ -363,6 +363,30 @@ What only the start can find out, a trust anchor file that is missing or empty o
 somebody else holds, stops the start with the key named, rather than leaving a host that appears to
 run and cannot be reached.
 
+### The proxy login
+
+A proxy that asks for a sign-in gets a user name and a password by HTTP Basic authentication and by
+no other method. The address in `network.proxy_url` names no user and no password. The login is kept
+in this host's secret store, under one item for the proxy the document names, and the daemon reads
+it once, when it starts. It is never in the document, a backup, an answer or a log.
+
+`kr host network --proxy-login --proxy-credential-file <file>` sends the login to the daemon, which
+is the only process that writes the store; `network.proxy_login.set` is the method it calls, and `kr
+host network --proxy-logout` calls `network.proxy_login.clear`. The file holds one line,
+`user:password` in UTF-8, split at the first colon; the user name is not empty, and neither part has
+a control character or more than 255 bytes. Both commands answer that the change applies when the
+daemon starts again: run `kr host stop` from outside a KalaReach session, and the daemon starts
+again at the next `kr new` when `kr host startup` chose `service` or `standalone`. A login stored
+for another proxy is not used.
+
+The daemon tries the proxy once when it starts, with one `CONNECT` to the first relay, Pkarr server
+or service address the document names. A proxy that asks for a login this host does not hold, that
+refuses the one it holds, or that asks for another sign-in method leaves the daemon running with its
+local socket, without its network, and `kr doctor` says which. After a refusal no process of the
+host sends the login again until the daemon starts again. The network library never holds the login:
+the endpoint reaches the proxy through a loopback forwarder that this host runs, and each tunnel the
+forwarder opens is the host's own `CONNECT`.
+
 ### Relay leases
 
 Relay usage is controlled by leases. A relay will only carry traffic between two endpoints if it

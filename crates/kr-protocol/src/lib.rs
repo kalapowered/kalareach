@@ -155,6 +155,7 @@ pub mod machine;
 pub mod mailbox;
 pub mod method;
 pub mod metrics;
+pub mod network_proxy;
 pub mod ordering;
 pub mod organisation;
 pub mod pairing;

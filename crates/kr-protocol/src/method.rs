@@ -449,6 +449,21 @@ methods! {
           secret store, under the destination's identifier. It is never answered back, and it \
           goes when the destination does.";
 
+    NetworkProxyLoginSet = "network.proxy_login.set", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Keep a login for the given proxy in this host's secret store. No method answers it \
+          back or reads it. The daemon sends it from its next start, and only while \
+          network.proxy_url names that proxy.";
+
+    NetworkProxyLoginClear = "network.proxy_login.clear", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Remove the proxy login kept in this host's secret store. The daemon that is running \
+          keeps the login it started with, and sends none from its next start.";
+
     PrivacySet = "privacy.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
     selectors: [Environment],
@@ -2210,6 +2225,9 @@ mod tests {
             "delivery.destination.secret.set",
             &[ActionRight::HostManage],
         ),
+        // The login a proxy asks for decides who is reached through it.
+        ("network.proxy_login.set", &[ActionRight::HostManage]),
+        ("network.proxy_login.clear", &[ActionRight::HostManage]),
         // Privacy mode: switching this host's retention, and reading what it kept and what left.
         ("privacy.set", &[ActionRight::HostManage]),
         ("privacy.status", &[ActionRight::HostManage]),
