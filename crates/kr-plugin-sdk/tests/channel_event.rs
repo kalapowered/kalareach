@@ -197,4 +197,84 @@ fn an_event_is_built_from_members_and_writes_each_place_once() {
         table.event(&route, &[(&inside_method, json!("other"))]),
         Err(EventError::Unwritable { .. })
     ));
+    let under_method = path(&["method", "name", "part"]);
+    assert!(matches!(
+        table.event(&route, &[(&under_method, json!("other"))]),
+        Err(EventError::Unwritable { .. })
+    ));
+}
+
+/// KR-REQ-12.26: an event carries no identifier. A member at the table's request-identifier path is
+/// refused, so the message cannot be taken for a request that waits for an answer.
+#[test]
+fn kr_req_12_26_an_event_refuses_a_member_at_the_tables_identifier_path() {
+    let table = channels();
+    let route = method("channel.event");
+    let content = path(&["params", "content"]);
+    let identifier = path(&["id"]);
+
+    assert!(matches!(
+        table.event(&route, &[(&content, json!("hi")), (&identifier, json!(7))]),
+        Err(EventError::Unwritable { .. })
+    ));
+    assert!(matches!(
+        table.event(&route, &[(&identifier, json!(7)), (&content, json!("hi"))]),
+        Err(EventError::Unwritable { .. })
+    ));
+}
+
+/// KR-REQ-12.26: the identifier's place is refused by path, so a member that is an object holding
+/// the place is refused too, whatever the object holds.
+#[test]
+fn kr_req_12_26_an_event_refuses_a_member_whose_object_holds_the_tables_identifier_path() {
+    let mut table = channels();
+    table.request_id_path = path(&["params", "id"]);
+    let route = method("channel.event");
+    let content = path(&["params", "content"]);
+    let meta = path(&["params", "meta"]);
+    let params = path(&["params"]);
+
+    assert!(matches!(
+        table.event(&route, &[(&params, json!({"id": 7}))]),
+        Err(EventError::Unwritable { .. })
+    ));
+    assert!(matches!(
+        table.event(&route, &[(&params, json!({}))]),
+        Err(EventError::Unwritable { .. })
+    ));
+    assert!(
+        table
+            .event(&route, &[(&content, json!("hi")), (&meta, json!({}))])
+            .is_ok()
+    );
+}
+
+/// KR-REQ-12.26: a member inside an object that another member gives is refused in either order,
+/// whatever the object holds, so the event written with empty values for the open check is
+/// refused for every pair of members that a prompt would refuse.
+#[test]
+fn kr_req_12_26_an_event_refuses_a_member_inside_the_object_of_another_member_in_either_order() {
+    let table = channels();
+    let route = method("channel.event");
+    let meta = path(&["params", "meta"]);
+    let inside_meta = path(&["params", "meta", "chat_id"]);
+
+    assert!(matches!(
+        table.event(
+            &route,
+            &[(&meta, json!({"sender": "a"})), (&inside_meta, json!("b"))]
+        ),
+        Err(EventError::Unwritable { .. })
+    ));
+    assert!(matches!(
+        table.event(&route, &[(&meta, json!({})), (&inside_meta, json!("b"))]),
+        Err(EventError::Unwritable { .. })
+    ));
+    assert!(matches!(
+        table.event(
+            &route,
+            &[(&inside_meta, json!("b")), (&meta, json!({"sender": "a"}))]
+        ),
+        Err(EventError::Unwritable { .. })
+    ));
 }

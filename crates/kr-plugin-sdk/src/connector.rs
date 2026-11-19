@@ -841,18 +841,21 @@ impl ConnectorManifest {
     /// An event is a message with no identifier and no reply: the table's method path carries the
     /// routed method as the wire spells it, and each member goes at its own path with its value as
     /// given. Nothing else goes in. The method must be one the table routes from the host to the
-    /// application, and a member cannot take the place of the method or of another member, so the
-    /// event is the table's own method with the values the caller supplied.
+    /// application. A member cannot take the place of the method, the table's request-identifier
+    /// path or another member, and none goes inside a value that another member gives, so the event
+    /// is the table's own method with the values the caller supplied and carries no identifier.
     ///
-    /// The paths are the table's and the package's to state, so a caller that has them in hand can
-    /// learn whether the table can write its event by writing it once with empty values.
+    /// Every refusal of a member depends on the paths alone, never on the values, and the package
+    /// check refuses a binding by the same overlap rule. A caller that has the paths in hand can
+    /// therefore learn whether the table can write its event by writing it once with empty values.
     ///
     /// # Errors
     ///
     /// Returns [`EventError::NotRouted`] when the table does not route the method from the host to
     /// the application, and [`EventError::Unwritable`] for a member the table cannot write: a path
     /// with no segments or an index segment, a place that is written twice, a place inside a value
-    /// that is already written, and the place of the method.
+    /// that is already written, the place of the method, a member that meets another member, and a
+    /// member that meets the table's request-identifier path.
     pub fn event(
         &self,
         method: &MethodName,
@@ -874,6 +877,26 @@ impl ConnectorManifest {
         for (path, value) in members {
             write_member(&mut event, path, value.clone()).map_err(unwritable)?;
         }
+        // The writer refuses every member that meets the method, which it wrote first as text. It
+        // does not know the identifier's place, and it writes into an object that an earlier
+        // member gave, so those two are refused by path, as the package check refuses them for
+        // bindings.
+        for (index, (path, _)) in members.iter().enumerate() {
+            if paths_overlap(path, &self.request_id_path) {
+                return Err(unwritable(
+                    "an event has no identifier, and a member meets the table's identifier path"
+                        .to_owned(),
+                ));
+            }
+            if members[index + 1..]
+                .iter()
+                .any(|(other, _)| paths_overlap(path, other))
+            {
+                return Err(unwritable(
+                    "two members meet, so one would be written inside the other".to_owned(),
+                ));
+            }
+        }
         Ok(event)
     }
 
@@ -888,9 +911,10 @@ impl ConnectorManifest {
 
 /// Writes one value at a path of member names, building the objects on the way.
 ///
-/// A path that reaches a value already written, or that names an array element, is refused: a
-/// message is built from nothing, so an index would leave the other elements to be invented, and a
-/// second write to one place would leave the first value unsent. The error is what stopped it.
+/// A path that ends at a value already written, that goes through a written value that is not an
+/// object, or that names an array element, is refused: a message is built from nothing, so an
+/// index would leave the other elements to be invented, and a second write to one place would
+/// leave the first value unsent. The error is what stopped it.
 fn write_member(
     root: &mut serde_json::Value,
     path: &FieldPath,
@@ -924,6 +948,26 @@ fn write_member(
     }
     object.insert(name, value);
     Ok(())
+}
+
+/// Returns true when two field paths cannot both be written into one message.
+///
+/// Two paths conflict when they name the same field, when one is inside the other, or when they
+/// disagree about what a shared prefix is. `params.0` and `params.name` need `params` to be both an
+/// array and an object, so writing both is not a thing a broker can do, and the package check and
+/// the event writer both say so rather than leaving it to find out.
+pub(crate) fn paths_overlap(left: &FieldPath, right: &FieldPath) -> bool {
+    for (one, other) in left.segments.iter().zip(&right.segments) {
+        if one == other {
+            continue;
+        }
+        return matches!(
+            (one, other),
+            (FieldSegment::Member { .. }, FieldSegment::Index { .. })
+                | (FieldSegment::Index { .. }, FieldSegment::Member { .. })
+        );
+    }
+    true
 }
 
 #[cfg(test)]
