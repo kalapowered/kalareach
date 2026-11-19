@@ -312,7 +312,7 @@ async fn a_call_whose_write_fails_beside_a_closure_on_the_socket_ends_as_the_pro
     assert_eq!(
         control.write(control.revision(), thinking()).await,
         Err(WriteRefusal::Lost),
-        "the write was made before the closure was read"
+        "the write is refused as lost"
     );
     settle().await;
     assert_eq!(
@@ -350,7 +350,7 @@ async fn a_call_whose_write_is_cancelled_beside_a_closure_on_the_socket_ends_as_
     assert_eq!(
         written,
         Err(WriteRefusal::Lost),
-        "the write was made before the closure was read"
+        "the write that never finished is refused as lost"
     );
     assert_eq!(
         gate.mode(),
