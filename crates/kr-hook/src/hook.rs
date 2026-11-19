@@ -347,8 +347,9 @@ fn observe(application: &Application, started: std::time::Instant) -> Result<(),
     if held.is_ok() {
         let _ = crate::helper::hand_over(REGISTRATION_WAIT, Some((started, HOOK_DEADLINE)));
     }
-    // However the run ends from here on, the application's write of its input completes: what
-    // ends the run without a report reads the input to its end first.
+    // However the work ends from here on, it reads the input to its end first, so the
+    // application's write completes. A run that reaches its deadline ends without the rest
+    // (`run_with`).
     let mut stdin = std::io::stdin().lock();
     if let Err(error) = held {
         return end_unreported(&mut stdin, error);
