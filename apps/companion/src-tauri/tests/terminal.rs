@@ -4540,30 +4540,16 @@ impl Page {
     }
 }
 
-/// The first of the view's next call and a `showing` state on `channel`. The watchdog of the call
-/// is the only bound: a screen that was shown first ends the wait at once.
+/// The first of the view's next call and a `showing` state on `channel`: the view holds its first
+/// screen until the place it was opened with is judged, so a case reads this and decides, in its
+/// own body, which came first. The watchdog of the call is the only bound: a screen that was shown
+/// first ends the wait at once.
 async fn first_of(page: &Page, channel: u32, link: &mut Link) -> First {
     tokio::select! {
         biased;
         state = page.first_screen(channel) => First::Screen(state),
         call = link.call() => First::Report(call),
     }
-}
-
-/// The report a view makes before it shows anything: the view holds its first screen until the
-/// place it was opened with is judged. A screen shown first fails here, on its own value.
-async fn held_report(
-    page: &Page,
-    channel: u32,
-    link: &mut Link,
-) -> (scripted_worker::Call, AttachmentViewportParams) {
-    let call = match first_of(page, channel, link).await {
-        First::Report(call) => call,
-        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
-    };
-    assert_eq!(call.method, Method::AttachmentViewport.to_string());
-    let asked = call.params();
-    (call, asked)
 }
 
 /// A pan of three columns, made as the page's move `number` after a `showing` state, and the report
@@ -4605,7 +4591,11 @@ async fn no_screen_is_published_until_the_restore_is_judged() {
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, _) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     link.answer(&restore, &viewport_answer(1)).await;
     frame(&mut link, &kept().revision(1)).await;
     let shown = first_showing(&page, 4).await;
@@ -4621,7 +4611,12 @@ async fn an_anchor_on_the_live_screen_is_asked_by_line_and_column() {
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &wide_session().at(2, 3)).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (_, asked) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
+    let asked: AttachmentViewportParams = restore.params();
     assert_eq!(asked.position.0, line_position(2));
     assert_eq!(asked.column.get(), 3);
 }
@@ -4667,7 +4662,11 @@ async fn a_restore_with_an_unknown_outcome_waits_for_a_screen() {
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, _) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     link.refuse_with(&restore, ErrorCode::OutcomeUnknown, "no word of it")
         .await;
     frame(&mut link, &kept().revision(1)).await;
@@ -4684,7 +4683,11 @@ async fn a_screen_that_arrived_before_an_unknown_answer_settles_the_restore() {
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, _) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     frame(&mut link, &kept().revision(1)).await;
     link.refuse_with(&restore, ErrorCode::OutcomeUnknown, "no word of it")
         .await;
@@ -4700,7 +4703,11 @@ async fn an_accepted_answer_that_does_not_decode_is_an_unknown_outcome_for_a_res
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, _) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     link.answer(&restore, &json!({"nothing": "of what was asked"}))
         .await;
     frame(&mut link, &kept().revision(1)).await;
@@ -4716,7 +4723,12 @@ async fn a_go_live_after_an_unknown_outcome_goes_next_and_the_restore_is_never_d
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &wide_session().in_history(13, 4)).await;
     let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, asked) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
+    let asked: AttachmentViewportParams = restore.params();
     assert_eq!(asked.position.0, row_position(13));
     link.refuse_with(&restore, ErrorCode::OutcomeUnknown, "no word of it")
         .await;
@@ -4746,7 +4758,12 @@ async fn a_go_live_before_the_restore_goes_drops_it_and_keeps_its_column() {
     link.attach().await;
     page.live(&view, 1);
     frame(&mut link, &wide_session()).await;
-    let (live, asked) = held_report(&page, 4, &mut link).await;
+    let live = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(live.method, Method::AttachmentViewport.to_string());
+    let asked: AttachmentViewportParams = live.params();
     assert_eq!(asked.position.0, None);
     assert_eq!(asked.column.get(), 4, "the column is kept");
     link.answer(&live, &viewport_answer(1)).await;
@@ -4820,7 +4837,11 @@ async fn a_width_change_during_the_restore_is_said_to_be_different() {
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, _) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     link.answer(&restore, &viewport_answer(1)).await;
     let wider = Frame::live((30, 6), (10, 2), 30)
         .in_history(13, 0)
@@ -4838,7 +4859,12 @@ async fn a_row_that_left_the_history_shows_the_oldest_and_says_gone() {
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &wide_session().in_history(4, 0)).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, asked) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
+    let asked: AttachmentViewportParams = restore.params();
     assert_eq!(asked.position.0, row_position(4));
     link.answer(&restore, &viewport_answer(1)).await;
     let mut oldest = wide_session().in_history(10, 0).revision(1);
@@ -4881,7 +4907,11 @@ async fn a_row_in_the_same_generation_is_trusted_and_another_generation_compares
         let page = Page::new(worker.paths());
         let anchor = place_of(&page, &mut worker, 3, &kept()).await;
         let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-        let (restore, _) = held_report(&page, 4, &mut link).await;
+        let restore = match first_of(&page, 4, &mut link).await {
+            First::Report(call) => call,
+            First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+        };
+        assert_eq!(restore.method, Method::AttachmentViewport.to_string());
         link.answer(&restore, &viewport_answer(1)).await;
         let mut landing = kept().revision(1).first_row(first);
         landing.generation = generation;
@@ -5000,7 +5030,12 @@ async fn an_anchor_row_above_2_pow_53_is_kept_exact_and_one_above_u64_is_refused
     let mut huge = anchor.clone();
     huge["row"] = json!("9007199254740993");
     let (_view, mut link) = restoring(&page, &mut worker, 4, &huge, &wide_session()).await;
-    let (_, asked) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
+    let asked: AttachmentViewportParams = restore.params();
     assert_eq!(asked.position.0, row_position(9_007_199_254_740_993));
     let mut over = anchor;
     over["row"] = json!("18446744073709551616");
@@ -5014,13 +5049,19 @@ async fn an_anchor_row_above_2_pow_53_is_kept_exact_and_one_above_u64_is_refused
 /// A restore whose answer comes after the screen it would be judged on was discarded, by the host's
 /// reset or by the view's own recovery: nothing is shown until the replacement screen arrives, and
 /// that screen is shown with its judgement. The replacement is a wider session, which the anchor
-/// says is different; a stale screen judged at the answer would show with no note.
-async fn a_discarded_screen_leaves_the_restore_unjudged(recovery: bool) {
+/// says is different; a stale screen judged at the answer would show with no note. The first state
+/// shown is the helper's answer, and the case decides on it: a screen shown before the view
+/// reported is its `Err`.
+async fn a_discarded_screen_leaves_the_restore_unjudged(recovery: bool) -> Result<Value, Value> {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, _) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => return Err(state),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     frame(&mut link, &kept().revision(1)).await;
     if recovery {
         link.push("session.resync", &resync_marker(60)).await;
@@ -5042,59 +5083,81 @@ async fn a_discarded_screen_leaves_the_restore_unjudged(recovery: bool) {
         .revision(1);
     replacement.generation = 2;
     frame(&mut link, &replacement).await;
-    let shown = first_showing(&page, 4).await;
-    assert_eq!(shown["note"], "different", "recovery {recovery}");
-    assert_eq!(first_row(&shown), 13, "recovery {recovery}");
+    Ok(first_showing(&page, 4).await)
 }
 
 /// KR-REQ-13.03: a screen discarded by the host's reset before the restore is judged keeps the
 /// hold; the replacement screen is the first one shown, with its judgement.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_screen_discarded_by_a_reset_before_the_restore_is_judged_keeps_the_hold() {
-    a_discarded_screen_leaves_the_restore_unjudged(false).await;
+    let shown = match a_discarded_screen_leaves_the_restore_unjudged(false).await {
+        Ok(shown) => shown,
+        Err(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(first_row(&shown), 13);
+    assert_eq!(shown["note"], "different");
 }
 
 /// KR-REQ-13.03: the same, by the view's own recovery.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_screen_discarded_by_a_recovery_before_the_restore_is_judged_keeps_the_hold() {
-    a_discarded_screen_leaves_the_restore_unjudged(true).await;
+    let shown = match a_discarded_screen_leaves_the_restore_unjudged(true).await {
+        Ok(shown) => shown,
+        Err(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(first_row(&shown), 13);
+    assert_eq!(shown["note"], "different");
 }
 
 /// The first `showing` state of a view restoring row 13, whose landing is in another generation
-/// and has `first` for its first row.
-async fn landing_in_another_generation(first: FirstRow) -> Value {
+/// and has `first` for its first row; a screen shown before the view reported is its `Err`.
+async fn landing_in_another_generation(first: FirstRow) -> Result<Value, Value> {
     let mut worker = ScriptedWorker::start(Challenge::Answered);
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (_view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, _) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => return Err(state),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     link.answer(&restore, &viewport_answer(1)).await;
     let mut landing = kept().revision(1).first_row(first);
     landing.generation = 2;
     frame(&mut link, &landing).await;
-    let shown = first_showing(&page, 4).await;
-    assert_eq!(first_row(&shown), 13);
-    shown
+    Ok(first_showing(&page, 4).await)
 }
 
 /// KR-REQ-13.03: a first row with other text in another generation is not taken for the place.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_row_with_other_text_in_another_generation_is_said_to_be_different() {
-    let shown = landing_in_another_generation(FirstRow::Text("another line, wholly")).await;
+    let shown = match landing_in_another_generation(FirstRow::Text("another line, wholly")).await {
+        Ok(shown) => shown,
+        Err(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(first_row(&shown), 13);
     assert_eq!(shown["note"], "different");
 }
 
 /// KR-REQ-13.03: a blank first row in another generation is not taken for the place.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blank_first_row_in_another_generation_is_said_to_be_different() {
-    let shown = landing_in_another_generation(FirstRow::Blank).await;
+    let shown = match landing_in_another_generation(FirstRow::Blank).await {
+        Ok(shown) => shown,
+        Err(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(first_row(&shown), 13);
     assert_eq!(shown["note"], "different");
 }
 
 /// KR-REQ-13.03: a first row the host cut, in another generation, is not taken for the place.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cut_first_row_in_another_generation_is_said_to_be_different() {
-    let shown = landing_in_another_generation(FirstRow::Cut).await;
+    let shown = match landing_in_another_generation(FirstRow::Cut).await {
+        Ok(shown) => shown,
+        Err(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(first_row(&shown), 13);
     assert_eq!(shown["note"], "different");
 }
 
@@ -5142,7 +5205,11 @@ async fn a_go_live_the_host_does_not_take_ends_the_hold_on_the_hosts_window() {
         let page = Page::new(worker.paths());
         let anchor = place_of(&page, &mut worker, 3, &kept()).await;
         let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-        let (restore, _) = held_report(&page, 4, &mut link).await;
+        let restore = match first_of(&page, 4, &mut link).await {
+            First::Report(call) => call,
+            First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+        };
+        assert_eq!(restore.method, Method::AttachmentViewport.to_string());
         page.live(&view, 1);
         page.pan(&view, 2, 3, 0);
         link.answer(&restore, &viewport_answer(1)).await;
@@ -5181,7 +5248,11 @@ async fn a_pan_behind_a_go_live_is_made_only_when_it_landed_where_it_was_to() {
         let page = Page::new(worker.paths());
         let anchor = place_of(&page, &mut worker, 3, &wide_session().in_history(13, 4)).await;
         let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-        let (restore, _) = held_report(&page, 4, &mut link).await;
+        let restore = match first_of(&page, 4, &mut link).await {
+            First::Report(call) => call,
+            First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+        };
+        assert_eq!(restore.method, Method::AttachmentViewport.to_string());
         page.live(&view, 1);
         page.pan(&view, 2, 3, 0);
         link.answer(&restore, &viewport_answer(1)).await;
@@ -5269,7 +5340,12 @@ async fn a_take_with_a_go_live_made_while_the_restore_is_in_flight_lets_a_paste_
     let page = Page::new(worker.paths());
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-    let (restore, asked) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
+    let asked: AttachmentViewportParams = restore.params();
     assert_eq!(asked.position.0, row_position(13));
     page.live(&view, 1);
     page.take(&view, 1);
@@ -5312,7 +5388,11 @@ async fn a_go_live_goes_at_the_restores_answer_and_does_not_wait_for_its_screen(
         let page = Page::new(worker.paths());
         let anchor = place_of(&page, &mut worker, 3, &kept()).await;
         let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-        let (restore, _) = held_report(&page, 4, &mut link).await;
+        let restore = match first_of(&page, 4, &mut link).await {
+            First::Report(call) => call,
+            First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+        };
+        assert_eq!(restore.method, Method::AttachmentViewport.to_string());
         if !accepted_first {
             page.live(&view, 1);
         }
@@ -5363,7 +5443,11 @@ async fn a_go_live_in_the_hold_tells_the_pans_it_cancelled_without_a_screen() {
         let page = Page::new(worker.paths());
         let anchor = place_of(&page, &mut worker, 3, &kept()).await;
         let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
-        let (restore, _) = held_report(&page, 4, &mut link).await;
+        let restore = match first_of(&page, 4, &mut link).await {
+            First::Report(call) => call,
+            First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+        };
+        assert_eq!(restore.method, Method::AttachmentViewport.to_string());
         page.pan(&view, 1, 0, -1);
         page.take(&view, 1);
         let acquire = link.expect(Method::InputAcquire).await;
@@ -5417,7 +5501,11 @@ async fn a_pan_behind_a_restore_that_lands_on_its_place_with_a_note_is_not_made(
     let anchor = place_of(&page, &mut worker, 3, &kept()).await;
     let (view, mut link) = restoring(&page, &mut worker, 4, &anchor, &wide_session()).await;
     page.pan(&view, 1, 0, -1);
-    let (restore, _) = held_report(&page, 4, &mut link).await;
+    let restore = match first_of(&page, 4, &mut link).await {
+        First::Report(call) => call,
+        First::Screen(state) => panic!("a screen was shown before the view reported: {state}"),
+    };
+    assert_eq!(restore.method, Method::AttachmentViewport.to_string());
     link.answer(&restore, &viewport_answer(1)).await;
     let mut landing = kept()
         .revision(1)
