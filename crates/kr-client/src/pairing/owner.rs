@@ -29,7 +29,7 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_pairing::platform::PairingClock;
 use kr_protocol::confirmation::{
     CLOCK_PURPOSE, CatalogueTrustPlan, ConfirmationDisplay, DescribedAction,
-    ExclusiveManagementPlan, INTEGRATION_STATEMENT_LABEL, OrganisationEnrolPlan,
+    ExclusiveManagementPlan, OrganisationEnrolPlan,
     OwnerConfirmationCompleteParams, OwnerConfirmationPendingParams,
     OwnerConfirmationPendingResult, PendingConfirmation, PluginInstallPlan, TransferControlPlan,
 };
@@ -976,14 +976,8 @@ const fn platform(platform: DevicePlatform) -> &'static str {
 /// The longest address, name or identifier an enrolment or an installation shows whole.
 pub const FIELD_CHARS: usize = 2048;
 
-/// The longest statement an installation's confirmation carries, and so the longest shown whole:
-/// the publisher's statement of a native bridge, the host's label, and the host's reading of a
-/// command integration, each at the longest the package contract allows.
-pub const STATEMENT_CHARS: usize = kr_plugin_sdk::text::Summary::LIMIT
-    + 1
-    + INTEGRATION_STATEMENT_LABEL.len()
-    + 1
-    + kr_plugin_sdk::integration::MAX_STATEMENT_CHARS;
+/// The longest statement an installation's confirmation carries, and so the longest shown whole.
+pub use kr_protocol::confirmation::STATEMENT_CHARS;
 
 /// True when `text` is one line a person reads as it is written: no control character, no
 /// character that reorders or hides text, and no white space but the space.

@@ -718,7 +718,10 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
             if let Some(statement) = &grant_statement.0 {
                 // The statement holds the publisher's words about a bridge and the host's reading
                 // of an integration, told apart at the label the host writes before its reading.
-                let parts = split_install_statement(grant, statement);
+                // This command line shows what the daemon it is installed with sends, and takes no hello
+                // of a paired link, so no host here states the placement label: the part stays in
+                // the publisher's words until the link states it.
+                let parts = split_install_statement(grant, statement, false);
                 if let Some(words) = parts.publisher {
                     output::line(&stdout_line!(
                         "  the publisher says: {}",
