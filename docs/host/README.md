@@ -8787,10 +8787,12 @@ here can say a capability works here; a signed qualification result is evidence 
 probe declares the operations it will perform and the budget it may spend before it runs, and a
 probe with a destructive effect needs its own isolated test context.
 
-Invalidation is by what the change was about. An installed upgrade invalidates the records that
-name the binary and leaves a running binding's correctly pinned record exactly as it was. A record
-only ever moves forward: a late answer at a revision the host has already passed is refused rather
-than allowed to restore availability that was withdrawn.
+What a change invalidates depends on its kind. A rebind invalidates the records gathered through
+the old binding. A refused image check, which means the host cannot confirm that the program still
+runs the code it checked, invalidates the records that name the binary and holds the instance, so
+the host records nothing more for it. An installed upgrade invalidates nothing: a running process
+keeps the identity it was pinned to. A record only moves forward: a late answer at a revision the
+host has already passed is refused, so it cannot restore availability that was withdrawn.
 
 ### Launch profiles
 

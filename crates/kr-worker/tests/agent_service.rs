@@ -1363,12 +1363,12 @@ async fn kr_req_11_33_a_natively_resolved_resource_leaves_the_rich_answer_a_reje
     );
 }
 
-/// KR-REQ-11.17 and section 9: evidence withdrawn before the service admits is a rejection too.
+/// KR-REQ-11.33 and section 9: evidence withdrawn before the service admits is a rejection too.
 ///
 /// The other door: the capability the answer needs is invalidated rather than the resource being
 /// resolved. Again the interval version follows below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_11_17_evidence_withdrawn_before_the_service_admits_is_a_rejection() {
+async fn kr_req_11_33_evidence_withdrawn_before_the_service_admits_is_a_rejection() {
     let host = host().await;
     let upstream = Arc::new(CountingUpstream::default());
     register(&host, None);
@@ -1436,7 +1436,7 @@ fn durable(host: &Host, action_id: ActionId) -> (Option<String>, Vec<String>) {
     (state, events)
 }
 
-/// KR-REQ-11.33, KR-REQ-11.17 and section 9: what changes inside the interval between the durable
+/// KR-REQ-11.33 and section 9: what changes inside the interval between the durable
 /// acceptance and the broker's admission is still a rejection, and still sends nothing.
 ///
 /// This is the window the admission was moved across. The service used to finish its own checks
