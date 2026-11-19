@@ -821,6 +821,9 @@ struct ManagedFake {
     /// A real creation takes as long as a network round trip, and the window this opens is that
     /// round trip rather than an invention of the test.
     holding: tokio::sync::Semaphore,
+    /// How many creations are registered in the hold's queue, so a test releases them in the order
+    /// they began.
+    waiting: std::sync::atomic::AtomicUsize,
     held: Mutex<bool>,
     /// Whether a close waits to be let through, as one does when the service is slow to answer.
     close_held: Mutex<bool>,
@@ -839,6 +842,7 @@ impl ManagedFake {
             holds: Mutex::new(ServiceHolds::Open),
             asked: Mutex::new(Vec::new()),
             holding: tokio::sync::Semaphore::new(0),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
             held: Mutex::new(false),
             close_held: Mutex::new(false),
             closing: tokio::sync::Semaphore::new(0),
@@ -884,6 +888,10 @@ impl ManagedFake {
 
     fn closed(&self) -> Vec<String> {
         self.closed.lock().expect("what was closed").clone()
+    }
+
+    fn waiting(&self) -> usize {
+        self.waiting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn offers(&self) -> Vec<String> {
@@ -1007,11 +1015,21 @@ impl ManagedVoiceService for ManagedFake {
         let held = *self.held.lock().expect("the hold");
         Box::pin(async move {
             if held {
-                self.holding
-                    .acquire()
-                    .await
-                    .expect("the hold is never closed")
-                    .forget();
+                let mut acquiring = std::pin::pin!(self.holding.acquire());
+                let mut registered = false;
+                std::future::poll_fn(|context| {
+                    let polled = acquiring.as_mut().poll(context);
+                    // The first poll has put this creation in the queue.
+                    if !registered {
+                        registered = true;
+                        self.waiting
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    polled
+                })
+                .await
+                .expect("the hold is never closed")
+                .forget();
             }
             Ok(match answer {
                 Answer::Started => VoiceStart::Started(Box::new(running_call("managed"))),
@@ -4791,6 +4809,8 @@ struct Recording {
     /// What a deferred closure asks the coordinator for before it records: a closure that ran under
     /// the coordinator's lock would wait for the lock it runs under.
     coordinator: Mutex<Option<Arc<Coordinator>>>,
+    /// Whether each closure's read of the coordinator was answered.
+    probes: Arc<Mutex<Vec<bool>>>,
 }
 
 impl std::fmt::Debug for Recording {
@@ -4808,7 +4828,12 @@ impl Recording {
             effects: Mutex::new(Vec::new()),
             resolved: Arc::new(Mutex::new(Vec::new())),
             coordinator: Mutex::new(None),
+            probes: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    fn probes(&self) -> Vec<bool> {
+        self.probes.lock().expect("the probes").clone()
     }
 
     fn effects(&self) -> Vec<kr_voice::BrokerEffect> {
@@ -4855,10 +4880,21 @@ impl kr_voice::Admission for Recording {
 
     fn deferred(&self) -> Option<kr_voice::AfterDeferred> {
         let resolved = Arc::clone(&self.resolved);
+        let probes = Arc::clone(&self.probes);
         let coordinator = self.coordinator.lock().expect("the coordinator").clone();
         Some(Box::new(move |effect| {
-            if let Some(coordinator) = &coordinator {
-                let _ = coordinator.live_sessions();
+            if let Some(coordinator) = coordinator {
+                // The read runs on a thread of its own and is waited for with a bound, so a closure
+                // that holds the coordinator's lock finds the read unanswered and says so, instead of
+                // waiting for itself.
+                let (sender, receiver) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = sender.send(coordinator.live_sessions());
+                });
+                let answered = receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok();
+                probes.lock().expect("the probes").push(answered);
             }
             resolved.lock().expect("the resolutions").push(effect);
         }))
@@ -5059,14 +5095,16 @@ async fn every_exit_of_a_start_reports_its_effect() {
     }
 }
 
-/// Starts `devices` starts, one after the other, each held in the broker, and lets them answer in
-/// the order they began, with a service that answers every one with the call an earlier attempt
-/// made. Returns each start's admission once all have finished.
-async fn replays_resolved_after_one_another(
-    devices: u8,
+/// Starts one start per entry of `answers`, each held in the broker in the order given, and lets
+/// them answer in that order: the broker answers a start with what `answers` names for it. Returns
+/// each start's admission once all have finished, and the broker. No start is started before the
+/// one before it is waiting inside the broker, and none is released before the last is.
+async fn starts_that_answer_in_turn(
+    answers: &[Answer],
     closure_asks_the_coordinator: bool,
-) -> Vec<Arc<Recording>> {
+) -> (Vec<Arc<Recording>>, Arc<ManagedFake>) {
     let fixture = fixture();
+    let devices = u8::try_from(answers.len()).expect("a few starts");
     let who = |index: u8| device(PHONE + index);
     for index in 0..devices {
         fixture
@@ -5089,18 +5127,19 @@ async fn replays_resolved_after_one_another(
             .await
             .expect("a standing voice grant");
     }
-    *fixture.broker.answer.lock().expect("the answer") = Answer::Replayed;
     fixture.broker.hold_creations();
     let broker = Arc::clone(&fixture.broker);
     let coordinator = Arc::new(fixture.coordinator);
     let mut started = Vec::new();
-    for index in 0..devices {
+    for (index, answer) in (0..devices).zip(answers) {
         let admission = Recording::new(None);
         if closure_asks_the_coordinator {
             *admission.coordinator.lock().expect("the coordinator") =
                 Some(Arc::clone(&coordinator));
         }
         let params = params_for(&coordinator, who(index)).await;
+        // The broker reads its answer when the start reaches it.
+        *broker.answer.lock().expect("the answer") = answer.clone();
         let handle = tokio::spawn({
             let coordinator = Arc::clone(&coordinator);
             let admission = Arc::clone(&admission);
@@ -5116,11 +5155,10 @@ async fn replays_resolved_after_one_another(
                     .await
             }
         });
-        while broker.offers().len() <= usize::from(index) {
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        // Registered in the hold's queue, so the answers come in the order the starts began.
+        while broker.waiting() <= usize::from(index) {
+            tokio::task::yield_now().await;
         }
-        // Inside the semaphore's queue, so the answers come in the order the starts began.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         started.push((admission, handle));
     }
     let mut admissions = Vec::new();
@@ -5139,14 +5177,16 @@ async fn replays_resolved_after_one_another(
         }
         admissions.push(admission);
     }
-    admissions
+    (admissions, broker)
 }
 
 /// KR-REQ-23.24: a replayed call another start may be about to bind is resolved later, and the
-/// start that left it runs its closure then, with what the resolution came to.
+/// start that left it runs its closure then, with what the resolution came to. The call is closed
+/// once, for the replay that closes it and for the start that deferred it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deferred_entry_runs_its_closure_when_resolved() {
-    let admissions = replays_resolved_after_one_another(2, false).await;
+    let (admissions, broker) =
+        starts_that_answer_in_turn(&[Answer::Replayed, Answer::Replayed], false).await;
     assert_eq!(
         admissions[0].effects(),
         vec![kr_voice::BrokerEffect::Deferred]
@@ -5160,24 +5200,40 @@ async fn a_deferred_entry_runs_its_closure_when_resolved() {
         vec![kr_voice::BrokerEffect::Closed]
     );
     assert!(admissions[1].resolved().is_empty());
+    assert_eq!(broker.closed(), vec!["call-managed".to_owned()]);
 }
 
 /// KR-REQ-23.24: a closure runs after the coordinator's lock is released, so it can ask the
-/// coordinator for anything.
+/// coordinator for anything, whether the start that ends after the one that deferred the call
+/// closes the call or takes it. A closure that ran under the lock could not read the coordinator:
+/// its probe finds the lock held and says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closures_run_after_the_coordinators_lock_is_released() {
-    let admissions = replays_resolved_after_one_another(2, true).await;
-    assert_eq!(
-        admissions[0].resolved(),
-        vec![kr_voice::BrokerEffect::Closed]
-    );
+    for (second, expected, closes) in [
+        (Answer::Capacity, kr_voice::BrokerEffect::Closed, 1),
+        (Answer::Started, kr_voice::BrokerEffect::Handed, 0),
+    ] {
+        let (admissions, broker) =
+            starts_that_answer_in_turn(&[Answer::Replayed, second], true).await;
+        assert_eq!(admissions[0].resolved(), vec![expected]);
+        assert_eq!(
+            admissions[0].probes(),
+            vec![true],
+            "the closure read the coordinator while it ran"
+        );
+        assert_eq!(broker.closed().len(), closes);
+    }
 }
 
 /// KR-REQ-23.24: a second start that defers the same call keeps its closure beside the first, and
-/// the call is closed once.
+/// the call is closed once for all three.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_closure_on_one_entry_is_kept() {
-    let admissions = replays_resolved_after_one_another(3, false).await;
+    let (admissions, broker) = starts_that_answer_in_turn(
+        &[Answer::Replayed, Answer::Replayed, Answer::Replayed],
+        false,
+    )
+    .await;
     assert_eq!(
         admissions[0].resolved(),
         vec![kr_voice::BrokerEffect::Closed]
@@ -5189,5 +5245,11 @@ async fn a_second_closure_on_one_entry_is_kept() {
     assert_eq!(
         admissions[2].effects(),
         vec![kr_voice::BrokerEffect::Closed]
+    );
+    assert!(admissions[2].resolved().is_empty());
+    assert_eq!(
+        broker.closed(),
+        vec!["call-managed".to_owned()],
+        "one close request for the replay and the two closures"
     );
 }
