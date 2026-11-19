@@ -16,6 +16,8 @@ use super::stand_in::{
 use super::*;
 use crate::services::own_registry::RegistryState;
 
+mod sideband;
+
 const KEY: &str = "sk-test-sentinel-key-0001";
 
 struct World {

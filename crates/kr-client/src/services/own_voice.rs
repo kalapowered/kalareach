@@ -2250,14 +2250,77 @@ fn reply_of(answer: Result<super::http::StatusAnswer>) -> std::result::Result<Re
         .map_err(|_| Lost)
 }
 
-struct WebSocketSideband {
-    socket: crate::wss::Socket,
+/// How many messages one write reads ahead of itself.
+///
+/// A message the library holds, or the socket has ready, when a write begins is out of reach once
+/// that write fails: a failed write ends the library's reading, buffered messages and all. So a
+/// write first takes what is ready into [`WebSocketSideband::ahead`], at most this many messages.
+/// A closure behind more than this many ready messages, when the write fails, is not read; the
+/// hangup's answer decides then, as it does for a closure still in transit, or one that reaches
+/// the socket after the write began and before its flush failed.
+const READ_AHEAD_MESSAGES: usize = 256;
+
+struct WebSocketSideband<S> {
+    socket: tokio_websockets::WebSocketStream<S>,
+    /// Messages a write read ahead, in the order they came, and not yet handed on. A closing
+    /// frame or a failure the read ahead met is the last of them.
+    ahead: VecDeque<SocketRead>,
 }
 
-impl SidebandSocket for WebSocketSideband {
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> WebSocketSideband<S> {
+    const fn new(socket: tokio_websockets::WebSocketStream<S>) -> Self {
+        Self {
+            socket,
+            ahead: VecDeque::new(),
+        }
+    }
+
+    /// What one item of the library's stream is to the call: a text message, the end of the
+    /// socket, or nothing (a control or binary message).
+    fn read_of(
+        item: Option<std::result::Result<tokio_websockets::Message, tokio_websockets::Error>>,
+    ) -> Option<SocketRead> {
+        match item {
+            Some(Ok(message)) if message.is_text() => Some(
+                message
+                    .as_text()
+                    .map_or(SocketRead::Closed, |text| SocketRead::Text(text.to_owned())),
+            ),
+            Some(Ok(message)) if message.is_close() => Some(SocketRead::Closed),
+            Some(Ok(_)) => None,
+            Some(Err(_)) | None => Some(SocketRead::Closed),
+        }
+    }
+
+    /// Takes what the library holds or the socket has ready into `ahead`, without waiting, outside
+    /// the task's cooperative budget, and stops at the first end or after
+    /// [`READ_AHEAD_MESSAGES`].
+    fn read_ahead(&mut self) {
+        use futures_util::StreamExt;
+        let mut taken = 0;
+        while taken < READ_AHEAD_MESSAGES {
+            let Some(item) = tokio::task::unconstrained(self.socket.next()).now_or_never() else {
+                return;
+            };
+            taken += 1;
+            if let Some(read) = Self::read_of(item) {
+                let ended = read == SocketRead::Closed;
+                self.ahead.push_back(read);
+                if ended {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> SidebandSocket
+    for WebSocketSideband<S>
+{
     fn send(&mut self, text: String) -> TransportFuture<'_, bool> {
         use futures_util::SinkExt;
         Box::pin(async move {
+            self.read_ahead();
             self.socket
                 .send(tokio_websockets::Message::text(text))
                 .await
@@ -2268,16 +2331,12 @@ impl SidebandSocket for WebSocketSideband {
     fn next(&mut self) -> TransportFuture<'_, SocketRead> {
         use futures_util::StreamExt;
         Box::pin(async move {
+            if let Some(read) = self.ahead.pop_front() {
+                return read;
+            }
             loop {
-                match self.socket.next().await {
-                    Some(Ok(message)) if message.is_text() => {
-                        return message
-                            .as_text()
-                            .map_or(SocketRead::Closed, |text| SocketRead::Text(text.to_owned()));
-                    }
-                    Some(Ok(message)) if message.is_close() => return SocketRead::Closed,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) | None => return SocketRead::Closed,
+                if let Some(read) = Self::read_of(self.socket.next().await) {
+                    return read;
                 }
             }
         })
@@ -2366,7 +2425,7 @@ impl OwnVoiceTransport for OpenAiLiveTransport {
             // A refused upgrade carries no recognised closure, so none of its statuses ends a
             // call: a 404 from a proxy or a route this host does not know is not OpenAI's word.
             .map_err(|_| AttachFault::Unavailable)?;
-            Ok(Box::new(WebSocketSideband { socket }) as Box<dyn SidebandSocket>)
+            Ok(Box::new(WebSocketSideband::new(socket)) as Box<dyn SidebandSocket>)
         })
     }
 }

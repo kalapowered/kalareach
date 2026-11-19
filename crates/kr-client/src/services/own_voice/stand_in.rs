@@ -87,7 +87,11 @@ struct Script {
     answer_close: bool,
     send_started: bool,
     closed_at_attach: bool,
+    wrap: Option<WrapSocket>,
 }
+
+/// Turns the stand-in's own side channel into another one.
+type WrapSocket = Box<dyn FnOnce(Box<dyn SidebandSocket>) -> Box<dyn SidebandSocket> + Send>;
 
 struct State {
     script: Mutex<Script>,
@@ -171,6 +175,7 @@ impl StandIn {
                     answer_close: true,
                     send_started: true,
                     closed_at_attach: false,
+                    wrap: None,
                 }),
                 recorded: Mutex::new(Recorded::default()),
                 socket: Mutex::new(None),
@@ -215,6 +220,15 @@ impl StandIn {
     /// `session.started`.
     pub fn close_at_attach(&self, on: bool) {
         self.script().closed_at_attach = on;
+    }
+
+    /// The next side channel the stand-in gives is handed to `wrap`, and what `wrap` returns is
+    /// given in its place.
+    pub fn wrap_next_attach(
+        &self,
+        wrap: impl FnOnce(Box<dyn SidebandSocket>) -> Box<dyn SidebandSocket> + Send + 'static,
+    ) {
+        self.script().wrap = Some(Box::new(wrap));
     }
 
     /// Whether commands are acknowledged.
@@ -440,11 +454,16 @@ impl OwnVoiceTransport for StandIn {
                         .to_string(),
                 ));
             }
-            Ok(Box::new(StandSocket {
+            let socket = Box::new(StandSocket {
                 inbound,
                 inject,
                 stand_in: self.clone(),
-            }) as Box<dyn SidebandSocket>)
+            }) as Box<dyn SidebandSocket>;
+            let wrap = self.script().wrap.take();
+            Ok(match wrap {
+                Some(wrap) => wrap(socket),
+                None => socket,
+            })
         })
     }
 }
