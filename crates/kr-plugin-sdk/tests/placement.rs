@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use kr_plugin_sdk::digest::PayloadDigest;
-use kr_plugin_sdk::placement::{Placement, PlacementRefusal, Shape};
+use kr_plugin_sdk::placement::{Placement, PlacementRefusal, Shape, is_plain_component};
 use kr_plugin_sdk::schema::package_contract;
 use kr_plugin_sdk::validate::{FindingCode, Validated, validate_package_directory};
 use kr_plugin_sdk::version::SDK_VERSION;
@@ -247,6 +247,105 @@ fn a_placement_tail_that_is_not_plain_is_refused_by_name() {
             |table| table["files"][0]["tail"] = json!(tail),
             PlacementRefusal::TailNotPlain,
         );
+    }
+}
+
+/// Windows reads a device name as the device whatever extension follows it, in any case, so a
+/// component that is one cannot be a folder or a file there: every place a component stands
+/// refuses it, and a name that only resembles one stays accepted.
+#[test]
+fn a_placement_component_that_is_a_windows_device_name_is_refused_by_name() {
+    for name in [
+        "nul",
+        "NUL",
+        "con.json",
+        "Aux",
+        "prn.tar.gz",
+        "com1",
+        "COM9.txt",
+        "com0",
+        "lpt1",
+        "LPT9.json",
+        "nul .txt",
+    ] {
+        assert!(!is_plain_component(name), "{name:?} is a device name");
+        refused_with(
+            |table| table["directory"] = json!([name]),
+            PlacementRefusal::DirectoryNotPlain,
+        );
+        refused_with(
+            |table| table["area"] = json!(name),
+            PlacementRefusal::AreaNotPlain,
+        );
+        refused_with(
+            |table| table["files"][0]["tail"] = json!(name),
+            PlacementRefusal::TailNotPlain,
+        );
+        refused_with(
+            |table| table["files"][0]["tail"] = json!(format!("inner/{name}")),
+            PlacementRefusal::TailNotPlain,
+        );
+    }
+    for name in [
+        "console",
+        "com10",
+        "com",
+        "lpt",
+        "lptx.json",
+        "nulls.json",
+        "auxiliary",
+        "a.con",
+        ".nul",
+        "com1x",
+        "my-nul",
+    ] {
+        assert!(is_plain_component(name), "{name:?} only resembles one");
+        let mut table = claude();
+        table["directory"] = json!([name]);
+        table["area"] = json!(name);
+        table["files"][0]["tail"] = json!(format!("{name}/{name}"));
+        let component_refusals: Vec<&str> = placement(&table)
+            .refusals()
+            .iter()
+            .filter(|found| {
+                matches!(
+                    found.refusal,
+                    PlacementRefusal::DirectoryNotPlain
+                        | PlacementRefusal::AreaNotPlain
+                        | PlacementRefusal::TailNotPlain
+                )
+            })
+            .map(|found| found.refusal.name())
+            .collect();
+        assert_eq!(component_refusals, Vec::<&str>::new(), "{name:?}");
+    }
+}
+
+/// Windows shell does not keep a name that ends in a dot or a space, so no place of a placement
+/// ends in one, and a dot or a space inside a name is not refused.
+#[test]
+fn a_placement_component_that_ends_in_a_dot_or_a_space_is_refused_by_name() {
+    for name in ["plugins.", "plugins ", "a..", "x. ", " plugins"] {
+        assert!(!is_plain_component(name), "{name:?} ends or starts badly");
+        refused_with(
+            |table| table["directory"] = json!([name]),
+            PlacementRefusal::DirectoryNotPlain,
+        );
+        refused_with(
+            |table| table["area"] = json!(name),
+            PlacementRefusal::AreaNotPlain,
+        );
+        refused_with(
+            |table| table["files"][0]["tail"] = json!(name),
+            PlacementRefusal::TailNotPlain,
+        );
+        refused_with(
+            |table| table["files"][0]["tail"] = json!(format!("inner/{name}")),
+            PlacementRefusal::TailNotPlain,
+        );
+    }
+    for name in ["my plugins", "a.b", ".hidden", "a. b"] {
+        assert!(is_plain_component(name), "{name:?} is plain");
     }
 }
 
@@ -764,6 +863,10 @@ fn the_plugin_documentation_names_the_placement_declaration_and_what_is_not_plac
         (
             "plain components",
             "one to three plain components under the account's home",
+        ),
+        (
+            "a Windows device name",
+            "not a name Windows opens as a device",
         ),
         ("no link", "follows no link in it"),
         ("the default's link", "a person may keep as a link"),
