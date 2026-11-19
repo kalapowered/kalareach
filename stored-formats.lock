@@ -124,10 +124,10 @@
         "recording": {
           "kind": "sqlite_user_version"
         },
-        "version": 1,
+        "version": 2,
         "migrates_from": 0
       },
-      "digest": "6699b8806b8192a662269fcf6d1ad6b2a468c0a0bc388f01d7c04575df597bc4",
+      "digest": "ddef7e12191969457fca8ce11e9ca95215bb2bbd15d318714da9fa289c4a548d",
       "kept": [
         "EnrolmentBudgets",
         "CatalogueAddResult",
