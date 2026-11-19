@@ -413,9 +413,9 @@ impl WindowReports {
                 self.skip_pans();
                 if let Some(flight) = self.in_flight
                     && flight.restore
-                    && flight.unknown
+                    && (flight.unknown || flight.awaiting.is_some())
                 {
-                    // The host has said all it will about it.
+                    // The host has said all it will about it: its screen is not waited for.
                     self.in_flight = None;
                 }
                 anchor.live_of().unwrap_or(anchor)
@@ -809,7 +809,12 @@ impl WindowReports {
                         how: How::Landed(window_revision),
                     };
                 }
-                if self
+                if restore && matches!(self.restore, Restore::Superseded { .. }) {
+                    // The return that took its place goes next: the restore's answer is its last
+                    // word, and its screen is not waited for. `answered` keeps the floor that a
+                    // screen must reach to say where the window is.
+                    self.in_flight = None;
+                } else if self
                     .installed
                     .is_some_and(|installed| installed >= window_revision)
                 {
