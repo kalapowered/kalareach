@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 15;
+pub const SCHEMA_VERSION: i64 = 16;
 
 /// The newest schema version above [`SCHEMA_VERSION`] that this build reads without writing it.
 ///
@@ -76,7 +76,7 @@ pub const SCHEMA_VERSION: i64 = 15;
 /// update reads it. Its own next acceptance records the document at the version it writes, in a
 /// registry that stays at this version. A copy of the accepted document that this build cannot
 /// read stops the daemon's start ([`crate::config::from_record`]).
-pub const READS_THROUGH_SCHEMA_VERSION: i64 = 16;
+pub const READS_THROUGH_SCHEMA_VERSION: i64 = 17;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -1040,6 +1040,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -1055,6 +1056,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -1069,6 +1071,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -1082,6 +1085,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -1094,6 +1098,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
@@ -1105,6 +1110,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
@@ -1115,6 +1121,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
@@ -1124,6 +1131,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(9) => {
                 self.migrate_9_to_10()?;
@@ -1132,6 +1140,7 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(10) => {
                 self.migrate_10_to_11()?;
@@ -1139,23 +1148,31 @@ impl Registry {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(11) => {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(12) => {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
             Some(13) => {
                 self.migrate_13_to_14()?;
                 self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
             }
-            Some(14) => self.migrate_14_to_15()?,
+            Some(14) => {
+                self.migrate_14_to_15()?;
+                self.migrate_15_to_16()?;
+            }
+            Some(15) => self.migrate_15_to_16()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1568,6 +1585,22 @@ impl Registry {
     fn migrate_14_to_15(&self) -> Result<()> {
         self.connection
             .execute("UPDATE schema_version SET version = 15", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 15 to 16: the registry keeps the answers of two more owner methods, `network.proxy_login.set`
+    /// and `network.proxy_login.clear`, whose result is `NetworkProxyLoginResult`.
+    ///
+    /// The type is new and no table or row of an earlier release holds one, so nothing is
+    /// rewritten and no table changes: an earlier release's registry is the same file with no
+    /// answer of these two methods in it.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version.
+    fn migrate_15_to_16(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 16", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }
@@ -4991,7 +5024,7 @@ mod tests {
                 .execute_batch(sql)
                 .expect("changes the registry");
         };
-        change("UPDATE schema_version SET version = 16;");
+        change("UPDATE schema_version SET version = 17;");
 
         assert_eq!(
             Registry::bring_forward(&path, environment_id).expect("is left"),
@@ -5016,16 +5049,16 @@ mod tests {
         drop(opened);
         assert_eq!(
             recorded(&path),
-            vec![16],
+            vec![17],
             "and the version is as it was found"
         );
 
-        change("UPDATE schema_version SET version = 17;");
+        change("UPDATE schema_version SET version = 18;");
         assert!(Registry::open(&path, environment_id).is_err());
         assert!(Registry::open_to_read(&path, environment_id).is_err());
         assert_eq!(
             recorded(&path),
-            vec![17],
+            vec![18],
             "and the version is as it was found"
         );
     }
