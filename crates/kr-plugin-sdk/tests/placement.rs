@@ -1158,6 +1158,96 @@ fn the_package_check_refuses_every_key_but_the_labels_one() {
     assert_eq!(named(&gemini), 1, "{:?}", gemini.report.findings);
 }
 
+/// The package check reads every file a recipe installs: a file it did not keep, because other
+/// files of the package filled its cache first, is refused and not skipped, and the same package
+/// with fewer other files, where the check keeps it, is read.
+#[test]
+fn a_bridge_file_the_check_did_not_keep_is_refused() {
+    let unread = |pads: usize| {
+        let home = tempfile::tempdir().expect("a directory");
+        let directory = home.path().join("package");
+        copy_tree(&bundled("gemini-cli"), &directory);
+        for number in 0..pads {
+            std::fs::write(directory.join(format!("pad-{number}.bin")), vec![0_u8; 1 << 20])
+                .expect("writes");
+        }
+        validate_package_directory(&directory)
+            .report
+            .findings
+            .iter()
+            .filter(|finding| {
+                finding.code == FindingCode::BridgeRecipeInvalid
+                    && finding.path.as_deref() == Some("bridge/hooks.json")
+                    && finding.detail.contains("was not read whole")
+            })
+            .count()
+    };
+    assert_eq!(unread(0), 0, "the control keeps every bridge file");
+    assert_eq!(unread(8), 1, "eight other files fill the cache before the bridge's");
+}
+
+/// The package check composes the host's whole statement, the publisher's words, the reading of
+/// the placement and the reading of the command integration, and holds it to the one limit an
+/// owner is shown whole: the longest that fits is accepted, and one character more is refused
+/// though each part is within its own limit.
+#[test]
+fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
+    use kr_protocol::confirmation::{STATEMENT_CHARS, install_statement};
+    let base: Value = serde_json::from_slice(
+        &std::fs::read(bundled("claude-code").join("plugin.json")).expect("reads"),
+    )
+    .expect("JSON");
+    let with_filler = |length: usize| {
+        let mut manifest = base.clone();
+        manifest["command_integration"]["flags"]
+            .as_array_mut()
+            .expect("flags")
+            .push(json!("x".repeat(length)));
+        manifest
+    };
+    let parts = |manifest: &Value| {
+        let bridge: kr_plugin_sdk::plugin::NativeBridge =
+            serde_json::from_value(manifest["native_bridge"].clone()).expect("a recipe");
+        let integration: kr_plugin_sdk::integration::CommandIntegration =
+            serde_json::from_value(manifest["command_integration"].clone()).expect("an integration");
+        let reading = Placement::claude_code().statement(&bridge).expect("a reading");
+        let words = bridge.grant_statement.as_str().to_owned();
+        (words, reading, integration.statement())
+    };
+    let composed = |manifest: &Value| {
+        let (words, reading, integration) = parts(manifest);
+        install_statement(Some(&words), Some(&reading), Some(&integration))
+            .expect("a statement")
+            .chars()
+            .count()
+    };
+    let exact = 1 + (STATEMENT_CHARS - composed(&with_filler(1)));
+    assert_eq!(composed(&with_filler(exact)), STATEMENT_CHARS, "the longest that fits");
+    let (words, reading, integration) = parts(&with_filler(exact + 1));
+    assert!(words.chars().count() <= kr_plugin_sdk::text::Summary::LIMIT);
+    assert!(reading.chars().count() <= kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS);
+    assert!(integration.chars().count() <= kr_plugin_sdk::integration::MAX_STATEMENT_CHARS);
+
+    let whole = |length: usize| {
+        let validated = package_edited(
+            "claude-code",
+            |manifest| *manifest = with_filler(length),
+            |table| table["placement"] = claude(),
+        );
+        validated
+            .report
+            .findings
+            .iter()
+            .filter(|finding| finding.detail.contains("whole statement"))
+            .map(|finding| finding.detail.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(whole(exact).is_empty(), "the longest that fits is accepted: {:?}", whole(exact));
+    let over = whole(exact + 1);
+    assert_eq!(over.len(), 1, "one character more is refused: {over:?}");
+    assert!(over[0].contains("5055 characters"), "{over:?}");
+}
+
 /// The plugin documentation names the placement declaration, each floor the host holds before it
 /// places a file, and what it does not check or place: each by its own words, in the section that
 /// describes the declaration and in the SDK page that dates it.

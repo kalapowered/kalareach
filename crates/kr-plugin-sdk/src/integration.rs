@@ -67,6 +67,9 @@ pub const MAX_LAUNCHING_WORD_BYTES: usize = 32;
 /// shows it within.
 pub const MAX_STATEMENT_CHARS: usize = 4000;
 
+/// What the host says of a release that asks for the integration and declares none.
+pub const NO_INTEGRATION_STATEMENT: &str = "The package declares no command integration.";
+
 /// The text a flag holds, as a whole element, where the host writes the address of the gateway the
 /// terminal connects to.
 pub const GATEWAY_PLACEHOLDER: &str = "{gateway}";
