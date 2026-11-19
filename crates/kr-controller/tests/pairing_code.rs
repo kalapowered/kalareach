@@ -904,3 +904,221 @@ fn pairing_secrets_reach_no_log_and_no_diagnostics() {
         }
     }
 }
+
+/// What `pair.status` answers on an unpaired surface of a candidate.
+async fn status_of(
+    surface: &mut kr_transport::handshake::CandidateConnection,
+    invitation_id: kr_protocol::ids::InvitationId,
+) -> Result<PairStatusResult, kr_transport::error::TransportError> {
+    surface
+        .call::<_, PairStatusResult>(Method::PairStatus, &PairStatusParams { invitation_id })
+        .await
+}
+
+/// A binding tag that is not the one the candidate computed.
+fn spoil(request: &mut kr_protocol::pairing::PairFinishRequest) {
+    let mut bytes = *request.binding_tag.as_bytes();
+    bytes[0] ^= 1;
+    request.binding_tag = kr_protocol::scalars::Mac256::from_bytes(bytes);
+}
+
+/// KR-REQ-10.37: a second connection of the candidate's endpoint that repeats its finish is told
+/// that the owner has not decided, and once the owner approves it is refused, while the connection
+/// that proved the candidate is told what it became.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_connection_that_repeats_the_finish_is_refused_once_the_owner_approves() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await;
+    let (origin, code) = code_of(&invited);
+    let device = Device::create().await;
+    let mut candidate = CodeCandidate::start(&host.room, device.candidate(), &origin, &code)
+        .await
+        .expect("admitted");
+    candidate.confirm().await.expect("the host proved the code");
+    candidate
+        .send_bundle()
+        .await
+        .expect("the host took the bundle");
+    let (proving, mut proved, _) = candidate.finish().await;
+    let (repeating, mut repeated, _) = candidate.finish().await;
+    let waiting = status_of(&mut repeated, invited.invitation_id)
+        .await
+        .expect("the repeating connection is answered before the commitment");
+    assert!(
+        matches!(waiting.status, PairStatus::AwaitingApproval { .. }),
+        "{:?}",
+        waiting.status
+    );
+
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    match status_of(&mut repeated, invited.invitation_id).await {
+        Err(kr_transport::error::TransportError::Refused(error)) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the repeating connection is refused, not {other:?}"),
+    }
+    let told = status_of(&mut proved, invited.invitation_id)
+        .await
+        .expect("the proving connection is answered");
+    assert!(
+        matches!(told.status, PairStatus::Committed { device_id, .. } if device_id == confirmed.device_id),
+        "{:?}",
+        told.status
+    );
+    proving.close(0u32.into(), b"done");
+    repeating.close(0u32.into(), b"done");
+    host.stop().await;
+}
+
+/// KR-REQ-10.37: the same when the repeated finish carries a binding tag that is wrong, which the
+/// host's answer to a repeat does not check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_finish_with_a_wrong_binding_tag_is_refused_once_the_owner_approves() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await;
+    let (origin, code) = code_of(&invited);
+    let device = Device::create().await;
+    let mut candidate = CodeCandidate::start(&host.room, device.candidate(), &origin, &code)
+        .await
+        .expect("admitted");
+    candidate.confirm().await.expect("the host proved the code");
+    candidate
+        .send_bundle()
+        .await
+        .expect("the host took the bundle");
+    let (proving, mut proved, _) = candidate.finish().await;
+    let (repeating, mut repeated, _) = candidate.finish_with(spoil).await;
+    let waiting = status_of(&mut repeated, invited.invitation_id)
+        .await
+        .expect("the repeating connection is answered before the commitment");
+    assert!(
+        matches!(waiting.status, PairStatus::AwaitingApproval { .. }),
+        "{:?}",
+        waiting.status
+    );
+
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    match status_of(&mut repeated, invited.invitation_id).await {
+        Err(kr_transport::error::TransportError::Refused(error)) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the repeating connection is refused, not {other:?}"),
+    }
+    let told = status_of(&mut proved, invited.invitation_id)
+        .await
+        .expect("the proving connection is answered");
+    assert!(
+        matches!(told.status, PairStatus::Committed { device_id, .. } if device_id == confirmed.device_id),
+        "{:?}",
+        told.status
+    );
+    proving.close(0u32.into(), b"done");
+    repeating.close(0u32.into(), b"done");
+    host.stop().await;
+}
+
+/// KR-REQ-10.37: a confirmation of a code invitation that fails after its commitment leaves nothing
+/// in memory that tells another connection what the device became, and still releases the room's
+/// locator, once. The owner's call returns the failure; a second connection of the candidate's
+/// endpoint is refused; the connection that proved the candidate is told; and the owner's view
+/// reads the commitment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_code_confirmation_that_fails_after_its_commitment_tells_only_the_proving_connection() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let mut client = host.client().await;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let invited = invite_code(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await;
+    let (origin, code) = code_of(&invited);
+    let device = Device::create().await;
+    let mut candidate = CodeCandidate::start(&host.room, device.candidate(), &origin, &code)
+        .await
+        .expect("admitted");
+    candidate.confirm().await.expect("the host proved the code");
+    candidate
+        .send_bundle()
+        .await
+        .expect("the host took the bundle");
+    let (proving, mut proved, _) = candidate.finish().await;
+    let (repeating, mut repeated, _) = candidate.finish().await;
+
+    host.network()
+        .pairing()
+        .fail_the_next_confirm_after_the_commit();
+    calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+        .await
+        .expect_err("the confirmation fails after its commitment");
+
+    assert_eq!(
+        host.room.released(),
+        vec![code[..4].to_owned()],
+        "the locator was released once"
+    );
+    assert_eq!(
+        host.room.release_requests(),
+        vec![code[..4].to_owned()],
+        "and asked to be released once"
+    );
+    match status_of(&mut repeated, invited.invitation_id).await {
+        Err(kr_transport::error::TransportError::Refused(error)) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the second connection is refused, not {other:?}"),
+    }
+    let told = status_of(&mut proved, invited.invitation_id)
+        .await
+        .expect("the proving connection is answered");
+    let PairStatus::Committed { device_id, .. } = told.status else {
+        panic!(
+            "the proving connection is told it is committed: {:?}",
+            told.status
+        );
+    };
+    let viewed = calls::owner_status(&mut client, invited.invitation_id)
+        .await
+        .expect("the owner's view after the failure");
+    assert!(
+        matches!(viewed.status, PairStatus::Committed { device_id: viewed, .. } if viewed == device_id),
+        "the owner reads the commitment: {:?}",
+        viewed.status
+    );
+    proving.close(0u32.into(), b"done");
+    repeating.close(0u32.into(), b"done");
+    host.stop().await;
+}

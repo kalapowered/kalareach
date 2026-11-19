@@ -13,6 +13,9 @@
 //! | --- | --- |
 //! | KR-REQ-17.53 | `a_member_connects_by_presenting_its_lease_first_and_keeps_it_on_the_advised_interval` |
 //! | KR-REQ-17.53 | `a_member_whose_host_restarted_presents_first_again_and_is_served` |
+//! | KR-REQ-10.37 | `a_stranded_member_recovers_as_the_device_it_became_and_presents_its_lease_first` |
+//! | KR-REQ-10.37 | `a_member_that_moved_to_another_connection_before_the_approval_recovers_and_is_served` |
+//! | KR-REQ-10.37 | `a_stranded_member_whose_host_restarted_presents_again_and_is_served` |
 //! | KR-REQ-17.53 | `a_lease_signed_by_a_key_the_host_has_not_followed_travels_with_the_chain` |
 //! | KR-REQ-17.53 | `a_member_the_organisation_removes_is_told_so` |
 //! | KR-REQ-17.53 | `a_host_the_person_forgets_is_no_longer_kept` |
@@ -114,7 +117,8 @@ use organisation_fixture::{Fixture, SERVED};
 use organisation_support::{MINUTE_MS, Organisation, member};
 use serde_json::json;
 use support::{
-    Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, govern, pair_under, parts,
+    Awaiting, Companion, LinkControl, NoOwner, Phone, StubIntake, WATCHDOG, awaiting_under, govern,
+    pair_under, parts,
 };
 use tokio::sync::{oneshot, watch};
 
@@ -462,6 +466,16 @@ impl Rig {
     /// As [`Self::start`], for a member whose grant and leases carry `rights`, and with a host that
     /// serves `sessions` sessions.
     async fn start_with(rights: &[ActionRight], sessions: u64) -> Self {
+        let (rig, awaiting) = Self::awaiting_with(rights, sessions).await;
+        awaiting
+            .approved(&rig.phone, &rig.fixture.host, &rig.fixture.owner)
+            .await;
+        rig
+    }
+
+    /// As [`Self::start_with`], up to the owner's approval of the device's pairing, which is not
+    /// given yet.
+    async fn awaiting_with(rights: &[ActionRight], sessions: u64) -> (Self, Awaiting) {
         // The host binds a port the system gives it, and keeps that address from here on, so no
         // port is chosen first and left for another socket to take before the host binds it.
         let settings = kr_controller::service::net::config::NetworkSettings {
@@ -525,8 +539,8 @@ impl Rig {
             }),
             ..proposal(rights)
         };
-        pair_under(&phone, &fixture.host, &fixture.owner, grant).await;
-        Self {
+        let awaiting = awaiting_under(&phone, &fixture.host, &fixture.owner, grant).await;
+        let rig = Self {
             fixture,
             served,
             signing,
@@ -535,7 +549,8 @@ impl Rig {
             tokens,
             control,
             workers,
-        }
+        };
+        (rig, awaiting)
     }
 
     /// The session the host serves.
@@ -862,6 +877,17 @@ impl Rig {
                 self.companion().standing.texts()
             )
         })
+    }
+
+    /// The device asked the host a question on a fresh connection and was not answered.
+    async fn until_a_question_goes_unanswered(&self) {
+        tokio::time::timeout(WATCHDOG, async {
+            while self.control.statuses_failed() == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the device asks on a fresh connection after the approval");
     }
 
     /// The host stops and starts again on its tree, where it was.
@@ -3047,4 +3073,92 @@ async fn read_host_info(session: &Session) -> Result<(), kr_client::ClientError>
         )
         .await
         .map(|_| ())
+}
+
+/// KR-REQ-10.37: a member's device that the owner approved while its connection was silent recovers
+/// as the device it became. The organisation's lease is bound to that identity, so the device
+/// presents it before the host says anything to it, and is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranded_member_recovers_as_the_device_it_became_and_presents_its_lease_first() {
+    let (rig, awaiting) = Rig::awaiting_with(SERVED, 0).await;
+    rig.control.silence_the_first_surface();
+    awaiting
+        .approved_without_waiting(&rig.fixture.host, &rig.fixture.owner)
+        .await;
+    rig.until_a_question_goes_unanswered().await;
+    assert!(
+        rig.control.statuses_refused() >= 1,
+        "the host's refusal of the device's question reached it as a refusal"
+    );
+    rig.phone
+        .companion
+        .reached(|state| state["state"] == "paired")
+        .await;
+    assert!(
+        rig.control.surfaces_opened() >= 2,
+        "the device asked on a fresh connection once the first went quiet"
+    );
+    rig.until_lease_requests(1).await;
+    rig.connection(true).await;
+    rig.reads().expect("the host serves the device");
+    rig.host_holds_the_newest_lease().await;
+}
+
+/// KR-REQ-10.37: a member's device that moved to another connection before the owner approved is
+/// refused there once the host has committed it, recovers as the device it became, and is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_moved_to_another_connection_before_the_approval_recovers_and_is_served() {
+    let (rig, awaiting) = Rig::awaiting_with(SERVED, 0).await;
+    rig.control.silence_the_first_surface();
+    tokio::time::timeout(WATCHDOG, async {
+        while rig.control.surfaces_opened() < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the device moves to a fresh connection once the first went quiet");
+    awaiting
+        .approved_without_waiting(&rig.fixture.host, &rig.fixture.owner)
+        .await;
+    rig.until_a_question_goes_unanswered().await;
+    assert!(
+        rig.control.statuses_refused() >= 1,
+        "the host's refusal of the device's question reached it as a refusal"
+    );
+    rig.phone
+        .companion
+        .reached(|state| state["state"] == "paired")
+        .await;
+    rig.until_lease_requests(1).await;
+    rig.connection(true).await;
+    rig.reads().expect("the host serves the device");
+    rig.host_holds_the_newest_lease().await;
+}
+
+/// KR-REQ-10.37: no lease survives a host's restart, so a stranded member's device whose host
+/// restarted after it committed the device presents its lease again on the connection it recovers
+/// with, and is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stranded_member_whose_host_restarted_presents_again_and_is_served() {
+    let (rig, awaiting) = Rig::awaiting_with(SERVED, 0).await;
+    rig.control.silence_the_first_surface();
+    awaiting
+        .approved_without_waiting(&rig.fixture.host, &rig.fixture.owner)
+        .await;
+    let before = rig.signing.issued().len();
+
+    let rig = rig.restarted().await;
+    rig.until_a_question_goes_unanswered().await;
+    assert!(
+        rig.control.statuses_refused() >= 1,
+        "the host's refusal of the device's question reached it as a refusal"
+    );
+    rig.phone
+        .companion
+        .reached(|state| state["state"] == "paired")
+        .await;
+    rig.until_lease_requests(before + 1).await;
+    rig.connection(true).await;
+    rig.reads().expect("the restarted host serves the device");
+    rig.host_holds_the_newest_lease().await;
 }
