@@ -1063,31 +1063,96 @@ pub struct RootPin {
 /// Makes the pipe `name` relative to `directory`, a handle that was checked, refusing a name that
 /// exists.
 #[cfg(not(target_os = "macos"))]
-fn make_fifo_in(directory: &std::os::fd::OwnedFd, name: &str) -> Result<(), String> {
+fn make_fifo_in(directory: &std::os::fd::OwnedFd, _base: &Path, name: &str) -> Result<(), String> {
     rustix::fs::mkfifoat(directory, name, rustix::fs::Mode::from_raw_mode(0o600))
         .map_err(|error| format!("the pipe {name} is not made: {error}"))
 }
 
-/// Makes the pipe `name` relative to `directory`, a handle that was checked, refusing a name that
-/// exists. macOS has the call from version 13, below the host floor; the wrapper the harness uses
-/// elsewhere does not offer it there, so this one function calls it directly.
+/// The name the pipe has in the staging directory before it is moved.
 #[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn make_fifo_in(directory: &std::os::fd::OwnedFd, name: &str) -> Result<(), String> {
-    use std::os::fd::AsRawFd as _;
-    let named = std::ffi::CString::new(name)
-        .map_err(|_| format!("the pipe name {name:?} holds a NUL byte"))?;
-    // SAFETY: `directory` is an open descriptor for the duration of the call, and `named` is a
-    // NUL-terminated string that the call only reads.
-    let made = unsafe { libc::mkfifoat(directory.as_raw_fd(), named.as_ptr(), 0o600) };
-    if made == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "the pipe {name} is not made: {}",
-            std::io::Error::last_os_error()
-        ))
+const STAGED_PIPE: &str = "pipe";
+
+/// Makes the pipe `name` relative to `directory`, a handle that was checked, refusing a name that
+/// exists. No call of the system library the harness uses makes a pipe relative to a handle on
+/// macOS, and the `mkfifo` program takes a path, which would walk the path of `directory` again.
+/// So the program makes the pipe in a directory of the harness's own, made in `base` (on the
+/// run's file system) and removed again; the pipe is looked at through that directory's handle,
+/// moved into `directory` by one call that names both handles and replaces nothing, and looked at
+/// there: it must be the object that was made, by its device and inode.
+#[cfg(target_os = "macos")]
+fn make_fifo_in(directory: &std::os::fd::OwnedFd, base: &Path, name: &str) -> Result<(), String> {
+    let (staging, pin) = make_root(base, &mut || kr_ipc::new_uuid().to_string(), &mut |_| {})?;
+    let made = make_fifo_through(directory, &staging, &pin, name);
+    match remove_run_directory(&staging, &pin) {
+        Removal::Removed => made,
+        left => made.and(Err(format!(
+            "the directory the pipe was staged in is left where it is: {left:?}"
+        ))),
     }
+}
+
+/// [`make_fifo_in`] through the staging directory `staging`, which `pin` names.
+#[cfg(target_os = "macos")]
+fn make_fifo_through(
+    directory: &std::os::fd::OwnedFd,
+    staging: &Path,
+    pin: &RootPin,
+    name: &str,
+) -> Result<(), String> {
+    use rustix::fs::{AtFlags, FileType, RenameFlags};
+    let handle = open_directory(staging)
+        .map_err(|error| format!("the pipe's staging directory is not opened: {error}"))?;
+    if !pin.holds(&handle) {
+        return Err("the pipe's staging directory is not the one that was made".to_owned());
+    }
+    let place = current_place(&handle)
+        .ok_or_else(|| "the system names no place for the pipe's staging directory".to_owned())?;
+    let (staged, target) = (
+        rustix::fs::fstat(&handle).map_err(|error| error.to_string())?,
+        rustix::fs::fstat(directory).map_err(|error| error.to_string())?,
+    );
+    if staged.st_dev != target.st_dev {
+        return Err(
+            "the pipe's staging directory is on another file system than the directory it is for"
+                .to_owned(),
+        );
+    }
+    let output = std::process::Command::new("/usr/bin/mkfifo")
+        .arg("-m")
+        .arg("600")
+        .arg(place.join(STAGED_PIPE))
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("the pipe is not made: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "the pipe is not made: mkfifo ended with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let made = rustix::fs::statat(&handle, STAGED_PIPE, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| format!("the pipe is not looked at in its staging directory: {error}"))?;
+    if FileType::from_raw_mode(made.st_mode) != FileType::Fifo {
+        return Err("what the staging directory holds is not a pipe".to_owned());
+    }
+    rustix::fs::renameat_with(
+        &handle,
+        STAGED_PIPE,
+        directory,
+        name,
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| format!("the pipe {name} is not moved into place: {error}"))?;
+    let moved = rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| format!("the pipe {name} is not looked at after the move: {error}"))?;
+    if FileType::from_raw_mode(moved.st_mode) != FileType::Fifo
+        || object_of(&moved) != object_of(&made)
+    {
+        return Err(format!("{name} is not the pipe that was made"));
+    }
+    Ok(())
 }
 
 /// Opens the directory at `path`, following no link at its last component.
@@ -1476,11 +1541,10 @@ impl PlacedDirectory {
     }
 
     /// Makes the named pipe `name` in the directory, and returns its device and inode as made. The
-    /// pipe is made relative to the held handle that was checked (`mkfifoat`), the name must not
-    /// exist (the call refuses an existing name), and what is at the name afterwards is looked at
-    /// through the handle with no link followed and must be a pipe. On macOS, which has no call that
-    /// makes a pipe relative to a handle, `mkfifo` is given the handle's own place, which no link
-    /// names, and the object looked at afterwards is the check.
+    /// pipe is made relative to the held handle that was checked (`mkfifoat`; on macOS, which has
+    /// no such call, in a staging directory of the harness's own and moved in through the two
+    /// handles), the name must not exist (the call refuses an existing name), and what is at the
+    /// name afterwards is looked at through the handle with no link followed and must be a pipe.
     ///
     /// # Errors
     ///
@@ -1488,7 +1552,10 @@ impl PlacedDirectory {
     pub fn make_fifo(&self, root: &Path, pin: &RootPin, name: &str) -> Result<(u64, u64), String> {
         let name = one_name(name)?;
         let handle = self.open(root, pin)?;
-        make_fifo_in(&handle, &name)?;
+        let base = root
+            .parent()
+            .ok_or_else(|| "the run's directory has no parent".to_owned())?;
+        make_fifo_in(&handle, base, &name)?;
         let stat = rustix::fs::statat(
             &handle,
             name.as_str(),
@@ -2937,7 +3004,7 @@ mod root_tests {
         let after = base.join("after");
         std::fs::rename(&before, &after).expect("a rename");
         std::fs::create_dir(&before).expect("another directory at the old path");
-        make_fifo_in(&handle, "pipe").expect("a pipe");
+        make_fifo_in(&handle, &base, "pipe").expect("a pipe");
         assert!(
             std::fs::symlink_metadata(after.join("pipe"))
                 .expect("the pipe is in the handle's directory")
@@ -2949,7 +3016,51 @@ mod root_tests {
             "nothing is made at the old path"
         );
         // A name that exists is refused, and is left as it is.
-        assert!(make_fifo_in(&handle, "pipe").is_err());
+        assert!(make_fifo_in(&handle, &base, "pipe").is_err());
+        std::fs::remove_dir_all(&base).expect("clean up");
+    }
+
+    /// The directory's parent loses its search permission after the handle was opened: a call that
+    /// walks the directory's path fails, and a pipe made through the handle does not.
+    #[test]
+    fn a_pipe_is_made_in_the_directory_the_handle_holds_though_its_parent_cannot_be_searched() {
+        use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+        if rustix::process::getuid().is_root() {
+            eprintln!("skipping: root searches every directory whatever its mode");
+            return;
+        }
+        let base = scratch("fifo-parent");
+        let outer = base.join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).expect("directories");
+        let handle = open_directory(&inner).expect("it opens");
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o600))
+            .expect("the parent loses its search permission");
+        let walked = std::fs::read_dir(&inner).is_err();
+        let made = make_fifo_in(&handle, &base, "pipe");
+        let seen = rustix::fs::statat(&handle, "pipe", rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+            .map(|stat| rustix::fs::FileType::from_raw_mode(stat.st_mode));
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o700))
+            .expect("the parent is searchable again");
+        assert!(walked, "a path through the parent is no longer walked");
+        assert!(made.is_ok(), "the pipe is made through the handle: {made:?}");
+        assert_eq!(
+            seen,
+            Ok(rustix::fs::FileType::Fifo),
+            "the handle's directory holds the pipe"
+        );
+        assert!(
+            std::fs::symlink_metadata(inner.join("pipe"))
+                .expect("the pipe")
+                .file_type()
+                .is_fifo()
+        );
+        // Nothing of the staging is left beside the directory.
+        let names: Vec<_> = std::fs::read_dir(&base)
+            .expect("the base")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("outer")]);
         std::fs::remove_dir_all(&base).expect("clean up");
     }
 
