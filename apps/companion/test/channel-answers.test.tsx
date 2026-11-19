@@ -135,6 +135,42 @@ describe('a release that is still on its way', () => {
   })
 })
 
+describe('the lines that stay beside the requests', () => {
+  it('each name their request and how long ago it was asked, and the oldest are counted', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.useChannel(SESSION_MAIN, 0)
+    controls.records.holdAnswered(SESSION_MAIN, 7)
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+        <App />
+      </AppProvider>
+    )
+    const lines = await screen.findAllByTestId('approval-unconfirmed')
+    // The five asked most recently, newest first, each with its own request and its age.
+    expect(lines).toHaveLength(5)
+    lines.forEach((line, index) => {
+      expect(line).toHaveTextContent(new RegExp(`^Request earlier-${String(7 - index)}, asked .+ ago\\.`))
+      expect(line).toHaveTextContent(/cannot tell whether Claude Code took the answer to this request/)
+    })
+    expect(screen.getByTestId('approval-unconfirmed-more')).toHaveTextContent(
+      /^2 more answers are in the same state/
+    )
+  })
+
+  it('keep one line for each of up to five, and no count line', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.useChannel(SESSION_MAIN, 0)
+    controls.records.holdAnswered(SESSION_MAIN, 5)
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+        <App />
+      </AppProvider>
+    )
+    expect(await screen.findAllByTestId('approval-unconfirmed')).toHaveLength(5)
+    expect(screen.queryByTestId('approval-unconfirmed-more')).toBeNull()
+  })
+})
+
 describe('an unknown outcome that is not a channel end', () => {
   const unknown = { receipt: null, value: null, action_id: 'action-1', answer_lost: false }
 

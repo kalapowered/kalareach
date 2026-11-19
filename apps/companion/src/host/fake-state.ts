@@ -1579,6 +1579,32 @@ export class ScriptedRecords {
     agent.channel = { lost: lostAnswers, unrecorded: unrecordedAnswers }
   }
 
+  /**
+   * Adds `count` approvals of the session's channel instance that were answered earlier and that
+   * the host still lists as uncertain, named `earlier-1` and on, the first asked longest ago.
+   */
+  holdAnswered(sessionId: string, count: number): void {
+    const agent = this.#agentOf(sessionId)
+    const instance = agent.instances[0]?.application_instance_id
+    if (instance === undefined) throw new Error('the session has no instance')
+    for (let index = 0; index < count; index += 1) {
+      agent.resources.push({
+        resource_id: idOf('d5d5d5d5', index + 1),
+        application_instance_id: instance,
+        request: { connection: '1', upstream: JSON.stringify(`earlier-${String(index + 1)}`) },
+        kind: 'approval',
+        method: 'execCommandApproval',
+        classification: { class: 'mutation', declared: true },
+        source_generation: '1',
+        state: 'uncertain',
+        durability: 'durable',
+        deadline_ms: null,
+        recorded_at: String(this.#ids.nowMs - (20 - index) * 60_000),
+        interpretation_verified: true
+      })
+    }
+  }
+
   /** Whether the worker holds a receipt, reading unknown, for an answer a channel took. */
   holdsChannelReceipt(actionId: string): boolean {
     return this.#channelReceipts.has(actionId)
