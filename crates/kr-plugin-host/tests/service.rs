@@ -414,10 +414,11 @@ fn launched_state(pid: Option<u32>) -> String {
 fn job_state(label: &str) -> String {
     #[cfg(target_os = "macos")]
     {
-        let output = std::process::Command::new("/bin/launchctl")
-            .arg("print")
-            .arg(format!("gui/{}/{label}", kr_ipc::paths::current_uid()))
-            .output();
+        let output = kr_ipc::testing::account_launchd::command(&[
+            "print",
+            &format!("gui/{}/{label}", kr_ipc::paths::current_uid()),
+        ])
+        .output();
         match output {
             Ok(output) => format!(
                 "launchctl print {label}: {}{}",
@@ -443,12 +444,13 @@ fn retire_job(label: &str) {
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("/bin/launchctl")
-            .arg("bootout")
-            .arg(format!("gui/{}/{label}", kr_ipc::paths::current_uid()))
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
+        let _ = kr_ipc::testing::account_launchd::command(&[
+            "bootout",
+            &format!("gui/{}/{label}", kr_ipc::paths::current_uid()),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     }
     #[cfg(target_os = "linux")]
     {

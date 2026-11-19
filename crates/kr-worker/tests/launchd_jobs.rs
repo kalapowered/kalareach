@@ -384,8 +384,7 @@ fn loaded(label: &str) -> Vec<String> {
     let mut found = Vec::new();
     for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
         let target = format!("{domain}/{label}");
-        let status = std::process::Command::new("/bin/launchctl")
-            .args(["print", &target])
+        let status = kr_ipc::testing::account_launchd::command(&["print", &target])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -401,8 +400,7 @@ fn loaded(label: &str) -> Vec<String> {
 
 /// Whether launchd describes `target` as loaded with a process running in it.
 fn has_process(target: &str) -> bool {
-    let printed = std::process::Command::new("/bin/launchctl")
-        .args(["print", target])
+    let printed = kr_ipc::testing::account_launchd::command(&["print", target])
         .output()
         .expect("runs launchctl");
     assert!(
@@ -519,8 +517,7 @@ async fn a_worker_ended_outright_has_its_job_removed() {
     let target = format!("{}/{job}", domain(WorkerProfile::HeadlessUser));
     assert_eq!(loaded(&job), vec![target.clone()]);
 
-    let killed = std::process::Command::new("/bin/launchctl")
-        .args(["kill", "SIGKILL", &target])
+    let killed = kr_ipc::testing::account_launchd::command(&["kill", "SIGKILL", &target])
         .output()
         .expect("runs launchctl");
     assert!(

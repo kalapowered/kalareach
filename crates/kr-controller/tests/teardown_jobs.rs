@@ -27,8 +27,7 @@ impl Drop for Registered {
     fn drop(&mut self) {
         #[cfg(target_os = "macos")]
         for domain in ["gui", "user"] {
-            let _ = Command::new("/bin/launchctl")
-                .arg("bootout")
+            let _ = kr_ipc::testing::account_launchd::command(&["bootout"])
                 .arg(format!(
                     "{domain}/{}/{}",
                     kr_ipc::paths::current_uid(),
@@ -55,9 +54,7 @@ fn registered(label: &str) -> bool {
     let uid = kr_ipc::paths::current_uid();
     ["gui", "user"].into_iter().any(|domain| {
         let target = format!("{domain}/{uid}/{label}");
-        let status = Command::new("/bin/launchctl")
-            .arg("print")
-            .arg(&target)
+        let status = kr_ipc::testing::account_launchd::command(&["print", &target])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
