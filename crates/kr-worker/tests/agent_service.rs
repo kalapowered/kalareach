@@ -3248,6 +3248,11 @@ impl Installed {
 /// service's deadline is therefore the longest wait this suite allows, and the case ends the wait
 /// itself, as the deadline ends it, once the signal of the pause has come: the caller is told only
 /// after the thread stands at its pause.
+///
+/// The limit: no case runs the deadline's own arm, in the wait for the call to be made, with a
+/// thread at its pause. The case where the deadline is short passes it in the wait that follows the
+/// call. The end that this case makes and the deadline's arm drop the same state today, so what is
+/// proved is the same; a change made only in the deadline's arm before the call is not seen here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_25_22_an_ending_binding_stays_while_the_thread_of_a_cancellation_whose_deadline_passed_still_stands()
  {
