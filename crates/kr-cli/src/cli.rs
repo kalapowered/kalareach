@@ -1595,13 +1595,31 @@ pub struct RollbackArguments {
 
 /// `kr host network`.
 #[derive(Args)]
+#[command(group(clap::ArgGroup::new("login_use").args(["join", "proxy_login"]).multiple(true)))]
 pub struct NetworkArguments {
     /// Join a service: read the description it publishes of itself and write the relay map, the
     /// discovery servers and the service origins it names into this host's configuration document.
     /// Without it, what the document selects is shown and nothing is fetched. The settings apply
     /// when the control daemon next starts.
-    #[arg(long, conflicts_with = "clear")]
+    #[arg(long, conflicts_with_all = ["clear", "proxy_login", "proxy_logout"])]
     pub join: bool,
+    /// Store the login the proxy named in `network.proxy_url` asks for: the control daemon keeps it
+    /// in its secret store and uses it from its next start. It is read from
+    /// `--proxy-credential-file`.
+    #[arg(
+        long,
+        conflicts_with_all = ["clear", "proxy_logout"],
+        requires = "proxy_credential_file"
+    )]
+    pub proxy_login: bool,
+    /// Remove the stored proxy login. The control daemon that is running keeps the login it
+    /// started with.
+    #[arg(long, conflicts_with = "clear")]
+    pub proxy_logout: bool,
+    /// The file that holds the proxy's login as one line, `user:password`. With `--join` it is
+    /// given to that one request and kept nowhere.
+    #[arg(long, requires = "login_use", value_name = "FILE")]
+    pub proxy_credential_file: Option<std::path::PathBuf>,
     /// The origin of the service to join, instead of the KalaReach service: an `https` address with
     /// no path, or an `http` address on this machine. A service you run is verified with `--key`, or
     /// taken on the connection alone with `--unsigned`. A signature covers the origin it was made

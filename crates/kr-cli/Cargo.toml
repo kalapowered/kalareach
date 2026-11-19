@@ -54,6 +54,8 @@ kr-keys.workspace = true
 # The owner-confirmation proof and the grants an invitation proposes.
 kr-pairing.workspace = true
 kr-protocol.workspace = true
+# The proxy a login is for, and the login the daemon is given.
+kr-transport.workspace = true
 # One signer and one verifier of a release's manifest, which the tool that builds a release uses too.
 kr-release.workspace = true
 kr-shell-integration.workspace = true

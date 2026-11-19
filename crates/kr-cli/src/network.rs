@@ -23,13 +23,21 @@ use kr_client::services::matrix::Pins;
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_ipc::paths::{EnvironmentPaths, HostPaths};
+use kr_protocol::delivery::SecretText;
 use kr_protocol::hostinfo::configuration::{
     self, Change, ConfigurationDocument, Loaded, ServiceSelection,
 };
 use kr_protocol::hostinfo::export::ContentClass;
+use kr_protocol::method::Method;
+use kr_protocol::network_proxy::{
+    NetworkProxyLoginClearParams, NetworkProxyLoginResult, NetworkProxyLoginSetParams,
+};
 use kr_protocol::service::GatewayOrigin;
+use kr_transport::config::ProxyUrl;
+use kr_transport::proxy::{ProxyCredential, ProxyLoginKind};
 
-use crate::cli::NetworkArguments;
+use crate::cli::{EnvironmentSelector, NetworkArguments};
+use crate::daemon::Daemon;
 use crate::doctor::configuration::{WRITTEN, apply_over, document_path, load, refusal, validate};
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Request};
@@ -48,6 +56,10 @@ enum Action {
     },
     /// It took the selection out. `revision` is none when the document held none.
     Cleared { revision: Option<u64> },
+    /// It gave the control daemon a proxy login to keep.
+    LoginStored,
+    /// It had the control daemon remove the proxy login it kept.
+    LoginCleared,
 }
 
 /// Runs `kr host network`.
@@ -62,6 +74,10 @@ pub async fn run(paths: &HostPaths, arguments: &NetworkArguments, json: bool) ->
     let loaded = load(&environment.paths);
     let action = if arguments.clear {
         clear(&environment.paths, &loaded)?
+    } else if arguments.proxy_login {
+        store_login(paths, arguments, &loaded, json).await?
+    } else if arguments.proxy_logout {
+        clear_login(paths).await?
     } else if arguments.join {
         join(&environment.paths, arguments, loaded, json).await?
     } else {
@@ -127,13 +143,23 @@ async fn join(
     })?;
     let trust = trust(&origin, arguments)?;
 
-    // The proxy is the document's to name, and only a document that can be used names one.
-    let proxy = loaded
-        .document
-        .as_ref()
-        .and_then(|document| document.network.proxy_url());
-    let http = description::connect(&origin, proxy).map_err(unread)?;
-    let body = description::fetch(&http, &origin).await.map_err(unread)?;
+    // The proxy is the document's to name, and only a document that can be used names one. A login
+    // from the file goes to this one request and is kept nowhere.
+    let proxy = proxy_of(&loaded, arguments.proxy_credential_file.as_deref(), json)?;
+    let http = description::connect(&origin, proxy.as_ref()).map_err(unread)?;
+    let body = match description::fetch(&http, &origin).await {
+        Ok(body) => body,
+        // A proxy that answers `HTTP/1.0 407` reads as a failed tunnel; one request through it
+        // says which login failed.
+        Err(Unread::Unreachable) => {
+            return Err(unread(
+                description::recheck(proxy.as_ref())
+                    .await
+                    .unwrap_or(Unread::Unreachable),
+            ));
+        }
+        Err(why) => return Err(unread(why)),
+    };
     let described = description::read(&body, &origin, &trust)
         .map_err(|refusal| CliError::Usage(Shown::said(refusal.sentence())))?;
 
@@ -171,6 +197,106 @@ async fn join(
         revision: Some(revision),
         description: Box::new(described),
     })
+}
+
+/// The proxy the document names, with the login the file holds when one is given.
+///
+/// A login sent to a proxy whose address is `http` goes in clear, which is said before anything is
+/// sent.
+fn proxy_of(
+    loaded: &Loaded,
+    credential_file: Option<&std::path::Path>,
+    json: bool,
+) -> Result<Option<ProxyUrl>> {
+    let proxy = loaded
+        .document
+        .as_ref()
+        .and_then(|document| document.network.proxy_url())
+        .map(|text| text.parse::<ProxyUrl>())
+        .transpose()
+        .map_err(|_| unread(Unread::NoTransport))?;
+    let Some(file) = credential_file else {
+        return Ok(proxy);
+    };
+    let Some(proxy) = proxy else {
+        return Err(CliError::Usage(Shown::said(
+            "name the proxy in network.proxy_url first",
+        )));
+    };
+    let (login, _) = login_of(file)?;
+    if !json && proxy.as_url().scheme() == "http" {
+        output::say(&Shown::said(
+            "the login is sent in clear to the proxy, because the proxy's address is an http one",
+        ));
+    }
+    Ok(Some(proxy.with_login(login)))
+}
+
+/// Reads a login from its file: the credential the transport holds, and the line the daemon is
+/// given. Nothing the file held is printed or kept.
+fn login_of(file: &std::path::Path) -> Result<(ProxyCredential, SecretText)> {
+    let bytes = crate::destination::read_credential(file)?;
+    let refused = || {
+        CliError::Usage(shown!(
+            "{}: the file must hold one line of a user name, a colon and a password, where the user \
+             name is not empty and neither part has a control character or more than 255 bytes",
+            crate::shown::named(file)
+        ))
+    };
+    let credential = ProxyCredential::parse_line(&bytes).map_err(|_| refused())?;
+    let line = std::str::from_utf8(bytes.expose()).map_err(|_| refused())?;
+    let line = line
+        .strip_suffix("\r\n")
+        .or_else(|| line.strip_suffix('\n'))
+        .unwrap_or(line);
+    Ok((credential, SecretText::new(line).map_err(|_| refused())?))
+}
+
+/// Gives the control daemon the login in the file, for the proxy the document names.
+async fn store_login(
+    paths: &HostPaths,
+    arguments: &NetworkArguments,
+    loaded: &Loaded,
+    json: bool,
+) -> Result<Action> {
+    let Some(file) = arguments.proxy_credential_file.as_deref() else {
+        return Err(CliError::Usage(Shown::said(
+            "--proxy-login takes the login in --proxy-credential-file",
+        )));
+    };
+    // Read before the daemon is reached: a mistake in the file or the document is the person's to
+    // fix, and nothing has been sent anywhere.
+    let proxy = proxy_of(loaded, None, json)?
+        .ok_or_else(|| CliError::Usage(Shown::said("name the proxy in network.proxy_url first")))?;
+    let (_, line) = login_of(file)?;
+    if !json && proxy.as_url().scheme() == "http" {
+        output::say(&Shown::said(
+            "the login is sent in clear to the proxy, because the proxy's address is an http one",
+        ));
+    }
+    let mut daemon = Daemon::open(paths, &EnvironmentSelector { environment: None }).await?;
+    let _: NetworkProxyLoginResult = daemon
+        .mutate(
+            Method::NetworkProxyLoginSet,
+            &NetworkProxyLoginSetParams {
+                proxy: proxy.to_string(),
+                login: line,
+            },
+        )
+        .await?;
+    Ok(Action::LoginStored)
+}
+
+/// Has the control daemon remove the proxy login it keeps.
+async fn clear_login(paths: &HostPaths) -> Result<Action> {
+    let mut daemon = Daemon::open(paths, &EnvironmentSelector { environment: None }).await?;
+    let _: NetworkProxyLoginResult = daemon
+        .mutate(
+            Method::NetworkProxyLoginClear,
+            &NetworkProxyLoginClearParams::default(),
+        )
+        .await?;
+    Ok(Action::LoginCleared)
 }
 
 /// What vouches for the description of the service at `origin`.
@@ -212,6 +338,13 @@ fn unread(why: Unread) -> CliError {
         // did not answer.
         Unread::NoTransport | Unread::ClearTextViaProxy => {
             CliError::Usage(Shown::said(why.sentence()))
+        }
+        // The login in the file is the one this command sent, so a refusal is of that file's.
+        Unread::ProxyLogin(ProxyLoginKind::Needed) => CliError::Usage(Shown::said(
+            "the proxy requires a sign-in: give a login with --proxy-credential-file <file>",
+        )),
+        Unread::ProxyLogin(ProxyLoginKind::Refused) => {
+            CliError::Usage(Shown::said("the proxy refused the login in the file"))
         }
         why => CliError::Other(Shown::said(why.sentence())),
     }
@@ -295,7 +428,7 @@ fn present(environment: &KnownEnvironment, action: &Action, json: bool) {
     let document = now.document.as_ref().unwrap_or(&empty);
     let revision = match action {
         Action::Joined { revision, .. } | Action::Cleared { revision } => *revision,
-        Action::Showed => None,
+        Action::Showed | Action::LoginStored | Action::LoginCleared => None,
     };
     if json {
         let mut shown = Document::new()
@@ -305,6 +438,9 @@ fn present(environment: &KnownEnvironment, action: &Action, json: bool) {
             .with("changed", revision.is_some())
             .with("revision", now.revision())
             .with("network", selection_document(document));
+        if matches!(action, Action::LoginStored | Action::LoginCleared) {
+            shown.set("applies_at_next_start", true);
+        }
         if let Action::Joined { description, .. } = action {
             shown.set("signed", description.signed());
             shown.set("ignored_members", description.ignored().count());
@@ -333,6 +469,12 @@ fn present(environment: &KnownEnvironment, action: &Action, json: bool) {
             ));
             note_description(description);
         }
+        Action::LoginStored => output::say(&Shown::said(
+            "the proxy login is stored; the daemon uses it from its next start",
+        )),
+        Action::LoginCleared => output::say(&Shown::said(
+            "the proxy login is cleared; the daemon sends none from its next start",
+        )),
         Action::Cleared { revision: None } => output::say(&Shown::said(
             "this host's configuration selected none of what a join writes; nothing was written",
         )),
@@ -478,7 +620,52 @@ mod tests {
             unsigned: false,
             replace: false,
             clear: false,
+            proxy_login: false,
+            proxy_logout: false,
+            proxy_credential_file: None,
         };
         assert!(matches!(trust(&managed, &arguments), Ok(Trust::Pinned(_))));
+    }
+
+    /// KR-REQ-10.02: the proxy login's flags combine as the command's help says. The file needs
+    /// `--join` or `--proxy-login`; `--proxy-login` needs the file; the four modes exclude each
+    /// other.
+    #[test]
+    fn the_proxy_login_flags_combine_only_as_the_command_says() {
+        use clap::Parser as _;
+
+        let parses = |line: &[&str]| {
+            let mut arguments = vec!["kr", "host", "network"];
+            arguments.extend_from_slice(line);
+            crate::cli::Cli::try_parse_from(arguments).is_ok()
+        };
+        assert!(parses(&[
+            "--proxy-login",
+            "--proxy-credential-file",
+            "login"
+        ]));
+        assert!(parses(&["--join", "--proxy-credential-file", "login"]));
+        assert!(parses(&["--proxy-logout"]));
+        assert!(!parses(&["--proxy-credential-file", "login"]));
+        assert!(!parses(&["--proxy-login"]));
+        assert!(!parses(&[
+            "--proxy-login",
+            "--join",
+            "--proxy-credential-file",
+            "login"
+        ]));
+        assert!(!parses(&[
+            "--proxy-login",
+            "--proxy-logout",
+            "--proxy-credential-file",
+            "login"
+        ]));
+        assert!(!parses(&["--proxy-logout", "--clear"]));
+        assert!(!parses(&[
+            "--clear",
+            "--proxy-login",
+            "--proxy-credential-file",
+            "login"
+        ]));
     }
 }

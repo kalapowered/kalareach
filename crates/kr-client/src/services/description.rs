@@ -48,6 +48,7 @@
 //! makes it when the selection is written.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -278,11 +279,7 @@ const DEADLINES: HttpDeadlines = HttpDeadlines {
 ///
 /// Returns [`Unread::NoTransport`] when the proxy or the platform's certificate verification
 /// cannot be used, and [`Unread::ClearTextViaProxy`] for a plain `http` origin with a proxy.
-pub fn connect(origin: &GatewayOrigin, proxy: Option<&str>) -> Result<HttpService, Unread> {
-    let proxy = proxy
-        .map(|text| text.parse::<ProxyUrl>())
-        .transpose()
-        .map_err(|_| Unread::NoTransport)?;
+pub fn connect(origin: &GatewayOrigin, proxy: Option<&ProxyUrl>) -> Result<HttpService, Unread> {
     if proxy.is_some() && origin.as_str().starts_with("http://") {
         return Err(Unread::ClearTextViaProxy);
     }
@@ -290,9 +287,35 @@ pub fn connect(origin: &GatewayOrigin, proxy: Option<&str>) -> Result<HttpServic
         origin.clone(),
         DEADLINES,
         super::managed_response_limits(),
-        proxy.as_ref(),
+        proxy,
     )
     .map_err(|_| Unread::NoTransport)
+}
+
+/// How long the one re-check of a proxy that held a login may take.
+const RECHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Asks the proxy once, after a request through it found the service unreachable, and says what it
+/// answered when that was about its login.
+///
+/// A proxy that answers `HTTP/1.0 407` is read by the client only as a failed tunnel, so the
+/// request alone cannot tell a refused login from an unreachable service. The failed request left
+/// its target in the login's suspicion; this makes one `CONNECT` to it, with the same login and
+/// under [`RECHECK_TIMEOUT`], with no loop and no interval. `None` leaves the request's own reading
+/// of the failure as it was.
+pub async fn recheck(proxy: Option<&ProxyUrl>) -> Option<Unread> {
+    let proxy = proxy?;
+    let target = proxy.login()?.suspicion().take()?;
+    let tls = Arc::new(super::http::platform_tls(&[]).ok()?);
+    match tokio::time::timeout(
+        RECHECK_TIMEOUT,
+        crate::tunnel::through(proxy, &target.host, target.port, &tls),
+    )
+    .await
+    {
+        Ok(Err(crate::tunnel::TunnelFailure::Login(kind))) => Some(Unread::ProxyLogin(kind)),
+        _ => None,
+    }
 }
 
 /// Reads the published reply from `origin`.

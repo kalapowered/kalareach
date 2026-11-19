@@ -196,7 +196,7 @@ fn credential(
 }
 
 /// The credential file's bytes, in a buffer that clears itself.
-fn read_credential(file: &Path) -> Result<SecretVec> {
+pub(crate) fn read_credential(file: &Path) -> Result<SecretVec> {
     use std::io::Read as _;
 
     let unreadable =
