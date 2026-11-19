@@ -27,9 +27,9 @@ use kr_protocol::gateway::{
     PendingState,
 };
 use kr_protocol::ids::{
-    AgentBindingRevision, AgentTurnId, ApplicationInstanceId, GatewayConnectionId, GeometryEpoch,
-    InputLeaseEpoch, InputSequence, PendingResourceId, PluginId, SessionId, SourceGeneration,
-    UpstreamMethod, UpstreamRequestId,
+    ActionId, AgentBindingRevision, AgentTurnId, ApplicationInstanceId, GatewayConnectionId,
+    GeometryEpoch, InputLeaseEpoch, InputSequence, PendingResourceId, PluginId, SessionId,
+    SourceGeneration, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::input::InputLeaseState;
 use kr_protocol::method::Method;
@@ -74,6 +74,7 @@ impl Page {
                 companion_tauri::commands::agent_turn_cancel,
                 companion_tauri::commands::agent_approval_respond,
                 companion_tauri::commands::plugin_action_invoke,
+                companion_tauri::commands::agent_action_settle,
                 companion_tauri::commands::session_agents,
                 companion_tauri::commands::history_page,
                 companion_tauri::commands::action_read,
@@ -122,6 +123,14 @@ impl Page {
         self.app
             .state::<companion_tauri::agent::WorkerLinks>()
             .held()
+    }
+
+    /// The actions the link of `session_id` still counts as unresolved, once it holds a link.
+    async fn unsettled(&self, session_id: SessionId) -> Option<Vec<ActionId>> {
+        self.app
+            .state::<companion_tauri::agent::WorkerLinks>()
+            .unsettled(session_id)
+            .await
     }
 }
 
@@ -801,7 +810,7 @@ async fn a_live_sessions_history_is_read_on_its_worker_and_an_ended_ones_from_th
 /// connected to.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_live_sessions_receipt_is_read_on_its_worker_and_every_other_from_the_host() {
-    use kr_protocol::ids::{ActionId, ActorId};
+    use kr_protocol::ids::ActorId;
     use kr_protocol::method::MethodVersion;
     use kr_protocol::receipt::{ActionReadParams, ActionReadResult, Receipt, ReceiptState};
 
@@ -858,5 +867,154 @@ async fn a_live_sessions_receipt_is_read_on_its_worker_and_every_other_from_the_
     assert!(
         !worker.connected(),
         "neither read went to the live session's worker"
+    );
+}
+
+/// The page's call that answers the approval `resource` names, as the page writes it.
+fn approval_answer(worker: &ScriptedWorker, resource: u8) -> Value {
+    json!({ "params": {
+        "target": target(worker),
+        "resource_id": PendingResourceId::new(Uuid::from_bytes([resource; 16])).to_string(),
+        "option_id": "allow"
+    } })
+}
+
+/// KR-REQ-12.18: the page is told whether an answer was lost on the way back. It is lost only when
+/// the connection ended after the request was sent, so the worker may hold no receipt for it or one
+/// that can still become a refusal; the worker's own word that it cannot establish the outcome is
+/// not a lost answer, because its journal holds the receipt.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_is_told_as_lost_only_when_the_connection_ended_after_it_was_sent() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+
+    // An answer the worker gave: its result.
+    let asked = page.call("agent_approval_respond", approval_answer(&worker, 7));
+    let mut link = worker.link().await;
+    let call = link.expect(Method::AgentApprovalRespond).await;
+    link.answer(&call, &mutated()).await;
+    let settled = answered(asked).await.expect("the worker's answer");
+    assert_eq!(
+        settled["answer_lost"], false,
+        "a result is not a lost answer"
+    );
+
+    // The worker's own word that it cannot establish what became of the answer.
+    let asked = page.call("agent_approval_respond", approval_answer(&worker, 8));
+    let call = link.expect(Method::AgentApprovalRespond).await;
+    let unknown = call.action_id.expect("an action identifier");
+    link.refuse_with(
+        &call,
+        ErrorCode::OutcomeUnknown,
+        "the outcome cannot be established",
+    )
+    .await;
+    let settled = answered(asked).await.expect("the action is told");
+    assert_eq!(settled["action_id"], unknown.to_string());
+    assert_eq!(
+        settled["answer_lost"], false,
+        "the worker's own word is not a lost answer"
+    );
+
+    // The connection ends after the request was sent: the answer never came back.
+    let asked = page.call("agent_approval_respond", approval_answer(&worker, 9));
+    let call = link.expect(Method::AgentApprovalRespond).await;
+    let lost = call.action_id.expect("an action identifier");
+    drop(link);
+    let settled = answered(asked).await.expect("the action is told");
+    assert_eq!(settled["action_id"], lost.to_string());
+    assert_eq!(
+        settled["answer_lost"], true,
+        "an answer the connection lost is told as lost"
+    );
+}
+
+/// KR-REQ-12.18: the release names a session and an action, sends nothing to the worker, and lets
+/// the session's link stop counting that action alone. The link's other unresolved actions stay on
+/// its book, an action it does not hold changes nothing, and a call that names no session link
+/// reaches no worker.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_release_of_an_action_lets_the_link_go_of_that_action_alone() {
+    let mut worker = ScriptedWorker::start(Challenge::Answered);
+    let page = Page::new(worker.paths());
+
+    let mut held = Vec::new();
+    let mut link = None;
+    for resource in [7, 8] {
+        let asked = page.call("agent_approval_respond", approval_answer(&worker, resource));
+        if link.is_none() {
+            link = Some(worker.link().await);
+        }
+        let link = link.as_mut().expect("the session's link");
+        let call = link.expect(Method::AgentApprovalRespond).await;
+        held.push(call.action_id.expect("an action identifier"));
+        link.refuse_with(
+            &call,
+            ErrorCode::OutcomeUnknown,
+            "the outcome cannot be established",
+        )
+        .await;
+        answered(asked).await.expect("the action is told");
+    }
+    let mut link = link.expect("the session's link");
+    let book = page
+        .unsettled(worker.session_id)
+        .await
+        .expect("the link holds a book");
+    assert_eq!(
+        book.len(),
+        2,
+        "the worker's unknown outcomes stay on the book"
+    );
+    assert!(held.iter().all(|action| book.contains(action)));
+
+    let release = |action: &ActionId| {
+        page.call(
+            "agent_action_settle",
+            json!({ "params": {
+                "session_id": worker.session_id.to_string(),
+                "action_id": action.to_string()
+            } }),
+        )
+    };
+    // An action the link does not hold changes nothing.
+    answered(release(&ActionId::new(kr_ipc::new_uuid())))
+        .await
+        .expect("the release answers");
+    assert_eq!(
+        page.unsettled(worker.session_id)
+            .await
+            .map(|each| each.len()),
+        Some(2)
+    );
+    // The action the page names is the one that goes.
+    answered(release(&held[0]))
+        .await
+        .expect("the release answers");
+    assert_eq!(
+        page.unsettled(worker.session_id).await,
+        Some(vec![held[1]]),
+        "the link lets go of the named action and keeps the other"
+    );
+    assert!(
+        link.quiet_for(QUIET).await,
+        "the release sent the worker nothing"
+    );
+
+    // A session no link of this application reaches.
+    let refused = answered(page.call(
+        "agent_action_settle",
+        json!({ "params": {
+            "session_id": SessionId::new(kr_ipc::new_uuid()).to_string(),
+            "action_id": held[1].to_string()
+        } }),
+    ))
+    .await
+    .expect_err("no worker serves that session");
+    assert_ne!(code_of(&refused), "not a refusal");
+    assert_eq!(
+        page.unsettled(worker.session_id).await,
+        Some(vec![held[1]]),
+        "and the named link's book is as it was"
     );
 }

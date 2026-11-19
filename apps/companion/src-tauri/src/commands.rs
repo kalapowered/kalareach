@@ -4144,6 +4144,7 @@ mod tests {
         assert_eq!(
             local,
             BTreeSet::from([
+                "agent_action_settle",
                 "choose_export_destination",
                 "connection_state",
                 "export_asciicast",
