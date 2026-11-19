@@ -3727,7 +3727,8 @@
         "approval.respond",
         "native_bridge.install",
         "command_integration.launch",
-        "launch.probe"
+        "launch.probe",
+        "skill_target.install"
       ],
       "type": "string"
     },

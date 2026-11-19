@@ -48,11 +48,20 @@ use crate::trust::{self, AcceptedTarget, MetadataVersions, TargetRecord};
 /// The database file, beside the repositories' directories.
 pub const DATABASE_FILE: &str = "catalogue.sqlite3";
 
-/// The format the database is written in, recorded in the file as SQLite's `user_version`.
+/// The highest format this build writes, recorded in the file as SQLite's `user_version`.
 ///
 /// It covers the tables and every value the catalogue keeps in them. A change to either raises it,
-/// and the stored-format lock (`stored-formats.lock`) fails until it has been raised.
-pub const SCHEMA_VERSION: i64 = 1;
+/// and the stored-format lock (`stored-formats.lock`) fails until it has been raised. A store is at
+/// this format only once it holds state that names a capability a build before
+/// [`PluginCapability::SkillTargetInstall`] cannot read; until then it stays at
+/// [`BASELINE_SCHEMA_VERSION`], so a host that never stored such state can still roll back.
+pub const SCHEMA_VERSION: i64 = 2;
+
+/// The format a store stays in while it holds only state that every build since the version was
+/// recorded reads. A store that records none is stamped with it, and it is raised to
+/// [`SCHEMA_VERSION`] in the same commit that first makes state naming the skill-target
+/// capability durable.
+pub const BASELINE_SCHEMA_VERSION: i64 = 1;
 
 /// The oldest format this build opens. A database that records none, as every one written before
 /// the version was recorded does, reads as `0` and is the format this build writes.
@@ -233,12 +242,27 @@ impl Db {
         db.connection
             .execute_batch(SCHEMA)
             .map_err(|source| db.failure(&source))?;
-        if recorded != SCHEMA_VERSION {
+        if recorded < BASELINE_SCHEMA_VERSION {
             db.connection
-                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .pragma_update(None, "user_version", BASELINE_SCHEMA_VERSION)
                 .map_err(|source| db.failure(&source))?;
         }
         Ok(db)
+    }
+
+    /// Raises the format to [`SCHEMA_VERSION`], for state that names the skill-target capability
+    /// and is made durable outside this database, before it is made.
+    ///
+    /// A crash after this and before that state is written leaves the store at the higher format,
+    /// which only stops a rollback that nothing needed to stop.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
+    pub(crate) fn raise_format(&mut self) -> CatalogueResult<()> {
+        self.connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|source| self.failure(&source))
     }
 
     /// Returns the durability settings this connection runs under.
@@ -953,6 +977,25 @@ impl<'a> core::ops::Deref for Changes<'a> {
 }
 
 impl Changes<'_> {
+    /// Raises the format to [`SCHEMA_VERSION`] in this commit when what the commit writes names
+    /// the skill-target capability, so the state and the format that says an older build cannot
+    /// read it become durable together.
+    fn raise_for(
+        &self,
+        capabilities: impl IntoIterator<Item = PluginCapability>,
+    ) -> CatalogueResult<()> {
+        if capabilities
+            .into_iter()
+            .any(|capability| capability == PluginCapability::SkillTargetInstall)
+        {
+            self.0
+                .transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|source| self.0.failure(&source))?;
+        }
+        Ok(())
+    }
+
     fn execute(&self, sql: &str, parameters: impl rusqlite::Params) -> CatalogueResult<usize> {
         self.0
             .transaction
@@ -972,6 +1015,7 @@ impl Changes<'_> {
                 detail: format!("{} is already enrolled", enrolment.id),
             });
         }
+        self.raise_for(enrolment.ceiling.capabilities())?;
         self.execute(
             "INSERT INTO enrolments (enrolment_key, repository_id, kind, metadata_url, targets_url,
                                      root, budgets, ceiling, pinned_generation, active_generation)
@@ -1005,6 +1049,7 @@ impl Changes<'_> {
         key: &EnrolmentKey,
         enrolment: &Enrolment,
     ) -> CatalogueResult<()> {
+        self.raise_for(enrolment.ceiling.capabilities())?;
         let changed = self.execute(
             "UPDATE enrolments
                 SET kind = ?2, metadata_url = ?3, targets_url = ?4, root = ?5, budgets = ?6,
@@ -1177,6 +1222,19 @@ impl Changes<'_> {
     ///
     /// Returns [`CatalogueError::StorageUnavailable`] when it cannot be written.
     pub fn install(&self, installation: &Installation) -> CatalogueResult<()> {
+        self.raise_for(
+            installation
+                .grant
+                .capabilities()
+                .into_iter()
+                .chain(installation.ceiling.capabilities())
+                .chain(
+                    installation
+                        .requested
+                        .iter()
+                        .map(|request| request.capability),
+                ),
+        )?;
         self.execute(
             "INSERT INTO installations
                  (environment_id, plugin_id, enrolment_key, repository_id, publisher_id,
@@ -1270,6 +1328,7 @@ impl Changes<'_> {
             Some(held) => held.cap.intersection(&release.cap).copied().collect(),
             None => release.cap.iter().copied().collect(),
         };
+        self.raise_for(cap.iter().copied())?;
         self.execute(
             "INSERT INTO retired_releases
                  (environment_id, plugin_id, package_digest, enrolment_key, repository_id, cap)
@@ -1948,14 +2007,15 @@ mod tests {
     }
 
     /// The database records the format it is written in, a database written before one was
-    /// recorded is the same format and is stamped when it is opened, and one written in a format
-    /// this build does not read is refused and left as it is.
+    /// recorded is the same format as one a build wrote at the baseline and is stamped with it when
+    /// it is opened, and one written in a format this build does not read is refused and left as
+    /// it is.
     #[test]
     fn the_database_records_its_format_and_refuses_a_later_one() {
         let root = tempfile::tempdir().expect("a directory");
         let path = root.path().join(DATABASE_FILE);
         drop(Db::open(root.path()).expect("a new database"));
-        assert_eq!(recorded(&path), SCHEMA_VERSION);
+        assert_eq!(recorded(&path), BASELINE_SCHEMA_VERSION);
 
         // As every database written before the format was recorded: no format, all its tables.
         Connection::open(&path)
@@ -1963,7 +2023,7 @@ mod tests {
             .pragma_update(None, "user_version", 0)
             .expect("writes");
         drop(Db::open(root.path()).expect("an unstamped database opens"));
-        assert_eq!(recorded(&path), SCHEMA_VERSION);
+        assert_eq!(recorded(&path), BASELINE_SCHEMA_VERSION);
 
         Connection::open(&path)
             .expect("opens")
@@ -1974,6 +2034,65 @@ mod tests {
             "a database of a later format is refused"
         );
         assert_eq!(recorded(&path), SCHEMA_VERSION + 1, "and is left as it was");
+    }
+
+    fn retired(capability: PluginCapability) -> RetiredRelease {
+        RetiredRelease {
+            environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::NIL),
+            plugin_id: PluginId::new("kalareach/example-declarative").expect("a plugin"),
+            package_digest: PayloadDigest::of(b"package"),
+            origin: ReleaseOrigin {
+                repository_id: RepositoryId::new("official").expect("a repository"),
+                enrolment_key: EnrolmentKey::generate().expect("a key"),
+            },
+            cap: [capability].into_iter().collect(),
+        }
+    }
+
+    fn keep(db: &mut Db, release: &RetiredRelease) {
+        db.begin()
+            .expect("a change")
+            .run(&Permit::for_test(), |changes| {
+                changes.retire_release(release)
+            })
+            .expect("committed");
+    }
+
+    /// A store that holds only state an earlier build reads stays at the baseline, so a switch to
+    /// that build is allowed, and it is raised in the very commit that makes state naming the
+    /// skill-target capability durable.
+    #[test]
+    fn a_store_is_raised_only_by_the_commit_that_first_holds_the_skill_target_capability() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(DATABASE_FILE);
+        let mut db = Db::open(root.path()).expect("a new database");
+        keep(&mut db, &retired(PluginCapability::LaunchProbe));
+        assert_eq!(
+            recorded(&path),
+            BASELINE_SCHEMA_VERSION,
+            "a host that never stored the capability keeps the format an earlier build reads"
+        );
+        keep(&mut db, &retired(PluginCapability::SkillTargetInstall));
+        assert_eq!(
+            recorded(&path),
+            SCHEMA_VERSION,
+            "a host that stored it is at the format an earlier build refuses"
+        );
+        drop(db);
+        drop(Db::open(root.path()).expect("opens again"));
+        assert_eq!(recorded(&path), SCHEMA_VERSION, "opening does not lower it");
+    }
+
+    /// An index generation that lists a release requesting the capability is written outside the
+    /// database, so the format is raised before it is written.
+    #[test]
+    fn the_format_is_raised_before_an_index_that_names_the_capability_is_written() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(DATABASE_FILE);
+        let mut db = Db::open(root.path()).expect("a new database");
+        assert_eq!(recorded(&path), BASELINE_SCHEMA_VERSION);
+        db.raise_format().expect("raised");
+        assert_eq!(recorded(&path), SCHEMA_VERSION);
     }
 }
 
