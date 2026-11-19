@@ -14,10 +14,12 @@
 //! A grant holds while both of its deadlines are ahead: its anchor on the continuous clock, and its
 //! expiry in UTC, read through this host's clock floor, which the reading raises.
 //!
-//! **Lock order.** A check made inside a transaction on the device directory's connection reads
+//! **Locks.** Three locks are kept apart: the grants' anchors, the anchoring lock and the offline
+//! anchor's cell. A check made inside a transaction on the device directory's connection reads
 //! the anchors, so the anchors are never held while anything waits for that connection.
-//! Deriving an anchor, which reads and writes a directory, is serialised by a lock of its own
-//! that nothing inside a transaction takes.
+//! Deriving an anchor, which reads and writes a directory, is serialised by the anchoring lock,
+//! which nothing inside a transaction takes. The offline anchor's cell is read and set in one
+//! step. Their place among the crate's locks is in the lock order on `Controller::commit_hold`.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
