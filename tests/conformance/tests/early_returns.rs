@@ -15,9 +15,12 @@
 //!   `not tested`) is wherever it stands in the repository, because a message of that kind that the
 //!   report cannot read is the fault.
 //! - By its shape: in test code, a print that a `return` or a `continue` follows later in the same
-//!   block, at the print's own depth, is a test that stops where it stands, whatever it says. Test code is a file under a `tests` or a
-//!   `testing` folder, a file named `tests.rs` or `testing.rs`, and each item under
-//!   `#[cfg(test)]`. A program under `src/bin`, and a `src/main.rs`, is not test code.
+//!   block, at the print's own depth, is a test that stops where it stands, whatever it says. Test
+//!   code is a file under a `tests` or a `testing` folder, a file named `tests.rs` or `testing.rs`,
+//!   each item under `#[cfg(test)]` (a `cfg` that holds `test` outside a `not`), and each module
+//!   that such an item or file declares with `mod name;`, by its `#[path]` or its `name.rs` or
+//!   `name/mod.rs`, and the modules that module declares in turn. A program under `src/bin`, and a
+//!   `src/main.rs`, is not test code.
 //!
 //! Each such print starts with a marker of [`EARLY_RETURN`], or holds [`EARLY_RETURN_NAMED`], or is
 //! on the list below with its reason. A test that skips only part of its case says
@@ -30,6 +33,7 @@
 //! `process::exit` or `break`, and a print whose first literal is made by a macro are not seen.
 //! Review holds those.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -372,8 +376,32 @@ fn prints(tokens: &[Token]) -> Vec<Print> {
     found
 }
 
+/// Whether `attribute`, the tokens between the brackets of an attribute, is a `cfg` that holds
+/// `test` outside every `not(..)`: `cfg(test)` and `cfg(all(test, not(windows)))` do, and
+/// `cfg(not(test))` does not.
+fn is_test_cfg(attribute: &[Token]) -> bool {
+    if attribute.first().and_then(Token::ident) != Some("cfg") {
+        return false;
+    }
+    // For each open parenthesis: whether what stands inside it is under an odd number of `not`s.
+    let mut negated = vec![false];
+    let mut word = None;
+    for token in attribute {
+        if token.is_punct('(') {
+            let outer = negated.last().copied().unwrap_or(false);
+            negated.push(outer != (word == Some("not")));
+        } else if token.is_punct(')') {
+            negated.pop();
+        } else if token.ident() == Some("test") && !negated.last().copied().unwrap_or(false) {
+            return true;
+        }
+        word = token.ident();
+    }
+    false
+}
+
 /// The line ranges of `tokens` that are test code by their attribute: each item under
-/// `#[cfg(test)]` (or a `cfg` that holds `test` and no `not`), and the whole file under
+/// `#[cfg(test)]` (or a `cfg` that holds `test` outside a `not`), and the whole file under
 /// `#![cfg(test)]`.
 fn cfg_test_lines(tokens: &[Token]) -> Vec<(usize, usize)> {
     let mut found = Vec::new();
@@ -393,9 +421,7 @@ fn cfg_test_lines(tokens: &[Token]) -> Vec<(usize, usize)> {
             break;
         };
         let attribute = &tokens[open + 1..close];
-        let is_test = attribute.first().and_then(Token::ident) == Some("cfg")
-            && attribute.iter().any(|token| token.ident() == Some("test"))
-            && !attribute.iter().any(|token| token.ident() == Some("not"));
+        let is_test = is_test_cfg(attribute);
         if is_test && inner {
             return vec![(0, usize::MAX)];
         }
@@ -420,6 +446,195 @@ fn cfg_test_lines(tokens: &[Token]) -> Vec<(usize, usize)> {
         at = close + 1;
     }
     found
+}
+
+/// A module declared as `mod name;`, which lives in a file of its own.
+#[derive(Debug)]
+struct OutOfLine {
+    /// The line the declaration is on.
+    line: usize,
+    /// Whether the attributes of the declaration hold `test`.
+    attributed: bool,
+    /// The files the module can be, from the repository's root.
+    files: Vec<String>,
+}
+
+/// The `#[path = ".."]` among `attributes`.
+fn renamed<'a>(attributes: &[&'a [Token]]) -> Option<&'a str> {
+    attributes.iter().find_map(|attribute| match *attribute {
+        [name, equals, token] if name.ident() == Some("path") && equals.is_punct('=') => {
+            match &token.tok {
+                Tok::Str(value, _) => Some(value.as_str()),
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
+/// Whether the file at `path` is a root of its module tree, or a `mod.rs`: its modules are in its
+/// own folder. A file that is not one keeps its modules in a folder named for it.
+fn is_crate_root(path: &str) -> bool {
+    let (folder, file) = path.rsplit_once('/').unwrap_or(("", path));
+    matches!(file, "lib.rs" | "main.rs" | "mod.rs" | "build.rs")
+        || matches!(
+            folder.rsplit('/').next(),
+            Some("tests" | "benches" | "examples" | "bin")
+        )
+}
+
+/// `tail` below `folder`, with its `.` and `..` parts taken out.
+fn joined(folder: &[&str], tail: &str) -> String {
+    let mut parts = folder.to_vec();
+    for part in tail.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    parts.join("/")
+}
+
+/// The files that `mod name;` can be when the file at `path` declares it inside the inline
+/// modules `inline`, with the `#[path]` it carries, if any.
+fn module_files(path: &str, inline: &[&str], name: &str, renamed: Option<&str>) -> Vec<String> {
+    let (folder, file) = path.rsplit_once('/').unwrap_or(("", path));
+    let beside: Vec<&str> = folder.split('/').filter(|part| !part.is_empty()).collect();
+    let mut modules = beside.clone();
+    if !is_crate_root(path) {
+        modules.push(file.strip_suffix(".rs").unwrap_or(file));
+    }
+    modules.extend(inline);
+    if let Some(renamed) = renamed {
+        // A `#[path]` outside an inline module starts at the file's own folder.
+        let from = if inline.is_empty() { &beside } else { &modules };
+        return vec![joined(from, renamed)];
+    }
+    vec![
+        joined(&modules, &format!("{name}.rs")),
+        joined(&modules, &format!("{name}/mod.rs")),
+    ]
+}
+
+/// The modules that `tokens`, the source of the file at `path`, declares with `mod name;`.
+fn out_of_line(path: &str, tokens: &[Token]) -> Vec<OutOfLine> {
+    let mut found = Vec::new();
+    // The inline modules the reading stands in, each with where its brace closes.
+    let mut inline: Vec<(&str, usize)> = Vec::new();
+    // The attributes of the item that comes next.
+    let mut attributes: Vec<&[Token]> = Vec::new();
+    let mut at = 0;
+    while at < tokens.len() {
+        while inline.last().is_some_and(|(_, end)| at > *end) {
+            inline.pop();
+        }
+        let token = &tokens[at];
+        if token.is_punct('#') {
+            let inner = tokens.get(at + 1).is_some_and(|next| next.is_punct('!'));
+            let open = at + 1 + usize::from(inner);
+            if tokens.get(open).is_some_and(|next| next.is_punct('['))
+                && let Some(close) = closing(tokens, open)
+            {
+                if !inner {
+                    attributes.push(&tokens[open + 1..close]);
+                }
+                at = close + 1;
+                continue;
+            }
+        }
+        if token.ident() == Some("mod")
+            && let Some(name) = tokens.get(at + 1).and_then(Token::ident)
+            && let Some(after) = tokens.get(at + 2)
+        {
+            if after.is_punct(';') {
+                let inside: Vec<&str> = inline.iter().map(|(inside, _)| *inside).collect();
+                found.push(OutOfLine {
+                    line: token.line,
+                    attributed: attributes.iter().any(|attribute| is_test_cfg(attribute)),
+                    files: module_files(path, &inside, name, renamed(&attributes)),
+                });
+                attributes.clear();
+                at += 3;
+                continue;
+            }
+            if after.is_punct('{')
+                && let Some(end) = closing(tokens, at + 2)
+            {
+                inline.push((name, end));
+                attributes.clear();
+                at += 3;
+                continue;
+            }
+        }
+        if matches!(token.tok, Tok::Punct(';' | '{' | '}')) {
+            attributes.clear();
+        }
+        at += 1;
+    }
+    found
+}
+
+/// The files of `sources`, each as its path from the repository's root and its text, that are test
+/// code because a module declaration says so: a `mod name;` under an attribute that holds `test`
+/// or inside an item that has one, or in a file that is test code, with the file it names; and,
+/// the same way, the files those declare. The second part holds a line for each such declaration
+/// that names no file among `sources`, but not in a tree of planted sources under a `fixtures`
+/// folder, which holds such declarations on purpose. A source that cannot be read as Rust
+/// declares nothing.
+fn declared_test_files(sources: &[(String, String)]) -> (HashSet<String>, Vec<String>) {
+    let known: HashSet<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+    let mut declarations = Vec::new();
+    for (path, source) in sources {
+        let Ok(tokens) = code_tokens(path, source) else {
+            continue;
+        };
+        let under_attribute = cfg_test_lines(&tokens);
+        for declared in out_of_line(path, &tokens) {
+            let in_test_item = declared.attributed
+                || under_attribute
+                    .iter()
+                    .any(|(from, to)| (*from..=*to).contains(&declared.line));
+            declarations.push((path.as_str(), in_test_item, declared));
+        }
+    }
+    let mut test_files: HashSet<String> = HashSet::new();
+    loop {
+        let before = test_files.len();
+        for (path, in_test_item, declared) in &declarations {
+            if *in_test_item || is_test_file(path) || test_files.contains(*path) {
+                for file in &declared.files {
+                    if known.contains(file.as_str()) {
+                        test_files.insert(file.clone());
+                    }
+                }
+            }
+        }
+        if test_files.len() == before {
+            break;
+        }
+    }
+    let missing = declarations
+        .iter()
+        .filter(|(path, in_test_item, declared)| {
+            (*in_test_item || is_test_file(path) || test_files.contains(*path))
+                && !path.split('/').any(|part| part == "fixtures")
+                && !declared
+                    .files
+                    .iter()
+                    .any(|file| known.contains(file.as_str()))
+        })
+        .map(|(path, _, declared)| {
+            format!(
+                "{path}:{}: a module declared for tests has none of the files {}",
+                declared.line,
+                declared.files.join(", ")
+            )
+        })
+        .collect();
+    (test_files, missing)
 }
 
 /// Whether the file at `path` is a test's: under a `tests` or a `testing` folder, or named for one.
@@ -451,12 +666,17 @@ struct Candidate {
     marked: bool,
 }
 
-/// Every print of `source`, the file at `path`, that is read as an early return.
+/// Every print of `source`, the file at `path`, that is read as an early return. `test_files` are
+/// the files that module declarations make test code.
 ///
 /// # Errors
 ///
 /// Returns where the source cannot be read as Rust.
-fn candidates(path: &str, source: &str) -> Result<Vec<Candidate>, String> {
+fn candidates(
+    path: &str,
+    source: &str,
+    test_files: &HashSet<String>,
+) -> Result<Vec<Candidate>, String> {
     let tokens = code_tokens(path, source)?;
     let under_attribute = cfg_test_lines(&tokens);
     let found = prints(&tokens)
@@ -466,6 +686,7 @@ fn candidates(path: &str, source: &str) -> Result<Vec<Candidate>, String> {
             let by_words = WORDS.iter().any(|word| lower.contains(word));
             let in_test_code = !is_program(path)
                 && (is_test_file(path)
+                    || test_files.contains(path)
                     || under_attribute
                         .iter()
                         .any(|(from, to)| (*from..=*to).contains(&print.line)));
@@ -497,15 +718,31 @@ fn every_early_return_of_a_test_says_so_on_a_line_the_report_reads() {
         "the reading reaches the repository's sources: {} files",
         files.len()
     );
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .filter_map(|path| {
+            std::fs::read_to_string(root.join(path))
+                .ok()
+                .map(|source| (path.clone(), source))
+        })
+        .collect();
+    let (test_files, missing) = declared_test_files(&sources);
+    assert!(
+        missing.is_empty(),
+        "test modules whose file the reading does not find:\n{}",
+        missing.join("\n")
+    );
+    assert!(
+        test_files.len() > 50,
+        "the reading reaches the test modules that live in files of their own: {}",
+        test_files.len()
+    );
     let mut unread = Vec::new();
     let mut unmarked = Vec::new();
     let mut marked = 0_usize;
     let mut listed = vec![false; ALLOWED.len()];
-    for path in &files {
-        let Ok(source) = std::fs::read_to_string(root.join(path)) else {
-            continue;
-        };
-        let found = match candidates(path, &source) {
+    for (path, source) in &sources {
+        let found = match candidates(path, source, &test_files) {
             Ok(found) => found,
             Err(error) => {
                 unread.push(error);
@@ -562,13 +799,36 @@ fn every_early_return_of_a_test_says_so_on_a_line_the_report_reads() {
     );
 }
 
-/// What `candidates` finds in `source` as the file at `path`: the line, why, and whether it is
-/// marked.
+/// What the reading finds in the planted files `files`, each as its path and its source: the
+/// path, the line, why, and whether it is marked.
+fn found_in(files: &[(&str, &str)]) -> Vec<(String, usize, Why, bool)> {
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|(path, source)| ((*path).to_owned(), (*source).to_owned()))
+        .collect();
+    let (test_files, missing) = declared_test_files(&sources);
+    assert!(missing.is_empty(), "{missing:?}");
+    let mut all = Vec::new();
+    for (path, source) in &sources {
+        for candidate in candidates(path, source, &test_files).expect("the planted source is read")
+        {
+            all.push((
+                path.clone(),
+                candidate.line,
+                candidate.why,
+                candidate.marked,
+            ));
+        }
+    }
+    all
+}
+
+/// What the reading finds in `source` as the file at `path` alone: the line, why, and whether it
+/// is marked.
 fn found(path: &str, source: &str) -> Vec<(usize, Why, bool)> {
-    candidates(path, source)
-        .expect("the planted source is read")
+    found_in(&[(path, source)])
         .into_iter()
-        .map(|candidate| (candidate.line, candidate.why, candidate.marked))
+        .map(|(_, line, why, marked)| (line, why, marked))
         .collect()
 }
 
@@ -668,7 +928,8 @@ fn the_reading_names_a_print_that_says_a_skip_or_stops_a_test_and_passes_the_res
 #[test]
 fn a_message_that_wraps_over_lines_is_read_as_the_compiler_joins_it() {
     let wrapped = "fn f() {\n    eprintln!(\"this host could not \\\n        run the leg\");\n}";
-    let read = candidates("crates/x/src/lib.rs", wrapped).expect("the planted source is read");
+    let read = candidates("crates/x/src/lib.rs", wrapped, &HashSet::new())
+        .expect("the planted source is read");
     assert_eq!(read.len(), 1, "{read:?}");
     assert_eq!(read[0].said, "this host could not run the leg");
     assert_eq!(
@@ -853,4 +1114,135 @@ fn the_reading_takes_a_return_that_follows_a_print_later_in_its_block() {
         )
         .is_empty()
     );
+}
+
+/// The control: a module that a `#[cfg(test)]` declaration puts in a file of its own is test code,
+/// in each place its file can stand, and so is each module that file declares; a module that is
+/// not declared for tests is not.
+#[test]
+fn the_reading_takes_a_module_declared_out_of_line_for_tests_as_test_code() {
+    const SHAPE: &str = "fn f() { eprintln!(\"no IPv6 here\"); return; }";
+
+    // The file of a module declared in a crate's root, and in a module file named for its module.
+    for (declaring, module) in [
+        ("crates/x/src/lib.rs", "crates/x/src/cases.rs"),
+        ("crates/x/src/net.rs", "crates/x/src/net/cases.rs"),
+        ("crates/x/src/net/mod.rs", "crates/x/src/net/cases.rs"),
+        ("crates/x/src/net/mod.rs", "crates/x/src/net/cases/mod.rs"),
+    ] {
+        assert_eq!(
+            found_in(&[(declaring, "#[cfg(test)]\nmod cases;\n"), (module, SHAPE)]),
+            [(module.to_owned(), 1, Why::Shape, false)],
+            "{declaring} {module}"
+        );
+    }
+    // A `#[path]`, with the attributes in either order and the declaration public.
+    for declared in [
+        "#[cfg(test)]\n#[path = \"../shared/cases.rs\"]\nmod cases;\n",
+        "#[path = \"../shared/cases.rs\"]\n#[cfg(test)]\npub(crate) mod cases;\n",
+        "#[cfg(all(test, not(windows)))]\n#[path = \"../shared/cases.rs\"]\n// Shared with the other crate.\nmod cases;\n",
+    ] {
+        assert_eq!(
+            found_in(&[
+                ("crates/x/src/lib.rs", declared),
+                ("crates/x/shared/cases.rs", SHAPE)
+            ]),
+            [("crates/x/shared/cases.rs".to_owned(), 1, Why::Shape, false)],
+            "{declared}"
+        );
+    }
+    // The module's own declarations are test code, however far down.
+    assert_eq!(
+        found_in(&[
+            ("crates/x/src/lib.rs", "#[cfg(test)]\nmod cases;\n"),
+            ("crates/x/src/cases.rs", "mod more;\n"),
+            ("crates/x/src/cases/more.rs", "mod deeper;\n"),
+            ("crates/x/src/cases/more/deeper.rs", SHAPE),
+        ]),
+        [(
+            "crates/x/src/cases/more/deeper.rs".to_owned(),
+            1,
+            Why::Shape,
+            false
+        )]
+    );
+    // A declaration inside a test module, and inside an inline module in a root.
+    assert_eq!(
+        found_in(&[
+            (
+                "crates/x/src/lib.rs",
+                "#[cfg(test)]\nmod outer {\n    mod inner;\n}\n"
+            ),
+            ("crates/x/src/outer/inner.rs", SHAPE),
+        ]),
+        [(
+            "crates/x/src/outer/inner.rs".to_owned(),
+            1,
+            Why::Shape,
+            false
+        )]
+    );
+
+    // A module that is not declared for tests is product code, and so is one that is declared
+    // for builds that are not tests.
+    for declared in [
+        "mod real;\n",
+        "#[cfg(not(test))]\nmod real;\n",
+        "#[cfg(unix)]\nmod real;\n",
+        "#[cfg(all(unix, not(test)))]\nmod real;\n",
+    ] {
+        assert!(
+            found_in(&[
+                ("crates/x/src/lib.rs", declared),
+                ("crates/x/src/real.rs", SHAPE)
+            ])
+            .is_empty(),
+            "{declared}"
+        );
+    }
+}
+
+/// The control: a `cfg` that holds `test` and also a `not` of something else is test code; one that
+/// holds `test` only under a `not` is not.
+#[test]
+fn the_reading_takes_a_cfg_that_holds_test_beside_a_not_as_test_code() {
+    assert_eq!(
+        found_in(&[(
+            "crates/x/src/lib.rs",
+            "#[cfg(all(test, not(windows)))]\nmod tests {\n    fn f() { eprintln!(\"no IPv6 here\"); return; }\n}\n"
+        )]),
+        [("crates/x/src/lib.rs".to_owned(), 3, Why::Shape, false)]
+    );
+    assert!(
+        found_in(&[(
+            "crates/x/src/lib.rs",
+            "#[cfg(all(unix, not(test)))]\nmod real {\n    fn f() { eprintln!(\"no IPv6 here\"); return; }\n}\n"
+        )])
+        .is_empty()
+    );
+}
+
+/// The control: a module declared for tests whose file is not among the sources is named, so that
+/// a declaration the reading cannot follow does not pass as read.
+#[test]
+fn a_module_declared_for_tests_that_has_no_file_is_named() {
+    let sources = vec![(
+        "crates/x/src/lib.rs".to_owned(),
+        "#[cfg(test)]\nmod gone;\nmod product;\n".to_owned(),
+    )];
+    let (test_files, missing) = declared_test_files(&sources);
+    assert!(test_files.is_empty());
+    assert_eq!(
+        missing,
+        [
+            "crates/x/src/lib.rs:2: a module declared for tests has none of the files \
+             crates/x/src/gone.rs, crates/x/src/gone/mod.rs"
+        ]
+    );
+    // A tree of planted sources holds such a declaration on purpose.
+    let fixture = vec![(
+        "crates/x/tests/fixtures/a/src/lib.rs".to_owned(),
+        "#[cfg(test)]\nmod gone;\n".to_owned(),
+    )];
+    assert!(declared_test_files(&fixture).1.is_empty());
 }
