@@ -153,6 +153,108 @@ export type MethodName = string
  */
 export type ConditionValue = string | boolean | number
 /**
+ * What each value is.
+ */
+export type Shape =
+  | {
+      kind: 'object'
+      /**
+       * The members that may be there.
+       */
+      members: ShapeMember[]
+    }
+  | {
+      kind: 'map'
+      values: Shape
+    }
+  | {
+      items: Shape1
+      kind: 'array'
+    }
+  | {
+      kind: 'text'
+      /**
+       * The most bytes.
+       */
+      max_bytes: number
+    }
+  | {
+      kind: 'boolean'
+    }
+  | {
+      kind: 'number'
+    }
+  | {
+      kind: 'exact'
+      /**
+       * The text.
+       */
+      value: string
+    }
+  | {
+      kind: 'directory_name'
+    }
+  | {
+      kind: 'record_path'
+    }
+  | {
+      kind: 'command_handler'
+    }
+  | {
+      kind: 'stdio_server'
+    }
+/**
+ * What each item is.
+ */
+export type Shape1 =
+  | {
+      kind: 'object'
+      /**
+       * The members that may be there.
+       */
+      members: ShapeMember[]
+    }
+  | {
+      kind: 'map'
+      values: Shape
+    }
+  | {
+      items: Shape1
+      kind: 'array'
+    }
+  | {
+      kind: 'text'
+      /**
+       * The most bytes.
+       */
+      max_bytes: number
+    }
+  | {
+      kind: 'boolean'
+    }
+  | {
+      kind: 'number'
+    }
+  | {
+      kind: 'exact'
+      /**
+       * The text.
+       */
+      value: string
+    }
+  | {
+      kind: 'directory_name'
+    }
+  | {
+      kind: 'record_path'
+    }
+  | {
+      kind: 'command_handler'
+    }
+  | {
+      kind: 'stdio_server'
+    }
+/**
  * The package summary. One line, no control or bidirectional characters.
  */
 export type Summary = string
@@ -1418,6 +1520,18 @@ export interface ConnectorManifest {
    */
   operations?: Operations | null
   /**
+   * Where the files of the package's native bridge are placed under the account's home, and the
+   * closed shape of each: the application's directory, the folder in it that holds one folder
+   * for each plugin, and the files each holds.
+   *
+   * A table that does not state it leaves the member out, and the host places the bridge by the
+   * layout it holds for the application's label, so a connector written before the member
+   * existed reads and hashes exactly as it did. A package that states it declares an
+   * `sdk_range` from SDK 0.1.9, and the installation statement the owner confirms says what the
+   * host checks of the files and what it does not.
+   */
+  placement?: Placement | null
+  /**
    * A plugin identifier from its manifest.
    */
   plugin_id: string
@@ -1981,6 +2095,171 @@ export interface OperationRoute {
    * names one.
    */
   reply_turn?: FieldPath4 | null
+}
+/**
+ * Where a package says its native bridge is placed.
+ */
+export interface Placement {
+  /**
+   * The folder of the directory that holds one folder for each plugin: one plain component.
+   */
+  area: string
+  /**
+   * How the forwarder is written in a command of these files.
+   */
+  command_form: 'line' | 'argument_list'
+  /**
+   * The application's directory under the account's home, as plain components (one to three),
+   * each of a directory that exists. The host makes none and follows no link in it, except the
+   * first component of a compiled default that the package does not declare.
+   */
+  directory: string[]
+  /**
+   * The files each plugin's folder holds, one to eight, each tail named once.
+   */
+  files: PlacedFile[]
+  /**
+   * How the application keeps one plugin for each name, where it does.
+   */
+  one_per_name?: NameCheck | null
+}
+/**
+ * One file of a placement.
+ */
+export interface PlacedFile {
+  /**
+   * What the file holds.
+   */
+  shape:
+    | {
+        kind: 'object'
+        /**
+         * The members that may be there.
+         */
+        members: ShapeMember[]
+      }
+    | {
+        kind: 'map'
+        values: Shape
+      }
+    | {
+        items: Shape1
+        kind: 'array'
+      }
+    | {
+        kind: 'text'
+        /**
+         * The most bytes.
+         */
+        max_bytes: number
+      }
+    | {
+        kind: 'boolean'
+      }
+    | {
+        kind: 'number'
+      }
+    | {
+        kind: 'exact'
+        /**
+         * The text.
+         */
+        value: string
+      }
+    | {
+        kind: 'directory_name'
+      }
+    | {
+        kind: 'record_path'
+      }
+    | {
+        kind: 'command_handler'
+      }
+    | {
+        kind: 'stdio_server'
+      }
+  /**
+   * Its path in the plugin's folder, one to three plain components.
+   */
+  tail: string
+}
+/**
+ * One member of an object shape.
+ */
+export interface ShapeMember {
+  /**
+   * Its name.
+   */
+  name: string
+  /**
+   * Whether the object has to hold it.
+   */
+  required?: boolean
+  /**
+   * What it is.
+   */
+  shape:
+    | {
+        kind: 'object'
+        /**
+         * The members that may be there.
+         */
+        members: ShapeMember[]
+      }
+    | {
+        kind: 'map'
+        values: Shape
+      }
+    | {
+        items: Shape1
+        kind: 'array'
+      }
+    | {
+        kind: 'text'
+        /**
+         * The most bytes.
+         */
+        max_bytes: number
+      }
+    | {
+        kind: 'boolean'
+      }
+    | {
+        kind: 'number'
+      }
+    | {
+        kind: 'exact'
+        /**
+         * The text.
+         */
+        value: string
+      }
+    | {
+        kind: 'directory_name'
+      }
+    | {
+        kind: 'record_path'
+      }
+    | {
+        kind: 'command_handler'
+      }
+    | {
+        kind: 'stdio_server'
+      }
+}
+/**
+ * How the application keeps one plugin for each name: the first it reads.
+ */
+export interface NameCheck {
+  /**
+   * The tail of the manifest that gives a plugin its name. Its shape has a required `name`
+   * member of the kind `directory_name`.
+   */
+  manifest: string
+  /**
+   * Whether the application does not read a folder whose name starts with a dot as a plugin.
+   */
+  skips_hidden: boolean
 }
 /**
  * The upstream protocol this table is qualified against.
