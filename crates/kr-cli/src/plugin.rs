@@ -725,12 +725,25 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
                 // whole in the publisher's line with its label as text: it is never captioned as
                 // the host's here. A device that is paired with the host gets the caption from
                 // the link's own hello.
-                let parts = split_install_statement(grant, statement, false);
+                let parts = split_install_statement(
+                    grant,
+                    statement,
+                    kr_protocol::confirmation::HostReadings::default(),
+                );
                 if let Some(words) = parts.publisher {
                     output::line(&stdout_line!(
                         "  the publisher says: {}",
                         Asked::text(Request::Plugins, words)
                     ));
+                }
+                // The same holds for the skill-target part, which stays whole in the publisher's
+                // line, and the line that follows says so in the host's own words.
+                if grant.iter().any(|name| name == "skill_target.install")
+                    && parts.publisher.is_some_and(|words| {
+                        words.contains(kr_protocol::confirmation::SKILL_TARGET_STATEMENT_LABEL)
+                    })
+                {
+                    output::line(&stdout_line!("  {}", Shown::said(SKILL_TARGET_UNCONFIRMED)));
                 }
                 if let Some(reading) = parts.reading {
                     output::line(&stdout_line!(
@@ -744,6 +757,12 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
         _ => {}
     }
 }
+
+/// What this command line says of the skill-target part of a statement it has no hello evidence
+/// for: it cannot tell the host's own reading from the publisher's words, so it shows the text
+/// whole as received.
+const SKILL_TARGET_UNCONFIRMED: &str = "This command line cannot tell the host's own reading of the \
+     skill target from the publisher's words, so it shows the text whole as received.";
 
 /// `kr plugin remove`.
 async fn remove(paths: &HostPaths, arguments: &PluginArguments, json: bool) -> Result<()> {

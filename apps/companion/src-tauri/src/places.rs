@@ -466,8 +466,8 @@ impl Placed {
 }
 
 impl ControlTransport for Placed {
-    fn host_states_placement_reading(&self) -> bool {
-        self.inner.host_states_placement_reading()
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+        self.inner.host_readings()
     }
 
     fn connection_id(&self) -> ConnectionId {
@@ -550,8 +550,11 @@ mod tests {
     struct Closed(bool);
 
     impl ControlTransport for Closed {
-        fn host_states_placement_reading(&self) -> bool {
-            self.0
+        fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+            kr_protocol::confirmation::HostReadings {
+                placement: self.0,
+                skill_target: false,
+            }
         }
 
         fn connection_id(&self) -> ConnectionId {
@@ -656,8 +659,8 @@ mod tests {
     }
 
     impl ControlTransport for Streaming {
-        fn host_states_placement_reading(&self) -> bool {
-            false
+        fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+            kr_protocol::confirmation::HostReadings::default()
         }
 
         fn connection_id(&self) -> ConnectionId {
@@ -803,7 +806,7 @@ mod tests {
         for says in [true, false] {
             let place = places.try_take(host(1), Kind::Other).expect("a place");
             let connection = Placed::over(Arc::new(Closed(says)), place);
-            assert_eq!(connection.host_states_placement_reading(), says);
+            assert_eq!(connection.host_readings().placement, says);
         }
     }
 

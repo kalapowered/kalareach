@@ -83,9 +83,9 @@ pub trait OwnerChannel: Send + Sync {
         params: &'a OwnerConfirmationCompleteParams,
     ) -> BoxFuture<'a, Result<(), ClientError>>;
 
-    /// Whether the host's hello says it writes the placement reading under its own label. A
-    /// channel with no hello of a host says no, and a statement is then the publisher's whole.
-    fn host_states_placement_reading(&self) -> bool;
+    /// Which readings the host's hello says it writes under its own labels. A channel with no
+    /// hello of a host says none, and a statement is then the publisher's whole.
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings;
 }
 
 /// A method that takes no parameters, as the empty map the protocol expects.
@@ -121,8 +121,8 @@ impl SessionChannel {
 }
 
 impl OwnerChannel for SessionChannel {
-    fn host_states_placement_reading(&self) -> bool {
-        self.session.transport().host_states_placement_reading()
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+        self.session.transport().host_readings()
     }
 
     fn pending(&self) -> BoxFuture<'_, Result<OwnerConfirmationPendingResult, ClientError>> {
@@ -1145,7 +1145,7 @@ pub struct Listed {
     /// Whether the host's hello says it writes the placement reading under its own label, which
     /// decides whether a statement is told apart at that label
     /// ([`kr_protocol::confirmation::split_install_statement`]).
-    pub host_states_placement_reading: bool,
+    pub host_readings: kr_protocol::confirmation::HostReadings,
 }
 
 /// How a review ended.
@@ -1215,7 +1215,7 @@ impl OwnerConfirmations {
     /// Returns the channel's failure.
     pub async fn pending(&self) -> Result<Vec<Listed>, ClientError> {
         let listed = self.channel.pending().await?;
-        let host_states_placement_reading = self.channel.host_states_placement_reading();
+        let host_readings = self.channel.host_readings();
         Ok(listed
             .pending
             .iter()
@@ -1223,7 +1223,7 @@ impl OwnerConfirmations {
                 request: pending.request.clone(),
                 subject: check(pending, &self.host),
                 answered: pending.answered,
-                host_states_placement_reading,
+                host_readings,
             })
             .collect())
     }
@@ -2827,8 +2827,8 @@ mod tests {
     }
 
     impl OwnerChannel for Listing {
-        fn host_states_placement_reading(&self) -> bool {
-            false
+        fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+            kr_protocol::confirmation::HostReadings::default()
         }
 
         fn pending(&self) -> BoxFuture<'_, Result<OwnerConfirmationPendingResult, ClientError>> {

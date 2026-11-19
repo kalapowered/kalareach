@@ -187,7 +187,7 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     /// refuses that label in a publisher's words. Every transport states it: one that has no hello
     /// of a host says no, so a statement it carries is read whole as the publisher's, and one that
     /// wraps another says what the transport it wraps says.
-    fn host_states_placement_reading(&self) -> bool;
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings;
 
     /// Ends the connection.
     fn close(&self);
@@ -207,7 +207,7 @@ pub struct NetworkTransport {
     opener: Arc<NetworkStreams>,
     reach: Reach,
     /// Whether the host selected the capability that says it writes the placement reading.
-    host_states_placement_reading: bool,
+    host_readings: kr_protocol::confirmation::HostReadings,
 }
 
 crate::debug_fields!(NetworkTransport { connection_id });
@@ -262,7 +262,7 @@ impl NetworkTransport {
                 host: format!("host:{}", host_record.device_id),
                 actor: format!("device:{}", identity.device_id),
             },
-            host_states_placement_reading: kr_protocol::confirmation::states_placement_reading(
+            host_readings: kr_protocol::confirmation::states_readings(
                 &authorised.selection.capabilities,
             ),
         })
@@ -307,8 +307,8 @@ impl ControlTransport for NetworkTransport {
         self.limits
     }
 
-    fn host_states_placement_reading(&self) -> bool {
-        self.host_states_placement_reading
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
+        self.host_readings
     }
 
     fn initial_action_window(&self) -> ActionWindow {

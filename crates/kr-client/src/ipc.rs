@@ -288,9 +288,9 @@ impl IpcTransport {
 }
 
 impl ControlTransport for IpcTransport {
-    fn host_states_placement_reading(&self) -> bool {
+    fn host_readings(&self) -> kr_protocol::confirmation::HostReadings {
         // A local socket carries no hello, so there is no host to state it.
-        false
+        kr_protocol::confirmation::HostReadings::default()
     }
 
     fn connection_id(&self) -> ConnectionId {
