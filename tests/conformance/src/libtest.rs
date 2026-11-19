@@ -68,6 +68,37 @@ pub const EARLY_RETURN: &[&str] = &["skipped:", "skipping:", "not exercised"];
 /// <why>`.
 pub const EARLY_RETURN_NAMED: &str = ": skipped, because ";
 
+/// How a case that stood down for want of the account's own launchd begins the one line it prints:
+/// `stood down <whole case name>: <what would have loaded a job> needs ...`. The line is written on
+/// standard error in one write that the test program does not capture, so it can land inside a line
+/// of the harness's own, and the reading finds it anywhere in a line.
+pub const STOOD_DOWN: &str = "stood down ";
+
+/// What a stood-down notice names.
+enum Notice<'a> {
+    /// A whole case name: not empty, with no white space.
+    Named(&'a str),
+    /// A notice that names no one case (the text from its start): `an unnamed case` holds white
+    /// space.
+    Malformed(&'a str),
+}
+
+/// The first stood-down notice in `line`, with the text before it, which is the rest of a line of the
+/// harness's own that the notice broke.
+fn notice_in(line: &str) -> Option<(&str, Notice<'_>)> {
+    let at = line.find(STOOD_DOWN)?;
+    let (before, after) = line.split_at(at);
+    let name = after[STOOD_DOWN.len()..]
+        .split_once(": ")
+        .map_or("", |(name, _)| name);
+    let notice = if name.is_empty() || name.contains(char::is_whitespace) {
+        Notice::Malformed(after)
+    } else {
+        Notice::Named(name)
+    };
+    Some((before, notice))
+}
+
 /// What one test came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
@@ -207,6 +238,10 @@ struct Reading {
     early: BTreeMap<String, String>,
     /// The first such line that no one test's output could be told apart for.
     loose: Option<String>,
+    /// The names that stood-down notices gave.
+    told: BTreeSet<String>,
+    /// The stood-down notices that name no one case.
+    malformed: Vec<String>,
 }
 
 /// Whether `line` is a test saying it returned early.
@@ -257,6 +292,28 @@ pub fn read<'r>(output: &str, recording_of: impl Fn(&str) -> Recording<'r>) -> V
         }
         let Some(binary) = binaries.last_mut() else {
             continue;
+        };
+        // A stood-down notice may stand anywhere in a line: inside the line a test is named on,
+        // between a verdict and its newline, or inside another test's line. It is read first, and
+        // what stood before it goes on as the line.
+        let line = match notice_in(line) {
+            Some((before, notice)) => {
+                match notice {
+                    Notice::Named(name) => {
+                        reading
+                            .early
+                            .entry(name.to_owned())
+                            .or_insert_with(|| line[before.len()..].trim().to_owned());
+                        reading.told.insert(name.to_owned());
+                    }
+                    Notice::Malformed(text) => reading.malformed.push(text.trim().to_owned()),
+                }
+                if before.trim().is_empty() {
+                    continue;
+                }
+                before
+            }
+            None => line,
         };
         if let Some(summary) = summary(line) {
             binary.summary = Some(summary);
@@ -385,6 +442,8 @@ fn settle(binary: &mut Binary, reading: &mut Reading, recording: Recording<'_>) 
         failures,
         early,
         loose,
+        told,
+        malformed,
         ..
     } = std::mem::take(reading);
     let alone = match recording {
@@ -448,9 +507,13 @@ fn settle(binary: &mut Binary, reading: &mut Reading, recording: Recording<'_>) 
     });
     binary.problem = if let Recording::Lost(why) = recording {
         Some(why.to_owned())
-    } else if loose.is_some() && !alone {
-        // A test said it returned early and the output cannot say which: every pass of this binary
-        // is in doubt, so none of it is read.
+    } else if !malformed.is_empty()
+        || told.iter().any(|name| !binary.tests.contains_key(name))
+        || (loose.is_some() && !alone)
+    {
+        // A test said it returned early and the output cannot say which: a stood-down notice that
+        // names no case of this binary, or none at all, or a line of another kind that no one test
+        // owns in a binary of several. Every pass of this binary is in doubt, so none of it is read.
         Some("a test said it returned early, and the output does not say which".to_owned())
     } else {
         match agrees {
