@@ -2381,6 +2381,85 @@ mod tests {
         );
     }
 
+    /// The starts a launch kept, by the kinds of D-3731's table, are what the launch that follows
+    /// finds and names: a fresh `Calls` over the file the first one wrote finds the older kept
+    /// start and the start the host never answered as candidates, shows only the notices, and
+    /// offers no hidden start to the page.
+    #[test]
+    fn a_fresh_calls_over_the_file_finds_the_kept_starts_the_refusal_names() {
+        let directory = tempfile::tempdir().expect("a folder");
+        {
+            let calls = calls_in(directory.path());
+            let shared = calls.shared.as_ref().expect("a phone holds calls");
+            shared.settle_start(
+                0,
+                None,
+                Some(entry(START_KEPT, "x-0001-aaaa", host(1))),
+                None,
+            );
+            shared.settle_start(
+                0,
+                None,
+                Some(entry(START_UNANSWERED, "y-0002-bbbb", host(1))),
+                None,
+            );
+            shared.settle_start(
+                0,
+                None,
+                Some(entry(START_UNKNOWN, "z-0003-cccc", host(1))),
+                None,
+            );
+        }
+        let fresh = calls_in(directory.path());
+        let shared = fresh.shared.as_ref().expect("a phone holds calls");
+        assert_eq!(
+            actions_shown(&fresh),
+            vec!["z-0003-cccc".to_owned()],
+            "only the notice is shown after the restart"
+        );
+        assert_eq!(
+            shared
+                .start_named_in(host(1), "held under action x-0001-aaaa, begun", None)
+                .as_deref(),
+            Some("x-0001-aaaa"),
+            "the older kept start is a candidate after the restart"
+        );
+        assert_eq!(
+            shared
+                .start_named_in(host(1), "held under y-0002-bbbb", None)
+                .as_deref(),
+            Some("y-0002-bbbb"),
+            "the start the host never answered is a candidate after the restart"
+        );
+    }
+
+    /// A directory flush that fails after the file was put in place is a write that failed: the
+    /// start is not sent, and the launch that follows reads the file the rename left, which holds
+    /// the entry of the start that was never sent, as a start the host did not answer.
+    #[test]
+    fn a_start_whose_record_could_not_be_flushed_is_not_sent_and_the_next_launch_reads_the_file() {
+        let directory = tempfile::tempdir().expect("a folder");
+        let calls = calls_in(directory.path());
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        let owner = shared
+            .next_owner
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let refused = kr_flush::testing::refuse_flushes_of(directory.path());
+        let durable = shared.stand_open_durably(owner, entry(START_UNKNOWN, "flight", host(1)));
+        drop(refused);
+        assert!(
+            !durable,
+            "a record that could not be made durable does not let the start be sent"
+        );
+        // The rename had already put the file in place, so a fresh reader finds the entry.
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_UNKNOWN, "flight")]
+        );
+        let fresh = calls_in(directory.path());
+        assert_eq!(actions_shown(&fresh), vec!["flight".to_owned()]);
+    }
+
     /// A revocation settled while a dismissal is being saved is not brought back by the dismissal:
     /// both take the same order as every other change of the record.
     #[test]
