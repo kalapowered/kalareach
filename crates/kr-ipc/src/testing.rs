@@ -13,6 +13,7 @@ use kr_protocol::ids::EnvironmentId;
 
 use crate::paths::{EnvironmentPaths, HostPaths};
 
+pub mod account_launchd;
 pub mod created;
 #[cfg(target_os = "linux")]
 pub mod hung_mount;

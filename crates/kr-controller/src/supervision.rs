@@ -433,11 +433,21 @@ pub(crate) fn blocking_start<T>(start: impl FnOnce() -> T) -> T {
 /// is built for one environment and for the program its task runs, `daemon`: this installation's
 /// `kr-controller`, which is also what a test passes for the `kr-controller` it built. Neither
 /// argument is read elsewhere.
+///
+/// A build with the `testing` feature on macOS chooses the detached process, before it reads
+/// anything of launchd, when the run did not ask for the account's own launchd. No shipped build
+/// has the feature.
 #[must_use]
 pub fn detect(
     environment: &kr_ipc::paths::EnvironmentPaths,
     daemon: &Path,
 ) -> Box<dyn WorkerSupervisor> {
+    #[cfg(all(feature = "testing", target_os = "macos"))]
+    {
+        if !kr_ipc::testing::account_launchd::asked() {
+            return fallback(environment, daemon);
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         if LaunchdSupervisor::available() {
@@ -868,12 +878,26 @@ fn launchctl_within(arguments: &[&str]) -> std::result::Result<std::process::Out
 ///
 /// A command that could not be started at all is [`RunFailure::NotRun`]; every failure after it
 /// started is [`RunFailure::Failed`], because it may have reached the service manager first.
+///
+/// A build with the `testing` feature does not start a `launchctl` command that changes the
+/// manager when the run did not ask for the account's own launchd: that is a command that could
+/// not be started.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn command_within(
     program: &str,
     arguments: &[&str],
     bound: std::time::Duration,
 ) -> std::result::Result<std::process::Output, RunFailure> {
+    #[cfg(feature = "testing")]
+    {
+        if let Some(refusal) = kr_ipc::testing::account_launchd::refusal_given(
+            kr_ipc::testing::account_launchd::asked(),
+            Path::new(program),
+            arguments,
+        ) {
+            return Err(RunFailure::NotRun(format!("{program}: {refusal}")));
+        }
+    }
     let asked = format!("{program} {}", arguments.join(" "));
     let mut child = std::process::Command::new(program)
         .args(arguments)
@@ -2525,6 +2549,56 @@ mod tests {
             )),
             "the definition names {}: {written}",
             diagnostics.display()
+        );
+    }
+
+    /// What a child of the case checks, with the variable removed: the runner refuses a
+    /// `launchctl` command that changes the manager and starts nothing, and a read reaches the
+    /// program.
+    #[test]
+    #[ignore = "run by a child of the case with the variable removed"]
+    #[cfg(unix)]
+    fn the_runner_fixture_for_a_run_that_did_not_ask() {
+        use kr_ipc::testing::account_launchd::{REFUSAL, VARIABLE, place_fake_in};
+
+        assert!(
+            std::env::var_os(VARIABLE).is_none(),
+            "the child has the variable removed"
+        );
+        let folder = kr_ipc::testing::PrivateTempDir::create();
+        let (program, ran) = place_fake_in(folder.path());
+        let program = program.to_str().expect("a path that is text");
+        let bound = std::time::Duration::from_secs(5);
+
+        let Err(RunFailure::NotRun(detail)) =
+            command_within(program, &["bootstrap", "gui/501", "/x/y.plist"], bound)
+        else {
+            panic!("a change that a run that did not ask is given to run is refused unrun");
+        };
+        assert!(detail.contains(REFUSAL), "{detail}");
+        assert!(!ran.exists(), "the refused change started the program");
+
+        command_within(program, &["print", "gui/501"], bound).expect("a read is run");
+        assert!(ran.exists(), "a read did not reach the program");
+    }
+
+    /// The controller's runner of service-manager commands refuses a `launchctl` command that
+    /// changes the manager when the run did not ask, without starting the program.
+    #[test]
+    #[cfg(unix)]
+    fn the_controllers_runner_refuses_a_launchctl_change_it_is_asked_to_run_when_the_run_did_not_ask()
+     {
+        let child = kr_ipc::testing::account_launchd::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_runner_fixture_for_a_run_that_did_not_ask"
+            ),
+            None,
+        );
+        assert!(
+            child.passed,
+            "the runner of a run that did not ask:\n{}",
+            child.log
         );
     }
 }

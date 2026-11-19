@@ -23,6 +23,11 @@ path = "src/bin/kr-attach-guard.rs"
 # Windows `--test upgrade_windows`.
 upgrade-suite = []
 
+# A `launchctl` command that changes the manager is refused when the run did not ask for the
+# account's own launchd, and the service definition carries the run's asking to the daemon it
+# starts. It compiles to nothing without this feature, and no shipped build enables it.
+testing = ["kr-ipc/testing"]
+
 [[test]]
 name = "upgrade"
 required-features = ["upgrade-suite"]
@@ -89,6 +94,8 @@ zeroize.workspace = true
 rustix = { workspace = true, features = ["thread"] }
 
 [dev-dependencies]
+# This crate's own tests, with the refusal above compiled in.
+kr-cli = { path = ".", features = ["testing"] }
 # The update tests make channel roots and sign release manifests with keys of their own.
 aws-lc-rs.workspace = true
 # The tests act exactly when a held rename was refused, through the retry's own seam.

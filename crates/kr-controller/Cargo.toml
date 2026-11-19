@@ -86,6 +86,7 @@ url.workspace = true
 # nothing without this feature, and no shipped build enables it.
 testing = [
     "kr-describe/testing",
+    "kr-ipc/testing",
     "kr-transport/testing",
     "kr-voice/testing",
     "kr-project/git-fixtures",

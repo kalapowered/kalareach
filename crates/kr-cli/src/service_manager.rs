@@ -1138,6 +1138,18 @@ fn run(
     environment: &[(&str, &std::ffi::OsStr)],
     asked: &Shown,
 ) -> std::result::Result<std::process::Output, Shown> {
+    // A build with the `testing` feature does not run a `launchctl` command that changes the
+    // manager when the run did not ask for the account's own launchd.
+    #[cfg(feature = "testing")]
+    {
+        if let Some(refusal) = kr_ipc::testing::account_launchd::refusal_given(
+            kr_ipc::testing::account_launchd::asked(),
+            Path::new(program),
+            arguments,
+        ) {
+            return Err(shown!("{}: {}", *asked, Shown::said(refusal)));
+        }
+    }
     let mut child = std::process::Command::new(program)
         .args(arguments)
         .envs(environment.iter().copied())
@@ -3862,6 +3874,58 @@ mod tests {
                 .as_str()
                 .is_some_and(|note| note.contains(&kr_client::shown::spelled(drop_in)))),
             "{notes}"
+        );
+    }
+
+    /// What a child of the case checks, with the variable removed: the runner refuses a
+    /// `launchctl` command that changes the manager and starts nothing, and a read reaches the
+    /// program.
+    #[test]
+    #[ignore = "run by a child of the case with the variable removed"]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn the_runner_fixture_for_a_run_that_did_not_ask() {
+        use kr_ipc::testing::account_launchd::{REFUSAL, VARIABLE, place_fake_in};
+
+        assert!(
+            std::env::var_os(VARIABLE).is_none(),
+            "the child has the variable removed"
+        );
+        let folder = kr_ipc::testing::PrivateTempDir::create();
+        let (program, ran) = place_fake_in(folder.path());
+        let program = program.to_str().expect("a path that is text");
+        let asked = Shown::said("the probe");
+
+        let refused = run(
+            program,
+            &["bootstrap", "gui/501", "/x/y.plist"],
+            &[],
+            &asked,
+        )
+        .expect_err("a change that a run that did not ask is given to run is refused");
+        assert!(refused.to_string().contains(REFUSAL), "{refused}");
+        assert!(!ran.exists(), "the refused change started the program");
+
+        run(program, &["print", "gui/501"], &[], &asked).expect("a read is run");
+        assert!(ran.exists(), "a read did not reach the program");
+    }
+
+    /// The command line's runner of service-manager commands refuses a `launchctl` command that
+    /// changes the manager when the run did not ask, without starting the program.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn the_command_lines_service_manager_runner_refuses_a_launchctl_change_when_the_run_did_not_ask()
+     {
+        let child = kr_ipc::testing::account_launchd::run_fixture(
+            concat!(
+                module_path!(),
+                "::the_runner_fixture_for_a_run_that_did_not_ask"
+            ),
+            None,
+        );
+        assert!(
+            child.passed,
+            "the runner of a run that did not ask:\n{}",
+            child.log
         );
     }
 }
