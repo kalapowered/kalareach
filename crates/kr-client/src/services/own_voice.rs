@@ -677,6 +677,15 @@ impl Core {
             .clone()
     }
 
+    /// Forgets `slot` once a settle has told what became of its start, so that a later settle
+    /// with no start in flight does not tell that start's end again.
+    fn clear_slot(&self, slot: &Arc<StartSlot>) {
+        let mut held = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.as_ref().is_some_and(|held| Arc::ptr_eq(held, slot)) {
+            *held = None;
+        }
+    }
+
     fn live(&self) -> Vec<Arc<Shared>> {
         self.calls
             .lock()
@@ -783,6 +792,7 @@ impl OwnVoiceProvider {
             // Registered before the state is read, so a finish between the two is not missed.
             notified.as_mut().enable();
             if let Some(end) = slot.ended() {
+                self.core.clear_slot(&slot);
                 return match end {
                     StartEnd::Ended => Settled::NothingStarting,
                     StartEnd::LateClosed => Settled::LateSessionClosed,
