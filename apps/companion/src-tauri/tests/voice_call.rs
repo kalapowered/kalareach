@@ -5240,6 +5240,15 @@ async fn a_start_the_hold_refused_whose_answer_was_lost_is_told_the_holds_refusa
     assert_eq!(owed.len(), 1, "no unknown start is added: {state}");
     assert_eq!(owed[0]["action_id"], earlier.as_str(), "{state}");
     assert_eq!(owed[0]["kind"], "start_unconfirmed", "{state}");
+    // The page's state drops hidden entries, so the file is read as well: the refused start left
+    // no entry of its own, and the earlier one is the only entry the file holds.
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the file"),
+    )
+    .expect("a file");
+    let kept = file["owed"].as_array().expect("the entries");
+    assert_eq!(kept.len(), 1, "{file}");
+    assert_eq!(kept[0]["action_id"], earlier.as_str(), "{file}");
     scene.stop_host().await;
 }
 
