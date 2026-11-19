@@ -3958,6 +3958,168 @@ mod tests {
         assert_eq!(settled(&declared), 2, "a result for a declared word");
     }
 
+    /// KR-REQ-11.01 (W4): the records a real installation writes carry the word's version through
+    /// every writer: the installation record after an installation, after the repair of an
+    /// interrupted one and after a removal, and the action record of each result this host settles,
+    /// at version 1 for one of the six and 2 for a declared word.
+    #[cfg(unix)]
+    #[test]
+    fn the_records_of_real_installations_carry_the_version_of_their_word() {
+        let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");
+        let digest = Digest256::from_bytes([7; 32]);
+        let read = |path: &Path| -> Value {
+            serde_json::from_slice(&std::fs::read(path).expect("the record")).expect("JSON")
+        };
+        let cases: [(
+            AgentTarget,
+            Option<kr_plugin_sdk::skill_target::SkillTarget>,
+            u64,
+        ); 2] = [
+            (AgentTarget::CODEX, None, 1),
+            (amp(), Some(declared(None, &[".amp", "skills"])), 2),
+        ];
+        for (word, declaration, version) in cases {
+            let tree = Tree::create();
+            let installer = tree.installer().with_declaration(declaration, Vec::new());
+            let request = params(word.clone(), InstallScope::User);
+            let settle = |result: kr_protocol::envelope::ParamsValue| {
+                let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+                installer
+                    .mark_dispatching(&actor, action, &digest)
+                    .expect("marks");
+                installer
+                    .settle(&actor, action, &digest, &result, &word)
+                    .expect("settles");
+                read(&installer.action_path(&actor, action))["version"].clone()
+            };
+
+            // A completed installation.
+            let installed = installer.install(&request).expect("installs");
+            assert_eq!(
+                read(&installer.record_path(&request))["version"],
+                version,
+                "{word}: the installation record after an installation"
+            );
+            assert_eq!(
+                settle(
+                    kr_protocol::envelope::ParamsValue::from_typed(&installed).expect("encodes")
+                ),
+                version,
+                "{word}: the action record of an installation result"
+            );
+
+            // The repair of an installation that stopped: the record is open, a file is gone.
+            let path = installer.record_path(&request);
+            let mut record =
+                read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+            record.state = InstallationRecord::INSTALLING.to_owned();
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(&record).expect("encodes"),
+            )
+            .expect("writes");
+            std::fs::remove_file(tree.home().join(match word.compiled() {
+                Some(_) => ".agents/skills/kalareach-contact/TOOLS.md",
+                None => ".amp/skills/kalareach-contact/TOOLS.md",
+            }))
+            .expect("a file goes missing");
+            let repaired = installer.install(&request).expect("repairs");
+            assert_eq!(
+                read(&path)["version"],
+                version,
+                "{word}: the installation record after a repair"
+            );
+            assert_eq!(
+                settle(kr_protocol::envelope::ParamsValue::from_typed(&repaired).expect("encodes")),
+                version,
+                "{word}: the action record of a repair result"
+            );
+
+            // A removal.
+            let removed = installer.remove(&request).expect("removes");
+            assert_eq!(
+                settle(kr_protocol::envelope::ParamsValue::from_typed(&removed).expect("encodes")),
+                version,
+                "{word}: the action record of a removal result"
+            );
+        }
+    }
+
+    /// KR-REQ-11.01 (I15): a declaration with no configuration document installs the skill's three
+    /// files and no entry, reports itself installed with no configuration entry in its record, and
+    /// is removed whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_declaration_with_no_configuration_installs_the_skill_alone() {
+        let tree = Tree::create();
+        let installer = tree
+            .installer()
+            .with_declaration(Some(declared(None, &[".amp", "skills"])), Vec::new());
+        let request = params(amp(), InstallScope::User);
+        let result = installer.install(&request).expect("installs");
+        let folder = tree.home().join(".amp/skills/kalareach-contact");
+        for name in ["SKILL.md", "TOOLS.md", "manifest.json"] {
+            assert!(folder.join(name).is_file(), "{name} is written");
+        }
+        assert!(
+            result.unresolved.is_empty(),
+            "nothing is left unaccounted for: {:?}",
+            result.unresolved
+        );
+        let record = installer
+            .recorded(&request)
+            .expect("reads")
+            .expect("a record");
+        assert!(record.is_complete());
+        assert!(
+            !record.manifest.operations.iter().any(|operation| matches!(
+                operation,
+                ChangeOperation::AddConfigurationEntry { .. }
+            )),
+            "no entry was added"
+        );
+        let status = installer.status(&request).expect("reads");
+        assert!(status.installed && status.drift.is_empty(), "{status:?}");
+        installer.remove(&request).expect("removes");
+        assert!(!folder.exists(), "the skill's folder is removed");
+        assert!(
+            !tree.home().join(".amp").exists(),
+            "the folders this host made go with it"
+        );
+    }
+
+    /// KR-REQ-11.01 (I16): a scope the declaration has no place for is refused by name before
+    /// anything is written, and the scope it does declare installs.
+    #[cfg(unix)]
+    #[test]
+    fn a_scope_the_declaration_does_not_name_is_refused_before_anything_is_written() {
+        let tree = Tree::create();
+        let project = tree.root.join("project");
+        std::fs::create_dir_all(&project).expect("a project");
+        let installer = tree
+            .installer()
+            .with_declaration(Some(declared(None, &[".amp", "skills"])), Vec::new());
+        let refused = installer.install(&AgentToolsParams {
+            agent: amp(),
+            scope: InstallScope::Project,
+            project_dir: Nullable::some(display(&project)),
+        });
+        assert_eq!(
+            refused.as_ref().err().map(ToString::to_string),
+            Some(
+                "amp declares no place at project scope, so this host installs nothing there for it"
+                    .to_owned()
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            std::fs::read_dir(&project).expect("reads").next().is_none(),
+            "nothing was written"
+        );
+        let declared_scope = installer.install(&params(amp(), InstallScope::User));
+        assert!(declared_scope.is_ok(), "{declared_scope:?}");
+    }
+
     /// A record of version 1 and one of version 2 are read through one reader, as the same shape.
     #[test]
     fn a_version_one_and_a_version_two_record_read_through_one_reader() {

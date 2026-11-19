@@ -1997,6 +1997,34 @@ fn capabilities_from(text: &str) -> CatalogueResult<Vec<PluginCapability>> {
         .collect()
 }
 
+/// Keeps one retired release whose cap holds `capability` in the database under `root`, through the
+/// writer a retirement uses, so that a case can see the format that writer leaves the database in.
+/// Compiled away in every shipped build.
+///
+/// # Errors
+///
+/// Returns the error of opening the database or of the change.
+#[cfg(feature = "testing")]
+pub fn keep_a_retired_release_for_test(
+    root: &Path,
+    capability: PluginCapability,
+) -> CatalogueResult<()> {
+    let mut db = Db::open(root)?;
+    let release = RetiredRelease {
+        environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::NIL),
+        plugin_id: PluginId::new("kalareach/example-declarative").expect("a plugin"),
+        package_digest: PayloadDigest::of(b"package"),
+        origin: ReleaseOrigin {
+            repository_id: RepositoryId::new("example").expect("a repository"),
+            enrolment_key: EnrolmentKey::generate().expect("a key"),
+        },
+        cap: [capability].into_iter().collect(),
+    };
+    db.begin()?.run(&Permit::for_test(), |changes| {
+        changes.retire_release(&release)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

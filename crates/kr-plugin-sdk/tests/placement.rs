@@ -1628,6 +1628,95 @@ fn the_package_check_counts_the_reading_of_an_absent_skill_target_in_the_whole_s
     );
 }
 
+/// A package that declares a skill target has the host's reading of it counted in the whole
+/// statement, and the package check names the finding `skill_target.statement_too_long` when that
+/// whole is one character over: the longest that fits is accepted.
+#[test]
+fn the_package_check_names_a_statement_too_long_for_a_declared_skill_target() {
+    use kr_protocol::confirmation::{STATEMENT_CHARS, install_statement};
+    let target_json = json!({ "word": "amp", "user": { "skills": [".amp", "skills"] } });
+    let target: kr_plugin_sdk::skill_target::SkillTarget =
+        serde_json::from_value(target_json.clone()).expect("a target");
+    let base: Value = serde_json::from_slice(
+        &std::fs::read(bundled("claude-code").join("plugin.json")).expect("reads"),
+    )
+    .expect("JSON");
+    let with_filler = |length: usize| {
+        let mut manifest = base.clone();
+        manifest["command_integration"]["flags"]
+            .as_array_mut()
+            .expect("flags")
+            .push(json!("x".repeat(length)));
+        manifest["capabilities"]
+            .as_array_mut()
+            .expect("the capabilities a release asks for")
+            .push(json!({
+                "capability": "skill_target.install",
+                "reason": "Install the contact skill for the agent this package names"
+            }));
+        manifest
+    };
+    let composed = |manifest: &Value| {
+        let bridge: kr_plugin_sdk::plugin::NativeBridge =
+            serde_json::from_value(manifest["native_bridge"].clone()).expect("a recipe");
+        let integration: kr_plugin_sdk::integration::CommandIntegration =
+            serde_json::from_value(manifest["command_integration"].clone())
+                .expect("an integration");
+        let reading = Placement::claude_code()
+            .statement(&bridge)
+            .expect("a reading");
+        install_statement(
+            Some(bridge.grant_statement.as_str()),
+            Some(&reading),
+            Some(&target.statement()),
+            Some(&integration.statement()),
+        )
+        .expect("a statement")
+        .chars()
+        .count()
+    };
+    let exact = 1 + (STATEMENT_CHARS - composed(&with_filler(1)));
+    assert_eq!(
+        composed(&with_filler(exact)),
+        STATEMENT_CHARS,
+        "the longest that fits, with the reading of the declared target"
+    );
+    let whole = |length: usize| {
+        package_edited(
+            "claude-code",
+            |manifest| {
+                *manifest = with_filler(length);
+                manifest["sdk_range"] = json!(">=0.1.11, <0.2.0");
+            },
+            |table| {
+                table["placement"] = claude();
+                table["skill_target"] = target_json.clone();
+            },
+        )
+    };
+    let fits = whole(exact);
+    assert!(
+        fits.report.is_valid(),
+        "the longest that fits is a valid package: {:?}",
+        fits.report.findings
+    );
+    let over = whole(exact + 1);
+    assert_eq!(
+        over.report.findings.len(),
+        1,
+        "one character more is refused by the length alone: {:?}",
+        over.report.findings
+    );
+    assert!(
+        over.report.findings[0]
+            .detail
+            .contains("skill_target.statement_too_long")
+            && over.report.findings[0].detail.contains("5055 characters"),
+        "{:?}",
+        over.report.findings
+    );
+}
+
 /// The plugin documentation names the placement declaration, each floor the host holds before it
 /// places a file, and what it does not check or place: each by its own words, in the section that
 /// describes the declaration and in the SDK page that dates it.

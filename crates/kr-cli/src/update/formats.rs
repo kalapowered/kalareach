@@ -822,6 +822,208 @@ mod tests {
         ])
     }
 
+    /// The release a switch goes to, listing the stores that the skill-target capability changed as
+    /// the release before it lists them: the catalogue at its baseline format, and the installation
+    /// records and the retained actions at version 1.
+    fn target_before_the_skill_target() -> ReleaseManifest {
+        let json_records = |store: &str, path: &str| {
+            serde_json::json!({
+                "store": store,
+                "scope": "state_root",
+                "path": path,
+                "recording": { "kind": "json_member", "member": "version", "absent": 0 },
+                "version": 1,
+                "migrates_from": 0,
+            })
+        };
+        target_with(vec![
+            serde_json::json!({
+                "store": "catalogue",
+                "scope": "state_root",
+                "path": "catalogue/catalogue.sqlite3",
+                "recording": { "kind": "sqlite_user_version" },
+                "version": kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION,
+                "migrates_from": 0,
+            }),
+            json_records("agent-tools", "agent-tools/*.json"),
+            json_records("agent-tool-actions", "agent-tools/actions/*.json"),
+        ])
+    }
+
+    /// A state root a host used, as the command line's survey finds it, with the roots it needs for
+    /// the check; `check` answers for it what a switch to `target` would be refused for.
+    fn refusals_for(state: &Path, target: &ReleaseManifest) -> Vec<String> {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = kr_ipc::install::Store::at(directory.path().join("host"));
+        store.create_directories().expect("the store");
+        let environment_id = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
+        let host =
+            kr_ipc::paths::HostPaths::new(directory.path().join("run"), state).expect("the roots");
+        let environment = Environment {
+            environment_id,
+            paths: host.environment(environment_id),
+            host,
+        };
+        let writers = store
+            .try_lock_writers()
+            .expect("asks")
+            .expect("no command is writing");
+        let checked = check(target, &store, &[&environment], &[], true, &writers);
+        checked
+            .refusals
+            .iter()
+            .map(|refusal| {
+                format!(
+                    "{} {}",
+                    refusal.store,
+                    refusal
+                        .place
+                        .file_name()
+                        .map_or_else(String::new, |name| { name.to_string_lossy().into_owned() })
+                )
+            })
+            .collect()
+    }
+
+    /// KR-REQ-26.10 (W3): the switch back to a release before the skill-target capability is
+    /// refused by the check for the state a real writer left, and not for a host that never stored
+    /// the capability. The writers are the catalogue's retirement of a release, which raises the
+    /// database's format in its own commit, and the installation of a declared word with the
+    /// action record that settles it.
+    #[test]
+    fn the_check_refuses_a_switch_back_over_state_a_real_writer_made_and_only_that() {
+        let target = target_before_the_skill_target();
+        let host_state = |name: &str| {
+            let state = tempfile::tempdir().expect("a directory");
+            let root = state.path().join(name);
+            kr_ipc::paths::create_private_directory(&root).expect("the state root");
+            (state, root)
+        };
+
+        // The catalogue: a retired release whose cap holds a capability an earlier release knows
+        // leaves the baseline format; one whose cap holds the skill-target capability raises it.
+        let (_older, older) = host_state("older");
+        kr_ipc::paths::create_private_directory(&older.join("catalogue")).expect("a folder");
+        kr_plugin_catalogue::db::keep_a_retired_release_for_test(
+            &older.join("catalogue"),
+            kr_plugin_sdk::capability::PluginCapability::LaunchProbe,
+        )
+        .expect("a release is retired");
+        assert_eq!(refusals_for(&older, &target), Vec::<String>::new());
+        let (_newer, newer) = host_state("newer");
+        kr_ipc::paths::create_private_directory(&newer.join("catalogue")).expect("a folder");
+        kr_plugin_catalogue::db::keep_a_retired_release_for_test(
+            &newer.join("catalogue"),
+            kr_plugin_sdk::capability::PluginCapability::SkillTargetInstall,
+        )
+        .expect("a release is retired");
+        assert_eq!(
+            refusals_for(&newer, &target),
+            vec!["catalogue catalogue.sqlite3".to_owned()]
+        );
+
+        // The installation records and the retained actions: the six compiled words write version
+        // 1, a declared word's installation and its settled result write version 2.
+        let installer = |state: &Path, home: &Path| {
+            kr_controller::agent_tools::Installer::new(
+                home.to_path_buf(),
+                state.join("agent-tools"),
+                "/opt/kalareach/kr".to_owned(),
+            )
+        };
+        let settle = |installer: &kr_controller::agent_tools::Installer,
+                      word: &kr_protocol::skill::AgentTarget,
+                      result: &kr_protocol::envelope::ParamsValue| {
+            let actor = kr_protocol::ids::ActorId::new("local:owner").expect("a principal");
+            let action = kr_protocol::ids::ActionId::new(kr_ipc::new_uuid());
+            let digest = kr_protocol::scalars::Digest256::from_bytes([3; 32]);
+            installer
+                .mark_dispatching(&actor, action, &digest)
+                .expect("marks");
+            installer
+                .settle(&actor, action, &digest, result, word)
+                .expect("settles");
+        };
+        let (_six, six) = host_state("six");
+        let home = tempfile::tempdir().expect("a home");
+        let compiled = installer(&six, home.path());
+        let request = kr_protocol::skill::AgentToolsParams {
+            agent: kr_protocol::skill::AgentTarget::CODEX,
+            scope: kr_protocol::skill::InstallScope::User,
+            project_dir: kr_protocol::scalars::Nullable::null(),
+        };
+        let installed = compiled.install(&request).expect("installs");
+        settle(
+            &compiled,
+            &request.agent,
+            &kr_protocol::envelope::ParamsValue::from_typed(&installed).expect("encodes"),
+        );
+        assert_eq!(
+            refusals_for(&six, &target),
+            Vec::<String>::new(),
+            "a host that used only the six switches back"
+        );
+        let (_declared, declared_state) = host_state("declared");
+        let declared_home = tempfile::tempdir().expect("a home");
+        let word = kr_protocol::skill::AgentTarget::parse("amp").expect("a word");
+        let declaring = installer(&declared_state, declared_home.path()).with_declaration(
+            serde_json::from_value(serde_json::json!({
+                "word": "amp", "user": { "skills": [".amp", "skills"] }
+            }))
+            .expect("a target"),
+            Vec::new(),
+        );
+        let declared_request = kr_protocol::skill::AgentToolsParams {
+            agent: word.clone(),
+            scope: kr_protocol::skill::InstallScope::User,
+            project_dir: kr_protocol::scalars::Nullable::null(),
+        };
+        let installed = declaring.install(&declared_request).expect("installs");
+        settle(
+            &declaring,
+            &word,
+            &kr_protocol::envelope::ParamsValue::from_typed(&installed).expect("encodes"),
+        );
+        let mut refused = refusals_for(&declared_state, &target);
+        refused.sort();
+        assert_eq!(
+            refused,
+            vec![
+                "agent-tool-actions".to_owned()
+                    + " "
+                    + &only_file(&declared_state.join("agent-tools/actions")),
+                "agent-tools amp-user.json".to_owned(),
+            ],
+            "the record and the action of a declared word refuse the switch"
+        );
+        // A removal leaves the action record of its result, which keeps the barrier for good.
+        let removed = declaring.remove(&declared_request).expect("removes");
+        settle(
+            &declaring,
+            &word,
+            &kr_protocol::envelope::ParamsValue::from_typed(&removed).expect("encodes"),
+        );
+        let after = refusals_for(&declared_state, &target);
+        assert!(
+            after
+                .iter()
+                .any(|said| said.starts_with("agent-tool-actions ")),
+            "{after:?}"
+        );
+    }
+
+    /// The name of the one file in `directory`.
+    fn only_file(directory: &Path) -> String {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .expect("reads")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_file())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names.pop().expect("a file")
+    }
+
     /// A release that lists the stores `stores` names, each as a name, a scope and a path, at
     /// versions 1 to 1.
     fn target_listing(stores: &[(&str, &str, &str)]) -> ReleaseManifest {
@@ -835,6 +1037,17 @@ mod tests {
                 "migrates_from": 1,
             })
         };
+        target_with(
+            stores
+                .iter()
+                .map(|(name, scope, path)| listed(name, scope, path))
+                .collect(),
+        )
+    }
+
+    /// A release that lists the stores that `stores` holds the listings of, at the versions each
+    /// listing says.
+    fn target_with(stores: Vec<serde_json::Value>) -> ReleaseManifest {
         let document = serde_json::json!({
             "signed": {
                 "_type": "kalareach-release",
@@ -849,10 +1062,7 @@ mod tests {
                 "shells": [],
                 "agents": [],
                 "dependencies": { "lock_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "pinned": [], "vectors": [] },
-                "stores": stores
-                    .iter()
-                    .map(|(name, scope, path)| listed(name, scope, path))
-                    .collect::<Vec<_>>(),
+                "stores": stores,
                 "files": [],
             },
             "signatures": [],

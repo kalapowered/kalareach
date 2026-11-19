@@ -329,6 +329,7 @@ async fn a_change_of_the_admissions_while_the_packages_are_read_refuses_before_t
 fn package_declaring(
     host: &Host,
     word: &str,
+    tag: &str,
 ) -> (
     kr_protocol::admission::AdmittedPackage,
     kr_worker::broker::connectors::ConnectorSource,
@@ -339,7 +340,7 @@ fn package_declaring(
 
     let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../fixtures/plugins/valid/example-connector");
-    let directory = host._temp.root().join(format!("package-{word}"));
+    let directory = host._temp.root().join(format!("package-{word}-{tag}"));
     std::fs::create_dir_all(&directory).expect("a directory");
     for name in ["plugin.json", "presentation.json", "connector.json"] {
         std::fs::copy(example.join(name), directory.join(name)).expect("copies");
@@ -401,7 +402,7 @@ fn package_declaring(
 /// Admits a package that declares `word`, as the daemon reads the packages it admits.
 #[cfg(unix)]
 fn admit_declaring(host: &Host, word: &str) {
-    let (admitted, _) = package_declaring(host, word);
+    let (admitted, _) = package_declaring(host, word, "first");
     host._controller.admit_package_for_test(admitted);
 }
 
@@ -493,6 +494,76 @@ async fn the_unknown_word_list_holds_the_declared_and_the_recorded_words() {
         "zed is not an agent this host knows; it knows codex, claude-code, opencode, gemini-cli, \
          kimi-code-cli and qoder-cli, and amp, bmp"
     );
+}
+
+/// KR-REQ-11.01: while two admitted packages declare one word, an installation of it is refused by
+/// name, and a removal of what a record of this host names goes on by the record alone: the
+/// conflict between the packages blocks no removal.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_removal_goes_on_while_two_packages_declare_its_word() {
+    let host = host().await;
+    // An earlier installation of `amp` at project scope left its record and its files.
+    let params = install_for_amp(&host);
+    let home = host._temp.root().join("home");
+    std::fs::create_dir_all(&home).expect("a home");
+    let target = serde_json::from_value(serde_json::json!({
+        "word": "amp", "project": { "skills": [".amp", "skills"] }
+    }))
+    .expect("a target");
+    kr_controller::agent_tools::Installer::new(
+        home,
+        host.state_dir.join("agent-tools"),
+        "/opt/kalareach/kr".to_owned(),
+    )
+    .with_declaration(Some(target), Vec::new())
+    .install(&params)
+    .expect("the record is made");
+    let folder = host
+        ._temp
+        .root()
+        .join("project/.amp/skills/kalareach-contact");
+    assert!(folder.join("SKILL.md").is_file());
+
+    // Two packages declare the word now.
+    for tag in ["first", "second"] {
+        let (admitted, _) = package_declaring(&host, "amp", tag);
+        host._controller.admit_package_for_test(admitted);
+    }
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let target = ActionTarget::environment(host.environment_id);
+    let refused = client
+        .mutate(
+            Method::AgentToolsInstall,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon");
+    let Err(refused) = refused else {
+        panic!("an installation of a word two packages declare is refused");
+    };
+    assert_eq!(
+        refused.message,
+        "amp is named by more than one package this host admits, so it installs for none of them"
+    );
+    let removed = client
+        .mutate(
+            Method::AgentToolsRemove,
+            ActionId::new(kr_ipc::new_uuid()),
+            target,
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon");
+    assert!(
+        removed.is_ok(),
+        "the record alone decides a removal: {removed:?}"
+    );
+    assert!(!folder.exists(), "what the record named is removed");
 }
 
 mod fence_support;

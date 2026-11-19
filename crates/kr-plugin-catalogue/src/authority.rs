@@ -374,7 +374,7 @@ pub(crate) struct Permit {
     _private: (),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Permit {
     /// A permit for a case that tests one change of the store without an authority.
     pub(crate) const fn for_test() -> Self {
