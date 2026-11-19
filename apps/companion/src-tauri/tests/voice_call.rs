@@ -8302,8 +8302,11 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
 async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_deadline_and_provider_closure_while_the_peer_looks_connected()
  {
     for (cause, word, words) in [
+        // The host could not restore the channel and closed the call at OpenAI itself.
+        ("recovery", "host_stopped", "The host ended the call."),
+        // The host could not restore the channel and could not confirm that it closed the call.
         (
-            "recovery",
+            "recovery_unconfirmed",
             "host_sideband_lost",
             "The host lost its connection to OpenAI and could not restore it, so the call was ended.",
         ),
@@ -8341,7 +8344,12 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
         );
 
         match cause {
-            "recovery" => {
+            "recovery" | "recovery_unconfirmed" => {
+                if cause == "recovery_unconfirmed" {
+                    openai.script_hangup(
+                        kr_client::services::own_voice::stand_in::HangupScript::Lost,
+                    );
+                }
                 for _ in 0..200 {
                     openai.fail_attach(kr_client::services::own_voice::AttachFault::Unavailable);
                 }
