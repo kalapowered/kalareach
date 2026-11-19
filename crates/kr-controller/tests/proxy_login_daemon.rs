@@ -412,6 +412,19 @@ enum Behaviour {
     Refuses(u16),
 }
 
+/// One row of the scheme table: its name, what the proxy does, the password of the login stored
+/// beforehand (none, or one the proxy does not take), the sentence the diagnostics must hold, the
+/// sentence they must not, and the one login the proxy must have been written (none for a row that
+/// does not stop at the check).
+type Row = (
+    &'static str,
+    Behaviour,
+    Option<&'static str>,
+    &'static str,
+    &'static str,
+    Option<Login>,
+);
+
 /// KR-REQ-10.02: the sign-in the proxy asks for decides the state the daemon reports: a proxy that
 /// offers no Basic is "unsupported" whether or not a login is held, never "refused"; a Basic
 /// challenge with no login held needs one and with a wrong one refuses it; a bare challenge reads
@@ -422,7 +435,7 @@ async fn the_scheme_the_proxy_asks_for_decides_the_state_the_daemon_reports() {
     const NEEDED: &str = "the proxy requires a sign-in, and this host holds no login for it";
     const REFUSED: &str = "the proxy refused the login this host holds, so this host starts no new request through the proxy";
     const UNCHECKED: &str = "the start check could not tell whether the proxy asks for a login";
-    let rows: [(&str, Behaviour, Option<&str>, &str, &str, Option<Login>); 9] = [
+    let rows: [Row; 9] = [
         (
             "NTLM, no login",
             Behaviour::Authenticates("NTLM"),
