@@ -2545,16 +2545,8 @@ async fn kr_req_11_42_the_publishers_words_never_hold_the_hosts_label() {
 
 /// One bundled bridge package (`name` is its folder under the bundled targets) copied under
 /// `into`, with an SDK range that holds the arrival of a placement, `edit` applied to its
-/// connector table and the table's payload record brought up to the changed file.
-fn placing_package(
-    into: &std::path::Path,
-    name: &str,
-    edit: impl FnOnce(&mut serde_json::Value),
-) -> std::path::PathBuf {
-    placing_package_edited(into, name, edit, |_| {})
-}
-
-/// [`placing_package`] with `edit_manifest` applied to the manifest as well.
+/// connector table and `edit_manifest` to its manifest, and the table's payload record brought up
+/// to the changed file.
 fn placing_package_edited(
     into: &std::path::Path,
     name: &str,
