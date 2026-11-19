@@ -7,7 +7,7 @@
 
 mod net_support;
 
-#[path = "../../kr-client/tests/support/connect_proxy.rs"]
+#[path = "../../kr-client/src/services/http/connect_proxy.rs"]
 mod connect_proxy;
 
 use std::time::Duration;
