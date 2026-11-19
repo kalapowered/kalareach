@@ -545,9 +545,9 @@ describe('a control says why it asks nothing of an agent no package is bound to 
   // equally well (no package is bound then), and when it adopts a program that a package is bound
   // to (the package is named then).
   const TIE =
-    'it was not launched through the integration, and openai.codex and acme.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+    'it was not launched through the integration, and acme.codex and openai.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
   const TIE_OF_THREE =
-    'it was not launched through the integration, and openai.codex, acme.codex and other.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
+    'it was not launched through the integration, and acme.codex, openai.codex and other.codex recognise it equally well, so no package was chosen for it and none of its bridges is admitted'
   const ADOPTED =
     'it was not launched through the integration, so no registration names it and none of its bridges is admitted'
   const adopted = (over: Partial<AgentInstanceSummary>): AgentInstanceSummary => ({

@@ -310,7 +310,13 @@ export type ComposerOffers = Readonly<Record<keyof typeof COMPOSER_CAPABILITIES,
 export interface ComposerFacts {
   /** Whether the session's agent has been read at all. */
   readonly known: boolean
-  /** The live instance the composer speaks to, or null where none was read or none is live. */
+  /**
+   * The live instance the composer speaks to, or null where none was read or none is live. The
+   * voice route and the approvals view pass null for a live instance too: the host gives a binding
+   * for any instance it holds, so a binding does not show that a package is bound, but each view
+   * stops short of the offer for an agent no package took (the voice route at an agent on no turn,
+   * the approvals view at a request that needs a package's decoder).
+   */
   readonly instance: AgentInstanceSummary | null
   /** The binding in force, or null before one has been read or when no agent is live. */
   readonly binding: AgentBindingState | null
