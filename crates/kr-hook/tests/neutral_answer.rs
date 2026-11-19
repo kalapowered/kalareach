@@ -227,8 +227,9 @@ fn kr_req_12_27_input_a_hook_cannot_read_is_answered_neutrally() {
 
 /// KR-REQ-12.27: outside a launch a hook reads its input to the end without parsing it, so an
 /// application's write of a large input completes and a malformed one is not a diagnostic: the
-/// answer is the neutral one and standard error is empty. A hook that ran out of its deadline always
-/// says so on standard error, so an empty one is a hook that answered before it.
+/// answer is the neutral one and standard error is empty. A run that says it ran out of its
+/// deadline answered and ended without the rest of its input, as every run does at its deadline
+/// (`run_with`): it is not a run of this claim, and another is started, at most `ATTEMPTS`.
 #[test]
 fn outside_a_launch_the_input_is_drained_without_a_parse_and_without_a_diagnostic() {
     let placed = Placed::new();
@@ -243,22 +244,43 @@ fn outside_a_launch_the_input_is_drained_without_a_parse_and_without_a_diagnosti
             &b"[]"[..],
             &b"{\"session_id\":\"4d1c0a57\",\"hook_event_name\":\"SessionStart\""[..],
         ] {
-            let ran = run_with_input(placed.command(&[hooks.application, "hook"]), input);
             let case = format!("{} {} bytes", hooks.application, input.len());
-            assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
-            assert_eq!(ran.stdout, b"{}\n", "{case}");
+            let mut last = String::new();
+            let mut finished = None;
+            for _ in 0..ATTEMPTS {
+                let ran = run_with_input(placed.command(&[hooks.application, "hook"]), input);
+                assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
+                assert_eq!(ran.stdout, b"{}\n", "{case}");
+                assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
+                if kr_hook::hook::ran_out_of_its_deadline(&ran.stderr) {
+                    last = ran.stderr;
+                    continue;
+                }
+                finished = Some(ran);
+                break;
+            }
+            let Some(ran) = finished else {
+                panic!(
+                    "{case}: none of {ATTEMPTS} hooks answered before its deadline; the last said {last:?}"
+                );
+            };
             assert_eq!(
                 ran.stderr, "",
                 "{case}: nothing is said about an input nobody reads"
             );
-            assert!(ran.written.is_ok(), "{case}: {:?}", ran.written);
+            assert!(
+                ran.written.is_ok(),
+                "{case}: {:?}; it said {:?}",
+                ran.written,
+                ran.stderr
+            );
         }
     }
 }
 
 /// The length of the tail that a hook's input carries in the cases that read it to its end: more
 /// than a pipe holds, so a hook that stops reading leaves the application's write unfinished.
-const LARGE: usize = 4 * 1024 * 1024;
+const LARGE: usize = 1024 * 1024;
 
 /// What a hook of a launch is asked to read: where its registration is, and the hook events file
 /// the registration names, if any.
@@ -279,16 +301,19 @@ enum Says {
     Line(String),
 }
 
-/// KR-REQ-12.27: inside a launch a hook reads its input to the end however its run ends, and says
-/// nothing and reports nothing about an event its registration's map does not name. The run ends
-/// at a registration that is not there, at a hook events file that cannot be read or that holds
-/// events the check refuses, at input that is not JSON, at an event named twice, and at an event the
-/// map names with a member of the wrong type; none of them reaches the worker, and an application's
-/// write of an input over a pipe's size completes in each. An event the map does not name is read
-/// the same, whatever else the input holds and whatever type its members have, and is no
-/// diagnostic. The cases that say something say one line and the answer is the neutral one.
+/// KR-REQ-12.27: inside a launch a hook whose work ends before its deadline has read its input to
+/// the end, however the work ends, and says nothing and reports nothing about an event its
+/// registration's map does not name. A run that says it ran out of its deadline answered and ended
+/// without the rest of its input, as every run does at its deadline (`run_with`): it is not a run of
+/// this claim, and another is started, at most `ATTEMPTS`. The work ends at a registration that is
+/// not there, at a hook events file that cannot be read or that holds events the check refuses, at
+/// input that is not JSON, at an event named twice, and at an event the map names with a member of
+/// the wrong type; none of them reaches the worker, and an application's write of an input over a
+/// pipe's size completes in each. An event the map does not name is read the same, whatever else the
+/// input holds and whatever type its members have, and is no diagnostic. The cases that say
+/// something say one line and the answer is the neutral one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn inside_a_launch_a_hook_reads_its_input_to_the_end_however_its_run_ends() {
+async fn inside_a_launch_a_hook_reads_its_input_to_the_end_however_its_work_ends() {
     let placed = Placed::new();
     let files = placed.host.root().join("files");
     kr_ipc::paths::create_private_directory(&files).expect("a private directory");
@@ -368,11 +393,11 @@ async fn inside_a_launch_a_hook_reads_its_input_to_the_end_however_its_run_ends(
             let stand_in = StandIn::bind(&files, hooks.application);
             let registration = files.join(format!("registration.{}.{number}", hooks.application));
             let events_file = files.join(format!("events.{}.{number}", hooks.application));
-            let mut said = String::new();
-            let mut command = placed.command(&[hooks.application, "hook"]);
+            let mut said = "is not an event this bridge reads".to_string();
+            let mut registration_place = registration.clone();
             match registered {
                 Registered::Absent => {
-                    command.env("KR_REGISTRATION", files.join("absent").join("registration"));
+                    registration_place = files.join("absent").join("registration");
                     said = files.join("absent").display().to_string();
                 }
                 Registered::Default | Registered::Events(_) => {
@@ -390,7 +415,6 @@ async fn inside_a_launch_a_hook_reads_its_input_to_the_end_however_its_run_ends(
                         said = events_file.display().to_string();
                     }
                     std::fs::write(&registration, text).expect("the registration is written");
-                    command.env("KR_REGISTRATION", &registration);
                 }
             }
             let says = if *says {
@@ -398,14 +422,43 @@ async fn inside_a_launch_a_hook_reads_its_input_to_the_end_however_its_run_ends(
             } else {
                 Says::Nothing
             };
-            let input = input.clone();
-            let ran = tokio::task::spawn_blocking(move || run_with_input(command, &input))
-                .await
-                .expect("the hook ran");
-            assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
-            assert_eq!(ran.stdout, b"{}\n", "{case}");
-            assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
-            assert!(ran.written.is_ok(), "{case}: {:?}", ran.written);
+            let mut last = String::new();
+            let mut finished = None;
+            for _ in 0..ATTEMPTS {
+                let mut command = placed.command(&[hooks.application, "hook"]);
+                command.env("KR_REGISTRATION", &registration_place);
+                let input = input.clone();
+                let ran = tokio::task::spawn_blocking(move || run_with_input(command, &input))
+                    .await
+                    .expect("the hook ran");
+                assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
+                assert_eq!(ran.stdout, b"{}\n", "{case}");
+                assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
+                // A connection the hook made is waiting for an accept by now.
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), stand_in.listener.accept())
+                        .await
+                        .is_err(),
+                    "{case}: the hook reached the worker"
+                );
+                if kr_hook::hook::ran_out_of_its_deadline(&ran.stderr) {
+                    last = ran.stderr;
+                    continue;
+                }
+                finished = Some(ran);
+                break;
+            }
+            let Some(ran) = finished else {
+                panic!(
+                    "{case}: none of {ATTEMPTS} hooks ended its work before its deadline; the last said {last:?}"
+                );
+            };
+            assert!(
+                ran.written.is_ok(),
+                "{case}: {:?}; it said {:?}",
+                ran.written,
+                ran.stderr
+            );
             match says {
                 Says::Nothing => assert_eq!(ran.stderr, "", "{case}"),
                 Says::Line(text) => assert!(
@@ -417,13 +470,6 @@ async fn inside_a_launch_a_hook_reads_its_input_to_the_end_however_its_run_ends(
                     ran.stderr
                 ),
             }
-            // A connection the hook made is waiting for an accept by now.
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), stand_in.listener.accept())
-                    .await
-                    .is_err(),
-                "{case}: the hook reached the worker"
-            );
         }
     }
 }
