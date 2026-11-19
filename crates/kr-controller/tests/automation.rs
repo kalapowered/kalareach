@@ -9447,7 +9447,10 @@ fn writes_report(path: &str, lines: &[&str], status: u8) -> String {
     let directory = path
         .rsplit_once('/')
         .map_or(".", |(directory, _)| directory);
-    let lines: Vec<String> = lines.iter().map(|line| format!("'{line}'")).collect();
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|line| kr_worker::testing::shell_word(line))
+        .collect();
     format!(
         "mkdir -p {directory} && printf '%s\\n' {} > {path}; exit {status}",
         lines.join(" ")
