@@ -430,7 +430,13 @@ async fn the_front_is_up_before_iroh_binds_and_a_late_guard_closes_at_once() {
 
     // The guard starts after the verdict and closes the endpoint with nothing else to wake it.
     let guard = guard_proxy(&closer, &login);
-    until("the guard closed the endpoint", || guard.proxy_closed()).await;
+    tokio::time::timeout(WATCHDOG, async {
+        while !guard.proxy_closed() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the guard closed the endpoint with no further event");
     assert!(endpoint.is_closed());
     assert_eq!(proxy.accepted(), 0, "nothing reached the proxy");
     assert!(proxy.logins().is_empty());
