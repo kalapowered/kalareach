@@ -4035,28 +4035,50 @@ async fn kept_file_where(
     .expect("the kept file never held what was waited for")
 }
 
-/// The kept file as a call's own debts read it: without the entries that stand for starts this device
-/// kept (`start_*`), which a later start's pass removes and which a case about what a call owes does
-/// not read.
-fn without_starts(file: &serde_json::Value) -> serde_json::Value {
+/// The kinds of entry that stand for starts this device kept and no longer shows: a later start's
+/// pass removes them, and a case about what a call owes does not read them.
+const HIDDEN_START_KINDS: [&str; 2] = ["start_kept", "start_unanswered"];
+
+/// The kept file without its hidden start entries, for a wait that polls it.
+fn without_hidden_starts(file: &serde_json::Value) -> serde_json::Value {
     let mut file = file.clone();
     if let Some(owed) = file["owed"].as_array_mut() {
         owed.retain(|each| {
             !each["kind"]
                 .as_str()
-                .is_some_and(|kind| kind.starts_with("start_"))
+                .is_some_and(|kind| HIDDEN_START_KINDS.contains(&kind))
         });
     }
     file
 }
 
+/// The kept file as a call's own debts read it: without the hidden entries of starts this device
+/// kept, and with nothing left that stands for a start. A start the host has not answered is kept
+/// as a shown notice, so a shown start notice is a debt this case did not expect: it fails here
+/// and is never skipped.
+fn without_starts(file: &serde_json::Value) -> serde_json::Value {
+    let file = without_hidden_starts(file);
+    let shown_start = file["owed"].as_array().is_some_and(|owed| {
+        owed.iter().any(|each| {
+            each["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("start_"))
+        })
+    });
+    assert!(
+        !shown_start,
+        "a shown start stands in a case about what a call owes: {file}"
+    );
+    file
+}
+
 /// `kept_file_where` for a case about what a call owes: `until` and the answer both read the file
-/// without the entries of kept starts.
+/// without the hidden entries of kept starts.
 async fn kept_file_without_starts(
     directory: &std::path::Path,
     until: impl Fn(&serde_json::Value) -> bool,
 ) -> serde_json::Value {
-    without_starts(&kept_file_where(directory, |file| until(&without_starts(file))).await)
+    without_starts(&kept_file_where(directory, |file| until(&without_hidden_starts(file))).await)
 }
 
 /// A copy of the kept file in a directory of its own: the process that starts afterwards reads a
