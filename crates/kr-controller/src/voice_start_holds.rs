@@ -270,14 +270,15 @@ impl Record {
             .map_err(ControllerError::registry)?;
         if let Some((standing_action, standing_asked, standing_ends)) = standing {
             let names_it = supersedes.is_some_and(|named| named.to_string() == standing_action);
-            if !names_it && !bound_passed(moment(standing_ends), asked_ms)? {
-                if let Ok(held) = standing_action.parse::<ActionId>() {
-                    return Ok(Decision::Held(Row {
-                        action: held,
-                        asked_ms: moment(standing_asked),
-                        ends_ms: moment(standing_ends),
-                    }));
-                }
+            if !names_it
+                && !bound_passed(moment(standing_ends), asked_ms)?
+                && let Ok(held) = standing_action.parse::<ActionId>()
+            {
+                return Ok(Decision::Held(Row {
+                    action: held,
+                    asked_ms: moment(standing_asked),
+                    ends_ms: moment(standing_ends),
+                }));
             }
         }
         // Rows past their end are deleted, for every actor, where the end is on disk.

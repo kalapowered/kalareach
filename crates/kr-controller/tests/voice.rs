@@ -3740,3 +3740,49 @@ async fn a_hold_that_cannot_be_written_refuses_the_start_before_the_broker() {
     );
     assert_eq!(world.calls_asked(), 0, "the service was not asked");
 }
+
+/// KR-REQ-23.24: a supersession key that is not an action identifier, or that says nothing, is
+/// refused before anything is claimed or asked, and leaves no hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_malformed_or_null_supersession_key_is_refused_before_the_claim() {
+    let world = HoldWorld::with(vec![a_start_whose_answer_is_lost()]).await;
+    let key = kr_protocol::action::SUPERSEDES_ACTION_KEY;
+    let encodings = [
+        kr_protocol::envelope::ParamsValue::from_typed(&std::collections::BTreeMap::from([(
+            key,
+            Some("not an action".to_owned()),
+        )]))
+        .expect("a malformed key encodes"),
+        kr_protocol::envelope::ParamsValue::from_typed(&std::collections::BTreeMap::from([(
+            key,
+            None::<String>,
+        )]))
+        .expect("a null key encodes"),
+    ];
+    for expected in &encodings {
+        let refused = world
+            .session
+            .mutate(
+                Method::VoiceStart,
+                ActionTarget::environment(world.environment_id),
+                None,
+                expected,
+                &world.params,
+                NETWORK_LIFETIME,
+            )
+            .await
+            .expect_err("a key that names no action is refused");
+        assert_eq!(
+            refused.code(),
+            kr_protocol::error::ErrorCode::InvalidArgument,
+            "{refused}"
+        );
+    }
+    assert_eq!(world.calls_asked(), 0, "the service was not asked");
+    assert_eq!(world.hold(), None, "nothing was held");
+    world
+        .start(None)
+        .await
+        .expect("a plain start is still admitted");
+    assert_eq!(world.calls_asked(), 1);
+}
