@@ -425,7 +425,7 @@ pub struct PluginActionInvokeParams {
     ///
     /// An action that answers a pending request, through the connector table's decision
     /// destination, answers exactly one, and this names it. Every other action names none, and a
-    /// call that names one is refused before anything is admitted. The caller never supplies the
+    /// call that names one is refused before its dispatch marker. The caller never supplies the
     /// upstream's own request identifier: an answer carries the identifier the named resource
     /// recorded when the request arrived, so it can resolve only the request it names.
     pub resource_id: Nullable<PendingResourceId>,
