@@ -475,14 +475,35 @@ struct Scanned {
     manifests: BTreeMap<String, Vec<u8>>,
     /// The paths of the files that write the forwarder as a line a POSIX shell runs.
     shell_forms: BTreeSet<String>,
-    /// The bytes of the other small files, up to [`SOURCES_BYTES`] in all, which a bridge's
-    /// registration files are checked from without reading them again.
+    /// The bytes of the files a native bridge's recipe installs, up to [`SOURCES_BYTES`] in all,
+    /// which the bridge's registration files are checked from without reading them again. No
+    /// other file is kept: no check reads one.
     sources: BTreeMap<String, Vec<u8>>,
 }
 
 /// The most of a package's files the scan keeps for the checks of a bridge's registration files:
-/// no file over a mebibyte, and eight mebibytes in all.
+/// no file over a mebibyte, and eight mebibytes in all. Only the files the recipe installs count
+/// against it, so a package's other files never take the place of one.
 const SOURCES_BYTES: usize = 8 << 20;
+
+/// The package path each file a native bridge's recipe installs is read from, as the plugin
+/// manifest's own bytes name them. A manifest this host cannot read names none: it is refused
+/// where it is read, and no later check runs.
+fn installed_sources(manifest: &[u8]) -> BTreeSet<String> {
+    let Ok(manifest) = serde_json::from_slice::<PluginManifest>(manifest) else {
+        return BTreeSet::new();
+    };
+    manifest
+        .native_bridge
+        .0
+        .iter()
+        .flat_map(|bridge| bridge.install.iter())
+        .filter_map(|step| match step {
+            BridgeStep::InstallFile { source, .. } => Some(source.as_str().to_owned()),
+            BridgeStep::AddConfigurationKey { .. } => None,
+        })
+        .collect()
+}
 
 fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
     // The walk is anchored to a directory handle. Every open below resolves inside that handle, so
@@ -505,6 +526,9 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
     let mut manifests: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut shell_forms: BTreeSet<String> = BTreeSet::new();
     let mut sources: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    // The files the recipe installs, known once the root's manifest is read, which is before any
+    // other file is.
+    let mut installed: BTreeSet<String> = BTreeSet::new();
     let mut kept: usize = 0;
     let mut total: u64 = 0;
     let mut queue: Vec<(Dir, Vec<String>)> = vec![(root, Vec::new())];
@@ -519,7 +543,28 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                 return None;
             }
         };
-        for entry in entries {
+        // The root's manifest is read before any other file, whatever order the listing gives, so
+        // that the files its recipe installs are known when the others are read and are the ones
+        // kept. Its entry is found by a lookup: the listing is never held whole.
+        let manifest_first = if prefix.is_empty() {
+            current.entries().ok().and_then(|mut listing| {
+                listing.find(|entry| {
+                    entry
+                        .as_ref()
+                        .is_ok_and(|entry| entry.file_name() == MANIFEST_FILE)
+                })
+            })
+        } else {
+            None
+        };
+        let found = manifest_first.is_some();
+        let later = entries.filter(move |entry| {
+            !(found
+                && entry
+                    .as_ref()
+                    .is_ok_and(|entry| entry.file_name() == MANIFEST_FILE))
+        });
+        for entry in manifest_first.into_iter().chain(later) {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
@@ -631,12 +676,18 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
             match read_bounded(&current, &name_os, limit) {
                 Ok(bytes) => {
                     if is_manifest_name(path.as_str()) {
+                        if path.as_str() == MANIFEST_FILE {
+                            installed = installed_sources(&bytes);
+                        }
                         manifests.insert(path.to_string(), bytes.clone());
                     } else {
                         if std::str::from_utf8(&bytes).is_ok_and(forwarder::holds_shell_form) {
                             shell_forms.insert(path.to_string());
                         }
-                        if bytes.len() <= 1 << 20 && kept + bytes.len() <= SOURCES_BYTES {
+                        if installed.contains(path.as_str())
+                            && bytes.len() <= 1 << 20
+                            && kept + bytes.len() <= SOURCES_BYTES
+                        {
                             kept += bytes.len();
                             sources.insert(path.to_string(), bytes.clone());
                         }
