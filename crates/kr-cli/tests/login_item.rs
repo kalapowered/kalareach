@@ -905,8 +905,10 @@ mod written {
                 if argument == "install" {
                     assert!(!output.status.success(), "install is refused: {said}");
                     assert!(
-                        said.contains("cannot be written into a")
-                            && said.contains("; nothing was written"),
+                        said.contains(
+                            "is not text, so the login item's record cannot hold it exactly; \
+                             nothing was written"
+                        ),
                         "{said}"
                     );
                 }
@@ -1061,14 +1063,101 @@ mod written {
         let (ok, _, refused) = run_in(&setup, &second, &["host", "login-item", "install"]);
         assert!(!ok, "{refused}");
         assert!(
-            refused.contains(&first.display().to_string())
-                && refused.contains("was changed after kr wrote it"),
-            "{refused}"
+            refused.contains("the file the record ")
+                && refused.contains(
+                    " names was changed after kr wrote it, so kr does not replace it; run kr host \
+                 login-item remove, which leaves it, then run kr host login-item install again"
+                ),
+            "the refusal names the file by the record that names it: {refused}"
+        );
+        assert!(
+            !refused.contains(&first.display().to_string()),
+            "the first home's path is not printed whole: {refused}"
         );
         assert!(
             !refused.contains(&second.display().to_string()),
             "a file under the other home is not said to be changed: {refused}"
         );
+    }
+
+    /// A removal that stopped after it took the file out and flushed: nothing is left to take
+    /// back, and an install says so before it writes the file again.
+    #[test]
+    fn an_install_does_not_say_it_took_back_a_removal_that_had_taken_the_file_out() {
+        let setup = Setup::new();
+        setup.ok("install");
+        let first = setup.item();
+        let aside = beside(&first, "kr-moving");
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "remove", "aside": aside}),
+        );
+        std::fs::remove_file(&first).expect("the removal had taken the file out");
+        assert!(!aside.exists());
+        let (ok, said, refused) = run_in(&setup, &setup.home, &["host", "login-item", "install"]);
+        assert!(ok, "{said}{refused}");
+        assert!(
+            said.contains(
+                "an earlier kr host login-item remove had already taken out the file, so kr had \
+                 nothing to take back"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("took back what"), "{said}");
+        assert!(
+            setup.item_in(&setup.home).is_some(),
+            "install wrote the file again"
+        );
+        assert!(setup.record()["pending"].is_null());
+        // An install that stopped before it put the file in place is not said to have finished.
+        let item = setup.item();
+        std::fs::remove_file(&item).expect("the file goes");
+        let staging = beside(&item, "kr-staging");
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "publish", "staging": staging}),
+        );
+        let (ok, said, refused) = run_in(&setup, &setup.home, &["host", "login-item", "install"]);
+        assert!(ok, "{said}{refused}");
+        assert!(
+            said.contains(
+                "an earlier kr host login-item install stopped before it put the file in place, \
+                 so kr had no file to finish"
+            ),
+            "{said}"
+        );
+        assert!(!said.contains("finished what"), "{said}");
+    }
+
+    /// A removal whose own removal fails after the settling did its part does not say it took
+    /// out what an earlier install began: the file is still there.
+    #[test]
+    fn a_removal_that_fails_after_its_settling_does_not_say_it_took_out_the_install() {
+        let setup = Setup::new();
+        setup.ok("install");
+        let item = setup.item();
+        let staging = beside(&item, "kr-staging");
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "publish", "staging": staging}),
+        );
+        let directory = item.parent().expect("a directory").to_owned();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+            .expect("a read-only directory");
+        let (ok, said, refused) = run_in(&setup, &setup.home, &["host", "login-item", "remove"]);
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .expect("the directory is writable again");
+        assert!(!ok, "the removal fails: {said}{refused}");
+        assert!(
+            refused.contains("kr stopped while it was moving the file aside"),
+            "{said}{refused}"
+        );
+        assert!(
+            !said.contains("took out what an earlier")
+                && !refused.contains("took out what an earlier"),
+            "{said}{refused}"
+        );
+        assert!(item.exists(), "the file is still there");
     }
 
     #[test]
@@ -1102,6 +1191,60 @@ mod written {
                 "{argument:?} prints text of a path that is not this home's: {said}{refused}"
             );
         }
+    }
+
+    #[test]
+    fn a_changed_file_a_record_names_that_is_not_the_homes_is_never_printed_whole() {
+        let setup = Setup::new();
+        let marked = setup.root.join("home-MARKER-9f3a");
+        std::fs::create_dir_all(&marked).expect("a home");
+        let (ok, said, _) = run_in(&setup, &marked, &["host", "login-item", "install"]);
+        assert!(ok, "{said}");
+        let item = setup
+            .item_in(&marked)
+            .expect("the item is in the marked home");
+        let staging = beside(&item, "kr-staging");
+        leave_pending(
+            &setup,
+            serde_json::json!({"operation": "publish", "staging": staging}),
+        );
+        let mut changed = std::fs::read(&item).expect("the file");
+        changed.extend_from_slice(b"\n");
+        std::fs::write(&item, changed).expect("a changed file");
+        let second = other_home(&setup);
+        let said_by = |arguments: &[&str]| {
+            let mut full = vec!["host", "login-item"];
+            full.extend_from_slice(arguments);
+            let (ok, said, refused) = run_in(&setup, &second, &full);
+            assert!(
+                !said.contains("MARKER-9f3a") && !refused.contains("MARKER-9f3a"),
+                "{arguments:?} prints text of a path that is not this home's: {said}{refused}"
+            );
+            (ok, said, refused)
+        };
+        let (ok, _, _) = said_by(&["status"]);
+        assert!(ok);
+        let (ok, _, _) = said_by(&["status", "--json"]);
+        assert!(ok);
+        let (ok, said, refused) = said_by(&["install"]);
+        assert!(!ok, "{said}{refused}");
+        assert!(
+            refused.contains(" names was changed after kr wrote it, so kr does not replace it"),
+            "{refused}"
+        );
+        let (ok, said, _) = said_by(&["install", "--json"]);
+        assert!(!ok);
+        let document: serde_json::Value = serde_json::from_str(&said).expect("one document");
+        assert!(
+            document["message"].as_str().is_some_and(|message| {
+                message.contains(" names was changed after kr wrote it, so kr does not replace it")
+            }),
+            "{said}"
+        );
+        let (ok, said, refused) = said_by(&["remove"]);
+        assert!(ok, "{said}{refused}");
+        assert!(item.exists(), "the changed file is left");
+        assert!(setup.record_path().is_some_and(|path| !path.exists()));
     }
 
     #[test]
