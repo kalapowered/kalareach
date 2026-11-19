@@ -1483,14 +1483,21 @@ describe('while a call is running', () => {
   // timer that reads the state at the end counts it, however old the notice is.
   it('stops showing a lone notice with a finite end once its time has passed', async () => {
     start((controls) => {
-      controls.oweVoice({ until_ms: Date.now() + 400 })
+      // A start notice and nothing else is owed, so no revocation keeps the screen reading: only
+      // the timer that counts the notice's own end reads the state again.
+      controls.oweVoice({
+        kind: 'start_unknown',
+        action_id: 'an-old-start',
+        voice_session_id: null,
+        until_ms: Date.now() + 400
+      })
     })
     await waitForChoice()
-    expect(await screen.findByRole('status', { name: 'The last call' })).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
 
     await waitFor(
       () => {
-        expect(screen.queryByRole('status', { name: 'The last call' })).not.toBeInTheDocument()
+        expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument()
       },
       { timeout: 6000 }
     )
@@ -1719,18 +1726,33 @@ describe('the rate a start accepts', () => {
 
   // A start answered with a changed rate was taken by the host's hold, which can change what the
   // device kept of the starts before it: the screen reads what the device keeps again.
-  it('reads what the device keeps again after a start answered with a changed rate', async () => {
+  it('shows what the device keeps after a start answered with a changed rate', async () => {
     const user = userEvent.setup()
-    const { controls, port } = start()
+    const { controls, port } = start((controls) => {
+      controls.oweVoice({
+        kind: 'start_unknown',
+        action_id: 'an-old-start',
+        voice_session_id: null,
+        until_ms: Number.MAX_SAFE_INTEGER
+      })
+    })
     await waitForChoice()
-    const read = vi.spyOn(port, 'voiceCallState')
+    expect(await screen.findByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+    // The host's hold took the start and the device removed the older notice: the answer carries
+    // the rate, and what the device keeps afterwards no longer holds the notice.
+    const answered = port.voiceStart.bind(port)
+    vi.mocked(port.voiceStart).mockImplementationOnce(async (...args) => {
+      const outcome = await answered(...args)
+      controls.removeOwedVoiceStarts()
+      return outcome
+    })
     controls.changeVoiceRate('2026-10-b', '3')
 
     await user.click(screen.getByRole('button', { name: 'Start voice session' }))
     await screen.findByRole('button', { name: 'Start at the new rate' })
 
     await waitFor(() => {
-      expect(read).toHaveBeenCalled()
+      expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument()
     })
   })
 
