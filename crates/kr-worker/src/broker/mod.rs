@@ -1425,10 +1425,11 @@ impl Broker {
     ///
     /// The image check refuses a program that is not the one that was hashed, and also one whose
     /// image could not be read or kept changing while it was read, so `why` is the check's own
-    /// account. Every usable record is made `NotTested` with a reason that carries it, cut to
-    /// [`MAX_BROKER_REASON_LEN`]; a record that was not usable keeps its earlier reason. The
-    /// permit's final check refuses a held instance, so a mutation admitted before the refusal is
-    /// not sent after it. No token is withdrawn and no binding revision moves.
+    /// account. Every record that names the binary and is not already `NotTested`, usable or not,
+    /// is made `NotTested` with a reason that carries it, cut to [`MAX_BROKER_REASON_LEN`]; a
+    /// record that was already `NotTested` keeps its earlier reason. The permit's final check
+    /// refuses a held instance, so a mutation admitted before the refusal is not sent after it. No
+    /// token is withdrawn and no binding revision moves.
     ///
     /// The check runs at the next authenticated bridge of the instance and at a gateway's one
     /// accept, not at the exec itself, and an exec that keeps a gateway's socket open and makes no

@@ -115,9 +115,9 @@ impl CapabilityOwner {
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the instance is held, because the host cannot
-    /// confirm that its program still runs the code it checked, and [`BrokerError::Capability`] when the record breaks one
-    /// of section 11's rules: a source that cannot establish a working capability claiming one, or
-    /// an unusable state with no reason a person can read.
+    /// confirm that its program still runs the code it checked, and [`BrokerError::Capability`]
+    /// when the record breaks one of section 11's rules: a source that cannot establish a working
+    /// capability claiming one, or an unusable state with no reason a person can read.
     pub fn record(&mut self, record: InstanceCapabilityRecord) -> Result<()> {
         if self.held.contains(&record.application_instance_id) {
             return Err(BrokerError::invalid(
