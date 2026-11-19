@@ -9,7 +9,10 @@
 //!
 //! Suites in other crates include this module by its path rather than keep a copy of their own; the
 //! library of this crate holds it as a module of its own at its standard place.
+//!
+//! The file keeps itself out of every build but a test's: it builds a login's header on purpose.
 
+#![cfg(test)]
 #![allow(
     dead_code,
     reason = "each suite that includes this module uses the part of it that it needs"
