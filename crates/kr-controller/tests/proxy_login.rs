@@ -5,13 +5,15 @@
 //! The proxy is a stand-in on the loopback that never stores a header value. Each case waits for an
 //! event it can see (a count, the verdict, a finished check) and never for a quiet interval.
 
+mod net_support;
+
 #[path = "../../kr-client/tests/support/connect_proxy.rs"]
 mod connect_proxy;
 
 use std::time::Duration;
 
 use connect_proxy::{ConnectProxy, Login};
-use kr_controller::config::{ProxyItem, ProxyStart, Started};
+use kr_controller::config::{Outbound, ProxyItem, ProxyStart, Started};
 use kr_controller::service::net::proxy_login::{
     Timing, Watch, check, item_bytes, item_name, proxy_tls, read_item, start_target,
 };
@@ -284,4 +286,138 @@ async fn the_watch_checks_once_for_each_suspicion_and_stops_at_the_verdict() {
     wrong.suspicion().suspect(two);
     assert_eq!(watch.checks_done(), 1);
     assert_eq!(refusing.logins(), vec![Login::Wrong]);
+}
+
+/// The daemon of a case: the controller, started over the folders of a temporary host.
+async fn start_controller(
+    host: &kr_ipc::testing::TempHost,
+) -> std::sync::Arc<kr_controller::service::Controller> {
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    kr_controller::testing::taken_over(|| {
+        let secrets = environment.secrets_dir();
+        kr_controller::service::Controller::start(kr_controller::service::ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store = kr_crypto::store::open_store_in(&secrets)
+                    .expect("a secret store for the test environment");
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    store.store.as_ref(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            secret_store: kr_crypto::store::StoreSelection::File,
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(net_support::RefusingSupervisor),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: net_support::build(),
+            release: "0".to_owned(),
+            shell_packages: None,
+            terminal: Box::new(kr_controller::supervision::NoTerminal),
+        })
+    })
+    .await
+    .unwrap_or_else(|error| panic!("the daemon starts: {error}"))
+}
+
+/// KR-REQ-10.02: no value the controller keeps for a start that holds a login prints it, in any
+/// spelling: the start's reading, the route, the network's settings and setup, the network that
+/// is on the proxy through the front, and the relays of its endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_login_is_in_any_debug_of_the_start_or_the_network() {
+    use base64::Engine as _;
+    const USER: &str = "usér-planted";
+    const SECRET: &str = "p4ss-planted-7f3c";
+    let proxy = ConnectProxy::authenticating(USER, SECRET, "Basic realm=\"proxy\"").await;
+    let relay = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+    let port = relay.local_addr().expect("an address").port();
+    let held = tokio::spawn(async move {
+        let mut kept = Vec::new();
+        while let Ok((stream, _)) = relay.accept().await {
+            kept.push(stream);
+        }
+    });
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{USER}:{SECRET}"));
+    let forms = [USER, SECRET, basic.as_str(), "us%C3%A9r-planted"];
+
+    // The search finds a login that is there, so a clean result means something.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    struct Printing(String);
+    let control = format!("{:?}", Printing(format!("{USER}:{SECRET}")));
+    assert!(
+        forms[..2].iter().all(|form| control.contains(form)),
+        "the search finds a printed login: {control}"
+    );
+
+    let login = credential(USER, SECRET);
+    let through = proxy_at(&proxy, Some(login.clone()));
+    let selection = NetworkSelection {
+        enabled: Nullable::some(true),
+        bind_address: Nullable::some("127.0.0.1:0".to_owned()),
+        relay_urls: Nullable::some(vec![format!("https://127.0.0.1:{port}")]),
+        proxy_url: Nullable::some(proxy.url.clone()),
+        ..NetworkSelection::default()
+    };
+    let started = Started {
+        network: selection.clone(),
+        proxy_login: Some(login.clone()),
+        ..Started::default()
+    };
+    let route = Outbound::Through(through.clone());
+    let settings = kr_controller::service::net::config::NetworkSettings::from_selection(
+        &selection,
+        Some(through),
+    )
+    .expect("a usable selection")
+    .expect("this host joins");
+    let setup = kr_controller::service::net::NetworkSetup {
+        settings: settings.clone(),
+        secrets: std::sync::Arc::new(MemoryStore::new()),
+        rendezvous: None,
+    };
+    let mut printed = vec![
+        ("Started", format!("{started:?}")),
+        ("Outbound", format!("{route:?}")),
+        ("NetworkSettings", format!("{settings:?}")),
+        ("NetworkSetup", format!("{setup:?}")),
+    ];
+
+    let host = kr_ipc::testing::TempHost::create();
+    let controller = start_controller(&host).await;
+    let network = kr_controller::service::net::register(&controller, setup)
+        .await
+        .expect("the daemon joins the network through the front");
+    printed.push(("Network", format!("{network:?}")));
+    let endpoint = network
+        .endpoint_for_tests()
+        .expect("the network holds an endpoint");
+    let relays =
+        kr_controller::relay_leases::endpoint::EndpointRelays::new(endpoint, &settings.endpoint);
+    printed.push(("EndpointRelays", format!("{relays:?}")));
+    for (what, text) in &printed {
+        for form in forms {
+            assert!(!text.contains(form), "{what} prints the login: {text}");
+        }
+    }
+    // The panic message of an assertion over a value that prints holds none either.
+    let caught = std::panic::catch_unwind(|| {
+        let text = format!("{started:?}");
+        assert!(text.is_empty(), "the start is {started:?}");
+    })
+    .expect_err("the assertion fails");
+    let message = caught.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(!message.is_empty(), "the panic says what it formed");
+    for form in forms {
+        assert!(
+            !message.contains(form),
+            "a panic message prints the login: {message}"
+        );
+    }
+    drop(network);
+    drop(controller);
+    held.abort();
 }

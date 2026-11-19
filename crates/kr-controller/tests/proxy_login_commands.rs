@@ -171,3 +171,46 @@ async fn a_proxy_login_of_the_wrong_shape_is_refused_with_one_sentence_that_repe
     );
     assert!(store.get(&name).expect("the store reads").is_none());
 }
+
+/// KR-REQ-10.02: a request that carries a login is covered by a digest that a guess at the login
+/// cannot check: two requests that differ only in the freshness window the host issued give two
+/// digests, and neither is the plain digest of the request's parameters, which a guess could be
+/// compared with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_digest_of_a_login_request_is_not_one_a_guess_at_the_login_can_check() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = net_support::Host::start(&owner).await;
+    let mut control = host.client().await;
+    let first = control
+        .compose(
+            Method::NetworkProxyLoginSet,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params("http://proxy.example.com:3128", &format!("user:{PASSWORD}")),
+        )
+        .await
+        .expect("the request is composed");
+    let mut second = first.clone();
+    second.action_window_id = kr_protocol::ids::ActionWindowId::new("kr-window-another-one")
+        .expect("a window identifier");
+    assert_ne!(first.action_window_id, second.action_window_id);
+    let actor = kr_protocol::ids::ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+        .expect("a principal");
+    let first_digest = kr_protocol::digest::mutation_digest(&first, &actor).expect("a digest");
+    let second_digest = kr_protocol::digest::mutation_digest(&second, &actor).expect("a digest");
+    assert_ne!(
+        first_digest, second_digest,
+        "the window is covered, so the digest is not one a guess can be checked against"
+    );
+    let plain = kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
+        first.params.as_value(),
+    )));
+    assert_ne!(
+        first_digest, plain,
+        "the digest is not the plain digest of the parameters"
+    );
+    assert_ne!(
+        second_digest, plain,
+        "the digest is not the plain digest of the parameters"
+    );
+}

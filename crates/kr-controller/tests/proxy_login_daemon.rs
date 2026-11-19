@@ -321,3 +321,213 @@ async fn a_refusal_after_a_good_start_closes_the_endpoint_and_the_daemon_keeps_s
     let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
     assert!(!log.contains(PASSWORD), "the daemon's log holds the login");
 }
+
+/// Keeps `bytes` as the stored login item of `host`, whatever they are.
+fn store_item(host: &kr_ipc::testing::TempHost, bytes: &[u8]) {
+    let store = open_store_in(&host.environment().secrets_dir())
+        .expect("the store the daemon keeps its secrets in")
+        .store;
+    let name = item_name(host.environment_id()).expect("the item's name");
+    store.set(&name, bytes).expect("the item is kept");
+}
+
+/// KR-REQ-10.02: an item that cannot be read, an item that does not decode and an item made for
+/// another proxy each send no login: the proxy sees the start check's request with none, the
+/// diagnostics state which of the two it was, and the daemon starts and serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_item_and_an_item_for_another_proxy_send_no_login() {
+    const UNREADABLE: &str = "the proxy login stored on this host could not be read when the host started, so none was sent";
+    const ANOTHER: &str = "the stored proxy login was made for another proxy, so this host did not send it when it started";
+    let line = format!("user:{PASSWORD}");
+    for label in [
+        "no line feed",
+        "an origin that is no address",
+        "a line with no colon",
+        "a place that holds a directory",
+        "another proxy",
+    ] {
+        let proxy = ConnectProxy::authenticating("user", PASSWORD, "Basic realm=\"proxy\"").await;
+        let (host, _relay, _) = host_behind(&proxy).await;
+        let (bytes, says) = match label {
+            "no line feed" => (b"a stored value that is no item".to_vec(), UNREADABLE),
+            "an origin that is no address" => (
+                item_bytes("not an address", line.as_bytes())
+                    .expose()
+                    .to_vec(),
+                UNREADABLE,
+            ),
+            "a line with no colon" => (
+                item_bytes(&proxy.url, b"no-colon-here").expose().to_vec(),
+                UNREADABLE,
+            ),
+            "a place that holds a directory" => {
+                // The item is written, then its place is given to a directory: a read of it fails.
+                store_login(&host, &proxy, "user", PASSWORD);
+                let path = host
+                    .environment()
+                    .secrets_dir()
+                    .join(host.environment_id().to_string())
+                    .join("network-proxy-login");
+                std::fs::remove_file(&path).expect("the item's file");
+                std::fs::create_dir(&path).expect("a directory in its place");
+                (Vec::new(), UNREADABLE)
+            }
+            _ => (
+                item_bytes("http://127.0.0.1:9", line.as_bytes())
+                    .expose()
+                    .to_vec(),
+                ANOTHER,
+            ),
+        };
+        if !bytes.is_empty() {
+            store_item(&host, &bytes);
+        }
+
+        let mut daemon = Daemon::start(&host);
+        let said = network_detail(&host).await;
+        assert!(said.contains(says), "{label}: {said}");
+        assert!(
+            said.contains("the proxy requires a sign-in, and this host holds no login for it"),
+            "{label}: the route holds no login: {said}"
+        );
+        assert_eq!(
+            proxy.logins(),
+            vec![Login::Absent],
+            "{label}: the proxy was written no login"
+        );
+        daemon.stop();
+        let log = std::fs::read_to_string(host.root().join("daemon.log")).unwrap_or_default();
+        assert!(!log.contains(PASSWORD), "{label}: the log holds the login");
+    }
+}
+
+/// What the stand-in proxy does for a row of the scheme table.
+enum Behaviour {
+    /// Opens a tunnel for a request that carries Basic with the right login, and answers every
+    /// other with `407` offering these challenges.
+    Authenticates(&'static str),
+    /// Opens every tunnel.
+    Opens,
+    /// Refuses every request with this status.
+    Refuses(u16),
+}
+
+/// KR-REQ-10.02: the sign-in the proxy asks for decides the state the daemon reports: a proxy that
+/// offers no Basic is "unsupported" whether or not a login is held, never "refused"; a Basic
+/// challenge with no login held needs one and with a wrong one refuses it; a bare challenge reads
+/// as Basic; an open proxy joins the network; any other status says the check could not tell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_scheme_the_proxy_asks_for_decides_the_state_the_daemon_reports() {
+    const UNSUPPORTED: &str = "the proxy asks for a sign-in method this host does not support; this host can send only a user name and password (Basic)";
+    const NEEDED: &str = "the proxy requires a sign-in, and this host holds no login for it";
+    const REFUSED: &str = "the proxy refused the login this host holds, so this host starts no new request through the proxy";
+    const UNCHECKED: &str = "the start check could not tell whether the proxy asks for a login";
+    let rows: [(&str, Behaviour, Option<&str>, &str, &str, Option<Login>); 9] = [
+        (
+            "NTLM, no login",
+            Behaviour::Authenticates("NTLM"),
+            None,
+            UNSUPPORTED,
+            REFUSED,
+            Some(Login::Absent),
+        ),
+        (
+            "NTLM, a wrong login",
+            Behaviour::Authenticates("Negotiate, NTLM"),
+            Some("another"),
+            UNSUPPORTED,
+            REFUSED,
+            Some(Login::Wrong),
+        ),
+        (
+            "Basic, no login",
+            Behaviour::Authenticates("Basic realm=\"proxy\""),
+            None,
+            NEEDED,
+            REFUSED,
+            Some(Login::Absent),
+        ),
+        (
+            "Basic, a wrong login",
+            Behaviour::Authenticates("Basic realm=\"proxy\""),
+            Some("another"),
+            REFUSED,
+            NEEDED,
+            Some(Login::Wrong),
+        ),
+        (
+            "a bare challenge, no login",
+            Behaviour::Authenticates(""),
+            None,
+            NEEDED,
+            UNSUPPORTED,
+            Some(Login::Absent),
+        ),
+        (
+            "a bare challenge, a wrong login",
+            Behaviour::Authenticates(""),
+            Some("another"),
+            REFUSED,
+            UNSUPPORTED,
+            Some(Login::Wrong),
+        ),
+        (
+            "NTLM and Basic, no login",
+            Behaviour::Authenticates("NTLM, Basic realm=\"proxy\""),
+            None,
+            NEEDED,
+            UNSUPPORTED,
+            Some(Login::Absent),
+        ),
+        (
+            "a proxy that opens",
+            Behaviour::Opens,
+            None,
+            "this host is on the network",
+            REFUSED,
+            None,
+        ),
+        (
+            "a status 403",
+            Behaviour::Refuses(403),
+            None,
+            UNCHECKED,
+            NEEDED,
+            None,
+        ),
+    ];
+    for (label, behaviour, stored, says, never, written) in rows {
+        let proxy = match behaviour {
+            Behaviour::Authenticates(offered) => {
+                ConnectProxy::authenticating("user", PASSWORD, offered).await
+            }
+            Behaviour::Opens => ConnectProxy::tunnelling().await,
+            Behaviour::Refuses(status) => ConnectProxy::refusing(status).await,
+        };
+        let (host, _relay, _) = host_behind(&proxy).await;
+        if let Some(password) = stored {
+            store_login(&host, &proxy, "user", password);
+        }
+        let mut daemon = Daemon::start(&host);
+        let said = network_detail(&host).await;
+        assert!(said.contains(says), "{label}: {said}");
+        assert!(!said.contains(never), "{label}: {said}");
+        if let Some(written) = written {
+            assert_eq!(
+                proxy.logins(),
+                vec![written],
+                "{label}: the check's own request, and no other"
+            );
+            assert!(
+                said.contains("this host is not on the network"),
+                "{label}: no endpoint is registered: {said}"
+            );
+        } else {
+            assert!(
+                said.contains("this host is on the network"),
+                "{label}: the check does not stop the network: {said}"
+            );
+        }
+        daemon.stop();
+    }
+}
