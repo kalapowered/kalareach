@@ -14515,7 +14515,7 @@ async fn answer_within(
     let marked = broker.mark_approval(admitted, now)?;
     // On a refusal or at the deadline `marked` is dropped here, which leaves the resource
     // uncertain before the caller is told anything, unless the refusal proves that nothing was
-    // queued: then the claim is given back.
+    // queued and the store records the give-back: then the claim is given back.
     let against = admitted.admitted_against();
     let rechecked = {
         let broker = Arc::clone(broker);
