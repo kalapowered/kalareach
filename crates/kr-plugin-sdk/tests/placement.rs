@@ -911,6 +911,45 @@ fn a_publishers_words_holding_the_placement_label_are_refused() {
     );
 }
 
+/// The package check reads the one list of the host's labels: a bridge's words that hold the label
+/// of the skill-target reading, or of any other reading, are refused by name.
+#[test]
+fn a_publishers_words_holding_the_skill_target_label_are_refused() {
+    let labels = kr_protocol::confirmation::HOST_STATEMENT_LABELS;
+    assert!(
+        labels
+            .iter()
+            .any(|(label, _)| *label == kr_protocol::confirmation::SKILL_TARGET_STATEMENT_LABEL),
+        "the skill target's label is on the list"
+    );
+    for (label, reading) in labels {
+        let home = tempfile::tempdir().expect("a directory");
+        let directory = home.path().join("package");
+        copy_tree(&bundled("gemini-cli"), &directory);
+        let manifest_path = directory.join("plugin.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).expect("reads")).expect("JSON");
+        manifest["native_bridge"]["grant_statement"] =
+            json!(format!("Harmless. {label} Reads nothing."));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let refused = validate_package_directory(&directory);
+        assert!(
+            refused.report.findings.iter().any(|finding| {
+                finding.code == FindingCode::BridgeRecipeInvalid
+                    && finding
+                        .detail
+                        .contains(&format!("before its own reading of a {reading}"))
+            }),
+            "{label}: {:?}",
+            refused.report.findings
+        );
+    }
+}
+
 #[test]
 fn the_statement_bound_is_the_sum_of_the_contract_limits() {
     use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, STATEMENT_CHARS};

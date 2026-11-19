@@ -2477,6 +2477,25 @@ async fn statement_of_edited(
     integration: bool,
     edit: impl FnOnce(&mut serde_json::Value),
 ) -> CatalogueResult<Option<String>> {
+    statement_held(
+        words,
+        integration,
+        edit,
+        [
+            PluginCapability::NativeBridgeInstall,
+            PluginCapability::CommandIntegrationLaunch,
+        ],
+    )
+    .await
+}
+
+/// [`statement_of_edited`] for a grant that holds `grant`.
+async fn statement_held(
+    words: &str,
+    integration: bool,
+    edit: impl FnOnce(&mut serde_json::Value),
+    grant: impl IntoIterator<Item = PluginCapability>,
+) -> CatalogueResult<Option<String>> {
     let home = tempfile::tempdir().expect("a temporary directory");
     let packages = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(
@@ -2501,10 +2520,7 @@ async fn statement_of_edited(
             &plugin(),
             &PackageVersion::parse("0.1.0").expect("a valid version"),
             generation.manifest_digest(),
-            &InstallationGrant::with([
-                PluginCapability::NativeBridgeInstall,
-                PluginCapability::CommandIntegrationLaunch,
-            ]),
+            &InstallationGrant::with(grant),
         )
         .await
 }
@@ -2650,6 +2666,26 @@ async fn placed_statement_granted(
     withhold_table: bool,
     grant: impl IntoIterator<Item = PluginCapability>,
 ) -> CatalogueResult<Option<String>> {
+    placed_statement_metered(
+        name,
+        edit,
+        edit_manifest,
+        withhold_table,
+        grant,
+        &Metered::default(),
+    )
+    .await
+}
+
+/// [`placed_statement_granted`] with every address the catalogue fetches counted in `metered`.
+async fn placed_statement_metered(
+    name: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+    edit_manifest: impl FnOnce(&mut serde_json::Value),
+    withhold_table: bool,
+    grant: impl IntoIterator<Item = PluginCapability>,
+    metered: &Metered,
+) -> CatalogueResult<Option<String>> {
     let home = tempfile::tempdir().expect("a temporary directory");
     let packages = tempfile::tempdir().expect("a temporary directory");
     let generation = Generation::build(
@@ -2673,6 +2709,7 @@ async fn placed_statement_granted(
         CapabilityCeiling::default_ceiling(),
     )
     .await;
+    catalogue.set_transport(Arc::new(metered.clone()));
     catalogue.sync(&repository()).await.expect("a generation");
     catalogue
         .grant_statement(
@@ -2985,6 +3022,208 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_is_refused_where_no_placement
             "{what}: {refusal:?}"
         );
     }
+}
+
+/// The skill target the tables of these cases declare: the word `amp` and a user location with
+/// the skills only.
+fn amp_target() -> serde_json::Value {
+    serde_json::json!({ "word": "amp", "user": { "skills": [".amp", "skills"] } })
+}
+
+/// A manifest edit that makes the release ask for the skill-target capability.
+fn asks_for_the_skill_target(manifest: &mut serde_json::Value) {
+    manifest["capabilities"]
+        .as_array_mut()
+        .expect("the capabilities a release asks for")
+        .push(serde_json::json!({
+            "capability": "skill_target.install",
+            "reason": "Install the contact skill for the agent this package names"
+        }));
+}
+
+/// What an owner is shown of the bundled bridge package `claude-code` for a grant that holds
+/// `grant`, where its table declares `target` (or none) and its manifest asks for the skill target,
+/// and how many times the catalogue fetched its table.
+async fn targeted_statement(
+    target: Option<serde_json::Value>,
+    grant: Vec<PluginCapability>,
+) -> (CatalogueResult<Option<String>>, usize) {
+    let metered = Metered::default();
+    let shown = placed_statement_metered(
+        "claude-code",
+        |table| {
+            if let Some(target) = target {
+                table["skill_target"] = target;
+            }
+        },
+        asks_for_the_skill_target,
+        false,
+        grant,
+        &metered,
+    )
+    .await;
+    (shown, metered.fetches("connector.json"))
+}
+
+/// A release whose grant holds the skill-target capability is shown the host's reading of what its
+/// table declares, after the host's label, and a table that declares none is told so: in the
+/// reading of a bridge, behind the publisher's words, and for a release that ships no table at all.
+#[tokio::test]
+async fn a_grant_that_holds_the_capability_and_a_table_that_declares_none_is_told_so() {
+    use kr_protocol::confirmation::SKILL_TARGET_STATEMENT_LABEL;
+    let told = format!("{SKILL_TARGET_STATEMENT_LABEL} The package declares no skill target.");
+
+    let (shown, _) = targeted_statement(None, vec![PluginCapability::SkillTargetInstall]).await;
+    assert_eq!(
+        shown.expect("the table the manifest pins is read"),
+        Some(told.clone())
+    );
+
+    let (shown, _) = targeted_statement(
+        None,
+        vec![
+            PluginCapability::NativeBridgeInstall,
+            PluginCapability::SkillTargetInstall,
+        ],
+    )
+    .await;
+    assert_eq!(
+        shown.expect("the table the manifest pins is read"),
+        Some(format!("{} {told}", bridge_words("claude-code"))),
+        "the publisher's words come first"
+    );
+
+    let shown = statement_held(
+        "Changes one setting of the example agent.",
+        false,
+        |_| {},
+        [PluginCapability::SkillTargetInstall],
+    )
+    .await;
+    assert_eq!(
+        shown.expect("a release with no table is read"),
+        Some(told),
+        "a release that ships no table declares none"
+    );
+
+    // The control: the same release with a table that declares a target is shown that reading.
+    let declared: kr_plugin_sdk::skill_target::SkillTarget =
+        serde_json::from_value(amp_target()).expect("a target");
+    let (shown, _) = targeted_statement(
+        Some(amp_target()),
+        vec![PluginCapability::SkillTargetInstall],
+    )
+    .await;
+    assert_eq!(
+        shown.expect("the table the manifest pins is read"),
+        Some(format!(
+            "{SKILL_TARGET_STATEMENT_LABEL} {}",
+            declared.statement()
+        ))
+    );
+}
+
+/// GUARD: a release whose grant does not hold the skill-target capability has the statement it
+/// had, whatever its table declares: the publisher's words alone for a bridge, the placement
+/// reading beside them where one is declared, and none where nothing is granted.
+#[tokio::test]
+async fn a_package_that_declares_none_has_the_statement_it_had() {
+    use kr_plugin_sdk::placement::Placement;
+    use kr_protocol::confirmation::SKILL_TARGET_STATEMENT_LABEL;
+    let words = bridge_words("claude-code");
+    for target in [None, Some(amp_target())] {
+        let (shown, _) =
+            targeted_statement(target, vec![PluginCapability::NativeBridgeInstall]).await;
+        assert_eq!(
+            shown.expect("the table the manifest pins is read"),
+            Some(words.clone())
+        );
+    }
+    let (shown, _) = targeted_statement(Some(amp_target()), vec![]).await;
+    assert_eq!(
+        shown.expect("the table the manifest pins is read"),
+        None,
+        "nothing granted, nothing stated"
+    );
+
+    let placing = |target: Option<serde_json::Value>| async move {
+        placed_statement_granted(
+            "claude-code",
+            |table| {
+                table["placement"] =
+                    serde_json::to_value(Placement::claude_code()).expect("a placement");
+                if let Some(target) = target {
+                    table["skill_target"] = target;
+                }
+            },
+            asks_for_the_skill_target,
+            false,
+            [PluginCapability::NativeBridgeInstall],
+        )
+        .await
+        .expect("the table the manifest pins is read")
+        .expect("a statement")
+    };
+    let without = placing(None).await;
+    assert!(
+        without.starts_with(&words)
+            && without.contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL),
+        "the control states the placement: {without}"
+    );
+    assert_eq!(placing(Some(amp_target())).await, without);
+    assert!(!without.contains(SKILL_TARGET_STATEMENT_LABEL));
+}
+
+/// The publisher's words never hold the host's label for its reading of a skill target, as they
+/// never hold another of the host's labels: words that hold it are not shown, and the labels one
+/// list holds are each refused the same way.
+#[tokio::test]
+async fn a_publishers_words_holding_the_skill_target_label_are_refused() {
+    use kr_protocol::confirmation::{HOST_STATEMENT_LABELS, SKILL_TARGET_STATEMENT_LABEL};
+    statement_of("Harmless. Reads nothing.", true)
+        .await
+        .expect("the control is read")
+        .expect("a statement");
+    let imitation = format!("Harmless. {SKILL_TARGET_STATEMENT_LABEL} Reads nothing.");
+    let refusal = statement_of(&imitation, true)
+        .await
+        .expect_err("the publisher wrote the host's label");
+    assert!(
+        matches!(&refusal, CatalogueError::UnsafePackage { detail }
+            if detail.contains("before its own reading of a skill target")),
+        "{refusal:?}"
+    );
+    for (label, reading) in HOST_STATEMENT_LABELS {
+        let refusal = statement_of(&format!("Harmless. {label} Reads nothing."), true)
+            .await
+            .expect_err("the publisher wrote one of the host's labels");
+        assert!(
+            matches!(&refusal, CatalogueError::UnsafePackage { detail }
+                if detail.contains(&format!("before its own reading of a {reading}"))),
+            "{label}: {refusal:?}"
+        );
+    }
+}
+
+/// GUARD: the connector table a release pins is fetched once for a statement, whether the grant
+/// holds the bridge, the skill target or both, and not at all where it holds neither.
+#[tokio::test]
+async fn the_connector_table_is_fetched_once_for_a_release_with_a_bridge_and_a_target() {
+    for grant in [
+        vec![PluginCapability::NativeBridgeInstall],
+        vec![PluginCapability::SkillTargetInstall],
+        vec![
+            PluginCapability::NativeBridgeInstall,
+            PluginCapability::SkillTargetInstall,
+        ],
+    ] {
+        let (shown, fetches) = targeted_statement(Some(amp_target()), grant.clone()).await;
+        shown.expect("the table the manifest pins is read");
+        assert_eq!(fetches, 1, "{grant:?}");
+    }
+    let (shown, fetches) = targeted_statement(Some(amp_target()), vec![]).await;
+    shown.expect("the manifest the index pins is read");
+    assert_eq!(fetches, 0, "a grant that reads no table fetches none");
 }
 
 /// KR-REQ-11.44: the key rule holds for a release that holds no connector table at all, with the
