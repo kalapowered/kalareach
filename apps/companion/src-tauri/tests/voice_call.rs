@@ -4997,6 +4997,15 @@ async fn an_earlier_kept_start_survives_a_later_one_declined_before_the_hold() {
     assert_eq!(owed.len(), 1, "{state}");
     assert_eq!(owed[0]["action_id"], earlier.as_str(), "{state}");
     assert_eq!(owed[0]["kind"], "start_unconfirmed", "{state}");
+    // The page's state drops hidden entries, so the file is read as well: the declined start left
+    // no entry of its own, hidden or shown, and the earlier one is the only entry the file holds.
+    let file: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(scene.phone.data.path().join("voice-kept.json")).expect("the file"),
+    )
+    .expect("a file");
+    let kept = file["owed"].as_array().expect("the entries");
+    assert_eq!(kept.len(), 1, "{file}");
+    assert_eq!(kept[0]["action_id"], earlier.as_str(), "{file}");
 
     let held = scene
         .call("voice_start", scene.start_request(&prepared))
