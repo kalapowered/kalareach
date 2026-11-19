@@ -4432,6 +4432,118 @@ async fn a_worker_told_two_revisions_by_name_has_the_actions_of_both_in_each_res
     );
 }
 
+/// KR-REQ-10.45 and KR-REQ-09.13: a device's revocation ends the input lease a worker holds under
+/// a delegated grant whose row cannot be read, and takes no lease held under another device's
+/// share.
+///
+/// Two workers, each with a lease. The first holds one under a grant delegated from the revoked
+/// device's own, and that row is damaged after the lease exists: its mark of revocation is text,
+/// which the store cannot read as a moment. The second holds one under a grant of another tree.
+/// The row cannot say what rights it carried, so the revocation names it in the notice the workers
+/// are told, and the worker that holds the lease under it ends it. A notice that left the row out
+/// would leave that lease in force beside a device the host has revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_lease_under_a_delegated_grant_whose_row_cannot_be_read_is_ended_with_its_holders_device()
+{
+    use kr_controller::grants::GrantRecord;
+    use kr_protocol::ids::{DeviceId, GrantId};
+
+    let daemon = hosted_daemon().await;
+    let hosts = [
+        add_worker(&daemon, false).await,
+        add_worker(&daemon, false).await,
+    ];
+    let first = tokio::time::timeout(
+        Duration::from_secs(60),
+        daemon.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
+    announced_until(&daemon.controller, first, |barrier| barrier.holds()).await;
+
+    let device = |byte: u8| DeviceId::new(Uuid::from_bytes([byte; 16]));
+    let (holder, delegate, bystander) = (device(0xd1), device(0xe1), device(0xf2));
+    let mut root = a_typists_grant(GrantId::new(Uuid::from_bytes([0x71; 16])), None);
+    root.recipient_device_id = holder;
+    let mut below = a_typists_grant(
+        GrantId::new(Uuid::from_bytes([0x72; 16])),
+        Some(root.grant_id),
+    );
+    below.issuer_device_id = holder;
+    below.recipient_device_id = delegate;
+    let mut unrelated = a_typists_grant(GrantId::new(Uuid::from_bytes([0x73; 16])), None);
+    unrelated.recipient_device_id = bystander;
+    for grant in [&root, &below, &unrelated] {
+        daemon
+            .controller
+            .sharing()
+            .grants()
+            .issue(
+                &GrantRecord {
+                    grant: grant.clone(),
+                    session_id: None,
+                    issued_at_ms: 1_000,
+                    activated_at_ms: Some(1_000),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("the grant is written");
+    }
+    let (under_below, _) = a_lease_under(&hosts[0], below.grant_id);
+    let (under_unrelated, kept_epoch) = a_lease_under(&hosts[1], unrelated.grant_id);
+
+    // The row is damaged after the lease exists, as a store written by a release of another build
+    // or cut by a disk fault would be found.
+    let registry = rusqlite::Connection::open(daemon.temp.environment().registry_database())
+        .expect("the registry opens");
+    let damaged = registry
+        .execute(
+            "UPDATE grants SET revoked_at_ms = 'text' WHERE grant_id = ?1",
+            rusqlite::params![below.grant_id.get().as_bytes().as_slice()],
+        )
+        .expect("the mark of the delegated row is damaged");
+    assert_eq!(damaged, 1, "the delegated row is the one damaged");
+    drop(registry);
+
+    let answered = tokio::time::timeout(
+        Duration::from_secs(60),
+        daemon
+            .controller
+            .revoke_device_authority(holder, None, None),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("a row that cannot be read does not stop the revocation");
+    assert!(
+        answered.revoked_grants.contains(&root.grant_id),
+        "the device's own grant is withdrawn"
+    );
+    assert!(
+        !answered.revoked_grants.contains(&unrelated.grant_id),
+        "a grant of another tree is not"
+    );
+    announced_until(&daemon.controller, answered.barrier, |barrier| {
+        barrier.holds()
+    })
+    .await;
+
+    let lease = hosts[0].runtime.session().lease();
+    assert_eq!(
+        lease.holder.0, None,
+        "the lease held under the row that cannot be read is ended with the revocation \
+         (it was held by {under_below:?})"
+    );
+    let lease = hosts[1].runtime.session().lease();
+    assert_eq!(
+        (lease.holder.0, lease.epoch.get()),
+        (Some(under_unrelated), kept_epoch),
+        "a lease under a grant of another tree is not taken"
+    );
+}
+
 /// KR-REQ-09.13: a worker that was told a revision of the whole host's and then one by name in one
 /// announcement has the actions its fence for the first named in the result of both revocations,
 /// the pages of them that follow the first included.
