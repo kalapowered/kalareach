@@ -465,9 +465,10 @@ report cannot give to one test makes its binary's output unreadable, which fails
 that skips only part of its case says `not exercised:`, so that the whole case reads as not run: the
 report then claims too little and never too much. A scan of the repository's tests
 (`tests/conformance/tests/early_returns.rs`) holds the rule: a print that speaks of a skip, or that
-a `return` or a `continue` follows at once in test code, starts with one of these words, or is on
-the scan's list with its reason. It does not see a print made through a variable or a helper, or a
-`return` with no print before it. The cases that need the real description weights stand down with
+a `return` or a `continue` follows later in the same block in test code, starts with one of these
+words, or is on the scan's list with its reason. It does not see a print made through a variable or
+a helper, a `return` with no print before it, a conditional `return` in a block of its own after the
+print, or a block that ends in a value where a `return` would stand. The cases that need the real description weights stand down with
 that line too, and fail instead where the run sets `KR_REQUIRE_DESCRIBE_WEIGHTS=1`, which a run that
 holds the weights sets: there the weights are promised, and a case that stood down would read as
 passed in a log that shows no output.

@@ -14,8 +14,8 @@
 //!   something that did not run (`skip`, `not run`, `cannot run`, `could not run`, `not exercised`,
 //!   `not tested`) is wherever it stands in the repository, because a message of that kind that the
 //!   report cannot read is the fault.
-//! - By its shape: in test code, a print that a `return` or a `continue` follows at once is a test
-//!   that stops where it stands, whatever it says. Test code is a file under a `tests` or a
+//! - By its shape: in test code, a print that a `return` or a `continue` follows later in the same
+//!   block, at the print's own depth, is a test that stops where it stands, whatever it says. Test code is a file under a `tests` or a
 //!   `testing` folder, a file named `tests.rs` or `testing.rs`, and each item under
 //!   `#[cfg(test)]`. A program under `src/bin`, and a `src/main.rs`, is not test code.
 //!
@@ -25,8 +25,10 @@
 //! never too much.
 //!
 //! The limits: a print that goes through a variable or a helper, a write to a stream that is not a
-//! print macro, a `return;` with no print before it, an early return by `process::exit` or `break`,
-//! and a print whose first literal is made by a macro are not seen. Review holds those.
+//! print macro, a `return;` with no print before it, a conditional `return` in a block of its own
+//! after the print, a block that ends in a value where a `return` would stand, an early return by
+//! `process::exit` or `break`, and a print whose first literal is made by a macro are not seen.
+//! Review holds those.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -64,6 +66,11 @@ const ALLOWED: &[Allowed] = &[
         path: "apps/companion/src-tauri/tests/host_events.rs",
         said: "host_events: ",
         reason: "the helper's failure report, which it ends with exit status 1",
+    },
+    Allowed {
+        path: "crates/kr-cli/src/attach.rs",
+        said: "kr-probe:lost:",
+        reason: "the child half of the case, a program the case starts: it prints the marker the case reads and ends, and the case fails for the marker",
     },
     Allowed {
         path: "crates/kr-cli/tests/upgrade.rs",
@@ -106,6 +113,11 @@ const ALLOWED: &[Allowed] = &[
         reason: "the stand-in description program's usage line",
     },
     Allowed {
+        path: "crates/kr-ipc/src/testing.rs",
+        said: "the drop returned",
+        reason: "the child half of the case, which the case starts: it prints a line the case reads, and the assertions after it decide",
+    },
+    Allowed {
         path: "crates/kr-plugin-runtime/tests/bundled.rs",
         said: "{REQUIRE_NO_NETWORK} is not set",
         reason: "the helper says which path the run exercises, and the case goes on and runs it",
@@ -126,6 +138,11 @@ const ALLOWED: &[Allowed] = &[
         reason: "a count line that names the other platform's cases",
     },
     Allowed {
+        path: "crates/kr-transfer/tests/authority.rs",
+        said: "hdiutil refused for a moment",
+        reason: "a refused attempt is made again, in a loop that goes on to the next attempt and returns the last refusal as an error",
+    },
+    Allowed {
         path: "crates/kr-worker/src/diagnostics.rs",
         said: "{DONE}",
         reason: "the child half of a case, whose output the half that started it reads",
@@ -144,6 +161,11 @@ const ALLOWED: &[Allowed] = &[
         path: "crates/kr-worker/tests/persistence.rs",
         said: "said ",
         reason: "the child half of a case, whose output the half that started it reads",
+    },
+    Allowed {
+        path: "crates/kr-worker/tests/windows.rs",
+        said: "{} is left in the temporary folder",
+        reason: "a Drop's report of a folder it could not remove, which it follows with a panic unless the case is already failing",
     },
     Allowed {
         path: "tests/conformance/src/main.rs",
@@ -205,6 +227,11 @@ const ALLOWED: &[Allowed] = &[
         said: "stand-in: ",
         reason: "the stand-in program's own error line before it ends",
     },
+    Allowed {
+        path: "tests/support/codex-stand-in/src/terminal.rs",
+        said: "TUI: holding the answer to ",
+        reason: "the stand-in program's trace line before it reads its next request",
+    },
 ];
 
 fn repository() -> PathBuf {
@@ -264,6 +291,27 @@ fn closing(tokens: &[Token], open: usize) -> Option<usize> {
     None
 }
 
+/// Whether a `return` or a `continue` comes in `rest`, the tokens that follow a print, before the
+/// block that holds the print closes: one at the print's own depth, whatever statements stand
+/// between. One in a deeper block is a conditional return and is not read.
+fn returns_in_block(rest: &[Token]) -> bool {
+    let mut depth = 0_usize;
+    for token in rest {
+        match token.tok {
+            Tok::Punct('(' | '[' | '{') => depth += 1,
+            Tok::Punct(')' | ']' | '}') => match depth.checked_sub(1) {
+                Some(outer) => depth = outer,
+                None => return false,
+            },
+            _ if depth == 0 && matches!(token.ident(), Some("return" | "continue")) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// One print of a source.
 #[derive(Debug, PartialEq, Eq)]
 struct Print {
@@ -271,7 +319,7 @@ struct Print {
     line: usize,
     /// Its first literal, with the escapes and the wrapped line breaks decoded.
     said: String,
-    /// Whether a `return` or a `continue` follows it at once.
+    /// Whether a `return` or a `continue` follows it later in its block, at its own depth.
     leaves: bool,
 }
 
@@ -314,10 +362,7 @@ fn prints(tokens: &[Token]) -> Vec<Print> {
             _ if *delimiter == '{' => Some(close + 1),
             _ => None,
         };
-        let leaves = after
-            .and_then(|next| tokens.get(next))
-            .and_then(Token::ident)
-            .is_some_and(|word| matches!(word, "return" | "continue"));
+        let leaves = after.is_some_and(|next| returns_in_block(&tokens[next..]));
         found.push(Print {
             line: token.line,
             said,
@@ -393,7 +438,7 @@ fn is_program(path: &str) -> bool {
 enum Why {
     /// Its words speak of something that did not run.
     Words,
-    /// It stands in test code and a `return` or a `continue` follows it at once.
+    /// It stands in test code and a `return` or a `continue` follows it in its block.
     Shape,
 }
 
@@ -482,7 +527,10 @@ fn every_early_return_of_a_test_says_so_on_a_line_the_report_reads() {
             let said = candidate.said.escape_debug();
             unmarked.push(match candidate.why {
                 Why::Words => format!("{path}:{}: speaks of a skip: \"{said}\"", candidate.line),
-                Why::Shape => format!("{path}:{}: returns at once: \"{said}\"", candidate.line),
+                Why::Shape => format!(
+                    "{path}:{}: returns after the print: \"{said}\"",
+                    candidate.line
+                ),
             });
         }
     }
@@ -731,5 +779,78 @@ fn the_reading_passes_over_comments_between_the_tokens_of_a_print() {
             "fn f() { eprintln!(/* skipping: not this */ \"skipped: the leg\"); }"
         ),
         [(1, Why::Words, true)]
+    );
+}
+
+/// The control: a `return` or a `continue` that comes later in the block of the print, at its own
+/// depth, is the print's early return, with statements between them; one in a block that closes
+/// first, or in a deeper block, is not.
+#[test]
+fn the_reading_takes_a_return_that_follows_a_print_later_in_its_block() {
+    let target = "crates/x/tests/a.rs";
+
+    // A statement, or several, between the print and the `return` or the `continue`.
+    assert_eq!(
+        found(
+            target,
+            "fn f() {\n    eprintln!(\"no IPv6 here\");\n    cleanup();\n    return;\n}"
+        ),
+        [(2, Why::Shape, false)]
+    );
+    assert_eq!(
+        found(
+            target,
+            "fn f() { for a in all { eprintln!(\"no IPv6 here\"); let seen = 1; note(seen); continue; } }"
+        ),
+        [(1, Why::Shape, false)]
+    );
+    // A block between them does not hide it: the `return` is at the print's own depth.
+    assert_eq!(
+        found(
+            target,
+            "fn f() { eprintln!(\"no IPv6 here\"); if again { work(); } return None; }"
+        ),
+        [(1, Why::Shape, false)]
+    );
+    // Marked, it is read and passes.
+    assert_eq!(
+        found(
+            target,
+            "fn f() { eprintln!(\"not exercised: no IPv6 here\"); cleanup(); return; }"
+        ),
+        [(1, Why::Words, true)]
+    );
+
+    // The print's block closes before the `return`: the print is on one branch, the `return` on
+    // another.
+    assert!(
+        found(
+            target,
+            "fn f() { if no { eprintln!(\"no IPv6 here\"); } return; }"
+        )
+        .is_empty()
+    );
+    assert!(
+        found(
+            target,
+            "fn f() { if no { eprintln!(\"no IPv6 here\"); } else { return; } }"
+        )
+        .is_empty()
+    );
+    // A `return` in a deeper block is a conditional one, which stays a limit.
+    assert!(
+        found(
+            target,
+            "fn f() { eprintln!(\"no IPv6 here\"); if no { return; } }"
+        )
+        .is_empty()
+    );
+    // The next function's `return` is another block.
+    assert!(
+        found(
+            target,
+            "fn f() { eprintln!(\"no IPv6 here\"); }\nfn g() { return; }"
+        )
+        .is_empty()
     );
 }
