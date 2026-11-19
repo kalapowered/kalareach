@@ -1571,6 +1571,43 @@ mod attempt_row {
             "the later row stands"
         );
     }
+
+    /// A delete that comes after a named start replaced the row leaves the row the named start
+    /// wrote: the earlier attempt's gate names its own action, so the device is still held by the
+    /// later one, and a start that names neither is refused in the later one's words.
+    #[test]
+    fn a_delayed_delete_of_an_earlier_attempt_leaves_the_row_that_a_named_start_replaced() {
+        let (_directory, holds, earlier) = written();
+        // The later start names the earlier one and replaces its row before the earlier delete runs.
+        let replaced = holds
+            .begin(
+                actor(),
+                action(2),
+                Some(action(1)),
+                &|| (20, 120),
+                &|_, _| Ok(false),
+                &|_| false,
+            )
+            .expect("a named start");
+        assert_eq!(replaced, Decision::Admitted);
+        // The earlier attempt's effect and claim now end its gate, and its delete runs late.
+        earlier.ended();
+        earlier.settled();
+        let unnamed = holds
+            .begin(
+                actor(),
+                action(3),
+                None,
+                &|| (30, 130),
+                &|_, _| Ok(false),
+                &|_| false,
+            )
+            .expect("an unnamed start");
+        let Decision::Held(held) = unnamed else {
+            panic!("the later start's row holds the device: {unnamed:?}");
+        };
+        assert_eq!(held.action, action(2));
+    }
 }
 
 /// The hold a voice start writes before the managed service is asked, on clocks the test moves.
@@ -1758,5 +1795,376 @@ mod a_start_hold_on_clocks_moved_by_hand {
             "a start read at the end is admitted: {admitted:?}"
         );
         assert_eq!(standing(&controller).action, action(3));
+    }
+
+    /// The thread that runs a wall clock's reading is armed, and the first reading by that thread
+    /// runs the step: the case's own thread is the start's thread, so no task of the daemon sets it
+    /// off.
+    type Armed = Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>;
+
+    /// Clocks whose wall clock always answers `wall_ms`, and runs `at_the_reading` at the first
+    /// reading by the armed thread, which is after the start's first reading of `continuous` and
+    /// before the write lock.
+    fn clocks_that_move_at_a_reading(
+        continuous: &kr_transport::clock::ManualClock,
+        wall_ms: u64,
+        at_the_reading: impl Fn() + Send + Sync + 'static,
+    ) -> (Armed, crate::service::Clocks) {
+        let armed: Armed = Arc::new(std::sync::Mutex::new(None));
+        let clocks = crate::service::Clocks {
+            continuous: Arc::new(continuous.clone()),
+            wall: {
+                let armed = Arc::clone(&armed);
+                crate::service::WallClock::from_fn(move || {
+                    let fire = {
+                        let mut on = armed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let fire = *on == Some(std::thread::current().id());
+                        if fire {
+                            *on = None;
+                        }
+                        fire
+                    };
+                    if fire {
+                        at_the_reading();
+                    }
+                    wall_ms
+                })
+            },
+        };
+        (armed, clocks)
+    }
+
+    fn arm_for_this_thread(armed: &Armed) {
+        *armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current().id());
+    }
+
+    /// Another connection to the record of holds that takes its write lock now, waits for the
+    /// message the returned sender sends, runs `then`, and lets the lock go.
+    fn another_writer_of_the_holds(
+        temp: &kr_ipc::testing::TempHost,
+        then: impl FnOnce() + Send + 'static,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let path = temp
+            .environment()
+            .state_dir()
+            .join(crate::voice_start_holds::VOICE_START_HOLDS_RECORD);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let connection = rusqlite::Connection::open(path).expect("the record opens");
+            connection
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("another writer holds the record");
+            held_tx.send(()).expect("the case waits");
+            wait.recv().expect("the case lets the writer go");
+            then();
+            connection
+                .execute_batch("ROLLBACK")
+                .expect("the other writer lets the record go");
+        });
+        held_rx.recv().expect("the record is held");
+        (release, writer)
+    }
+
+    /// A slot the clock's step finds the writer's release in, once the case has made the writer.
+    type Release = Arc<std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>>;
+
+    fn let_the_writer_go(release: &Release) {
+        if let Some(release) = release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            release.send(()).expect("the writer waits");
+        }
+    }
+
+    /// Both waits before the lock count toward the start's moment: the continuous clock moves
+    /// four seconds while the start reads the settled wall clock, and four more while another
+    /// writer holds the record. The moment is the wall reading plus eight seconds, and the time to
+    /// send counts from the reading once the lock is held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_moment_of_a_start_counts_the_wait_for_the_floor_and_the_wait_for_the_lock() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let continuous = kr_transport::clock::ManualClock::new();
+        let wall_ms = kr_ipc::now_ms().get();
+        let release: Release = Arc::new(std::sync::Mutex::new(None));
+        let (armed, clocks) = clocks_that_move_at_a_reading(&continuous, wall_ms, {
+            let (continuous, release) = (continuous.clone(), Arc::clone(&release));
+            move || {
+                continuous.advance(std::time::Duration::from_secs(4));
+                let_the_writer_go(&release);
+            }
+        });
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let (writer_release, writer) = another_writer_of_the_holds(&temp, {
+            let continuous = continuous.clone();
+            move || continuous.advance(std::time::Duration::from_secs(4))
+        });
+        *release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer_release);
+        let (start, _) =
+            start_of(&controller, action(1), std::time::Duration::from_secs(600)).await;
+        arm_for_this_thread(&armed);
+        start.before_the_broker(600).expect("admitted");
+        writer.join().expect("the other writer ran");
+        let row = standing(&controller);
+        assert_eq!(row.asked_ms, wall_ms + 8_000, "both waits count");
+        let limit = std::time::Duration::from_millis(crate::voice_start_holds::SEND_LIMIT_MS);
+        assert_eq!(
+            start.send_by(),
+            Some(controller.clock.now().checked_add(limit).expect("a limit")),
+            "the time to send counts from the reading once the lock is held"
+        );
+    }
+
+    /// An admission that ends while the hold waits for the write lock is refused in its own words
+    /// before the service is asked, and the row the start wrote ends with it: the caller's own
+    /// sequence is the check, the hold, the check that stands immediately before the service, and
+    /// the effect the host is told when that check refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admission_that_ends_while_the_hold_is_written_asks_the_broker_nothing() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let continuous = kr_transport::clock::ManualClock::new();
+        let wall_ms = kr_ipc::now_ms().get();
+        let release: Release = Arc::new(std::sync::Mutex::new(None));
+        let (armed, clocks) = clocks_that_move_at_a_reading(&continuous, wall_ms, {
+            let (continuous, release) = (continuous.clone(), Arc::clone(&release));
+            move || {
+                // The admission's deadline is a minute out, and it passes during the wait.
+                continuous.advance(std::time::Duration::from_secs(61));
+                let_the_writer_go(&release);
+            }
+        });
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let (writer_release, writer) = another_writer_of_the_holds(&temp, || ());
+        *release
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer_release);
+        let (start, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        start
+            .still_admitted()
+            .expect("the check before the hold passes");
+        arm_for_this_thread(&armed);
+        start
+            .before_the_broker(600)
+            .expect("the hold is written once the other writer lets go");
+        writer.join().expect("the other writer ran");
+        let refused = start
+            .still_admitted()
+            .expect_err("the check before the service sees the admission over");
+        assert_ne!(refused.code, ErrorCode::StorageUnavailable, "{refused}");
+        assert_ne!(refused.code, ErrorCode::DraftConflict, "{refused}");
+        assert_eq!(standing(&controller).action, action(1), "the row stands");
+        // Nothing was asked, so the effect ends the row, and the claim's settlement deletes it.
+        start.after_the_broker(BrokerEffect::NotAsked);
+        start.settled();
+        assert!(
+            controller
+                .voice_start_holds
+                .standing(actor())
+                .expect("the record reads")
+                .is_none(),
+            "no row stands for a start that asked nothing"
+        );
+    }
+
+    /// A hold the store reports it could not write can still have left its row: the start is
+    /// refused in the unrecorded words before the service, the row stands until the start's claim
+    /// settles, and the claim's settlement ends it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_the_store_reports_failed_leaves_no_row_once_its_claim_has_settled() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, _wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        // The row of the action stands on disk, as a commit that reported failure can leave it.
+        let (planted, _) =
+            start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        planted.before_the_broker(600).expect("admitted");
+        let other = rusqlite::Connection::open(
+            temp.environment()
+                .state_dir()
+                .join(crate::voice_start_holds::VOICE_START_HOLDS_RECORD),
+        )
+        .expect("the record opens beside the daemon's own handle");
+        other
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("waits for the daemon's own writes");
+        other
+            .execute_batch(
+                "CREATE TRIGGER refuses_a_row BEFORE INSERT ON voice_start_holds
+                 BEGIN SELECT RAISE(ABORT, 'the store refused'); END",
+            )
+            .expect("the store refuses a row");
+        // The same action is written again, naming itself so that the standing row does not hold
+        // it, and the store fails the write.
+        let (mut start, _) =
+            start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        if let Some(hold) = start.start.as_mut() {
+            hold.supersedes = Some(action(1));
+        }
+        let refused = start
+            .before_the_broker(600)
+            .expect_err("the store could not write the hold");
+        assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused}");
+        assert!(
+            refused
+                .to_string()
+                .contains(crate::voice_start_holds::HOLD_NOT_RECORDED_WORDS),
+            "{refused}"
+        );
+        assert_eq!(
+            standing(&controller).action,
+            action(1),
+            "the row stands until the claim has settled"
+        );
+        start.settled();
+        assert!(
+            controller
+                .voice_start_holds
+                .standing(actor())
+                .expect("the record reads")
+                .is_none(),
+            "the claim settled, so the row of the start that asked nothing ends"
+        );
+    }
+
+    /// While the clock floor is ahead of the wall clock, a start's moment is the floor's, so the
+    /// row ends an hour of the host's own time after it was written: a start the wall clock alone
+    /// would admit is held until the floor's end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_row_written_while_the_floor_is_ahead_of_the_wall_clock_ends_at_the_floors_time() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let behind = wall.load(std::sync::atomic::Ordering::SeqCst);
+        let ahead = behind + 3_600_000;
+        // The floor takes the reading an hour ahead, and the wall clock then steps back.
+        wall.store(ahead, std::sync::atomic::Ordering::SeqCst);
+        let _ = controller.settled_now_ms();
+        controller.settle_floor();
+        wall.store(behind, std::sync::atomic::Ordering::SeqCst);
+
+        let (first, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        first.before_the_broker(600).expect("admitted");
+        let row = standing(&controller);
+        assert!(
+            row.asked_ms >= ahead,
+            "the moment is the floor's: {} against {ahead}",
+            row.asked_ms
+        );
+        assert_eq!(
+            row.ends_ms,
+            crate::voice_start_holds::hold_ends_ms(row.asked_ms, 600)
+        );
+        // The wall clock alone is far behind the row's end, and the start is held all the same.
+        let (second, _) =
+            start_of(&controller, action(2), std::time::Duration::from_secs(60)).await;
+        let held = second
+            .before_the_broker(600)
+            .expect_err("a start inside the floor's hold is held");
+        assert_eq!(held.code, ErrorCode::DraftConflict, "{held}");
+        // The wall clock catches up with the end, and the start is admitted.
+        wall.store(row.ends_ms, std::sync::atomic::Ordering::SeqCst);
+        let (third, _) = start_of(&controller, action(3), std::time::Duration::from_secs(60)).await;
+        let admitted = third.before_the_broker(600);
+        assert!(
+            admitted.is_ok(),
+            "a start read at the end is admitted: {admitted:?}"
+        );
+    }
+
+    /// A start is not decided while the floor is owed its record: where the floor's write fails,
+    /// the start is refused before the service under the floor's own code, never the hold's, and
+    /// the standing row is untouched; once the write succeeds the start is admitted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hold_is_not_decided_while_the_clock_floor_is_owed_its_record() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let (first, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        first.before_the_broker(600).expect("admitted");
+        let ends = standing(&controller).ends_ms;
+
+        // The row has run out on the wall clock, and the registry cannot be written.
+        wall.store(ends + 1_000, std::sync::atomic::Ordering::SeqCst);
+        let registry = rusqlite::Connection::open(temp.environment().registry_database())
+            .expect("the registry opens beside the daemon's own handle");
+        registry
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("waits for the daemon's own writes");
+        controller
+            .sharing
+            .grants()
+            .wait_for_storage_up_to(std::time::Duration::ZERO)
+            .expect("the store waits no time for another writer");
+        registry
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("another writer holds the registry");
+        let (second, _) =
+            start_of(&controller, action(2), std::time::Duration::from_secs(60)).await;
+        let refused = second
+            .before_the_broker(600)
+            .expect_err("the floor cannot be written, so nothing is decided");
+        assert_ne!(refused.code, ErrorCode::DraftConflict, "{refused}");
+        assert_eq!(refused.code, ErrorCode::StorageUnavailable, "{refused}");
+        assert!(
+            !refused
+                .to_string()
+                .contains(crate::voice_start_holds::HOLD_NOT_RECORDED_WORDS),
+            "the floor's own refusal goes back, not the hold's words: {refused}"
+        );
+        assert_eq!(
+            standing(&controller).action,
+            action(1),
+            "a refusal of the floor leaves the standing row as it was"
+        );
+
+        registry
+            .execute_batch("ROLLBACK")
+            .expect("the other writer lets the registry go");
+        controller
+            .sharing
+            .grants()
+            .wait_for_storage_up_to(std::time::Duration::from_secs(5))
+            .expect("the store waits as it does");
+        let (third, _) = start_of(&controller, action(3), std::time::Duration::from_secs(60)).await;
+        let admitted = third.before_the_broker(600);
+        assert!(
+            admitted.is_ok(),
+            "the floor is written, so the lapsed row no longer holds: {admitted:?}"
+        );
+    }
+
+    /// The closure a start leaves for a deferred call holds the store and two identifiers, not the
+    /// controller: a controller that stops while the closure is queued is not kept alive by it,
+    /// and the closure still runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deferred_closure_does_not_keep_a_stopped_controller_alive() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (_continuous, _wall, clocks) = manual_clocks();
+        let controller = daemon_on_clocks_to_move(&temp, clocks).await;
+        let (start, _) = start_of(&controller, action(1), std::time::Duration::from_secs(60)).await;
+        start.before_the_broker(600).expect("admitted");
+        let closure = start.deferred().expect("a start defers its closure");
+        let controller_after = Arc::downgrade(&controller);
+        drop(start);
+        drop(controller);
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while controller_after.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "the closure keeps the controller alive after its last handle was dropped"
+        );
+        closure(BrokerEffect::Closed);
     }
 }

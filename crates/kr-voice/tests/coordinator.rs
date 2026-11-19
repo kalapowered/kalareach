@@ -4805,13 +4805,13 @@ async fn a_start_is_bound_to_the_preparation_the_person_was_shown() {
 // What a voice start reports to its host
 // ---------------------------------------------------------------------------------------------
 
+/// A step a test runs at one place in a start.
+type Step = Box<dyn Fn() + Send>;
+
 /// An admission that records what the start tells it: how often `before_the_broker` was called,
 /// the effect the start came to, and the effect each deferred closure was run with. It can refuse
 /// the Nth check made after `before_the_broker`, which is how each exit that follows the broker is
 /// reached.
-/// A step a test runs at one place in a start.
-type Step = Box<dyn Fn() + Send>;
-
 struct Recording {
     before: std::sync::atomic::AtomicUsize,
     checks: std::sync::atomic::AtomicUsize,
@@ -5284,9 +5284,13 @@ async fn starts_that_answer_in_turn(
             }
         });
         // Registered in the hold's queue, so the answers come in the order the starts began.
-        while broker.waiting() <= usize::from(index) {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while broker.waiting() <= usize::from(index) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a start reaches the broker");
         started.push((admission, handle));
     }
     let mut admissions = Vec::new();
@@ -5340,6 +5344,7 @@ async fn closures_run_after_the_coordinators_lock_is_released() {
     for (second, expected, closes) in [
         (Answer::Capacity, kr_voice::BrokerEffect::Closed, 1),
         (Answer::Started, kr_voice::BrokerEffect::Handed, 0),
+        (Answer::Replayed, kr_voice::BrokerEffect::Closed, 1),
     ] {
         let (admissions, broker) =
             starts_that_answer_in_turn(&[Answer::Replayed, second], true).await;
