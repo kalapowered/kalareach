@@ -1182,6 +1182,16 @@ impl HostCall {
                 break;
             }
             let id = self.next_write_id(None);
+            // A frame that cannot be built is refused before anything is written.
+            let Ok(frame) = VoiceContextFrame::new(
+                id.clone(),
+                VoiceCommand::Thinking,
+                delegation_id.clone(),
+                Some(text.clone()),
+            ) else {
+                stopped = Some(VoiceContextStop::SidebandLost);
+                break;
+            };
             {
                 // The append counts as written from the step that may write it, in the lock that
                 // makes it wait for its answer: the provider's closure can be read and the call
@@ -1197,25 +1207,24 @@ impl HostCall {
                     send.in_flight = true;
                 }
             }
-            let written = match VoiceContextFrame::new(
-                id.clone(),
-                VoiceCommand::Thinking,
-                delegation_id.clone(),
-                Some(text.clone()),
-            ) {
-                Ok(frame) => self.control.write(revision, frame).await,
-                Err(_) => Err(WriteRefusal::Lost),
-            };
+            let written = self.control.write(revision, frame).await;
             if let Err(refusal) = written {
                 {
                     let mut state = self.state();
                     state.acks.remove(&id);
-                    // Refused before it was written: it is not an append left unanswered.
                     if let Some(send) = state
                         .sending
                         .as_mut()
                         .filter(|send| send.action_id == action_id)
                     {
+                        // A refusal before anything was sent leaves no append unanswered. A write
+                        // that did not finish (`Lost`) may have been read by the provider: it is
+                        // counted here, once, and the flag is cleared so that the call's end does
+                        // not count it again. When the call ended first, the end took the send
+                        // and counted it, and nothing is left here to count.
+                        if refusal == WriteRefusal::Lost && send.in_flight {
+                            send.unconfirmed += 1;
+                        }
                         send.in_flight = false;
                     }
                 }
@@ -1348,6 +1357,9 @@ mod tests {
         closes_with_the_write: std::sync::atomic::AtomicBool,
         /// Whether every write is refused by the call's pace.
         rate_refuses: std::sync::atomic::AtomicBool,
+        /// Whether a write is taken and then reported as not finished: the provider may have read
+        /// it, and the writer cannot say.
+        loses_the_write: std::sync::atomic::AtomicBool,
         pacer: Mutex<Pacer>,
     }
 
@@ -1365,6 +1377,7 @@ mod tests {
                 refuses: std::sync::atomic::AtomicBool::new(false),
                 closes_with_the_write: std::sync::atomic::AtomicBool::new(false),
                 rate_refuses: std::sync::atomic::AtomicBool::new(false),
+                loses_the_write: std::sync::atomic::AtomicBool::new(false),
                 pacer: Mutex::new(Pacer::new(timings.burst_window, timings.minute_window)),
             })
         }
@@ -1458,6 +1471,9 @@ mod tests {
                     self.tell(HostCallEvent::State(SidebandState::Closed(
                         SidebandEnd::ProviderClosed,
                     )));
+                }
+                if self.loses_the_write.load(Ordering::SeqCst) {
+                    return Err(WriteRefusal::Lost);
                 }
                 Ok(())
             })
@@ -1912,6 +1928,60 @@ mod tests {
                 unconfirmed: 1,
                 state: VoiceContextState::Stopped {
                     stopped_by: stop_of(VoiceEndReason::ProviderClosed)
+                }
+            }]
+        );
+    }
+
+    /// A write that did not finish may have been read by the provider: the append is counted as
+    /// unconfirmed once, whether the sender hears of the loss before the provider's closure comes
+    /// or the closure is read before the write's result is back.
+    #[tokio::test(start_paused = true)]
+    async fn an_append_whose_write_is_lost_is_counted_unconfirmed_once_in_either_order() {
+        // The write returns `Lost` first, and the closure comes after.
+        let (calls, call, sideband) = held();
+        sideband.loses_the_write.store(true, Ordering::SeqCst);
+        let _ = call
+            .send_context(action(5), send_params(), Support::of(2), OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(sideband.written().len(), 1);
+        sideband.set(SidebandState::Closed(SidebandEnd::ProviderClosed));
+        sideband.tell(HostCallEvent::State(SidebandState::Closed(
+            SidebandEnd::ProviderClosed,
+        )));
+        settle().await;
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 0,
+                of: 3,
+                unconfirmed: 1,
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::SidebandLost
+                }
+            }]
+        );
+
+        // The closure is read before the write returns `Lost`.
+        let (calls, call, sideband) = held();
+        sideband.loses_the_write.store(true, Ordering::SeqCst);
+        sideband.closes_with_the_write.store(true, Ordering::SeqCst);
+        let _ = call
+            .send_context(action(6), send_params(), Support::of(2), OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(sideband.written().len(), 1);
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(6),
+                appended: 0,
+                of: 3,
+                unconfirmed: 1,
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::SidebandLost
                 }
             }]
         );
