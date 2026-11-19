@@ -8316,8 +8316,9 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
     ] {
         let mut scene = own_scene(own_timings()).await;
         let openai = scene.openai.clone().expect("an own-key scene");
-        // The provider takes no command: the host's sender is held at its first append.
-        openai.acknowledge(false);
+        // The request for the context is held until the provider has been told to take no command, so
+        // that the host's sender is held at its first append.
+        scene.link.hold_next_request(HostMethod::VoiceContextSend);
         let prepared = scene.prepared().await;
         let mut request = scene.own_start_request(&prepared);
         if cause == "deadline" {
@@ -8328,6 +8329,9 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
             answer.is_ok(),
             "an own-key call starts ({cause}): {answer:?}"
         );
+        scene.link.until_request_held().await;
+        openai.acknowledge(false);
+        scene.link.release_request();
         until_written(&scene, "session.thinking.append", |_| true).await;
         assert_eq!(scene.link.sent(HostMethod::VoiceContextSend), 1, "{cause}");
         assert_eq!(
