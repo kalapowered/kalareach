@@ -2640,14 +2640,28 @@ export type VoiceContextState =
          * What stopped it.
          */
         stopped_by:
-          'stop' | 'revocation' | 'grant' | 'history' | 'privacy' | 'deadline' | 'sideband_lost'
+          | 'stop'
+          | 'revocation'
+          | 'grant'
+          | 'history'
+          | 'privacy'
+          | 'deadline'
+          | 'sideband_lost'
+          | 'provider_refused'
       }
     }
 /**
  * What stopped a context send.
  */
 export type VoiceContextStop =
-  'stop' | 'revocation' | 'grant' | 'history' | 'privacy' | 'deadline' | 'sideband_lost'
+  | 'stop'
+  | 'revocation'
+  | 'grant'
+  | 'history'
+  | 'privacy'
+  | 'deadline'
+  | 'sideband_lost'
+  | 'provider_refused'
 /**
  * What a `voice.control` asks for.
  *
@@ -2983,6 +2997,7 @@ export type VoiceNewsItem =
                   | 'privacy'
                   | 'deadline'
                   | 'sideband_lost'
+                  | 'provider_refused'
               }
             }
         /**
@@ -32592,6 +32607,7 @@ export interface VoiceNews {
                     | 'privacy'
                     | 'deadline'
                     | 'sideband_lost'
+                    | 'provider_refused'
                 }
               }
           /**

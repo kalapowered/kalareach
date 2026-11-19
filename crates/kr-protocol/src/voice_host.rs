@@ -601,6 +601,8 @@ pub enum VoiceContextStop {
     Deadline,
     /// The host's side channel was lost.
     SidebandLost,
+    /// The provider refused an append, when it was written or after it had taken it.
+    ProviderRefused,
 }
 
 /* -------------------------------------------------------------------------- */

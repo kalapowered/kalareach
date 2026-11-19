@@ -16,6 +16,9 @@ use super::authority_changes::decoded;
 use super::workers::WorkerLink;
 use super::{Controller, parse};
 
+/// How often the voice service looks at the calls the host controls itself.
+const VOICE_TICK: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long the voice service waits on a session's worker for one request.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VoiceBudgets {
@@ -111,7 +114,12 @@ impl Controller {
                 .unwrap_or_default()
                 .to_owned(),
         );
-        let module = Arc::new(module);
+        let clocked = Arc::downgrade(self);
+        let module = Arc::new(module.with_clock(crate::voice::Clock::new(move || {
+            clocked
+                .upgrade()
+                .map_or_else(|| kr_ipc::now_ms().get(), |daemon| daemon.settled_now_ms())
+        })));
         // The account never changes under a call: from the moment a start asks the broker to the
         // moment the close has been told, the call is open, and signing in or out waits for it.
         self.account.watch_calls(Arc::new(VoiceCalls {
@@ -746,6 +754,37 @@ impl Controller {
         self.voice_attempt(attempt).await
     }
 
+    /// Starts the tick that watches the calls the host controls itself, when it is not running and
+    /// the host holds such a call. The tick passes every [`VOICE_TICK`] and ends when no such call
+    /// is left; the next start of one starts it again.
+    ///
+    /// It holds the daemon weakly, and only while it reads the clock.
+    fn keep_voice_ticking(self: &Arc<Self>) {
+        let module = Arc::clone(self.voice());
+        if module.host_calls().is_empty() || !module.claim_tick() {
+            return;
+        }
+        let daemon = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(VOICE_TICK);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticks.tick().await;
+                let Some(now_ms) = daemon.upgrade().map(|held| held.settled_now_ms()) else {
+                    return;
+                };
+                module.tick(now_ms).await;
+                if module.host_calls().is_empty() {
+                    module.release_tick();
+                    // A call registered after the last look still needs the tick.
+                    if module.host_calls().is_empty() || !module.claim_tick() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
     /// One claimed voice action, performed and recorded under its claim.
     async fn voice_attempt(self: &Arc<Self>, attempt: VoiceAttempt) -> Result<ParamsValue> {
         let VoiceAttempt {
@@ -768,6 +807,9 @@ impl Controller {
                 &(Arc::clone(&admission) as Arc<dyn kr_voice::Admission>),
             )
             .await;
+        if method == Method::VoiceStart {
+            self.keep_voice_ticking();
+        }
         // The challenge a device signs admits nothing, so nothing is kept for it: the signed
         // delegation is the same action under the same identifier, and claims it afresh. The route
         // the ingress claimed goes back first, while this attempt still holds its claim: a request

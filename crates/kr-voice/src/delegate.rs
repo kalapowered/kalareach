@@ -672,6 +672,39 @@ impl Coordinator {
         true
     }
 
+    /// Ends one live call for a reason of the host's own that no sweep decides, as a stop would end
+    /// it: the call's grant is revoked first, then the record leaves, then the provider is told to
+    /// close the call. Says whether the call was ended here.
+    ///
+    /// Used when the host itself finds the call over, as when the device that holds it has not been
+    /// heard from for too long ([`VoiceEndReason::Silence`]).
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    pub async fn end_call(
+        &self,
+        voice_session_id: VoiceSessionId,
+        reason: VoiceEndReason,
+        now_ms: u64,
+    ) -> bool {
+        let held = {
+            let state = self.state.lock().expect("the coordinator's state");
+            state
+                .sessions
+                .iter()
+                .find(|record| record.voice_session_id == voice_session_id)
+                .map(|record| (record.device_id, record.grant_id))
+        };
+        match held {
+            Some((device_id, grant_id)) => {
+                self.end_held(voice_session_id, device_id, grant_id, reason, now_ms)
+                    .await
+            }
+            None => false,
+        }
+    }
+
     /// Ends the voice sessions of a device the host has revoked, and returns how many it ended.
     ///
     /// The device's revocation withdraws every grant it held, the voice grants among them. What it
@@ -1637,6 +1670,59 @@ impl Coordinator {
     /* voice.context                                                     */
     /* ---------------------------------------------------------------- */
 
+    /// What a context send checks again before each append: the voice session still reaches the
+    /// session, the voice grant is live, the device's own grant covers the session, and both permit
+    /// a briefing. Reads nothing. Gives the history bound the two grants allow now, in UTC
+    /// milliseconds, or `None` for no bound, so the sender can tell that it narrowed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal [`Self::context`] would give at its checks, and an error when the host
+    /// could not say.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    pub fn context_allowed(
+        &self,
+        device_id: DeviceId,
+        voice_session_id: VoiceSessionId,
+        session_id: SessionId,
+    ) -> Result<Option<u64>> {
+        let (voice_grant_id, reaches) = {
+            let state = self.state.lock().expect("the coordinator's state");
+            let record = state.sessions.of_device(voice_session_id, device_id)?;
+            (record.grant_id, record.reaches(session_id))
+        };
+        if !reaches {
+            return Err(VoiceError::refused(
+                VoiceRefusal::SessionOutsideVoiceSession,
+                "this voice session does not reach that session",
+            ));
+        }
+        let voice_grant = self.live_voice_grant(voice_grant_id)?;
+        let device_grant = self
+            .authority
+            .device_grant(device_id, Some(session_id))?
+            .ok_or_else(|| {
+                VoiceError::refused(
+                    VoiceRefusal::OutsideDeviceGrant,
+                    "this device's grant does not cover that session",
+                )
+            })?;
+        if !permits(&voice_grant, &device_grant, VoiceAction::Brief) {
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideVoiceGrant,
+                "this voice grant does not permit a briefing",
+            ));
+        }
+        Ok(narrower_history(&device_grant, &voice_grant)
+            .history
+            .lower_bound_ms
+            .0
+            .map(|bound| bound.get()))
+    }
+
     /// Selects the bounded context for one session.
     ///
     /// The selection uses the requesting device's own grant and nothing wider, and what comes back
@@ -1940,27 +2026,8 @@ impl Coordinator {
         kept: &VoiceDelegateResult,
         now_ms: u64,
     ) -> Result<VoiceDelegateResult> {
-        let Some(action) = kept.action.0 else {
-            return Err(VoiceError::InvalidArgument(
-                "only a read is answered again".to_owned(),
-            ));
-        };
-        let intent = Intent {
-            action,
-            session_id: kept.session_id.0,
-            destination: None,
-            approval: None,
-            turn_id: None,
-        };
         match self
-            .propose(
-                device_id,
-                action_id,
-                params,
-                &intent,
-                now_ms,
-                Spend::Nothing,
-            )
+            .restate_proposal(device_id, action_id, params, kept, now_ms)
             .await?
         {
             // A read made again has no window of its own to ask again: it is made from the grants
@@ -1977,6 +2044,68 @@ impl Coordinator {
                 "only a read is answered again".to_owned(),
             )),
         }
+    }
+
+    /// Whether [`Self::restate`] would be allowed now, by the grants and the history bound as they
+    /// stand, with nothing read and nothing submitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal [`Self::restate`] would give at the checks, and an error when the host
+    /// could not say.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a thread holding the coordinator's lock panicked.
+    pub async fn allows_restate(
+        &self,
+        device_id: DeviceId,
+        action_id: ActionId,
+        params: &VoiceDelegateParams,
+        kept: &VoiceDelegateResult,
+        now_ms: u64,
+    ) -> Result<()> {
+        match self
+            .restate_proposal(device_id, action_id, params, kept, now_ms)
+            .await?
+        {
+            Proposed::Ready(_) => Ok(()),
+            Proposed::NeedsConfirmation(_) => Err(VoiceError::InvalidArgument(
+                "only a read is answered again".to_owned(),
+            )),
+        }
+    }
+
+    /// The checks a read made again passes, ending in the proposal that would carry it out.
+    async fn restate_proposal(
+        &self,
+        device_id: DeviceId,
+        action_id: ActionId,
+        params: &VoiceDelegateParams,
+        kept: &VoiceDelegateResult,
+        now_ms: u64,
+    ) -> Result<Proposed> {
+        let Some(action) = kept.action.0 else {
+            return Err(VoiceError::InvalidArgument(
+                "only a read is answered again".to_owned(),
+            ));
+        };
+        let intent = Intent {
+            action,
+            session_id: kept.session_id.0,
+            destination: None,
+            approval: None,
+            turn_id: None,
+        };
+        self.propose(
+            device_id,
+            action_id,
+            params,
+            &intent,
+            now_ms,
+            Spend::Nothing,
+        )
+        .await
     }
 
     /// Reads the fragments of a delegation into what they ask for, against the call that heard them.

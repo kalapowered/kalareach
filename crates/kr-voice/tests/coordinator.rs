@@ -1689,6 +1689,72 @@ async fn a_call_ended_by_the_sweep_is_told_as_its_deadline_and_a_revoked_devices
     drop(session);
 }
 
+/// A call the host ends because its phone went silent is told as `silence` before its grant goes,
+/// its grant is revoked, and the provider is asked to close it; a call the host does not hold is
+/// not ended, and a call that ended is not ended a second time.
+#[tokio::test]
+async fn a_call_the_host_ends_for_silence_is_told_as_silence_revoked_and_closed_at_its_provider() {
+    fn closed(provider: &OwnKeyFake) -> Vec<String> {
+        provider.closed.lock().expect("what was closed").clone()
+    }
+    let (coordinator, authority, provider, session) = own_call_started().await;
+    let told = Arc::new(Mutex::new(Vec::new()));
+    {
+        let told = Arc::clone(&told);
+        coordinator.on_call_end(Arc::new(move |voice_session_id, reason, now_ms| {
+            told.lock()
+                .expect("what was told")
+                .push((voice_session_id, reason, now_ms));
+        }));
+    }
+    let unknown = kr_protocol::ids::VoiceSessionId::new(Uuid::from_bytes([0x77; 16]));
+    assert!(
+        !coordinator
+            .end_call(
+                unknown,
+                kr_protocol::voice_host::VoiceEndReason::Silence,
+                20_000
+            )
+            .await,
+        "a call this host does not hold is not ended"
+    );
+    assert!(closed(&provider).is_empty());
+
+    assert!(
+        coordinator
+            .end_call(
+                session.voice_session_id,
+                kr_protocol::voice_host::VoiceEndReason::Silence,
+                130_000
+            )
+            .await
+    );
+    assert_eq!(
+        told.lock().expect("what was told").as_slice(),
+        [(
+            session.voice_session_id,
+            kr_protocol::voice_host::VoiceEndReason::Silence,
+            130_000
+        )]
+    );
+    assert_eq!(closed(&provider), ["own_call_1".to_owned()]);
+    assert!(
+        authority.revoked_at(session.grant_id).is_some(),
+        "the call's grant was revoked"
+    );
+    assert!(
+        !coordinator
+            .end_call(
+                session.voice_session_id,
+                kr_protocol::voice_host::VoiceEndReason::Silence,
+                131_000
+            )
+            .await,
+        "a call that ended is not ended again"
+    );
+    assert_eq!(closed(&provider).len(), 1);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The fixture
 // ---------------------------------------------------------------------------------------------

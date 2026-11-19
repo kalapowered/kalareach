@@ -41449,6 +41449,11 @@
           "const": "sideband_lost",
           "description": "The host's side channel was lost.",
           "type": "string"
+        },
+        {
+          "const": "provider_refused",
+          "description": "The provider refused an append, when it was written or after it had taken it.",
+          "type": "string"
         }
       ]
     },

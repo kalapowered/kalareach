@@ -14,18 +14,25 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use kr_client::services::host_call::HostFuture;
 use kr_client::services::host_call::{
     HostCallControl, HostCallEvent, SidebandEnd, SidebandState, WriteRefusal,
 };
 use kr_client::services::voice::{VoiceCommand, VoiceContextFrame};
+use kr_client::services::voice_control::ControlTimings;
+use kr_client::services::voice_pacing::{MAX_START_APPENDS, Pacer, call_start_appends};
 use kr_protocol::ids::{ActionId, DeviceId, VoiceSessionId};
 use kr_protocol::scalars::{Nullable, U64};
-use kr_protocol::voice::{VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationOutcome};
+use kr_protocol::voice::{
+    VoiceContextSelection, VoiceDelegateParams, VoiceDelegateResult, VoiceDelegationOutcome,
+};
 use kr_protocol::voice_host::{
     HOST_CLIENT_ABSENT_SECONDS, HOST_HEARD_WAIT_MS, HOST_HEARTBEAT_SECONDS, HOST_NEWS_LIMIT,
-    HOST_PERFORMED_WORDS_BYTES, HostNote, NotePhase, VoiceControlResult, VoiceEndReason,
-    VoiceHostCallState, VoiceHostRefusal, VoiceNews, VoiceNewsItem, VoiceNote,
+    HOST_PERFORMED_WORDS_BYTES, HostNote, NotePhase, VoiceContextSendParams,
+    VoiceContextSendResult, VoiceContextState, VoiceContextStop, VoiceControlResult,
+    VoiceEndReason, VoiceHostCallState, VoiceHostRefusal, VoiceNews, VoiceNewsItem, VoiceNote,
 };
+use tokio::time::Instant;
 
 /// The most calls whose final status the host keeps after they end.
 pub const FINAL_STATUS_RECORDS: usize = 16;
@@ -111,6 +118,94 @@ pub trait NoteSupport: Send + Sync {
         &'a self,
         record: &'a DelegationRecord,
     ) -> kr_client::services::host_call::HostFuture<'a, Result<String, VoiceHostRefusal>>;
+
+    /// Checks again, just before the words are written, that the grants, the history bound and
+    /// privacy mode still allow what [`Self::fresh_summary`] read. Reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// The same refusals as [`Self::fresh_summary`].
+    fn allowed_now<'a>(
+        &'a self,
+        record: &'a DelegationRecord,
+    ) -> kr_client::services::host_call::HostFuture<'a, Result<(), VoiceHostRefusal>>;
+}
+
+/// How long a context send waits for the provider to acknowledge one append before it stops.
+pub const SEND_ACKNOWLEDGEMENT_WAIT: Duration = Duration::from_secs(15);
+
+/// A selection of context, and what it was selected under.
+#[derive(Clone, Debug)]
+pub struct ContextSelected {
+    /// The selection the send carries.
+    pub selection: VoiceContextSelection,
+    /// The history bound the two grants allowed when it was selected, in UTC milliseconds.
+    pub lower_bound_ms: Option<u64>,
+    /// Privacy mode as it stood when the read began.
+    pub decided: crate::privacy::Published,
+}
+
+/// What the sender of a call's context needs from outside the call.
+pub trait SendSupport: Send + Sync {
+    /// The time the send's own decisions are made on.
+    fn now_ms(&self) -> u64;
+
+    /// Selects what the send carries, under the device's own scope, so that privacy mode did not
+    /// move during the read.
+    ///
+    /// # Errors
+    ///
+    /// The refusal a device is told: a grant that no longer reaches the session is
+    /// [`VoiceHostRefusal::OutsideGrant`] and privacy mode that kept moving is
+    /// [`VoiceHostRefusal::Privacy`].
+    fn select<'a>(
+        &'a self,
+        params: &'a VoiceContextSendParams,
+    ) -> HostFuture<'a, Result<ContextSelected, VoiceHostRefusal>>;
+
+    /// Looks again, before one append, at what allows the send: the voice session still reaches
+    /// the session, both grants permit a briefing, the history bound has not narrowed and privacy
+    /// mode has not moved. Reads nothing.
+    ///
+    /// # Errors
+    ///
+    /// What stopped the send.
+    fn still_allowed<'a>(
+        &'a self,
+        params: &'a VoiceContextSendParams,
+        selected: &'a ContextSelected,
+    ) -> HostFuture<'a, Result<(), VoiceContextStop>>;
+}
+
+/// Where a provider's answer to one write stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ack {
+    Waiting,
+    Acknowledged,
+    Refused,
+}
+
+/// How far the one send of a call has come.
+#[derive(Clone, Copy, Debug)]
+struct SendProgress {
+    action_id: ActionId,
+    of: u32,
+    appended: u32,
+    unconfirmed: u32,
+}
+
+/// The stop a call's end is for a send that was still running.
+const fn stop_of(reason: VoiceEndReason) -> VoiceContextStop {
+    match reason {
+        VoiceEndReason::Stop | VoiceEndReason::Silence => VoiceContextStop::Stop,
+        VoiceEndReason::Deadline => VoiceContextStop::Deadline,
+        VoiceEndReason::Revocation | VoiceEndReason::CredentialRemoved => {
+            VoiceContextStop::Revocation
+        }
+        VoiceEndReason::ProviderClosed | VoiceEndReason::SidebandLost => {
+            VoiceContextStop::SidebandLost
+        }
+    }
 }
 
 /// What one delegation has been told to the model.
@@ -133,6 +228,10 @@ struct CallState {
     writes: VecDeque<(String, ActionId)>,
     write_count: u64,
     ended: Option<VoiceEndReason>,
+    /// The send of context that runs now, at most one.
+    sending: Option<SendProgress>,
+    /// What the provider said of the appends of that send.
+    acks: BTreeMap<String, Ack>,
 }
 
 /// One call on the owner's own key, as the host holds it.
@@ -142,6 +241,9 @@ pub struct HostCall {
     closes_at_ms: u64,
     control: Arc<dyn HostCallControl>,
     state: Mutex<CallState>,
+    /// Told when the provider answers a write, when the channel changes state and when the call
+    /// ends, so the sender looks again.
+    progress: tokio::sync::Notify,
     calls: Weak<Shared>,
 }
 
@@ -228,7 +330,10 @@ impl HostCalls {
                 writes: VecDeque::new(),
                 write_count: 0,
                 ended: None,
+                sending: None,
+                acks: BTreeMap::new(),
             }),
+            progress: tokio::sync::Notify::new(),
             calls: Arc::downgrade(&self.shared),
         });
         self.registry()
@@ -415,6 +520,12 @@ impl HostCall {
             }
             HostCallEvent::WriteRefused { write_id } => {
                 let mut state = self.state();
+                if let Some(ack) = state.acks.get_mut(&write_id) {
+                    *ack = Ack::Refused;
+                    drop(state);
+                    self.progress.notify_one();
+                    return;
+                }
                 if let Some(at) = state.writes.iter().position(|(id, _)| *id == write_id) {
                     let (_, action_id) = state.writes.remove(at).expect("a write at a position");
                     Self::push_news(
@@ -428,6 +539,12 @@ impl HostCall {
             }
             HostCallEvent::WriteAcknowledged { write_id } => {
                 let mut state = self.state();
+                if let Some(ack) = state.acks.get_mut(&write_id) {
+                    *ack = Ack::Acknowledged;
+                    drop(state);
+                    self.progress.notify_one();
+                    return;
+                }
                 if let Some(at) = state.writes.iter().position(|(id, _)| *id == write_id) {
                     state.writes.remove(at);
                 }
@@ -440,7 +557,7 @@ impl HostCall {
                 };
                 self.finish(reason, self.last_seen_ms());
             }
-            HostCallEvent::State(_) => {}
+            HostCallEvent::State(_) => self.progress.notify_one(),
         }
     }
 
@@ -457,6 +574,15 @@ impl HostCall {
                 return;
             }
             state.ended = Some(reason);
+            if let Some(send) = state.sending.take() {
+                Self::upsert_context(
+                    &mut state,
+                    send,
+                    VoiceContextState::Stopped {
+                        stopped_by: stop_of(reason),
+                    },
+                );
+            }
             Self::push_news(&mut state, VoiceNewsItem::Ended { reason });
             FinalStatus {
                 voice_session_id: self.voice_session_id,
@@ -466,6 +592,7 @@ impl HostCall {
                 last_seq: state.next_seq - 1,
             }
         };
+        self.progress.notify_one();
         let Some(shared) = self.calls.upgrade() else {
             return;
         };
@@ -652,6 +779,15 @@ impl HostCall {
         state.delegations.insert(delegation_id.to_owned(), record);
     }
 
+    /// Whether the host's own side channel heard the delegation, waiting at most five seconds for
+    /// it. A delegation the provider never announced to this call is not one the host acts on.
+    pub async fn announced(&self, delegation_id: &str) -> bool {
+        self.control
+            .heard_within(delegation_id, Duration::from_millis(HOST_HEARD_WAIT_MS))
+            .await
+            .is_some()
+    }
+
     /// Answers `heard`: where the host's own side channel heard the delegation, within five
     /// seconds, or that it has not.
     pub async fn heard(&self, delegation_id: &str, now_ms: u64) -> VoiceControlResult {
@@ -735,10 +871,22 @@ impl HostCall {
             let Some(record) = &record else {
                 return refused(VoiceHostRefusal::UnknownDelegation);
             };
-            match support.fresh_summary(record).await {
-                Ok(summary) => performed_words(&summary),
+            let summary = match support.fresh_summary(record).await {
+                Ok(summary) => summary,
+                Err(reason) => return refused(reason),
+            };
+            // Between the read and the write the grants, the history bound, privacy mode, the
+            // call's deadline and the side channel's revision are looked at again, so a change in
+            // that interval writes nothing.
+            if let Err(reason) = support.allowed_now(record).await {
+                return refused(reason);
+            }
+            match self.writable(now_ms) {
+                Ok(current) if current == revision => {}
+                Ok(_) => return refused(VoiceHostRefusal::NotReady),
                 Err(reason) => return refused(reason),
             }
+            performed_words(&summary)
         } else {
             note.words().to_owned()
         };
@@ -789,6 +937,254 @@ impl HostCall {
                 }
                 refused(reason)
             }
+        }
+    }
+
+    /// Puts the progress of a send in the news: the one item of that send, which a newer one
+    /// replaces, so a send of many appends never fills the queue.
+    fn upsert_context(state: &mut CallState, send: SendProgress, now: VoiceContextState) {
+        state.news.retain(|item| {
+            !matches!(&item.item, VoiceNewsItem::Context { action_id, .. } if *action_id == send.action_id)
+        });
+        Self::push_news(
+            state,
+            VoiceNewsItem::Context {
+                action_id: send.action_id,
+                appended: send.appended,
+                of: send.of,
+                unconfirmed: send.unconfirmed,
+                state: now,
+            },
+        );
+    }
+
+    /// Takes a selection of context for the model and answers at once: the sender is a task of this
+    /// call, one at a time, and its progress arrives as news naming `action_id`.
+    ///
+    /// An answer of `queued` proves the sender took the selection, not that the provider acted on
+    /// it.
+    pub async fn send_context(
+        self: &Arc<Self>,
+        action_id: ActionId,
+        params: VoiceContextSendParams,
+        support: Arc<dyn SendSupport>,
+        now_ms: u64,
+    ) -> VoiceContextSendResult {
+        let refused = |reason| VoiceContextSendResult::Refused { reason };
+        self.phone_is_back(now_ms).await;
+        let revision = match self.writable(now_ms) {
+            Ok(revision) => revision,
+            Err(reason) => return refused(reason),
+        };
+        if let Some(id) = params.delegation_id.0.as_ref()
+            && self.control.heard(id.as_str()).is_none()
+        {
+            return refused(VoiceHostRefusal::UnknownDelegation);
+        }
+        {
+            let mut state = self.state();
+            if state.sending.is_some() {
+                return refused(VoiceHostRefusal::Busy);
+            }
+            state.sending = Some(SendProgress {
+                action_id,
+                of: 0,
+                appended: 0,
+                unconfirmed: 0,
+            });
+        }
+        let selected = match support.select(&params).await {
+            Ok(selected) => selected,
+            Err(reason) => {
+                self.give_up_send(action_id);
+                return refused(reason);
+            }
+        };
+        let appends = call_start_appends(&selected.selection);
+        if appends.len() > MAX_START_APPENDS {
+            self.give_up_send(action_id);
+            return refused(VoiceHostRefusal::TooLarge);
+        }
+        let of = u32::try_from(appends.len()).unwrap_or(u32::MAX);
+        {
+            let mut state = self.state();
+            // The call may have ended while the selection was read: its end took the send.
+            let Some(send) = state
+                .sending
+                .as_mut()
+                .filter(|send| send.action_id == action_id)
+            else {
+                return refused(VoiceHostRefusal::Closing);
+            };
+            send.of = of;
+            let send = *send;
+            Self::upsert_context(&mut state, send, VoiceContextState::Sending);
+        }
+        let call = Arc::clone(self);
+        tokio::spawn(async move {
+            call.run_sender(action_id, params, selected, appends, support, revision)
+                .await;
+        });
+        VoiceContextSendResult::Queued { appends: of }
+    }
+
+    fn give_up_send(&self, action_id: ActionId) {
+        let mut state = self.state();
+        if state
+            .sending
+            .is_some_and(|send| send.action_id == action_id)
+        {
+            state.sending = None;
+        }
+    }
+
+    /// Why a running send must stop now, when it must: the call ended, its deadline passed, or the
+    /// side channel is not the one the send began on.
+    fn send_stop(&self, revision: u64, now_ms: u64) -> Option<VoiceContextStop> {
+        if let Some(reason) = self.state().ended {
+            return Some(stop_of(reason));
+        }
+        if now_ms >= self.closes_at_ms {
+            return Some(VoiceContextStop::Deadline);
+        }
+        match self.control.state() {
+            SidebandState::Ready => {}
+            SidebandState::Closing => return Some(VoiceContextStop::Stop),
+            SidebandState::Recovering | SidebandState::Closed(_) => {
+                return Some(VoiceContextStop::SidebandLost);
+            }
+        }
+        (self.control.revision() != revision).then_some(VoiceContextStop::SidebandLost)
+    }
+
+    /// Waits for the provider to acknowledge the write `id`, and stops where the send must stop.
+    async fn acknowledged(
+        &self,
+        id: &str,
+        revision: u64,
+        support: &dyn SendSupport,
+    ) -> Result<(), VoiceContextStop> {
+        let deadline = Instant::now() + SEND_ACKNOWLEDGEMENT_WAIT;
+        loop {
+            {
+                let mut state = self.state();
+                match state.acks.get(id).copied() {
+                    Some(Ack::Acknowledged) => {
+                        state.acks.remove(id);
+                        return Ok(());
+                    }
+                    // The provider took a frame it then refused.
+                    Some(Ack::Refused) => {
+                        state.acks.remove(id);
+                        return Err(VoiceContextStop::ProviderRefused);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(stop) = self.send_stop(revision, support.now_ms()) {
+                return Err(stop);
+            }
+            tokio::select! {
+                () = self.progress.notified() => {}
+                () = tokio::time::sleep_until(deadline) => return Err(VoiceContextStop::SidebandLost),
+            }
+        }
+    }
+
+    /// The sender: writes each append under the pacing of the managed control, looking again at
+    /// what allows the send before every one, and stops at the first change.
+    async fn run_sender(
+        self: Arc<Self>,
+        action_id: ActionId,
+        params: VoiceContextSendParams,
+        selected: ContextSelected,
+        appends: Vec<String>,
+        support: Arc<dyn SendSupport>,
+        revision: u64,
+    ) {
+        let timings = ControlTimings::default();
+        let mut pacer = Pacer::new(timings.burst_window, timings.minute_window);
+        let delegation_id = params
+            .delegation_id
+            .0
+            .as_ref()
+            .map(|id| id.as_str().to_owned());
+        let mut stopped = None;
+        for text in &appends {
+            loop {
+                if let Some(stop) = self.send_stop(revision, support.now_ms()) {
+                    stopped = Some(stop);
+                    break;
+                }
+                let Some(at) = pacer.next_at(Instant::now()) else {
+                    break;
+                };
+                tokio::select! {
+                    () = tokio::time::sleep_until(at) => {}
+                    () = self.progress.notified() => {}
+                }
+            }
+            if stopped.is_none()
+                && let Err(stop) = support.still_allowed(&params, &selected).await
+            {
+                stopped = Some(stop);
+            }
+            if stopped.is_some() {
+                break;
+            }
+            let id = self.next_write_id(None);
+            self.state().acks.insert(id.clone(), Ack::Waiting);
+            let written = match VoiceContextFrame::new(
+                id.clone(),
+                VoiceCommand::Thinking,
+                delegation_id.clone(),
+                Some(text.clone()),
+            ) {
+                Ok(frame) => self.control.write(revision, frame).await,
+                Err(_) => Err(WriteRefusal::Lost),
+            };
+            if let Err(refusal) = written {
+                self.state().acks.remove(&id);
+                stopped = Some(match refusal {
+                    WriteRefusal::ProviderRefused => VoiceContextStop::ProviderRefused,
+                    WriteRefusal::NotReady | WriteRefusal::Stale | WriteRefusal::Lost => {
+                        VoiceContextStop::SidebandLost
+                    }
+                });
+                break;
+            }
+            pacer.record(&id, Instant::now());
+            let answer = self.acknowledged(&id, revision, &*support).await;
+            let mut state = self.state();
+            state.acks.remove(&id);
+            let Some(send) = state
+                .sending
+                .as_mut()
+                .filter(|send| send.action_id == action_id)
+            else {
+                return;
+            };
+            match answer {
+                Ok(()) => {
+                    send.appended += 1;
+                    let send = *send;
+                    Self::upsert_context(&mut state, send, VoiceContextState::Sending);
+                }
+                Err(stop) => {
+                    // Written, and never answered: counted, and never written again.
+                    send.unconfirmed += 1;
+                    stopped = Some(stop);
+                    break;
+                }
+            }
+        }
+        let mut state = self.state();
+        if let Some(send) = state.sending.filter(|send| send.action_id == action_id) {
+            state.sending = None;
+            let end = stopped.map_or(VoiceContextState::Done, |stopped_by| {
+                VoiceContextState::Stopped { stopped_by }
+            });
+            Self::upsert_context(&mut state, send, end);
         }
     }
 
@@ -860,6 +1256,8 @@ mod tests {
         state: Mutex<SidebandState>,
         heard: Mutex<BTreeMap<String, u64>>,
         written: Mutex<Written>,
+        ids: Mutex<Vec<String>>,
+        acknowledged: AtomicU64,
         listener: Mutex<Option<HostCallListener>>,
         revision: AtomicU64,
         refuses: std::sync::atomic::AtomicBool,
@@ -871,6 +1269,8 @@ mod tests {
                 state: Mutex::new(SidebandState::Ready),
                 heard: Mutex::new(BTreeMap::new()),
                 written: Mutex::new(Vec::new()),
+                ids: Mutex::new(Vec::new()),
+                acknowledged: AtomicU64::new(0),
                 listener: Mutex::new(None),
                 revision: AtomicU64::new(1),
                 refuses: std::sync::atomic::AtomicBool::new(false),
@@ -899,6 +1299,18 @@ mod tests {
 
         fn written(&self) -> Written {
             self.written.lock().expect("written").clone()
+        }
+
+        /// Tells the call that the provider acknowledged every write it has not yet acknowledged.
+        fn acknowledge_all(&self) {
+            let ids = self.ids.lock().expect("ids").clone();
+            let from = usize::try_from(self.acknowledged.swap(ids.len() as u64, Ordering::SeqCst))
+                .expect("a count");
+            for id in &ids[from..] {
+                self.tell(HostCallEvent::WriteAcknowledged {
+                    write_id: id.clone(),
+                });
+            }
         }
     }
 
@@ -932,6 +1344,7 @@ mod tests {
                 if self.refuses.load(Ordering::SeqCst) {
                     return Err(WriteRefusal::ProviderRefused);
                 }
+                self.ids.lock().expect("ids").push(frame.id.clone());
                 self.written.lock().expect("written").push((
                     frame.command,
                     frame.delegation_id.clone(),
@@ -972,6 +1385,34 @@ mod tests {
         ) -> HostFuture<'a, Result<String, VoiceHostRefusal>> {
             let answer = self.0.clone();
             Box::pin(async move { answer })
+        }
+
+        fn allowed_now<'a>(
+            &'a self,
+            _record: &'a DelegationRecord,
+        ) -> HostFuture<'a, Result<(), VoiceHostRefusal>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A read that passes, and a check just before the write that does not: a grant, the history
+    /// bound or privacy mode moved in between.
+    struct MovesBeforeTheWrite(VoiceHostRefusal);
+
+    impl NoteSupport for MovesBeforeTheWrite {
+        fn fresh_summary<'a>(
+            &'a self,
+            _record: &'a DelegationRecord,
+        ) -> HostFuture<'a, Result<String, VoiceHostRefusal>> {
+            Box::pin(async { Ok("fresh".to_owned()) })
+        }
+
+        fn allowed_now<'a>(
+            &'a self,
+            _record: &'a DelegationRecord,
+        ) -> HostFuture<'a, Result<(), VoiceHostRefusal>> {
+            let refusal = self.0;
+            Box::pin(async move { Err(refusal) })
         }
     }
 
@@ -1057,6 +1498,339 @@ mod tests {
             VoiceControlResult::Admitted { note } => note.0,
             other => panic!("not admitted: {other:?}"),
         }
+    }
+
+    /// What the sender of a call's context reads of the host, as the test steers it.
+    struct Support {
+        selection: VoiceContextSelection,
+        verdict: Mutex<Result<(), VoiceContextStop>>,
+        rechecks: AtomicU64,
+    }
+
+    impl Support {
+        fn of(messages: usize) -> Arc<Self> {
+            Arc::new(Self {
+                selection: selection_of(messages),
+                verdict: Mutex::new(Ok(())),
+                rechecks: AtomicU64::new(0),
+            })
+        }
+
+        fn change(&self, to: VoiceContextStop) {
+            *self.verdict.lock().expect("the verdict") = Err(to);
+        }
+    }
+
+    impl SendSupport for Support {
+        fn now_ms(&self) -> u64 {
+            OPENED + 1_000
+        }
+
+        fn select<'a>(
+            &'a self,
+            _params: &'a VoiceContextSendParams,
+        ) -> HostFuture<'a, Result<ContextSelected, VoiceHostRefusal>> {
+            Box::pin(async move {
+                Ok(ContextSelected {
+                    selection: self.selection.clone(),
+                    lower_bound_ms: None,
+                    decided: crate::privacy::Published::default(),
+                })
+            })
+        }
+
+        fn still_allowed<'a>(
+            &'a self,
+            _params: &'a VoiceContextSendParams,
+            _selected: &'a ContextSelected,
+        ) -> HostFuture<'a, Result<(), VoiceContextStop>> {
+            self.rechecks.fetch_add(1, Ordering::SeqCst);
+            let verdict = *self.verdict.lock().expect("the verdict");
+            Box::pin(async move { verdict })
+        }
+    }
+
+    /// A selection whose opening is the header and `messages` messages of 400 bytes, which pack
+    /// into one append each.
+    fn selection_of(messages: usize) -> VoiceContextSelection {
+        VoiceContextSelection {
+            session_description: String::new(),
+            working_directory: String::new(),
+            active_application: String::new(),
+            pending_decisions: Vec::new(),
+            recent_messages: (0..messages).map(|n| format!("{n:0>400}")).collect(),
+            selected: Vec::new(),
+            text_tokens: 0,
+            truncated: false,
+            secrets_stripped: 0,
+            stripping_note: String::new(),
+        }
+    }
+
+    fn send_params() -> VoiceContextSendParams {
+        VoiceContextSendParams {
+            voice_session_id: voice_session(1),
+            session_id: kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes(
+                [3; 16],
+            )),
+            selected: kr_protocol::scalars::CanonicalSet::from_iter([]),
+            delegation_id: Nullable::null(),
+        }
+    }
+
+    /// Lets the tasks of the test's runtime run until they wait.
+    async fn settle() {
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn context_news(calls: &HostCalls) -> Vec<VoiceNewsItem> {
+        let (_, _, news, _) = heartbeat(calls, 0, OPENED + 2_000);
+        news.into_iter()
+            .map(|item| item.item)
+            .filter(|item| matches!(item, VoiceNewsItem::Context { .. }))
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_context_send_is_queued_at_once_its_progress_is_one_news_item_naming_its_action_and_a_second_send_is_busy()
+     {
+        let (calls, call, sideband) = held();
+        let support = Support::of(3);
+        let appends = u32::try_from(call_start_appends(&support.selection).len()).expect("a count");
+        assert_eq!(appends, 4, "the header and three messages");
+        assert_eq!(
+            call.send_context(action(5), send_params(), support.clone(), OPENED + 1_000)
+                .await,
+            VoiceContextSendResult::Queued { appends }
+        );
+        assert_eq!(
+            call.send_context(action(6), send_params(), support.clone(), OPENED + 1_000)
+                .await,
+            VoiceContextSendResult::Refused {
+                reason: VoiceHostRefusal::Busy
+            }
+        );
+        for written in 1..=4 {
+            settle().await;
+            assert_eq!(sideband.written().len(), written);
+            assert!(
+                sideband
+                    .written()
+                    .iter()
+                    .all(|(command, _, _)| *command == VoiceCommand::Thinking)
+            );
+            sideband.acknowledge_all();
+        }
+        settle().await;
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 4,
+                of: 4,
+                unconfirmed: 0,
+                state: VoiceContextState::Done
+            }]
+        );
+        // A send that is done lets the next begin.
+        assert!(matches!(
+            call.send_context(action(7), send_params(), support, OPENED + 1_500)
+                .await,
+            VoiceContextSendResult::Queued { .. }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_context_send_looks_again_before_every_append_and_a_change_stops_it_with_no_further_write()
+     {
+        for change in [
+            VoiceContextStop::History,
+            VoiceContextStop::Privacy,
+            VoiceContextStop::Grant,
+        ] {
+            let (calls, call, sideband) = held();
+            let support = Support::of(3);
+            let _ = call
+                .send_context(action(5), send_params(), support.clone(), OPENED + 1_000)
+                .await;
+            settle().await;
+            assert_eq!(sideband.written().len(), 1);
+            support.change(change);
+            sideband.acknowledge_all();
+            settle().await;
+            assert_eq!(
+                sideband.written().len(),
+                1,
+                "nothing is written after {change:?}"
+            );
+            assert_eq!(
+                context_news(&calls),
+                [VoiceNewsItem::Context {
+                    action_id: action(5),
+                    appended: 1,
+                    of: 4,
+                    unconfirmed: 0,
+                    state: VoiceContextState::Stopped { stopped_by: change }
+                }]
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_append_without_its_acknowledgement_before_a_sideband_loss_is_unconfirmed_and_never_written_again()
+     {
+        let (calls, call, sideband) = held();
+        let support = Support::of(2);
+        let _ = call
+            .send_context(action(5), send_params(), support, OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(sideband.written().len(), 1);
+        // The channel is lost before the provider answered the append.
+        sideband.set(SidebandState::Recovering);
+        sideband.tell(HostCallEvent::State(SidebandState::Recovering));
+        settle().await;
+        sideband.set(SidebandState::Ready);
+        sideband.tell(HostCallEvent::State(SidebandState::Ready));
+        sideband.acknowledge_all();
+        settle().await;
+        assert_eq!(
+            sideband.written().len(),
+            1,
+            "an append is never written again"
+        );
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 0,
+                of: 3,
+                unconfirmed: 1,
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::SidebandLost
+                }
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_append_the_provider_refuses_stops_the_send_as_provider_refused_not_as_a_lost_channel()
+     {
+        // Refused when it was written.
+        let (calls, call, sideband) = held();
+        sideband.refuses.store(true, Ordering::SeqCst);
+        let _ = call
+            .send_context(action(5), send_params(), Support::of(2), OPENED + 1_000)
+            .await;
+        settle().await;
+        assert!(sideband.written().is_empty());
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 0,
+                of: 3,
+                unconfirmed: 0,
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::ProviderRefused
+                }
+            }]
+        );
+
+        // Refused after the provider had taken it.
+        let (calls, call, sideband) = held();
+        let _ = call
+            .send_context(action(6), send_params(), Support::of(2), OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(sideband.written().len(), 1);
+        let id = sideband.ids.lock().expect("ids")[0].clone();
+        sideband.tell(HostCallEvent::WriteRefused { write_id: id });
+        settle().await;
+        assert_eq!(
+            sideband.written().len(),
+            1,
+            "nothing is written after the refusal"
+        );
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(6),
+                appended: 0,
+                of: 3,
+                unconfirmed: 1,
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::ProviderRefused
+                }
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_send_that_waits_for_its_pace_delays_neither_a_heartbeat_nor_the_end_of_the_call() {
+        let (calls, call, sideband) = held();
+        let support = Support::of(14);
+        let _ = call
+            .send_context(action(5), send_params(), support, OPENED + 1_000)
+            .await;
+        // Ten appends are the burst; the eleventh waits for its window.
+        for _ in 0..10 {
+            settle().await;
+            sideband.acknowledge_all();
+        }
+        settle().await;
+        assert_eq!(
+            sideband.written().len(),
+            10,
+            "the burst, and the pace holds the rest"
+        );
+        let (state, _, _, _) = heartbeat(&calls, 0, OPENED + 2_000);
+        assert_eq!(
+            state,
+            VoiceHostCallState::Open,
+            "a heartbeat is answered while the sender waits"
+        );
+        calls.end(voice_session(1), VoiceEndReason::Stop, OPENED + 3_000);
+        tokio::time::advance(Duration::from_secs(12)).await;
+        settle().await;
+        assert_eq!(
+            sideband.written().len(),
+            10,
+            "nothing is written after the call ended"
+        );
+        let (_, _, news, _) = heartbeat(&calls, 0, OPENED + 4_000);
+        assert!(news.iter().any(|item| matches!(
+            item.item,
+            VoiceNewsItem::Context {
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::Stop
+                },
+                ..
+            }
+        )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_selection_that_needs_more_than_64_appends_is_refused_whole_and_writes_nothing() {
+        let (_calls, call, sideband) = held();
+        let support = Support::of(70);
+        assert_eq!(
+            call.send_context(action(5), send_params(), support, OPENED + 1_000)
+                .await,
+            VoiceContextSendResult::Refused {
+                reason: VoiceHostRefusal::TooLarge
+            }
+        );
+        settle().await;
+        assert!(sideband.written().is_empty());
+        // The refusal left no send behind.
+        assert!(matches!(
+            call.send_context(action(6), send_params(), Support::of(1), OPENED + 1_100)
+                .await,
+            VoiceContextSendResult::Queued { .. }
+        ));
     }
 
     #[test]
@@ -1532,6 +2306,53 @@ mod tests {
             .await,
             VoiceControlResult::Admitted { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn a_grant_the_history_bound_or_privacy_moved_between_the_read_and_the_write_writes_nothing_and_stays_owed()
+     {
+        for moved in [VoiceHostRefusal::OutsideGrant, VoiceHostRefusal::Privacy] {
+            let (_calls, call, sideband) = held();
+            sideband.hear("d1", 100);
+            recorded(&call, "d1", performed("old summary"));
+            assert_eq!(
+                call.note(
+                    action(1),
+                    VoiceNote::DelegationPerformed,
+                    Some("d1"),
+                    &MovesBeforeTheWrite(moved),
+                    5_000
+                )
+                .await,
+                VoiceControlResult::Refused { reason: moved }
+            );
+            assert!(
+                sideband.written().is_empty(),
+                "nothing was written for {moved:?}"
+            );
+            // The note was not used up: it is told once the checks pass.
+            let reads = Reads(Ok("fresh".to_owned()));
+            assert!(matches!(
+                call.note(
+                    action(2),
+                    VoiceNote::DelegationPerformed,
+                    Some("d1"),
+                    &reads,
+                    5_001
+                )
+                .await,
+                VoiceControlResult::Admitted { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delegation_is_announced_only_when_the_side_channel_heard_it() {
+        let (_calls, call, sideband) = held();
+        assert!(!call.announced("d1").await);
+        sideband.hear("d1", 100);
+        assert!(call.announced("d1").await);
+        assert!(!call.announced("d2").await);
     }
 
     #[tokio::test]

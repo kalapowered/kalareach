@@ -172,9 +172,18 @@ pub type Written = Vec<(String, Option<String>, Option<String>)>;
 #[derive(Debug, Default)]
 pub struct StandInSideband {
     written: std::sync::Mutex<Written>,
+    heard: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
 }
 
 impl StandInSideband {
+    /// Makes the side channel say it heard `delegation_id`, `offset_ms` into the call.
+    pub fn hear(&self, delegation_id: &str, offset_ms: u64) {
+        self.heard
+            .lock()
+            .expect("what was heard")
+            .insert(delegation_id.to_owned(), offset_ms);
+    }
+
     /// What the host wrote: the command's wire word, the delegation it named and its text.
     pub fn written(&self) -> Written {
         self.written.lock().expect("what was written").clone()
@@ -206,16 +215,21 @@ impl kr_client::services::host_call::HostCallControl for StandInSideband {
         Box::pin(async { Ok(()) })
     }
 
-    fn heard(&self, _delegation_id: &str) -> Option<u64> {
-        None
+    fn heard(&self, delegation_id: &str) -> Option<u64> {
+        self.heard
+            .lock()
+            .expect("what was heard")
+            .get(delegation_id)
+            .copied()
     }
 
     fn heard_within<'a>(
         &'a self,
-        _delegation_id: &'a str,
+        delegation_id: &'a str,
         _within: std::time::Duration,
     ) -> kr_client::services::host_call::HostFuture<'a, Option<u64>> {
-        Box::pin(async { None })
+        let heard = self.heard(delegation_id);
+        Box::pin(async move { heard })
     }
 
     fn listen(&self, _listener: kr_client::services::host_call::HostCallListener) {}

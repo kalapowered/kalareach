@@ -46,8 +46,8 @@ pub use context::{
 pub use credentials::VoiceCredentials;
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use host_call::{
-    DelegationKind, DelegationRecord, FINAL_STATUS_KEEP_MS, FINAL_STATUS_RECORDS, FinalStatus,
-    HostCall, HostCalls, NoteSupport, performed_words,
+    ContextSelected, DelegationKind, DelegationRecord, FINAL_STATUS_KEEP_MS, FINAL_STATUS_RECORDS,
+    FinalStatus, HostCall, HostCalls, NoteSupport, SendSupport, performed_words,
 };
 pub use submit::{HostDispatch, ProposalSubmitter, method_for};
 pub use worker_half::{
@@ -102,6 +102,33 @@ pub struct VoiceModule {
     /// The calls on the owner's own key that this host controls itself: the phone's heartbeats,
     /// its notes and the news it has not yet been told.
     host_calls: HostCalls,
+    /// Whether the tick that watches those calls is running.
+    ticking: std::sync::atomic::AtomicBool,
+    /// The time the voice service's own tasks decide on. The daemon sets its settled clock.
+    clock: Clock,
+}
+
+/// A source of the current time, in milliseconds since the epoch.
+#[derive(Clone)]
+pub struct Clock(Arc<dyn Fn() -> u64 + Send + Sync>);
+
+impl Clock {
+    /// A clock that reads `read`.
+    pub fn new(read: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        Self(Arc::new(read))
+    }
+
+    /// The time now.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for Clock {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Clock")
+    }
 }
 
 impl VoiceModule {
@@ -142,13 +169,63 @@ impl VoiceModule {
             coordinator,
             broker_origin,
             host_calls,
+            ticking: std::sync::atomic::AtomicBool::new(false),
+            clock: Clock::new(|| kr_ipc::now_ms().get()),
         }
+    }
+
+    /// Replaces the clock the voice service's own tasks decide on.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Takes the one place for the tick that watches the calls the host controls itself. Says
+    /// whether it was free; the caller that takes it runs the tick and gives the place back.
+    pub fn claim_tick(&self) -> bool {
+        self.ticking
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Gives the tick's place back.
+    pub fn release_tick(&self) {
+        self.ticking
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The calls on the owner's own key that this host controls itself.
     #[must_use]
     pub const fn host_calls(&self) -> &HostCalls {
         &self.host_calls
+    }
+
+    /// One pass of the voice service's own tick, at `now_ms`.
+    ///
+    /// While the host holds a call on the owner's own key it ends the calls that are over at their
+    /// deadline, with or without an account, and begins the closure of each call whose phone has
+    /// not been heard from for [`kr_protocol::voice_host::HOST_CLIENT_ABSENT_SECONDS`], as a stop
+    /// would (the grant first, then the provider). A host with no such call does nothing.
+    pub async fn tick(&self, now_ms: u64) {
+        if self.host_calls.is_empty() {
+            return;
+        }
+        for voice_session_id in self.host_calls.tick(now_ms).await {
+            self.coordinator
+                .end_call(
+                    voice_session_id,
+                    kr_protocol::voice_host::VoiceEndReason::Silence,
+                    now_ms,
+                )
+                .await;
+        }
+        self.coordinator.end_calls_that_are_over(now_ms).await;
     }
 
     /// The managed broker's origin this service names to a device whose voice session starts,
@@ -336,7 +413,7 @@ impl VoiceModule {
     /// delegation is claimed like the others, and the coordinator spends the delegation's own
     /// identifier as well, so the same delegation under another action is not a second action.
     pub async fn answer(
-        &self,
+        self: &Arc<Self>,
         actor: VoiceActor,
         mutation: &MutationRequest,
         method: Method,
@@ -455,6 +532,8 @@ impl VoiceModule {
             } => {
                 let support = ReadAgain {
                     coordinator: &self.coordinator,
+                    facts: &*self.facts,
+                    decided: self.facts.privacy(),
                     device_id,
                     now_ms,
                 };
@@ -473,28 +552,34 @@ impl VoiceModule {
         }
     }
 
-    /// Answers `voice.context.send`.
-    fn context_send(
-        &self,
+    /// Answers `voice.context.send`: the selection goes to the model in paced appends, by the call
+    /// object's own sender.
+    async fn context_send(
+        self: &Arc<Self>,
         device_id: DeviceId,
+        action_id: ActionId,
         params: &kr_protocol::voice_host::VoiceContextSendParams,
+        now_ms: u64,
     ) -> kr_protocol::voice_host::VoiceContextSendResult {
-        use kr_protocol::voice_host::{VoiceContextSendResult, VoiceHostRefusal};
+        use kr_protocol::voice_host::VoiceContextSendResult;
         match self
             .host_calls
             .of_device(params.voice_session_id, device_id)
         {
-            // The sender that writes a selection in paced appends is not wired yet: a call the
-            // host holds is not ready for one.
-            Ok(_) => VoiceContextSendResult::Refused {
-                reason: VoiceHostRefusal::NotReady,
-            },
+            Ok(call) => {
+                let support = Arc::new(ModuleSend {
+                    module: Arc::clone(self),
+                    device_id,
+                });
+                call.send_context(action_id, params.clone(), support, now_ms)
+                    .await
+            }
             Err(reason) => VoiceContextSendResult::Refused { reason },
         }
     }
 
     async fn dispatch(
-        &self,
+        self: &Arc<Self>,
         actor: VoiceActor,
         mutation: &MutationRequest,
         method: Method,
@@ -567,6 +652,18 @@ impl VoiceModule {
             Method::VoiceDelegate => {
                 let params: kr_protocol::voice::VoiceDelegateParams = parse(&mutation.params)?;
                 let device_id = device_of(actor)?;
+                // A call the host controls itself is one whose side channel heard what the model
+                // said: an identifier it never heard is not a delegation of this call.
+                if let Ok(call) = self
+                    .host_calls
+                    .of_device(params.voice_session_id, device_id)
+                    && !call.announced(params.delegation_id.as_str()).await
+                {
+                    return Err(voice_error(kr_voice::VoiceError::refused(
+                        kr_protocol::voice::VoiceRefusal::UnannouncedDelegation,
+                        "the provider never announced that delegation to this call",
+                    )));
+                }
                 let answered = self
                     .coordinator
                     .delegate(device_id, action_id, &params, now_ms, admission)
@@ -600,7 +697,11 @@ impl VoiceModule {
             Method::VoiceContextSend => {
                 let params: kr_protocol::voice_host::VoiceContextSendParams =
                     parse(&mutation.params)?;
-                value(&self.context_send(device_of(actor)?, &params))
+                value(
+                    &self
+                        .context_send(device_of(actor)?, action_id, &params, now_ms)
+                        .await,
+                )
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a voice mutation",
@@ -614,8 +715,23 @@ impl VoiceModule {
 /// grants, the history bound and privacy mode as they stand now.
 struct ReadAgain<'a> {
     coordinator: &'a Coordinator,
+    facts: &'a dyn SessionFacts,
+    /// Privacy mode as it stood when the note's request began; a read that privacy mode moved under
+    /// is not given.
+    decided: crate::privacy::Published,
     device_id: DeviceId,
     now_ms: u64,
+}
+
+/// What the host tells a device when the read behind a note failed, by what failed: a grant or the
+/// history bound that no longer allows it is `outside_grant`, and a host that could not say is
+/// `not_ready`, which keeps the note owed.
+fn refusal_of_the_read(error: &kr_voice::VoiceError) -> kr_protocol::voice_host::VoiceHostRefusal {
+    use kr_protocol::voice_host::VoiceHostRefusal;
+    match error {
+        kr_voice::VoiceError::Refused { .. } => VoiceHostRefusal::OutsideGrant,
+        _ => VoiceHostRefusal::NotReady,
+    }
 }
 
 impl NoteSupport for ReadAgain<'_> {
@@ -626,6 +742,7 @@ impl NoteSupport for ReadAgain<'_> {
         'a,
         std::result::Result<String, kr_protocol::voice_host::VoiceHostRefusal>,
     > {
+        use kr_protocol::voice_host::VoiceHostRefusal;
         Box::pin(async move {
             let again = self
                 .coordinator
@@ -637,13 +754,137 @@ impl NoteSupport for ReadAgain<'_> {
                     self.now_ms,
                 )
                 .await
-                .map_err(|_| kr_protocol::voice_host::VoiceHostRefusal::OutsideGrant)?;
+                .map_err(|error| refusal_of_the_read(&error))?;
+            // Privacy mode removes what a model wrote and what the host observed: a read it moved
+            // under is not given.
+            if !self.facts.unmoved(self.decided) {
+                return Err(VoiceHostRefusal::Privacy);
+            }
             match again.outcome {
                 kr_protocol::voice::VoiceDelegationOutcome::Performed { summary, .. } => {
                     Ok(summary)
                 }
-                _ => Err(kr_protocol::voice_host::VoiceHostRefusal::OutsideGrant),
+                _ => Err(VoiceHostRefusal::OutsideGrant),
             }
+        })
+    }
+
+    fn allowed_now<'a>(
+        &'a self,
+        record: &'a DelegationRecord,
+    ) -> kr_client::services::host_call::HostFuture<
+        'a,
+        std::result::Result<(), kr_protocol::voice_host::VoiceHostRefusal>,
+    > {
+        use kr_protocol::voice_host::VoiceHostRefusal;
+        Box::pin(async move {
+            self.coordinator
+                .allows_restate(
+                    self.device_id,
+                    record.delegate_action_id,
+                    &record.params,
+                    &record.kept,
+                    self.now_ms,
+                )
+                .await
+                .map_err(|error| refusal_of_the_read(&error))?;
+            if self.facts.unmoved(self.decided) {
+                Ok(())
+            } else {
+                Err(VoiceHostRefusal::Privacy)
+            }
+        })
+    }
+}
+
+/// What a call's context sender reads of this host: the coordinator's selection and its checks, and
+/// privacy mode, under the device that owns the call.
+struct ModuleSend {
+    module: Arc<VoiceModule>,
+    device_id: DeviceId,
+}
+
+/// The stop a failed check of a running send is.
+fn stop_of_the_check(error: &kr_voice::VoiceError) -> kr_protocol::voice_host::VoiceContextStop {
+    use kr_protocol::voice::VoiceRefusal;
+    use kr_protocol::voice_host::VoiceContextStop;
+    match error.reason() {
+        // The call is gone: what ended it is told as the call's own end.
+        Some(VoiceRefusal::UnknownVoiceSession) => VoiceContextStop::Stop,
+        _ => VoiceContextStop::Grant,
+    }
+}
+
+impl SendSupport for ModuleSend {
+    fn now_ms(&self) -> u64 {
+        self.module.clock.now_ms()
+    }
+
+    fn select<'a>(
+        &'a self,
+        params: &'a kr_protocol::voice_host::VoiceContextSendParams,
+    ) -> kr_client::services::host_call::HostFuture<
+        'a,
+        std::result::Result<ContextSelected, kr_protocol::voice_host::VoiceHostRefusal>,
+    > {
+        use kr_protocol::voice_host::VoiceHostRefusal;
+        Box::pin(async move {
+            let read = kr_protocol::voice::VoiceContextParams {
+                voice_session_id: params.voice_session_id,
+                session_id: params.session_id,
+                selected: params.selected.clone(),
+                delegation_id: params.delegation_id.clone(),
+            };
+            // The same rule as `voice.context`: a reading that privacy mode moved under is made
+            // again, and given up on when it keeps moving.
+            for _ in 0..CONTEXT_READS {
+                let decided = self.module.facts.privacy();
+                let lower_bound_ms = self
+                    .module
+                    .coordinator
+                    .context_allowed(self.device_id, params.voice_session_id, params.session_id)
+                    .map_err(|error| refusal_of_the_read(&error))?;
+                let result = self
+                    .module
+                    .coordinator
+                    .context(self.device_id, &read)
+                    .await
+                    .map_err(|error| refusal_of_the_read(&error))?;
+                if self.module.facts.unmoved(decided) {
+                    return Ok(ContextSelected {
+                        selection: result.selection,
+                        lower_bound_ms,
+                        decided,
+                    });
+                }
+            }
+            Err(VoiceHostRefusal::Privacy)
+        })
+    }
+
+    fn still_allowed<'a>(
+        &'a self,
+        params: &'a kr_protocol::voice_host::VoiceContextSendParams,
+        selected: &'a ContextSelected,
+    ) -> kr_client::services::host_call::HostFuture<
+        'a,
+        std::result::Result<(), kr_protocol::voice_host::VoiceContextStop>,
+    > {
+        use kr_protocol::voice_host::VoiceContextStop;
+        Box::pin(async move {
+            let bound = self
+                .module
+                .coordinator
+                .context_allowed(self.device_id, params.voice_session_id, params.session_id)
+                .map_err(|error| stop_of_the_check(&error))?;
+            // A bound that moved later hides history the selection already holds.
+            if bound.unwrap_or(0) > selected.lower_bound_ms.unwrap_or(0) {
+                return Err(VoiceContextStop::History);
+            }
+            if !self.module.facts.unmoved(selected.decided) {
+                return Err(VoiceContextStop::Privacy);
+            }
+            Ok(())
         })
     }
 }
@@ -712,6 +953,41 @@ mod tests {
     use kr_client::services::ServiceHeader;
     use kr_protocol::hostinfo::configuration::{self, ConfigurationDocument};
     use kr_protocol::scalars::Nullable;
+
+    /// A performed note's re-read that failed is told by what failed: a refusal of a grant or of the
+    /// history bound is `outside_grant`, and a host that could not say is `not_ready`, which keeps
+    /// the note owed.
+    #[test]
+    fn a_re_read_that_failed_is_told_by_what_failed() {
+        use kr_protocol::voice::VoiceRefusal;
+        use kr_protocol::voice_host::VoiceHostRefusal;
+        for reason in [
+            VoiceRefusal::OutsideVoiceGrant,
+            VoiceRefusal::OutsideDeviceGrant,
+            VoiceRefusal::SessionOutsideVoiceSession,
+            VoiceRefusal::UnknownVoiceSession,
+        ] {
+            assert_eq!(
+                refusal_of_the_read(&kr_voice::VoiceError::refused(reason, "refused")),
+                VoiceHostRefusal::OutsideGrant,
+                "{reason:?}"
+            );
+        }
+        for error in [
+            kr_voice::VoiceError::InvalidArgument("only a read is answered again".to_owned()),
+            kr_voice::VoiceError::NotConfigured("no voice service".to_owned()),
+            kr_voice::VoiceError::Host(ProtocolError::new(
+                ErrorCode::ResourceUnavailable,
+                "the host could not say",
+            )),
+        ] {
+            assert_eq!(
+                refusal_of_the_read(&error),
+                VoiceHostRefusal::NotReady,
+                "{error}"
+            );
+        }
+    }
 
     /// An exchange that is never made: building a broker client does not reach the network.
     #[derive(Debug)]

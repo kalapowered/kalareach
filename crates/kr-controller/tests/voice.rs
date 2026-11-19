@@ -3646,3 +3646,91 @@ async fn a_heartbeat_after_a_stop_is_answered_from_the_final_status_and_the_othe
         }
     );
 }
+
+/// `voice.delegate` for a call the host controls itself is refused for an identifier the call's own
+/// side channel never heard, and spends nothing: the same identifier is admitted once the channel
+/// has heard it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_delegate_on_a_host_call_refuses_an_id_its_side_channel_never_heard_and_spends_nothing()
+ {
+    let (provider, voice, call) = own_key_call().await;
+    voice.reads_everything_as(voice.submitting_a_prompt());
+    let params = voice.prompt(call, "d-unheard");
+
+    let refused = voice
+        .delegate(ActionId::new(kr_ipc::new_uuid()), &params)
+        .await
+        .expect_err("a delegation the side channel never heard is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(
+        refused.message.contains("never announced"),
+        "the refusal says the provider never announced it: {}",
+        refused.message
+    );
+
+    provider.sideband().hear(params.delegation_id.as_str(), 0);
+    let admitted = voice
+        .delegate(ActionId::new(kr_ipc::new_uuid()), &params)
+        .await
+        .expect("the same identifier is admitted once the side channel heard it");
+    assert_eq!(admitted.delegation_id, params.delegation_id);
+}
+
+/// A phone that has not been heard from for two beats is told to the model once, and one that has
+/// not been heard from for two minutes has its call closed by the host's own tick, as a stop would:
+/// the provider is asked to close it, and the phone's next heartbeat learns the reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_phone_not_heard_from_for_two_minutes_has_its_call_closed_by_the_hosts_tick_as_silence() {
+    use kr_protocol::voice_host::{
+        HostNote, VoiceControlArm, VoiceControlResult, VoiceEndReason, VoiceHostCallState,
+    };
+    let (provider, voice, call) = own_key_call().await;
+    let module = Arc::clone(voice.host.controller().voice());
+    let now = kr_ipc::now_ms().get();
+
+    module.tick(now + 45_000).await;
+    assert_eq!(
+        provider.sideband().written(),
+        [(
+            "instructions".to_owned(),
+            None,
+            Some(HostNote::PhoneSilent.words().to_owned())
+        )],
+        "two missed beats are told to the model"
+    );
+    assert!(provider.closed().is_empty(), "the call is still held");
+
+    module.tick(now + 60_000).await;
+    assert_eq!(provider.sideband().written().len(), 1, "told once");
+    assert!(provider.closed().is_empty());
+
+    module.tick(now + 125_000).await;
+    assert_eq!(
+        provider.closed(),
+        ["own-1"],
+        "the provider was asked to close the call"
+    );
+
+    let VoiceControlResult::Heartbeat { state, .. } = voice
+        .control(
+            ActionId::new(kr_ipc::new_uuid()),
+            call,
+            VoiceControlArm::Heartbeat {
+                after_seq: U64::new(0),
+            },
+        )
+        .await
+        .expect("a heartbeat after the closure is answered")
+    else {
+        panic!("a heartbeat answer");
+    };
+    assert_eq!(
+        state,
+        VoiceHostCallState::Closed {
+            reason: VoiceEndReason::Silence
+        }
+    );
+}
