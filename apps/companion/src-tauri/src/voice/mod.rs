@@ -2718,6 +2718,143 @@ mod tests {
         );
     }
 
+    /// A file that keeps the earlier start `a-0001` of the first host, and the standing entry that
+    /// a start `b-0002` of that host opens before it is sent.
+    fn the_file_of_an_earlier_start_and_a_start_being_sent(
+        directory: &std::path::Path,
+    ) -> (Calls, u64) {
+        Kept::at(directory)
+            .write(&KeptVoice {
+                owed: vec![entry(START_KEPT, "a-0001", host(1))],
+                note: None,
+            })
+            .expect("the file is written");
+        let calls = calls_in(directory);
+        let shared = calls.shared.as_ref().expect("a phone holds calls");
+        let owner = shared
+            .next_owner
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(shared.stand_open_durably(owner, entry(START_UNKNOWN, "b-0002", host(1))));
+        (calls, owner)
+    }
+
+    /// A start whose send ended in an error that says no byte of it left this device leaves no
+    /// entry, for each of those errors, and the earlier start stays and is still the one a later
+    /// refusal names. An error that does not say so leaves the start, hidden, and a refusal at the
+    /// hold leaves no entry.
+    #[test]
+    fn a_start_that_never_left_this_device_leaves_the_earlier_start_and_no_entry_of_its_own() {
+        use kr_client::error::ClientError;
+        use kr_protocol::error::{ErrorCode, ProtocolError};
+        let cases: Vec<(ClientError, bool, bool)> = vec![
+            (ClientError::Withheld, false, false),
+            (ClientError::Misdirected { repeating: false }, false, false),
+            (ClientError::OtherHost, false, false),
+            (ClientError::StillAccounting, false, false),
+            (ClientError::NoActionWindow, false, false),
+            (
+                ClientError::TooManyOutstandingMutations { limit: 8 },
+                false,
+                false,
+            ),
+            (
+                ClientError::TooManyUnresolvedActions { limit: 64 },
+                false,
+                false,
+            ),
+            (
+                ClientError::Host(ProtocolError::new(ErrorCode::DraftConflict, "held")),
+                false,
+                true,
+            ),
+            (
+                ClientError::Host(ProtocolError::new(ErrorCode::PermissionDenied, "no")),
+                true,
+                false,
+            ),
+            (ClientError::ConnectionEnded, true, false),
+        ];
+        for (error, keeps_the_start, is_the_hold_refusal) in cases {
+            let directory = tempfile::tempdir().expect("a folder");
+            let (calls, owner) =
+                the_file_of_an_earlier_start_and_a_start_being_sent(directory.path());
+            let shared = calls.shared.as_ref().expect("a phone holds calls");
+            assert_eq!(
+                file_holds(directory.path()),
+                vec![pair(START_KEPT, "a-0001"), pair(START_UNKNOWN, "b-0002")],
+                "the entry of the start is on disk beside the earlier start before it is sent"
+            );
+
+            let conflict = super::owner::record_failed_start(
+                shared,
+                owner,
+                &error,
+                entry(START_KEPT, "b-0002", host(1)),
+            );
+
+            assert_eq!(conflict, is_the_hold_refusal, "{error:?}");
+            let mut expected = vec![pair(START_KEPT, "a-0001")];
+            if keeps_the_start {
+                expected.push(pair(START_KEPT, "b-0002"));
+            }
+            assert_eq!(file_holds(directory.path()), expected, "{error:?}");
+            assert_eq!(
+                shared
+                    .start_named_in(host(1), "held under action a-0001, begun", None)
+                    .as_deref(),
+                Some("a-0001"),
+                "the earlier start is still the one a refusal names after {error:?}"
+            );
+        }
+    }
+
+    /// The app ends between a start's send and its answer: the file lists the earlier start and the
+    /// start, the fresh launch shows the start's notice only, and a refusal of a later start that
+    /// names the earlier one finds it, not the start in flight.
+    #[test]
+    fn a_restart_between_a_starts_send_and_its_answer_keeps_both_and_a_refusal_names_the_earlier() {
+        let directory = tempfile::tempdir().expect("a folder");
+        {
+            let (_ended, _) = the_file_of_an_earlier_start_and_a_start_being_sent(directory.path());
+        }
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_KEPT, "a-0001"), pair(START_UNKNOWN, "b-0002")],
+            "the process ended with no answer: both entries are in the file"
+        );
+
+        let fresh = calls_in(directory.path());
+        let shared = fresh.shared.as_ref().expect("a phone holds calls");
+        assert_eq!(
+            actions_shown(&fresh),
+            vec!["b-0002".to_owned()],
+            "the launch shows the notice of the start the host never answered, and not the earlier one"
+        );
+        assert_eq!(
+            shared
+                .start_named_in(
+                    host(1),
+                    "held under action a-0001, begun",
+                    Some("c-0003".to_owned())
+                )
+                .as_deref(),
+            Some("a-0001"),
+            "a refusal of a later start that names the earlier start finds it"
+        );
+        assert_eq!(
+            shared
+                .start_named_in(host(1), "held under action b-0002, begun", None)
+                .as_deref(),
+            Some("b-0002"),
+            "and one that names the start in flight finds that one"
+        );
+        assert_eq!(
+            file_holds(directory.path()),
+            vec![pair(START_KEPT, "a-0001"), pair(START_UNKNOWN, "b-0002")],
+            "the launch changed nothing in the file"
+        );
+    }
+
     /// The starts a launch kept, by the kinds of D-3731's table, are what the launch that follows
     /// finds and names: a fresh `Calls` over the file the first one wrote finds the older kept
     /// start and the start the host never answered as candidates, shows only the notices, and

@@ -5278,6 +5278,156 @@ fn waiting_on_the_service() -> (Timings, HttpDeadlines) {
     )
 }
 
+/// KR-REQ-23.24: a start that is still on its way to the host when the application ends reaches
+/// the host after the next launch's first start has passed and finished, and the host still holds
+/// the device for it. The launch's next plain start is refused in the first start's words, the
+/// refusal offers "Start again" for that start, which the launch still keeps although the later
+/// start passed, and the start that names it reaches the host and is admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_reaches_the_host_after_the_next_launch_passed_is_still_named_by_that_launch()
+{
+    let timings = Timings {
+        // The first start is held on its way by the test's own control: no bound of time decides
+        // this case.
+        start_within: Duration::from_secs(600),
+        host_within: Duration::from_secs(600),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let handle = scene.phone.companion.app.handle().clone();
+    let reach = || -> Arc<dyn companion_tauri::voice::HostReach> {
+        Arc::new(companion_tauri::voice::AppReach::new(handle.clone()))
+    };
+
+    // The first start is held before the host reads it, and the file holds its entry.
+    scene.link.hold_next_request(HostMethod::VoiceStart);
+    let prepared = scene.prepared().await;
+    let first = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    scene.link.until_request_held().await;
+    let file = kept_file_where(scene.phone.data.path(), |file| {
+        file["owed"]
+            .as_array()
+            .is_some_and(|owed| owed.len() == 1 && owed[0]["kind"] == "start_unknown")
+    })
+    .await;
+    let earlier = file["owed"][0]["action_id"]
+        .as_str()
+        .expect("the start names its action")
+        .to_owned();
+    // The notice has no time lapse in the file the next launch reads: a finite time written there
+    // would lapse it while the host may still hold the device.
+    assert_eq!(
+        milliseconds(&file["owed"][0]["until_ms"]),
+        u64::MAX,
+        "{file}"
+    );
+
+    // The application ends here: the next launch reads the file this one left, and its first start
+    // passes the host while the first is still on its way.
+    let directory = copy_of_the_kept_file(scene.phone.data.path(), "next-launch");
+    let launched = calls_on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    );
+    launched.know_pairings(companion_tauri::hosts::pairing_known(handle.clone()));
+    assert!(
+        as_read(&launched.state(None))["owed"]
+            .as_array()
+            .expect("the entries")
+            .iter()
+            .any(|owed| owed["action_id"] == earlier.as_str()),
+        "the launch shows the notice of the start the host never answered"
+    );
+    let prepared = scene.prepared().await;
+    let second = launched
+        .start(
+            request_of(&scene, &prepared),
+            reach(),
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("the launch's first start passes the host");
+    assert!(
+        matches!(&second, companion_tauri::voice::Started::Result(_)),
+        "the host answered the launch's start with its call"
+    );
+    let _ = launched.stop(None, &*reach()).await;
+    kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(|owed| {
+            owed.iter().any(|owed| {
+                owed["action_id"] == earlier.as_str() && owed["kind"] == "start_unanswered"
+            })
+        })
+    })
+    .await;
+
+    // The first start reaches the host now, and the service cannot say what became of it.
+    scene.stand_in.lose_creation_answers(true);
+    scene.link.release_request();
+    let late = first
+        .await
+        .expect("the first start ran")
+        .expect("the host answers the first start");
+    assert!(
+        late["value"]["outcome"]["creation_unknown"].is_object(),
+        "the host could not learn what became of the late start: {late}"
+    );
+
+    // A plain start of the launch is held, in words that name the late start, and the launch offers
+    // that start for "Start again" although a later start of its own passed.
+    let prepared = scene.prepared().await;
+    let asked = scene.stand_in.count("/api/voice/sessions");
+    let held = launched
+        .start(
+            request_of(&scene, &prepared),
+            reach(),
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect_err("the host holds the device for the late start");
+    assert_eq!(
+        held.code,
+        kr_protocol::error::ErrorCode::DraftConflict,
+        "{held:?}"
+    );
+    assert_eq!(
+        held.start_again_for.as_deref(),
+        Some(earlier.as_str()),
+        "the launch offers the late start: {held:?}"
+    );
+    assert_eq!(
+        scene.stand_in.count("/api/voice/sessions"),
+        asked,
+        "the held start asked the service for nothing"
+    );
+
+    // The start that names it reaches the host and is admitted.
+    scene.stand_in.lose_creation_answers(false);
+    let mut again = request_of(&scene, &prepared);
+    again.after = Some(earlier.parse().expect("an action identifier"));
+    let recovered = launched
+        .start(again, reach(), Arc::clone(&scene.tokens))
+        .await
+        .expect("a start that names the standing start passes the hold");
+    assert!(
+        matches!(&recovered, companion_tauri::voice::Started::Result(result)
+            if matches!(result.outcome, kr_protocol::voice::VoiceStartOutcome::Started { .. })),
+        "the host admitted the named start with a call of its own"
+    );
+    assert_eq!(
+        scene.stand_in.count("/api/voice/sessions"),
+        asked + 1,
+        "the named start asked the service once"
+    );
+    let _ = launched.stop(None, &*reach()).await;
+    scene.stop_host().await;
+}
+
 /// A call whose close the voice service has not confirmed, though this device asked, is owed until
 /// the call's own limit has passed, and a new start inside the window in which the answer is
 /// awaited does not lose it. The device says it is still finalising while the earlier call's answer
