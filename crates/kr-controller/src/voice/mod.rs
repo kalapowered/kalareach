@@ -108,6 +108,9 @@ pub struct VoiceModule {
     ticking: std::sync::atomic::AtomicBool,
     /// The time the voice service's own tasks decide on. The daemon sets its settled clock.
     clock: Clock,
+    /// The grant seam, kept for the testing fault on its revocations.
+    #[cfg(feature = "testing")]
+    authority: Arc<GrantAuthority>,
 }
 
 /// A source of the current time, in milliseconds since the epoch.
@@ -151,6 +154,8 @@ impl VoiceModule {
         broker_origin: String,
     ) -> Self {
         let host_calls = HostCalls::new();
+        #[cfg(feature = "testing")]
+        let held_authority = Arc::clone(&authority);
         let coordinator = Coordinator::new(
             Arc::new(FilteredContext::new(Arc::clone(&facts))),
             authority,
@@ -173,7 +178,16 @@ impl VoiceModule {
             host_calls,
             ticking: std::sync::atomic::AtomicBool::new(false),
             clock: Clock::new(|| kr_ipc::now_ms().get()),
+            #[cfg(feature = "testing")]
+            authority: held_authority,
         }
+    }
+
+    /// Makes every revocation of a grant fail, or lets them through again: a call whose end the
+    /// host cannot complete keeps running, as it does when the grant store fails.
+    #[cfg(feature = "testing")]
+    pub fn refuse_grant_revocations(&self, on: bool) {
+        self.authority.refuse_revocations(on);
     }
 
     /// Replaces the clock the voice service's own tasks decide on.

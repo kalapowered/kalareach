@@ -182,6 +182,13 @@ impl Controller {
         self.own_voice.registry().track()
     }
 
+    /// Makes every revocation of a voice grant fail, or lets them through again, so that a call
+    /// the host ends keeps running.
+    #[cfg(feature = "testing")]
+    pub fn own_key_refuse_grant_revocations(&self, on: bool) {
+        self.voice().refuse_grant_revocations(on);
+    }
+
     /// The environment's voice service.
     ///
     /// # Panics

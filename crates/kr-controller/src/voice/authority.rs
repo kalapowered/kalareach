@@ -28,6 +28,10 @@ pub struct GrantAuthority {
     /// because the daemon owns the voice service, and a counted reference the other way would
     /// keep a daemon, and its environment lock, alive.
     daemon: std::sync::Weak<crate::service::Controller>,
+    /// Whether every revocation is refused, for a case that needs a call the end could not close.
+    /// Only a build with the `testing` feature has it.
+    #[cfg(feature = "testing")]
+    refuse_revocations: std::sync::atomic::AtomicBool,
 }
 
 impl GrantAuthority {
@@ -44,7 +48,16 @@ impl GrantAuthority {
             devices,
             host_device_id,
             daemon,
+            #[cfg(feature = "testing")]
+            refuse_revocations: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Makes every revocation fail, or lets them through again.
+    #[cfg(feature = "testing")]
+    pub fn refuse_revocations(&self, on: bool) {
+        self.refuse_revocations
+            .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// What decides whether a grant stands: its anchor on the continuous clock and its expiry in
@@ -417,6 +430,16 @@ impl VoiceAuthority for GrantAuthority {
         now_ms: u64,
         admission: &dyn kr_voice::Admission,
     ) -> kr_voice::Result<Revoked> {
+        #[cfg(feature = "testing")]
+        if self
+            .refuse_revocations
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(VoiceError::Host(kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::ResourceUnavailable,
+                "a revocation refused by the test".to_owned(),
+            )));
+        }
         // The store's own cascade: revoking a parent revokes its descendants, which is what makes
         // withdrawing a standing voice grant end the calls running under it.
         // The admission check inside the transaction is the caller's authority to revoke, which

@@ -964,6 +964,15 @@ impl OwnVoiceProvider {
             .collect()
     }
 
+    /// One bounded hangup of each call this provider still holds live. A settle that could not
+    /// wait for the tasks of the calls it ended uses it, so that no call runs to its deadline at
+    /// the owner's cost. It marks no row and deletes none.
+    pub async fn hang_up_live_calls(&self) {
+        for session in &self.live_sessions() {
+            let _ = self.cleanup_hangup(session).await;
+        }
+    }
+
     fn check(request: &VoiceSessionRequest) -> Result<()> {
         if request.duration_seconds > OWN_CALL_MAX_SECONDS {
             return Err(host_error(ErrorCode::InvalidArgument, words::TOO_LONG));

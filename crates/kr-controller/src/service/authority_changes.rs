@@ -1498,15 +1498,17 @@ impl Controller {
         let settled = provider.settle().await;
         self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
             .await;
-        let quiet = provider.registry().quiesce(CLEANUP_BOUND).await;
-        let left = provider.close_stored_calls().await;
-        if !quiet {
+        if !provider.registry().quiesce(CLEANUP_BOUND).await {
             // A task that still runs may read the key and write a row, and the call it holds may
-            // not be in the record yet. The key and the record stay as they are, and the fence
+            // not be in the record yet. The key and every row stay as they are, and the fence
             // stays until that task has ended: no start is admitted and no key is put meanwhile.
+            // A call the end did not close is hung up once, so that it does not run to its
+            // deadline at the owner's cost.
+            provider.hang_up_live_calls().await;
             provider.registry().unfence_when_quiet();
             return Err(refused_voice(words::STILL_CLOSING));
         }
+        let left = provider.close_stored_calls().await;
         // No stored call with a session id stands, so each was confirmed closed: a late session
         // that was hung up is closed, whatever the start reported.
         let settled = if left == StoredCalls::NoneLeft && settled == StartSettled::MayStillRun {
@@ -1566,16 +1568,16 @@ impl Controller {
         self.end_host_calls(kr_protocol::voice_host::VoiceEndReason::CredentialRemoved)
             .await;
         if !provider.registry().quiesce(CLEANUP_BOUND).await {
-            // A task that still runs may read the key and write a row: the record stays as it is
-            // and the fence stays until that task has ended.
+            // A task that still runs may read the key and write a row: every row stays as it is
+            // and the fence stays until that task has ended. A call the end did not close is hung
+            // up once, so that it does not run to its deadline at the owner's cost.
+            provider.hang_up_live_calls().await;
             provider.registry().unfence_when_quiet();
             return Err(refused_voice(words::STILL_CLOSING));
         }
         // A call whose close was confirmed is hung up no more. One bounded best-effort hangup of
         // each call that is still live, before its record goes.
-        for session in &provider.live_sessions() {
-            let _ = provider.cleanup_hangup(session).await;
-        }
+        provider.hang_up_live_calls().await;
         let forgotten = provider.ledger().forget_all();
         provider.registry().unfence();
         let forgotten = forgotten.map_err(|_| refused_voice(words::NOT_FORGOTTEN))?;

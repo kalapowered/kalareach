@@ -1203,20 +1203,38 @@ async fn a_plain_removal_that_cannot_confirm_the_late_session_closed_keeps_the_k
     daemon.host.stop().await;
 }
 
-/// A removal that cannot wait out the task of a call it ended keeps the key, the record and the
-/// fence: no start is admitted and no key is put until that task has ended, and then the registry
-/// is free again.
+/// A removal that cannot wait out the task of a call it ended keeps the key, every row and the
+/// fence: the record is not touched while that task may still write to it, no start is admitted and
+/// no key is put until that task has ended, and then the removal runs to its end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removal_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_that_task_ends() {
     let mut daemon = daemon().await;
     let phone = phone(&daemon, &MANAGER).await;
     let _ = started(phone.start().await);
-    // The call's own task has ended in the host; what stays is a task that still holds the key.
+    // The call's close is not heard and its hangup is not confirmed, so its end leaves an
+    // unresolved row. The call's own task has ended in the host; what stays is a task that still
+    // holds the key.
+    daemon.stand_in.answer_close(false);
+    daemon
+        .stand_in
+        .script_hangup(HangupScript::Answer(500, None));
     let task = daemon.host.controller().own_key_task_token();
     let refused = remove_key(&mut daemon.control, &daemon.host)
         .await
         .expect_err("the removal could not wait out the task");
     assert_eq!(refused.message, words::STILL_CLOSING);
+    let rows = rows_of(&daemon);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the record is kept while a task may still write to it"
+    );
+    assert_eq!(rows[0].state, CallState::Unresolved);
+    assert_eq!(
+        daemon.stand_in.recorded().hangups.len(),
+        1,
+        "no stored call is hung up again while the task runs"
+    );
     assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
     assert!(
         the_registry_is(&daemon, RegistryState::Settling),
@@ -1236,26 +1254,82 @@ async fn a_removal_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_that_
 
     drop(task);
     assert!(the_registry_is(&daemon, RegistryState::Idle));
+    let removed = remove_key(&mut daemon.control, &daemon.host)
+        .await
+        .expect("the removal is answered once the task has ended");
+    assert!(removed.removed);
+    assert!(rows_of(&daemon).is_empty());
+    assert_eq!(held_key(&daemon.host), None);
     set_key(&mut daemon.control, &daemon.host, OTHER_KEY)
         .await
-        .expect("the key is replaced once the task has ended");
+        .expect("a key is put once the removal has ended");
     assert_eq!(held_key(&daemon.host).as_deref(), Some(OTHER_KEY));
     daemon.host.stop().await;
 }
 
-/// A forget-calls that cannot wait out the task of a call it ended keeps the fence until that task
-/// has ended, so that the task never finds its record or its key gone, and the registry is free
-/// again once it has.
+/// A removal that cannot wait out a call the end did not close (its grant could not be revoked)
+/// hangs that call up once, and keeps the key, every row and the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_that_cannot_wait_out_a_live_call_hangs_it_up_once_and_keeps_the_key_every_row_and_the_fence()
+ {
+    let mut daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    // The grant of the call cannot be revoked, so the end does not close the call.
+    daemon
+        .host
+        .controller()
+        .own_key_refuse_grant_revocations(true);
+    let refused = remove_key(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("the removal could not wait out the call");
+    assert_eq!(refused.message, words::STILL_CLOSING);
+    assert_eq!(
+        daemon.stand_in.recorded().hangups,
+        vec![(HELD_KEY.to_owned(), "live_u1_stand_in".to_owned())],
+        "the live call is hung up once, with the held key"
+    );
+    let rows = rows_of(&daemon);
+    assert_eq!(rows.len(), 1, "every row stands");
+    assert_eq!(rows[0].state, CallState::Open);
+    assert_eq!(held_key(&daemon.host).as_deref(), Some(HELD_KEY));
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the fence is kept while the call's task runs"
+    );
+    daemon
+        .host
+        .controller()
+        .own_key_refuse_grant_revocations(false);
+    daemon.host.stop().await;
+}
+
+/// A forget-calls that cannot wait out the task of a call it ended keeps every row and the fence
+/// until that task has ended, so that the task never finds its record or its key gone, and the
+/// registry is free again once it has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forget_calls_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_that_task_ends() {
     let mut daemon = daemon().await;
     let phone = phone(&daemon, &MANAGER).await;
     let _ = started(phone.start().await);
+    // The call's close is not heard and its hangup is not confirmed, so its end leaves an
+    // unresolved row, which the refused forget must leave standing.
+    daemon.stand_in.answer_close(false);
+    daemon
+        .stand_in
+        .script_hangup(HangupScript::Answer(500, None));
     let task = daemon.host.controller().own_key_task_token();
     let refused = forget_calls(&mut daemon.control, &daemon.host)
         .await
         .expect_err("forgetting could not wait out the task");
     assert_eq!(refused.message, words::STILL_CLOSING);
+    let rows = rows_of(&daemon);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the record is kept while a task may still write to it"
+    );
+    assert_eq!(rows[0].state, CallState::Unresolved);
     assert!(
         the_registry_is(&daemon, RegistryState::Settling),
         "the fence is kept while the task runs"
@@ -1266,6 +1340,41 @@ async fn a_forget_calls_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_
         .await
         .expect("forgetting is answered once the task has ended");
     assert!(rows_of(&daemon).is_empty());
+    daemon.host.stop().await;
+}
+
+/// A forget-calls that cannot wait out a call the end did not close hangs that call up once and
+/// keeps every row and the fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forget_calls_that_cannot_wait_out_a_live_call_hangs_it_up_once_and_keeps_every_row_and_the_fence()
+ {
+    let mut daemon = daemon().await;
+    let phone = phone(&daemon, &MANAGER).await;
+    let _ = started(phone.start().await);
+    daemon
+        .host
+        .controller()
+        .own_key_refuse_grant_revocations(true);
+    let refused = forget_calls(&mut daemon.control, &daemon.host)
+        .await
+        .expect_err("forgetting could not wait out the call");
+    assert_eq!(refused.message, words::STILL_CLOSING);
+    assert_eq!(
+        daemon.stand_in.recorded().hangups,
+        vec![(HELD_KEY.to_owned(), "live_u1_stand_in".to_owned())],
+        "the live call is hung up once, with the held key"
+    );
+    let rows = rows_of(&daemon);
+    assert_eq!(rows.len(), 1, "every row stands");
+    assert_eq!(rows[0].state, CallState::Open);
+    assert!(
+        the_registry_is(&daemon, RegistryState::Settling),
+        "the fence is kept while the call's task runs"
+    );
+    daemon
+        .host
+        .controller()
+        .own_key_refuse_grant_revocations(false);
     daemon.host.stop().await;
 }
 
