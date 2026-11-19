@@ -466,3 +466,122 @@ async fn two_copies_of_one_action_establish_the_clock_once() {
     );
     assert!(proven(&controller));
 }
+
+/// KR-REQ-09.19: the establishment of the clock holds the device directory while it asks for the
+/// hold on commits at its commit; a raise of a feed refusal holds that hold, for writing, while it
+/// asks for the policy's lock; and a policy commit holds the policy's lock while it asks for the
+/// device directory. Forced into that order, the three finish: the raise lets go of the hold where
+/// the policy's lock is held, so the establishment commits, the policy commit is made, and the
+/// raise takes the lock last. A watchdog ends the process where they wait for each other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_feed_refusal_that_finds_the_policy_held_does_not_hold_up_an_establishment_at_its_commit()
+{
+    const BOUND: Duration = Duration::from_secs(20);
+
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let finished = Arc::clone(&finished);
+        std::thread::spawn(move || {
+            std::thread::sleep(BOUND * 3);
+            if !finished.load(Ordering::SeqCst) {
+                eprintln!(
+                    "an establishment at its commit, a raise of a feed refusal and a policy \
+                     commit wait for each other"
+                );
+                std::process::exit(1);
+            }
+        });
+    }
+    let (temp, controller, ..) = distrusting().await;
+    let door = Door::open(&temp, &controller).await;
+    let challenge = door.challenge().await;
+    door.answer(&challenge.request).await.expect("answered");
+
+    // The establishment stops once it holds the directory's connection.
+    let (connected, let_the_establishment_go) = controller
+        .owner_authority()
+        .pauses
+        .after_the_connection
+        .arm();
+    let establishing = tokio::spawn({
+        let door = door.clone();
+        async move { door.establish().await }
+    });
+    connected
+        .await
+        .expect("the establishment holds the directory");
+
+    // The policy commit takes the policy's lock and stops there, before it goes on to the
+    // directory.
+    let (policy_is_held, held_rx) = std::sync::mpsc::channel();
+    let (let_the_commit_go, go_rx) = std::sync::mpsc::channel::<()>();
+    let committing = tokio::task::spawn_blocking({
+        let controller = Arc::clone(&controller);
+        move || {
+            controller.update_policy(|policy| {
+                policy_is_held
+                    .send(())
+                    .expect("the case waits for the commit");
+                go_rx.recv().expect("the case lets the commit go");
+                policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
+                    maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60 * 60 * 1000),
+                    last_synchronised_at_ms: kr_protocol::scalars::Nullable::some(
+                        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+                    ),
+                }));
+            })
+        }
+    });
+    tokio::task::spawn_blocking(move || held_rx.recv_timeout(BOUND))
+        .await
+        .expect("the wait for the commit ends")
+        .expect("the commit takes the policy's lock");
+
+    // The raise stops once it holds the registry's guard and the hold on commits.
+    let (holding, let_the_raise_go) = controller.after_the_hold_of_a_feed_refusal.arm();
+    let raising = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move {
+            controller
+                .move_a_feed_refusal(
+                    crate::grants::RemoteRefusal::FEED_REMOVED,
+                    true,
+                    crate::grants::HostPolicy::feed_removed,
+                    crate::grants::HostPolicy::set_feed_removed,
+                )
+                .await;
+        }
+    });
+    tokio::task::spawn_blocking(move || holding.recv_timeout(BOUND))
+        .await
+        .expect("the wait for the raise ends")
+        .expect("the raise holds the hold on commits");
+
+    // The establishment asks for the hold, which the raise holds; the commit asks for the
+    // directory, which the establishment holds; and the raise asks for the policy's lock.
+    let_the_establishment_go
+        .send(())
+        .expect("the establishment goes on");
+    let_the_commit_go.send(()).expect("the commit goes on");
+    let_the_raise_go.send(()).expect("the raise goes on");
+
+    tokio::time::timeout(BOUND, establishing)
+        .await
+        .expect("the establishment commits while the raise asks for the policy's lock")
+        .expect("the establishment ends")
+        .expect("the owner establishes the clock");
+    tokio::time::timeout(BOUND, committing)
+        .await
+        .expect("the commit is made once the establishment has left the directory")
+        .expect("the commit ends")
+        .expect("the policy is written");
+    tokio::time::timeout(BOUND, raising)
+        .await
+        .expect("the raise takes the policy's lock once the commit is made")
+        .expect("the raise ends");
+    assert!(
+        controller.feed_refusal.word() & crate::grants::RemoteRefusal::FEED_REMOVED != 0,
+        "the refusal stands"
+    );
+    finished.store(true, Ordering::SeqCst);
+}

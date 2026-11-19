@@ -1245,6 +1245,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             before_the_policy_lock: ThreadPause::default(),
             #[cfg(feature = "testing")]
+            after_the_hold_of_a_feed_refusal: ThreadPause::default(),
+            #[cfg(feature = "testing")]
             after_the_lease_is_read: ThreadPause::default(),
             #[cfg(feature = "testing")]
             before_the_shares_lock: ThreadPause::default(),

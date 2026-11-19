@@ -808,6 +808,12 @@ pub struct Controller {
     /// be owed in that wait. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
     before_the_policy_lock: ThreadPause,
+    /// Where this host's own tests stop a raise of a feed refusal once it holds the registry's
+    /// guard and the hold on commits, before it asks for the policy's lock, so that a commit that
+    /// stands on a registration can ask for the hold in that wait. Compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    after_the_hold_of_a_feed_refusal: ThreadPause,
     /// Where this host's own tests stop a frame's ask once the local owner's lease has been read,
     /// and before the footing's question, so that a fence, a withdrawal or a policy commit can come
     /// after the last wait. Compiled away in every shipped build.
