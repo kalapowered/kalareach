@@ -6,8 +6,12 @@
 //! job's program is the system's own, and everything it is given is inside the tree, on the
 //! internal disk.
 //!
-//! Every job a case registers is removed again when the case ends, however it ends, so a case that
-//! fails leaves nothing registered either.
+//! Every job a case registers is removed again when the case returns and when it panics, as the
+//! stack unwinds, so a case that fails leaves nothing registered either. A case that is killed,
+//! aborted or ended by a time-out runs no destructor and removes nothing: on a Mac its job stays
+//! loaded until something removes it, and on Linux it can leave a transient `systemd --user` unit
+//! that runs `/bin/sleep 300`, which the manager collects when that ends, up to five minutes later;
+//! no unit file is installed.
 
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
@@ -22,7 +26,7 @@ use kr_controller::supervision::{LaunchOutcome, WorkerSupervisor};
 use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::EnvironmentId;
 
-/// A job a case registered, removed from the service manager when the case ends, however it ends.
+/// A job a case registered, removed from the service manager when the case returns or panics.
 struct Registered(String);
 
 impl Drop for Registered {
