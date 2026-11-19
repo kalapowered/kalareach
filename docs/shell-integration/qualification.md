@@ -12,6 +12,8 @@ each one against a real package in a real terminal, and one command that does th
 bash scripts/e2e-fence.sh
 ```
 
+On macOS, set KR_ALLOW_ACCOUNT_LAUNCHD=1 for this command: it starts a daemon and a session, which load a job into the account's own launchd.
+
 That builds or verifies the packages from their pinned upstream releases, fetches the pinned
 customisations by digest, starts a real control daemon and a real managed session, and then drives
 every case. Its evidence goes to the directory `KR_TEST_ARTIFACTS_DIR` names, including
