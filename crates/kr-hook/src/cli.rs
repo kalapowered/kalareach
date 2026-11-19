@@ -1,13 +1,14 @@
 //! What `kr-hook` accepts on its command line, and the exit codes it answers with.
 //!
 //! The command line is fixed by the registrations that start the forwarder and by the shell that
-//! runs an integrated invocation. Each registration names exactly one invocation: `kr-hook
-//! claude-code channel` for Claude Code's Channels server, and `kr-hook claude-code hook`,
-//! `kr-hook gemini-cli hook` and `kr-hook qoder-cli hook` for every hook of Claude Code, Gemini
-//! CLI and Qoder CLI. The shell runs `kr-hook launch -- <executable> <arguments...>` for an
-//! invocation the worker gave a backend. Nothing else is accepted. An unknown application, an
-//! unknown surface, an extra argument or a flag this forwarder does not declare is refused with a
-//! usage error on standard error, before anything is read or connected.
+//! runs an integrated invocation. A registration names exactly one invocation: `kr-hook
+//! claude-code channel` for Claude Code's Channels server, and `kr-hook <application> hook` for each
+//! hook of an application, the application being the word its registration names (`claude-code`,
+//! `gemini-cli` and `qoder-cli` are the words of the packages published today). The shell runs
+//! `kr-hook launch -- <executable> <arguments...>` for an invocation the worker gave a backend.
+//! Nothing else is accepted. A word that is not an application word, an unknown surface, an extra
+//! argument or a flag this forwarder does not declare is refused with a usage error on standard
+//! error, before anything is read or connected.
 //!
 //! The usage error's exit code is [`EXIT_USAGE`], 64, and not the 2 an argument parser uses by
 //! default. Claude Code and Qoder CLI read a hook's exit code: 2 is the one code that blocks an
@@ -18,7 +19,7 @@
 //! read as a refusal of the event it ran for; the Gemini CLI registration names only events whose
 //! refusals Gemini CLI ignores.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory as _, Parser, Subcommand};
 
 /// The exit code of a command line this forwarder does not accept.
 ///
@@ -55,20 +56,9 @@ pub enum Command {
         #[command(subcommand)]
         surface: ClaudeCode,
     },
-    /// Gemini CLI's native bridge: its session and notification hooks.
-    #[command(name = "gemini-cli")]
-    GeminiCli {
-        /// The registration that started this process.
-        #[command(subcommand)]
-        surface: Hooks,
-    },
-    /// Qoder CLI's native bridge: its session, tool and notification hooks.
-    #[command(name = "qoder-cli")]
-    QoderCli {
-        /// The registration that started this process.
-        #[command(subcommand)]
-        surface: Hooks,
-    },
+    /// One hook of an application the registration names: `<application> hook`.
+    #[command(external_subcommand)]
+    Hook(Vec<String>),
     /// Runs an integrated invocation's program, after presenting it to the backend the worker gave
     /// it: the executable, then its argument vector, command name first, after `--`.
     Launch {
@@ -110,11 +100,68 @@ pub enum ClaudeCode {
     Hook,
 }
 
-/// The one registration of a bridge that has hooks and nothing else.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Subcommand)]
-pub enum Hooks {
-    /// One hook: reads the event on standard input and answers `{}`.
-    Hook,
+/// What a usage error says of an invocation that is not `<application> hook`.
+const NOT_AN_INVOCATION: &str = "an invocation is `kr-hook <application> hook`, where the application is a word of lower-case letters, digits and hyphens that does not begin with a hyphen";
+
+/// Returns whether `word` is an application word: lower-case letters, digits and hyphens, and not
+/// beginning with a hyphen, which no command line reads as an option.
+#[must_use]
+pub fn is_application_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word.starts_with('-')
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The application word of an invocation clap did not name, when it is exactly `<application> hook`
+/// and the application is an application word; `None` for anything else.
+#[must_use]
+pub fn hooked_application(words: &[String]) -> Option<&str> {
+    match words {
+        [application, surface] if surface == "hook" && is_application_word(application) => {
+            Some(application)
+        }
+        _ => None,
+    }
+}
+
+fn not_an_invocation() -> clap::Error {
+    Cli::command().error(clap::error::ErrorKind::InvalidSubcommand, NOT_AN_INVOCATION)
+}
+
+/// Parses a command line, the program's name first, and refuses an invocation this forwarder does
+/// not accept: this is the one place that decides what a command line is, for the program and for
+/// every case that holds what it accepts.
+///
+/// # Errors
+///
+/// Returns the usage error clap gives, or the one for an invocation that is not `<application>
+/// hook`: a word that is not an application word, another surface, an extra argument or a `--`.
+pub fn parse_from<I, T>(arguments: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let arguments: Vec<std::ffi::OsString> = arguments.into_iter().map(Into::into).collect();
+    // `--` makes the next word an external command's, which no registration starts.
+    if arguments.get(1).is_some_and(|word| word == "--") {
+        return Err(not_an_invocation());
+    }
+    let cli = Cli::try_parse_from(&arguments)?;
+    match &cli.command {
+        Command::Hook(words) if hooked_application(words).is_none() => Err(not_an_invocation()),
+        _ => Ok(cli),
+    }
+}
+
+/// Parses this process's command line with [`parse_from`].
+///
+/// # Errors
+///
+/// Returns what [`parse_from`] returns.
+pub fn parse() -> Result<Cli, clap::Error> {
+    parse_from(std::env::args_os())
 }
 
 #[cfg(test)]
@@ -124,7 +171,7 @@ mod tests {
     use super::*;
 
     fn parse(arguments: &[&str]) -> Result<Command, clap::Error> {
-        Cli::try_parse_from(std::iter::once("kr-hook").chain(arguments.iter().copied()))
+        parse_from(std::iter::once("kr-hook").chain(arguments.iter().copied()))
             .map(|cli| cli.command)
     }
 
@@ -149,15 +196,11 @@ mod tests {
         );
         assert_eq!(
             parse(&["gemini-cli", "hook"]).expect("Gemini CLI's hook registration"),
-            Command::GeminiCli {
-                surface: Hooks::Hook
-            }
+            Command::Hook(vec!["gemini-cli".to_owned(), "hook".to_owned()])
         );
         assert_eq!(
             parse(&["qoder-cli", "hook"]).expect("Qoder CLI's hook registration"),
-            Command::QoderCli {
-                surface: Hooks::Hook
-            }
+            Command::Hook(vec!["qoder-cli".to_owned(), "hook".to_owned()])
         );
         assert_eq!(
             parse(&["relay"]).expect("the relay"),
@@ -216,16 +259,18 @@ mod tests {
             &["claude-code", "hook", "extra"][..],
             &["claude-code", "channel", "--session", "abc"][..],
             &["claude-code", "--close-after-hello", "hook"][..],
-            &["codex", "hook"][..],
+            &["a_b", "hook"][..],
+            &["Amp", "hook"][..],
+            &["amp", "channel"][..],
+            &["amp", "hook", "extra"][..],
+            &["-amp", "hook"][..],
             &["gemini-cli"][..],
             &["gemini-cli", "channel"][..],
             &["gemini-cli", "hook", "extra"][..],
-            &["gemini", "hook"][..],
             &["qoder-cli"][..],
             &["qoder-cli", "channel"][..],
             &["qoder-cli", "Hook"][..],
             &["qoder-cli", "hook", "--close-after-hello"][..],
-            &["qoder", "hook"][..],
             &["relay", "extra"][..],
             &["--session=abc", "claude-code", "hook"][..],
             &["launch"][..],
@@ -238,6 +283,51 @@ mod tests {
                 refused.use_stderr(),
                 "{arguments:?} is refused on standard error, not answered as help"
             );
+        }
+    }
+
+    /// KR-REQ-11.44: a hook is accepted for any application word, whichever application it is.
+    #[test]
+    fn kr_req_11_44_a_hook_for_any_application_word_is_accepted() {
+        for word in ["amp", "codex", "gemini", "qoder", "a1-b", "7zip"] {
+            match parse_from(["kr-hook", word, "hook"]) {
+                Ok(Cli {
+                    command: Command::Hook(words),
+                }) => assert_eq!(hooked_application(&words), Some(word), "{word}"),
+                Ok(other) => panic!("{word} parsed as {other:?}"),
+                Err(error) => panic!("{word} is refused: {error}"),
+            }
+        }
+    }
+
+    /// KR-REQ-11.44: a word that starts with a hyphen is never an application: a flag is refused as
+    /// a usage error, help and the version are answers, and `-` and `--` reach no hook.
+    #[test]
+    fn kr_req_11_44_a_word_that_starts_with_a_hyphen_is_never_an_application() {
+        for arguments in [
+            &["-amp", "hook"][..],
+            &["-x", "hook"][..],
+            &["-"][..],
+            &["-", "hook"][..],
+            &["--", "hook"][..],
+            &["--", "amp", "hook"][..],
+        ] {
+            match parse_from(std::iter::once("kr-hook").chain(arguments.iter().copied())) {
+                Ok(cli) => panic!("{arguments:?} parsed as {cli:?}"),
+                Err(error) => assert!(
+                    error.use_stderr(),
+                    "{arguments:?} is a usage error on standard error: {error}"
+                ),
+            }
+        }
+        for arguments in [&["--help", "hook"][..], &["--version", "hook"][..]] {
+            match parse_from(std::iter::once("kr-hook").chain(arguments.iter().copied())) {
+                Ok(cli) => panic!("{arguments:?} parsed as {cli:?}"),
+                Err(error) => assert!(
+                    !error.use_stderr(),
+                    "{arguments:?} is an answer, never a hook: {error}"
+                ),
+            }
         }
     }
 }

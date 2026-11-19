@@ -9,15 +9,14 @@ const SESSION_START: &[u8] = br#"{"session_id":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b
 
 /// KR-REQ-11.42: an unknown application, an unknown surface, a surface in the wrong case, an extra
 /// argument or an undeclared flag is refused before anything is read, on standard error, with the
-/// usage code, which is not the code Claude Code or Qoder CLI reads as a request to block. Gemini
-/// CLI and Qoder CLI have hooks and nothing else, so a channel is not a surface of theirs.
+/// usage code, which is not the code Claude Code or Qoder CLI reads as a request to block. A hook
+/// is the only surface of an application other than Claude Code, so a channel is not one of theirs.
 #[test]
 fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
     let placed = Placed::new();
     for arguments in [
         &[][..],
         &["claude-code"][..],
-        &["codex", "hook"][..],
         &["claude-code", "hooks"][..],
         &["claude-code", "Hook"][..],
         &["claude-code", "hook", "--session", "4d1c0a57"][..],
@@ -27,7 +26,6 @@ fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
         &["--help-me"][..],
         &["gemini-cli"][..],
         &["gemini"][..],
-        &["gemini", "hook"][..],
         &["Gemini-CLI", "hook"][..],
         &["gemini-cli", "hooks"][..],
         &["gemini-cli", "Hook"][..],
@@ -35,11 +33,22 @@ fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
         &["gemini-cli", "channel"][..],
         &["gemini-cli", "hook", "--close-after-hello"][..],
         &["qoder-cli"][..],
-        &["qoder", "hook"][..],
-        &["qodercli", "hook"][..],
         &["qoder-cli", "HOOK"][..],
         &["qoder-cli", "hook", "--session", "4d1c0a57"][..],
         &["qoder-cli", "channel"][..],
+        &["amp", "channel"][..],
+        &["launch", "hook"][..],
+        &["relay", "hook"][..],
+        &["a_b", "hook"][..],
+        &["Amp", "hook"][..],
+        &["", "hook"][..],
+        &["-amp", "hook"][..],
+        &["-", "hook"][..],
+        &["--", "hook"][..],
+        &["--", "amp", "hook"][..],
+        &["amp", "hook", "extra"][..],
+        &["gemini-cli", "--help"][..],
+        &["qoder-cli", "--help"][..],
     ] {
         let ran = run_with_input(placed.command(arguments), SESSION_START);
         assert_eq!(
@@ -65,39 +74,29 @@ fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
         &["--help"][..],
         &["--version"][..],
         &["claude-code", "--help"][..],
-        &["gemini-cli", "--help"][..],
-        &["qoder-cli", "--help"][..],
     ] {
         let ran = run_with_input(placed.command(arguments), b"");
         assert_eq!(ran.code, Some(0), "{arguments:?}");
     }
 }
 
-/// KR-REQ-11.44: the invocations the forwarder's command line accepts, apart from its own `launch`
-/// and `relay`, are exactly the ones the host lists as the ones a registration may start, so the
-/// host places no registration the forwarder would refuse and refuses none that it serves.
+/// KR-REQ-11.44: every invocation the host lists as one a registration may start parses, as the
+/// command the forwarder runs it for, through the one function the program parses with.
 #[test]
-fn kr_req_11_44_the_forwarder_accepts_exactly_the_invocations_the_host_may_place() {
-    use clap::CommandFactory as _;
-
-    let mut accepted = std::collections::BTreeSet::new();
-    for application in kr_hook::cli::Cli::command().get_subcommands() {
-        if matches!(application.get_name(), "launch" | "relay") {
-            continue;
-        }
-        for surface in application.get_subcommands() {
-            accepted.insert((
-                application.get_name().to_owned(),
-                surface.get_name().to_owned(),
-            ));
+fn kr_req_11_44_every_invocation_the_host_may_place_parses() {
+    for (word, surface) in kr_worker::broker::bridge::SERVED_INVOCATIONS {
+        match kr_hook::cli::parse_from(["kr-hook", word, surface.as_str()]) {
+            Ok(cli) => assert!(
+                matches!(
+                    cli.command,
+                    kr_hook::cli::Command::Hook(_) | kr_hook::cli::Command::ClaudeCode { .. }
+                ),
+                "{word} {surface:?} parsed as {:?}",
+                cli.command
+            ),
+            Err(error) => panic!("{word} {surface:?} is refused: {error}"),
         }
     }
-    let served: std::collections::BTreeSet<(String, String)> =
-        kr_worker::broker::bridge::SERVED_INVOCATIONS
-            .iter()
-            .map(|(word, surface)| ((*word).to_owned(), surface.as_str().to_owned()))
-            .collect();
-    assert_eq!(accepted, served);
 }
 
 /// KR-REQ-11.42, KR-REQ-11.43: the hook registration's own invocation, in a process whose

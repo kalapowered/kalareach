@@ -400,7 +400,7 @@ mod tests {
             Exchange::open(
                 &registration,
                 Bridge {
-                    application: "claude-code",
+                    application: "claude-code".into(),
                     surface: "hook",
                 },
             )

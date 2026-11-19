@@ -451,7 +451,7 @@ fn the_hello_this_forwarder_writes_has_the_members_of_the_one_the_release_before
     .expect("a whole registration");
     let written = read
         .hello(Some(kr_hook::registration::Bridge {
-            application: "claude-code",
+            application: "claude-code".into(),
             surface: "hook",
         }))
         .expect("a hello");

@@ -20,23 +20,19 @@
 //! | [`exchange`] | The private exchange with the worker: admission and bounded JSON lines |
 //! | `helper` (Unix only) | Handing a launch whose worker runs another release to that release's own forwarder |
 //! | [`hook`] | One observing hook, whichever application started it: prompt, neutral, and never a decision |
-//! | [`claude_code`] | Claude Code's bridge: its Channels server and what its hooks report |
-//! | [`gemini_cli`] | Gemini CLI's bridge: what its hooks report |
-//! | [`qoder_cli`] | Qoder CLI's bridge: what its hooks report |
+//! | [`claude_code`] | Claude Code's Channels server |
 //! | [`launch`] | The launcher an integrated invocation presents itself to its backend through |
 //! | [`relay`] | The byte relay a launched agent reaches its worker through |
 
 pub mod claude_code;
 pub mod cli;
 pub mod exchange;
-pub mod gemini_cli;
 #[cfg(unix)]
 pub mod helper;
 pub mod hook;
 pub mod launch;
 #[cfg(test)]
 mod made;
-pub mod qoder_cli;
 pub mod registration;
 pub mod relay;
 
@@ -52,7 +48,7 @@ pub fn run(command: cli::Command, started: std::time::Instant) -> std::process::
     match command {
         cli::Command::ClaudeCode {
             surface: cli::ClaudeCode::Hook,
-        } => hook::run(&claude_code::HOOKS, started),
+        } => hook::run(hook::Application::for_word("claude-code"), started),
         cli::Command::ClaudeCode {
             surface: cli::ClaudeCode::Channel,
         } => held(|| {
@@ -61,12 +57,10 @@ pub fn run(command: cli::Command, started: std::time::Instant) -> std::process::
             let _ = helper::hand_over(claude_code::channel::REGISTRATION_WAIT, None);
             claude_code::channel::run()
         }),
-        cli::Command::GeminiCli {
-            surface: cli::Hooks::Hook,
-        } => hook::run(&gemini_cli::HOOKS, started),
-        cli::Command::QoderCli {
-            surface: cli::Hooks::Hook,
-        } => hook::run(&qoder_cli::HOOKS, started),
+        cli::Command::Hook(words) => match cli::hooked_application(&words) {
+            Some(application) => hook::run(hook::Application::for_word(application), started),
+            None => held(|| std::process::ExitCode::from(cli::EXIT_USAGE)),
+        },
         cli::Command::Launch {
             hold_after_admission,
             hold_before_exec,

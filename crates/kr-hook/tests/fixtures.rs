@@ -27,7 +27,7 @@
 //! which are the packages' hashes. A copy pins what the release declares, which is all this suite
 //! reads from it.
 
-use kr_hook::cli::{ClaudeCode, Cli, Command, Hooks};
+use kr_hook::cli::{ClaudeCode, Command};
 
 /// A copy, beside the other fixtures at the top of the repository, in the application's own
 /// directory.
@@ -79,7 +79,7 @@ fn parsed(command: &serde_json::Value, args: &serde_json::Value) -> Command {
         .iter()
         .map(|arg| arg.as_str().expect("text"))
         .collect();
-    <Cli as clap::Parser>::try_parse_from(std::iter::once("kr-hook").chain(args.iter().copied()))
+    kr_hook::cli::parse_from(std::iter::once("kr-hook").chain(args.iter().copied()))
         .unwrap_or_else(|error| {
             panic!("{args:?} is not an invocation the forwarder accepts: {error}")
         })
@@ -211,7 +211,7 @@ fn the_qoder_cli_flags_are_the_pinned_bytes() {
 
 /// KR-REQ-12.22, KR-REQ-12.27: a Qoder CLI launch adds exactly two elements, `--settings` and the
 /// inline JSON after it, and that JSON holds hooks and nothing else: the forwarder's `qoder-cli
-/// hook` invocation, in exec form, for exactly the events the forwarder reports for Qoder CLI, for
+/// hook` invocation, in exec form, for exactly the events the forwarder reads, for
 /// every tool, notification and source (no matcher), in the foreground, each with a timeout in
 /// seconds that the forwarder's deadline fits inside.
 #[test]
@@ -226,8 +226,7 @@ fn the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else() {
 
     let events = &settings["hooks"];
     let mut registered = members(events);
-    let mut reported: Vec<&str> = kr_hook::qoder_cli::HOOKS
-        .events
+    let mut reported: Vec<&str> = kr_hook::hook::EVENTS
         .iter()
         .map(|(event, _)| *event)
         .collect();
@@ -235,7 +234,7 @@ fn the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else() {
     reported.sort_unstable();
     assert_eq!(
         registered, reported,
-        "the launch registers exactly the events the forwarder reports for Qoder CLI"
+        "the launch registers exactly the events the forwarder reads"
     );
     for (event, groups) in events.as_object().expect("events") {
         let groups = groups.as_array().expect("matcher groups");
@@ -256,9 +255,7 @@ fn the_qoder_cli_flags_pass_its_hooks_in_exec_form_and_nothing_else() {
         assert_eq!(handler["type"], "command", "{event}");
         assert_eq!(
             parsed(&handler["command"], &handler["args"]),
-            Command::QoderCli {
-                surface: Hooks::Hook
-            },
+            Command::Hook(vec!["qoder-cli".to_owned(), "hook".to_owned()]),
             "{event}"
         );
         let timeout = handler["timeout"].as_u64().expect("a timeout in seconds");
@@ -296,7 +293,8 @@ fn the_gemini_cli_bridge_files_are_the_bytes_the_package_publishes() {
 }
 
 /// KR-REQ-12.20, KR-REQ-12.27: the extension's hooks file registers the forwarder's `gemini-cli
-/// hook` invocation for exactly the events the forwarder reports for Gemini CLI, for every source and
+/// hook` invocation for exactly a session starting, a session ending and a notification, each an event the
+/// forwarder reads, for every source and
 /// notification (no matcher), in the order Gemini CLI chooses (no `sequential`), each as a command
 /// of plain words, which bash runs in its own process, and each with a timeout in milliseconds that
 /// the forwarder's deadline fits inside. The manifest names the extension and nothing it could load.
@@ -311,17 +309,21 @@ fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
     assert_eq!(members(&hooks), ["hooks"]);
     let events = &hooks["hooks"];
     let mut registered = members(events);
-    let mut reported: Vec<&str> = kr_hook::gemini_cli::HOOKS
-        .events
-        .iter()
-        .map(|(event, _)| *event)
-        .collect();
     registered.sort_unstable();
-    reported.sort_unstable();
+    // Written out here, not taken from the forwarder's vocabulary: a refused tool event replaces
+    // the result Gemini CLI's model reads, and a forwarder that is missing or refuses its command
+    // line prints exactly the text that refuses it, so the extension names no tool event.
     assert_eq!(
-        registered, reported,
-        "the extension registers exactly the events the forwarder reports for Gemini CLI"
+        registered,
+        ["Notification", "SessionEnd", "SessionStart"],
+        "the extension registers a session starting, a session ending and a notification, and nothing else"
     );
+    for event in &registered {
+        assert!(
+            kr_hook::hook::EVENTS.iter().any(|(name, _)| name == event),
+            "{event} is an event the forwarder reads"
+        );
+    }
     for (event, groups) in events.as_object().expect("events") {
         let groups = groups.as_array().expect("groups");
         assert_eq!(groups.len(), 1, "{event}");
@@ -359,9 +361,7 @@ fn the_gemini_cli_extension_registers_its_three_events_as_plain_words() {
         );
         assert_eq!(
             parsed(&serde_json::json!(words[0]), &serde_json::json!(words[1..])),
-            Command::GeminiCli {
-                surface: Hooks::Hook
-            },
+            Command::Hook(vec!["gemini-cli".to_owned(), "hook".to_owned()]),
             "{event}"
         );
         let timeout = handler["timeout"]

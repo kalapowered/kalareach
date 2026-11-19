@@ -264,37 +264,36 @@ mod waits_only_through_the_seam {
     const HELD_RUN: &str = "#[cfg(unix)] let started = match resumed(started) { \
         Resumed::Passed => { answer(); return std::process::ExitCode::SUCCESS; } \
         Resumed::At(started) => started, }; \
-        run_with(started, move |started| observe(application, started), claim_answer, answer, \
+        run_with(started, move |started| observe(&application, started), claim_answer, answer, \
         |bytes| { use std::io::Write as _; let _ = std::io::stderr().lock().write_all(bytes); }, \
         std::time::Instant::now, crate::wait_by,); std::process::ExitCode::SUCCESS";
 
     /// The call in `HELD_RUN` that gives `run_with` what it waits with.
-    const HELD_CALL: &str = "run_with(started, move |started| observe(application, started), \
+    const HELD_CALL: &str = "run_with(started, move |started| observe(&application, started), \
         claim_answer, answer, \
         |bytes| { use std::io::Write as _; let _ = std::io::stderr().lock().write_all(bytes); }, \
         std::time::Instant::now, crate::wait_by,);";
 
     /// The body of `main`, whole: where a hook's clock starts, and where it goes from there.
     const HELD_MAIN: &str = "let started = std::time::Instant::now(); \
-        match kr_hook::cli::Cli::try_parse() { \
+        match kr_hook::cli::parse() { \
         Ok(cli) => kr_hook::run(cli.command, started), \
         Err(error) => kr_hook::held(|| { let _ = error.print(); \
         if error.use_stderr() { std::process::ExitCode::from(kr_hook::cli::EXIT_USAGE) } \
         else { std::process::ExitCode::SUCCESS } }), }";
 
-    /// The three arms of `lib.rs`'s `run` that hand a hook the start it was given.
-    const HELD_HOOK_ARMS: [&str; 3] = [
+    /// The two arms of `lib.rs`'s `run` that hand a hook the start it was given.
+    const HELD_HOOK_ARMS: [&str; 2] = [
         "cli::Command::ClaudeCode { surface: cli::ClaudeCode::Hook, } \
-         => hook::run(&claude_code::HOOKS, started),",
-        "cli::Command::GeminiCli { surface: cli::Hooks::Hook, } \
-         => hook::run(&gemini_cli::HOOKS, started),",
-        "cli::Command::QoderCli { surface: cli::Hooks::Hook, } \
-         => hook::run(&qoder_cli::HOOKS, started),",
+         => hook::run(hook::Application::for_word(\"claude-code\"), started),",
+        "cli::Command::Hook(words) => match cli::hooked_application(&words) { \
+         Some(application) => hook::run(hook::Application::for_word(application), started), \
+         None => held(|| std::process::ExitCode::from(cli::EXIT_USAGE)), },",
     ];
 
-    /// Whether `lib.rs`'s `run` begins with its `match` on the invocation, contains the three hook
+    /// Whether `lib.rs`'s `run` begins with its `match` on the invocation, contains the two hook
     /// arms word for word, and writes `started` as many times as there are arms. A statement before
-    /// the `match`, a `held(...)` around an arm, an arm besides the three that names `started`, and
+    /// the `match`, a `held(...)` around an arm, an arm besides the two that names `started`, and
     /// a copy of an arm in a comment beside an arm that still names `started` each fail it. It does
     /// not fail an arm that is changed to give a hook a start of its own while a copy of the held
     /// arm stands in a comment beside it, nor a further arm that does not name `started`.
@@ -318,7 +317,7 @@ mod waits_only_through_the_seam {
     /// - By equality of text, word for word: the whole body of `main`, the whole body of
     ///   `hook::run`, the body of `report_by`, the claim's wrapper, `wait_by`, and `claim_answer`
     ///   in `helper.rs`. A change in any of these changes the held text.
-    /// - By a text found in the body and a count of the start's name, not by equality: the three
+    /// - By a text found in the body and a count of the start's name, not by equality: the two
     ///   hook arms of `lib.rs`'s `run`. Each arm is found as text in the body, and `started` is
     ///   written as many times as there are arms. An arm that is changed while a copy of the held
     ///   arm stands in a comment beside it passes, and so does a further arm that does not name
@@ -639,10 +638,7 @@ mod waits_only_through_the_seam {
         );
         let commented = format!("/* {} */", HELD_HOOK_ARMS[0]);
         assert!(
-            !lib_run_holds(&lib_source(
-                "",
-                &[&moved, HELD_HOOK_ARMS[1], HELD_HOOK_ARMS[2]]
-            )),
+            !lib_run_holds(&lib_source("", &[&moved, HELD_HOOK_ARMS[1]])),
             "the start moved by 300 ms in an arm"
         );
         assert!(
@@ -652,10 +648,7 @@ mod waits_only_through_the_seam {
             )),
             "the start moved by 300 ms before the arms"
         );
-        let beside = lib_source(
-            "",
-            &[&moved, &commented, HELD_HOOK_ARMS[1], HELD_HOOK_ARMS[2]],
-        );
+        let beside = lib_source("", &[&moved, &commented, HELD_HOOK_ARMS[1]]);
         assert!(
             holds(&beside, "run", HELD_HOOK_ARMS[0]),
             "a hold that looks for the arm finds its copy in the comment"

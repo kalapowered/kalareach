@@ -85,7 +85,7 @@ pub const REQUEST_ID_LENGTH: usize = 5;
 
 /// What the channel declares itself to the worker as.
 const BRIDGE: Bridge = Bridge {
-    application: super::APPLICATION,
+    application: std::borrow::Cow::Borrowed(super::APPLICATION),
     surface: "channel",
 };
 

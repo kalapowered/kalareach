@@ -28,6 +28,7 @@
 //! ([`answered_after`]), which is the figure to hold against an application's timeout: how long the
 //! machine took to start the process and to let it end lies outside the run.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use crate::exchange::Exchange;
@@ -90,13 +91,40 @@ pub const MAX_CONTACT_REQUEST_BYTES: usize = 256;
 pub struct Application {
     /// The application name its registration invokes the forwarder with, which is also the
     /// application its bridge declares to the worker.
-    pub name: &'static str,
+    pub name: Cow<'static, str>,
     /// The events its registration names, each with what it reports. An event not named here is
     /// answered and reports nothing.
     pub events: &'static [(&'static str, Report)],
 }
 
+/// The hook events the forwarder reports, and what each reports, for every application.
+///
+/// A session starting after a compaction goes on in the same thread; every other start is a new
+/// selection. A registration that names only some of these events, as Gemini CLI's does, is
+/// started for those alone.
+pub static EVENTS: [(&str, Report); 5] = [
+    (
+        "SessionStart",
+        Report::SessionStarted {
+            continued_by: Some("compact"),
+        },
+    ),
+    ("SessionEnd", Report::SessionEnded),
+    ("PostToolUse", Report::ToolFinished),
+    ("PostToolUseFailure", Report::ToolFailed),
+    ("Notification", Report::Notification),
+];
+
 impl Application {
+    /// The hooks of the application a registration names by `word`.
+    #[must_use]
+    pub fn for_word(word: &str) -> Self {
+        Self {
+            name: Cow::Owned(word.to_owned()),
+            events: &EVENTS,
+        }
+    }
+
     /// What an event reports, where this application's registration names it.
     #[must_use]
     pub fn report(&self, event: &str) -> Option<Report> {
@@ -108,9 +136,9 @@ impl Application {
 
     /// The bridge a hook of this application declares.
     #[must_use]
-    pub const fn bridge(&self) -> Bridge {
+    pub fn bridge(&self) -> Bridge {
         Bridge {
-            application: self.name,
+            application: self.name.clone(),
             surface: SURFACE,
         }
     }
@@ -141,10 +169,7 @@ pub enum Report {
 /// The run's clock is the process's: what a hook waits for before it reads its input, taking the
 /// hold on its release included, counts against its deadline.
 #[must_use]
-pub fn run(
-    application: &'static Application,
-    started: std::time::Instant,
-) -> std::process::ExitCode {
+pub fn run(application: Application, started: std::time::Instant) -> std::process::ExitCode {
     // A hook started in place of another has the rest of the deadline the application gave that
     // one, which may have ended before it began.
     #[cfg(unix)]
@@ -157,7 +182,7 @@ pub fn run(
     };
     run_with(
         started,
-        move |started| observe(application, started),
+        move |started| observe(&application, started),
         claim_answer,
         answer,
         |bytes| {
@@ -1261,12 +1286,10 @@ mod tests {
         );
     }
 
-    /// Every application this forwarder serves.
-    const EVERY: [&Application; 3] = [
-        &crate::claude_code::HOOKS,
-        &crate::gemini_cli::HOOKS,
-        &crate::qoder_cli::HOOKS,
-    ];
+    /// Every application this forwarder serves today, by its word.
+    fn every() -> [Application; 3] {
+        ["claude-code", "gemini-cli", "qoder-cli"].map(Application::for_word)
+    }
 
     fn translated(
         application: &Application,
@@ -1280,9 +1303,13 @@ mod tests {
     /// event it registers once.
     #[test]
     fn each_application_declares_its_own_hook_bridge() {
-        let names: Vec<&str> = EVERY.iter().map(|application| application.name).collect();
+        let every = every();
+        let names: Vec<&str> = every
+            .iter()
+            .map(|application| application.name.as_ref())
+            .collect();
         assert_eq!(names, ["claude-code", "gemini-cli", "qoder-cli"]);
-        for application in EVERY {
+        for application in &every {
             assert_eq!(application.bridge().application, application.name);
             assert_eq!(application.bridge().surface, "hook");
             let mut events: Vec<&str> = application.events.iter().map(|(name, _)| *name).collect();
@@ -1298,7 +1325,7 @@ mod tests {
     #[test]
     fn a_thread_report_is_held_two_ticks_and_inside_the_deadline() {
         assert!(THREAD_REPORT_LINGER < HOOK_DEADLINE);
-        for application in EVERY {
+        for application in &every() {
             for (event, report) in application.events {
                 let input = read_input(
                     serde_json::json!({"session_id": "t", "hook_event_name": event})
@@ -1321,14 +1348,14 @@ mod tests {
     #[test]
     fn a_continuation_is_the_named_source_and_nothing_else() {
         const WITHOUT: Application = Application {
-            name: "no-continuation",
+            name: Cow::Borrowed("no-continuation"),
             events: &[(
                 "SessionStart",
                 Report::SessionStarted { continued_by: None },
             )],
         };
         const WITH: Application = Application {
-            name: "continuation",
+            name: Cow::Borrowed("continuation"),
             events: &[(
                 "SessionStart",
                 Report::SessionStarted {
@@ -1357,7 +1384,7 @@ mod tests {
     #[test]
     fn a_contact_request_is_named_only_when_every_name_agrees() {
         const FINISHED: Application = Application {
-            name: "tools",
+            name: Cow::Borrowed("tools"),
             events: &[("PostToolUse", Report::ToolFinished)],
         };
         let asked = |tool: &str, extra: serde_json::Value| {
@@ -1410,7 +1437,7 @@ mod tests {
     #[test]
     fn long_text_is_cut_at_a_character_boundary() {
         const NOTIFIED: Application = Application {
-            name: "notifications",
+            name: Cow::Borrowed("notifications"),
             events: &[("Notification", Report::Notification)],
         };
         let message = format!("{}{}", "x".repeat(MAX_TEXT_BYTES - 1), "\u{00e9}");
@@ -1482,9 +1509,10 @@ mod tests {
         let registration =
             Registration::read(&paths, Duration::from_secs(5)).expect("the registration reads");
 
-        let mut exchange = Exchange::open(&registration, crate::claude_code::HOOKS.bridge())
-            .await
-            .expect("the hook connects and writes its hello");
+        let mut exchange =
+            Exchange::open(&registration, Application::for_word("claude-code").bridge())
+                .await
+                .expect("the hook connects and writes its hello");
         let (worker, _) = listener.accept().await.expect("the worker accepts");
         let mut worker = tokio::io::BufReader::new(worker);
         let mut hello = Vec::new();
@@ -1502,5 +1530,261 @@ mod tests {
             matches!(delivered, Err(crate::exchange::ExchangeError::Refused)),
             "the hook reports a refusal as a refusal: {delivered:?}"
         );
+    }
+
+    /// KR-REQ-11.44: every application word reports the same five events, each as the observation
+    /// written out here, a start from the source `compact` continues the thread, and an event
+    /// outside the five reports nothing.
+    #[test]
+    fn kr_req_11_44_every_application_word_reports_the_same_five_events_and_compact_continues() {
+        let thread = "4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11";
+        let cases = [
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "SessionStart", "source": "startup"}),
+                Some(
+                    serde_json::json!({"event": "thread_started", "thread": thread, "detail": "startup"}),
+                ),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "SessionStart", "source": "compact"}),
+                Some(
+                    serde_json::json!({"event": "thread_continued", "thread": thread, "detail": "compact"}),
+                ),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "SessionStart", "source": "Compact"}),
+                Some(
+                    serde_json::json!({"event": "thread_started", "thread": thread, "detail": "Compact"}),
+                ),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "SessionEnd", "reason": "exit"}),
+                Some(
+                    serde_json::json!({"event": "thread_ended", "thread": thread, "detail": "exit"}),
+                ),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "PostToolUse", "tool_name": "Bash"}),
+                Some(
+                    serde_json::json!({"event": "tool_finished", "thread": thread, "detail": "Bash"}),
+                ),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "PostToolUseFailure", "tool_name": "Bash"}),
+                Some(
+                    serde_json::json!({"event": "tool_failed", "thread": thread, "detail": "Bash"}),
+                ),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "Notification", "message": "m", "notification_type": "n"}),
+                Some(
+                    serde_json::json!({"event": "notification", "thread": thread, "detail": "n", "text": "m"}),
+                ),
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "BeforeTool", "tool_name": "Bash"}),
+                None,
+            ),
+            (
+                serde_json::json!({"session_id": thread, "hook_event_name": "AfterTool", "tool_name": "Bash"}),
+                None,
+            ),
+        ];
+        for word in ["claude-code", "gemini-cli", "qoder-cli", "amp"] {
+            let application = Application::for_word(word);
+            for (payload, expected) in &cases {
+                assert_eq!(
+                    translated(&application, payload),
+                    *expected,
+                    "{word} {payload}"
+                );
+            }
+        }
+    }
+
+    /// Qoder CLI: the events its hooks send, read through the one vocabulary.
+    mod qoder_cli {
+        use super::{Application, observation, read_input};
+
+        const THREAD: &str = "6b3bbfa1-1e44-480a-ae1f-a44fb86916f2";
+
+        fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
+            let input = read_input(payload.to_string().as_bytes()).expect("a hook's input");
+            observation(&Application::for_word("qoder-cli"), &input)
+                .map(|frame| frame["kr_observation"].clone())
+        }
+
+        /// The payloads Qoder CLI 1.1.63 wrote for a session starting and ending, and the ones its hook
+        /// reference documents for the other three events, each become their observation.
+        #[test]
+        fn each_registered_event_becomes_its_observation() {
+            let cases = [
+                (
+                    serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",
+                        "cwd": "/tmp/work", "hook_event_name": "SessionStart",
+                        "permission_mode": "default", "source": "startup"}),
+                    serde_json::json!({"event": "thread_started", "thread": THREAD, "detail": "startup"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "SessionStart",
+                        "source": "new"}),
+                    serde_json::json!({"event": "thread_started", "thread": THREAD, "detail": "new"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "SessionStart",
+                        "source": "compact"}),
+                    serde_json::json!({"event": "thread_continued", "thread": THREAD, "detail": "compact"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",
+                        "cwd": "/tmp/work", "hook_event_name": "SessionEnd",
+                        "permission_mode": "default", "reason": "other"}),
+                    serde_json::json!({"event": "thread_ended", "thread": THREAD, "detail": "other"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "PostToolUse",
+                        "tool_name": "Write", "tool_input": {"file_path": "/p/f.ts", "content": "x"},
+                        "tool_response": {"success": true, "bytes_written": 1024},
+                        "tool_use_id": "toolu_01ABC123"}),
+                    serde_json::json!({"event": "tool_finished", "thread": THREAD, "detail": "Write"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "PostToolUseFailure",
+                        "tool_name": "Bash", "tool_input": {"command": "npm test"},
+                        "tool_use_id": "toolu_01ABC123",
+                        "error": "Command exited with non-zero status code 1",
+                        "error_type": "execution_failed", "is_interrupt": false}),
+                    serde_json::json!({"event": "tool_failed", "thread": THREAD, "detail": "Bash"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "Notification",
+                        "notification_type": "permission_prompt",
+                        "message": "Agent is requesting permission to run: rm -rf node_modules",
+                        "title": "Permission Required", "details": {}}),
+                    serde_json::json!({"event": "notification", "thread": THREAD,
+                        "detail": "permission_prompt",
+                        "text": "Agent is requesting permission to run: rm -rf node_modules"}),
+                ),
+            ];
+            for (payload, expected) in cases {
+                assert_eq!(translated(&payload), Some(expected), "{payload}");
+            }
+        }
+
+        /// A finished call of the contact skill's `ask_user`, which Qoder CLI names
+        /// `mcp__kalareach__ask_user` and describes in its MCP context, names the request it asked.
+        #[test]
+        fn a_finished_contact_question_names_its_request() {
+            let reported = translated(&serde_json::json!({"session_id": THREAD,
+                "hook_event_name": "PostToolUse", "tool_name": "mcp__kalareach__ask_user",
+                "tool_input": {"request_id": "r-7f3a", "question": "Which one?", "type": "input"},
+                "tool_response": {"content": []}, "tool_use_id": "toolu_02",
+                "mcp_context": {"server_name": "kalareach", "tool_name": "ask_user"}}))
+            .expect("an observation");
+            assert_eq!(reported["contact_request"], "r-7f3a");
+        }
+
+        /// Every event the registration does not name is answered and reports nothing.
+        #[test]
+        fn an_event_the_registration_does_not_name_reports_nothing() {
+            for event in [
+                "PreToolUse",
+                "UserPromptSubmit",
+                "PermissionRequest",
+                "PermissionDenied",
+                "Stop",
+                "StopFailure",
+                "SubagentStart",
+                "SubagentStop",
+                "PreCompact",
+                "PostCompact",
+                "InstructionsLoaded",
+                "ConfigChange",
+                "CwdChanged",
+                "FileChanged",
+                "WorktreeCreate",
+                "WorktreeRemove",
+                "Elicitation",
+                "ElicitationResult",
+            ] {
+                let payload = serde_json::json!({"session_id": THREAD, "hook_event_name": event});
+                assert_eq!(translated(&payload), None, "{event}");
+            }
+        }
+    }
+
+    /// Gemini CLI: the events its hooks send, read through the one vocabulary.
+    mod gemini_cli {
+        use super::{Application, observation, read_input};
+
+        const THREAD: &str = "1740a246-b45f-4436-932a-3107700094f5";
+
+        fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
+            let input = read_input(payload.to_string().as_bytes()).expect("a hook's input");
+            observation(&Application::for_word("gemini-cli"), &input)
+                .map(|frame| frame["kr_observation"].clone())
+        }
+
+        /// The payloads Gemini CLI 0.60.0 wrote for a session starting and ending, and the one its
+        /// hook reference documents for a tool permission notification, each become their observation.
+        #[test]
+        fn each_registered_event_becomes_its_observation() {
+            let cases = [
+                (
+                    serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",
+                        "cwd": "/tmp/work", "hook_event_name": "SessionStart",
+                        "timestamp": "2026-09-25T17:39:42.013Z", "source": "startup"}),
+                    serde_json::json!({"event": "thread_started", "thread": THREAD, "detail": "startup"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "SessionStart",
+                        "source": "clear"}),
+                    serde_json::json!({"event": "thread_started", "thread": THREAD, "detail": "clear"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "SessionStart",
+                        "source": "resume"}),
+                    serde_json::json!({"event": "thread_started", "thread": THREAD, "detail": "resume"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "transcript_path": "/tmp/t.jsonl",
+                        "cwd": "/tmp/work", "hook_event_name": "SessionEnd",
+                        "timestamp": "2026-09-25T17:39:42.193Z", "reason": "exit"}),
+                    serde_json::json!({"event": "thread_ended", "thread": THREAD, "detail": "exit"}),
+                ),
+                (
+                    serde_json::json!({"session_id": THREAD, "hook_event_name": "Notification",
+                        "timestamp": "2026-09-25T17:40:02.000Z", "notification_type": "ToolPermission",
+                        "message": "Tool Shell requires execution",
+                        "details": {"type": "exec", "title": "Shell", "command": "ls", "rootCommand": "ls"}}),
+                    serde_json::json!({"event": "notification", "thread": THREAD,
+                        "detail": "ToolPermission", "text": "Tool Shell requires execution"}),
+                ),
+            ];
+            for (payload, expected) in cases {
+                assert_eq!(translated(&payload), Some(expected), "{payload}");
+            }
+        }
+
+        /// An event outside the forwarder's vocabulary is answered and reports nothing, Gemini CLI's own
+        /// `AfterTool` included, however it names the contact skill's tool.
+        #[test]
+        fn an_event_the_registration_does_not_name_reports_nothing() {
+            for event in [
+                "AfterTool",
+                "BeforeTool",
+                "BeforeAgent",
+                "AfterAgent",
+                "BeforeModel",
+                "AfterModel",
+                "BeforeToolSelection",
+                "PreCompress",
+            ] {
+                let payload = serde_json::json!({"session_id": THREAD, "hook_event_name": event,
+                    "tool_name": "mcp_kalareach_ask_user", "tool_input": {"request_id": "r-7f3a"},
+                    "mcp_context": {"server_name": "kalareach", "tool_name": "ask_user"}});
+                assert_eq!(translated(&payload), None, "{event}");
+            }
+        }
     }
 }
