@@ -646,8 +646,7 @@ async fn kr_req_11_44_a_package_with_no_native_bridge_is_admitted_under_its_plug
 /// KR-REQ-11.01, KR-REQ-11.44: a package whose application names its events and the members of its
 /// hook payload another way declares them in its connector table, the worker publishes them for the
 /// launch, and the forwarder reads the application's payload by them: its session opening selects
-/// the thread, a continuation is the source the package names, its closing ends the thread, and
-/// nothing in the core names the application.
+/// the thread, its closing ends the thread, and nothing in the core names the application.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_vendor_hook_selects_the_thread_in_a_launch() {
     let place = |names: &[&str]| {
