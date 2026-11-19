@@ -3093,11 +3093,18 @@ impl Broker {
     /// connection is open, and cancelled once it has closed, as a closing connection cancels a
     /// resource no answer went for.
     ///
+    /// The give-back is refused when the store cannot record it, and the claim is left as it was:
+    /// a marker cleared in memory and set in the row would refuse every later answer while memory
+    /// says the request is pending, and the recovery that writes the gap keeps a marker a
+    /// concurrent answer may have set. The caller leaves the resource uncertain then, as dropping
+    /// the claim does.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::Arbitration`] or [`BrokerError::PermissionDenied`] as the claim
     /// requires: a resource that a closing connection has already settled is settled, and what it
-    /// was settled as is the truthful state.
+    /// was settled as is the truthful state. Returns [`BrokerError::LedgerUnavailable`] while the
+    /// journal is faulted and [`BrokerError::StoreFault`] when the write fails.
     pub(crate) fn unsent(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let mut state = self.state();
         let transition = {
@@ -3107,14 +3114,15 @@ impl Broker {
                 .plan_unsent(claim, |connection| gateway.contains(connection))?
         };
         let actor_id = Some(claim.actor_id.clone());
-        // Undoing the marker records what did not happen, so it happens whether or not the store
-        // can record it, as giving a claim back does.
+        // Clearing the marker is not carried in memory when the store cannot record it: the row
+        // would keep the marker and memory would not, and the recovery keeps a marker it finds
+        // set. The claim stays where it was, and the caller leaves the resource uncertain.
         state.commit_transition(
             transition,
             now,
             crate::broker::ledger::TransitionCause::RichClaim,
             actor_id,
-            OnStoreFault::CarryOn,
+            OnStoreFault::Refuse,
         )
     }
 

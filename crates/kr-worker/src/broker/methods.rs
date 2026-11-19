@@ -844,13 +844,16 @@ impl<'a> MarkedAnswer<'a> {
     /// A refusal that proves nothing was queued gives the claim back with its marker, so the
     /// resource is answerable again on an open connection and cancelled on one that has closed:
     /// the answer never left this host, and nothing is uncertain. Any other refusal leaves the
-    /// resource uncertain, because the marker says the answer may have gone.
+    /// resource uncertain, because the marker says the answer may have gone. So does a give-back
+    /// the store cannot record: the row keeps its marker, and the resource stays one an answer may
+    /// have gone for rather than one memory calls pending and the row refuses.
     #[must_use]
     pub fn refused(mut self, error: BrokerError) -> BrokerError {
         if error.proven_unsent()
             && let Some(claim) = self.claim.take()
+            && self.broker.unsent(&claim, kr_ipc::now_ms()).is_err()
         {
-            crate::broker::settled(self.broker.unsent(&claim, kr_ipc::now_ms()));
+            crate::broker::settled(self.broker.uncertain(&claim, kr_ipc::now_ms()));
         }
         drop(self);
         error
