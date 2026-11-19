@@ -960,12 +960,15 @@ mod written {
             &["host", "login-item", "install", "--json"],
         );
         assert!(!ok, "install from another home is refused: {said}");
-        // The settling's document comes first, and the refusal's follows it.
-        let document: serde_json::Value = serde_json::Deserializer::from_str(&said)
-            .into_iter::<serde_json::Value>()
-            .next()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+        // One document holds what the settling did and the refusal that followed it.
+        let document: serde_json::Value = serde_json::from_str(&said).expect("one document");
+        assert_eq!(document["ok"], false, "{said}");
+        assert!(
+            document["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("the file the record ")),
+            "{said}"
+        );
         assert!(
             document["actions"]
                 .as_array()

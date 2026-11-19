@@ -14,6 +14,7 @@ use kr_ipc::paths::HostPaths;
 
 use crate::cli::LoginItemCommand;
 use crate::error::{CliError, Result};
+use crate::report::Completion;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod record;
@@ -58,14 +59,20 @@ pub fn refuse_without_a_writer() -> Result<()> {
 /// # Errors
 ///
 /// Returns what the step failed with.
-pub fn run(paths: &HostPaths, command: &LoginItemCommand, json: bool) -> Result<()> {
+pub fn run(paths: &HostPaths, command: &LoginItemCommand, json: bool) -> Result<Completion> {
     refuse_without_a_writer()?;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        match command {
+        let ended = match command {
             LoginItemCommand::Status => writer::status(paths, json),
             LoginItemCommand::Install => writer::install(paths, json),
             LoginItemCommand::Remove => writer::remove(paths, json),
+        };
+        match ended {
+            // The document already says what failed, beside what the settling did: a second
+            // document for the same failure would give a reader two to reconcile.
+            Err(error) if writer::reported() => Ok(Completion::Reported(error)),
+            other => other.map(|()| Completion::Done),
         }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -90,6 +97,7 @@ mod writer {
     use super::{LOCK_FILE, RECORD_FILE, WRITTEN};
     use crate::error::{CliError, Result};
     use crate::output::{self, Document};
+    use crate::report;
 
     const LABEL_PREFIX: &str = "kr-desktop-host-";
     const LOCK_WAIT: Duration = Duration::from_secs(60);
@@ -418,6 +426,28 @@ mod writer {
         }
     }
 
+    /// The document of what a command did and the state it leaves.
+    fn document_of(
+        lines: &[(&'static str, Shown)],
+        state: State,
+        derived: &Derived,
+        record: Option<&Record>,
+    ) -> Document {
+        let pending = record.and_then(|record| record.pending.as_ref().map(|p| p.operation));
+        let actions = lines
+            .iter()
+            .map(|(word, _)| *word)
+            .filter(|word| *word != "notice")
+            .collect();
+        document(
+            state,
+            Some(&derived.file),
+            record.is_some(),
+            pending,
+            Some(actions),
+        )
+    }
+
     /// Prints what a command did: its document, or one line for each thing it did.
     fn emit(
         json: bool,
@@ -426,25 +456,21 @@ mod writer {
         derived: &Derived,
         record: Option<&Record>,
     ) {
-        let pending = record.and_then(|record| record.pending.as_ref().map(|p| p.operation));
         if json {
-            let actions = lines
-                .iter()
-                .map(|(word, _)| *word)
-                .filter(|word| *word != "notice")
-                .collect();
-            output::document(&document(
-                state,
-                Some(&derived.file),
-                record.is_some(),
-                pending,
-                Some(actions),
-            ));
+            output::document(&document_of(lines, state, derived, record));
             return;
         }
         for (_, line) in lines {
             output::say(line);
         }
+    }
+
+    /// Whether this command wrote its failure into its document, which then stands as its one
+    /// result.
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub(super) fn reported() -> bool {
+        REPORTED.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hands `error` back after telling what the settling before it did, which the record no
@@ -459,7 +485,13 @@ mod writer {
         if !lines.is_empty() {
             let record = read().ok().flatten();
             let state = state_of(record.as_ref(), &derived.file, derived.expected.as_deref());
-            emit(json, lines, state, derived, record.as_ref());
+            if json {
+                let document = document_of(lines, state, derived, record.as_ref());
+                output::document(&report::with_failure(document, &error));
+                REPORTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                emit(false, lines, state, derived, record.as_ref());
+            }
         }
         error
     }
@@ -582,7 +614,7 @@ mod writer {
         record: Record,
         mode: Mode,
         said: &Shown,
-    ) -> std::result::Result<(Settled, Lines), (CliError, Lines)> {
+    ) -> std::result::Result<(Settled, Lines), Box<(CliError, Lines)>> {
         let mut run = Run::new(
             run_paths(environment, &record.path),
             kind,
@@ -604,7 +636,7 @@ mod writer {
                         "remove"
                     }
                 ));
-                return Err((error, lines));
+                return Err(Box::new((error, lines)));
             }
         };
         if settled == Settled::Done {
@@ -683,8 +715,12 @@ mod writer {
         if let Some(pending) = record.clone().filter(|record| record.pending.is_some()) {
             let recorded = pending.path.clone();
             let (settled, more) =
-                settle(&environment, &derived, kind, pending, Mode::Install, &said)
-                    .map_err(|(error, more)| carried(json, &more, &derived, &read, error))?;
+                settle(&environment, &derived, kind, pending, Mode::Install, &said).map_err(
+                    |stopped| {
+                        let (error, more) = *stopped;
+                        carried(json, &more, &derived, &read, error)
+                    },
+                )?;
             lines.extend(more);
             if settled == Settled::Changed {
                 let error = refusal_changed(&recorded);
@@ -905,7 +941,10 @@ mod writer {
         let mut lines = Lines::new();
         if record.pending.is_some() {
             let (_, more) = settle(&environment, &derived, kind, record, Mode::Remove, &said)
-                .map_err(|(error, more)| carried(json, &more, &derived, &read, error))?;
+                .map_err(|stopped| {
+                    let (error, more) = *stopped;
+                    carried(json, &more, &derived, &read, error)
+                })?;
             lines.extend(more);
             record = read()?.ok_or_else(|| {
                 carried(
