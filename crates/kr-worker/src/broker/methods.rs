@@ -175,9 +175,6 @@ pub struct PendingTransmission {
     /// What an operation that was given up on claims the upstream's answer with, where the
     /// transport can say one came late.
     late: Option<crate::broker::duplex::LateHandle>,
-    /// What the operation ends as when its caller stops waiting for it, where the transport has
-    /// already queued it for a channel: a channel's end is the same whenever the caller stops.
-    channel_end: Option<String>,
 }
 
 enum Flight {
@@ -206,7 +203,6 @@ impl PendingTransmission {
         Self {
             flight: Flight::Settled(outcome),
             late: None,
-            channel_end: None,
         }
     }
 
@@ -218,7 +214,6 @@ impl PendingTransmission {
         Self {
             flight: Flight::Carried(Box::pin(work)),
             late: None,
-            channel_end: None,
         }
     }
 
@@ -227,24 +222,6 @@ impl PendingTransmission {
     pub fn with_late(mut self, late: crate::broker::duplex::LateHandle) -> Self {
         self.late = Some(late);
         self
-    }
-
-    /// Says that the operation is queued for a channel, which confirms nothing: whoever stops
-    /// waiting for it, it ends as [`BrokerError::ChannelEnd`] with `detail`, and not as a typed
-    /// upstream's answer that never came.
-    #[must_use]
-    pub fn with_channel_end(mut self, detail: String) -> Self {
-        self.channel_end = Some(detail);
-        self
-    }
-
-    /// Returns the channel end the operation has when its caller stops waiting for it, where the
-    /// transport queued it for a channel.
-    #[must_use]
-    pub fn channel_end(&self) -> Option<BrokerError> {
-        self.channel_end
-            .clone()
-            .map(|detail| BrokerError::ChannelEnd { detail })
     }
 
     /// Returns what an operation that is given up on claims the upstream's late answer with,
@@ -302,6 +279,129 @@ pub trait UpstreamDispatch: Send + Sync + core::fmt::Debug {
     /// Returns whatever refuses the operation before anything is queued for it, which is the only
     /// point at which a transport can still refuse one outright.
     fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission>;
+
+    /// Does what [`UpstreamDispatch::submit`] does, for a caller that stops waiting for it at a
+    /// deadline of its own.
+    ///
+    /// A transport that queues the operation for a channel says so through `gate` at the moment
+    /// its queue takes it, and not by what it returns: the call can still be running when the
+    /// caller gives up, and what it returns after that is nobody's to read. One that queues
+    /// nothing of the kind has nothing to say, which is what this does.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`UpstreamDispatch::submit`] does.
+    fn submit_gated(
+        &self,
+        request: &UpstreamRequest,
+        gate: &SubmitGate,
+    ) -> Result<PendingTransmission> {
+        let _ = gate;
+        self.submit(request)
+    }
+}
+
+/// What the caller of a transport's call and the transport agree on about one operation: whether
+/// the transport's queue has taken it.
+///
+/// The call that queues an operation runs on a thread of its own, and the caller waits for it only
+/// until a deadline. A queue that took the operation just before the deadline is a fact the
+/// caller must not lose with the call's return, and a queue that has not taken it by the deadline
+/// must never take it after. Both are decided under one lock: the transport queues through
+/// [`SubmitGate::queue`], and the caller's decision to stop waiting is [`SubmitGate::give_up`], so
+/// exactly one of them is first.
+#[derive(Debug, Default)]
+pub struct SubmitGate {
+    state: std::sync::Mutex<GateState>,
+    /// Where this host's own tests stop the call that queued the operation, after the queue took
+    /// it and before the call returns. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    after_queueing:
+        std::sync::Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+}
+
+#[derive(Debug, Default)]
+enum GateState {
+    /// Nothing has queued the operation, and the caller still waits.
+    #[default]
+    Open,
+    /// A channel's queue took the operation, and what it ends as is `detail`.
+    Queued(String),
+    /// The caller stopped waiting before any queue took the operation.
+    GivenUp,
+}
+
+impl SubmitGate {
+    /// Queues one operation with `queue`, which must not wait for anything, unless the caller has
+    /// stopped waiting; a queue that takes it is a channel's, so the operation ends as a channel's
+    /// end, with `detail`, whenever the caller stops waiting for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::NotTransmitted`] when the caller stopped waiting first, and what
+    /// `queue` returns.
+    pub fn queue<T>(&self, detail: &str, queue: impl FnOnce() -> Result<T>) -> Result<T> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, GateState::GivenUp) {
+            return Err(BrokerError::NotTransmitted(Box::new(
+                BrokerError::UpstreamUnavailable {
+                    detail: "the worker stopped waiting before the channel's queue took the answer"
+                        .to_owned(),
+                },
+            )));
+        }
+        let queued = queue()?;
+        *state = GateState::Queued(detail.to_owned());
+        drop(state);
+        #[cfg(feature = "testing")]
+        self.at_queueing_pause();
+        Ok(queued)
+    }
+
+    /// Stops waiting for the operation. Returns the channel end it is if a queue took it, and
+    /// otherwise stops any queue taking it afterwards.
+    pub fn give_up(&self) -> Option<BrokerError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let GateState::Queued(detail) = &*state {
+            return Some(BrokerError::ChannelEnd {
+                detail: detail.clone(),
+            });
+        }
+        *state = GateState::GivenUp;
+        None
+    }
+
+    /// Arms the pause for the next call that queues through this gate.
+    #[cfg(feature = "testing")]
+    pub(crate) fn arm_after_queueing(
+        &self,
+        pause: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    ) {
+        *self
+            .after_queueing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = pause;
+    }
+
+    /// Waits, blocking this thread, at an armed pause after the queue took the operation.
+    #[cfg(feature = "testing")]
+    fn at_queueing_pause(&self) {
+        let armed = self
+            .after_queueing
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
 }
 
 /// Which component is answerable for one mutation reaching its upstream.
