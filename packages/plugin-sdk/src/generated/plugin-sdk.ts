@@ -1374,6 +1374,16 @@ export interface ConnectorManifest {
         type: 'server_sent_events'
       }
   /**
+   * How the forwarder reads the hook payload of the application's bridge: where the event and
+   * the session are, which event names report which of five things, and where the members a
+   * report carries are.
+   *
+   * A table that does not state it leaves the member out, and a bridge's forwarder then reads the
+   * payload as Claude Code writes it, so a connector written before the member existed reads and
+   * hashes exactly as it did. A package that states it declares an `sdk_range` from SDK 0.1.8.
+   */
+  hook_events?: HookEvents | null
+  /**
    * The manifest format version.
    */
   manifest_version: number
@@ -1386,7 +1396,7 @@ export interface ConnectorManifest {
    * reads and hashes exactly as it did.
    */
   messages?: MessageMembers | null
-  method_path: FieldPath2
+  method_path: FieldPath7
   /**
    * What each method does.
    */
@@ -1416,13 +1426,13 @@ export interface ConnectorManifest {
    * What the publisher says about the qualification behind this table.
    */
   qualification_note: Summary | null
-  request_id_path: FieldPath10
+  request_id_path: FieldPath14
   /**
    * How a response is matched to its request.
    */
   response_correlation:
     | {
-        id_path: FieldPath11
+        id_path: FieldPath15
         type: 'matching_id'
       }
     | {
@@ -1543,6 +1553,153 @@ export interface DecisionResponse {
   result_member: string
 }
 /**
+ * What a hook's payload means, for one application.
+ */
+export interface HookEvents {
+  /**
+   * How the application names the contact skill's tool, for a package that reports it.
+   */
+  contact?: HookContact | null
+  details?: HookDetails
+  event: FieldPath5
+  /**
+   * The event names the forwarder reports, one to thirty-two, each with what it reports. An
+   * event not named here is answered and reports nothing.
+   */
+  events: HookEvent[]
+  thread: FieldPath6
+}
+/**
+ * How the application names the contact skill's tool and the request it asked.
+ */
+export interface HookContact {
+  /**
+   * The other members the application names the server or the tool by. When the payload holds
+   * one of them, it has to agree with the contact skill's own name.
+   */
+  agreeing?: HookAgreement[]
+  tool_input: FieldPath3
+  /**
+   * How the application spells the tool's name at the `tool_name` place: plain characters and
+   * the words `{server}` and `{tool}`, which the host expands to the contact skill's server
+   * name and tool name before it compares for equality.
+   */
+  tool_name: string
+}
+/**
+ * A member that names the contact skill's server or tool, and which one.
+ */
+export interface HookAgreement {
+  /**
+   * Which of the two it names.
+   */
+  names: 'server' | 'tool'
+  place: FieldPath2
+}
+/**
+ * Where the payload names it.
+ */
+export interface FieldPath2 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * Where the tool's input object is. The request identifier is its member `request_id`.
+ */
+export interface FieldPath3 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * The members a report carries.
+ */
+export interface HookDetails {
+  /**
+   * Why a session ended.
+   */
+  end_reason?: FieldPath4 | null
+  /**
+   * Which notification this is.
+   */
+  notification_kind?: FieldPath4 | null
+  /**
+   * The notification's text.
+   */
+  notification_text?: FieldPath4 | null
+  /**
+   * How a session started.
+   */
+  start_source?: FieldPath4 | null
+  /**
+   * The tool that ran.
+   */
+  tool_name?: FieldPath4 | null
+}
+/**
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
+ */
+export interface FieldPath4 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
+ */
+export interface FieldPath5 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
+ * One event name and what it reports.
+ */
+export interface HookEvent {
+  /**
+   * The start source that makes this a continuation of the thread already selected, for a
+   * session start.
+   *
+   * A start whose source reads as this one goes on in the same thread; every other start is a
+   * new selection. It needs the `start_source` place.
+   */
+  continued_by?: string | null
+  /**
+   * The name the application gives the event.
+   */
+  name: string
+  /**
+   * What the forwarder reports for it.
+   */
+  report: 'session_started' | 'session_ended' | 'tool_finished' | 'tool_failed' | 'notification'
+}
+/**
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
+ */
+export interface FieldPath6 {
+  /**
+   * The path segments, from the root of the message.
+   */
+  segments: FieldSegment[]
+}
+/**
  * The top-level members a message is read by, beyond its identifier and its method.
  *
  * A table for the application server a native terminal speaks to names them here: the member a
@@ -1567,9 +1724,13 @@ export interface MessageMembers {
   result: string
 }
 /**
- * Where a message names its method.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath2 {
+export interface FieldPath7 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1633,12 +1794,16 @@ export interface LeaveRoute {
    * A native protocol method name in the connector's classification table.
    */
   method: string
-  thread: FieldPath3
+  thread: FieldPath8
 }
 /**
- * Where the message names the thread, from the root of the message.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath3 {
+export interface FieldPath8 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1652,12 +1817,16 @@ export interface ResolvedRoute {
    * A native protocol method name in the connector's classification table.
    */
   method: string
-  request_id: FieldPath4
+  request_id: FieldPath9
 }
 /**
- * Where the notification names the request it cleared, from the root of the message.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath4 {
+export interface FieldPath9 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1681,7 +1850,7 @@ export interface SelectionRoute {
    * A native protocol method name in the connector's classification table.
    */
   method: string
-  thread: FieldPath6
+  thread: FieldPath11
 }
 /**
  * A condition on a request: the place in its message must hold one of some scalar values.
@@ -1691,25 +1860,33 @@ export interface SelectionRoute {
  * with nothing at the place does not meet it, and neither does a condition that lists no value.
  */
 export interface RequestCondition {
-  place: FieldPath5
+  place: FieldPath10
   /**
    * The values the place may hold; the condition is met when it holds any one of them.
    */
   values: ConditionValue[]
 }
 /**
- * Where the request's message holds the value, from the root of the message.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath5 {
+export interface FieldPath10 {
   /**
    * The path segments, from the root of the message.
    */
   segments: FieldSegment[]
 }
 /**
- * Where the success reply names the thread, from the root of the reply.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath6 {
+export interface FieldPath11 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1723,22 +1900,30 @@ export interface TurnRoute {
    * A native protocol method name in the connector's classification table.
    */
   method: string
-  thread: FieldPath7
-  turn: FieldPath8
+  thread: FieldPath12
+  turn: FieldPath13
 }
 /**
- * Where the notification names the thread, from the root of the message.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath7 {
+export interface FieldPath12 {
   /**
    * The path segments, from the root of the message.
    */
   segments: FieldSegment[]
 }
 /**
- * Where it names the turn, from the root of the message.
+ * A bounded path into a decoded native message.
+ *
+ * The grammar is member names and array indices only, with no wildcard, no filter and no
+ * recursive descent. The broker evaluates it against every framed message on the forwarding
+ * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath8 {
+export interface FieldPath13 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1795,20 +1980,7 @@ export interface OperationRoute {
    * Where the reply names the turn the operation started, from the root of the reply, where it
    * names one.
    */
-  reply_turn?: FieldPath9 | null
-}
-/**
- * A bounded path into a decoded native message.
- *
- * The grammar is member names and array indices only, with no wildcard, no filter and no
- * recursive descent. The broker evaluates it against every framed message on the forwarding
- * path, so it must cost a fixed number of lookups.
- */
-export interface FieldPath9 {
-  /**
-   * The path segments, from the root of the message.
-   */
-  segments: FieldSegment[]
+  reply_turn?: FieldPath4 | null
 }
 /**
  * The upstream protocol this table is qualified against.
@@ -1834,7 +2006,7 @@ export interface ProtocolPin {
  * recursive descent. The broker evaluates it against every framed message on the forwarding
  * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath10 {
+export interface FieldPath14 {
   /**
    * The path segments, from the root of the message.
    */
@@ -1847,7 +2019,7 @@ export interface FieldPath10 {
  * recursive descent. The broker evaluates it against every framed message on the forwarding
  * path, so it must cost a fixed number of lookups.
  */
-export interface FieldPath11 {
+export interface FieldPath15 {
   /**
    * The path segments, from the root of the message.
    */
@@ -3585,7 +3757,7 @@ export interface ActionDeclaration {
  * One declared parameter bound to a field of an upstream request.
  */
 export interface ParameterBinding {
-  field: FieldPath12
+  field: FieldPath16
   /**
    * The declared parameter supplying the value.
    */
@@ -3594,7 +3766,7 @@ export interface ParameterBinding {
 /**
  * Where the value goes in the upstream request.
  */
-export interface FieldPath12 {
+export interface FieldPath16 {
   /**
    * The path segments, from the root of the message.
    */

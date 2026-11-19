@@ -103,6 +103,7 @@ pub mod digest;
 pub mod effect;
 pub mod example;
 pub mod forwarder;
+pub mod hook_events;
 pub mod identity;
 pub mod ids;
 pub mod integration;
