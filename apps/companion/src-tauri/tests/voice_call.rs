@@ -9269,12 +9269,31 @@ fn wrote_for(scene: &Scene, id: &str) -> Vec<String> {
         .collect()
 }
 
-/// Waits until the host has written `note`'s sentence for the delegation `id`.
-async fn until_noted(scene: &Scene, id: &str, note: VoiceNote) {
-    until_written(scene, "session.commentary.append", |(content, delegation)| {
-        content == note.words() && delegation.as_deref() == Some(id)
+/// Waits until the host has written a command of `kind` that `wanted` accepts, and says whether it
+/// did within the watchdog: a case that decides on it asserts the answer itself.
+async fn host_wrote(
+    scene: &Scene,
+    kind: &str,
+    wanted: impl Fn(&(String, Option<String>)) -> bool,
+) -> bool {
+    tokio::time::timeout(WATCHDOG, async {
+        while !written_of(scene, kind).iter().any(&wanted) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     })
-    .await;
+    .await
+    .is_ok()
+}
+
+/// Waits until the host has written `note`'s sentence for the delegation `id`, and says whether it
+/// did within the watchdog.
+async fn host_noted(scene: &Scene, id: &str, note: VoiceNote) -> bool {
+    host_wrote(
+        scene,
+        "session.commentary.append",
+        |(content, delegation)| content == note.words() && delegation.as_deref() == Some(id),
+    )
+    .await
 }
 
 /// A status asked for after a pause on a call on the host's own key is handed to the host as on a
@@ -9282,7 +9301,8 @@ async fn until_noted(scene: &Scene, id: &str, note: VoiceNote) {
 /// for the delegation with its own summary after it. The phone writes nothing to the provider and
 /// asks nothing of the voice service or the account.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_status_asked_for_on_an_own_key_call_is_performed_by_the_host_and_told_with_its_summary() {
+async fn a_status_asked_for_on_an_own_key_call_is_performed_by_the_host_and_told_with_its_summary()
+{
     let mut scene = own_acting_with(delegating_timings(), own_standing(false)).await;
     own_calling(&scene).await;
     own_chatter(&scene).await;
@@ -9294,16 +9314,20 @@ async fn a_status_asked_for_on_an_own_key_call_is_performed_by_the_host_and_told
     assert_eq!(row["offset_ms"], end - 200);
     assert_eq!(at_the_host(&scene), 1, "the host was sent the one request");
     let performed = VoiceNote::DelegationPerformed.words();
-    until_written(
-        &scene,
-        "session.commentary.append",
-        |(content, delegation)| {
-            delegation.as_deref() == Some("d-1")
-                && content.starts_with(performed)
-                && !content[performed.len()..].trim().is_empty()
-        },
-    )
-    .await;
+    assert!(
+        host_wrote(
+            &scene,
+            "session.commentary.append",
+            |(content, delegation)| {
+                delegation.as_deref() == Some("d-1")
+                    && content.starts_with(performed)
+                    && !content[performed.len()..].trim().is_empty()
+            },
+        )
+        .await,
+        "the host never wrote the performed sentence with its summary: {:?}",
+        wrote_for(&scene, "d-1")
+    );
     scene
         .state_where("the model told", |state| {
             row_of(state, "d-1").is_some_and(|row| row["told"] == true)
@@ -9335,7 +9359,11 @@ async fn a_request_the_host_refuses_on_an_own_key_call_is_told_to_the_model_as_t
 
     assert!(row["cause"].is_string(), "{row}");
     assert_eq!(at_the_host(&scene), 1);
-    until_noted(&scene, "d-1", VoiceNote::DelegationHostRefused).await;
+    assert!(
+        host_noted(&scene, "d-1", VoiceNote::DelegationHostRefused).await,
+        "the host never wrote DelegationHostRefused: {:?}",
+        wrote_for(&scene, "d-1")
+    );
     let wrote = wrote_for(&scene, "d-1");
     assert_eq!(
         wrote,
@@ -9390,12 +9418,17 @@ async fn a_close_said_aloud_on_an_own_key_call_is_confirmed_on_the_phone_and_the
         "about the session: {asked:?}"
     );
     let performed = VoiceNote::DelegationPerformed.words();
-    until_written(
-        &scene,
-        "session.commentary.append",
-        |(content, delegation)| delegation.as_deref() == Some("d-1") && content.starts_with(performed),
-    )
-    .await;
+    assert!(
+        host_wrote(
+            &scene,
+            "session.commentary.append",
+            |(content, delegation)| delegation.as_deref() == Some("d-1")
+                && content.starts_with(performed),
+        )
+        .await,
+        "the host never wrote the performed sentence: {:?}",
+        wrote_for(&scene, "d-1")
+    );
     let wrote = wrote_for(&scene, "d-1");
     assert_eq!(
         wrote.first().map(String::as_str),
@@ -9403,7 +9436,9 @@ async fn a_close_said_aloud_on_an_own_key_call_is_confirmed_on_the_phone_and_the
         "first, that the person is being asked: {wrote:?}"
     );
     assert!(
-        wrote.last().is_some_and(|words| words.starts_with(performed)),
+        wrote
+            .last()
+            .is_some_and(|words| words.starts_with(performed)),
         "last, what the host did: {wrote:?}"
     );
     assert!(
@@ -9422,7 +9457,8 @@ async fn a_close_said_aloud_on_an_own_key_call_is_confirmed_on_the_phone_and_the
 /// and the host writes the sentence for the reason. The same request said again, once the person does
 /// confirm, closes the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_person_who_does_not_confirm_on_an_own_key_call_signs_nothing_and_the_host_tells_the_model_why() {
+async fn a_person_who_does_not_confirm_on_an_own_key_call_signs_nothing_and_the_host_tells_the_model_why()
+ {
     use kr_client::pairing::owner::CeremonyOutcome;
 
     for (outcome, cause, note) in [
@@ -9444,7 +9480,11 @@ async fn a_person_who_does_not_confirm_on_an_own_key_call_signs_nothing_and_the_
         let row = row_reaching(&scene, "d-1", "cancelled").await;
 
         assert_eq!(row["cause"], cause, "{outcome:?}");
-        until_noted(&scene, "d-1", note).await;
+        assert!(
+            host_noted(&scene, "d-1", note).await,
+            "the host never wrote {note}: {:?}",
+            wrote_for(&scene, "d-1")
+        );
         assert_eq!(scene.ceremony.asked().len(), 1, "{outcome:?}");
         assert_eq!(at_the_host(&scene), 1, "no signature was sent: {outcome:?}");
         assert!(!scene.is_closed().await, "{outcome:?}");
@@ -9480,7 +9520,11 @@ async fn a_challenge_that_does_not_agree_or_ran_out_on_an_own_key_call_is_not_si
     own_ask(&scene, "d-1", end - 200).await;
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "challenge_mismatch");
-    until_noted(&scene, "d-1", VoiceNote::DelegationChallengeMismatch).await;
+    assert!(
+        host_noted(&scene, "d-1", VoiceNote::DelegationChallengeMismatch).await,
+        "the host never wrote DelegationChallengeMismatch: {:?}",
+        wrote_for(&scene, "d-1")
+    );
     assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
     assert_eq!(at_the_host(&scene), 1);
     assert!(!scene.is_closed().await);
@@ -9498,7 +9542,11 @@ async fn a_challenge_that_does_not_agree_or_ran_out_on_an_own_key_call_is_not_si
     own_closing_asked(&scene, "d-1").await;
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "confirmation_expired");
-    until_noted(&scene, "d-1", VoiceNote::DelegationConfirmationExpired).await;
+    assert!(
+        host_noted(&scene, "d-1", VoiceNote::DelegationConfirmationExpired).await,
+        "the host never wrote DelegationConfirmationExpired: {:?}",
+        wrote_for(&scene, "d-1")
+    );
     assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
     assert_eq!(at_the_host(&scene), 1);
     assert!(!scene.is_closed().await);
@@ -9522,7 +9570,11 @@ async fn a_challenge_that_does_not_agree_or_ran_out_on_an_own_key_call_is_not_si
     scene.ceremony.release();
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "confirmation_expired");
-    until_noted(&scene, "d-1", VoiceNote::DelegationConfirmationExpired).await;
+    assert!(
+        host_noted(&scene, "d-1", VoiceNote::DelegationConfirmationExpired).await,
+        "the host never wrote DelegationConfirmationExpired: {:?}",
+        wrote_for(&scene, "d-1")
+    );
     assert_eq!(at_the_host(&scene), 1);
     assert!(!scene.is_closed().await);
     hang_up(&scene);
@@ -9549,7 +9601,11 @@ async fn a_session_not_named_or_more_said_on_an_own_key_call_stops_the_confirmat
     scene.link.until_request_held().await;
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "session_not_named", "{row}");
-    until_noted(&scene, "d-1", VoiceNote::DelegationSessionNotNamed).await;
+    assert!(
+        host_noted(&scene, "d-1", VoiceNote::DelegationSessionNotNamed).await,
+        "the host never wrote DelegationSessionNotNamed: {:?}",
+        wrote_for(&scene, "d-1")
+    );
     assert!(scene.ceremony.asked().is_empty(), "nobody was asked");
     assert_eq!(at_the_host(&scene), 1, "no signature was sent");
     assert!(!scene.is_closed().await);
@@ -9570,7 +9626,11 @@ async fn a_session_not_named_or_more_said_on_an_own_key_call_stops_the_confirmat
         .tell_provider(&fragment(end, end + 200, " not"));
     let row = row_reaching(&scene, "d-1", "cancelled").await;
     assert_eq!(row["cause"], "late_fragment");
-    until_noted(&scene, "d-1", VoiceNote::DelegationLate).await;
+    assert!(
+        host_noted(&scene, "d-1", VoiceNote::DelegationLate).await,
+        "the host never wrote DelegationLate: {:?}",
+        wrote_for(&scene, "d-1")
+    );
     scene.ceremony.release();
     until_the_ceremony_is_handled(&scene, "d-1").await;
     assert_eq!(at_the_host(&scene), 1, "no signature was sent");
