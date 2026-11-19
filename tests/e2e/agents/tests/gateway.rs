@@ -97,10 +97,10 @@ use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
 use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::held::{
     Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard,
-    NEWER_CONFIG_DIRECTORY, RunScan, Stop, absent_below, absent_paths, absent_paths_in,
+    NEWER_CONFIG_DIRECTORY, Recorded, RunScan, Stop, absent_below, absent_paths, absent_paths_in,
     audit_turns, conversations_relative, conversations_relative_in, folder_of, grouped_output,
-    kept_panic_text, other_agent_processes, other_agents_refusal, panic_text, person_home,
-    read_record, turns_recorded, unchanged_before_the_charge,
+    kept_panic_text, new_turns, other_agent_processes, other_agents_refusal, panic_text,
+    person_home, read_record, turns_recorded, unchanged_before_the_charge,
 };
 use kr_e2e_agents::outcome::Outcome;
 use kr_e2e_agents::session_environment::{self, Expected};
@@ -299,10 +299,11 @@ struct Real {
     /// The files that would load the person's own settings into the newer build, listed once before
     /// the agent's first start: what every later check of them looks at.
     newer_absent: std::sync::OnceLock<Vec<PathBuf>>,
-    /// The turns the newer build's conversation directory held right after its probes: the probes
-    /// are the build's own and may leave a record, and the audit at the end counts the turns above
-    /// this number, since no prompt is sent to the newer build.
-    newer_baseline: std::sync::OnceLock<u64>,
+    /// The turns the newer build's conversation directory held right after its probes, with their
+    /// identities: the probes are the build's own and may leave a record, and the audit at the end
+    /// finds the turns whose identities are not among these, since no prompt is sent to the newer
+    /// build.
+    newer_baseline: std::sync::OnceLock<Recorded>,
     /// The signed catalogue generation the package is installed from, which the operator names:
     /// a real route has no fixture generation to fall back to.
     generation: PathBuf,
@@ -607,7 +608,8 @@ impl Real {
     }
 
     /// Records the turns the newer build's conversation directory holds now, once, right after its
-    /// probes ([`Real::newer_baseline`]); the probes' record stays among the evidence.
+    /// probes ([`Real::newer_baseline`]): their count and their identities, so that the audit finds
+    /// a turn that is new by its identity; the probes' record stays among the evidence.
     ///
     /// # Panics
     ///
@@ -616,8 +618,8 @@ impl Real {
     fn records_the_newer_baseline(&self, run: &Run) {
         let relative = conversations_relative_in(&self.account, NEWER_CONFIG_DIRECTORY);
         let turns = match turns_recorded(&self.account, run.root(), run.pin(), &relative) {
-            Ok(found) => found.turns,
-            Err(_) if !run.root().join(&relative).exists() => 0,
+            Ok(found) => found,
+            Err(_) if !run.root().join(&relative).exists() => Recorded::default(),
             Err(why) => panic!(
                 "{ISOLATION_UNPROVEN} the newer build's record after its probes was not counted: {why}"
             ),
@@ -854,6 +856,10 @@ impl Real {
         variables: &[(String, String)],
     ) -> serde_json::Value {
         let keys = self.held.values();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let directory = std::env::var_os(EVIDENCE_VARIABLE)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let mut total_left = RECORDED_TOTAL_CHARS;
         let probes: Vec<serde_json::Value> = self
             .account
@@ -863,26 +869,13 @@ impl Real {
             .map(
                 |(index, probe)| match self.answer(run, newer, true, variables, probe) {
                     Ok(answer) => {
-                        let searched = keys.iter().filter(|key| !key.is_empty()).count();
-                        let found = keys
-                            .iter()
-                            .any(|key| !key.is_empty() && answer.text.contains(key.as_str()));
-                        // An answer that holds a key is not written anywhere.
-                        let kept_in = if found {
-                            Err("the answer holds a key the run holds".to_owned())
-                        } else {
-                            keeps_the_answer(run, index, &answer.text)
-                        };
-                        probe_record(
-                            probe,
-                            &answer,
-                            &Kept {
-                                kept_in,
-                                keys_searched: searched,
-                                key_found: found,
-                            },
-                            &mut total_left,
-                        )
+                        let kept = searches_and_keeps(
+                            &keys,
+                            directory.as_deref(),
+                            &format!("{}-newer-probe-{index}.txt", run.mark().1),
+                            &answer.text,
+                        );
+                        probe_record(probe, &answer, &kept, &mut total_left)
                     }
                     Err(why) => serde_json::json!({
                         "arguments": probe.arguments,
@@ -1119,30 +1112,46 @@ struct Kept {
     key_found: bool,
 }
 
-/// Writes `text`, the whole answer of probe `index`, to a new private file of the evidence
-/// directory, and returns the file's name. A file that is there is not written over.
-fn keeps_the_answer(run: &Run, index: usize, text: &str) -> Result<String, String> {
+/// Searches `text`, the whole answer of a probe, for the `keys` the run holds, by the part's own
+/// search (every key, and every piece of eight characters of one), and keeps it whole in the file
+/// `name` of `directory` where it holds none. An answer that holds a key is written nowhere.
+fn searches_and_keeps(keys: &[&str], directory: Option<&Path>, name: &str, text: &str) -> Kept {
+    let keys: Vec<&str> = keys.iter().copied().filter(|key| !key.is_empty()).collect();
+    let lines: Vec<&str> = text.lines().collect();
+    let found = kr_e2e_agents::held::holds_a_key(&lines, &keys);
+    let kept_in = if found {
+        Err("the answer holds a key the run holds".to_owned())
+    } else {
+        keeps_the_answer(directory, name, text)
+    };
+    Kept {
+        kept_in,
+        keys_searched: keys.len(),
+        key_found: found,
+    }
+}
+
+/// Writes `text`, the whole answer of a probe, to the new private file `name` of `directory`, which
+/// is an absolute path of an existing directory, and returns the file's name. A file that is there
+/// is not written over.
+fn keeps_the_answer(directory: Option<&Path>, name: &str, text: &str) -> Result<String, String> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let directory = std::env::var_os(EVIDENCE_VARIABLE)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("{EVIDENCE_VARIABLE} names no directory"))?;
+    let directory = directory.ok_or_else(|| format!("{EVIDENCE_VARIABLE} names no directory"))?;
     if !directory.is_absolute() || !directory.is_dir() {
         return Err(format!(
             "{EVIDENCE_VARIABLE} does not name an existing absolute directory"
         ));
     }
-    let name = format!("{}-newer-probe-{index}.txt", run.mark().1);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(directory.join(&name))
+        .open(directory.join(name))
         .map_err(|error| format!("the answer is not kept: {error}"))?;
     file.write_all(text.as_bytes())
         .map_err(|error| format!("the answer is not kept: {error}"))?;
-    Ok(name)
+    Ok(name.to_owned())
 }
 
 /// A row of a feature list: a name, a stage and `true` or `false`.
@@ -1154,8 +1163,13 @@ fn is_feature_row(line: &str) -> bool {
 /// The rows of `text` the record keeps for `probe`, in order: every feature row and every row that
 /// holds a text the probe expects or refuses (spaces and case aside), each cut to
 /// [`RECORDED_ROW_CHARS`], at most [`RECORDED_ROWS`] of them and at most `total_left` characters
-/// of all the probes' together, which it takes from; with what was left out or cut, as texts.
-fn relevant_rows(probe: &Probe, text: &str, total_left: &mut usize) -> (Vec<String>, Vec<String>) {
+/// of all the probes' together, which it takes from; with what was cut, as texts, and how many
+/// non-empty rows of the whole answer are not kept because they are neither.
+fn relevant_rows(
+    probe: &Probe,
+    text: &str,
+    total_left: &mut usize,
+) -> (Vec<String>, Vec<String>, usize) {
     let squeeze = |text: &str| {
         text.split_whitespace()
             .collect::<Vec<_>>()
@@ -1170,10 +1184,17 @@ fn relevant_rows(probe: &Probe, text: &str, total_left: &mut usize) -> (Vec<Stri
         .filter(|text| text.as_str() != "{servers}")
         .map(|text| squeeze(text))
         .collect();
+    let relevant = |line: &str| {
+        let squeezed = squeeze(line);
+        is_feature_row(line) || wanted.iter().any(|text| squeezed.contains(text.as_str()))
+    };
+    let left_out = text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !relevant(line))
+        .count();
     let (mut rows, mut cut) = (Vec::new(), Vec::new());
     for line in text.lines() {
-        let squeezed = squeeze(line);
-        if !is_feature_row(line) && !wanted.iter().any(|text| squeezed.contains(text.as_str())) {
+        if !relevant(line) {
             continue;
         }
         if rows.len() == RECORDED_ROWS {
@@ -1194,14 +1215,26 @@ fn relevant_rows(probe: &Probe, text: &str, total_left: &mut usize) -> (Vec<Stri
         *total_left -= kept.len();
         rows.push(kept);
     }
-    (rows, cut)
+    (rows, cut, left_out)
+}
+
+/// Whether `probe` is the feature list, whose every row the criteria are read from.
+fn lists_features(probe: &Probe) -> bool {
+    probe
+        .arguments
+        .iter()
+        .map(String::as_str)
+        .take(2)
+        .eq(["features", "list"])
 }
 
 /// One probe of the probe-only run: its arguments, how it ended, whether the answer holds what the
 /// probe expects of the pinned build, which expectation it misses where it does not, the answer's
 /// size and digest and the file that holds it whole, the search of it for keys, the rows the
-/// criteria are read from, what was cut, and whether the record may be adopted: only where the
-/// probe answered, the whole answer is kept, no key was found in it and nothing was cut.
+/// criteria are read from, what was cut, how many non-empty rows were left out of those (the
+/// reviewers read them in the whole answer that was kept), and whether the record may be adopted:
+/// only where the probe answered, the whole answer is kept, no key was found in it, nothing was cut
+/// and, for the feature list, no non-empty row was left out.
 fn probe_record(
     probe: &Probe,
     answer: &Answer,
@@ -1209,12 +1242,15 @@ fn probe_record(
     total_left: &mut usize,
 ) -> serde_json::Value {
     let verdict = judged(probe, answer);
-    let (rows, cut) = relevant_rows(probe, &answer.text, total_left);
+    let (rows, cut, left_out) = relevant_rows(probe, &answer.text, total_left);
     let digest: String = kr_cbor::sha256(answer.text.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    let adoptable = kept.kept_in.is_ok() && !kept.key_found && cut.is_empty();
+    let adoptable = kept.kept_in.is_ok()
+        && !kept.key_found
+        && cut.is_empty()
+        && !(lists_features(probe) && left_out > 0);
     serde_json::json!({
         "arguments": probe.arguments,
         "answered": true,
@@ -1230,6 +1266,7 @@ fn probe_record(
         },
         "keys": { "values_searched": kept.keys_searched, "found": kept.key_found },
         "relevant_rows": rows,
+        "rows_left_out": left_out,
         "truncated": !cut.is_empty(),
         "truncated_because": cut,
         "adoptable": adoptable,
@@ -1828,6 +1865,32 @@ impl Context {
     }
 
     /// Reads the binding until `holds` is true of it, within the liveness bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns why a read failed, or the last binding read when the bound passed.
+    fn binding_within(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        why: &str,
+        holds: impl Fn(&AgentBindingState) -> bool,
+    ) -> Result<AgentBindingState, String> {
+        let started = Instant::now();
+        loop {
+            let read = self.read_binding(remote, session_id, instance)?;
+            if holds(&read) {
+                return Ok(read);
+            }
+            if started.elapsed() >= LIVENESS {
+                return Err(format!("{why}: the binding is {read:?}"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// [`Context::binding_within`] where a failure stops the case at once.
     fn binding_until(
         &self,
         remote: &Remote,
@@ -1836,18 +1899,8 @@ impl Context {
         why: &str,
         holds: impl Fn(&AgentBindingState) -> bool,
     ) -> AgentBindingState {
-        let started = Instant::now();
-        loop {
-            let read = self.binding(remote, session_id, instance);
-            if holds(&read) {
-                return read;
-            }
-            assert!(
-                started.elapsed() < LIVENESS,
-                "{why}: the binding is {read:?}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        self.binding_within(remote, session_id, instance, why, holds)
+            .unwrap_or_else(|why| panic!("{why}"))
     }
 
     /// What a rich call at `binding` acts on.
@@ -2130,21 +2183,26 @@ struct GenerationEntry {
 ///
 /// # Panics
 ///
-/// Panics where the generation's index does not name the package, or names a capability the
-/// vocabulary does not hold.
+/// Panics where the generation's index does not name the package exactly once, or names a
+/// capability the vocabulary does not hold.
 fn generation_entry(directory: &Path) -> GenerationEntry {
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(directory.join("targets/index.json")).expect("the generation's index"),
     )
     .expect("the index is JSON");
-    let entry = index["entries"]
+    let named: Vec<&serde_json::Value> = index["entries"]
         .as_array()
-        .and_then(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry["plugin_id"] == codex().to_string())
-        })
-        .expect("the generation's index names the Codex package");
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["plugin_id"] == codex().to_string())
+        .collect();
+    assert_eq!(
+        named.len(),
+        1,
+        "the generation's index names the Codex package once, not {} times",
+        named.len()
+    );
+    let entry = named[0];
     let text = |value: &serde_json::Value| value.as_str().unwrap_or_default().to_owned();
     let mut grant: Vec<PluginCapability> = entry["capabilities"]
         .as_array()
@@ -3252,6 +3310,17 @@ impl<'a> Session<'a> {
             .binding_until(&self.remote, self.session_id(), instance, why, holds)
     }
 
+    /// [`Session::binding_until`] where the failure is returned.
+    fn binding_within(
+        &self,
+        instance: ApplicationInstanceId,
+        why: &str,
+        holds: impl Fn(&AgentBindingState) -> bool,
+    ) -> Result<AgentBindingState, String> {
+        self.ctx
+            .binding_within(&self.remote, self.session_id(), instance, why, holds)
+    }
+
     /// Reads the binding until `holds` is true of it with rich work available, and fails on any read
     /// that finds rich work suspended for a reason other than a request in flight, and on a hold for
     /// a request in flight that lasts past its bound.
@@ -3484,21 +3553,25 @@ fn ends(
                 let newer_record = conversations_relative_in(&real.account, NEWER_CONFIG_DIRECTORY);
                 // The probes of the newer build may leave a record of their own: the turns counted
                 // are those above what its directory held right after them.
-                let baseline = real.newer_baseline.get().copied().unwrap_or(0);
+                let baseline = real.newer_baseline.get().cloned().unwrap_or_default();
                 match turns_recorded(&real.account, run.root(), run.pin(), &newer_record) {
                     Ok(found) => {
+                        // A turn is new where its identity is not among those the probes left, so
+                        // a turn the probes left that is gone and a new one do not pass as an equal
+                        // count.
+                        let new = new_turns(&baseline, &found);
                         evidence["newer_turns"] = serde_json::json!({
-                            "after_the_probes": baseline,
+                            "after_the_probes": baseline.turns,
                             "at_the_end": found.turns,
+                            "new_since_the_probes": new,
                         });
-                        if found.turns > baseline {
+                        if new > 0 {
                             stops.push((
                                 "uncharged_turns",
                                 format!(
-                                    "the newer build's configuration directory holds {} turn(s) \
-                                     where its probes left {baseline}, and no prompt is sent to \
-                                     the newer build",
-                                    found.turns
+                                    "the newer build's configuration directory holds {new} turn(s) \
+                                     that its probes did not leave, and no prompt is sent to the \
+                                     newer build"
                                 ),
                             ));
                         }
@@ -4151,7 +4224,7 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                         .expect("the newer build was placed"),
                 );
             }
-            let _ = servers_seen(&workers, &mut servers);
+            let sampled_before = servers_seen(&workers, &mut servers);
             let (typed, shows) = match &ctx.route {
                 Route::StandIn => ("codex".to_owned(), RAN_AS_TYPED.to_owned()),
                 Route::Real(real) => (
@@ -4177,6 +4250,27 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                 &workers,
                 &mut servers,
             );
+
+            // The second instance, read right after its launch and before any turn is charged: what
+            // the host announces for it, its capabilities, and the program the launch typed.
+            let second_read = ctx.instances_within(
+                &second.remote,
+                second_session,
+                "the second instance",
+                |read| !read.agent_instances.instances.is_empty(),
+            );
+            let second_summary = second_read
+                .as_ref()
+                .ok()
+                .and_then(|read| read.agent_instances.instances.first().cloned());
+            let second_capabilities = second_summary.as_ref().map(|summary| {
+                capability_identity(
+                    ctx,
+                    &second.remote,
+                    second_session,
+                    summary.application_instance_id,
+                )
+            });
 
             // Step 8: fresh traffic through the pinned adapter, made after the upgrade: the device
             // answers the held approval, and the pinned server asks a second one that did not exist
@@ -4219,7 +4313,24 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                         as_typed.is_ok(),
                         "the second program runs as typed: {as_typed:?}"
                     );
-                    assert!(sampled.is_ok(), "the process table was read: {sampled:?}");
+                    assert!(
+                        sampled_before.is_ok() && sampled.is_ok(),
+                        "the process table was read: {sampled_before:?}, {sampled:?}"
+                    );
+                    assert!(
+                        second_summary.as_ref().is_some_and(|summary| {
+                            !summary.mode.uses_gateway()
+                                && summary.mode
+                                    == kr_protocol::broker::IntegrationMode::NativeTerminal
+                        }),
+                        "the second instance is a native terminal with no gateway: \
+                         {second_read:?}"
+                    );
+                    assert!(
+                        matches!(&second_capabilities, Some(Ok((_, 0, _)))),
+                        "the second instance's capabilities are read and none is usable: \
+                         {second_capabilities:?}"
+                    );
                     real.checks_the_newer_route(
                         &ctx.run,
                         ctx.newer_placed
@@ -4255,7 +4366,9 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                         &mark,
                     );
                     let _ = session.person.dialog_names(&real.account, &command);
-                    let binding = session.binding_until(
+                    // Each observation is a result, asserted here before the step that depends
+                    // on it.
+                    let bound = session.binding_within(
                         instance,
                         "the stream names the thread and the running turn",
                         |binding| {
@@ -4264,16 +4377,28 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                                 && unsuspended(binding)
                         },
                     );
+                    assert!(
+                        bound.is_ok(),
+                        "the turn's binding names its thread and turn: {bound:?}"
+                    );
+                    let binding = bound.expect("asserted above");
                     let fresh = fresh_approval_within(ctx, &session.remote, first_session, &[]);
-                    let pending = fresh
-                        .as_ref()
-                        .unwrap_or_else(|why| panic!("the approval the turn asks: {why}"));
-                    inspected = Some(ctx.inspects(
+                    assert!(
+                        fresh.is_ok(),
+                        "the approval the turn asks is interpreted by the pinned table: {fresh:?}"
+                    );
+                    let pending = fresh.as_ref().expect("asserted above");
+                    let looked_at = ctx.inspects(
                         &session.remote,
                         first_session,
                         instance,
                         pending.resource_id,
-                    ));
+                    );
+                    assert!(
+                        looked_at.is_ok(),
+                        "the host's record of the approval: {looked_at:?}"
+                    );
+                    inspected = Some(looked_at);
                     let answered = ctx
                         .answers(
                             &session.remote,
@@ -4284,18 +4409,16 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                             DECLINE,
                         )
                         .map_err(|why| why.to_string());
-                    let started = Instant::now();
-                    loop {
-                        let binding = ctx.binding(&session.remote, first_session, instance);
-                        if binding.turn_id.0.is_none() && unsuspended(&binding) {
-                            break;
-                        }
-                        assert!(
-                            started.elapsed() < LIVENESS,
-                            "the turn does not end after {LIVENESS:?}: the binding is {binding:?}"
-                        );
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
+                    assert!(
+                        answered.is_ok(),
+                        "the device's decline of the approval: {answered:?}"
+                    );
+                    let ended = session.binding_within(
+                        instance,
+                        "the turn ends after the decline",
+                        |binding| binding.turn_id.0.is_none() && unsuspended(binding),
+                    );
+                    assert!(ended.is_ok(), "the turn ends: {ended:?}");
                     (answered, fresh, Some(command))
                 }
                 (Route::StandIn, None) => panic!("the stand-in route holds the first approval"),
@@ -4303,24 +4426,6 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
 
             // Reads for the assertions.
             let after = capability_identity(ctx, &session.remote, first_session, instance);
-            let second_read = ctx.instances_within(
-                &second.remote,
-                second_session,
-                "the second instance",
-                |read| !read.agent_instances.instances.is_empty(),
-            );
-            let second_summary = second_read
-                .as_ref()
-                .ok()
-                .and_then(|read| read.agent_instances.instances.first().cloned());
-            let second_capabilities = second_summary.as_ref().map(|summary| {
-                capability_identity(
-                    ctx,
-                    &second.remote,
-                    second_session,
-                    summary.application_instance_id,
-                )
-            });
             let cancel = second_summary.as_ref().map(|summary| {
                 ctx.cancels(
                     &second.remote,
@@ -4489,8 +4594,8 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
                 "the second program runs as typed: {as_typed:?}"
             );
             assert!(
-                sampled.is_ok(),
-                "every read of the process table was made: {sampled:?}"
+                sampled_before.is_ok() && sampled.is_ok(),
+                "every read of the process table was made: {sampled_before:?}, {sampled:?}"
             );
             // 9f: both profile identifiers are present and unequal.
             assert!(
@@ -4812,10 +4917,11 @@ struct Presented {
 }
 
 /// The helper's line, an instance served through the gateway and, where `ready` is given, the
-/// build's first screen, waited for together within [`LIVENESS`] from the typing: the process table
-/// is read every 25 ms with the servers below `worker` collected, until all of them are seen. A
-/// read of the table that fails ends the wait and is returned in `sampled`. A process that starts
-/// and ends between two reads is not seen.
+/// build's first screen, waited for together within [`LIVENESS`] from the typing. The process table
+/// is read every 25 ms by a thread of its own, with the servers below `worker` collected, from the
+/// typing until the wait ends, so that a read of the host's instances that blocks does not widen
+/// the gap between two reads of the table. A read of the table that fails ends the wait and is
+/// returned in `sampled`. A process that starts and ends between two reads is not seen.
 fn presented_within(
     ctx: &Context,
     session: &Session<'_>,
@@ -4826,42 +4932,58 @@ fn presented_within(
 ) -> Presented {
     const NEEDLE: &str = "forged presentation";
     let started = Instant::now();
-    let mut sampled = Ok(());
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let failed = std::sync::atomic::AtomicBool::new(false);
     let mut line = None;
     let mut served: Result<AgentInstancesResult, String> = Err("no read yet".to_owned());
     let mut found = false;
     let mut shown = ready.is_none();
     let mut rows = Vec::new();
-    loop {
-        if let Err(why) = servers_seen(&[worker], servers) {
-            sampled = Err(why);
-            break;
-        }
-        if line.is_none() {
-            let bytes = session.person.window.collected().since(mark);
-            if String::from_utf8_lossy(&bytes).contains(NEEDLE) {
-                line = Some(bytes);
+    let sampled = std::thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            loop {
+                if let Err(why) = servers_seen(&[worker], servers) {
+                    failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(why);
+                }
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(25));
             }
-        }
-        served = ctx.read_instances(&session.remote, session.session_id());
-        found = served.as_ref().is_ok_and(|read| {
-            read.agent_instances
-                .instances
-                .iter()
-                .any(|summary| summary.mode.uses_gateway())
         });
-        if let Some(needle) = ready {
-            rows = session.person.window.screen();
-            shown = rows.iter().any(|row| row.contains(needle));
+        loop {
+            if failed.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            if line.is_none() {
+                let bytes = session.person.window.collected().since(mark);
+                if String::from_utf8_lossy(&bytes).contains(NEEDLE) {
+                    line = Some(bytes);
+                }
+            }
+            served = ctx.read_instances(&session.remote, session.session_id());
+            found = served.as_ref().is_ok_and(|read| {
+                read.agent_instances
+                    .instances
+                    .iter()
+                    .any(|summary| summary.mode.uses_gateway())
+            });
+            if let Some(needle) = ready {
+                rows = session.person.window.screen();
+                shown = rows.iter().any(|row| row.contains(needle));
+            }
+            if (line.is_some() && found && shown) || started.elapsed() >= LIVENESS {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
-        if (line.is_some() && found && shown) || started.elapsed() >= LIVENESS {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    if sampled.is_ok() {
-        sampled = servers_seen(&[worker], servers);
-    }
+        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        sampler
+            .join()
+            .unwrap_or_else(|_| Err("the process sampler panicked".to_owned()))
+    });
+    let sampled = sampled.and_then(|()| servers_seen(&[worker], servers));
     Presented {
         line: line.ok_or_else(|| {
             format!(
@@ -7115,10 +7237,10 @@ fn a_probe_only_record_names_the_expectation_of_the_pinned_entry_the_answer_miss
     assert_eq!(record["holds_the_pinned_entrys_expectations"], false);
     assert_eq!(record["ended"], "it ended with exit status: 2");
 
-    // A feature the entry does not list is kept, with the rows that are not features left out of
-    // the rows but counted in the answer.
+    // A feature the entry does not list is kept. A row that is not a feature row is left out of
+    // the rows and counted, and the feature list is not adopted with a row left out.
     let record = record_of(
-        "prose that is no feature\napps stable false\nunlisted_feature experimental true\n",
+        "apps stable false\nunlisted_feature experimental true\n",
         Ok(()),
         &kept,
     );
@@ -7126,7 +7248,39 @@ fn a_probe_only_record_names_the_expectation_of_the_pinned_entry_the_answer_miss
         record["relevant_rows"],
         serde_json::json!(["apps stable false", "unlisted_feature experimental true"])
     );
-    assert_eq!(record["answer"]["line_count"], 3);
+    assert_eq!(record["rows_left_out"], 0);
+    assert_eq!(record["adoptable"], true);
+    let record = record_of(
+        "prose that is no feature\napps stable false\n\napps stable on\n",
+        Ok(()),
+        &kept,
+    );
+    assert_eq!(
+        record["relevant_rows"],
+        serde_json::json!(["apps stable false"])
+    );
+    assert_eq!(record["answer"]["line_count"], 4);
+    assert_eq!(record["rows_left_out"], 2, "{record}");
+    assert_eq!(record["adoptable"], false, "{record}");
+    // The prompt input's answer is read whole by the reviewers: a row left out is counted and
+    // adoption does not turn on it.
+    let prompt_input = a_probe(serde_json::json!({
+        "arguments": ["debug", "prompt-input"],
+        "shows": ["the sandbox is read-only"],
+    }));
+    let answer = Answer {
+        text: "the sandbox is read-only\nsomething else the build says\n".to_owned(),
+        stubbed: false,
+        ended: Ok(()),
+    };
+    let record = probe_record(
+        &prompt_input,
+        &answer,
+        &kept,
+        &mut RECORDED_TOTAL_CHARS.clone(),
+    );
+    assert_eq!(record["rows_left_out"], 1, "{record}");
+    assert_eq!(record["adoptable"], true, "{record}");
 
     // A row longer than the bound is cut and said to be: adoption is refused.
     let long = format!("apps stable false {}\n", "x".repeat(RECORDED_ROW_CHARS * 2));
@@ -7166,6 +7320,157 @@ fn a_probe_only_record_names_the_expectation_of_the_pinned_entry_the_answer_miss
     let record = record_of("apps stable false\n", Ok(()), &found);
     assert_eq!(record["keys"]["found"], true);
     assert_eq!(record["adoptable"], false);
+}
+
+/// A probe's whole answer is searched for the keys the run holds, by the part's own search, and kept
+/// in a new private file of the evidence directory only where it holds none: it is not written over
+/// a file that is there, nor kept where no existing absolute directory is named.
+#[test]
+fn a_probe_answer_is_kept_whole_in_a_private_file_unless_it_holds_a_piece_of_a_key() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = kr_ipc::testing::PrivateTempDir::create();
+    let place = std::fs::canonicalize(directory.path()).expect("the directory");
+    let keys = ["sk-live-0123456789abcdef", ""];
+    let answer = "apps stable false\nhooks stable false\n";
+
+    let kept = searches_and_keeps(&keys, Some(&place), "one.txt", answer);
+    assert_eq!(kept.kept_in, Ok("one.txt".to_owned()));
+    assert_eq!((kept.keys_searched, kept.key_found), (1, false));
+    assert_eq!(
+        std::fs::read_to_string(place.join("one.txt")).expect("the kept answer"),
+        answer
+    );
+    let mode = std::fs::metadata(place.join("one.txt"))
+        .expect("the file")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the file is private");
+
+    // A file that is there is not written over.
+    let again = searches_and_keeps(&keys, Some(&place), "one.txt", "other\n");
+    assert!(again.kept_in.is_err(), "{:?}", again.kept_in);
+    assert_eq!(
+        std::fs::read_to_string(place.join("one.txt")).expect("the kept answer"),
+        answer
+    );
+
+    // A piece of eight characters of a key is found, and the answer is written nowhere.
+    let leaked = searches_and_keeps(
+        &keys,
+        Some(&place),
+        "two.txt",
+        "a row\nthe key is -live-01 and more\n",
+    );
+    assert!(leaked.key_found, "a piece of the key is found");
+    assert!(leaked.kept_in.is_err());
+    assert!(
+        !place.join("two.txt").exists(),
+        "the answer holding a key is not written"
+    );
+
+    // No directory, a relative one and one that is not there keep nothing.
+    for directory in [
+        None,
+        Some(Path::new("relative")),
+        Some(Path::new("/nonexistent-evidence-directory")),
+    ] {
+        let nowhere = searches_and_keeps(&keys, directory, "three.txt", answer);
+        assert!(
+            nowhere.kept_in.is_err(),
+            "{directory:?}: {:?}",
+            nowhere.kept_in
+        );
+    }
+}
+
+/// A generation's index that names the Codex package twice is refused, not read at its first entry.
+#[test]
+fn a_generation_index_that_names_the_codex_package_twice_is_refused() {
+    let directory = kr_ipc::testing::PrivateTempDir::create();
+    let place = std::fs::canonicalize(directory.path()).expect("the directory");
+    std::fs::create_dir_all(place.join("targets")).expect("the targets directory");
+    let entry = |version: &str| {
+        serde_json::json!({
+            "plugin_id": codex().to_string(),
+            "version": version,
+            "manifest_digest": "00",
+            "capabilities": [],
+        })
+    };
+    let write = |entries: serde_json::Value| {
+        std::fs::write(
+            place.join("targets/index.json"),
+            serde_json::json!({ "entries": entries }).to_string(),
+        )
+        .expect("the index");
+    };
+    write(serde_json::json!([entry("1.0.0")]));
+    assert_eq!(generation_entry(&place).version, "1.0.0");
+    write(serde_json::json!([entry("1.0.0"), entry("1.1.0")]));
+    let refused = std::panic::catch_unwind(|| generation_entry(&place));
+    assert!(
+        refused.is_err(),
+        "an index that names the Codex package twice is refused"
+    );
+    let said = refused
+        .err()
+        .and_then(|why| why.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(said.contains("names the Codex package once"), "{said}");
+}
+
+/// A turn the newer build's record holds that its probes did not leave is found by its identity,
+/// whatever the totals: a probe's turn that is gone and a new turn do not pass as an equal count.
+#[test]
+fn a_turn_the_probes_did_not_leave_is_found_by_its_identity_though_the_totals_are_equal() {
+    let directory = kr_ipc::testing::PrivateTempDir::create();
+    let root = std::fs::canonicalize(directory.path()).expect("the directory");
+    let pin = kr_e2e_m1b::run::RootPin::of(&root).expect("a directory to pin");
+    let account: Account = serde_json::from_value(serde_json::json!({
+        "login": "l", "stored": "s", "home": "run", "budget": "b", "turns": 3,
+        "conversations": "sessions/{date}", "prompt_line": "\"role\":\"user\"",
+        "ready": "r", "composer": "c", "submit": "\r", "clear": "\u{15}",
+        "reply_line": "x", "decision_line": "y", "busy": "b",
+        "slash": { "input": "/p", "shows": "p" },
+        "interrupt": { "input": "\u{1b}", "shows": "i" },
+        "approval": { "shows": "a", "allow": "y", "deny": "n" },
+        "resume": ["resume", "{conversation}"], "image": "paste",
+        "turn_line": "\"type\":\"task_started\""
+    }))
+    .expect("an account");
+    let line = |number: u8| {
+        format!(
+            r#"{{"payload":{{"type":"task_started","turn_id":"019a0000-0000-7000-8000-00000000000{number}"}}}}"#
+        )
+    };
+    let count = || turns_recorded(&account, &root, &pin, Path::new("")).expect("a count");
+    std::fs::write(root.join("a.jsonl"), format!("{}\n{}\n", line(1), line(2)))
+        .expect("a conversation");
+    let baseline = count();
+    assert_eq!(baseline.turns, 2);
+    assert_eq!(
+        new_turns(&baseline, &count()),
+        0,
+        "an equal record has no new turn"
+    );
+    // One turn the probes left is removed and a new one is written: the total is the same.
+    std::fs::write(root.join("a.jsonl"), format!("{}\n{}\n", line(1), line(3)))
+        .expect("a rewritten conversation");
+    let found = count();
+    assert_eq!(found.turns, baseline.turns, "the totals are equal");
+    assert_eq!(
+        new_turns(&baseline, &found),
+        1,
+        "the new turn is found by its identity"
+    );
+    // A turn that names none counts by occurrence above the baseline's.
+    std::fs::write(root.join("b.jsonl"), "{\"type\":\"task_started\"}\n").expect("no name");
+    assert_eq!(new_turns(&baseline, &count()), 2);
+    // A record that only lost a turn has no new one, and no identity is ever printed.
+    let kept = count();
+    std::fs::write(root.join("a.jsonl"), format!("{}\n", line(1))).expect("a shorter one");
+    assert_eq!(new_turns(&kept, &count()), 0);
+    assert!(!format!("{kept:?}").contains("019a0000"), "{kept:?}");
 }
 
 /// A configuration names a provider by the key of its name, by its table, and by any address of a

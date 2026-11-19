@@ -1679,6 +1679,49 @@ fn read_record_within(
     Ok(files)
 }
 
+/// The identities of the turns of a record that name theirs: a UUID, or a name with the file that
+/// holds it, within the bounds of [`Limits`]. Debug shows how many there are and never a name.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Identities(BTreeSet<String>);
+
+impl std::fmt::Debug for Identities {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{} identities", self.0.len())
+    }
+}
+
+impl Identities {
+    /// How many identities are not among those of `baseline`.
+    #[must_use]
+    pub fn not_in(&self, baseline: &Self) -> u64 {
+        u64::try_from(self.0.difference(&baseline.0).count()).unwrap_or(u64::MAX)
+    }
+
+    /// How many identities there are.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether there is none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The turns of `found` that are not turns of `baseline`: a turn that names itself counts where its
+/// identity is not among the baseline's, whatever turns the baseline held that `found` lacks, and
+/// the turns of a line that names none count by occurrence above the baseline's. A record that
+/// lost one turn and gained another therefore shows the new one, though its total is the same.
+#[must_use]
+pub fn new_turns(baseline: &Recorded, found: &Recorded) -> u64 {
+    found
+        .identities
+        .not_in(&baseline.identities)
+        .saturating_add(found.unnamed.saturating_sub(baseline.unnamed))
+}
+
 /// The turns the agent's own record holds.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Recorded {
@@ -1692,6 +1735,9 @@ pub struct Recorded {
     pub by_uuid: u64,
     /// How many turn names, each for its file, are not UUIDs, and count once for each file.
     pub by_other_name: u64,
+    /// The identities of the turns that name themselves: what a later reading of the record is
+    /// compared with ([`new_turns`]).
+    pub identities: Identities,
     /// The forms of the names that are not UUIDs (an ASCII digit as `9`, a lower-case letter as
     /// `a`, an upper-case one as `A`, a hyphen and an underscore as they are, any other character
     /// as `?`; at most forty characters, at most five forms), so that the record says what the
@@ -1841,6 +1887,7 @@ fn turns_recorded_within(
         files,
         by_uuid: u64::try_from(by_uuid.len()).unwrap_or(u64::MAX),
         by_other_name: u64::try_from(by_other_name.len()).unwrap_or(u64::MAX),
+        identities: Identities(turns),
         forms: forms.into_iter().take(5).collect(),
     })
 }
@@ -2259,17 +2306,25 @@ mod tests {
             format!("{}\n{}\n{}\n", line(""), line(""), line("  ")),
         )
         .expect("lines with an empty name");
+        let found =
+            turns_recorded(&account(), &root, &pinned(&root), Path::new("")).expect("a count");
+        // The turns that name themselves have an identity each; the others count by occurrence.
+        assert_eq!(found.identities.len(), 3 + 2);
         assert_eq!(
-            turns_recorded(&account(), &root, &pinned(&root), Path::new("")),
-            Ok(Recorded {
+            Recorded {
+                identities: Identities::default(),
+                ..found
+            },
+            Recorded {
                 turns: 3 + 2 + 3 + 3,
                 unnamed: 6,
                 files: 6,
                 by_uuid: 3,
                 by_other_name: 2,
+                identities: Identities::default(),
                 // The non-UUID name is a digit: its form is one digit, and no value is kept.
                 forms: vec!["9".to_owned()],
-            })
+            }
         );
         assert_eq!(
             turns_recorded(&account(), &root, &pinned(&root), Path::new("none")),
