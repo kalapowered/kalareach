@@ -1096,8 +1096,12 @@ async fn a_host_that_cannot_finish_catching_up_refuses_remote_access_until_a_pas
 
     // The feed turns the next read back. What stops the pass now is the feed, and the host has not
     // stopped being behind it, but the registry is not what to look at.
-    let mut passes = rig.runtime().passes();
-    let seen = *passes.borrow_and_update();
+    //
+    // A count of the passes that have ended does not say which of them read the refusal: a pass
+    // that was already on its way to the feed, or still ending, moves it too. So no pass is left
+    // running before the refusal is put in place, and the pass the case then asks for is the one
+    // that meets it; the check it leaves is written before that pass ends.
+    rig.until_the_carrier_is_idle().await;
     rig.served.web().fail(
         AUTHORITY,
         1,
@@ -1107,13 +1111,7 @@ async fn a_host_that_cannot_finish_catching_up_refuses_remote_access_until_a_pas
             retry_after_seconds: None,
         },
     );
-    rig.timer.release_held();
-    within("a pass ends at the feed", async {
-        while *passes.borrow_and_update() <= seen {
-            passes.changed().await.expect("the carrier is running");
-        }
-    })
-    .await;
+    rig.poll().await;
     let check = rig.shown().await.check.expect("the feed check");
     assert_eq!(check.status, DoctorStatus::Warning);
     assert!(
