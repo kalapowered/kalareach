@@ -1461,28 +1461,42 @@ fn the_package_check_holds_the_whole_statement_to_the_shared_limit() {
     assert!(reading.chars().count() <= kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS);
     assert!(integration.chars().count() <= kr_plugin_sdk::integration::MAX_STATEMENT_CHARS);
 
+    // The package as `package_edited` writes it, with the SDK range that holds the arrival of a
+    // placement kept, and the whole validation result returned.
     let whole = |length: usize| {
-        let validated = package_edited(
+        package_edited(
             "claude-code",
-            |manifest| *manifest = with_filler(length),
+            |manifest| {
+                let range = manifest["sdk_range"].clone();
+                *manifest = with_filler(length);
+                manifest["sdk_range"] = range;
+            },
             |table| table["placement"] = claude(),
-        );
-        validated
-            .report
-            .findings
-            .iter()
-            .filter(|finding| finding.detail.contains("whole statement"))
-            .map(|finding| finding.detail.clone())
-            .collect::<Vec<_>>()
+        )
     };
+    let fits = whole(exact);
     assert!(
-        whole(exact).is_empty(),
-        "the longest that fits is accepted: {:?}",
-        whole(exact)
+        fits.report.is_valid(),
+        "the longest that fits is a valid package: {:?}",
+        fits.report.findings
     );
     let over = whole(exact + 1);
-    assert_eq!(over.len(), 1, "one character more is refused: {over:?}");
-    assert!(over[0].contains("5055 characters"), "{over:?}");
+    assert!(
+        !over.report.is_valid(),
+        "one character more is refused: {:?}",
+        over.report.findings
+    );
+    assert_eq!(
+        over.report.findings.len(),
+        1,
+        "by the length alone: {:?}",
+        over.report.findings
+    );
+    assert!(
+        over.report.findings[0].detail.contains("5055 characters"),
+        "{:?}",
+        over.report.findings
+    );
 }
 
 /// The plugin documentation names the placement declaration, each floor the host holds before it
