@@ -1347,6 +1347,13 @@ pub struct PlacedDirectory {
     inode: i128,
 }
 
+/// The device and the inode a `stat` names: the device is a signed 32-bit field on some systems
+/// and an unsigned 64-bit one on others.
+#[allow(clippy::unnecessary_cast)]
+fn object_of(stat: &rustix::fs::Stat) -> (u64, u64) {
+    (stat.st_dev as u64, stat.st_ino)
+}
+
 impl PlacedDirectory {
     /// Records the directory `relative` below the run's directory `root` as it stands now, reached
     /// by the walk with no link followed.
@@ -1470,7 +1477,7 @@ impl PlacedDirectory {
         if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Fifo {
             return Err(format!("{name} is not a pipe after it was made"));
         }
-        Ok((u64::from(stat.st_dev as u64), stat.st_ino))
+        Ok(object_of(&stat))
     }
 
     /// Opens the pipe `name` for reading without waiting for a writer, through the held handle,
@@ -1502,7 +1509,7 @@ impl PlacedDirectory {
         .map_err(|error| format!("the pipe {name} is not opened: {error}"))?;
         let stat = rustix::fs::fstat(&opened).map_err(|error| error.to_string())?;
         if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Fifo
-            || (u64::from(stat.st_dev as u64), stat.st_ino) != made
+            || object_of(&stat) != made
         {
             return Err(format!("{name} is not the pipe that was made"));
         }

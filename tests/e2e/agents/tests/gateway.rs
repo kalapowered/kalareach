@@ -97,8 +97,9 @@ use kr_e2e_agents::RESULT_VARIABLE;
 use kr_e2e_agents::account::{KEY_SCAN_VARIABLE, Ledger};
 use kr_e2e_agents::build::{self, Account, Build, InstallSwitch, Probe};
 use kr_e2e_agents::held::{
-    Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard, RunScan, Stop,
-    absent_below, absent_paths, audit_turns, conversations_relative, folder_of, grouped_output,
+    Absent, Audit, CONFIG_DIRECTORY, HeldKeys, ISOLATION_UNPROVEN, MetaGuard,
+    NEWER_CONFIG_DIRECTORY, RunScan, Stop, absent_below, absent_paths, absent_paths_in,
+    audit_turns, conversations_relative, conversations_relative_in, folder_of, grouped_output,
     kept_panic_text, other_agent_processes, other_agents_refusal, panic_text, person_home,
     read_record, turns_recorded, unchanged_before_the_charge,
 };
@@ -285,6 +286,9 @@ struct Real {
     /// The session's variables as they stood when the configuration was written, before the
     /// agent's first start: what every later read of them returns.
     prepared: std::sync::Mutex<Option<Vec<(String, String)>>>,
+    /// The session variables of the second person's shell in a case that upgrades: the newer
+    /// build's own configuration directory, which has no provider, and no login.
+    prepared_newer: std::sync::Mutex<Option<Vec<(String, String)>>>,
 }
 
 impl Route {
@@ -351,6 +355,7 @@ impl Route {
             placed: std::sync::OnceLock::new(),
             configured: std::sync::Mutex::new(Vec::new()),
             prepared: std::sync::Mutex::new(None),
+            prepared_newer: std::sync::Mutex::new(None),
         }))
     }
 }
@@ -470,6 +475,83 @@ impl Real {
             .expect("the configuration was prepared before the agent's first start")
     }
 
+    /// The newer build's own configuration directory of the run, written once with the list of
+    /// the first shell, before the agent's first start: a `config.toml` of the entry's switches as
+    /// keys and none of the entry's own text, so it names no provider, and the list for the second
+    /// person's shell, which holds this directory and no login. The directory and the file are
+    /// recorded as placed, as the first directory's are, and what the probes of the newer build
+    /// vouch for is this file as it is now.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the entry gives no configuration directory, or the file cannot be made.
+    fn prepare_newer_variables(
+        &self,
+        host: &Host<'_>,
+        first: &[(String, String)],
+    ) -> Vec<(String, String)> {
+        let config = self.account.config_directory.as_ref().expect(
+            "the entry gives the agent no configuration directory of the run's own, and its \
+             switches have nowhere to go",
+        );
+        let directory = host.run().root().join(NEWER_CONFIG_DIRECTORY);
+        kr_ipc::paths::create_private_tree(host.run().root(), &directory)
+            .expect("the newer build's configuration directory");
+        let (root, work) = Self::places(host.run());
+        let text = self
+            .account
+            .switch_keys_file(&root, &work)
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        std::fs::write(directory.join("config.toml"), text).expect("writes the configuration file");
+        let place = Path::new(NEWER_CONFIG_DIRECTORY).join("config.toml");
+        host.run()
+            .note_placed(&place)
+            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        self.configured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(place);
+        let login = self.held.key.as_ref().map(|(name, _)| name.as_str());
+        let mut variables: Vec<(String, String)> = first
+            .iter()
+            .filter(|(name, _)| Some(name.as_str()) != login && name != &config.variable)
+            .cloned()
+            .collect();
+        variables.push((config.variable.clone(), directory.display().to_string()));
+        let mut prepared = self
+            .prepared_newer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            prepared.is_none(),
+            "the newer build's configuration is written once, before the agent's first start"
+        );
+        *prepared = Some(variables.clone());
+        variables
+    }
+
+    /// The list [`Real::prepare_newer_variables`] returned, with nothing written.
+    fn newer_variables(&self) -> Vec<(String, String)> {
+        self.prepared_newer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("the newer build's configuration was prepared before the agent's first start")
+    }
+
+    /// [`Real::absent_list`] for the newer build's configuration directory.
+    fn newer_absent_list(&self, run: &Run) -> Vec<PathBuf> {
+        absent_paths_in(
+            &self.account,
+            run,
+            NEWER_CONFIG_DIRECTORY,
+            &run.home(),
+            &self.home,
+            &folder_of(run),
+            Absent::All,
+        )
+    }
+
     /// Fails the case when the agent would not have its updates and installs switched off: the
     /// entry must give it each switch, and the switches that are options reach it as keys of its
     /// file.
@@ -546,21 +628,64 @@ impl Real {
     /// Panics at the first probe that does not answer as it must.
     fn proves_isolation(&self, run: &Run, variables: &[(String, String)]) {
         for probe in &self.account.isolated {
-            self.proves(run, variables, probe).unwrap_or_else(|why| {
-                panic!(
-                    "{ISOLATION_UNPROVEN} `{} {}` did not answer as it must with the entry's \
+            self.proves(run, self.placed(), false, variables, probe)
+                .unwrap_or_else(|why| {
+                    panic!(
+                        "{ISOLATION_UNPROVEN} `{} {}` did not answer as it must with the entry's \
                          switches in the run's configuration file alone: {why}",
-                    self.build.command,
-                    probe.arguments.join(" ")
-                )
-            });
+                        self.build.command,
+                        probe.arguments.join(" ")
+                    )
+                });
         }
     }
 
-    /// One probe of [`Real::proves_isolation`].
+    /// [`Real::proves_isolation`] for the newer build, before the upgrade: the build's own set of
+    /// probes, run with its own configuration directory and no login, by the file recorded for it
+    /// ([`PlacedProgram::checked_as_recorded`]), since the installation's link still names the
+    /// pinned build. An answer that is not the recorded one stops the case before any start.
+    ///
+    /// # Panics
+    ///
+    /// Panics at the first probe that does not answer as it must, and where the newer build has no
+    /// set of probes.
+    fn proves_newer_isolation(
+        &self,
+        run: &Run,
+        newer: &PlacedProgram,
+        variables: &[(String, String)],
+    ) {
+        let probes = &self
+            .build
+            .newer
+            .as_ref()
+            .expect("the entry names a newer build")
+            .isolated;
+        assert!(
+            !probes.is_empty(),
+            "{ISOLATION_UNPROVEN} the entry gives the newer build no isolation set, and a build \
+             nobody has shown to load nothing of the person's own is not started"
+        );
+        for probe in probes {
+            self.proves(run, newer, true, variables, probe)
+                .unwrap_or_else(|why| {
+                    panic!(
+                        "{ISOLATION_UNPROVEN} the newer build's `{} {}` did not answer as it must \
+                         with its own configuration directory and no login: {why}",
+                        self.build.command,
+                        probe.arguments.join(" ")
+                    )
+                });
+        }
+    }
+
+    /// One probe of [`Real::proves_isolation`], of `program`: the pinned build ([`Real::placed`]),
+    /// or, with `as_recorded`, a build the installation's link does not name yet.
     fn proves(
         &self,
         run: &Run,
+        program: &PlacedProgram,
+        as_recorded: bool,
         variables: &[(String, String)],
         probe: &Probe,
     ) -> Result<(), String> {
@@ -573,7 +698,11 @@ impl Real {
         // The program is started by the absolute path recorded when it was placed, once the route to
         // it is checked to be as it was: the agent's earlier start may have left another link.
         self.configuration_as_placed(run)?;
-        let mut command = self.placed().command(run.root(), run.pin())?;
+        let mut command = if as_recorded {
+            program.command_as_recorded(run.root(), run.pin())?
+        } else {
+            program.command(run.root(), run.pin())?
+        };
         command
             .args(probe.arguments.iter().map(|argument| match &stub {
                 Some(stub) => argument.replace("{stub}", stub.address()),
@@ -819,6 +948,8 @@ struct Context {
     installation: Option<Installation>,
     /// The newer build's file and version, where the run placed one.
     newer: Option<(PathBuf, String)>,
+    /// The newer build as the run recorded it, on a real route: probed before the upgrade.
+    newer_placed: Option<PlacedProgram>,
     /// The programs of the stand-in route that every typed launch may run, by their place below
     /// the run's directory, each recorded when it was placed.
     placed_files: Vec<PathBuf>,
@@ -846,6 +977,7 @@ impl Context {
             forge: false,
             installation: None,
             newer: None,
+            newer_placed: None,
             placed_files: Vec::new(),
         }
     }
@@ -880,6 +1012,7 @@ impl Context {
         let mut placed_files = forge_files;
         let mut installation = None;
         let mut newer = None;
+        let mut newer_placed = None;
         let (executable, bin) = match &self.route {
             Route::StandIn if self.upgrade => {
                 // Two installed builds behind the link `agent/current`: the pinned stand-in and the
@@ -932,7 +1065,7 @@ impl Context {
                     real.build.sha256,
                     "the pinned build is the file the entry's digest names"
                 );
-                let installation = Installation::link(run, &real.build.prefix, &real.build.runtime);
+                let linked = Installation::link(run, &real.build.prefix, &real.build.runtime);
                 let placed = PlacedProgram::record(
                     &real.build.prefix,
                     &real.build.runtime,
@@ -951,7 +1084,42 @@ impl Context {
                 real.placed
                     .set(placed)
                     .expect("the agent's program is placed once");
-                (pinned, installation.bin())
+                let bin = linked.bin();
+                if self.upgrade {
+                    // The newer build is a file the entry names and digests, installed outside the
+                    // run: recorded as the pinned one is, before any start, and not run until the
+                    // installation's link is replaced by the upgrade.
+                    let build_newer = real
+                        .build
+                        .newer
+                        .as_ref()
+                        .expect("the entry names a newer build for the upgrade case");
+                    let file = build_newer.prefix.join(&build_newer.pinned);
+                    let bytes = std::fs::read(&file).unwrap_or_else(|error| {
+                        panic!("the newer build {}: {error}", file.display())
+                    });
+                    assert_eq!(
+                        kr_cbor::sha256(&bytes)
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>(),
+                        build_newer.sha256,
+                        "the newer build is the file the entry's digest names"
+                    );
+                    newer_placed = Some(
+                        PlacedProgram::record(
+                            &build_newer.prefix,
+                            &real.build.runtime,
+                            &real.build.command,
+                            &build_newer.pinned,
+                            work.clone(),
+                        )
+                        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}")),
+                    );
+                    newer = Some((file, build_newer.version.clone()));
+                    installation = Some(linked);
+                }
+                (pinned, bin)
             }
         };
         self.executable = executable;
@@ -960,6 +1128,7 @@ impl Context {
         self.placed_files = placed_files;
         self.installation = installation;
         self.newer = newer;
+        self.newer_placed = newer_placed;
     }
 
     /// Fails the case unless each executable the run placed that a typed launch runs is still the
@@ -1044,7 +1213,22 @@ impl Context {
                 ));
                 variables
             }
-            Route::Real(real) => real.prepare_variables(host, &self.shell),
+            Route::Real(real) => {
+                let variables = real.prepare_variables(host, &self.shell);
+                if self.upgrade {
+                    let _ = real.prepare_newer_variables(host, &variables);
+                }
+                variables
+            }
+        }
+    }
+
+    /// The environment the second person's shell is created with in a case that upgrades: no login,
+    /// and on a real route the newer build's own configuration directory.
+    fn newer_variables(&self, host: &Host<'_>) -> Vec<(String, String)> {
+        match &self.route {
+            Route::StandIn => self.without_login(&self.variables(host)),
+            Route::Real(real) => real.newer_variables(),
         }
     }
 
@@ -1475,7 +1659,7 @@ impl Person {
         } else {
             // A second person's shell is given no login: the first person's is the agent's
             // session's alone.
-            ctx.without_login(&ctx.variables(host))
+            ctx.newer_variables(host)
         };
         variables.extend(given.iter().cloned());
         let expected = ctx.expects(host, &variables);
@@ -2395,6 +2579,18 @@ impl<'a> Session<'a> {
                         &self.ctx.without_login(&self.ctx.variables(&self.host)),
                     );
                     real.checks_absent(&self.ctx.run, &absent);
+                    // A case that upgrades proves the newer build's isolation here too, before
+                    // any start of either: with its own configuration directory and no login.
+                    if let Some(newer) = &self.ctx.newer_placed {
+                        let newer_absent = real.newer_absent_list(&self.ctx.run);
+                        real.checks_absent(&self.ctx.run, &newer_absent);
+                        real.proves_newer_isolation(
+                            &self.ctx.run,
+                            newer,
+                            &self.ctx.newer_variables(&self.host),
+                        );
+                        real.checks_absent(&self.ctx.run, &newer_absent);
+                    }
                 }
                 // The shell finds the agent by its name on a search path that starts in the run, which
                 // an earlier start may have changed: the route is checked before each typing.
@@ -2689,6 +2885,32 @@ fn ends(
                 "named_by_a_name_that_is_no_uuid": recorded.as_ref().ok().map(|found| found.by_other_name),
                 "forms_of_the_names_that_are_no_uuid": recorded.as_ref().ok().map(|found| found.forms.clone()),
             });
+            // Every configuration directory the run prepared is counted: no prompt is sent to a
+            // newer build, so its directory holds no turn.
+            let prepared_newer = real
+                .prepared_newer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_some();
+            if prepared_newer {
+                let newer_record = conversations_relative_in(&real.account, NEWER_CONFIG_DIRECTORY);
+                match turns_recorded(&real.account, run.root(), run.pin(), &newer_record) {
+                    Ok(found) if found.turns > 0 => stops.push((
+                        "uncharged_turns",
+                        format!(
+                            "the newer build's configuration directory holds {} turn(s), and no \
+                             prompt is sent to the newer build",
+                            found.turns
+                        ),
+                    )),
+                    Ok(_) => {}
+                    Err(why) if run.root().join(&newer_record).exists() => stops.push((
+                        "turn_audit_incomplete",
+                        format!("the newer build's record was not counted: {why}"),
+                    )),
+                    Err(_) => {}
+                }
+            }
         }
         if let (Some(run), Ok(())) = (&run, &readable) {
             let rules = scan_rules(
@@ -3150,9 +3372,9 @@ fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_
         |ctx, session| {
             assert!(
                 matches!(ctx.route, Route::StandIn),
-                "the real arm of this part runs once the newer build's own isolation set is \
-                 recorded and its configuration directory is placed; the stand-in route is the \
-                 one this build runs"
+                "the real arm of this part runs once its charged turn after the upgrade is built \
+                 (the newer build's probes, configuration directory and recorded file are); the \
+                 stand-in route is the one this build runs"
             );
             let second = session.second.as_ref().expect("two sessions");
             let first_session = session.session_id();
@@ -3484,6 +3706,49 @@ fn gateway_a_newer_build_the_agent_replaced_is_not_run_by_the_next_start() {
         .placed_as_it_was(place)
         .expect_err("a replaced newer build is not as it was placed");
     assert!(why.contains("symbolic link"), "{why}");
+    run.closing_check().expect("nothing runs");
+}
+
+/// The newer build's own probes run before the upgrade, while the installation's link still names
+/// the pinned build: the check that compares the link refuses the newer build then, and the check
+/// as recorded takes it by the file recorded for it. A newer file replaced after it was recorded is
+/// refused by the check as recorded, so the probes do not run it.
+#[test]
+fn gateway_a_newer_build_replaced_before_its_probes_is_not_run_by_them() {
+    let run = Run::start("gateway-upgrade-probes");
+    let prefix = run.root().join("t/b");
+    kr_ipc::paths::create_private_tree(run.root(), &prefix.join("bin"))
+        .expect("a directory for the build");
+    run.place_built(
+        "codex-stand-in-newer",
+        &prefix.join("bin/codex"),
+        &["--version"],
+    );
+    let work = PlacedDirectory::record(run.root(), run.pin(), Path::new("w"))
+        .expect("the working directory is a directory of the run");
+    let placed = PlacedProgram::record(&prefix, &[], "codex", "bin/codex", work)
+        .expect("the newer build is recorded");
+    assert!(
+        placed.checked(run.root(), run.pin()).is_err(),
+        "the check that compares the link refuses a build the link does not name"
+    );
+    placed
+        .checked_as_recorded()
+        .expect("the newer build is as it was recorded");
+    placed
+        .command_as_recorded(run.root(), run.pin())
+        .expect("a probe of the newer build can be made");
+    let file = prefix.join("bin/codex");
+    std::fs::remove_file(&file).expect("the file removed");
+    std::fs::write(&file, b"another program").expect("another file in its place");
+    let why = placed
+        .checked_as_recorded()
+        .expect_err("a replaced newer build is not as it was recorded");
+    assert!(why.contains("its bytes differ"), "{why}");
+    assert!(
+        placed.command_as_recorded(run.root(), run.pin()).is_err(),
+        "no probe is made of a replaced build"
+    );
     run.closing_check().expect("nothing runs");
 }
 

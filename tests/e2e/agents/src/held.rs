@@ -35,6 +35,10 @@ pub const ISOLATION_UNPROVEN: &str =
 /// of the run's own.
 pub const CONFIG_DIRECTORY: &str = "agent-config";
 
+/// The run's directory for the configuration of a newer build, which has no provider and no login:
+/// the second configuration directory a case that upgrades prepares.
+pub const NEWER_CONFIG_DIRECTORY: &str = "agent-config-newer";
+
 /// The proxy variables a part without a login sets to a closed port. An agent with a login has
 /// none of them: it reaches its vendor.
 pub const PROXY_VARIABLES: [&str; 8] = [
@@ -412,8 +416,35 @@ pub fn absent_paths(
     resolved_work: &Path,
     which: Absent,
 ) -> Vec<PathBuf> {
+    absent_paths_in(
+        account,
+        run,
+        CONFIG_DIRECTORY,
+        home,
+        person,
+        resolved_work,
+        which,
+    )
+}
+
+/// [`absent_paths`] for the configuration directory `config_directory` of the run, which
+/// `{config}` stands for.
+///
+/// # Panics
+///
+/// Panics when the system cannot say the account name.
+#[must_use]
+pub fn absent_paths_in(
+    account: &Account,
+    run: &Run,
+    config_directory: &str,
+    home: &Path,
+    person: &Path,
+    resolved_work: &Path,
+    which: Absent,
+) -> Vec<PathBuf> {
     let home = home.display().to_string();
-    let config = run.root().join(CONFIG_DIRECTORY).display().to_string();
+    let config = run.root().join(config_directory).display().to_string();
     let work = run.work().display().to_string();
     let person = person.display().to_string();
     // The account name as the system has it, as the agent itself reads it, not the environment's.
@@ -2030,8 +2061,14 @@ fn grouped_output_by(
 /// directory and the entry's path before the `{date}` its files are sorted under.
 #[must_use]
 pub fn conversations_relative(account: &Account) -> PathBuf {
+    conversations_relative_in(account, CONFIG_DIRECTORY)
+}
+
+/// [`conversations_relative`] for the configuration directory `config_directory` of the run.
+#[must_use]
+pub fn conversations_relative_in(account: &Account, config_directory: &str) -> PathBuf {
     let base = account.conversations.split("{date}").next().unwrap_or("");
-    Path::new(CONFIG_DIRECTORY).join(base.trim_end_matches('/'))
+    Path::new(config_directory).join(base.trim_end_matches('/'))
 }
 
 #[cfg(test)]
