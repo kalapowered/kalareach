@@ -5076,7 +5076,7 @@ fn gateway_a_daemon_killed_with_a_request_pending_leaves_the_agent_and_the_resta
         "gateway-restart",
         "5b",
         TEST,
-        "leave-unanswered,tick,ping-when-released",
+        "leave-unanswered,tick,ping-when-released,stay",
         |ctx, session| {
             assert!(
                 matches!(ctx.route, Route::StandIn),
