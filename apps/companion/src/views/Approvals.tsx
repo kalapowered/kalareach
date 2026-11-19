@@ -24,7 +24,7 @@ import { AGENT_READ_CADENCE_MS } from '../app/agent'
 import { readOnCadence } from '../app/cadence'
 import { useConnectionRights } from '../app/rights'
 import { useApp } from '../app/state'
-import { failureCode, failureMessage, watch, type Watch } from '../host/port'
+import { failureMessage, failureRetry, watch, type Watch } from '../host/port'
 import { ask } from '../mobile/model/call'
 import {
   actionableApprovals,
@@ -144,10 +144,12 @@ export function ApprovalRequests({
   const again = useRef<() => void>(() => undefined)
 
   // Answers a channel took end for good on the host's own word, and the connection stops counting
-  // them. The word is the host's only once its receipt for the action reads unknown: a paired
-  // route says the same of an answer that was lost on the way, and then the worker holds no receipt
-  // and nothing is released. A release that fails is kept, by session and action, and tried again
-  // with the next read; one that is still on its way is not started a second time.
+  // them. The word is the host's only once its receipt for the action reads unknown: an answer that
+  // was lost on the way has no receipt on the worker, and nothing is released for it. The receipt
+  // is read on the link the answer was sent on. An action stays here, to be asked about again with
+  // the next read, only while the host may still change what its receipt says (it is with the
+  // host and not done) or while a failure's own retry category lets the page try again; one that
+  // is still on its way is not started a second time.
   const unreleased = useRef(new Map<string, { session: string; action: string }>())
   const releasing = useRef(new Set<string>())
   const release = useCallback(
@@ -157,19 +159,22 @@ export function ApprovalRequests({
       releasing.current.add(key)
       port
         .actionRead({ session_id: session, action_id: action })
-        .then((record) =>
-          record.receipt.state === 'unknown'
-            ? port.settleAction({ session_id: session, action_id: action })
-            : undefined
-        )
+        .then(async (record): Promise<boolean> => {
+          const state = record.receipt.state
+          if (state === 'unknown') {
+            await port.settleAction({ session_id: session, action_id: action })
+            return false
+          }
+          return state === 'received' || state === 'accepted' || state === 'dispatching'
+        })
         .then(
-          () => {
-            unreleased.current.delete(key)
+          (stillWithTheHost) => {
+            if (stillWithTheHost) unreleased.current.set(key, { session, action })
+            else unreleased.current.delete(key)
           },
           (error: unknown) => {
-            // The host holds no receipt for the action: nothing is released and nothing waits to be.
-            if (failureCode(error) === 'NOT_FOUND') unreleased.current.delete(key)
-            else unreleased.current.set(key, { session, action })
+            if (failureRetry(error) === 'transient') unreleased.current.set(key, { session, action })
+            else unreleased.current.delete(key)
           }
         )
         .finally(() => {

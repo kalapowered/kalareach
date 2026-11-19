@@ -603,12 +603,20 @@ export interface FakeHostControls {
   readonly releasedActions: readonly string[]
   /** The actions whose receipt the page asked the host for, in order. */
   readonly readActions: readonly string[]
+  /**
+   * Sets what the next reads of a receipt the worker holds say, in order: a receipt still with the
+   * host reads `received`, `accepted` or `dispatching` until it settles, and then unknown.
+   */
+  readReceiptsAs(...states: readonly Receipt['state'][]): void
   /** How many releases the page has asked the connection for, taken, held or failed. */
   readonly releaseAttempts: number
   /** Holds the next release until the returned function is called, as a slow link does. */
   holdNextRelease(): () => void
-  /** Makes the next `count` releases fail before one is taken, as a link that cannot be reached does. */
-  failReleases(count: number): void
+  /**
+   * Makes the next `count` releases fail before one is taken, as a link that cannot be reached does
+   * (a failure that is worth trying again), or with the host's refusal `code` where one is named.
+   */
+  failReleases(count: number, code?: string): void
   /** Sets what the connection may do, and says so as native code does. */
   setRights(rights: readonly ActionRight[]): void
   /**
@@ -1637,12 +1645,15 @@ export function fakeHost(
   let nextSendUnconfirmed = false
   let nextApprovalUnconfirmed = false
   const readActions: string[] = []
+  /** What the next reads of a receipt the worker holds say, in order, before it reads unknown. */
+  const scriptedReceiptStates: Receipt['state'][] = []
   let releaseAttempts = 0
   let heldRelease: Promise<void> | null = null
   /** The actions the page released from the connection's book, in order. */
   const releasedActions: string[] = []
   /** How many of the next releases fail before one is taken. */
   let settleActionFails = 0
+  let settleActionFailure = 'RESOURCE_UNAVAILABLE'
   const answeredWhenReleased = <T>(answer: T): Promise<T> => {
     const waiting = heldSends
     return waiting === null
@@ -2223,16 +2234,30 @@ export function fakeHost(
     actionRead: (params, opening) => {
       requireConnection()
       checkOpening('actionRead', params.session_id ?? '', opening)
+      // Over a host this device is paired with a receipt is read for a session, which the read
+      // names; the link is the session's own, the opening's or the ambient one.
+      if (pairedDevice && params.session_id === undefined) {
+        refuse(
+          'INVALID_ARGUMENT',
+          'a receipt read on a host this device is paired with names the session the receipt belongs to'
+        )
+      }
       readActions.push(params.action_id)
-      // The answers a channel took are the only receipts the scripted host keeps, and each reads
-      // unknown; a test that needs another gives the port its own.
-      if (records.holdsChannelReceipt(params.action_id)) {
+      // The answers the host could not confirm are the only receipts the scripted host keeps, and
+      // each reads unknown unless a test scripts what the next reads say before it does.
+      if (records.holdsUnknownReceipt(params.action_id)) {
         return Promise.resolve({
-          receipt: receipt(params.action_id, 'unknown', 'agent.approval.respond'),
+          receipt: receipt(
+            params.action_id,
+            scriptedReceiptStates.shift() ?? 'unknown',
+            'agent.approval.respond'
+          ),
           result: null
         })
       }
-      return refuse('NOT_FOUND', 'The host holds no receipt for that action.')
+      // The worker answers a read of an action it holds no receipt for as an invalid argument: the
+      // protocol has no code for a missing record.
+      return refuse('INVALID_ARGUMENT', `no receipt for action ${params.action_id}`)
     },
     settleAction: (params, opening) => {
       requireConnection()
@@ -2247,7 +2272,7 @@ export function fakeHost(
       }
       if (settleActionFails > 0) {
         settleActionFails -= 1
-        return Promise.reject(new Error('The release did not reach the session.'))
+        return refused(settleActionFailure, 'The release did not reach the session.')
       }
       releasedActions.push(params.action_id)
       return Promise.resolve()
@@ -3659,6 +3684,9 @@ export function fakeHost(
     descriptionDownloads,
     releasedActions,
     readActions,
+    readReceiptsAs(...states) {
+      scriptedReceiptStates.push(...states)
+    },
     get releaseAttempts() {
       return releaseAttempts
     },
@@ -3669,8 +3697,9 @@ export function fakeHost(
       })
       return finish
     },
-    failReleases(count) {
+    failReleases(count, code = 'RESOURCE_UNAVAILABLE') {
       settleActionFails = count
+      settleActionFailure = code
     },
     setRights(next) {
       rights = next
