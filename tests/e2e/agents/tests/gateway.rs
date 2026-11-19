@@ -6794,10 +6794,9 @@ fn an_agent_leaves_another_host_and_the_host_ends(ending: Ending) {
         .into_iter()
         .find(|path| Path::new(path).exists())
     else {
-        assert!(
-            !cfg!(target_os = "macos"),
-            "macOS has /bin/zsh, and this case opens sessions in it"
-        );
+        if cfg!(target_os = "macos") {
+            panic!("macOS has /bin/zsh, and this case opens sessions in it");
+        }
         eprintln!("skipping: no zsh on this machine; the second daemon's sessions need one");
         return;
     };

@@ -3043,7 +3043,10 @@ mod root_tests {
         std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o700))
             .expect("the parent is searchable again");
         assert!(walked, "a path through the parent is no longer walked");
-        assert!(made.is_ok(), "the pipe is made through the handle: {made:?}");
+        assert!(
+            made.is_ok(),
+            "the pipe is made through the handle: {made:?}"
+        );
         assert_eq!(
             seen,
             Ok(rustix::fs::FileType::Fifo),
