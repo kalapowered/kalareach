@@ -3754,6 +3754,20 @@ mod tests {
 #[path = "../../../kr-client/tests/support/connect_proxy.rs"]
 pub(crate) mod connect_proxy;
 
+// A certificate authority and a TLS origin that keeps its connections open, for the case of a
+// request on a tunnel that is already open.
+#[cfg(test)]
+#[path = "../../../kr-transport/tests/support/tls.rs"]
+#[allow(
+    dead_code,
+    reason = "each suite that includes this module uses the part of it that it needs"
+)]
+pub(crate) mod tls;
+
+#[cfg(test)]
+#[path = "../../tests/net_support/pooled_origin.rs"]
+pub(crate) mod pooled_origin;
+
 #[cfg(test)]
 mod proxy_login_gate {
     use kr_crypto::secret::SecretVec;
@@ -3802,5 +3816,70 @@ mod proxy_login_gate {
         };
         assert_eq!(said, ProxyLoginKind::Refused.clause());
         assert_eq!(proxy.accepted(), 0, "nothing reached the proxy");
+    }
+
+    /// KR-REQ-10.02: a request of the catalogue on a tunnel that is already open, and kept in the
+    /// pool, is stopped once another client has set the verdict: the origin reads no request after
+    /// it and the proxy sees no further connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_catalogues_egress_stops_a_request_on_a_tunnel_that_is_already_open() {
+        use super::connect_proxy::Login;
+
+        let authority = super::tls::Authority::new("a repository authority");
+        let origin = super::pooled_origin::PooledOrigin::start(tokio_rustls::TlsAcceptor::from(
+            authority.server_config("127.0.0.1"),
+        ))
+        .await;
+        let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+        let login = ProxyCredential::new(
+            SecretVec::new(b"user".to_vec()),
+            SecretVec::new(b"password".to_vec()),
+        )
+        .expect("a login");
+        let url = proxy
+            .url
+            .parse::<kr_transport::config::ProxyUrl>()
+            .expect("a proxy address")
+            .with_login(login.clone());
+        let client = kr_transport::proxy::proxied(
+            reqwest::Client::builder().tls_backend_preconfigured(
+                (*super::tls::client_config(std::slice::from_ref(&authority.der))).clone(),
+            ),
+            &url,
+        )
+        .expect("a proxy the library takes")
+        .build()
+        .expect("a client");
+        let egress = LoginEgress { proxy: url };
+        let address = format!("https://127.0.0.1:{}/index", origin.port);
+        let get = || client.get(&address).build().expect("a request");
+
+        for _ in 0..2 {
+            let answered = egress
+                .execute(&client, get())
+                .await
+                .ok()
+                .expect("the origin answers");
+            assert_eq!(answered.status().as_u16(), 200);
+        }
+        assert_eq!(origin.requests(), 2);
+        assert_eq!(
+            proxy.logins(),
+            vec![Login::Right],
+            "one tunnel carried both requests"
+        );
+
+        // Another client's refusal sets the verdict; the tunnel is still open.
+        login.refuse(StopKind::Refused);
+        let Err(EgressError::Refused(said)) = egress.execute(&client, get()).await else {
+            panic!("a request on the open tunnel is refused after the verdict");
+        };
+        assert_eq!(said, ProxyLoginKind::Refused.clause());
+        assert_eq!(
+            origin.requests(),
+            2,
+            "the open tunnel carried no request after the verdict"
+        );
+        assert_eq!(proxy.logins(), vec![Login::Right], "no further connection");
     }
 }
