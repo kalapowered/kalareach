@@ -5082,35 +5082,6 @@ async fn kr_req_10_51_an_answering_action_is_held_to_the_callers_history() {
 // KR-REQ-12.18: an answer a channel took ends unknown for good, and does not hold the next one back
 // ---------------------------------------------------------------------------------------------
 
-/// One `plugin.action.invoke` of the channel package's action `action`, naming `resource_id` when
-/// there is one.
-fn channel_action(
-    client: &LocalClient,
-    host: &Host,
-    connector: &kr_worker::broker::connectors::InstalledConnector,
-    request_id: u64,
-    action: &str,
-    resource_id: Option<kr_protocol::ids::PendingResourceId>,
-    envelope_of: kr_protocol::ids::PendingResourceId,
-) -> MutationRequest {
-    let mut mutation = channel_answer(client, host, connector, request_id, envelope_of, "allow");
-    mutation.params = ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
-        target: AgentMutationTarget {
-            subject: subject(host.session_id, instance()),
-            binding_revision: AgentBindingRevision::new(1),
-        },
-        plugin_id: connector.plugin_id(),
-        action: kr_protocol::broker::ActionName::new(action).expect("valid"),
-        draft_id: Nullable::null(),
-        resource_id: resource_id.map_or_else(Nullable::null, Nullable::some),
-        parameters: kr_protocol::scalars::Bytes::from(
-            serde_json::to_vec(&serde_json::json!({ "decision": "allow" })).expect("encodes"),
-        ),
-    })
-    .expect("encodes");
-    mutation
-}
-
 /// One `plugin.action.invoke` of the channel package's `status.refresh`, which names no request and
 /// takes no parameter.
 fn channel_refresh(
@@ -5198,8 +5169,8 @@ async fn kr_req_12_18_two_answers_on_one_channel_each_reach_it_and_each_ends_unk
 }
 
 /// KR-REQ-12.18: the same holds through the package's own answer action. After the first answer
-/// ended unknown, the second request's answer is admitted and written, and a later action of the
-/// package that names no request is not held back by the first answer either.
+/// ended unknown, the second request's answer is admitted and written, and the package's refresh,
+/// which names no request, is admitted and applied: the first answer does not hold it back either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_18_a_plugin_answer_to_a_second_request_is_admitted_after_the_first_ended_unknown()
  {
@@ -5242,24 +5213,18 @@ async fn kr_req_12_18_a_plugin_answer_to_a_second_request_is_admitted_after_the_
         );
     }
 
-    // An action of the package that names no request has the same subject as the answers. It is
-    // not held back by them: the channel refuses it for its own reason.
-    let later = channel_action(
-        &client,
-        &host,
-        &channel.connector,
-        70,
-        "turn.cancel",
-        None,
-        first,
+    // The package's refresh names no request and has the same subject as the answers. The host
+    // carries it out itself: it is admitted, runs, and its receipt says applied.
+    let refresh = channel_refresh(&client, &host, &channel.connector, 70);
+    let refresh_id = refresh.action_id;
+    let outcome = send(&mut client, refresh).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "a channel end does not hold the next action of its subject: {outcome:?}"
     );
-    let Outcome::Error(error) = send(&mut client, later).await else {
-        panic!("a channel carries no other action of the package");
-    };
-    assert_ne!(
-        error.code,
-        ErrorCode::DraftConflict,
-        "a channel end does not hold the next action of its subject"
+    assert_eq!(
+        receipt(&mut client, refresh_id).await.state,
+        ReceiptState::Applied
     );
 }
 
