@@ -405,16 +405,25 @@ async fn a_start_that_a_removal_fenced_hangs_a_late_creation_up_with_the_origina
 #[tokio::test(start_paused = true)]
 async fn a_start_that_is_never_answered_settles_as_may_still_run() {
     let world = fresh();
-    world.stand_in.script_create(CreateScript::Lost);
+    world.stand_in.script_create(CreateScript::After(
+        Duration::from_secs(60),
+        Box::new(CreateScript::Lost),
+    ));
     let request = request(1);
     let attempt = world.provider.begin(&request).await.expect("begin");
-    let outcome = world
-        .provider
-        .dispatch(attempt, &request)
-        .await
-        .expect("answer");
-    assert!(matches!(outcome, VoiceStart::CreationUnknown { .. }));
-    assert_eq!(world.provider.settle().await, Settled::MayStillRun);
+    let provider = &world.provider;
+    let dispatch = provider.dispatch(attempt, &request);
+    let removal = async {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _fence = provider.registry().fence().expect("a fence");
+        provider.settle().await
+    };
+    let (outcome, settled) = tokio::join!(dispatch, removal);
+    assert!(matches!(
+        outcome.expect("answer"),
+        VoiceStart::CreationUnknown { .. }
+    ));
+    assert_eq!(settled, Settled::MayStillRun);
     assert_eq!(states(&world), [CallState::Creating]);
 }
 
@@ -916,9 +925,13 @@ async fn a_start_that_sent_nothing_or_was_refused_marks_its_row_closed_before_de
 #[tokio::test(start_paused = true)]
 async fn a_slot_a_normal_end_leaves_is_not_told_by_a_later_settle() {
     let world = fresh();
-    world
-        .stand_in
-        .script_create(CreateScript::Answer(401, None));
-    let _ = start(&world, 1).await.expect("an answer");
-    assert_eq!(world.provider.settle().await, Settled::NothingStarting);
+    world.stand_in.script_create(CreateScript::Lost);
+    let outcome = start(&world, 1).await.expect("an answer");
+    assert!(matches!(outcome, VoiceStart::CreationUnknown { .. }));
+    assert_eq!(
+        world.provider.settle().await,
+        Settled::NothingStarting,
+        "the unanswered start left a row, and no slot for a removal to tell again"
+    );
+    assert_eq!(states(&world), [CallState::Creating]);
 }

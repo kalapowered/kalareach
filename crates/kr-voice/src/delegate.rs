@@ -217,7 +217,7 @@ struct Created {
     replayed: bool,
     /// Held until the start has written the call's record or refused it, so that a provider that
     /// keeps the start open until then does not let go while the call is half published.
-    published: Option<Published>,
+    _published: Option<Published>,
 }
 
 /// Tells the provider that a start's caller is done with the call it was given.
@@ -1310,7 +1310,7 @@ impl Coordinator {
                 model: session.model,
                 disclosure: session.disclosure,
                 replayed: session.replayed,
-                published: None,
+                _published: None,
             },
             // A call on the owner's own account: the host controls it, so the device is told to
             // send its writes and heartbeats here. It is never a replay: the host minted its
@@ -1328,7 +1328,7 @@ impl Coordinator {
                 control: VoiceSessionControl::Host {
                     heartbeat_seconds: HOST_HEARTBEAT_SECONDS,
                 },
-                published: Some(Published {
+                _published: Some(Published {
                     provider: Arc::clone(&provider),
                     call_id: own.call_id.clone(),
                 }),

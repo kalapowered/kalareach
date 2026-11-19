@@ -6,7 +6,6 @@
 //! stand-in is in the build and only then.
 
 use std::collections::VecDeque;
-use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;

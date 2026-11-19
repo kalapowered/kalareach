@@ -152,7 +152,8 @@ const READINESS_FIELDS: [&str; 5] = [
 
 /// The sentences a person is shown about a call on the owner's key.
 pub mod words {
-    use super::{ActionId, OPENAI_MODEL};
+    use super::{ActionId, DeviceId, OPENAI_MODEL};
+    use crate::shown::Shown;
 
     /// What a person is told before a call: where it runs, who pays, what OpenAI sees.
     pub const DISCLOSURE: [&str; 7] = [
@@ -728,7 +729,7 @@ impl Core {
             .unwrap_or_else(PoisonError::into_inner);
         if held
             .as_ref()
-            .is_some_and(|(held, _)| call_id.is_none_or(|call_id| call_id == held))
+            .is_some_and(|(held, _)| call_id.is_none_or(|call_id| call_id == held.as_str()))
             && let Some((_, slot)) = held.take()
         {
             drop(held);
@@ -1147,8 +1148,7 @@ impl OwnVoiceProvider {
             closed_seen: false,
             counter: 0,
             muted: false,
-            sent: VecDeque::new(),
-            token: core.registry.track(),
+            _token: core.registry.track(),
         };
         let readiness = task.establish(1, readiness_ends).await;
         match readiness {
@@ -1572,7 +1572,7 @@ struct CallTask {
     /// Whether the model's input audio is muted, as the provider last said.
     muted: bool,
     /// Held while this task runs, so that a removal waits for it before the key goes.
-    token: TaskToken,
+    _token: TaskToken,
 }
 
 async fn next_message(socket: &mut Option<Box<dyn SidebandSocket>>) -> SocketRead {
