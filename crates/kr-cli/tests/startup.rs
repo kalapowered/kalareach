@@ -3270,6 +3270,36 @@ impl Drop for ServiceHost {
     }
 }
 
+/// `program` run as `kr` runs against a service host: with a cleared environment, the home, the
+/// runtime and state directories of `tree`, and the asking of the run that started it. The command
+/// writes the service definition and starts the service, and asks for the account's own launchd
+/// only where this run did.
+fn service_command(
+    program: &Path,
+    arguments: &[&str],
+    home: &Path,
+    tree: &teardown::Tree,
+) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", home)
+        .env(
+            kr_ipc::paths::RUNTIME_DIR_VARIABLE,
+            tree.paths().runtime_root(),
+        )
+        .env(kr_ipc::paths::STATE_DIR_VARIABLE, tree.paths().state_root())
+        .current_dir(service_installation())
+        .stdin(Stdio::null());
+    if let Some(temporary) = std::env::var_os("TMPDIR") {
+        command.env("TMPDIR", temporary);
+    }
+    kr_ipc::testing::account_launchd::pass_the_ask(&mut command);
+    command
+}
+
 impl ServiceHost {
     /// A tree with a user service manager, or none where this host has no manager to test with,
     /// having said why; a host that sets `KR_REQUIRE_SERVICE_MANAGER` fails instead. On macOS the
@@ -3379,28 +3409,13 @@ impl ServiceHost {
 
     /// `kr` from the service installation, against this tree, this home and this host's manager.
     fn kr(&self, arguments: &[&str]) -> Command {
-        let mut command = Command::new(service_installation().join("kr"));
-        command
-            .args(arguments)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &self.home)
-            .env(
-                kr_ipc::paths::RUNTIME_DIR_VARIABLE,
-                self.tree.paths().runtime_root(),
-            )
-            .env(
-                kr_ipc::paths::STATE_DIR_VARIABLE,
-                self.tree.paths().state_root(),
-            )
-            .current_dir(service_installation())
-            .stdin(Stdio::null());
-        if let Some(temporary) = std::env::var_os("TMPDIR") {
-            command.env("TMPDIR", temporary);
-        }
-        // The command writes the service definition and starts the service, and asks for the
-        // account's own launchd only where this run did.
-        kr_ipc::testing::account_launchd::pass_the_ask(&mut command);
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+        let mut command = service_command(
+            &service_installation().join("kr"),
+            arguments,
+            &self.home,
+            &self.tree,
+        );
         #[cfg(target_os = "linux")]
         command.env("XDG_RUNTIME_DIR", &self.manager.runtime);
         command
@@ -3758,6 +3773,102 @@ fn three_first_invocations_at_once_converge_on_the_one_daemon_the_service_manage
     for created in &documents {
         host.close(created);
     }
+}
+
+/// What a child of the case checks, with the run's asking as the case gave it: the command that
+/// runs `kr` for a service host holds the asking exactly as this run has it, and none when it has
+/// none.
+#[test]
+#[ignore = "run by a child of the case"]
+#[cfg(unix)]
+fn the_service_command_fixture() {
+    let (tree, home) = ServiceHost::tree_and_home();
+    let mut command = service_command(Path::new("/usr/bin/env"), &[], &home, &tree);
+    let printed = String::from_utf8_lossy(&command.output().expect("env runs").stdout).into_owned();
+    let variable = kr_ipc::testing::account_launchd::VARIABLE;
+    match std::env::var_os(variable) {
+        Some(value) => assert!(
+            printed
+                .lines()
+                .any(|line| line == format!("{variable}={}", value.to_string_lossy())),
+            "the command does not hold the run's asking: {printed}"
+        ),
+        None => assert!(
+            !printed.contains(variable),
+            "the command holds an asking the run does not: {printed}"
+        ),
+    }
+}
+
+/// The command `kr host startup --set service` is run with passes the run's asking on exactly, for
+/// the service definition it writes and the service it starts.
+#[test]
+#[cfg(unix)]
+fn the_command_a_service_host_runs_holds_the_run_ask_exactly_as_the_run_has_it() {
+    for asked in [Some("1"), Some("yes"), None] {
+        let child = kr_ipc::testing::account_launchd::run_fixture(
+            concat!(module_path!(), "::the_service_command_fixture"),
+            asked,
+        );
+        assert!(child.passed, "a run that holds {asked:?}:\n{}", child.log);
+    }
+}
+
+/// What a child of the case checks, with the variable removed: `kr host startup --set service`
+/// against a home of its own refuses, says what a run asks with, and writes no definition.
+#[test]
+#[ignore = "run by a child of the case with the variable removed"]
+#[cfg(target_os = "macos")]
+fn the_install_fixture_for_a_run_that_did_not_ask() {
+    let variable = kr_ipc::testing::account_launchd::VARIABLE;
+    assert!(
+        std::env::var_os(variable).is_none(),
+        "the child has the variable removed"
+    );
+    let (tree, home) = ServiceHost::tree_and_home();
+    let command = service_command(
+        &service_installation().join("kr"),
+        &["--json", "host", "startup", "--set", "service"],
+        &home,
+        &tree,
+    );
+    let output = start(command).finish("kr host startup");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "a run that did not ask installed the service start: {said}"
+    );
+    assert!(
+        said.contains(variable),
+        "the refusal does not name {variable}: {said}"
+    );
+    let definitions = home.join("Library/LaunchAgents");
+    let written: Vec<PathBuf> = std::fs::read_dir(&definitions)
+        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        written.is_empty(),
+        "a definition launchd loads at the next login was written: {written:?}"
+    );
+}
+
+/// KR-REQ-07.12: installing the service start in a run that did not ask for the account's own
+/// launchd refuses before it writes a definition, which launchd would load at the next login.
+#[test]
+#[cfg(target_os = "macos")]
+fn installing_the_service_start_in_a_run_that_did_not_ask_writes_no_definition() {
+    let child = kr_ipc::testing::account_launchd::run_fixture(
+        concat!(
+            module_path!(),
+            "::the_install_fixture_for_a_run_that_did_not_ask"
+        ),
+        None,
+    );
+    assert!(child.passed, "a run that did not ask:\n{}", child.log);
 }
 
 /// KR-REQ-03.02, KR-REQ-07.12: the daemon launchd starts for a run that asked is asked itself: the
