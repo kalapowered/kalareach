@@ -256,14 +256,16 @@ impl WorkerLinks {
         opening: Option<&str>,
         params: &kr_protocol::receipt::ActionReadParams,
     ) -> Result<kr_protocol::receipt::ActionReadResult> {
-        let link = self.link(state, session_id, opening).await?;
+        let link = self
+            .link_of_action(state, session_id, opening, params.action_id)
+            .await?;
         let answer = link.session.read_receipt(params).await;
         self.settle(state, session_id, link.link(), answer)
     }
 
-    /// Lets the link `session_id`'s call used stop counting `action_id` as unresolved.
+    /// Lets the link that answered `action_id` stop counting it as unresolved.
     ///
-    /// The link is found as every agent call finds it, by the opening the call used.
+    /// The link is found as the receipt's read finds it ([`Self::read_receipt`]).
     ///
     /// # Errors
     ///
@@ -275,9 +277,41 @@ impl WorkerLinks {
         opening: Option<&str>,
         action_id: ActionId,
     ) -> Result<()> {
-        let link = self.link(state, session_id, opening).await?;
+        let link = self
+            .link_of_action(state, session_id, opening, action_id)
+            .await?;
         link.session.settle(action_id).await;
         Ok(())
+    }
+
+    /// The link a receipt read or a release for `action_id` goes to.
+    ///
+    /// Over a paired host, a call that names no opening goes to the link the action was answered
+    /// on while that link lives, and not to whichever link the session has now: a screen that opens
+    /// after the answer has a link of its own, and its book does not hold the action. Where that
+    /// link has ended, or the call names an opening, the link is found as every agent call finds
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the link could not be reached.
+    async fn link_of_action(
+        &self,
+        state: &AppState,
+        session_id: SessionId,
+        opening: Option<&str>,
+        action_id: ActionId,
+    ) -> Result<Leased> {
+        if opening.is_none()
+            && state.paired_context().is_some()
+            && let Some(answered) = state
+                .paired_links()
+                .answering_link(session_id, action_id)
+                .await
+        {
+            return Ok(answered);
+        }
+        self.link(state, session_id, opening).await
     }
 
     /// Submits one agent mutation to the worker of the session `about` names, about its instance at
