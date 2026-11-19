@@ -8338,6 +8338,90 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
     }
 }
 
+/// A grant the host revoked while the provider's hangup failed does not close the call: the phone
+/// does not show it closed by the host, however it ended. The call is left to the host with the
+/// notice of the host's own rule, the grant's revocation is not owed, and nothing reaches the voice
+/// service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leaves_an_own_key_call_to_the_host()
+ {
+    for by_the_person in [true, false] {
+        let mut scene = own_scene(own_timings()).await;
+        let openai = scene.openai.clone().expect("an own-key scene");
+        let prepared = scene.prepared().await;
+        openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Answer(
+            500, None,
+        ));
+        let cause = if by_the_person {
+            let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+            assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+            scene
+                .state_where("an attached control", |state| {
+                    state["control"] == "connected"
+                })
+                .await;
+            scene
+                .call("voice_stop", json!({ "voiceSessionId": null }))
+                .expect("the call ends");
+            "requested"
+        } else {
+            let reach = failing_reach(&scene, FailsAt::Pairing, 0);
+            let calls = scene.phone.companion.app.state::<Calls>();
+            let started = calls
+                .start(
+                    own_request_of(&scene, &prepared),
+                    Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+                    Arc::clone(&scene.tokens),
+                )
+                .await;
+            assert!(
+                matches!(started, Ok(companion_tauri::voice::Started::Result(_))),
+                "an own-key call starts"
+            );
+            scene
+                .state_where("a running call", |state| state["running"] == true)
+                .await;
+            reach.told.store(1, Ordering::SeqCst);
+            "owner_failed"
+        };
+        let ended = scene
+            .state_where("the end", |state| {
+                state["ended"]["cause"] == cause && state["setting_up"] == false
+            })
+            .await;
+        assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+        assert_eq!(
+            ended["ended"]["host"]["broker_notified"], false,
+            "the host did not confirm the provider's closure ({cause}): {ended}"
+        );
+        assert_eq!(ended["ended"]["broker"], "left_to_host", "({cause}) {ended}");
+        assert!(
+            ended["ended"]["words"]
+                .as_str()
+                .is_some_and(|words| words.ends_with(LEFT_TO_HOST_WORDS)),
+            "the call is said to be left to the host ({cause}): {ended}"
+        );
+        let owed_kinds: Vec<&str> = ended["owed"]
+            .as_array()
+            .map(|owed| owed.iter().filter_map(|entry| entry["kind"].as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            owed_kinds.contains(&"host_close") && !owed_kinds.contains(&"service_close"),
+            "the host's own rule is owed ({cause}): {owed_kinds:?}"
+        );
+        assert!(
+            !owed_kinds.contains(&"revocation"),
+            "the grant was revoked, so no revocation is owed ({cause}): {owed_kinds:?}"
+        );
+        assert_eq!(
+            what_reached_kalareach(&scene),
+            (0, 0, 0),
+            "the managed service and the account were asked for nothing ({cause})"
+        );
+        scene.stop_host().await;
+    }
+}
+
 /// A call the host ended and swept out of its list before this phone's stop reached it was closed by
 /// the host: the phone shows only the host's own words, and nothing about the call running on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
