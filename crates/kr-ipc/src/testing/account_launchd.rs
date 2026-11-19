@@ -19,7 +19,9 @@
 
 use std::ffi::OsStr;
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 
 /// The variable through which a run asks for the account's own launchd.
