@@ -33,6 +33,8 @@ enum Answer {
     Refuses {
         gate: Option<tokio::sync::oneshot::Receiver<()>>,
     },
+    /// The service fails with `code`, as it does when it cannot say what became of the start.
+    Fails(ErrorCode),
     /// The service answers with the call `call`, once `gate` says so, as the call an earlier
     /// attempt made when `replayed`.
     Call {
@@ -153,6 +155,10 @@ impl ManagedVoiceService for ServiceScript {
                         call_id: None,
                     })))
                 }
+                Answer::Fails(code) => Err(kr_client::error::ClientError::refusal(
+                    code,
+                    "the service could not say what became of the start".into(),
+                )),
                 Answer::Call {
                     call,
                     replayed,
@@ -241,8 +247,21 @@ fn starting(
 ) -> tokio::task::JoinHandle<
     crate::given::Given<crate::error::Result<kr_protocol::envelope::ParamsValue>>,
 > {
-    let controller = Arc::clone(controller);
     let mutation = voice_mutation_of(Method::VoiceStart, environment_id, params);
+    starting_under(controller, actor_id, device_id, mutation)
+}
+
+/// The start `mutation` by the device `device_id`, run on a task of its own: a repeat of an action
+/// sends the same request again.
+fn starting_under(
+    controller: &Arc<Controller>,
+    actor_id: ActorId,
+    device_id: DeviceId,
+    mutation: kr_protocol::envelope::MutationRequest,
+) -> tokio::task::JoinHandle<
+    crate::given::Given<crate::error::Result<kr_protocol::envelope::ParamsValue>>,
+> {
+    let controller = Arc::clone(controller);
     tokio::spawn(async move {
         let carried = admitted_for_five_minutes(&controller).await;
         submitted_under(
@@ -326,7 +345,9 @@ async fn a_start_whose_answer_could_not_be_kept_leaves_its_hold_standing() {
         matches!(unkept, crate::error::ControllerError::Uncertain { .. }),
         "{unkept}"
     );
-    let standing = hold_of(&controller, &actor_id).expect("the row stands after the failed claim");
+    let Some(standing) = hold_of(&controller, &actor_id) else {
+        panic!("the row stands after the failed claim");
+    };
 
     let again = starting(
         &controller,
@@ -444,4 +465,155 @@ async fn a_start_that_defers_a_call_keeps_its_hold_until_the_call_is_resolved() 
         );
         world.serving.abort();
     }
+}
+
+/// KR-REQ-23.24: a start that reaches the service after a later start of its device has passed
+/// and finished still leaves its hold when the service cannot say what became of it. The device's
+/// next unnamed start is refused in the first start's words, and the service is not asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_comes_late_after_another_start_passed_leaves_its_hold_standing() {
+    let world = scripted(&Scripted::new()).await;
+    let controller = Arc::clone(&world.controller);
+    // The service answers in the order the starts reach it: the later start's call first.
+    let service = ServiceScript::new(
+        vec![
+            Answer::Call {
+                call: "call-b",
+                replayed: false,
+                gate: None,
+            },
+            Answer::Fails(ErrorCode::OutcomeUnknown),
+        ],
+        true,
+    );
+    controller
+        .voice()
+        .attach_provider(Some(Arc::clone(&service) as Arc<dyn ManagedVoiceService>));
+    let device = paired(&controller, 62, None);
+    let actor_id = device.principal();
+    let params = ready(&controller, device.device_id, world.session_id).await;
+
+    // The first start stops before it claims its action, so it has written nothing yet.
+    let (arrived, go) = controller.before_a_voice_change_claims.arm();
+    let first = starting(
+        &controller,
+        world.environment_id,
+        actor_id.clone(),
+        device.device_id,
+        &params,
+    );
+    arrived
+        .await
+        .expect("the first start stops before its claim");
+
+    // A second start of the device passes, is answered with its call and finishes.
+    let second = starting(
+        &controller,
+        world.environment_id,
+        actor_id.clone(),
+        device.device_id,
+        &params,
+    )
+    .await
+    .expect("the second start ran")
+    .into_answer_for_test();
+    assert!(second.is_ok(), "{second:?}");
+    service.a_start_arrives().await;
+    assert!(
+        hold_of(&controller, &actor_id).is_none(),
+        "the second start's row ended with its bound call"
+    );
+
+    // The first start goes on, reaches the service, and the service cannot say what became of it.
+    let _ = go.send(());
+    let unknown = first
+        .await
+        .expect("the first start ran")
+        .into_answer_for_test();
+    assert!(unknown.is_err(), "{unknown:?}");
+    service.a_start_arrives().await;
+    let Some(standing) = hold_of(&controller, &actor_id) else {
+        panic!("the first start's row stands after the service could not say what became of it");
+    };
+
+    let third = starting(
+        &controller,
+        world.environment_id,
+        actor_id.clone(),
+        device.device_id,
+        &params,
+    )
+    .await
+    .expect("the third start ran")
+    .into_answer_for_test()
+    .expect_err("the device is held");
+    assert_eq!(third.code(), ErrorCode::DraftConflict, "{third}");
+    assert!(
+        third.to_string().contains(&standing.action.to_string()),
+        "the refusal names the first start's action: {third}"
+    );
+    assert_eq!(
+        service.arrived.available_permits(),
+        0,
+        "the service was asked twice and not for the third start"
+    );
+    world.serving.abort();
+}
+
+/// KR-REQ-23.24: a start the hold refused, sent again under the same action, is told the same
+/// refusal and asks the service nothing: the refusal is the action's answer, whether the device
+/// asks once or twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_the_hold_refused_is_told_the_same_refusal_when_it_is_sent_again() {
+    let world = scripted(&Scripted::new()).await;
+    let controller = Arc::clone(&world.controller);
+    let service = ServiceScript::new(vec![Answer::Fails(ErrorCode::OutcomeUnknown)], true);
+    controller
+        .voice()
+        .attach_provider(Some(Arc::clone(&service) as Arc<dyn ManagedVoiceService>));
+    let device = paired(&controller, 63, None);
+    let actor_id = device.principal();
+    let params = ready(&controller, device.device_id, world.session_id).await;
+
+    // The first start leaves the hold: the service could not say what became of it.
+    let first = starting(
+        &controller,
+        world.environment_id,
+        actor_id.clone(),
+        device.device_id,
+        &params,
+    )
+    .await
+    .expect("the first start ran")
+    .into_answer_for_test();
+    assert!(first.is_err(), "{first:?}");
+    service.a_start_arrives().await;
+    assert!(hold_of(&controller, &actor_id).is_some());
+
+    // A second start is refused for the hold, and sent again under its action it is told the same.
+    let mutation = voice_mutation_of(Method::VoiceStart, world.environment_id, &params);
+    let refused = starting_under(
+        &controller,
+        actor_id.clone(),
+        device.device_id,
+        mutation.clone(),
+    )
+    .await
+    .expect("the second start ran")
+    .into_answer_for_test()
+    .expect_err("the device is held");
+    assert_eq!(refused.code(), ErrorCode::DraftConflict, "{refused}");
+    let repeated = starting_under(&controller, actor_id.clone(), device.device_id, mutation)
+        .await
+        .expect("the repeat ran")
+        .into_answer_for_test()
+        .expect_err("the repeat is refused as the first send was");
+    assert_eq!(repeated.code(), refused.code(), "{repeated}");
+    assert_eq!(repeated.to_string(), refused.to_string());
+    assert_eq!(
+        service.arrived.available_permits(),
+        0,
+        "neither the refused start nor its repeat reached the service"
+    );
+    world.serving.abort();
 }

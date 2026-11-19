@@ -1752,9 +1752,11 @@ mod a_start_hold_on_clocks_moved_by_hand {
         wall.store(ends, std::sync::atomic::Ordering::SeqCst);
         let (at_the_end, _) =
             start_of(&controller, action(3), std::time::Duration::from_secs(60)).await;
-        at_the_end
-            .before_the_broker(600)
-            .expect("a start read at the end is admitted");
+        let admitted = at_the_end.before_the_broker(600);
+        assert!(
+            admitted.is_ok(),
+            "a start read at the end is admitted: {admitted:?}"
+        );
         assert_eq!(standing(&controller).action, action(3));
     }
 }

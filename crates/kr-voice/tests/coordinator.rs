@@ -787,6 +787,8 @@ enum Answer {
     Unauthorised,
     /// The rate moved on after the person was shown it.
     RateChanged,
+    /// The provider fails with this code instead of answering.
+    Fails(kr_protocol::error::ErrorCode),
 }
 
 /// What a fake provider says when it is asked whether it still holds a call open.
@@ -1031,7 +1033,14 @@ impl ManagedVoiceService for ManagedFake {
                 .expect("the hold is never closed")
                 .forget();
             }
+            if let Answer::Fails(code) = answer {
+                return Err(kr_client::error::ClientError::refusal(
+                    code,
+                    "the provider failed".into(),
+                ));
+            }
             Ok(match answer {
+                Answer::Fails(_) => unreachable!("a failing provider returned above"),
                 Answer::Started => VoiceStart::Started(Box::new(running_call("managed"))),
                 Answer::Replayed => VoiceStart::Started(Box::new(VoiceSession {
                     replayed: true,
@@ -4998,6 +5007,22 @@ async fn every_exit_of_a_start_reports_its_effect() {
             None,
             false,
             Refused,
+        ),
+        (
+            "the provider fails with a refusal that no call can follow",
+            Answer::Fails(kr_protocol::error::ErrorCode::PermissionDenied),
+            Before::Nothing,
+            None,
+            false,
+            Refused,
+        ),
+        (
+            "the provider fails where the start may have been carried out",
+            Answer::Fails(kr_protocol::error::ErrorCode::OutcomeUnknown),
+            Before::Nothing,
+            None,
+            false,
+            Unknown,
         ),
         (
             "a call that is bound",
