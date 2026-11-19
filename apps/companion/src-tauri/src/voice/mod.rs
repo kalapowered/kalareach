@@ -1446,24 +1446,22 @@ pub type Pairings = Arc<dyn Fn(kr_protocol::ids::DeviceId) -> PairedNow + Send +
 /// Whether the pairing `entry` was made under is the one `paired` reports for its host now: `None`
 /// while the records cannot say, and `Some(false)` for a start entry whose host was unpaired, or
 /// paired again since, which gave the device another identity. Only a start entry is told: what
-/// else is owed stands whatever the pairings are, and so does a start entry that carries no
-/// pairing.
+/// else is owed stands whatever the pairings are.
 fn pairing_holds(paired: &Pairings, entry: &OwedView) -> Option<bool> {
     let Some((host, _)) = entry.host.filter(|_| entry.is_start()) else {
         return Some(true);
     };
-    // A start entry with no pairing is one the release before wrote: it is neither matched nor
-    // mismatched. It is kept and handled as that release handled it until its own `until_ms`, and
-    // it is never written back with the identity of the pairing held now. Remove this arm when
-    // that release can no longer be the one a device is updated from: it writes no pairing, and its
-    // entries lapse at their own finite `until_ms`.
-    let Some(made) = entry.pairing else {
-        return Some(true);
-    };
+    // A start entry with no pairing and a finite lapse is a notice the release before wrote: its
+    // pairing cannot be told, so it stands whichever pairing the host is held under now, and is
+    // never written back with that pairing's identity. It goes at its own `until_ms`, or when the
+    // pairings report its host as not paired. Remove this when that release can no longer be the
+    // one a device is updated from. An entry with no pairing and no lapse is one this build wrote
+    // that a downgrade wrote back: it is told as an entry of a pairing that is not held now.
+    let release_before = entry.pairing.is_none() && entry.until_ms != view::NO_LAPSE_MS;
     match paired(host) {
         PairedNow::Unknown => None,
         PairedNow::Not => Some(false),
-        PairedNow::As(now) => Some(made == now),
+        PairedNow::As(now) => Some(release_before || entry.pairing == Some(now)),
     }
 }
 
@@ -2746,6 +2744,100 @@ mod tests {
             pairings_in_file(directory.path()),
             vec![("before".to_owned(), None)],
             "the notice stays as written, and only the first pairing's start is removed"
+        );
+    }
+
+    /// A start entry that this build wrote and a downgrade wrote back has no pairing and no lapse:
+    /// it is told as an entry of a pairing that is not held now, so the first use removes it and
+    /// writes the removal, and the notice of the release before beside it stays.
+    #[test]
+    fn a_start_entry_with_no_pairing_and_no_lapse_is_removed_at_the_first_use() {
+        let directory = tempfile::tempdir().expect("a folder");
+        write_in_the_form_before(
+            directory.path(),
+            vec![
+                OwedView {
+                    pairing: None,
+                    ..entry(START_UNKNOWN, "written-back", host(1))
+                },
+                notice_of_the_release_before("before", host(1)),
+            ],
+        );
+        let calls = calls_in(directory.path());
+        calls.know_pairings(PairedNow::As);
+        assert_eq!(
+            actions_shown(&calls),
+            vec!["before".to_owned()],
+            "the entry with no lapse is not shown"
+        );
+        assert_eq!(
+            pairings_in_file(directory.path()),
+            vec![("before".to_owned(), None)],
+            "the removal of the entry with no lapse is written"
+        );
+    }
+
+    /// A start notice the release before kept, for a host the pairings report as not paired, is
+    /// removed at the first use whatever its lapse, and the notice of a host that is paired stays.
+    #[test]
+    fn a_start_notice_of_the_release_before_for_a_host_that_is_not_paired_is_removed() {
+        let directory = tempfile::tempdir().expect("a folder");
+        write_in_the_form_before(
+            directory.path(),
+            vec![
+                notice_of_the_release_before("gone", host(1)),
+                notice_of_the_release_before("stays", host(2)),
+            ],
+        );
+        let calls = calls_in(directory.path());
+        calls.know_pairings(|paired| {
+            if paired == host(1).0 {
+                PairedNow::Not
+            } else {
+                PairedNow::As(paired)
+            }
+        });
+        assert_eq!(
+            actions_shown(&calls),
+            vec!["stays".to_owned()],
+            "the notice of the host that is not paired is not shown"
+        );
+        assert_eq!(
+            pairings_in_file(directory.path()),
+            vec![("stays".to_owned(), None)],
+            "the removal is written"
+        );
+    }
+
+    /// A start notice the release before kept, for a host the pairings cannot tell about yet, is
+    /// not shown and stays in the file until they can.
+    #[test]
+    fn a_start_notice_of_the_release_before_for_a_host_not_told_yet_is_not_shown() {
+        let directory = tempfile::tempdir().expect("a folder");
+        write_in_the_form_before(
+            directory.path(),
+            vec![
+                notice_of_the_release_before("waits", host(1)),
+                notice_of_the_release_before("stays", host(2)),
+            ],
+        );
+        let calls = calls_in(directory.path());
+        calls.know_pairings(|paired| {
+            if paired == host(1).0 {
+                PairedNow::Unknown
+            } else {
+                PairedNow::As(paired)
+            }
+        });
+        assert_eq!(
+            actions_shown(&calls),
+            vec!["stays".to_owned()],
+            "the notice of the host not told yet is not shown"
+        );
+        assert_eq!(
+            pairings_in_file(directory.path()),
+            vec![("waits".to_owned(), None), ("stays".to_owned(), None)],
+            "the file keeps it until the pairings can tell"
         );
     }
 
