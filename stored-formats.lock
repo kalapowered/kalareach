@@ -704,6 +704,21 @@
     },
     {
       "entry": {
+        "store": "voice-start-holds",
+        "scope": "environment",
+        "path": "voice-start-holds.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "voice_start_holds_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "674d7abf2b2ea7c4e8dacb1017fcc4c2545b268ad60736da89b4f18f466daf80",
+      "kept": []
+    },
+    {
+      "entry": {
         "store": "workflow-resources",
         "scope": "environment",
         "path": "workflow-resources.db",
