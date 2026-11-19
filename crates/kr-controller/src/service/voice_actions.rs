@@ -1468,3 +1468,100 @@ fn is_a_challenge(outcome: &Result<ParamsValue>) -> bool {
             )
         })
 }
+
+#[cfg(test)]
+mod attempt_row {
+    use super::*;
+    use crate::voice_start_holds::{Decision, Record};
+
+    fn actor() -> ActorId {
+        ActorId::new("local:1").expect("an actor")
+    }
+
+    fn action(n: u8) -> ActionId {
+        ActionId::new(kr_protocol::scalars::Uuid::from_bytes([n; 16]))
+    }
+
+    /// A record with one row for the actor under the first action, and the gate over that row.
+    fn written() -> (tempfile::TempDir, Arc<Record>, AttemptRow) {
+        let directory = tempfile::tempdir().expect("a directory");
+        let holds = Arc::new(Record::open(directory.path()).expect("the record opens"));
+        let admitted = holds
+            .begin(
+                actor(),
+                action(1),
+                None,
+                &|| (10, 100),
+                &|_, _| Ok(false),
+                &|_| false,
+            )
+            .expect("begin");
+        assert_eq!(admitted, Decision::Admitted);
+        let row = AttemptRow::new(Arc::clone(&holds), actor(), action(1));
+        (directory, holds, row)
+    }
+
+    fn stands(holds: &Record) -> bool {
+        holds.standing(actor()).expect("the record reads").is_some()
+    }
+
+    /// The row ends when the start's effect and the claim's settlement have both happened, in
+    /// either order, and not when only one has.
+    #[test]
+    fn the_row_ends_when_the_effect_and_the_claim_have_both_happened_in_either_order() {
+        for effect_first in [true, false] {
+            let (_directory, holds, row) = written();
+            if effect_first {
+                row.ended();
+            } else {
+                row.settled();
+            }
+            assert!(stands(&holds), "one of the two is not enough");
+            if effect_first {
+                row.settled();
+            } else {
+                row.ended();
+            }
+            assert!(!stands(&holds), "effect first: {effect_first}");
+        }
+    }
+
+    /// A claim that could not settle (its answer could not be kept) leaves the row, however often
+    /// the effect says that nothing is running.
+    #[test]
+    fn a_claim_that_never_settled_leaves_the_row() {
+        let (_directory, holds, row) = written();
+        row.ended();
+        row.ended();
+        assert!(stands(&holds));
+    }
+
+    /// The gate deletes once: a later row of the same device is not deleted by a gate that has run.
+    #[test]
+    fn a_gate_that_has_run_deletes_nothing_again() {
+        let (_directory, holds, row) = written();
+        row.ended();
+        row.settled();
+        assert!(!stands(&holds));
+        holds
+            .begin(
+                actor(),
+                action(2),
+                None,
+                &|| (20, 200),
+                &|_, _| Ok(false),
+                &|_| false,
+            )
+            .expect("a later start");
+        row.ended();
+        row.settled();
+        assert_eq!(
+            holds
+                .standing(actor())
+                .expect("reads")
+                .map(|row| row.action),
+            Some(action(2)),
+            "the later row stands"
+        );
+    }
+}
