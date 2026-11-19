@@ -777,6 +777,7 @@ impl Shared {
     }
 
     /// Keeps what the supervisor needs to end the call if its owner fails.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn keep_for_emergency(
         &self,
         owner: u64,
