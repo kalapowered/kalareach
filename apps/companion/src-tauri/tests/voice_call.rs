@@ -8325,7 +8325,7 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
         let prepared = scene.prepared().await;
         let mut request = scene.own_start_request(&prepared);
         if cause == "deadline" {
-            request["durationSeconds"] = json!(4);
+            request["durationSeconds"] = json!(8);
         }
         let answer = scene.call("voice_start", request);
         assert!(
@@ -8384,12 +8384,25 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
             })
             .cloned()
             .unwrap_or_default();
-        assert!(
-            cut["words"].as_str().is_some_and(|words| words
-                .starts_with("This call may not have been given all of the host's context")
-                && words.ends_with("and did not learn whether OpenAI took the next.")),
-            "the opening context is shown as cut with its last part unconfirmed ({cause}): {ended}"
+        let shown = cut["words"].as_str().unwrap_or_default();
+        let given_in_part = shown.starts_with(
+            "This call may not have been given all of the host's context for its session: the host sent 0 of its 1 parts and did not learn whether OpenAI took the next.",
         );
+        let cut_by_the_end = shown
+            == "This call ended while it was being given the host's context for its session, so it was not given all of it.";
+        if cause == "deadline" {
+            // The phone's own clock holds the call to the host's closing time, so that it may end the
+            // call before the host's news of the send reaches it: the send is then cut short by the end.
+            assert!(
+                given_in_part || cut_by_the_end,
+                "the unfinished context send is shown ({cause}): {ended}"
+            );
+        } else {
+            assert!(
+                given_in_part,
+                "the send the host stopped is shown with its last part unconfirmed ({cause}): {ended}"
+            );
+        }
         scene.stop_host().await;
     }
 }
