@@ -240,9 +240,15 @@ impl Connection {
         let connecting = async {
             if visiting {
                 let in_use = || device.host_in_use().map(|using| using.network_config);
-                pairing.link.visit_paired(host, &identity, &in_use).await
+                pairing
+                    .link
+                    .visit_paired(&host.credentials(), &identity, &in_use)
+                    .await
             } else {
-                pairing.link.connect_paired(host, &identity).await
+                pairing
+                    .link
+                    .connect_paired(&host.credentials(), &identity)
+                    .await
             }
         };
         let session = tokio::time::timeout(CONNECT_WITHIN, connecting)

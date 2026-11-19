@@ -44,7 +44,7 @@ use kr_pairing::platform::{ClientBudgetStore, LocatorRecord, PairingClock, Rende
 use kr_protocol::error::ErrorCode;
 use kr_protocol::grant::GrantExpiry;
 use kr_protocol::hostinfo::EnvironmentListResult;
-use kr_protocol::ids::{AttemptId, BuildId, DeviceId, DeviceKeyRevision};
+use kr_protocol::ids::{AttemptId, BuildId, DeviceId, DeviceKeyRevision, InvitationId};
 use kr_protocol::invitation::RendezvousMessage;
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{
@@ -199,10 +199,29 @@ impl Candidate {
     }
 
     /// The identity this device offers before it is paired. The device identity in it is a
-    /// random one the host does not use: the host assigns the record's own when it commits.
+    /// random one the host does not use: the host commits the device under the identity derived
+    /// for it ([`Self::derived_identity`]).
     #[must_use]
     pub fn unpaired(&self) -> LocalIdentity {
         self.paired_identity(DeviceId::new(kr_ipc::new_uuid()), DeviceKeyRevision::new(1))
+    }
+
+    /// The identity the host commits this device under for `invitation_id`, derived from the
+    /// invitation and this device's authorisation key, at the first revision of its keys. A device
+    /// that was committed while it was not listening connects as this identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error only when the derivation's input breaks the encoding's profile.
+    pub fn derived_identity(
+        &self,
+        invitation_id: InvitationId,
+    ) -> Result<LocalIdentity, PairingError> {
+        let device_id = kr_pairing::identity::committed_device_id(
+            invitation_id,
+            self.keys.authorisation.public(),
+        )?;
+        Ok(self.paired_identity(device_id, DeviceKeyRevision::new(1)))
     }
 
     /// The identity this device connects to a host with, as the device `device_id` it became, at the
@@ -511,8 +530,9 @@ impl Pairing {
         };
         let outcome = match recorded {
             Some(host) if host.host_endpoint_id == pending.host_endpoint_id => self
-                .confirm_committed(host, &pending, progress)
+                .confirm_committed(Known::Told(host), &pending, progress, None)
                 .await
+                .and_then(Confirmed::into_paired)
                 .map_err(|failure| failure.or_tries(pending.tries_left)),
             _ => self.await_approval(pending, None, progress).await,
         };
@@ -867,6 +887,8 @@ impl Pairing {
         let limits = PreAuthLimits::default();
         let mut reconnects = 0_usize;
         let mut refused = 0_u32;
+        // How many recoveries in a row reached no connection as the device it was committed as.
+        let mut lost_recoveries = 0_usize;
         let mut fresh_failed = 0_usize;
         // Whether a look for a fresh connection has just failed.
         let mut looked = false;
@@ -973,6 +995,7 @@ impl Pairing {
                 Ok(answer) => {
                     reconnects = 0;
                     refused = 0;
+                    lost_recoveries = 0;
                     match self.answered(&mut pending, answer, progress)? {
                         Some((device_id, grant_id)) => {
                             let _ = held.take();
@@ -993,6 +1016,25 @@ impl Pairing {
                 Err(LinkError::Refused(refusal)) if refusal.code == ErrorCode::RateLimited => {
                     rest(held.as_mut(), pause_after_refusals(refused, &limits));
                     refused += 1;
+                }
+                // A host that refuses the question this way may have committed the device on a
+                // connection this one is not, and the commitment is then the device's to learn: it
+                // connects as the device it was committed as and asks the host, which answers only
+                // a device that proves the key it was committed under. The connection it holds is
+                // kept, so its reserved question is still asked when the recovery reaches no host.
+                Err(LinkError::Refused(refusal)) if refusal.code == ErrorCode::PermissionDenied => {
+                    let reserve = self.reserve(&pending, held.as_ref());
+                    match self
+                        .confirm_committed(Known::Derived, &pending, progress, reserve)
+                        .await?
+                    {
+                        Confirmed::Paired(host) => return Ok(host),
+                        Confirmed::NotReached => {
+                            lost_recoveries += 1;
+                            progress.send_replace(awaiting(&pending));
+                            rest(held.as_mut(), recovery_rest(lost_recoveries));
+                        }
+                    }
                 }
                 Err(LinkError::Refused(refusal)) => {
                     let _ = self.hosts.clear_attempt();
@@ -1038,6 +1080,19 @@ impl Pairing {
         now: tokio::time::Instant,
     ) -> tokio::time::Instant {
         now + self.left(pending).saturating_sub(LAST_CALL_MARGIN)
+    }
+
+    /// The cutoff of the question `held` keeps for it, as a moment, while that question has not
+    /// gone: a recovery that starts while it is unasked ends by then and leaves the question to
+    /// be asked. Nothing when no connection is held or its kept question has gone.
+    fn reserve(
+        &self,
+        pending: &PendingAttempt,
+        held: Option<&Unpaired>,
+    ) -> Option<tokio::time::Instant> {
+        let held = held.filter(|held| !held.asked.kept)?;
+        let now = tokio::time::Instant::now();
+        Some(cutoff(&held.asked, self.attempt_call(pending, now)))
     }
 
     /// How long until the cutoff on `held`, read once from both clocks; nothing once it has come,
@@ -1205,28 +1260,52 @@ impl Pairing {
         // The record first: a device that stops between the two keeps both, and resuming then
         // reaches the host through the record rather than as a candidate it no longer is.
         self.hosts.record(host.clone())?;
-        self.confirm_committed(host, pending, progress).await
+        self.confirm_committed(Known::Told(host), pending, progress, None)
+            .await
+            .and_then(Confirmed::into_paired)
     }
 
     /// Connects to a host that committed this device, as the device it became, checks that the
     /// host reports it so, and only then lets the waiting attempt go and reports the pairing.
     ///
-    /// A host that cannot be reached leaves the attempt waiting, so the next start asks again,
-    /// until its time has passed, which is checked before every step; the record of the host stays
-    /// either way, because the host committed this device.
+    /// `Told` is a commitment the host named, whose record is written. `Derived` is one the device
+    /// learns only by proving it: the identity is the one derived for it, the record is written
+    /// after the host answers on the connection that proved it, and a refusal that is the host's
+    /// word about the connect ends the attempt. A host that cannot be reached leaves a `Told`
+    /// attempt waiting, so the next start asks again, until its time has passed, which is checked
+    /// before every step; the record of the host stays either way, because the host committed this
+    /// device. A `Derived` recovery that reaches no host returns [`Confirmed::NotReached`], and
+    /// the attempt goes on waiting.
+    ///
+    /// A recovery that must leave the question a held connection keeps for its cutoff to be asked
+    /// is given that cutoff as `reserve`: every wait of this routine ends by it, and a recovery
+    /// that is due to end already starts no connection.
     async fn confirm_committed(
         &self,
-        mut host: PairedHost,
+        known: Known,
         pending: &PendingAttempt,
         progress: &watch::Sender<AttemptState>,
-    ) -> Result<PairedHost, PairingFailure> {
+        reserve: Option<tokio::time::Instant>,
+    ) -> Result<Confirmed, PairingFailure> {
         progress.send_replace(AttemptState::Working {
             stage: Stage::ReachingHost,
         });
-        let device_id = host.device_id;
-        let identity = self
-            .candidate
-            .paired_identity(device_id, host.device_key_revision);
+        let (credentials, identity) = match &known {
+            Known::Told(host) => (
+                host.credentials(),
+                self.candidate
+                    .paired_identity(host.device_id, host.device_key_revision),
+            ),
+            Known::Derived => match self.candidate.derived_identity(pending.invitation_id) {
+                Ok(identity) => (pending.credentials(), identity),
+                Err(_) => {
+                    return Err(self.unknown(crate::shown!(
+                        "this device could not work out the identity it is committed under"
+                    )));
+                }
+            },
+        };
+        let device_id = identity.device_id;
         let params = PairStatusParams {
             invitation_id: pending.invitation_id,
         };
@@ -1237,60 +1316,109 @@ impl Pairing {
             .enumerate()
         {
             if index > 0 {
-                tokio::time::sleep((*delay).min(self.left(pending))).await;
+                let rest = (*delay).min(self.left(pending));
+                tokio::time::sleep(until_reserve(rest, reserve)).await;
             }
-            // The attempt's own deadline holds here too. Past it the device stops asking, and it
-            // keeps its record of the host, which committed it.
+            // The attempt's own deadline holds here too. Past it the device stops asking, and a
+            // `Told` device keeps its record of the host, which committed it.
             if self.left(pending).is_zero() {
                 last = Shown::said("the attempt's time ran out");
                 break;
             }
-            let session = match within(
-                self.step(pending),
-                self.link.connect_paired(&host, &identity),
-            )
-            .await
-            {
-                Ok(session) => session,
-                Err(error) => {
-                    last = error.said();
-                    continue;
-                }
+            let Some(step) = self.recovery_step(pending, reserve) else {
+                break;
             };
-            let status: Result<PairStatusResult, LinkError> = within(self.step(pending), async {
+            let session =
+                match within(step, self.link.connect_paired(&credentials, &identity)).await {
+                    Ok(session) => session,
+                    // The host's word about the connect, which asking again does not change.
+                    Err(LinkError::Refused(refusal))
+                        if !refusal.code.retry_category().permits_automatic_retry() =>
+                    {
+                        return Err(self.unknown(Shown::protocol(&refusal)));
+                    }
+                    Err(error) => {
+                        last = error.said();
+                        continue;
+                    }
+                };
+            let Some(step) = self.recovery_step(pending, reserve) else {
+                session.close();
+                break;
+            };
+            // Whatever goes wrong with this question, the host's refusals too, is asked again on
+            // a new connection: no refusal of it says anything about the commitment.
+            let status: Result<PairStatusResult, LinkError> = within(step, async {
                 session
                     .read(Method::PairStatus, &params)
                     .await
                     .map_err(|error| LinkError::lost(error.said()))
             })
             .await;
-            match status.map(|answer| answer.status) {
+            let grant_id = match status.map(|answer| answer.status) {
                 Ok(PairStatus::Committed {
                     device_id: committed,
-                    ..
-                }) if committed == device_id => {}
-                Ok(_) => {
+                    grant_id,
+                }) if committed == device_id => grant_id,
+                Ok(other) => {
                     session.close();
-                    let _ = self.hosts.clear_attempt();
-                    return Err(PairingFailure::new(
-                        FailureKind::HostMismatch,
-                        "the host does not report this device as the one it committed",
-                    ));
+                    return Err(match known {
+                        Known::Told(_) => {
+                            let _ = self.hosts.clear_attempt();
+                            PairingFailure::new(
+                                FailureKind::HostMismatch,
+                                "the host does not report this device as the one it committed",
+                            )
+                        }
+                        Known::Derived => self.unknown(match other {
+                            PairStatus::Committed { .. } => {
+                                crate::shown!(
+                                    "the host reported another device as the one it committed"
+                                )
+                            }
+                            _ => crate::shown!("the host did not report this device as committed"),
+                        }),
+                    });
                 }
                 Err(error) => {
                     session.close();
                     last = error.said();
                     continue;
                 }
-            }
+            };
+            let mut host = match known {
+                Known::Told(host) => host,
+                Known::Derived => {
+                    let host = PairedHost {
+                        host_device_id: pending.host_device_id,
+                        host_key_revision: pending.host_key_revision,
+                        host_keys: pending.host_keys,
+                        host_endpoint_id: pending.host_endpoint_id,
+                        network_config: pending.network_config.clone(),
+                        device_id,
+                        grant_id,
+                        proposed_grant: pending.proposed_grant.clone(),
+                        name: None,
+                        paired_at_ms: self.clock.wall_clock_ms(),
+                        device_key_revision: DeviceKeyRevision::new(1),
+                    };
+                    self.hosts.record(host.clone())?;
+                    host
+                }
+            };
             let environments: Result<EnvironmentListResult, LinkError> =
-                within(self.step(pending), async {
-                    session
-                        .read(Method::EnvironmentList, &EmptyParams {})
+                match self.recovery_step(pending, reserve) {
+                    Some(step) => {
+                        within(step, async {
+                            session
+                                .read(Method::EnvironmentList, &EmptyParams {})
+                                .await
+                                .map_err(|error| LinkError::lost(error.said()))
+                        })
                         .await
-                        .map_err(|error| LinkError::lost(error.said()))
-                })
-                .await;
+                    }
+                    None => Err(LinkError::lost(Shown::said("the recovery's time ran out"))),
+                };
             session.close();
             if let Some(label) = environments.ok().and_then(|listed| {
                 listed
@@ -1306,19 +1434,94 @@ impl Pairing {
             progress.send_replace(AttemptState::Paired {
                 host: HostView::of(&host),
             });
-            return Ok(host);
+            return Ok(Confirmed::Paired(host));
         }
-        if self.left(pending).is_zero() {
-            let _ = self.hosts.clear_attempt();
+        match known {
+            // The attempt is over only when its time is: the next wait asks again.
+            Known::Derived => Ok(Confirmed::NotReached),
+            Known::Told(_) => {
+                if self.left(pending).is_zero() {
+                    let _ = self.hosts.clear_attempt();
+                }
+                Err(PairingFailure::new(
+                    FailureKind::HostUnreachable,
+                    crate::shown!(
+                        "the host committed this device, which could not connect as it: {}",
+                        last
+                    ),
+                ))
+            }
         }
-        Err(PairingFailure::new(
-            FailureKind::HostUnreachable,
-            crate::shown!(
-                "the host committed this device, which could not connect as it: {}",
-                last
-            ),
-        ))
     }
+
+    /// How long one step of a recovery may take: a step of the attempt, ended by `reserve` when
+    /// there is one. `None` once the reserve has come.
+    fn recovery_step(
+        &self,
+        pending: &PendingAttempt,
+        reserve: Option<tokio::time::Instant>,
+    ) -> Option<Duration> {
+        let step = self.step(pending);
+        match reserve {
+            None => Some(step),
+            Some(by) => {
+                let until = by.saturating_duration_since(tokio::time::Instant::now());
+                (!until.is_zero()).then(|| step.min(until))
+            }
+        }
+    }
+
+    /// Ends the attempt as one whose outcome the device cannot know, having cleared it.
+    fn unknown(&self, why: Shown) -> PairingFailure {
+        let _ = self.hosts.clear_attempt();
+        PairingFailure::new(FailureKind::ApprovalUnknown, why)
+    }
+}
+
+/// What a device knows of the commitment it confirms.
+enum Known {
+    /// The host named the device and its grant on the connection that proved the candidate, or the
+    /// record was read at a restart. The record is written.
+    Told(PairedHost),
+    /// Only the identity the device derived for itself is known.
+    Derived,
+}
+
+/// How a confirmation of a commitment ended, short of failing.
+enum Confirmed {
+    /// The host reported the commitment as it should and the pairing is complete.
+    Paired(PairedHost),
+    /// No connection as the device it was committed as reached the host, or the time reserved for
+    /// a question ran out: the attempt goes on waiting.
+    NotReached,
+}
+
+impl Confirmed {
+    /// The pairing, for a caller whose commitment is already told: such a confirmation ends the
+    /// attempt itself, so nothing is left waiting here.
+    fn into_paired(self) -> Result<PairedHost, PairingFailure> {
+        match self {
+            Self::Paired(host) => Ok(host),
+            Self::NotReached => Err(PairingFailure::new(
+                FailureKind::HostUnreachable,
+                "the host committed this device, but this device could not connect under that identity",
+            )),
+        }
+    }
+}
+
+/// `wait`, ended by `reserve` when there is one.
+fn until_reserve(wait: Duration, reserve: Option<tokio::time::Instant>) -> Duration {
+    reserve.map_or(wait, |by| {
+        wait.min(by.saturating_duration_since(tokio::time::Instant::now()))
+    })
+}
+
+/// How long a waiting device rests after `lost` recoveries in a row reached no connection as the
+/// device it was committed as: no less than its pace, and longer with each loss, so that a host
+/// that answers nothing is asked at most once in the last of the reconnection delays.
+fn recovery_rest(lost: usize) -> Duration {
+    STATUS_INTERVAL.max(RECONNECT_DELAYS[lost.min(RECONNECT_DELAYS.len() - 1)])
 }
 
 /// Waits at most `bound` for one question to a host, or one connection to it. A host that has not
@@ -2036,8 +2239,8 @@ pub fn room_failure(error: &RoomError) -> FailureKind {
 
 #[cfg(test)]
 mod tests {
+    use super::super::paired::HostCredentials;
     use super::*;
-    use kr_protocol::ids::InvitationId;
     use kr_protocol::scalars::Uuid;
     use tokio::sync::mpsc;
 
@@ -2730,6 +2933,13 @@ mod tests {
         TooSoon(Duration),
         /// That the question came too soon, at this moment.
         TooSoonAt(tokio::time::Instant),
+        /// The host's refusal of the question with this code, at once.
+        Refused(ErrorCode),
+        /// The host's refusal, `PERMISSION_DENIED`, at this moment.
+        RefusedAt(tokio::time::Instant),
+        /// That the owner has not decided yet until this moment, and that the host committed the
+        /// device from then on.
+        CommittedFrom(tokio::time::Instant),
     }
 
     /// A host's pre-authorisation surface, scripted: every status question is answered as `reply`
@@ -2737,6 +2947,8 @@ mod tests {
     struct Scripted {
         reply: Reply,
         asked: Arc<Mutex<Vec<tokio::time::Instant>>>,
+        /// When a refusal that was waited for reached the device.
+        answered: Arc<Mutex<Vec<tokio::time::Instant>>>,
         waiting: PairStatusResult,
     }
 
@@ -2768,6 +2980,7 @@ mod tests {
                 .expect("the record")
                 .push(tokio::time::Instant::now());
             let (reply, waiting) = (self.reply.clone(), self.waiting.clone());
+            let answered = Arc::clone(&self.answered);
             let too_soon = || {
                 LinkError::Refused(kr_protocol::error::ProtocolError::new(
                     ErrorCode::RateLimited,
@@ -2788,8 +3001,189 @@ mod tests {
                         tokio::time::sleep_until(at).await;
                         Err(too_soon())
                     }
+                    Reply::Refused(code) => Err(LinkError::Refused(
+                        kr_protocol::error::ProtocolError::new(code, "refused"),
+                    )),
+                    Reply::RefusedAt(at) => {
+                        tokio::time::sleep_until(at).await;
+                        answered
+                            .lock()
+                            .expect("the record")
+                            .push(tokio::time::Instant::now());
+                        Err(LinkError::Refused(kr_protocol::error::ProtocolError::new(
+                            ErrorCode::PermissionDenied,
+                            "refused",
+                        )))
+                    }
+                    Reply::CommittedFrom(at) => Ok(if tokio::time::Instant::now() >= at {
+                        committed_status(DeviceId::new(Uuid::from_bytes([7; 16])))
+                    } else {
+                        waiting
+                    }),
                 }
             })
+        }
+    }
+
+    /// The status a host answers a device it committed with.
+    fn committed_status(device_id: DeviceId) -> PairStatusResult {
+        PairStatusResult {
+            status: PairStatus::Committed {
+                device_id,
+                grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([8; 16])),
+            },
+            owner: kr_protocol::scalars::Nullable::null(),
+        }
+    }
+
+    /// What one scripted connection as the paired device does.
+    #[derive(Clone, Debug)]
+    enum Paired {
+        /// The connect is refused with this code.
+        Refused(ErrorCode),
+        /// The connect fails as a connection lost.
+        Lost,
+        /// The connect fails as this device's own budget refusing it.
+        Declined,
+        /// The connect fails as the host's admission refusal read by the presenter.
+        ConnectionRefused,
+        /// The connect fails as the host holding no membership lease for this device.
+        Membership,
+        /// The connect never ends.
+        Blocks,
+        /// The host refuses the connection, as an error for request zero, and every call with it.
+        RefuseConnection(ErrorCode),
+        /// The host answers `pair.status` as the device the connection proved.
+        Committed,
+        /// The host answers `pair.status` naming this device.
+        CommittedAs(DeviceId),
+        /// The host answers `pair.status` with this, which is no commitment.
+        Status(PairStatus),
+        /// The host refuses `pair.status` with this code, as the answer to that request.
+        Refuse(ErrorCode),
+        /// The host never answers `pair.status`.
+        Silent,
+    }
+
+    /// A control connection whose host answers each request as its script says, with no socket.
+    #[derive(Debug)]
+    struct PairedSession {
+        script: Paired,
+        device_id: DeviceId,
+        sender:
+            std::sync::Mutex<Option<mpsc::UnboundedSender<kr_protocol::envelope::ControlFrame>>>,
+        frames: tokio::sync::Mutex<mpsc::UnboundedReceiver<kr_protocol::envelope::ControlFrame>>,
+        closed: Arc<Mutex<usize>>,
+    }
+
+    impl PairedSession {
+        fn answer(
+            &self,
+            request: &kr_protocol::envelope::Request,
+        ) -> Option<kr_protocol::envelope::Response> {
+            use kr_protocol::envelope::{Outcome, ParamsValue, Response};
+            let outcome = if request.method.as_str() != Method::PairStatus.entry().name {
+                Outcome::Error(kr_protocol::error::ProtocolError::new(
+                    ErrorCode::InvalidArgument,
+                    "no environments are listed",
+                ))
+            } else {
+                match &self.script {
+                    Paired::Committed => Outcome::Ok(
+                        ParamsValue::from_typed(&committed_status(self.device_id))
+                            .expect("a value"),
+                    ),
+                    Paired::CommittedAs(other) => Outcome::Ok(
+                        ParamsValue::from_typed(&committed_status(*other)).expect("a value"),
+                    ),
+                    Paired::Status(status) => Outcome::Ok(
+                        ParamsValue::from_typed(&PairStatusResult {
+                            status: status.clone(),
+                            owner: kr_protocol::scalars::Nullable::null(),
+                        })
+                        .expect("a value"),
+                    ),
+                    Paired::Refuse(code) => Outcome::Error(kr_protocol::error::ProtocolError::new(
+                        *code,
+                        "the question is refused",
+                    )),
+                    Paired::RefuseConnection(code) => {
+                        return Some(Response {
+                            request_id: kr_protocol::ids::RequestId::new(0),
+                            outcome: Outcome::Error(kr_protocol::error::ProtocolError::new(
+                                *code,
+                                "open a new connection",
+                            )),
+                        });
+                    }
+                    _ => return None,
+                }
+            };
+            Some(Response {
+                request_id: request.request_id,
+                outcome,
+            })
+        }
+    }
+
+    impl crate::transport::ControlTransport for PairedSession {
+        fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
+            kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([42; 16]))
+        }
+
+        fn limits(&self) -> kr_protocol::hello::ReceiveLimits {
+            kr_protocol::hello::ReceiveLimits::default()
+        }
+
+        fn initial_action_window(&self) -> kr_protocol::hello::ActionWindow {
+            kr_protocol::hello::ActionWindow {
+                action_window_id: kr_protocol::ids::ActionWindowId::new("window-1")
+                    .expect("a literal window identifier"),
+                connection_id: self.connection_id(),
+                boot_epoch: kr_protocol::ids::BootEpoch::new(1),
+                issued_at_ms: kr_protocol::scalars::TimestampMs::new(0),
+                valid_for_ms: kr_protocol::scalars::DurationMs::new(60_000),
+            }
+        }
+
+        fn ended_by_this_device(&self) -> Option<crate::transport::DeviceEnd> {
+            None
+        }
+
+        fn send<'a>(
+            &'a self,
+            frame: &'a kr_protocol::envelope::ControlFrame,
+        ) -> crate::transport::TransportFuture<'a, ()> {
+            if let kr_protocol::envelope::ControlFrame::Request(request) = frame
+                && let Some(response) = self.answer(request)
+                && let Some(sender) = self.sender.lock().expect("the sender").as_ref()
+            {
+                let _ = sender.send(kr_protocol::envelope::ControlFrame::Response(response));
+            }
+            Box::pin(async { Ok(()) })
+        }
+
+        fn claim_receiver(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn recv(
+            &self,
+        ) -> crate::transport::TransportFuture<'_, Option<kr_protocol::envelope::ControlFrame>>
+        {
+            Box::pin(async move { Ok(self.frames.lock().await.recv().await) })
+        }
+
+        fn stream_opener(&self) -> Option<Arc<dyn crate::transport::StreamOpener>> {
+            None
+        }
+
+        fn revoke_streams(&self) {}
+
+        fn close(&self) {
+            if self.sender.lock().expect("the sender").take().is_some() {
+                *self.closed.lock().expect("the count") += 1;
+            }
         }
     }
 
@@ -2808,6 +3202,14 @@ mod tests {
         dials: Arc<Mutex<usize>>,
         opening: Option<Opening>,
         waiting: PairStatusResult,
+        /// When the refusals waited for on fresh connections reached the device.
+        fresh_answered: Arc<Mutex<Vec<tokio::time::Instant>>>,
+        /// What each connection as the paired device does, in turn; past the end it is lost.
+        paired: Mutex<VecDeque<Paired>>,
+        /// When each such connection was tried, and how many sessions it started and had closed.
+        connects: Arc<Mutex<Vec<tokio::time::Instant>>>,
+        sessions: Arc<Mutex<usize>>,
+        closed: Arc<Mutex<usize>>,
     }
 
     impl HostLink for Dropping {
@@ -2846,6 +3248,7 @@ mod tests {
             let surface = Scripted {
                 reply: opening.reply.clone(),
                 asked: Arc::new(Mutex::new(Vec::new())),
+                answered: Arc::clone(&self.fresh_answered),
                 waiting: self.waiting.clone(),
             };
             Box::pin(async move { Ok(Box::new(surface) as Box<dyn Preauth>) })
@@ -2853,15 +3256,71 @@ mod tests {
 
         fn connect_paired_transport<'a>(
             &'a self,
-            _host: &'a PairedHost,
-            _identity: &'a LocalIdentity,
+            _host: &'a HostCredentials,
+            identity: &'a LocalIdentity,
         ) -> BoxFuture<'a, Result<Arc<dyn crate::transport::ControlTransport>, LinkError>> {
-            unreachable!("the host commits nothing")
+            self.connects
+                .lock()
+                .expect("the record")
+                .push(tokio::time::Instant::now());
+            let script = self
+                .paired
+                .lock()
+                .expect("the script")
+                .pop_front()
+                .unwrap_or(Paired::Lost);
+            let refused = |code: ErrorCode| {
+                kr_protocol::error::ProtocolError::new(code, "the connection is refused")
+            };
+            let session = match script {
+                Paired::Refused(code) => {
+                    return Box::pin(async move { Err(LinkError::Refused(refused(code))) });
+                }
+                Paired::Lost => {
+                    return Box::pin(async {
+                        Err(LinkError::Lost("the connection was lost".to_owned()))
+                    });
+                }
+                Paired::Declined => {
+                    return Box::pin(async move {
+                        Err(LinkError::Declined(refused(ErrorCode::RateLimited)))
+                    });
+                }
+                Paired::ConnectionRefused => {
+                    return Box::pin(async move {
+                        Err(LinkError::ConnectionRefused(refused(
+                            ErrorCode::ResourceUnavailable,
+                        )))
+                    });
+                }
+                Paired::Membership => {
+                    return Box::pin(async move {
+                        Err(LinkError::Membership(
+                            refused(ErrorCode::PermissionDenied),
+                            crate::retry::user_action(ErrorCode::PermissionDenied),
+                        ))
+                    });
+                }
+                Paired::Blocks => return Box::pin(std::future::pending()),
+                other => other,
+            };
+            *self.sessions.lock().expect("the count") += 1;
+            let (sender, frames) = mpsc::unbounded_channel();
+            let transport = PairedSession {
+                script: session,
+                device_id: identity.device_id,
+                sender: std::sync::Mutex::new(Some(sender)),
+                frames: tokio::sync::Mutex::new(frames),
+                closed: Arc::clone(&self.closed),
+            };
+            Box::pin(async move {
+                Ok(Arc::new(transport) as Arc<dyn crate::transport::ControlTransport>)
+            })
         }
 
         fn visit_paired_transport<'a>(
             &'a self,
-            _host: &'a PairedHost,
+            _host: &'a HostCredentials,
             _identity: &'a LocalIdentity,
             _in_use: &'a super::super::link::HostInUse<'a>,
         ) -> BoxFuture<'a, Result<Arc<dyn crate::transport::ControlTransport>, LinkError>> {
@@ -2928,6 +3387,12 @@ mod tests {
         opening: Option<(Duration, Connection, Reply)>,
         /// How long after the start the attempt's own deadline falls.
         deadline: Duration,
+        /// What each connection as the paired device does, in turn.
+        paired: Vec<Paired>,
+        /// How long after the start the connection held from the start was opened: a connection
+        /// opened later has its last call later, so a case that needs the device to go on asking
+        /// on it past a minute has it opened as late as it needs.
+        held_opened: Duration,
     }
 
     impl Script {
@@ -2938,6 +3403,8 @@ mod tests {
                 fail_after,
                 opening: None,
                 deadline: Duration::from_secs(300),
+                paired: Vec::new(),
+                held_opened: Duration::ZERO,
             }
         }
     }
@@ -2950,6 +3417,19 @@ mod tests {
         dials: usize,
         /// Whether the loop ended within the run.
         ended: bool,
+        /// How the attempt ended, when it did within the run.
+        outcome: Option<Result<PairedHost, PairingFailure>>,
+        /// When each connection as the paired device was tried, counted from 0 s.
+        connects: Vec<Duration>,
+        /// How many sessions those connections started, and how many were closed.
+        sessions: usize,
+        closed: usize,
+        /// How many refusals waited for on fresh connections reached the device.
+        fresh_answered: usize,
+        /// Whether a record of the host was written.
+        record: bool,
+        /// The identity the device derived for itself.
+        derived: DeviceId,
     }
 
     /// Runs the waiting loop for `run` on a paused clock, on a connection the device began to open
@@ -2964,6 +3444,10 @@ mod tests {
         let now_ms = clock.wall_clock_ms();
         let asked = Arc::new(Mutex::new(Vec::new()));
         let dials = Arc::new(Mutex::new(0));
+        let connects = Arc::new(Mutex::new(Vec::new()));
+        let sessions = Arc::new(Mutex::new(0));
+        let closed = Arc::new(Mutex::new(0));
+        let fresh_answered = Arc::new(Mutex::new(Vec::new()));
         let directory = tempfile::tempdir().expect("a directory on the internal disk");
         let host = DeviceKeys::generate().expect("keys").public_keys();
         let value = "f3c146fd".to_owned();
@@ -3027,6 +3511,11 @@ mod tests {
                 dials: Arc::clone(&dials),
                 opening,
                 waiting: waiting.clone(),
+                fresh_answered: Arc::clone(&fresh_answered),
+                paired: Mutex::new(script.paired.into()),
+                connects: Arc::clone(&connects),
+                sessions: Arc::clone(&sessions),
+                closed: Arc::clone(&closed),
             }),
             hosts: Arc::new(PairedHosts::open(directory.path().join("pairing")).expect("a store")),
         };
@@ -3034,15 +3523,16 @@ mod tests {
             Box::new(Scripted {
                 reply: script.held,
                 asked: Arc::clone(&asked),
+                answered: Arc::new(Mutex::new(Vec::new())),
                 waiting,
             }),
-            start,
+            start + script.held_opened,
             2,
         );
         let (progress, _shown) = watch::channel(AttemptState::Idle);
-        let ended = tokio::time::timeout(run, pairing.waiting(pending, Some(held), &progress))
+        let outcome = tokio::time::timeout(run, pairing.waiting(pending, Some(held), &progress))
             .await
-            .is_ok();
+            .ok();
         let asked = asked
             .lock()
             .expect("the record")
@@ -3050,10 +3540,39 @@ mod tests {
             .map(|sent| *sent - start)
             .collect();
         let dials = *dials.lock().expect("the count");
+        let connects = connects
+            .lock()
+            .expect("the record")
+            .iter()
+            .map(|tried| *tried - start)
+            .collect();
+        let derived = pairing
+            .candidate
+            .derived_identity(InvitationId::new(Uuid::from_bytes([4; 16])))
+            .expect("an identity")
+            .device_id;
+        let record = pairing
+            .hosts
+            .by_device(DeviceId::new(Uuid::from_bytes([1; 16])))
+            .ok()
+            .flatten()
+            .is_some();
+        let (sessions, closed) = (
+            *sessions.lock().expect("the count"),
+            *closed.lock().expect("the count"),
+        );
+        let fresh_answered = fresh_answered.lock().expect("the record").len();
         Waited {
             asked,
             dials,
-            ended,
+            ended: outcome.is_some(),
+            outcome,
+            connects,
+            sessions,
+            closed,
+            fresh_answered,
+            record,
+            derived,
         }
     }
 
@@ -3143,6 +3662,7 @@ mod tests {
                 fail_after: Duration::ZERO,
                 opening: None,
                 deadline: Duration::from_secs(30),
+                ..Script::waiting(Duration::ZERO, Duration::ZERO)
             },
             Duration::from_secs(70),
         )
@@ -3228,11 +3748,402 @@ mod tests {
                     Reply::TooSoonAt(start + UNPAIRED_LIFE - LAST_CALL_MARGIN),
                 )),
                 deadline: Duration::from_secs(300),
+                ..Script::waiting(Duration::ZERO, Duration::ZERO)
             },
             Duration::from_secs(70),
         )
         .await;
         kept_its_last_call(&run, "a fresh connection turned away at the call");
+    }
+
+    /// Runs the waiting loop on a paused clock, on a connection that answers every question as
+    /// `held` says and is open for the whole run, while the paired connections go as `paired`
+    /// says. The attempt's deadline falls `deadline` after the start.
+    async fn recovering(
+        held: Reply,
+        paired: Vec<Paired>,
+        deadline: Duration,
+        run: Duration,
+    ) -> Waited {
+        waited(
+            Script {
+                held,
+                deadline,
+                paired,
+                held_opened: Duration::from_secs(1000),
+                ..Script::waiting(Duration::ZERO, Duration::ZERO)
+            },
+            run,
+        )
+        .await
+    }
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    fn paired_host(waited: &Waited) -> &PairedHost {
+        match &waited.outcome {
+            Some(Ok(host)) => host,
+            other => panic!("the attempt did not end paired: {other:?}"),
+        }
+    }
+
+    fn failure_kind(waited: &Waited) -> FailureKind {
+        match &waited.outcome {
+            Some(Err(failure)) => failure.kind,
+            other => panic!("the attempt did not end as a failure: {other:?}"),
+        }
+    }
+
+    /// KR-REQ-10.37: a refusal of the status question with `PERMISSION_DENIED` starts a recovery:
+    /// the device connects as the identity derived for it, the host answers it there, and it ends
+    /// paired with that identity and a record.
+    #[tokio::test(start_paused = true)]
+    async fn a_permission_denied_status_refusal_starts_one_recovery_that_ends_paired() {
+        let run = recovering(
+            Reply::Refused(ErrorCode::PermissionDenied),
+            vec![Paired::Committed],
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        )
+        .await;
+        let host = paired_host(&run);
+        assert_eq!(
+            host.device_id, run.derived,
+            "the device is the one derived for it"
+        );
+        assert!(run.record, "the record of the host was written");
+        assert_eq!(
+            run.connects.len(),
+            1,
+            "one connection was enough: {:?}",
+            run.connects
+        );
+        assert_eq!(run.sessions, run.closed, "no session was left open");
+    }
+
+    /// KR-REQ-10.37: a recovery that loses all four of its connections does not end the attempt.
+    /// The device returns to the wait, rests longer after each recovery lost in a row, and a later
+    /// refusal starts another, which succeeds. The refusal that starts a recovery is a word from the
+    /// host and does not reset the count: the rests are three, four and eight seconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_recovery_that_reaches_no_host_returns_to_the_wait_and_the_rest_grows() {
+        let mut paired = vec![Paired::Lost; 12];
+        paired.push(Paired::Committed);
+        let run = recovering(
+            Reply::Refused(ErrorCode::PermissionDenied),
+            paired,
+            Duration::from_secs(300),
+            Duration::from_secs(200),
+        )
+        .await;
+        paired_host(&run);
+        assert_eq!(
+            run.connects.len(),
+            13,
+            "three whole recoveries and a fourth: {:?}",
+            run.connects
+        );
+        // The last connection of each recovery and the first of the next: the rest between them.
+        let rests =
+            [(3, 4), (7, 8), (11, 12)].map(|(last, next)| run.connects[next] - run.connects[last]);
+        assert!(rests[0] >= 3 * SECOND, "{rests:?}");
+        assert!(rests[1] >= 4 * SECOND, "{rests:?}");
+        assert!(
+            rests[2] >= 8 * SECOND,
+            "the rest after three lost recoveries is eight seconds: {rests:?}"
+        );
+    }
+
+    /// KR-REQ-10.37: a connection the host refuses with a code that permits no retry is the host's
+    /// word: the attempt ends as unknown, with nothing recorded.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_connect_of_a_recovery_ends_the_attempt_as_unknown() {
+        let run = recovering(
+            Reply::Refused(ErrorCode::PermissionDenied),
+            vec![
+                Paired::Refused(ErrorCode::PermissionDenied),
+                Paired::Committed,
+            ],
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(failure_kind(&run), FailureKind::ApprovalUnknown);
+        assert!(!run.record, "nothing was recorded");
+        assert_eq!(run.connects.len(), 1, "the refusal is not asked again");
+    }
+
+    /// KR-REQ-10.37: this device's own budget, the host's admission refusal, a membership lease the
+    /// host does not hold and a connection lost are none of them the host's word about the
+    /// commitment: the recovery connects again, within its tries.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_is_not_the_hosts_word_is_not_reached_and_is_tried_again() {
+        let run = recovering(
+            Reply::Refused(ErrorCode::PermissionDenied),
+            vec![
+                Paired::Declined,
+                Paired::ConnectionRefused,
+                Paired::Membership,
+                Paired::Committed,
+            ],
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        )
+        .await;
+        paired_host(&run);
+        assert_eq!(run.connects.len(), 4, "{:?}", run.connects);
+    }
+
+    /// KR-REQ-10.37: a question refused as too soon starts no recovery: the device rests and asks
+    /// again.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limited_refusal_starts_no_recovery() {
+        let run = recovering(
+            Reply::Refused(ErrorCode::RateLimited),
+            vec![Paired::Committed],
+            Duration::from_secs(300),
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(run.connects.is_empty(), "{:?}", run.connects);
+        assert!(!run.ended);
+    }
+
+    /// KR-REQ-10.37: any other refusal is the host's word about the attempt, as it always was.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_with_another_code_ends_as_the_hosts_word() {
+        let run = recovering(
+            Reply::Refused(ErrorCode::PairingExpired),
+            vec![Paired::Committed],
+            Duration::from_secs(300),
+            Duration::from_secs(20),
+        )
+        .await;
+        assert_eq!(
+            failure_kind(&run),
+            refused_by_host(ErrorCode::PairingExpired, true)
+        );
+        assert!(run.connects.is_empty(), "no recovery started");
+    }
+
+    /// KR-REQ-10.37: a status question that never answers ends by the attempt's deadline, with no
+    /// session left open, and no record is written before the host answers as the authorised
+    /// device.
+    #[tokio::test(start_paused = true)]
+    async fn a_status_question_that_never_answers_ends_by_the_deadline_with_no_record() {
+        let run = recovering(
+            Reply::Refused(ErrorCode::PermissionDenied),
+            vec![Paired::Silent; 40],
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+        )
+        .await;
+        assert_eq!(failure_kind(&run), FailureKind::ApprovalUnknown);
+        assert!(run.sessions > 0, "the question was reached");
+        assert_eq!(run.sessions, run.closed, "no session was left open");
+        assert!(!run.record, "no record before the authorised answer");
+    }
+
+    /// KR-REQ-10.37: a commitment the host named whose connect is refused with a code that permits
+    /// no retry ends as unknown and keeps the record, which the host committed.
+    #[tokio::test(start_paused = true)]
+    async fn a_told_commitment_whose_connect_is_refused_ends_as_unknown_and_keeps_its_record() {
+        let run = recovering(
+            Reply::CommittedFrom(tokio::time::Instant::now()),
+            vec![
+                Paired::Refused(ErrorCode::PermissionDenied),
+                Paired::Committed,
+            ],
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(failure_kind(&run), FailureKind::ApprovalUnknown);
+        assert!(run.record, "the record the host committed is kept");
+        assert_eq!(run.connects.len(), 1);
+    }
+
+    /// KR-REQ-10.37: a first connection the host refuses as the connection (request zero) is no
+    /// word about the commitment: the device connects again and ends paired, whether the host named
+    /// the commitment or the device derived it.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_refused_as_the_connection_is_connected_again() {
+        for held in [
+            Reply::CommittedFrom(tokio::time::Instant::now()),
+            Reply::Refused(ErrorCode::PermissionDenied),
+        ] {
+            let run = recovering(
+                held.clone(),
+                vec![
+                    Paired::RefuseConnection(ErrorCode::PermissionDenied),
+                    Paired::Committed,
+                ],
+                Duration::from_secs(300),
+                Duration::from_secs(60),
+            )
+            .await;
+            paired_host(&run);
+            assert_eq!(run.connects.len(), 2, "{held:?}: {:?}", run.connects);
+            assert!(run.record);
+        }
+    }
+
+    /// KR-REQ-10.37: no refusal of the status question on the authorised session is the host's word
+    /// about the commitment, whatever its code and whether or not it is the connection's: the
+    /// device asks again on a new connection and ends paired.
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_of_the_status_question_is_asked_again_whatever_its_code() {
+        for code in [ErrorCode::ResourceUnavailable, ErrorCode::PermissionDenied] {
+            for held in [
+                Reply::CommittedFrom(tokio::time::Instant::now()),
+                Reply::Refused(ErrorCode::PermissionDenied),
+            ] {
+                let run = recovering(
+                    held.clone(),
+                    vec![Paired::Refuse(code), Paired::Committed],
+                    Duration::from_secs(300),
+                    Duration::from_secs(60),
+                )
+                .await;
+                paired_host(&run);
+                assert_eq!(
+                    run.connects.len(),
+                    2,
+                    "{code:?} {held:?}: {:?}",
+                    run.connects
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-10.37: a host that answers the authorised session with anything but the commitment
+    /// the device expects is not believed. A device that derived its identity ends as unknown
+    /// with no record; a device the host told keeps the mismatch it always had.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_that_is_not_the_expected_commitment_is_not_believed() {
+        let stranger = DeviceId::new(Uuid::from_bytes([0x66; 16]));
+        let awaiting = PairStatus::AwaitingApproval {
+            attempt_id: AttemptId::new(Uuid::from_bytes([5; 16])),
+            verification_value: "f3c146fd".to_owned(),
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        };
+        for answer in [Paired::Status(awaiting), Paired::CommittedAs(stranger)] {
+            let derived = recovering(
+                Reply::Refused(ErrorCode::PermissionDenied),
+                vec![answer.clone()],
+                Duration::from_secs(300),
+                Duration::from_secs(60),
+            )
+            .await;
+            assert_eq!(
+                failure_kind(&derived),
+                FailureKind::ApprovalUnknown,
+                "{answer:?}"
+            );
+            assert!(!derived.record, "{answer:?}: nothing was recorded");
+            let told = recovering(
+                Reply::CommittedFrom(tokio::time::Instant::now()),
+                vec![answer.clone()],
+                Duration::from_secs(300),
+                Duration::from_secs(60),
+            )
+            .await;
+            // The held connection names a device ([7; 16]) that the second answer repeats only for
+            // the identity it was built with, so a `Told` device meets a mismatch on both.
+            assert_eq!(failure_kind(&told), FailureKind::HostMismatch, "{answer:?}");
+        }
+    }
+
+    /// Runs the waiting loop as [`a_look_turned_away_at_the_last_call_does_not_hold_back_the_kept_question`]
+    /// does, except that the held connection answers `Committed` from its last call and the fresh
+    /// connection the device looks for at 40 seconds is refused with `PERMISSION_DENIED` at
+    /// `refused_at`. The recovery's connections go as `paired` says.
+    async fn refused_at(refused_at: Duration) -> Waited {
+        let connection = a_finished_connection().await;
+        tokio::time::pause();
+        let start = tokio::time::Instant::now();
+        waited(
+            Script {
+                held: Reply::CommittedFrom(start + UNPAIRED_LIFE - LAST_CALL_MARGIN),
+                fail_after: Duration::ZERO,
+                opening: Some((
+                    Duration::from_secs(40),
+                    connection,
+                    Reply::RefusedAt(start + refused_at),
+                )),
+                deadline: Duration::from_secs(300),
+                paired: vec![
+                    Paired::Blocks,
+                    Paired::Lost,
+                    Paired::Lost,
+                    Paired::Lost,
+                    Paired::Lost,
+                ],
+                held_opened: Duration::ZERO,
+            },
+            Duration::from_secs(120),
+        )
+        .await
+    }
+
+    /// What the cases of the held connection's kept question check after the run: the question
+    /// went at the call, the host's answer to it was believed, and the later failed connections
+    /// left the record the host committed and ended the attempt as the host being unreachable.
+    fn kept_question_was_asked_and_its_answer_kept(run: &Waited) {
+        let call = UNPAIRED_LIFE - LAST_CALL_MARGIN;
+        assert!(
+            run.asked
+                .iter()
+                .any(|sent| *sent >= call && *sent <= call + LAST_CALL_GRACE),
+            "the question kept for the last call did not go at it: {:?}",
+            run.asked
+        );
+        assert_eq!(failure_kind(run), FailureKind::HostUnreachable);
+        assert!(run.record, "the record the host committed is kept");
+    }
+
+    /// KR-REQ-10.37: a refusal on a fresh connection that comes before the held connection's last
+    /// call starts a recovery that ends by that call. The connection it makes never answers, so the
+    /// recovery is abandoned at the call, the held connection's kept question goes and is answered
+    /// `committed`, and the record is written. The connections made after it fail, and the attempt
+    /// ends as the host being unreachable, with the record kept.
+    #[tokio::test]
+    async fn a_recovery_that_meets_the_last_call_leaves_the_kept_question_to_go() {
+        let run = refused_at(Duration::from_secs(45)).await;
+        assert_eq!(run.fresh_answered, 1, "the refusal reached the device");
+        let call = UNPAIRED_LIFE - LAST_CALL_MARGIN;
+        assert!(
+            run.connects[0] < call,
+            "the recovery started before the call: {:?}",
+            run.connects
+        );
+        kept_question_was_asked_and_its_answer_kept(&run);
+    }
+
+    /// KR-REQ-10.37: a refusal that reaches the device at the held connection's last call, when the
+    /// question that connection keeps for it has not gone, starts no recovery before that question:
+    /// the device makes no connection as the paired device until the question has gone.
+    #[tokio::test]
+    async fn a_refusal_at_the_last_call_starts_no_recovery_before_the_kept_question() {
+        let call = UNPAIRED_LIFE - LAST_CALL_MARGIN;
+        let run = refused_at(call).await;
+        assert_eq!(
+            run.fresh_answered, 1,
+            "the refusal reached the device at the call, and did not time out"
+        );
+        let kept = run
+            .asked
+            .iter()
+            .copied()
+            .find(|sent| *sent >= call)
+            .expect("the kept question went");
+        assert!(
+            run.connects.iter().all(|tried| *tried >= kept),
+            "a connection as the paired device was made before the kept question: {:?} / {:?}",
+            run.connects,
+            run.asked
+        );
+        kept_question_was_asked_and_its_answer_kept(&run);
     }
 
     /// An attempt says its stage and when it expires, and never the verification value, a host's

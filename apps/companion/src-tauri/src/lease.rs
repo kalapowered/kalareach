@@ -37,7 +37,7 @@ use std::time::Duration;
 use kr_client::organisation::{LeaseEvent, LeaseKeeper, LeaseStop, LeaseTimer, RealTimer};
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::link::{LinkError, MembershipPresenter, Presentation};
-use kr_client::pairing::paired::PairedHost;
+use kr_client::pairing::paired::{HostCredentials, PairedHost};
 use kr_client::services::account::AccountStatus;
 use kr_client::services::{
     AccountMark, HttpDeadlines, HttpService, ManagedMembershipLeaseService, managed_response_limits,
@@ -232,10 +232,10 @@ impl LeaseDesk {
     /// when the person has signed in since; none for a host whose grant answers to no organisation.
     async fn keeper_of(
         &self,
-        host: &PairedHost,
+        host: &HostCredentials,
         key: AuthorisationKey,
     ) -> Result<Option<Arc<LeaseKeeper>>, LeaseStop> {
-        let Some(requirement) = host.proposed_grant.organisation.as_ref() else {
+        let Some(requirement) = host.organisation.as_ref() else {
             return Ok(None);
         };
         let organisation = requirement.organisation_id;
@@ -327,7 +327,7 @@ impl LeaseDesk {
         host: &PairedHost,
         key: AuthorisationKey,
     ) -> Option<LeaseStop> {
-        match self.keeper_of(host, key).await {
+        match self.keeper_of(&host.credentials(), key).await {
             Ok(Some(keeper)) => Some(keeper.keep(session).await),
             Ok(None) => None,
             Err(stop) => Some(stop),
@@ -359,12 +359,12 @@ fn failed_on(session: &Session, stop: &LeaseStop) -> LinkError {
 impl MembershipPresenter for LeaseDesk {
     fn bind<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         dial: BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
         Box::pin(async move {
-            let Some(requirement) = host.proposed_grant.organisation.as_ref() else {
+            let Some(requirement) = host.organisation.as_ref() else {
                 return dial.await;
             };
             let organisation = requirement.organisation_id;
@@ -402,7 +402,7 @@ impl MembershipPresenter for LeaseDesk {
     fn present<'a>(
         &'a self,
         session: &'a Session,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         key: AuthorisationKey,
         presentation: Presentation,
     ) -> BoxFuture<'a, Result<(), LinkError>> {

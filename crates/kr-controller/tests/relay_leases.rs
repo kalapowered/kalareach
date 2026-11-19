@@ -5278,7 +5278,7 @@ impl kr_client::pairing::link::HostLink for Counting {
 
     fn connect_paired_transport<'a>(
         &'a self,
-        host: &'a kr_client::pairing::paired::PairedHost,
+        host: &'a kr_client::pairing::paired::HostCredentials,
         identity: &'a kr_transport::handshake::LocalIdentity,
     ) -> kr_client::pairing::BoxFuture<
         'a,
@@ -5292,7 +5292,7 @@ impl kr_client::pairing::link::HostLink for Counting {
 
     fn visit_paired_transport<'a>(
         &'a self,
-        host: &'a kr_client::pairing::paired::PairedHost,
+        host: &'a kr_client::pairing::paired::HostCredentials,
         identity: &'a kr_transport::handshake::LocalIdentity,
         in_use: &'a kr_client::pairing::link::HostInUse<'a>,
     ) -> kr_client::pairing::BoxFuture<

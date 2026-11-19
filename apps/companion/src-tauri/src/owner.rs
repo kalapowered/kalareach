@@ -355,9 +355,15 @@ impl Owner {
         let session = if visiting {
             let device = &self.device;
             let in_use = || device.host_in_use().map(|using| using.network_config);
-            pairing.link.visit_paired(host, &identity, &in_use).await
+            pairing
+                .link
+                .visit_paired(&host.credentials(), &identity, &in_use)
+                .await
         } else {
-            pairing.link.connect_paired(host, &identity).await
+            pairing
+                .link
+                .connect_paired(&host.credentials(), &identity)
+                .await
         }
         .map_err(|error| match error {
             // The host was reached and was asked nothing: this computer could not give it the

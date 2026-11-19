@@ -122,7 +122,7 @@ async fn redeem(phone: &Phone, host: &Host, invitation_id: InvitationId) {
     let session = device
         .pairing()
         .link
-        .connect_paired(&paired, &identity)
+        .connect_paired(&paired.credentials(), &identity)
         .await
         .expect("the phone connects");
     session

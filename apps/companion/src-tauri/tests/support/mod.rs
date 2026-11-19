@@ -1836,7 +1836,7 @@ impl ControlledLink {
     /// `visiting` names when it is `Some`.
     async fn controlled(
         &self,
-        host: &kr_client::pairing::paired::PairedHost,
+        host: &kr_client::pairing::paired::HostCredentials,
         identity: &kr_transport::handshake::LocalIdentity,
         visiting: Option<&kr_client::pairing::link::HostInUse<'_>>,
     ) -> Result<Arc<dyn kr_client::transport::ControlTransport>, kr_client::pairing::link::LinkError>
@@ -2291,7 +2291,7 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
 
     fn connect_paired_transport<'a>(
         &'a self,
-        host: &'a kr_client::pairing::paired::PairedHost,
+        host: &'a kr_client::pairing::paired::HostCredentials,
         identity: &'a kr_transport::handshake::LocalIdentity,
     ) -> kr_client::pairing::BoxFuture<
         'a,
@@ -2305,7 +2305,7 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
 
     fn visit_paired_transport<'a>(
         &'a self,
-        host: &'a kr_client::pairing::paired::PairedHost,
+        host: &'a kr_client::pairing::paired::HostCredentials,
         identity: &'a kr_transport::handshake::LocalIdentity,
         in_use: &'a kr_client::pairing::link::HostInUse<'a>,
     ) -> kr_client::pairing::BoxFuture<
@@ -2321,7 +2321,7 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
     fn present_membership<'a>(
         &'a self,
         session: &'a kr_client::session::Session,
-        host: &'a kr_client::pairing::paired::PairedHost,
+        host: &'a kr_client::pairing::paired::HostCredentials,
         identity: &'a kr_transport::handshake::LocalIdentity,
         presentation: kr_client::pairing::link::Presentation,
     ) -> kr_client::pairing::BoxFuture<'a, Result<(), kr_client::pairing::link::LinkError>> {
@@ -2350,7 +2350,7 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
                 presented?;
             }
             if presentation == kr_client::pairing::link::Presentation::First
-                && host.proposed_grant.organisation.as_ref().is_some()
+                && host.organisation.as_ref().is_some()
             {
                 self.control.after_presenting().await;
             }

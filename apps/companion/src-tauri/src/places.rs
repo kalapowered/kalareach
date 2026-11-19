@@ -36,7 +36,7 @@ use std::time::Duration;
 use kr_client::error::Result;
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::link::{EndpointHold, HostInUse, HostLink, LinkError, Presentation};
-use kr_client::pairing::paired::PairedHost;
+use kr_client::pairing::paired::HostCredentials;
 use kr_client::session::Session;
 use kr_client::transport::{ControlTransport, Reach, StreamOpener, TransportFuture};
 use kr_protocol::envelope::ControlFrame;
@@ -336,7 +336,7 @@ impl Budgeted {
         Arc::new(Self { inner, places })
     }
 
-    async fn place_for(&self, host: &PairedHost) -> std::result::Result<Place, LinkError> {
+    async fn place_for(&self, host: &HostCredentials) -> std::result::Result<Place, LinkError> {
         self.places
             .take(host.host_device_id, kind_of_this_dial(), PLACE_WAIT)
             .await
@@ -364,7 +364,7 @@ impl HostLink for Budgeted {
 
     fn connect_paired_transport<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, std::result::Result<Arc<dyn ControlTransport>, LinkError>> {
         Box::pin(async move {
@@ -376,7 +376,7 @@ impl HostLink for Budgeted {
 
     fn visit_paired_transport<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, std::result::Result<Arc<dyn ControlTransport>, LinkError>> {
@@ -393,7 +393,7 @@ impl HostLink for Budgeted {
     fn present_membership<'a>(
         &'a self,
         session: &'a Session,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         presentation: Presentation,
     ) -> BoxFuture<'a, std::result::Result<(), LinkError>> {

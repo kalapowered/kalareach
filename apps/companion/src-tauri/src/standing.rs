@@ -244,7 +244,9 @@ impl Dial {
         let identity = pairing.paired_identity_for(&self.host);
         tokio::time::timeout(
             OPEN_WITHIN,
-            pairing.link.connect_paired_transport(&self.host, &identity),
+            pairing
+                .link
+                .connect_paired_transport(&self.host.credentials(), &identity),
         )
         .await
         .map_err(|_| Unopened::unreached(NotReached::NoAnswerInTime))?

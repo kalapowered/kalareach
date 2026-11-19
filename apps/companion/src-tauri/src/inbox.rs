@@ -423,7 +423,12 @@ async fn present(
     let identity = pairing.paired_identity_for(host);
     pairing
         .link
-        .present_membership(&connection.session(), host, &identity, presentation)
+        .present_membership(
+            &connection.session(),
+            &host.credentials(),
+            &identity,
+            presentation,
+        )
         .await
         .map_err(|error| match error {
             LinkError::Refused(refusal) | LinkError::Declined(refusal) => {

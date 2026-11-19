@@ -58,7 +58,7 @@ use kr_transport::scheduler::SendLimits;
 use tokio::sync::{Mutex, watch};
 
 use super::BoxFuture;
-use super::paired::PairedHost;
+use super::paired::HostCredentials;
 use crate::retry::UserAction;
 use crate::services::{PairingAdmissions, RelayRefusal};
 use crate::session::Session;
@@ -220,7 +220,7 @@ pub trait MembershipPresenter: Send + Sync {
     /// Returns why no connection under an account can be made, or `dial`'s own failure.
     fn bind<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         dial: BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
@@ -234,7 +234,7 @@ pub trait MembershipPresenter: Send + Sync {
     fn present<'a>(
         &'a self,
         session: &'a Session,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         device_key: AuthorisationKey,
         presentation: Presentation,
     ) -> BoxFuture<'a, Result<(), LinkError>>;
@@ -271,7 +271,7 @@ pub trait HostLink: Send + Sync {
     /// what it reads.
     fn connect_paired_transport<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
 
@@ -284,7 +284,7 @@ pub trait HostLink: Send + Sync {
     /// lost, and nothing the host in use has is touched.
     fn visit_paired_transport<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
@@ -294,7 +294,7 @@ pub trait HostLink: Send + Sync {
     /// ([`Self::present_membership`]).
     fn visit_paired<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Session, LinkError>> {
@@ -309,7 +309,7 @@ pub trait HostLink: Send + Sync {
     /// else on it ([`Self::present_membership`]).
     fn connect_paired<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Session, LinkError>> {
         Box::pin(async move {
@@ -335,7 +335,7 @@ pub trait HostLink: Send + Sync {
     fn present_membership<'a>(
         &'a self,
         _session: &'a Session,
-        _host: &'a PairedHost,
+        _host: &'a HostCredentials,
         _identity: &'a LocalIdentity,
         _presentation: Presentation,
     ) -> BoxFuture<'a, Result<(), LinkError>> {
@@ -392,7 +392,7 @@ pub trait HostLink: Send + Sync {
 async fn presenting<L: HostLink + ?Sized>(
     link: &L,
     transport: Arc<dyn ControlTransport>,
-    host: &PairedHost,
+    host: &HostCredentials,
     identity: &LocalIdentity,
 ) -> Result<Session, LinkError> {
     let session = Session::start(transport).map_err(|error| LinkError::lost(error.said()))?;
@@ -886,7 +886,7 @@ impl IrohLink {
     /// call this, so what is bound here is every session the device opens to such a host.
     fn bound<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         dial: BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
@@ -952,7 +952,7 @@ impl HostLink for IrohLink {
     fn present_membership<'a>(
         &'a self,
         session: &'a Session,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         presentation: Presentation,
     ) -> BoxFuture<'a, Result<(), LinkError>> {
@@ -969,7 +969,7 @@ impl HostLink for IrohLink {
 
     fn connect_paired_transport<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
         self.bound(
@@ -985,7 +985,7 @@ impl HostLink for IrohLink {
 
     fn visit_paired_transport<'a>(
         &'a self,
-        host: &'a PairedHost,
+        host: &'a HostCredentials,
         identity: &'a LocalIdentity,
         in_use: &'a HostInUse<'a>,
     ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
@@ -1026,7 +1026,7 @@ impl HostLink for IrohLink {
 
 /// Connects to `host` as the device it became, over the endpoint `endpoint` gives.
 async fn connect_paired_over(
-    host: &PairedHost,
+    host: &HostCredentials,
     identity: &LocalIdentity,
     endpoint: impl std::future::Future<Output = Result<Endpoint, LinkError>>,
 ) -> Result<Arc<dyn ControlTransport>, LinkError> {
