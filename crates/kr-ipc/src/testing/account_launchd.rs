@@ -92,6 +92,42 @@ pub fn launchctl_at(program: &Path, arguments: &[&str]) -> std::io::Result<Outpu
     launchctl_given(asked(), program, arguments)
 }
 
+/// Gives `command` the run's asking, as `value` holds it, for a program started with a cleared
+/// environment: the value exactly, when there is one, and no variable when there is none.
+///
+/// A program the test starts that runs `kr` against the service manager (and, through the job
+/// definition, a daemon the manager starts) asks only if it holds the variable, and a cleared
+/// environment does not.
+pub fn pass_the_ask_from<'a>(command: &'a mut Command, value: Option<&OsStr>) -> &'a mut Command {
+    match value {
+        Some(value) => command.env(VARIABLE, value),
+        None => command.env_remove(VARIABLE),
+    }
+}
+
+/// Gives `command` this process's own value of [`VARIABLE`], as [`pass_the_ask_from`] does.
+pub fn pass_the_ask(command: &mut Command) -> &mut Command {
+    pass_the_ask_from(command, std::env::var_os(VARIABLE).as_deref())
+}
+
+/// The command that runs `/bin/launchctl` with `arguments`, for a test source that starts it itself
+/// and keeps what it started (a bounded run, a status, an output).
+///
+/// A command that changes the manager, in a run that did not ask, is not `/bin/launchctl`: it is
+/// a shell that says [`REFUSAL`] on its error output and ends with status 1, so that the case
+/// reads a refused command as a failed one and no job is touched. A read is `/bin/launchctl`.
+#[must_use]
+pub fn command(arguments: &[&str]) -> Command {
+    if refusal_given(asked(), Path::new(LAUNCHCTL), arguments).is_some() {
+        let mut refused = Command::new("/bin/sh");
+        refused.args(["-c", "echo \"$0\" >&2; exit 1", REFUSAL]);
+        return refused;
+    }
+    let mut run = Command::new(LAUNCHCTL);
+    run.args(arguments);
+    run
+}
+
 /// Runs `/bin/launchctl` with `arguments` as [`launchctl_at`] does.
 ///
 /// # Errors

@@ -88,8 +88,9 @@ impl StartedEnvironment {
     /// Gives `command` this environment and working folder, and returns it for the caller to add
     /// what its own case needs by name.
     ///
-    /// Nothing of the test program's environment passes but the temporary directory's name. On
-    /// Windows the environment is left as it is and only the working folder is set.
+    /// Nothing of the test program's environment passes but the temporary directory's name and the
+    /// run's asking for the account's own launchd. On Windows the environment is left as it is and
+    /// only the working folder is set.
     pub fn apply<'a>(&self, command: &'a mut Command) -> &'a mut Command {
         self.apply_keeping(command, &[])
     }
@@ -109,6 +110,9 @@ impl StartedEnvironment {
                     command.env(name, value);
                 }
             }
+            // Whether the run asked for the account's own launchd goes on to what the program
+            // starts, the daemon's service definition among it.
+            super::account_launchd::pass_the_ask(command);
         }
         #[cfg(not(unix))]
         let _ = kept;

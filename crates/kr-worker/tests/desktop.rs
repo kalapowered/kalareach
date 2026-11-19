@@ -422,12 +422,14 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
             // desktop, and the test says which by asking the platform itself.
             #[cfg(target_os = "macos")]
             assert!(
-                !std::process::Command::new("/bin/launchctl")
-                    .args(["print", &format!("gui/{}", kr_ipc::paths::current_uid())])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .is_ok_and(|status| status.success()),
+                !kr_ipc::testing::account_launchd::command(&[
+                    "print",
+                    &format!("gui/{}", kr_ipc::paths::current_uid())
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success()),
                 "this host has a graphical login domain and no complete desktop identity was read"
             );
             #[cfg(windows)]
@@ -770,8 +772,7 @@ fn a_graphical_job_torn_down_by_the_service_manager_ends_the_processes_in_it() {
     let uid = kr_ipc::paths::current_uid();
     let domain = format!("gui/{uid}");
     assert!(
-        std::process::Command::new("/bin/launchctl")
-            .args(["print", &domain])
+        kr_ipc::testing::account_launchd::command(&["print", &domain])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -794,19 +795,25 @@ fn a_graphical_job_torn_down_by_the_service_manager_ends_the_processes_in_it() {
          </dict></plist>\n"
     );
     std::fs::write(&job, document).expect("writes the job definition");
-    let bootstrap = std::process::Command::new("/bin/launchctl")
-        .args(["bootstrap", &domain, &job.display().to_string()])
-        .output()
-        .expect("runs the service manager");
+    let bootstrap = kr_ipc::testing::account_launchd::command(&[
+        "bootstrap",
+        &domain,
+        &job.display().to_string(),
+    ])
+    .output()
+    .expect("runs the service manager");
     assert!(
         bootstrap.status.success(),
         "the job is bootstrapped into the graphical domain: {}",
         String::from_utf8_lossy(&bootstrap.stderr)
     );
-    let started = std::process::Command::new("/bin/launchctl")
-        .args(["kickstart", "-p", &format!("{domain}/{label}")])
-        .output()
-        .expect("runs the service manager");
+    let started = kr_ipc::testing::account_launchd::command(&[
+        "kickstart",
+        "-p",
+        &format!("{domain}/{label}"),
+    ])
+    .output()
+    .expect("runs the service manager");
     let printed = String::from_utf8_lossy(&started.stdout).into_owned();
     let pid = printed
         .split_whitespace()
@@ -835,10 +842,10 @@ fn a_graphical_job_torn_down_by_the_service_manager_ends_the_processes_in_it() {
 
     // The teardown a logout performs on every job in the graphical domain, performed on this
     // test's own job and no other.
-    let booted_out = std::process::Command::new("/bin/launchctl")
-        .args(["bootout", &format!("{domain}/{label}")])
-        .output()
-        .expect("runs the service manager");
+    let booted_out =
+        kr_ipc::testing::account_launchd::command(&["bootout", &format!("{domain}/{label}")])
+            .output()
+            .expect("runs the service manager");
     assert!(
         booted_out.status.success(),
         "the job is booted out: {}",

@@ -22,7 +22,7 @@ fn the_detect_fixture_for_a_run_that_did_not_ask() {
         "the child has the variable removed"
     );
     let host = kr_ipc::testing::TempHost::create();
-    let chosen = detect(&host.environment(), std::path::Path::new("kr-controller"));
+    let chosen = detect(&host.environment(), std::path::Path::new("daemon"));
     assert_eq!(chosen.describe(), DetachedSupervisor::new().describe());
 }
 
@@ -37,7 +37,7 @@ fn the_detect_fixture_for_a_run_that_asked() {
         "the child has the variable set"
     );
     let host = kr_ipc::testing::TempHost::create();
-    let chosen = detect(&host.environment(), std::path::Path::new("kr-controller"));
+    let chosen = detect(&host.environment(), std::path::Path::new("daemon"));
     assert_eq!(chosen.describe(), LaunchdSupervisor::new().describe());
 }
 

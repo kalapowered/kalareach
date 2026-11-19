@@ -382,8 +382,7 @@ impl Run {
         for label in labels {
             for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
                 let target = format!("{domain}/{label}");
-                let mut print = std::process::Command::new("/bin/launchctl");
-                print.args(["print", &target]);
+                let mut print = kr_ipc::testing::account_launchd::command(&["print", &target]);
                 let answer = output_within(print, SERVICE_MANAGER_BOUND);
                 match answer.as_ref().map(|output| output.status.code()) {
                     // 112 is a domain that is not there and 113 a job the domain does not have.
@@ -410,8 +409,7 @@ impl Run {
         };
         for target in targets {
             let target = target.split(' ').next().unwrap_or_default().to_owned();
-            let mut bootout = std::process::Command::new("/bin/launchctl");
-            bootout.args(["bootout", &target]);
+            let mut bootout = kr_ipc::testing::account_launchd::command(&["bootout", &target]);
             let _ = output_within(bootout, SERVICE_MANAGER_BOUND);
         }
     }

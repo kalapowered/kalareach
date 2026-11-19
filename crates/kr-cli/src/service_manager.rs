@@ -1267,8 +1267,34 @@ mod platform {
     const NOT_LOADED: i32 = 113;
 
     /// launchd is always there; what it needs is the domain, and that is asked when it is chosen.
+    ///
+    /// A build with the `testing` feature refuses where the run did not ask for the account's own
+    /// launchd, before a definition is written: the file is loaded by launchd at the next login.
     pub(super) fn available() -> Result<()> {
+        #[cfg(feature = "testing")]
+        {
+            if !kr_ipc::testing::account_launchd::asked() {
+                return Err(CliError::Usage(Shown::said(
+                    kr_ipc::testing::account_launchd::REFUSAL,
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// What a definition carries of the run's asking for the account's own launchd: under the
+    /// `testing` feature, the variable with the value `1` when the run asked, so that the daemon the
+    /// service starts asks too, and nothing otherwise. No shipped build writes it.
+    #[cfg(feature = "testing")]
+    pub(super) fn asked_entries(asked: bool) -> String {
+        if asked {
+            format!(
+                "\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>{}</key>\n\t\t<string>1</string>\n\t</dict>\n",
+                kr_ipc::testing::account_launchd::VARIABLE
+            )
+        } else {
+            String::new()
+        }
     }
 
     /// The domain the environment's default execution profile implies: the graphical domain for a
@@ -1366,6 +1392,8 @@ mod platform {
         contents.push_str("\t<key>WorkingDirectory</key>\n");
         contents.push_str(&string(working_directory));
         contents.push_str("\t<key>Umask</key>\n\t<integer>63</integer>\n");
+        #[cfg(feature = "testing")]
+        contents.push_str(&asked_entries(kr_ipc::testing::account_launchd::asked()));
         contents.push_str("\t<key>StandardOutPath</key>\n");
         contents.push_str(&string(log));
         contents.push_str("\t<key>StandardErrorPath</key>\n");
@@ -3927,5 +3955,91 @@ mod tests {
             "the runner of a run that did not ask:\n{}",
             child.log
         );
+    }
+
+    /// What a child of the case checks, with the variable removed: a launchd definition carries no
+    /// environment, and a host's startup is refused before a definition is written.
+    #[test]
+    #[ignore = "run by a child of the case with the variable removed"]
+    #[cfg(target_os = "macos")]
+    fn the_definition_fixture_for_a_run_that_did_not_ask() {
+        use kr_ipc::testing::account_launchd::{REFUSAL, VARIABLE};
+
+        assert!(
+            std::env::var_os(VARIABLE).is_none(),
+            "the child has the variable removed"
+        );
+        let written = platform::render(
+            LABEL,
+            Some("gui/501".to_owned()),
+            vec!["/opt/kr/kr-controller".to_owned()],
+            "/state/dir",
+            "/state/log",
+        )
+        .expect("a definition");
+        assert!(
+            !written.contents.contains("EnvironmentVariables")
+                && !written.contents.contains(VARIABLE),
+            "a run that did not ask writes no variable: {}",
+            written.contents
+        );
+        let refusal = platform::available().expect_err("a host's startup is refused");
+        assert!(refusal.to_string().contains(REFUSAL), "{refusal}");
+    }
+
+    /// What a child of the case checks, with the variable set to `1`: the definition carries the
+    /// variable with the value `1`, and the host's startup is not refused.
+    #[test]
+    #[ignore = "run by a child of the case with the variable set"]
+    #[cfg(target_os = "macos")]
+    fn the_definition_fixture_for_a_run_that_asked() {
+        use kr_ipc::testing::account_launchd::VARIABLE;
+
+        let written = platform::render(
+            LABEL,
+            Some("gui/501".to_owned()),
+            vec!["/opt/kr/kr-controller".to_owned()],
+            "/state/dir",
+            "/state/log",
+        )
+        .expect("a definition");
+        let entry = format!(
+            "<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>{VARIABLE}</key>\n\t\t<string>1</string>\n\t</dict>"
+        );
+        assert!(
+            written.contents.contains(&entry),
+            "a run that asked writes the variable: {}",
+            written.contents
+        );
+        platform::available().expect("a host's startup is not refused");
+    }
+
+    /// The job a run writes carries the run's asking, with the value `1`, so that the daemon
+    /// launchd starts asks too, and a run that did not ask writes none and writes no definition of
+    /// a host's startup at all.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_job_the_command_line_writes_carries_the_run_ask_only_when_the_run_asked() {
+        use kr_ipc::testing::account_launchd::run_fixture;
+
+        let without = run_fixture(
+            concat!(
+                module_path!(),
+                "::the_definition_fixture_for_a_run_that_did_not_ask"
+            ),
+            None,
+        );
+        assert!(without.passed, "a run that did not ask:\n{}", without.log);
+        let with = run_fixture(
+            concat!(
+                module_path!(),
+                "::the_definition_fixture_for_a_run_that_asked"
+            ),
+            Some("1"),
+        );
+        assert!(with.passed, "a run that asked:\n{}", with.log);
+        // Only exactly `1` asks, so only that is written.
+        assert_eq!(platform::asked_entries(false), "");
+        assert!(platform::asked_entries(true).contains("<string>1</string>"));
     }
 }

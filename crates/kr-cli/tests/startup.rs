@@ -165,13 +165,14 @@ fn installation() -> &'static Path {
     static PLACED: OnceLock<PathBuf> = OnceLock::new();
     PLACED.get_or_init(|| {
         let (Some(controller), Some(worker)) = (
-            beside_this_test("kr-controller"),
+            beside_this_test("kr-controller-held"),
             beside_this_test("kr-worker"),
         ) else {
             panic!(
-                "the kr-controller and kr-worker executables are not built beside this test, so \
-                 this check cannot run; a workspace test run builds them, and so does \
-                 `cargo build -p kr-controller -p kr-worker`"
+                "the kr-controller-held and kr-worker executables are not built beside this test, \
+                 so this check cannot run; a workspace test run builds them, and so do \
+                 `cargo build -p kr-controller --features testing --bin kr-controller-held` \
+                 and `cargo build -p kr-worker`"
             );
         };
         let directory = support::command_binaries();
@@ -3142,13 +3143,14 @@ fn service_installation() -> &'static Path {
     static PLACED: OnceLock<PathBuf> = OnceLock::new();
     PLACED.get_or_init(|| {
         let (Some(controller), Some(worker)) = (
-            beside_this_test("kr-controller"),
+            beside_this_test("kr-controller-held"),
             beside_this_test("kr-worker"),
         ) else {
             panic!(
-                "the kr-controller and kr-worker executables are not built beside this test, so \
-                 this check cannot run; a workspace test run builds them, and so does \
-                 `cargo build -p kr-controller -p kr-worker`"
+                "the kr-controller-held and kr-worker executables are not built beside this test, \
+                 so this check cannot run; a workspace test run builds them, and so do \
+                 `cargo build -p kr-controller --features testing --bin kr-controller-held` \
+                 and `cargo build -p kr-worker`"
             );
         };
         let directory = support::command_binaries().join("service");
@@ -3299,7 +3301,10 @@ impl ServiceHost {
         #[cfg(target_os = "macos")]
         {
             let asked = std::env::var_os(ALLOW_ACCOUNT_LAUNCHD);
-            match Self::in_launchd(asked.as_deref(), Path::new("/bin/launchctl")) {
+            match Self::in_launchd(
+                asked.as_deref(),
+                Path::new(kr_ipc::testing::account_launchd::LAUNCHCTL),
+            ) {
                 Ok(host) => Some(host),
                 Err(why) => Self::not_here(&why),
             }
@@ -3408,6 +3413,9 @@ impl ServiceHost {
         if let Some(temporary) = std::env::var_os("TMPDIR") {
             command.env("TMPDIR", temporary);
         }
+        // The command writes the service definition and starts the service, and asks for the
+        // account's own launchd only where this run did.
+        kr_ipc::testing::account_launchd::pass_the_ask(&mut command);
         #[cfg(target_os = "linux")]
         command.env("XDG_RUNTIME_DIR", &self.manager.runtime);
         command
@@ -3499,8 +3507,10 @@ impl ServiceHost {
             [format!("gui/{uid}"), format!("user/{uid}")]
                 .into_iter()
                 .find_map(|domain| {
-                    let mut print = Command::new("/bin/launchctl");
-                    print.args(["print", &format!("{domain}/{}", self.label())]);
+                    let mut print = kr_ipc::testing::account_launchd::command(&[
+                        "print",
+                        &format!("{domain}/{}", self.label()),
+                    ]);
                     let printed = bounded(print, STREAMS_DEADLINE).ok()?;
                     String::from_utf8_lossy(&printed.stdout)
                         .lines()
@@ -3593,15 +3603,13 @@ impl ServiceHost {
             for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
                 let target = format!("{domain}/{}", self.label());
                 let loaded = |target: &str| {
-                    let mut print = Command::new("/bin/launchctl");
-                    print.args(["print", target]);
+                    let mut print = kr_ipc::testing::account_launchd::command(&["print", target]);
                     bounded(print, STREAMS_DEADLINE).map(|printed| printed.status.success())
                 };
                 if !loaded(&target)? {
                     continue;
                 }
-                let mut bootout = Command::new("/bin/launchctl");
-                bootout.args(["bootout", &target]);
+                let mut bootout = kr_ipc::testing::account_launchd::command(&["bootout", &target]);
                 let removed = bounded(bootout, TEARDOWN_BOUND)?;
                 // The job goes a moment after `bootout` answers, so it is asked about again until
                 // the bound.
@@ -4039,8 +4047,7 @@ fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_
             .to_owned();
         let target = format!("{domain}/{}", host.label());
         let launchctl = |arguments: &[&str]| {
-            let mut command = Command::new("/bin/launchctl");
-            command.args(arguments);
+            let command = kr_ipc::testing::account_launchd::command(arguments);
             let answer = bounded(command, STREAMS_DEADLINE).expect("launchctl answers");
             assert!(
                 answer.status.success(),
@@ -4109,15 +4116,13 @@ fn a_manager_holding_anything_but_the_definition_kr_wrote_is_not_asked_to_start_
             "the setup names the remedy and leaves it to the person: {message}"
         );
         // Still the other form: the setup did not replace it.
-        let mut print = Command::new("/bin/launchctl");
-        print.args(["print", &target]);
+        let mut print = kr_ipc::testing::account_launchd::command(&["print", &target]);
         let printed = bounded(print, STREAMS_DEADLINE).expect("launchctl answers");
         assert!(
             String::from_utf8_lossy(&printed.stdout).contains("/usr/bin/false"),
             "launchd still holds the other form"
         );
-        let mut bootout = Command::new("/bin/launchctl");
-        bootout.args(["bootout", &target]);
+        let mut bootout = kr_ipc::testing::account_launchd::command(&["bootout", &target]);
         let removed = bounded(bootout, STREAMS_DEADLINE).expect("launchctl answers");
         assert!(removed.status.success(), "the person removes it");
     }
