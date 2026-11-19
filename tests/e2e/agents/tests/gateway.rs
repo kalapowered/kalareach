@@ -7867,9 +7867,23 @@ fn a_turn_the_probes_did_not_leave_is_found_by_its_identity_though_the_totals_ar
         1,
         "the new turn is found by its identity"
     );
-    // A turn that names none counts by occurrence above the baseline's.
+    // A turn that names none has an identity of its place and its bytes.
     std::fs::write(root.join("b.jsonl"), "{\"type\":\"task_started\"}\n").expect("no name");
-    assert_eq!(new_turns(&baseline, &count()), 2);
+    let unnamed = count();
+    assert_eq!(new_turns(&baseline, &unnamed), 2);
+    // Its bytes rewritten, the line is another turn though the total is the same.
+    std::fs::write(
+        root.join("b.jsonl"),
+        "{\"type\":\"task_started\",\"again\":true}\n",
+    )
+    .expect("another line");
+    let rewritten = count();
+    assert_eq!(rewritten.turns, unnamed.turns, "the totals are equal");
+    assert_eq!(
+        new_turns(&unnamed, &rewritten),
+        1,
+        "the rewritten line is found by its identity"
+    );
     // A record that only lost a turn has no new one, and no identity is ever printed.
     let kept = count();
     std::fs::write(root.join("a.jsonl"), format!("{}\n", line(1))).expect("a shorter one");
