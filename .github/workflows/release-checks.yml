@@ -141,3 +141,17 @@ jobs:
           paths: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
+
+  # A host refuses a whole catalogue index that lists a release requesting a capability it does not
+  # know. The plugins pipeline checks each index it builds before it publishes it, and this job
+  # proves that check on indexes of its own.
+  index-capabilities:
+    name: the index check refuses what an older host would refuse
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Test the index check
+        run: python3 -I scripts/check-index-capabilities.py self-test

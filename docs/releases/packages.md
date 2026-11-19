@@ -148,6 +148,13 @@ that lists the release. A host refuses any revision below that constant, held co
 lower value, a host with no copy would take a rolled-back revision that lists no build of the
 release.
 
+### The catalogue index and older hosts
+
+`scripts/check-index-capabilities.py` keeps a release that requests `skill_target.install` out of a
+catalogue index while a supported host release predates the one that adds the capability: the
+plugins pipeline runs its `check` on each index before it publishes it, and `release-checks` runs
+its `self-test`.
+
 ## A level is one surface
 
 A compatibility level is `0.<minor>` below `1.0.0` and the major number from it, and every build at
