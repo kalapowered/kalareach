@@ -777,6 +777,10 @@ fn refusal_of_the_read(error: &kr_voice::VoiceError) -> kr_protocol::voice_host:
 }
 
 impl NoteSupport for ReadAgain<'_> {
+    fn now_ms(&self) -> u64 {
+        self.clock.now_ms()
+    }
+
     fn fresh_summary<'a>(
         &'a self,
         record: &'a DelegationRecord,
@@ -796,7 +800,8 @@ impl NoteSupport for ReadAgain<'_> {
                     kr_protocol::voice::VoiceDelegationOutcome::Performed { summary, .. } => {
                         Ok(summary.clone())
                     }
-                    _ => Err(VoiceHostRefusal::OutsideGrant),
+                    // A write that was not performed has no words of its own to be told again.
+                    _ => Err(VoiceHostRefusal::NotSupportedByRecord),
                 };
             }
             let again = self
@@ -1384,7 +1389,7 @@ mod tests {
                     },
                 ))
                 .await,
-            Err(VoiceHostRefusal::OutsideGrant),
+            Err(VoiceHostRefusal::NotSupportedByRecord),
             "an admitted write is never told as done"
         );
         assert_eq!(asked_so_far(), before);

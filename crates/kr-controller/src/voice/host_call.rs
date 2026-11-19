@@ -107,6 +107,9 @@ impl DelegationRecord {
 /// What a note about a performed delegation needs from outside the call: the summary, read again
 /// under the grants, the history bound and privacy mode as they stand now.
 pub trait NoteSupport: Send + Sync {
+    /// The host's clock now, in milliseconds, which the call's deadline is decided on.
+    fn now_ms(&self) -> u64;
+
     /// Reads the performed delegation's summary again.
     ///
     /// # Errors
@@ -222,7 +225,11 @@ struct CallState {
     news: VecDeque<VoiceNews>,
     dropped_through: u64,
     last_beat_ms: u64,
+    /// Whether the model was told, and the write was accepted, that the phone is silent.
     silent_told: bool,
+    /// Whether the model is owed the note that the phone is back, because it was told the phone
+    /// was silent and the write of the note that it is back was refused by the pace.
+    back_owed: bool,
     delegations: BTreeMap<String, DelegationRecord>,
     told: BTreeMap<Option<String>, Told>,
     call_notes: BTreeSet<VoiceNote>,
@@ -325,6 +332,7 @@ impl HostCalls {
                 dropped_through: 0,
                 last_beat_ms: started_ms,
                 silent_told: false,
+                back_owed: false,
                 delegations: BTreeMap::new(),
                 told: BTreeMap::new(),
                 call_notes: BTreeSet::new(),
@@ -665,31 +673,56 @@ impl HostCall {
 
     /// Runs the phone-absence rules. Returns true when the phone has been silent long enough that
     /// the caller begins closing the call.
+    ///
+    /// A note the call's pace refuses is kept, and written on a later pass: the model is told the
+    /// phone is silent, or back, once the write is accepted and not before.
     async fn tick(&self, now_ms: u64) -> bool {
-        let (silent_for, tell) = {
-            let mut state = self.state();
+        let (silent_for, beat, back, tell) = {
+            let state = self.state();
             if state.ended.is_some() {
                 return false;
             }
             let silent_for = now_ms.saturating_sub(state.last_beat_ms);
             let tell = silent_for >= SILENT_AFTER_MS && !state.silent_told;
-            if tell {
-                state.silent_told = true;
-            }
-            (silent_for, tell)
+            (silent_for, state.last_beat_ms, state.back_owed, tell)
         };
-        if tell {
-            let id = self.next_write_id(None);
-            if let Ok(frame) = VoiceContextFrame::new(
-                id,
-                VoiceCommand::Instructions,
-                None,
-                Some(HostNote::PhoneSilent.words().to_owned()),
-            ) {
-                let _ = self.control.write(self.control.revision(), frame).await;
+        if back {
+            self.tell_that_the_phone_is_back().await;
+        } else if tell && self.write_automatic_note(HostNote::PhoneSilent).await {
+            let mut state = self.state();
+            if state.last_beat_ms == beat {
+                state.silent_told = true;
+            } else {
+                // The phone was heard while the note was being written: the model was told it
+                // is silent and is owed that it is back.
+                state.back_owed = true;
             }
         }
         silent_for >= u64::from(HOST_CLIENT_ABSENT_SECONDS) * 1_000
+    }
+
+    /// Writes one automatic note. Says whether the note is done with: written, or refused for a
+    /// reason a later try would not change. A note the pace refused is not done with.
+    async fn write_automatic_note(&self, note: HostNote) -> bool {
+        let id = self.next_write_id(None);
+        let Ok(frame) = VoiceContextFrame::new(
+            id,
+            VoiceCommand::Instructions,
+            None,
+            Some(note.words().to_owned()),
+        ) else {
+            return true;
+        };
+        !matches!(
+            self.control.write(self.control.revision(), frame).await,
+            Err(WriteRefusal::Rate)
+        )
+    }
+
+    async fn tell_that_the_phone_is_back(&self) {
+        if self.write_automatic_note(HostNote::PhoneBack).await {
+            self.state().back_owed = false;
+        }
     }
 
     fn next_write_id(&self, action_id: Option<ActionId>) -> String {
@@ -706,25 +739,21 @@ impl HostCall {
     }
 
     /// Notes that the next request after a silence is the phone coming back, and tells the model
-    /// once. Every control arm but the heartbeat calls it, as does the heartbeat itself.
+    /// once. Every control arm but the heartbeat calls it, as does the heartbeat itself. A note
+    /// the pace refuses is owed, and written by the next request or the next pass of the tick; it
+    /// never waits inside a request's answer.
     pub async fn phone_is_back(&self, now_ms: u64) {
-        let was_silent = {
+        let owed = {
             let mut state = self.state();
-            let was = state.silent_told;
-            state.silent_told = false;
-            state.last_beat_ms = now_ms;
-            was
-        };
-        if was_silent {
-            let id = self.next_write_id(None);
-            if let Ok(frame) = VoiceContextFrame::new(
-                id,
-                VoiceCommand::Instructions,
-                None,
-                Some(HostNote::PhoneBack.words().to_owned()),
-            ) {
-                let _ = self.control.write(self.control.revision(), frame).await;
+            if state.silent_told {
+                state.silent_told = false;
+                state.back_owed = true;
             }
+            state.last_beat_ms = now_ms;
+            state.back_owed
+        };
+        if owed {
+            self.tell_that_the_phone_is_back().await;
         }
     }
 
@@ -899,7 +928,9 @@ impl HostCall {
             if let Err(reason) = support.allowed_now(record).await {
                 return refused(reason);
             }
-            match self.writable(now_ms) {
+            // Asked again at the time it is now, not the time the note came: the read and the
+            // check before this each waited.
+            match self.writable(support.now_ms()) {
                 Ok(current) if current == revision => {}
                 Ok(_) => return refused(VoiceHostRefusal::NotReady),
                 Err(reason) => return refused(reason),
@@ -1151,7 +1182,21 @@ impl HostCall {
                 break;
             }
             let id = self.next_write_id(None);
-            self.state().acks.insert(id.clone(), Ack::Waiting);
+            {
+                // The append counts as written from the step that may write it, in the lock that
+                // makes it wait for its answer: the provider's closure can be read and the call
+                // ended before this task has the write's result back, and the final status then
+                // still counts it.
+                let mut state = self.state();
+                state.acks.insert(id.clone(), Ack::Waiting);
+                if let Some(send) = state
+                    .sending
+                    .as_mut()
+                    .filter(|send| send.action_id == action_id)
+                {
+                    send.in_flight = true;
+                }
+            }
             let written = match VoiceContextFrame::new(
                 id.clone(),
                 VoiceCommand::Thinking,
@@ -1162,7 +1207,18 @@ impl HostCall {
                 Err(_) => Err(WriteRefusal::Lost),
             };
             if let Err(refusal) = written {
-                self.state().acks.remove(&id);
+                {
+                    let mut state = self.state();
+                    state.acks.remove(&id);
+                    // Refused before it was written: it is not an append left unanswered.
+                    if let Some(send) = state
+                        .sending
+                        .as_mut()
+                        .filter(|send| send.action_id == action_id)
+                    {
+                        send.in_flight = false;
+                    }
+                }
                 stopped = Some(match refusal {
                     // Another command of the call took the pace first: the append waits for it
                     // again, and everything that allows it is looked at again.
@@ -1175,14 +1231,6 @@ impl HostCall {
                     }
                 });
                 break;
-            }
-            if let Some(send) = self
-                .state()
-                .sending
-                .as_mut()
-                .filter(|send| send.action_id == action_id)
-            {
-                send.in_flight = true;
             }
             next += 1;
             let answer = self.acknowledged(&id, revision, &*support).await;
@@ -1295,6 +1343,11 @@ mod tests {
         listener: Mutex<Option<HostCallListener>>,
         revision: AtomicU64,
         refuses: std::sync::atomic::AtomicBool,
+        /// Whether the provider's closure is read as soon as a write is taken, before the write's
+        /// caller has its result.
+        closes_with_the_write: std::sync::atomic::AtomicBool,
+        /// Whether every write is refused by the call's pace.
+        rate_refuses: std::sync::atomic::AtomicBool,
         pacer: Mutex<Pacer>,
     }
 
@@ -1310,6 +1363,8 @@ mod tests {
                 listener: Mutex::new(None),
                 revision: AtomicU64::new(1),
                 refuses: std::sync::atomic::AtomicBool::new(false),
+                closes_with_the_write: std::sync::atomic::AtomicBool::new(false),
+                rate_refuses: std::sync::atomic::AtomicBool::new(false),
                 pacer: Mutex::new(Pacer::new(timings.burst_window, timings.minute_window)),
             })
         }
@@ -1385,7 +1440,7 @@ mod tests {
                 if self.refuses.load(Ordering::SeqCst) {
                     return Err(WriteRefusal::ProviderRefused);
                 }
-                if self.next_write_at().is_some() {
+                if self.rate_refuses.load(Ordering::SeqCst) || self.next_write_at().is_some() {
                     return Err(WriteRefusal::Rate);
                 }
                 self.pacer
@@ -1398,6 +1453,12 @@ mod tests {
                     frame.delegation_id.clone(),
                     frame.content.clone(),
                 ));
+                if self.closes_with_the_write.load(Ordering::SeqCst) {
+                    self.set(SidebandState::Closed(SidebandEnd::ProviderClosed));
+                    self.tell(HostCallEvent::State(SidebandState::Closed(
+                        SidebandEnd::ProviderClosed,
+                    )));
+                }
                 Ok(())
             })
         }
@@ -1434,6 +1495,10 @@ mod tests {
     struct Reads(Result<String, VoiceHostRefusal>);
 
     impl NoteSupport for Reads {
+        fn now_ms(&self) -> u64 {
+            OPENED + 1_000
+        }
+
         fn fresh_summary<'a>(
             &'a self,
             _record: &'a DelegationRecord,
@@ -1450,11 +1515,38 @@ mod tests {
         }
     }
 
+    /// A read that passes and ends after the call's deadline.
+    struct ReadsPastTheDeadline;
+
+    impl NoteSupport for ReadsPastTheDeadline {
+        fn now_ms(&self) -> u64 {
+            CLOSES + 1
+        }
+
+        fn fresh_summary<'a>(
+            &'a self,
+            _record: &'a DelegationRecord,
+        ) -> HostFuture<'a, Result<String, VoiceHostRefusal>> {
+            Box::pin(async { Ok("fresh".to_owned()) })
+        }
+
+        fn allowed_now<'a>(
+            &'a self,
+            _record: &'a DelegationRecord,
+        ) -> HostFuture<'a, Result<(), VoiceHostRefusal>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     /// A read that passes, and a check just before the write that does not: a grant, the history
     /// bound or privacy mode moved in between.
     struct MovesBeforeTheWrite(VoiceHostRefusal);
 
     impl NoteSupport for MovesBeforeTheWrite {
+        fn now_ms(&self) -> u64 {
+            OPENED + 1_000
+        }
+
         fn fresh_summary<'a>(
             &'a self,
             _record: &'a DelegationRecord,
@@ -1786,6 +1878,31 @@ mod tests {
             SidebandEnd::ProviderClosed,
         )));
         settle().await;
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 0,
+                of: 3,
+                unconfirmed: 1,
+                state: VoiceContextState::Stopped {
+                    stopped_by: stop_of(VoiceEndReason::ProviderClosed)
+                }
+            }]
+        );
+    }
+
+    /// The provider's closure can be read before the sender has the result of the write it took:
+    /// the append is counted all the same, in the one final status.
+    #[tokio::test(start_paused = true)]
+    async fn an_append_whose_closure_is_read_before_its_write_returns_is_counted_unconfirmed() {
+        let (calls, call, sideband) = held();
+        sideband.closes_with_the_write.store(true, Ordering::SeqCst);
+        let _ = call
+            .send_context(action(5), send_params(), Support::of(2), OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(sideband.written().len(), 1);
         assert_eq!(
             context_news(&calls),
             [VoiceNewsItem::Context {
@@ -2429,6 +2546,82 @@ mod tests {
                 VoiceControlResult::Admitted { .. }
             ));
         }
+    }
+
+    /// The call's deadline is read when the write is about to go, not when the note came: a read
+    /// that ends after the deadline writes nothing.
+    #[tokio::test]
+    async fn a_performed_note_whose_read_ends_after_the_calls_deadline_is_not_written() {
+        let (_calls, call, sideband) = held();
+        sideband.hear("d1", 100);
+        recorded(&call, "d1", performed("old summary"));
+        assert_eq!(
+            call.note(
+                action(1),
+                VoiceNote::DelegationPerformed,
+                Some("d1"),
+                &ReadsPastTheDeadline,
+                5_000
+            )
+            .await,
+            VoiceControlResult::Refused {
+                reason: VoiceHostRefusal::Closing
+            }
+        );
+        assert!(sideband.written().is_empty());
+    }
+
+    /// The pace refuses the note that the phone is silent: it is kept, written on a later pass
+    /// once the pace allows it, and told once.
+    #[tokio::test]
+    async fn a_silent_note_the_pace_refuses_is_kept_and_written_once_the_pace_allows_it() {
+        let (calls, _call, sideband) = held();
+        sideband.rate_refuses.store(true, Ordering::SeqCst);
+        assert!(calls.tick(OPENED + 45_000).await.is_empty());
+        assert!(sideband.written().is_empty(), "the pace refused the note");
+        sideband.rate_refuses.store(false, Ordering::SeqCst);
+        assert!(calls.tick(OPENED + 50_000).await.is_empty());
+        let written = sideband.written();
+        assert_eq!(
+            written.len(),
+            1,
+            "the kept note is written on the next pass"
+        );
+        assert_eq!(written[0].2.as_deref(), Some(HostNote::PhoneSilent.words()));
+        assert!(calls.tick(OPENED + 55_000).await.is_empty());
+        assert_eq!(sideband.written().len(), 1, "told once");
+    }
+
+    /// The pace refuses the note that the phone is back: it is owed, and the next request or the
+    /// next pass of the tick writes it, once.
+    #[tokio::test]
+    async fn a_back_note_the_pace_refuses_is_owed_and_written_by_the_next_request_or_pass_once() {
+        let owed_then_paid = |by_the_tick: bool| async move {
+            let (calls, call, sideband) = held();
+            assert!(calls.tick(OPENED + 45_000).await.is_empty());
+            assert_eq!(sideband.written().len(), 1, "the silent note");
+            sideband.rate_refuses.store(true, Ordering::SeqCst);
+            call.phone_is_back(OPENED + 70_000).await;
+            assert_eq!(
+                sideband.written().len(),
+                1,
+                "the pace refused the back note"
+            );
+            sideband.rate_refuses.store(false, Ordering::SeqCst);
+            if by_the_tick {
+                assert!(calls.tick(OPENED + 75_000).await.is_empty());
+            } else {
+                call.phone_is_back(OPENED + 71_000).await;
+            }
+            let written = sideband.written();
+            assert_eq!(written.len(), 2);
+            assert_eq!(written[1].2.as_deref(), Some(HostNote::PhoneBack.words()));
+            call.phone_is_back(OPENED + 76_000).await;
+            assert!(calls.tick(OPENED + 77_000).await.is_empty());
+            assert_eq!(sideband.written().len(), 2, "told once");
+        };
+        owed_then_paid(false).await;
+        owed_then_paid(true).await;
     }
 
     #[tokio::test]
