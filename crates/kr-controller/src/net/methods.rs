@@ -340,21 +340,13 @@ impl Controller {
                 if !caller.may_confirm(&params.subject) {
                     return Err(caller.refusal_to_confirm());
                 }
-                // The caller's scope is read again where the admission is asked, inside the
-                // transaction that records the request: the lease the door found can end in the
-                // waits before it, and the refusal is the door's own.
+                // The caller's scope is read again by the request itself, before the record's lock
+                // is taken ([`OwnerAuthority::request`]); the admission is asked inside the record.
+                #[cfg(feature = "testing")]
                 let admission: Admission = {
-                    let caller = caller.clone();
-                    let subject = params.subject.clone();
-                    #[cfg(feature = "testing")]
                     let controller = Arc::clone(self);
                     Arc::new(move || {
-                        #[cfg(feature = "testing")]
                         controller.inside_the_record_of_a_confirmation.wait();
-                        let now = caller.decided_now();
-                        if !now.may_confirm(&subject) {
-                            return Err(now.refusal_to_confirm());
-                        }
                         admission()
                     })
                 };
