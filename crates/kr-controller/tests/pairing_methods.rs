@@ -31,7 +31,9 @@ use kr_protocol::pairing::{
     ConfirmationChannel, INVITATION_LIFETIME_MS, PairStatus, PairingConsumedReason, ProposedGrant,
     SensitiveAction,
 };
-use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
+use kr_protocol::preauth::{
+    PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
+};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable};
 use kr_protocol::sharing::DeviceRevokeParams;
@@ -2034,7 +2036,7 @@ async fn status_on(
 /// KR-REQ-10.37: a committed result is told only on the connection that proved the candidate. A
 /// second connection of the same endpoint, opened before the commit and told that the owner has not
 /// decided, is refused once the pairing is committed; the connection that proved the candidate is
-/// told what it became. A connection of another endpoint is refused too.
+/// told what it became.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_connection_of_the_candidate_is_not_told_it_is_committed() {
     let owner_keys = keys();
@@ -2084,6 +2086,78 @@ async fn a_second_connection_of_the_candidate_is_not_told_it_is_committed() {
     }
     proving.close(0u32.into(), b"done");
     other_connection.close(0u32.into(), b"done");
+    host.stop().await;
+}
+
+/// KR-REQ-10.37: a second connection of the candidate's endpoint that repeats the redemption with
+/// the proof of the first is given the locked candidate again and told that the owner has not
+/// decided; the connection that first proved the candidate keeps the proof. Once the owner approves,
+/// the second connection is refused and the first is told what the device became.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_connection_that_repeats_the_redemption_is_refused_once_the_owner_approves() {
+    let owner_keys = keys();
+    let host = Host::start(&owner_keys).await;
+    let environment = host.environment_id;
+    let owner = Signer::OwnerDevice(&owner_keys);
+    let mut client = host.client().await;
+    let invited = calls::invite_direct(
+        environment,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &viewer(),
+        &owner,
+    )
+    .await
+    .expect("an invitation");
+    let device = Device::create().await;
+    let (proving, mut proved, value, proof) =
+        calls::redeem_keeping_proof(&device.candidate(), &invited).await;
+    let (repeating, mut repeated) = open_unpaired(&host, &device).await;
+    let again = repeated
+        .call::<_, PairRedeemResult>(
+            Method::PairRedeem,
+            &PairRedeemParams::Direct(Box::new(proof)),
+        )
+        .await;
+    match again {
+        Ok(PairRedeemResult::Locked {
+            verification_value, ..
+        }) => assert_eq!(
+            verification_value, value,
+            "the repeated redemption is given the same candidate"
+        ),
+        other => panic!("the repeated redemption is given the locked candidate, not {other:?}"),
+    }
+    let waiting = status_on(&mut repeated, invited.invitation_id)
+        .await
+        .expect("the host answers the repeating connection before the commit");
+    assert!(
+        matches!(waiting.status, PairStatus::AwaitingApproval { .. }),
+        "{:?}",
+        waiting.status
+    );
+
+    let confirmed =
+        calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
+            .await
+            .expect("the owner approves");
+    match status_on(&mut repeated, invited.invitation_id).await {
+        Err(kr_transport::error::TransportError::Refused(error)) => {
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+        other => panic!("the repeating connection is refused, not {other:?}"),
+    }
+    let told = match status_on(&mut proved, invited.invitation_id).await {
+        Ok(told) => told,
+        refused => panic!("the proving connection is answered, not {refused:?}"),
+    };
+    assert!(
+        matches!(told.status, PairStatus::Committed { device_id, .. } if device_id == confirmed.device_id),
+        "{:?}",
+        told.status
+    );
+    proving.close(0u32.into(), b"done");
+    repeating.close(0u32.into(), b"done");
     host.stop().await;
 }
 
