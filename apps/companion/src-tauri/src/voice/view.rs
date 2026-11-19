@@ -166,7 +166,7 @@ impl VoiceCallState {
     ///
     /// The entries of the starts this device sent are the one exception to "not dropped": none is
     /// shown for ever. A hidden one is dropped, oldest first, when one host has more than
-    /// [`MAX_HIDDEN_STARTS`] of them, and no shown notice is ever dropped to make room.
+    /// `MAX_HIDDEN_STARTS` of them, and no shown notice is ever dropped to make room.
     pub fn owe(&mut self, now_ms: u64, owed: OwedView) {
         self.owed.retain(|each| each.until_ms > now_ms);
         let host = owed.host;
@@ -177,7 +177,7 @@ impl VoiceCallState {
         }
     }
 
-    /// Keeps at most [`MAX_HIDDEN_STARTS`] hidden start entries for `host`, dropping the oldest.
+    /// Keeps at most `MAX_HIDDEN_STARTS` hidden start entries for `host`, dropping the oldest.
     pub fn cap_hidden_starts(&mut self, host: Option<(DeviceId, EnvironmentId)>) {
         while self
             .owed

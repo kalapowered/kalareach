@@ -121,12 +121,22 @@ pub const RELAY_LEASE_REVOKE_PATH: &str = "/api/relay/lease/revoke";
 ///
 /// A request that is held past it is not sent: the caller asked for it to go out within a limit,
 /// and a late request could be one the caller no longer accounts for.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SendGate {
     /// The first instant at which the request is no longer sent.
     pub by: ContinuousInstant,
     /// The clock `by` is read on. It is the clock the caller took `by` from, so the two compare.
     pub clock: Arc<dyn ContinuousClock>,
+}
+
+impl std::fmt::Debug for SendGate {
+    /// Prints the limit and nothing else: the clock is a trait object, and a trait object prints
+    /// whatever its implementation chooses to show.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendGate")
+            .field("by", &self.by)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SendGate {
