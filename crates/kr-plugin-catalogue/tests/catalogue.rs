@@ -2952,13 +2952,11 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_never_reaches_a_statement() {
 /// table declares one, and the label's own key is not refused for want of a declared area.
 #[tokio::test]
 async fn kr_req_11_44_a_key_that_is_not_the_labels_is_refused_where_no_placement_is_declared() {
-    let control = placed_statement_edited("claude-code", |_| {}, |_| {}, false)
-        .await
-        .expect("the undamaged release is read")
-        .expect("a statement");
+    let control = placed_statement_edited("claude-code", |_| {}, |_| {}, false).await;
     assert!(
-        !control.contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL),
-        "the control declares no placement and gets no reading of one: {control}"
+        matches!(&control, Ok(Some(text))
+            if !text.contains(kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL)),
+        "the control declares no placement and gets no reading of one: {control:?}"
     );
     let integration = format!(
         "x {} Runs nothing.",
@@ -3015,10 +3013,11 @@ async fn kr_req_11_44_a_key_that_is_not_the_labels_is_refused_where_no_table_is_
         false,
         claude("enabledPlugins.kalareach-example@skills-dir"),
     )
-    .await
-    .expect("the label's own key is read")
-    .expect("a statement");
-    assert!(own.contains(words), "the control: {own}");
+    .await;
+    assert!(
+        matches!(&own, Ok(Some(text)) if text.contains(words)),
+        "the label's own key is read: {own:?}"
+    );
 
     let other = statement_of_edited(words, false, claude("enabledPlugins.other@skills-dir")).await;
     assert!(
