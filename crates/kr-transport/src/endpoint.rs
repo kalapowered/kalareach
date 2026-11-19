@@ -346,6 +346,7 @@ struct CloserParts {
 }
 
 struct CloserInner {
+    #[cfg(any(test, feature = "testing"))]
     front_address: Option<std::net::SocketAddr>,
     #[cfg(any(test, feature = "testing"))]
     front_probe: Option<crate::front::FrontProbe>,
@@ -389,6 +390,7 @@ impl EndpointCloser {
     fn of(parts: CloserParts) -> Self {
         let (done, _) = tokio::sync::watch::channel(false);
         Self(std::sync::Arc::new(CloserInner {
+            #[cfg(any(test, feature = "testing"))]
             front_address: parts.front.as_ref().map(RelayFront::address),
             #[cfg(any(test, feature = "testing"))]
             front_probe: parts.front.as_ref().map(RelayFront::probe),
