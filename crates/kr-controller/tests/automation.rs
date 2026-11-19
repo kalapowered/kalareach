@@ -9454,6 +9454,29 @@ fn writes_report(path: &str, lines: &[&str], status: u8) -> String {
     )
 }
 
+/// A suite command that writes a line that holds a quote and a space writes it as it is: the shell
+/// that reads the command gets each line as one word.
+#[test]
+fn a_suite_command_writes_a_report_line_that_holds_a_quote_and_a_space() {
+    let temp = teardown::Tree::create();
+    let command = writes_report(
+        "reports/junit.xml",
+        &["<a name=\"it's a name\"/>", "a second line"],
+        3,
+    );
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", &command])
+        .current_dir(temp.root())
+        .output()
+        .expect("a shell");
+    assert_eq!(output.status.code(), Some(3), "{command}: {output:?}");
+    assert_eq!(
+        std::fs::read_to_string(temp.root().join("reports/junit.xml"))
+            .expect("the command wrote its report"),
+        "<a name=\"it's a name\"/>\na second line\n"
+    );
+}
+
 /// The three-case JUnit report the cases below read: one failed, one skipped, one passed.
 const A_JUNIT_REPORT: [&str; 7] = [
     "<testsuites>",
