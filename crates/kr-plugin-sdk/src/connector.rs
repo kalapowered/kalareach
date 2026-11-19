@@ -21,6 +21,10 @@
 //! where the decision goes and the upstream's own value for each decision. An answer is then
 //! written from the table alone, by [`ConnectorManifest::answer`], and carries nothing a caller
 //! typed.
+//!
+//! An event the host sends to the application, a message with no identifier, is written by
+//! [`ConnectorManifest::event`] with the same writer: the table places the routed method, and the
+//! caller supplies only the places and values of its own members.
 
 use kr_protocol::scalars::Nullable;
 
@@ -614,6 +618,23 @@ pub enum AnswerError {
     },
 }
 
+/// Why an event could not be written.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum EventError {
+    /// The table does not route the method from the host to the application.
+    #[error("{method} is not routed from the host to the application")]
+    NotRouted {
+        /// The method that was asked for.
+        method: MethodName,
+    },
+    /// The table cannot write this event.
+    #[error("the connector table cannot write this event: {detail}")]
+    Unwritable {
+        /// What stopped it.
+        detail: String,
+    },
+}
+
 /// The connector manifest.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -785,65 +806,111 @@ impl ConnectorManifest {
             return Err(AnswerError::RequestId);
         }
         let route = self
-            .routes
-            .iter()
-            .find(|route| route.method == destination.method)
-            .filter(|route| route.direction != RouteDirection::UpstreamToHost)
+            .route_toward_application(&destination.method)
             .ok_or_else(|| AnswerError::Unwritable {
                 detail: format!(
                     "{} is not routed from the host to the application",
                     destination.method
                 ),
             })?;
+        let unwritable = |detail| AnswerError::Unwritable { detail };
         let mut answer = serde_json::Value::Object(serde_json::Map::new());
         write_member(
             &mut answer,
             &self.method_path,
             serde_json::Value::String(route.wire_name.clone()),
-        )?;
+        )
+        .map_err(unwritable)?;
         write_member(
             &mut answer,
             &destination.request_id_path,
             request_id.clone(),
-        )?;
+        )
+        .map_err(unwritable)?;
         write_member(
             &mut answer,
             &destination.decision_path,
             serde_json::Value::String(value.to_owned()),
-        )?;
+        )
+        .map_err(unwritable)?;
         Ok(answer)
+    }
+
+    /// Writes one event the host sends to the application.
+    ///
+    /// An event is a message with no identifier and no reply: the table's method path carries the
+    /// routed method as the wire spells it, and each member goes at its own path with its value as
+    /// given. Nothing else goes in. The method must be one the table routes from the host to the
+    /// application, and a member cannot take the place of the method or of another member, so the
+    /// event is the table's own method with the values the caller supplied.
+    ///
+    /// The paths are the table's and the package's to state, so a caller that has them in hand can
+    /// learn whether the table can write its event by writing it once with empty values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventError::NotRouted`] when the table does not route the method from the host to
+    /// the application, and [`EventError::Unwritable`] for a member the table cannot write: a path
+    /// with no segments or an index segment, a place that is written twice, a place inside a value
+    /// that is already written, and the place of the method.
+    pub fn event(
+        &self,
+        method: &MethodName,
+        members: &[(&FieldPath, serde_json::Value)],
+    ) -> Result<serde_json::Value, EventError> {
+        let route = self
+            .route_toward_application(method)
+            .ok_or_else(|| EventError::NotRouted {
+                method: method.clone(),
+            })?;
+        let unwritable = |detail| EventError::Unwritable { detail };
+        let mut event = serde_json::Value::Object(serde_json::Map::new());
+        write_member(
+            &mut event,
+            &self.method_path,
+            serde_json::Value::String(route.wire_name.clone()),
+        )
+        .map_err(unwritable)?;
+        for (path, value) in members {
+            write_member(&mut event, path, value.clone()).map_err(unwritable)?;
+        }
+        Ok(event)
+    }
+
+    /// Returns the route of a method that the host may send to the application.
+    fn route_toward_application(&self, method: &MethodName) -> Option<&Route> {
+        self.routes
+            .iter()
+            .find(|route| route.method == *method)
+            .filter(|route| route.direction != RouteDirection::UpstreamToHost)
     }
 }
 
 /// Writes one value at a path of member names, building the objects on the way.
 ///
-/// A path that reaches a value already written, or that names an array element, is refused: an
-/// answer is built from nothing, so an index would leave the other elements to be invented, and a
-/// second write to one place would leave the first value unsent.
+/// A path that reaches a value already written, or that names an array element, is refused: a
+/// message is built from nothing, so an index would leave the other elements to be invented, and a
+/// second write to one place would leave the first value unsent. The error is what stopped it.
 fn write_member(
     root: &mut serde_json::Value,
     path: &FieldPath,
     value: serde_json::Value,
-) -> Result<(), AnswerError> {
+) -> Result<(), String> {
     let Some((last, parents)) = path.segments.split_last() else {
-        return Err(AnswerError::Unwritable {
-            detail: "a field path with no segments names nothing".to_owned(),
-        });
+        return Err("a field path with no segments names nothing".to_owned());
     };
     let member = |segment: &FieldSegment| match segment {
         FieldSegment::Member { name } => Ok(name.clone()),
-        FieldSegment::Index { index } => Err(AnswerError::Unwritable {
-            detail: format!("an answer is built from members, and the path names element {index}"),
-        }),
+        FieldSegment::Index { index } => Err(format!(
+            "a message is built from members, and the path names element {index}"
+        )),
     };
     let mut current = root;
     for segment in parents {
         let name = member(segment)?;
         let object = current
             .as_object_mut()
-            .ok_or_else(|| AnswerError::Unwritable {
-                detail: format!("{name} is inside a value the answer already holds"),
-            })?;
+            .ok_or_else(|| format!("{name} is inside a value the message already holds"))?;
         current = object
             .entry(name)
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -851,13 +918,9 @@ fn write_member(
     let name = member(last)?;
     let object = current
         .as_object_mut()
-        .ok_or_else(|| AnswerError::Unwritable {
-            detail: format!("{name} is inside a value the answer already holds"),
-        })?;
+        .ok_or_else(|| format!("{name} is inside a value the message already holds"))?;
     if object.contains_key(&name) {
-        return Err(AnswerError::Unwritable {
-            detail: format!("two paths write {name}"),
-        });
+        return Err(format!("two paths write {name}"));
     }
     object.insert(name, value);
     Ok(())
