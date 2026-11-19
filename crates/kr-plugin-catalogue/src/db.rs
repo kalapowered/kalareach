@@ -244,7 +244,7 @@ impl Db {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|source| failed(&db.path, &source))?;
         #[cfg(test)]
-        open_pause::run(&db.path);
+        crate::open_pause::run(&db.path);
         if !(OLDEST_SCHEMA_VERSION..=SCHEMA_VERSION).contains(&recorded) {
             return Err(CatalogueError::StorageUnavailable {
                 detail: format!(
@@ -1997,31 +1997,6 @@ fn capabilities_from(text: &str) -> CatalogueResult<Vec<PluginCapability>> {
         .collect()
 }
 
-/// What the unit tests run inside [`Db::open`], after it has read the format and before it checks
-/// it, to reach an open that another connection races.
-#[cfg(test)]
-pub(crate) mod open_pause {
-    use std::cell::RefCell;
-    use std::path::Path;
-
-    type Then = Box<dyn FnOnce(&Path)>;
-
-    thread_local! {
-        static AFTER_READ: RefCell<Option<Then>> = const { RefCell::new(None) };
-    }
-
-    /// Runs `then` once, the next time an open on this thread has read the format.
-    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
-        AFTER_READ.with(|after| *after.borrow_mut() = Some(Box::new(then)));
-    }
-
-    pub(crate) fn run(database: &Path) {
-        if let Some(then) = AFTER_READ.with(|after| after.borrow_mut().take()) {
-            then(database);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2125,7 +2100,7 @@ mod tests {
 
         let raised = std::rc::Rc::new(std::cell::RefCell::new(None));
         let raising = std::rc::Rc::clone(&raised);
-        open_pause::once(move |database| {
+        crate::open_pause::once(move |database| {
             let other = Connection::open(database).expect("a second connection");
             // No wait: a lock held by the open is a refusal here, not a pause.
             other
