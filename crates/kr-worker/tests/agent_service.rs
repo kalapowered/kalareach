@@ -4640,6 +4640,94 @@ async fn kr_req_11_47_a_forwarded_action_needs_the_rights_of_its_class() {
     );
 }
 
+/// KR-REQ-23.30, KR-REQ-23.24 and KR-REQ-11.27: a plugin action whose outcome is uncertain holds
+/// back no other plugin action of the same actor on the same session. The package's answer action
+/// carries an approval's decision, and each approval is its own question put to the person: the
+/// uncertain answer to one is not the earlier outcome a later answer to another has to show.
+///
+/// Not shown here: the answers one subject keeps together, which have to name the uncertain one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_uncertain_plugin_answer_to_one_approval_does_not_hold_back_the_plugin_answer_to_another()
+ {
+    let host = host().await;
+    // The transport takes the first answer and never says what came of it. It carries every later
+    // one at once.
+    let (_never, waiting) = tokio::sync::oneshot::channel::<()>();
+    let upstream = Arc::new(WaitingUpstream {
+        release: std::sync::Mutex::new(Some(waiting)),
+        carried: std::sync::atomic::AtomicUsize::new(0),
+    });
+    register(&host, None);
+    let first = offer_approval(&host, Arc::clone(&upstream));
+    let second = offer_another(&host, 12);
+    register_class_actions(&host);
+    let mut client = cli(&host).await;
+    let window = client.action_window().action_window_id.clone();
+    let decision = br#"{"decision":"allow"}"#.as_slice();
+
+    let lost = plugin_invocation(
+        &host,
+        300,
+        window.clone(),
+        "request.answer",
+        Nullable::some(first),
+        decision,
+    );
+    let lost_id = lost.action_id;
+    let deadline = kr_worker::service::UPSTREAM_SUBMIT_DEADLINE;
+    let outcome = tokio::time::timeout(
+        deadline + std::time::Duration::from_secs(30),
+        send(&mut client, lost),
+    )
+    .await
+    .expect("the caller is answered at the deadline");
+    let Outcome::Error(error) = outcome else {
+        panic!("an answer nobody acknowledged is not applied: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut client, lost_id).await.state,
+        ReceiptState::Unknown
+    );
+    assert_eq!(
+        state_of(&host, first),
+        kr_protocol::gateway::PendingState::Uncertain
+    );
+    assert_eq!(
+        state_of(&host, second),
+        kr_protocol::gateway::PendingState::Pending,
+        "the other approval is still waiting for its answer"
+    );
+
+    let answer = plugin_invocation(
+        &host,
+        301,
+        window,
+        "request.answer",
+        Nullable::some(second),
+        decision,
+    );
+    let answer_id = answer.action_id;
+    let outcome = send(&mut client, answer).await;
+    assert!(
+        matches!(outcome, Outcome::Ok(_)),
+        "an uncertain plugin answer to one approval stands in the way of the plugin answer to another: {outcome:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, answer_id).await.state,
+        ReceiptState::Applied
+    );
+    assert_eq!(
+        state_of(&host, second),
+        kr_protocol::gateway::PendingState::Resolved
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "both answers went to the transport"
+    );
+}
+
 /// The action a package declares to cancel the running turn, which the host carries out itself.
 fn cancel_declaration() -> kr_plugin_sdk::effect::ActionDeclaration {
     serde_json::from_value(serde_json::json!({
