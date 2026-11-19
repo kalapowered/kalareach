@@ -1384,6 +1384,13 @@ impl Controller {
     /// word before it rose commits after it, and the wait of [`Self::move_a_feed_refusal`] is what
     /// orders those. A lift needs no order. Nothing is taken when the word already says what is
     /// asked.
+    ///
+    /// A raise only tries the policy's lock once it holds the hold: whoever holds the policy's lock
+    /// may be waiting for the device directory, which a commit that stands on a registration holds
+    /// while it waits for this hold to be let go of, so a raise that waited for the policy's lock
+    /// with the hold taken would wait for a cycle. Where the lock is held, the raise lets go of
+    /// the hold and the registry's guard, waits for the policy's lock holding neither, and begins
+    /// again with the word and the flag asked again. Nothing is changed before every guard is held.
     async fn put_a_feed_refusal(
         &self,
         bit: u8,
@@ -1392,37 +1399,77 @@ impl Controller {
         set: fn(&mut crate::grants::HostPolicy, bool),
     ) -> bool {
         let stands = |word: u8| word & bit != 0;
-        if stands(self.feed_refusal.word()) == raised {
-            return false;
-        }
-        let registry = if raised {
-            Some(self.registry.lock().await)
-        } else {
-            None
-        };
-        // The wait for a commit that stands on a registration is made before the policy's lock is
-        // taken, so that what needs the policy does not wait for it.
-        let hold = raised.then(|| self.withdraw_hold());
-        {
-            let mut policy = self
-                .policy
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if flag(&policy) == raised {
-                // Letting go of the hold withdraws the connections that ended while it was held.
+        loop {
+            if stands(self.feed_refusal.word()) == raised {
                 return false;
             }
-            let _table = hold.map(|hold| self.withdrawing(hold));
-            set(&mut policy, raised);
-            if raised {
-                self.feed_refusal.raise(bit);
+            let registry = if raised {
+                Some(self.registry.lock().await)
             } else {
-                self.feed_refusal.lower(bit);
+                None
+            };
+            // The wait for a commit that stands on a registration is made before the policy's lock
+            // is taken, so that what needs the policy does not wait for it.
+            let hold = raised.then(|| self.withdraw_hold());
+            #[cfg(feature = "testing")]
+            self.after_the_hold_of_a_feed_refusal.wait();
+            match self.change_a_feed_refusal(raised, flag, set, bit, hold) {
+                Some(changed) => {
+                    drop(registry);
+                    if changed {
+                        self.advance_authority_epoch();
+                    }
+                    return changed;
+                }
+                None => {
+                    drop(registry);
+                    // Holding no guard of this raise: whatever holds the policy's lock can go on.
+                    drop(
+                        self.policy
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    );
+                }
             }
         }
-        drop(registry);
-        self.advance_authority_epoch();
-        true
+    }
+
+    /// The change [`Self::put_a_feed_refusal`] makes under the policy's lock, with the registry's
+    /// guard held by its caller and `hold` taken for a raise. A raise takes the policy's lock only
+    /// where it is free, and says `None`, having let go of `hold`, where it is not; a lift waits
+    /// for the lock, holding nothing. Says whether it changed anything.
+    fn change_a_feed_refusal(
+        &self,
+        raised: bool,
+        flag: fn(&crate::grants::HostPolicy) -> bool,
+        set: fn(&mut crate::grants::HostPolicy, bool),
+        bit: u8,
+        hold: Option<super::admission::WithdrawHold<'_>>,
+    ) -> Option<bool> {
+        let mut policy = if hold.is_some() {
+            match self.policy.try_lock() {
+                Ok(policy) => policy,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                // The hold is let go of on the way out, before the caller waits for anything.
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            }
+        } else {
+            self.policy
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if flag(&policy) == raised {
+            // Letting go of the hold withdraws the connections that ended while it was held.
+            return Some(false);
+        }
+        let _table = hold.map(|hold| self.withdrawing(hold));
+        set(&mut policy, raised);
+        if raised {
+            self.feed_refusal.raise(bit);
+        } else {
+            self.feed_refusal.lower(bit);
+        }
+        Some(true)
     }
 
     /// Waits until every write to the pairing records that was under way when a refusal rose has
