@@ -1114,7 +1114,7 @@ mod tests {
             matches!(refused, Some(Why::Version { found, highest, .. })
                 if i64::from(found) == kr_plugin_catalogue::db::SCHEMA_VERSION
                     && i64::from(highest) == kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION),
-            "{refused:?}"
+            "the switch is refused for the version the catalogue records"
         );
     }
 
