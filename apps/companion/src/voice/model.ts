@@ -294,6 +294,23 @@ export function requestedSeconds(terms: VoiceManagedTerms): number | null {
 /** The call length the screen asks for when the service allows it: half an hour. */
 const CALL_SECONDS = 1800
 
+/**
+ * How long a call on the host owner's own key is asked for: half an hour, which is as long as the
+ * host lets such a call run. There is no service to publish a maximum and no rate to hold a budget
+ * against, so the length is the screen's own.
+ */
+export const OWN_KEY_CALL_SECONDS = CALL_SECONDS
+
+/**
+ * Whether a call can start from this choice: the managed service publishes terms that allow a call
+ * length this screen can ask for, or the host holds the owner's own key. A call is never offered
+ * on a provider that has not been shown.
+ */
+export function startable(choice: ProviderChoice): boolean {
+  if (choice.managed) return choice.managed.enabled && requestedSeconds(choice.managed) !== null
+  return choice.ownKey?.held === true
+}
+
 /** A rate as a person reads it, in their own locale's spelling of the service's currency. */
 export interface RateWords {
   /** The price of one second, for example "US$0.02". */
@@ -632,6 +649,9 @@ export function owedWords(owed: VoiceOwed): string {
   if (owed.kind === 'service_close') {
     return `${owed.words} This notice stays until ${until}, after the call's own limit.`
   }
+  // A call on the host's own key that the host closes by its own rule: the words state that rule,
+  // and the host is not being asked for anything.
+  if (owed.kind === 'host_close') return owed.words
   if (owed.kind !== 'revocation') return `${owed.words} It was asked of ${owed.host_name}.`
   return `${owed.host_name} may still hold a grant for this call open. It ends by itself by ${until}. ${owed.words}`
 }

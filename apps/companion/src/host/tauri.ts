@@ -422,6 +422,7 @@ export function tauriPort(): HostPort {
     voicePrepare: (params) => read('voice_prepare', params),
     voiceStart: (request, subject) =>
       call('voice_start', {
+        provider: request.provider,
         sessionIds: request.sessionIds,
         durationSeconds: request.durationSeconds,
         reasoningBudgetMinor: request.reasoningBudgetMinor,

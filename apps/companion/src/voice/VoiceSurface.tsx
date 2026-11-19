@@ -22,6 +22,7 @@ import {
   rateWords,
   requestedSeconds,
   speechCouldHaveBeenHeard,
+  startable,
   type ContextRequest,
   type Delegation,
   type ProviderChoice,
@@ -54,6 +55,9 @@ function sameTurn(a: CurrentTurn | null, b: CurrentTurn | null): boolean {
 
 /** What a person is told while the device ends what it was making, on either screen that says so. */
 const ENDING_WORDS = 'This device is ending its call. This screen changes when that is done.'
+
+/** What a person is told when the host's provider is its owner's own key and the host holds none. */
+const NO_OWN_KEY_WORDS = 'This host holds no OpenAI key, so it cannot start this call.'
 
 /** What the screen can do, supplied by whatever is hosting it. */
 export interface VoiceSurfaceActions {
@@ -396,8 +400,9 @@ function ProviderChoiceScreen({
     if (to instanceof HTMLButtonElement) to.scrollIntoView({ block: 'nearest' })
   })
   const terms = choice.managed
+  const ownKey = choice.ownKey
   const seconds = terms ? requestedSeconds(terms) : null
-  const startable = terms !== null && terms.enabled && seconds !== null
+  const canStart = startable(choice)
 
   return (
     <section
@@ -431,6 +436,13 @@ function ProviderChoiceScreen({
             <dd>{choice.brokerOrigin}</dd>
           </div>
         </dl>
+      ) : ownKey ? (
+        <dl className="kr-voice__provider">
+          <div>
+            <dt>Voice model</dt>
+            <dd>{ownKey.model}</dd>
+          </div>
+        </dl>
       ) : (
         <p className="kr-voice__refusal" role="status">
           {choice.unavailable}
@@ -439,15 +451,21 @@ function ProviderChoiceScreen({
 
       {/* The deployed service's own words, listed rather than summarised. A second wording of the
           same facts is a second thing to keep true. */}
-      {terms && (
+      {(terms ?? ownKey) && (
         <section className="kr-voice__panel" aria-labelledby={`${id}-access`}>
           <h2 id={`${id}-access`}>What this gives access to</h2>
           <ul className="kr-voice__list">
-            {terms.disclosure.map((line) => (
+            {(terms ? terms.disclosure : (ownKey?.disclosure ?? [])).map((line) => (
               <li key={line}>{line}</li>
             ))}
           </ul>
         </section>
+      )}
+
+      {ownKey && !ownKey.held && (
+        <p className="kr-voice__refusal" role="status">
+          {NO_OWN_KEY_WORDS}
+        </p>
       )}
 
       <section className="kr-voice__panel" aria-labelledby={`${id}-sessions`}>
@@ -531,7 +549,7 @@ function ProviderChoiceScreen({
         </p>
       )}
 
-      {startable && (
+      {canStart && (
         <div className="kr-voice__begin">
           <button
             type="button"
@@ -539,7 +557,7 @@ function ProviderChoiceScreen({
             className={busy ? 'kr-voice__start kr-voice__start--busy' : 'kr-voice__start'}
             onClick={onStart}
             disabled={busy}
-            aria-describedby={`${id}-cost-rate ${id}-cost-limits`}
+            aria-describedby={terms ? `${id}-cost-rate ${id}-cost-limits` : undefined}
           >
             {busy ? 'Starting…' : choice.previousRate ? 'Start at the new rate' : 'Start voice session'}
           </button>

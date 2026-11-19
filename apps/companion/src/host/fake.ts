@@ -1721,7 +1721,7 @@ export function fakeHost(
     }
     // The service compares the version the start names with the rate it would charge now, and
     // refuses before anything is held when they differ.
-    if (request.expectedRateVersion !== voice.rate.version) {
+    if (request.provider === 'managed' && request.expectedRateVersion !== voice.rate.version) {
       return Promise.resolve({
         receipt: null,
         action_id: null,
@@ -1766,7 +1766,11 @@ export function fakeHost(
         }
       })
     }
-    const started = fakeVoiceSession(request.sessionIds, VOICE_NOW_MS + 1_800_000)
+    const started = fakeVoiceSession(
+      request.sessionIds,
+      VOICE_NOW_MS + 1_800_000,
+      request.provider === 'own_key'
+    )
     voice.call = { session: started, capture: voice.startCapture, playing: true }
     voice.ended = null
     voice.delegations = []
@@ -2699,7 +2703,15 @@ export function fakeHost(
           prepared: preparedFor(voice),
           selected: VOICE_EXCLUDED_CLASSES.filter((each) => selected.includes(each)),
           provider:
-            voice.terms === 'unread'
+            voice.terms === 'own_key' || voice.terms === 'own_key_unheld'
+              ? {
+                  own_key: {
+                    model: VOICE_OWN_KEY.model,
+                    disclosure: [...VOICE_OWN_KEY.disclosure],
+                    held: voice.terms === 'own_key'
+                  }
+                }
+              : voice.terms === 'unread'
               ? {
                   unavailable: {
                     message:
@@ -3967,7 +3979,10 @@ function voiceSeed(): { terms: VoiceTermsState; capture: string; brokerReachable
   const params = new URLSearchParams(typeof window === 'undefined' ? '' : window.location.search)
   const terms = params.get('voice_terms')
   return {
-    terms: terms === 'closed' || terms === 'unread' ? terms : 'published',
+    terms:
+      terms === 'closed' || terms === 'unread' || terms === 'own_key' || terms === 'own_key_unheld'
+        ? terms
+        : 'published',
     capture: params.get('voice_capture') ?? 'capturing',
     brokerReachable: params.get('voice_broker') !== 'unreachable'
   }
@@ -3983,8 +3998,11 @@ function preparedFor(voice: VoiceState): string {
   return `scope-${String(voice.scope)}`
 }
 
-/** What the managed service tells a host about its terms. */
-export type VoiceTermsState = 'published' | 'closed' | 'unread'
+/**
+ * What the managed service tells a host about its terms, or that the host's provider is the
+ * owner's own account (`own_key`, and `own_key_unheld` when the host holds no key for it).
+ */
+export type VoiceTermsState = 'published' | 'closed' | 'unread' | 'own_key' | 'own_key_unheld'
 
 /** What the call this device is holding is doing. */
 function voiceCallState(voice: VoiceState): VoiceCallState {
@@ -4115,6 +4133,21 @@ const VOICE_DEFAULT_SCOPE: Omit<VoiceScope, 'optional'> = {
  * The wordings are the deployment's own and reach the screen through the host unchanged, which is
  * the point: the screen carries no second wording of any of them.
  */
+/**
+ * What a host whose voice provider is the owner's own account says before a call, in its own words:
+ * the screen draws the list and decides none of it.
+ */
+const VOICE_OWN_KEY = {
+  model: 'gpt-live-1',
+  disclosure: [
+    'This call runs on the OpenAI key set on this host. Only a device that you have given host-management authority on this host can start a call on it.',
+    'OpenAI processes the audio and the context this host selects, under your agreement with OpenAI and at your cost. Transcripts of the call reach this host, which discards them.',
+    "KalaReach's voice service is not used for this call.",
+    'This host keeps the key in its secret store and sends it only to OpenAI.',
+    'A call may run past 30 minutes if this host stops, loses its network or cannot confirm the close, and OpenAI may keep charging your account until it ends the call; the host tries to close it again when it restarts.'
+  ]
+} as const
+
 const VOICE_TERMS: VoiceManagedTerms = {
   enabled: true,
   model: 'gpt-live-1',
@@ -4144,7 +4177,8 @@ const VOICE_TERMS: VoiceManagedTerms = {
 /** The running voice session this host answers a start with. */
 function fakeVoiceSession(
   sessionIds: readonly string[],
-  closesAtMs: number
+  closesAtMs: number,
+  ownKey = false
 ): VoiceSessionDescriptor {
   return {
     voice_session_id: VOICE_SESSION,
@@ -4155,15 +4189,17 @@ function fakeVoiceSession(
     provider_session_id: 'sess_7f3a',
     answer_sdp: 'v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n',
     model: VOICE_TERMS.model,
-    control: {
-      broker: {
-        origin: VOICE_BROKER_ORIGIN,
-        control_path: '/api/voice/sessions/call-7f3a/control',
-        heartbeat_seconds: 20
-      }
-    },
+    control: ownKey
+      ? { host: { heartbeat_seconds: 20 } }
+      : {
+          broker: {
+            origin: VOICE_BROKER_ORIGIN,
+            control_path: '/api/voice/sessions/call-7f3a/control',
+            heartbeat_seconds: 20
+          }
+        },
     closes_at_ms: String(closesAtMs),
-    disclosure: VOICE_TERMS.disclosure
+    disclosure: ownKey ? [...VOICE_OWN_KEY.disclosure] : VOICE_TERMS.disclosure
   }
 }
 
