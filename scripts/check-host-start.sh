@@ -14,6 +14,8 @@
 # store, which on macOS is the login keychain of the account that runs it, and on macOS the startup
 # entries go into that account's shell startup files.
 # On macOS this script needs KR_ALLOW_ACCOUNT_LAUNCHD=1: it starts a daemon and sessions, which load jobs into the account's own launchd, and it refuses to start without it.
+# `scripts/check-host-start.sh self-test` runs the check against a stand-in for `kr`, starts no real
+# host and needs none of that.
 
 set -euo pipefail
 
@@ -26,10 +28,118 @@ stop_wait="${KR_START_STOP_SECONDS:-10}"
 # one it started did not answer (`crates/kr-cli/src/startup.rs`).
 process_of() { sed -n 's/.*the control daemon.*(process \([0-9][0-9]*\)).*/\1/p' | head -1; }
 
+# The real run: the stand-in's self-test, or the check of an installed release's `kr`. Only this
+# function refuses a Mac run that did not ask for the account's own launchd, and it does so before
+# anything is made or started; `start_and_check` is the check itself, which the self-test runs
+# against its stand-in.
+main() {
+    if [ "${1:-}" = self-test ]; then
+        self_test
+        return
+    fi
+    kr="${1:?name the kr program of the installed release}"
+    if [ "${CI:-}" != true ] && [ "${KR_THROWAWAY_HOST:-}" != 1 ]; then
+        echo "check-host-start: this starts a host and keeps its keys in the machine's key store; run it on a throwaway machine (CI=true or KR_THROWAWAY_HOST=1)" >&2
+        exit 2
+    fi
+
+    # shellcheck source=scripts/lib/account-launchd.sh
+    . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/account-launchd.sh"
+    require_account_launchd "$(uname -s)"
+    start_and_check "$kr"
+}
+
+# start_and_check <kr program>: starts the host of an installed release through that `kr` and has
+# it create and close a session, then ends what it started. It refuses nothing itself.
+start_and_check() {
+    kr="$1"
+    work="$(mktemp -d "${TMPDIR:-/tmp}/kr-host-start.XXXXXX")"
+    chmod 700 "$work"
+    mkdir -m 700 "$work/home" "$work/state" "$work/run"
+    export KR_STATE_DIR="$work/state" KR_RUNTIME_DIR="$work/run"
+    if [ "$(uname -s)" = Linux ]; then
+        mkdir -m 700 "$work/home/.config"
+        export HOME="$work/home" XDG_CONFIG_HOME="$work/home/.config"
+    fi
+    daemon=""
+    failed=0
+    cleanup() {
+        local status=$?
+        "$kr" close 1 > /dev/null 2>&1 || true
+        # The daemon is the process `kr new` reported starting; nothing else is ended. A process that
+        # is still alive after the wait fails the check, and the directories it uses stay where they
+        # are, since removing them under a running daemon proves nothing.
+        if [ -n "$daemon" ]; then
+            kill "$daemon" 2> /dev/null || true
+            for ((waited = 0; waited < stop_wait; waited++)); do kill -0 "$daemon" 2> /dev/null || break; sleep 1; done
+            if kill -0 "$daemon" 2> /dev/null; then
+                echo "check-host-start: the control daemon (process $daemon) is still running $stop_wait seconds after it was asked to stop; $work stays" >&2
+                exit 1
+            fi
+        fi
+        "$kr" shell remove > /dev/null 2>&1 || true
+        chmod -R u+w "${work:?}" 2> /dev/null || true
+        rm -rf "${work:?}"
+        # A step that ended the script under `set -e` keeps its own status.
+        if [ "$failed" -ne 0 ]; then exit 1; fi
+        exit "$status"
+    }
+    trap cleanup EXIT
+
+    "$kr" host startup --set standalone
+    "$kr" shell install
+    if ! created="$("$kr" new --invisible --headless 2>&1)"; then
+        printf '%s\n' "$created"
+        daemon="$(printf '%s\n' "$created" | process_of)"
+        echo "check-host-start: kr new failed" >&2
+        failed=1
+        exit 1
+    fi
+    printf '%s\n' "$created"
+    daemon="$(printf '%s\n' "$created" | process_of)"
+    if [ -z "$daemon" ]; then
+        echo "check-host-start: kr new did not say which process it started as the control daemon, so its stop cannot be shown" >&2
+        failed=1
+        exit 1
+    fi
+    if ! listed="$("$kr" list)"; then
+        echo "check-host-start: kr list failed" >&2
+        failed=1
+        exit 1
+    fi
+    printf '%s\n' "$listed"
+    case "$listed" in
+        *"no sessions"* | "") echo "check-host-start: the host lists no session after it created one" >&2; failed=1; exit 1 ;;
+    esac
+    "$kr" close 1
+    # A close is asked for and takes a moment: the daemon is stopped once no session is left.
+    closed=no
+    list_failed=no
+    for ((waited = 0; waited < close_wait; waited++)); do
+        if listed="$("$kr" list)"; then
+            list_failed=no
+            case "$listed" in *"no sessions"*) closed=yes; break ;; esac
+        else
+            list_failed=yes
+        fi
+        sleep 1
+    done
+    if [ "$closed" != yes ]; then
+        if [ "$list_failed" = yes ]; then
+            echo "check-host-start: kr list failed while the session was being closed, so its closing was not seen" >&2
+        else
+            echo "check-host-start: the session was still listed $close_wait seconds after it was closed" >&2
+        fi
+        failed=1
+        exit 1
+    fi
+    echo "check-host-start: the control daemon, a worker and a shell of $("$kr" --version) started, and the session closed"
+}
+
 self_test() {
     local work status=0 expected_exit
     work="$(mktemp -d "${TMPDIR:-/tmp}/kr-host-start-test.XXXXXX")"
-    trap 'rm -rf "${work:?}"' RETURN
+    trap 'rm -rf "${work:?}"; trap - RETURN' RETURN
     # A stand-in for `kr` that answers as the real one does, as far as this script reads it. The text
     # it prints when the daemon does not answer is the real one.
     cat > "$work/kr" << 'KR'
@@ -65,7 +175,7 @@ KR
         local out rc=0 gone=yes exit_ok
         mkdir -p "$work/state" "$work/tmp"
         rm -f "$work/state/pid" "$work/state/open" "$work/state/closed"
-        out="$(SCENARIO="$1" KR_STAND_IN_STATE="$work/state" CI=true TMPDIR="$work/tmp" KR_START_CLOSE_SECONDS=2 KR_START_STOP_SECONDS=2 bash "${BASH_SOURCE[0]}" "$work/kr" 2>&1)" || rc=$?
+        out="$(SCENARIO="$1" KR_STAND_IN_STATE="$work/state" TMPDIR="$work/tmp" KR_START_CLOSE_SECONDS=2 KR_START_STOP_SECONDS=2 bash -c 'set -euo pipefail; . "$1"; start_and_check "$2"' check-host-start "${BASH_SOURCE[0]}" "$work/kr" 2>&1)" || rc=$?
         if [ -f "$work/state/pid" ] && kill -0 "$(cat "$work/state/pid")" 2> /dev/null; then
             gone=no
             kill -9 "$(cat "$work/state/pid")" 2> /dev/null || true
@@ -95,100 +205,8 @@ KR
     return "$status"
 }
 
-if [ "${1:-}" = self-test ]; then
-    self_test
-    exit
-fi
 
-
-kr="${1:?name the kr program of the installed release}"
-if [ "${CI:-}" != true ] && [ "${KR_THROWAWAY_HOST:-}" != 1 ]; then
-    echo "check-host-start: this starts a host and keeps its keys in the machine's key store; run it on a throwaway machine (CI=true or KR_THROWAWAY_HOST=1)" >&2
-    exit 2
+# A script that is sourced only defines its functions, which the self-test's stand-in runs use.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
 fi
-
-# shellcheck source=scripts/lib/account-launchd.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/account-launchd.sh"
-require_account_launchd "$(uname -s)"
-
-work="$(mktemp -d "${TMPDIR:-/tmp}/kr-host-start.XXXXXX")"
-chmod 700 "$work"
-mkdir -m 700 "$work/home" "$work/state" "$work/run"
-export KR_STATE_DIR="$work/state" KR_RUNTIME_DIR="$work/run"
-if [ "$(uname -s)" = Linux ]; then
-    mkdir -m 700 "$work/home/.config"
-    export HOME="$work/home" XDG_CONFIG_HOME="$work/home/.config"
-fi
-daemon=""
-failed=0
-cleanup() {
-    local status=$?
-    "$kr" close 1 > /dev/null 2>&1 || true
-    # The daemon is the process `kr new` reported starting; nothing else is ended. A process that
-    # is still alive after the wait fails the check, and the directories it uses stay where they
-    # are, since removing them under a running daemon proves nothing.
-    if [ -n "$daemon" ]; then
-        kill "$daemon" 2> /dev/null || true
-        for ((waited = 0; waited < stop_wait; waited++)); do kill -0 "$daemon" 2> /dev/null || break; sleep 1; done
-        if kill -0 "$daemon" 2> /dev/null; then
-            echo "check-host-start: the control daemon (process $daemon) is still running $stop_wait seconds after it was asked to stop; $work stays" >&2
-            exit 1
-        fi
-    fi
-    "$kr" shell remove > /dev/null 2>&1 || true
-    chmod -R u+w "${work:?}" 2> /dev/null || true
-    rm -rf "${work:?}"
-    # A step that ended the script under `set -e` keeps its own status.
-    if [ "$failed" -ne 0 ]; then exit 1; fi
-    exit "$status"
-}
-trap cleanup EXIT
-
-"$kr" host startup --set standalone
-"$kr" shell install
-if ! created="$("$kr" new --invisible --headless 2>&1)"; then
-    printf '%s\n' "$created"
-    daemon="$(printf '%s\n' "$created" | process_of)"
-    echo "check-host-start: kr new failed" >&2
-    failed=1
-    exit 1
-fi
-printf '%s\n' "$created"
-daemon="$(printf '%s\n' "$created" | process_of)"
-if [ -z "$daemon" ]; then
-    echo "check-host-start: kr new did not say which process it started as the control daemon, so its stop cannot be shown" >&2
-    failed=1
-    exit 1
-fi
-if ! listed="$("$kr" list)"; then
-    echo "check-host-start: kr list failed" >&2
-    failed=1
-    exit 1
-fi
-printf '%s\n' "$listed"
-case "$listed" in
-    *"no sessions"* | "") echo "check-host-start: the host lists no session after it created one" >&2; failed=1; exit 1 ;;
-esac
-"$kr" close 1
-# A close is asked for and takes a moment: the daemon is stopped once no session is left.
-closed=no
-list_failed=no
-for ((waited = 0; waited < close_wait; waited++)); do
-    if listed="$("$kr" list)"; then
-        list_failed=no
-        case "$listed" in *"no sessions"*) closed=yes; break ;; esac
-    else
-        list_failed=yes
-    fi
-    sleep 1
-done
-if [ "$closed" != yes ]; then
-    if [ "$list_failed" = yes ]; then
-        echo "check-host-start: kr list failed while the session was being closed, so its closing was not seen" >&2
-    else
-        echo "check-host-start: the session was still listed $close_wait seconds after it was closed" >&2
-    fi
-    failed=1
-    exit 1
-fi
-echo "check-host-start: the control daemon, a worker and a shell of $("$kr" --version) started, and the session closed"
