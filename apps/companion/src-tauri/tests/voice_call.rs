@@ -852,7 +852,7 @@ async fn the_call_is_given_the_hosts_default_context_as_its_opening_context_and_
             .expect("the host selects the context"),
     )
     .expect("the selection decodes");
-    let expected = kr_client::services::voice_control::call_start_appends(&read.selection);
+    let expected = kr_client::services::voice_pacing::call_start_appends(&read.selection);
     assert!(!expected.is_empty());
 
     scene
@@ -1065,7 +1065,7 @@ async fn a_service_that_refuses_a_later_part_of_the_opening_context_says_the_cal
             .expect("the host selects the context"),
     )
     .expect("the selection decodes");
-    let parts = kr_client::services::voice_control::call_start_appends(&read.selection).len();
+    let parts = kr_client::services::voice_pacing::call_start_appends(&read.selection).len();
     assert!(parts >= 3, "the context goes in several parts: {parts}");
 
     let said = format!("took 1 of its {parts} parts and not the next");

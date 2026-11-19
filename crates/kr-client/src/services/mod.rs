@@ -143,6 +143,7 @@ pub mod sync;
 pub mod voice;
 pub mod voice_confirm;
 pub mod voice_control;
+pub mod voice_pacing;
 
 use std::future::Future;
 use std::pin::Pin;

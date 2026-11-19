@@ -545,7 +545,7 @@ async fn a_selection_at_the_cap_is_sent_within_it() {
         result.selection.pending_decisions.len() > 20,
         "many short decisions were kept: {result:?}"
     );
-    let sent: usize = kr_client::services::voice_control::call_start_appends(&result.selection)
+    let sent: usize = kr_client::services::voice_pacing::call_start_appends(&result.selection)
         .iter()
         .map(String::len)
         .sum();

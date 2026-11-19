@@ -20,8 +20,9 @@ use kr_client::services::voice::{
 use kr_client::services::voice_control::{
     AttemptFailure, ContextRefusal, ControlConnector, ControlEnd, ControlEvents, ControlNews,
     ControlTarget, ControlTimings, SendError, VOICE_KNOWN_DELEGATIONS,
-    VoiceControl as ProductControl, call_start_appends,
+    VoiceControl as ProductControl,
 };
+use kr_client::services::voice_pacing::call_start_appends;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::voice::{VoiceContextClass, VoiceContextSelection, VoiceSelectedContent};
 
