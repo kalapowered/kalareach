@@ -1058,6 +1058,12 @@ export interface RevocationView {
 
 /** What the page asks for when it starts a call. */
 export interface VoiceStartRequest {
+  /**
+   * Which provider the preparation the person was shown named. The device decides from it, before
+   * the host has answered, whether it needs an account for the call: a call on the host owner's
+   * own key is controlled through the host and holds none.
+   */
+  readonly provider: 'managed' | 'own_key'
   /** The sessions the call may reach, as the preparation the person was shown answered them. */
   readonly sessionIds: readonly string[]
   /**
@@ -1073,9 +1079,10 @@ export interface VoiceStartRequest {
    * The version of the managed rate the person was shown, as the host's preparation answered it.
    *
    * A start names it so the call runs under the terms the person saw. The service refuses a
-   * version that is no longer current, and the answer carries the rate as it is now.
+   * version that is no longer current, and the answer carries the rate as it is now. A call on the
+   * host owner's own key has no rate, so it names none.
    */
-  readonly expectedRateVersion: string
+  readonly expectedRateVersion: string | null
 }
 
 /** One action a voice grant permits by default, as the person is shown it before allowing it. */
@@ -1277,7 +1284,8 @@ export interface VoiceDelegationRow {
 export interface VoiceOwed {
   /**
    * `revocation` when a call's grant may still be live; `start_unknown` for a start never answered;
-   * `service_close` when the voice service has not confirmed that it closed a call.
+   * `service_close` when the voice service has not confirmed that it closed a call; `host_close`
+   * when a call on the host owner's own key was left to the host to close at the provider.
    */
   readonly kind: string
   /** What a person is told. */

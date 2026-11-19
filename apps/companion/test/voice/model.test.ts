@@ -429,6 +429,23 @@ describe('what is owed', () => {
     })
     expect(words).toBe("The host never said whether it created the call. It was asked of Ric's Mac.")
   })
+
+  // A call on the host owner's own key that this phone left to the host to close: the words state
+  // the host's own rule, and nothing is being asked of the host.
+  it('gives a call left to the host to close in the words that state the host’s rule, asking nothing of the host', () => {
+    const rule =
+      'The call has ended on this phone. This host starts closing the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm that, the call may keep running on your OpenAI account until OpenAI ends it.'
+    const words = owedWords({
+      kind: 'host_close',
+      words: rule,
+      action_id: null,
+      voice_session_id: 'vs-1',
+      until_ms: Date.UTC(2026, 9, 17, 12, 30),
+      host_reference: 'ref-1',
+      host_name: "Ric's Mac"
+    })
+    expect(words).toBe(rule)
+  })
 })
 
 describe('what the voice service did about a call that ended', () => {

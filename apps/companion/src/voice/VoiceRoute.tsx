@@ -29,6 +29,7 @@ import {
   unavailableWords,
   owedWords,
   problemWords,
+  OWN_KEY_CALL_SECONDS,
   requestedSeconds,
   runningCallFrom,
   serviceWords,
@@ -731,10 +732,13 @@ export function VoiceRoute({
     () => ({
       start: () => {
         // A managed call starts only under terms the person was shown: the start names the
-        // version of the rate on screen, and there is no start without one.
-        const terms = choice?.managed
-        if (busy || !terms) return
-        const seconds = requestedSeconds(terms)
+        // version of the rate on screen, and there is no start without one. A call on the host
+        // owner's own key starts only from the disclosure the host gave, on a key the host holds,
+        // and has no rate to name.
+        const terms = choice?.managed ?? null
+        const ownKey = choice?.ownKey ?? null
+        if (busy || !choice || (!terms && !ownKey?.held)) return
+        const seconds = terms ? requestedSeconds(terms) : OWN_KEY_CALL_SECONDS
         if (seconds === null) {
           setNotice('The managed service allows no call length this screen can ask for.')
           return
@@ -748,11 +752,12 @@ export function VoiceRoute({
         void ask(() =>
           port.voiceStart(
             {
+              provider: terms ? 'managed' : 'own_key',
               sessionIds: shown.sessions,
               durationSeconds: seconds,
               reasoningBudgetMinor: null,
               prepared: shown.prepared,
-              expectedRateVersion: terms.rate.version
+              expectedRateVersion: terms ? terms.rate.version : null
             },
             {}
           )
@@ -829,7 +834,7 @@ export function VoiceRoute({
             setLeft(null)
             setEndedBefore(null)
             setStartedHere(session.voice_session_id)
-            setCall(runningCallFrom(session, state, terms.admission_note))
+            setCall(runningCallFrom(session, state, terms ? terms.admission_note : ''))
           })
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
