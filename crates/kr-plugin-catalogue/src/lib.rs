@@ -2452,12 +2452,11 @@ impl Catalogue {
                         // and a label with none gives no area; a configuration key the recipe
                         // adds is the label's one enabling key or it is refused here, before any
                         // result that makes no statement.
-                        let compiled_area =
-                            kr_plugin_sdk::placement::Placement::for_label(
-                                recipe.application.as_str(),
-                            )
-                            .map(|placement| placement.area)
-                            .unwrap_or_default();
+                        let compiled_area = kr_plugin_sdk::placement::Placement::for_label(
+                            recipe.application.as_str(),
+                        )
+                        .map(|placement| placement.area)
+                        .unwrap_or_default();
                         if let Some(refusal) =
                             kr_plugin_sdk::placement::key_refusals(recipe, &compiled_area)
                                 .into_iter()
