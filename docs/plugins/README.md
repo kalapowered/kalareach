@@ -754,6 +754,21 @@ An application whose bridge is code that starts the forwarder, a module, is not 
 - It starts the installed forwarder by its path.
 - It keeps the launch environment the forwarder reads, which names the registration. The worker does not check this: a hook without it reads no registration, answers as every hook does and reports nothing.
 
+### Placement
+
+A package whose native bridge is for an application the host holds no layout for says where the bridge's files are placed in the `placement` member of its connector table. A package for Claude Code or Gemini CLI that declares none is placed by the layout the host holds for the label, and a package that declares one for either label declares that layout's directory, area and name check, and nothing else under the label.
+
+The member names a layout and the closed shape of each file:
+
+- `directory` is one to three plain components under the account's home. A plain component is one to 64 bytes of ASCII letters, digits, space, `.`, `_` and `-`, not `.` or `..`. The directory has to exist: the host makes no application's directory, and follows no link in it. The one exception is the compiled default's own directory for a package that declares no placement, which a person may keep as a link. A package that copies a compiled default's layout into its own declaration is placed like any other declared placement, so a link there is refused, and a declared directory that is the directory of another label's default is refused.
+- `area` is the one plain component of the directory that holds one folder for each plugin, and `files` lists one to eight tails, each in that folder once, each with a closed `shape`.
+- `command_form` says whether the forwarder is written as one line a shell runs or as a program with its arguments in a list. `one_per_name` names the manifest whose `name` is the folder's name, for an application that keeps one plugin for each name.
+- A shape is an object with named members (`required` or not), a map, a list, text with a size, a boolean, a number, exact text, the folder's name, the install record's source (`/dev/null/` and the folder's name), a command handler or a stdio server. A shape has no member for an enabling key or a last file: the host adds the enabling key of Claude Code's layout for that label alone, and keeps Gemini CLI's install record for last by its label.
+
+A declared placement is placed only into a folder the host makes: a folder of the plugin's name that is already there is the person's, whatever it holds, and is refused. The host checks each file before anything is written: it is JSON with no repeated member name, every member named `command` starts the forwarder (by its placeholder; the bare name is read for the two compiled layouts only), the file has its shape, and no other name or text in it holds a slash, a backslash, a colon, a tilde, a dollar sign or a backtick or is `.` or `..`. It does not check what the application does with the members that remain, and the installation statement the owner confirms says so, with the folder the files go to: the application can run what it reads, as the person, outside the plugin sandbox. The reading is written by the host from the verified table, after the label `The host's exact reading of the placement:`, which a publisher's words may not hold.
+
+A package that declares a placement declares `"sdk_range": ">=0.1.9, <0.2.0"`. The host reads the table only after it has tested the range, and a table it cannot read or whose placement it refuses is a refusal, never the application's own layout. A bridge that is code, such as a module, is not placed by this host, which places JSON registration files only; a placement of code waits on a ruling of its own.
+
 ## The component interface
 
 The WIT package is `kalareach:plugin@0.1.0`, published at `packages/plugin-sdk/wit/`. A component

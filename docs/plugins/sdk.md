@@ -25,6 +25,13 @@ states it declares `"sdk_range": ">=0.1.8, <0.2.0"`, and the package check refus
 carries it under a range that admits an earlier SDK version or one with a prerelease part. The
 plugin reference's [Hook events](README.md#hook-events) section holds the grammar.
 
+The `placement` member of a connector table is in version 0.1.9. It says where the files of a package's
+native bridge are placed under the account's home and the closed shape of each; a table without it
+means the layout the host holds for the application's label. A package whose table states it declares
+`"sdk_range": ">=0.1.9, <0.2.0"`, and the package check refuses a table that carries it under a range
+that admits an earlier SDK version or one with a prerelease part. The plugin reference's
+[Placement](README.md#placement) section holds the grammar and what the host checks.
+
 The `hidden_when` member of a selection route is in version 0.1.7. It lists conditions on the
 request: each names a place in the request's message and the strings, booleans or integers that
 place may hold. A request that meets every condition starts a thread that the terminal never shows,
