@@ -3686,8 +3686,7 @@ fn an_upstream_identifier_never_becomes_a_kalareach_identifier() {
 
     // An upstream identifier that happens to look like a UUID is still not one of ours. What makes
     // a KalaReach action identity is that the host or its client generated it for this action; an
-    // upstream value is carried as a precondition and never adopted, so the two are different
-    // fields of the same envelope and the digest covers both.
+    // upstream value is never adopted as one.
     let upstream_uuid = "e52e8d1a-6818-4be7-b4b8-f93a8b1c0c6d";
     let mut namespaced = kr_cbor::CanonicalMap::new();
     namespaced
@@ -3706,8 +3705,9 @@ fn an_upstream_identifier_never_becomes_a_kalareach_identifier() {
          sixteen bytes; the two cannot be the same value"
     );
 
-    // An upstream identifier travels as opaque text inside the preconditions, where it is covered
-    // by the mutation digest and is not an identity of ours.
+    // In this synthetic digest input, whatever a request carries in its preconditions is covered by
+    // the mutation digest, even a key the worker refuses at admission, as it refuses this one. None
+    // of it is an identity of ours.
     let mut expected = kr_cbor::CanonicalMap::new();
     expected
         .insert(
@@ -3749,8 +3749,8 @@ fn an_upstream_identifier_never_becomes_a_kalareach_identifier() {
         "request_id correlates a response and is not part of the action's identity"
     );
 
-    // Changing the upstream identifier changes the digest, because it is a precondition the host
-    // signs over rather than an identifier it adopts.
+    // Changing the upstream text changes the digest, because the digest covers the preconditions as
+    // they were sent.
     let mut other = kr_cbor::CanonicalMap::new();
     other
         .insert(

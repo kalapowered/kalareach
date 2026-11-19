@@ -4081,8 +4081,9 @@ async fn a_worker_with_an_uncertain_approval_answer()
 
 /// What a worker that selected an approval answer's subject by the target alone stored for `answer`.
 ///
-/// That selector named no parameter and no precondition, and a request's preconditions are empty,
-/// so the subject it stored is the one a request with no parameters has now.
+/// That selector named `expected.approval_request_id`. This request omitted that key, so its
+/// selected preconditions were empty, and the selector reduced to the target alone: the subject it
+/// stored is the one a request with no parameters has now.
 fn subject_stored_by_the_target_alone(answer: &MutationRequest) -> Digest256 {
     kr_protocol::action::subject_digest(&MutationRequest {
         params: ParamsValue::empty(),
