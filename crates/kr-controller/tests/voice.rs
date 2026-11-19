@@ -3073,19 +3073,67 @@ async fn one_action_identifier_is_one_action_across_the_voice_and_session_routes
 struct ScriptedService {
     script: std::sync::Mutex<std::collections::VecDeque<(String, u16, serde_json::Value)>>,
     sent: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    /// Where a start waits before the service answers it, for a service that is slow to answer.
+    gate: Option<StartGate>,
 }
 
+/// Where a held start waits: it says it has arrived, then waits to be let go.
+#[derive(Debug, Default)]
+struct StartGate {
+    reached: tokio::sync::Notify,
+    released: tokio::sync::Notify,
+}
+
+/// The status a script entry carries when the request fails in the transport instead of being
+/// answered: the body then names the error code the transport gives.
+const TRANSPORT_FAILS: u16 = 0;
+
 impl ScriptedService {
-    fn answering(script: Vec<(&str, u16, serde_json::Value)>) -> Arc<Self> {
+    fn answering<S: AsRef<str>>(script: Vec<(S, u16, serde_json::Value)>) -> Arc<Self> {
         let service = Self::default();
         for (path, status, body) in script {
-            service
-                .script
-                .lock()
-                .expect("the script")
-                .push_back((path.to_owned(), status, body));
+            service.script.lock().expect("the script").push_back((
+                path.as_ref().to_owned(),
+                status,
+                body,
+            ));
         }
         Arc::new(service)
+    }
+
+    /// As [`Self::answering`], for a service that holds every start until the test lets it answer.
+    fn holding_starts<S: AsRef<str>>(script: Vec<(S, u16, serde_json::Value)>) -> Arc<Self> {
+        let service = Self {
+            gate: Some(StartGate::default()),
+            ..Self::default()
+        };
+        for (path, status, body) in script {
+            service.script.lock().expect("the script").push_back((
+                path.as_ref().to_owned(),
+                status,
+                body,
+            ));
+        }
+        Arc::new(service)
+    }
+
+    /// Waits until a start has reached the service and is being held.
+    async fn reached(&self) {
+        self.gate
+            .as_ref()
+            .expect("a service that holds its starts")
+            .reached
+            .notified()
+            .await;
+    }
+
+    /// Lets the start being held be answered.
+    fn release(&self) {
+        self.gate
+            .as_ref()
+            .expect("a service that holds its starts")
+            .released
+            .notify_one();
     }
 
     /// Each request's path and body, in the order they arrived.
@@ -3110,20 +3158,37 @@ impl ServiceHttp for ScriptedService {
             .lock()
             .expect("what was sent")
             .push((path.clone(), body));
+        let gate = self.gate.as_ref().filter(|_| path == "/api/voice/sessions");
         // An answer out of order is a refusal the test then sees, rather than a panic inside the
         // daemon's own task.
         let answer = match self.script.lock().expect("the script").pop_front() {
-            Some((expected, status, body)) if expected == path => ServiceHttpAnswer {
+            Some((expected, TRANSPORT_FAILS, body)) if expected == path => {
+                let code = match body.as_str() {
+                    Some("OUTCOME_UNKNOWN") => kr_protocol::error::ErrorCode::OutcomeUnknown,
+                    _ => kr_protocol::error::ErrorCode::UpstreamUnavailable,
+                };
+                Err(kr_client::error::ClientError::refusal(
+                    code,
+                    "the transport failed".into(),
+                ))
+            }
+            Some((expected, status, body)) if expected == path => Ok(ServiceHttpAnswer {
                 status,
                 body: serde_json::to_vec(&body).expect("an answer"),
-            },
-            _ => ServiceHttpAnswer {
+            }),
+            _ => Ok(ServiceHttpAnswer {
                 status: 500,
                 body: br#"{"ok":false,"error":{"code":"INTERNAL","message":"out of script"}}"#
                     .to_vec(),
-            },
+            }),
         };
-        Box::pin(async move { Ok(answer) })
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.reached.notify_one();
+                gate.released.notified().await;
+            }
+            answer
+        })
     }
 }
 
@@ -3383,7 +3448,7 @@ async fn a_start_refused_for_a_changed_rate_reaches_the_device_with_the_new_rate
 /// scripted on its wire. The host's broker client, the daemon and the device's connection are real.
 struct HoldWorld {
     host: net_support::Host,
-    _device: net_support::Device,
+    device: net_support::Device,
     session: kr_client::session::Session,
     environment_id: EnvironmentId,
     device_id: DeviceId,
@@ -3408,14 +3473,18 @@ fn the_services_terms() -> serde_json::Value {
 }
 
 /// The service's answer when its own answer to a start is lost on the way: a gateway's 504.
-fn a_start_whose_answer_is_lost() -> (&'static str, u16, serde_json::Value) {
-    ("/api/voice/sessions", 504, serde_json::Value::Null)
+fn a_start_whose_answer_is_lost() -> (String, u16, serde_json::Value) {
+    (
+        "/api/voice/sessions".to_owned(),
+        504,
+        serde_json::Value::Null,
+    )
 }
 
 /// The service's answer to a start under a rate that is no longer current: nothing was created.
-fn a_start_under_a_changed_rate() -> (&'static str, u16, serde_json::Value) {
+fn a_start_under_a_changed_rate() -> (String, u16, serde_json::Value) {
     (
-        "/api/voice/sessions",
+        "/api/voice/sessions".to_owned(),
         409,
         serde_json::json!({"ok": false, "error": {
             "code": "CONFLICT",
@@ -3427,9 +3496,21 @@ fn a_start_under_a_changed_rate() -> (&'static str, u16, serde_json::Value) {
 }
 
 /// The service's answer to a start that made a call.
-fn a_start_that_made_a_call(call: &str) -> (&'static str, u16, serde_json::Value) {
+fn a_start_that_made_a_call(call: &str) -> (String, u16, serde_json::Value) {
+    a_start_that_answered_with_a_call(call, false)
+}
+
+/// The service's answer to a start that it answers with the call an earlier attempt made.
+fn a_start_that_replays_a_call(call: &str) -> (String, u16, serde_json::Value) {
+    a_start_that_answered_with_a_call(call, true)
+}
+
+fn a_start_that_answered_with_a_call(
+    call: &str,
+    replayed: bool,
+) -> (String, u16, serde_json::Value) {
     (
-        "/api/voice/sessions",
+        "/api/voice/sessions".to_owned(),
         200,
         serde_json::json!({"ok": true, "data": {
             "callId": call,
@@ -3447,16 +3528,63 @@ fn a_start_that_made_a_call(call: &str) -> (&'static str, u16, serde_json::Value
             "reasoningHold": null,
             "rate": quoted("2026-09-a", "2"),
             "latency": {"creationToAnswerMs": 300, "sidebandReadyMs": 100},
-            "replayed": false,
+            "replayed": replayed,
             "disclosure": ["Audio travels directly between this device and the provider."]
         }}),
     )
 }
 
+/// The service's answer to the close of `call`, which it ended.
+fn a_close_that_ended(call: &str) -> (String, u16, serde_json::Value) {
+    (
+        format!("/api/voice/sessions/{call}/close"),
+        200,
+        serde_json::json!({"ok": true, "data": {
+            "callId": call,
+            "state": "closed",
+            "usageSeconds": 0,
+            "usageProvisional": true
+        }}),
+    )
+}
+
+/// The service's answer to the close of `call` when it could not end it.
+fn a_close_that_failed(call: &str) -> (String, u16, serde_json::Value) {
+    (
+        format!("/api/voice/sessions/{call}/close"),
+        500,
+        serde_json::json!({"ok": false, "error": {"code": "INTERNAL", "message": "not now"}}),
+    )
+}
+
 impl HoldWorld {
-    async fn with(starts: Vec<(&'static str, u16, serde_json::Value)>) -> Self {
+    async fn with(starts: Vec<(String, u16, serde_json::Value)>) -> Self {
+        Self::build(starts, false, None).await
+    }
+
+    /// As [`Self::with`], for a service that holds each start until the test lets it answer.
+    async fn holding(starts: Vec<(String, u16, serde_json::Value)>) -> Self {
+        Self::build(starts, true, None).await
+    }
+
+    /// As [`Self::with`], on clocks the test moves by hand.
+    async fn on_clocks(
+        starts: Vec<(String, u16, serde_json::Value)>,
+        clocks: kr_controller::service::Clocks,
+    ) -> Self {
+        Self::build(starts, false, Some(clocks)).await
+    }
+
+    async fn build(
+        starts: Vec<(String, u16, serde_json::Value)>,
+        hold_starts: bool,
+        clocks: Option<kr_controller::service::Clocks>,
+    ) -> Self {
         let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
-        let host = net_support::Host::start(&owner).await;
+        let host = match clocks {
+            Some(clocks) => net_support::Host::start_on_clocks(&owner, clocks).await,
+            None => net_support::Host::start(&owner).await,
+        };
         let (device, session) = net_support::paired_device(
             &host,
             &owner,
@@ -3465,20 +3593,14 @@ impl HoldWorld {
         .await;
         let environment_id = host.environment_id;
         let session_id = SessionId::new(kr_ipc::new_uuid());
-        let mut script = vec![("/api/voice/metadata", 200, the_services_terms())];
+        let mut script = vec![("/api/voice/metadata".to_owned(), 200, the_services_terms())];
         script.extend(starts);
-        let service = ScriptedService::answering(script);
-        // The broker reads the send limit on the daemon's own continuous clock.
-        let broker = ManagedVoiceBroker::new(
-            "https://reach.example",
-            Arc::clone(&service) as Arc<dyn ServiceHttp>,
-            Arc::new(VoiceToken),
-        )
-        .expect("a broker client")
-        .with_continuous_clock(host.controller().continuous_clock());
-        host.controller()
-            .voice()
-            .attach_provider(Some(Arc::new(broker) as Arc<dyn ManagedVoiceService>));
+        let service = if hold_starts {
+            ScriptedService::holding_starts(script)
+        } else {
+            ScriptedService::answering(script)
+        };
+        Self::attach_broker(&host, &service);
         let device_id = host
             .controller()
             .devices()
@@ -3525,13 +3647,81 @@ impl HoldWorld {
         };
         Self {
             host,
-            _device: device,
+            device,
             session,
             environment_id,
             device_id,
             params,
             service,
         }
+    }
+
+    /// Gives the daemon's voice service a broker client over `service`. The broker reads the send
+    /// limit on the daemon's own continuous clock.
+    fn attach_broker(host: &net_support::Host, service: &Arc<ScriptedService>) {
+        let broker = ManagedVoiceBroker::new(
+            "https://reach.example",
+            Arc::clone(service) as Arc<dyn ServiceHttp>,
+            Arc::new(VoiceToken),
+        )
+        .expect("a broker client")
+        .with_continuous_clock(host.controller().continuous_clock());
+        host.controller()
+            .voice()
+            .attach_provider(Some(Arc::new(broker) as Arc<dyn ManagedVoiceService>));
+    }
+
+    /// The host stopped and started again on the same state, and the device connected again.
+    async fn restart(self) -> Self {
+        let Self {
+            host,
+            device,
+            session,
+            environment_id,
+            device_id,
+            params,
+            service,
+        } = self;
+        drop(session);
+        let host = host.restart().await;
+        Self::attach_broker(&host, &service);
+        let record = host.record_of(device_id);
+        let session = net_support::connect(&host, &device, &record).await;
+        Self {
+            host,
+            device,
+            session,
+            environment_id,
+            device_id,
+            params,
+            service,
+        }
+    }
+
+    /// The device connected again, as it must after the host's clocks moved past the action window
+    /// its connection was issued.
+    async fn reconnect(&mut self) {
+        let record = self.host.record_of(self.device_id);
+        self.session = net_support::connect(&self.host, &self.device, &record).await;
+    }
+
+    /// The device's voice grant written again from a second connection, which replaces the standing
+    /// one while a start on the first connection waits.
+    async fn regrant(&self) {
+        let record = self.host.record_of(self.device_id);
+        let other = net_support::connect(&self.host, &self.device, &record).await;
+        let _ = remote_voice(
+            &other,
+            self.environment_id,
+            Method::VoiceGrant,
+            &VoiceGrantParams {
+                device_id: self.device_id,
+                session_ids: self.params.session_ids.clone(),
+                actions: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the voice grant is written again");
     }
 
     /// A start under a fresh action, naming `earlier` when it is given.
@@ -3785,4 +3975,330 @@ async fn a_malformed_or_null_supersession_key_is_refused_before_the_claim() {
         .await
         .expect("a plain start is still admitted");
     assert_eq!(world.calls_asked(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The end rule: what holds a device, and what lets it go
+// ---------------------------------------------------------------------------------------------
+
+/// What a settled start answered, as the typed outcome.
+fn outcome_of(settled: &kr_client::session::Settled) -> VoiceStartOutcome {
+    settled
+        .result()
+        .cloned()
+        .expect("a result")
+        .to_typed::<kr_protocol::voice::VoiceStartResult>()
+        .expect("a start result")
+        .outcome
+}
+
+/// The service's answer to a start when the request fails in the transport, under `code`.
+fn a_start_whose_transport_fails(code: &str) -> (String, u16, serde_json::Value) {
+    (
+        "/api/voice/sessions".to_owned(),
+        TRANSPORT_FAILS,
+        serde_json::Value::String(code.to_owned()),
+    )
+}
+
+/// A start the service answers with `status` and nothing it can read.
+fn a_start_answered_with_status(status: u16) -> (String, u16, serde_json::Value) {
+    (
+        "/api/voice/sessions".to_owned(),
+        status,
+        serde_json::Value::Null,
+    )
+}
+
+/// Asserts that a start is refused by the hold and that the service was not asked again.
+async fn assert_held(world: &HoldWorld, asked: usize) {
+    let refused = world
+        .start(None)
+        .await
+        .expect_err("a fresh start is refused while the hold stands");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::DraftConflict,
+        "{refused}"
+    );
+    assert_eq!(
+        world.calls_asked(),
+        asked,
+        "the refused start asked nothing"
+    );
+}
+
+/// KR-REQ-23.24: an error whose category says the request may have been carried out leaves the
+/// outcome unknown, so the device is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_error_that_left_the_outcome_unknown_holds_the_device() {
+    let world = HoldWorld::with(vec![
+        a_start_whose_transport_fails("OUTCOME_UNKNOWN"),
+        a_start_that_made_a_call("call-1"),
+    ])
+    .await;
+    let answered = world
+        .start(None)
+        .await
+        .expect_err("the host answers with the error the broker gave");
+    assert_eq!(
+        answered.code(),
+        kr_protocol::error::ErrorCode::OutcomeUnknown
+    );
+    assert!(
+        world.hold().is_some(),
+        "the unknown outcome holds the device"
+    );
+    assert_held(&world, 1).await;
+}
+
+/// KR-REQ-23.24: a failure before any byte was written leaves no hold, so the next start asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connect_phase_failure_leaves_no_hold() {
+    let world = HoldWorld::with(vec![
+        a_start_whose_transport_fails("UPSTREAM_UNAVAILABLE"),
+        a_start_that_made_a_call("call-1"),
+    ])
+    .await;
+    let refused = world
+        .start(None)
+        .await
+        .expect_err("the host answers with the error the broker gave");
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+    assert_eq!(world.hold(), None);
+
+    let next = world.start(None).await.expect("the next start is admitted");
+    assert!(matches!(
+        outcome_of(&next),
+        VoiceStartOutcome::Started { .. }
+    ));
+    assert_eq!(world.calls_asked(), 2);
+}
+
+/// KR-REQ-23.24: an answer this client cannot read is a refusal and leaves no hold, except the two
+/// statuses a gateway gives when the service's answer did not reach it, which leave the creation
+/// unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_answer_is_a_refusal_except_where_a_gateway_lost_it() {
+    for (status, holds) in [
+        (500, false),
+        (503, false),
+        (400, false),
+        (502, true),
+        (504, true),
+    ] {
+        let world = HoldWorld::with(vec![a_start_answered_with_status(status)]).await;
+        let answered = world.start(None).await.expect("the host answers");
+        let outcome = outcome_of(&answered);
+        if holds {
+            assert!(
+                matches!(outcome, VoiceStartOutcome::CreationUnknown { .. }),
+                "{status}: {outcome:?}"
+            );
+            assert!(world.hold().is_some(), "{status} holds the device");
+        } else {
+            assert!(
+                matches!(outcome, VoiceStartOutcome::Unavailable { .. }),
+                "{status}: {outcome:?}"
+            );
+            assert_eq!(world.hold(), None, "{status} leaves no hold");
+        }
+    }
+}
+
+/// KR-REQ-23.24: a start that names the standing action and ends unknown holds the device under
+/// its own action, which is now the one a later start has to name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_named_start_that_ends_unknown_holds_under_its_own_action() {
+    let world = HoldWorld::with(vec![
+        a_start_whose_answer_is_lost(),
+        a_start_whose_answer_is_lost(),
+    ])
+    .await;
+    world.start(None).await.expect("the host answers");
+    let first = world.hold().expect("the first start's hold").action;
+
+    let second = world
+        .start(Some(first))
+        .await
+        .expect("a start that names the standing action is admitted");
+    assert!(matches!(
+        outcome_of(&second),
+        VoiceStartOutcome::CreationUnknown { .. }
+    ));
+    let standing = world
+        .hold()
+        .expect("the second start holds the device")
+        .action;
+    assert_ne!(
+        standing, first,
+        "the hold is under the second start's own action"
+    );
+    assert_eq!(world.calls_asked(), 2);
+
+    let stale = world
+        .start(Some(first))
+        .await
+        .expect_err("the first action is no longer the one that holds the device");
+    assert_eq!(stale.code(), kr_protocol::error::ErrorCode::DraftConflict);
+    assert!(stale.to_string().contains(&standing.to_string()), "{stale}");
+    assert_eq!(world.calls_asked(), 2);
+}
+
+/// KR-REQ-23.24: a restart keeps the hold a start left, and a start that names it still passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restart_with_a_hold_standing_refuses_an_unnamed_start() {
+    let world = HoldWorld::with(vec![
+        a_start_whose_answer_is_lost(),
+        a_start_that_made_a_call("call-1"),
+    ])
+    .await;
+    world.start(None).await.expect("the host answers");
+    let first = world.hold().expect("the hold").action;
+
+    let world = world.restart().await;
+    assert_eq!(world.hold().expect("the hold survives").action, first);
+    assert_held(&world, 1).await;
+
+    let named = world
+        .start(Some(first))
+        .await
+        .expect("a start that names the standing action is admitted");
+    assert!(matches!(
+        outcome_of(&named),
+        VoiceStartOutcome::Started { .. }
+    ));
+    assert_eq!(world.hold(), None);
+}
+
+/// KR-REQ-23.24: a call this host created and could not keep is closed, and the hold ends when the
+/// service confirms the close and stays when it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_closed_after_a_grant_change_leaves_no_hold_and_one_not_closed_holds_the_device() {
+    for (closes, holds) in [
+        (a_close_that_ended("call-1"), false),
+        (a_close_that_failed("call-1"), true),
+    ] {
+        let world = HoldWorld::holding(vec![a_start_that_made_a_call("call-1"), closes]).await;
+        let (answered, ()) = tokio::join!(world.start(None), async {
+            world.service.reached().await;
+            world.regrant().await;
+            world.service.release();
+        });
+        let outcome = outcome_of(&answered.expect("the host answers"));
+        assert!(
+            matches!(&outcome, VoiceStartOutcome::Unavailable { reason, .. } if reason == "voice_grant_changed"),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            world.hold().is_some(),
+            holds,
+            "the close confirmed: {}",
+            !holds
+        );
+        if holds {
+            assert_held(&world, 1).await;
+        } else {
+            assert_eq!(world.calls_asked(), 1);
+        }
+    }
+}
+
+/// KR-REQ-23.24: a replayed call that nothing holds is closed, and the hold ends when the service
+/// confirms the close and stays when it does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_call_closed_ends_the_hold_and_one_that_fails_to_close_holds_the_device() {
+    for (closes, holds) in [
+        (a_close_that_ended("call-9"), false),
+        (a_close_that_failed("call-9"), true),
+    ] {
+        let world = HoldWorld::with(vec![a_start_that_replays_a_call("call-9"), closes]).await;
+        let answered = world.start(None).await.expect("the host answers");
+        assert!(
+            matches!(&outcome_of(&answered), VoiceStartOutcome::Unavailable { reason, .. } if reason == "session_in_progress")
+        );
+        assert_eq!(
+            world.hold().is_some(),
+            holds,
+            "the close confirmed: {}",
+            !holds
+        );
+        if holds {
+            assert_held(&world, 1).await;
+        }
+    }
+}
+
+/// KR-REQ-23.24: a replayed call that a live voice session holds is that session's, and it ends the
+/// hold without a close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayed_call_held_by_a_live_session_ends_the_hold() {
+    let world = HoldWorld::with(vec![
+        a_start_that_made_a_call("call-1"),
+        a_start_that_replays_a_call("call-1"),
+    ])
+    .await;
+    let first = world.start(None).await.expect("the host answers");
+    assert!(matches!(
+        outcome_of(&first),
+        VoiceStartOutcome::Started { .. }
+    ));
+    let second = world.start(None).await.expect("the host answers");
+    assert!(
+        matches!(&outcome_of(&second), VoiceStartOutcome::Unavailable { reason, .. } if reason == "session_in_progress")
+    );
+    assert_eq!(
+        world.hold(),
+        None,
+        "a call that a live session holds is not a hold"
+    );
+    assert_eq!(world.calls_asked(), 2);
+    assert!(
+        world
+            .service
+            .sent()
+            .iter()
+            .all(|(path, _)| !path.ends_with("/close")),
+        "the live session's call was not closed"
+    );
+}
+
+/// KR-REQ-23.24: the hold ends at its end and not before, on the host's own clocks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hold_ends_at_its_end_and_not_before() {
+    let (moved, clocks) = net_support::Moved::new();
+    let mut world = HoldWorld::on_clocks(
+        vec![
+            a_start_whose_answer_is_lost(),
+            a_start_that_made_a_call("call-1"),
+        ],
+        clocks,
+    )
+    .await;
+    world.start(None).await.expect("the host answers");
+    let held = world.hold().expect("the hold");
+
+    // Twenty seconds short of the end, by the clock the start was read on.
+    let reads = kr_ipc::now_ms().get();
+    moved.advance(std::time::Duration::from_millis(
+        held.ends_ms.saturating_sub(20_000).saturating_sub(reads),
+    ));
+    world.reconnect().await;
+    assert_held(&world, 1).await;
+
+    moved.advance(std::time::Duration::from_secs(40));
+    world.reconnect().await;
+    let after = world
+        .start(None)
+        .await
+        .expect("a start after the end is admitted");
+    assert!(matches!(
+        outcome_of(&after),
+        VoiceStartOutcome::Started { .. }
+    ));
+    assert_eq!(world.calls_asked(), 2);
+    assert_eq!(world.hold(), None);
 }
