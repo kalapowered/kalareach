@@ -8285,13 +8285,101 @@ async fn a_lost_host_path_ends_the_call_by_the_hosts_absent_rule_and_the_device_
     );
     assert_eq!(told["running"], true, "the call is not ended by two misses");
 
-    scene.link.lose_the_answer_to(None);
+    // The host stays silent: the phone ends the call at the host's absent bound.
     let ended = scene
         .state_where("the end", |state| state["ended"]["cause"] == "host_silent")
         .await;
     assert_eq!(ended["ended"]["words"], LEFT_TO_HOST_WORDS, "{ended}");
     assert!(scene.platform.count("stop") >= 1, "the media is stopped");
     scene.stop_host().await;
+}
+
+/// What the host's news about the context it was sending comes to when the call ends under it, by
+/// the cause: the side channel lost and not restored, the call's time limit, and the provider's own
+/// closure. The call's native peer looks connected throughout, so only the host's end closes the
+/// media; the owner shows that the opening context was cut, whichever cause ended the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_deadline_and_provider_closure_while_the_peer_looks_connected()
+ {
+    for (cause, word, words) in [
+        (
+            "recovery",
+            "host_sideband_lost",
+            "The host lost its connection to OpenAI and could not restore it, so the call was ended.",
+        ),
+        ("deadline", "deadline", "The call reached its time limit."),
+        (
+            "provider_closure",
+            "provider_closed",
+            "OpenAI closed the call.",
+        ),
+    ] {
+        let mut scene = own_scene(own_timings()).await;
+        let openai = scene.openai.clone().expect("an own-key scene");
+        // The provider takes no command: the host's sender is held at its first append.
+        openai.acknowledge(false);
+        let prepared = scene.prepared().await;
+        let mut request = scene.own_start_request(&prepared);
+        if cause == "deadline" {
+            request["durationSeconds"] = json!(4);
+        }
+        let answer = scene.call("voice_start", request);
+        assert!(
+            answer.is_ok(),
+            "an own-key call starts ({cause}): {answer:?}"
+        );
+        until_written(&scene, "session.thinking.append", |_| true).await;
+        assert_eq!(scene.link.sent(HostMethod::VoiceContextSend), 1, "{cause}");
+        assert_eq!(
+            scene.platform.count("stop"),
+            0,
+            "the peer is connected ({cause})"
+        );
+
+        match cause {
+            "recovery" => {
+                for _ in 0..200 {
+                    openai.fail_attach(kr_client::services::own_voice::AttachFault::Unavailable);
+                }
+                openai.drop_socket();
+            }
+            "provider_closure" => openai.event(&json!({
+                "type": "session.closed", "event_id": "e-1", "reason": "expired",
+                "session": {
+                    "id": "live_1", "model": "gpt-live-1", "status": "active", "expires_at": 1
+                },
+                "usage": { "seconds": 3 },
+            })),
+            _ => {}
+        }
+
+        let ended = scene
+            .state_where("the end the host's news brings", |state| {
+                state["ended"]["cause"] == word
+            })
+            .await;
+        assert_eq!(ended["ended"]["words"], words, "({cause}) {ended}");
+        assert!(
+            scene.platform.count("stop") >= 1,
+            "the host's end closes the media ({cause})"
+        );
+        let cut = ended["problems"]
+            .as_array()
+            .and_then(|problems| {
+                problems
+                    .iter()
+                    .find(|each| each["kind"] == "opening_context")
+            })
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            cut["words"].as_str().is_some_and(|words| words
+                .starts_with("This call may not have been given all of the host's context")
+                && words.ends_with("and did not learn whether OpenAI took the next.")),
+            "the opening context is shown as cut with its last part unconfirmed ({cause}): {ended}"
+        );
+        scene.stop_host().await;
+    }
 }
 
 /// The unknown-start notice of a call on the host's key names the charge, and the notice for a call
