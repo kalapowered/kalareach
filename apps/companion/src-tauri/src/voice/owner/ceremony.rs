@@ -33,13 +33,9 @@ use kr_protocol::method::Method;
 use kr_protocol::voice::{VoiceConfirmationRequest, VoiceDelegateResult};
 use tokio::time::Instant;
 
-use super::{
-    DELEGATION_CHALLENGE_MISMATCH, DELEGATION_CONFIRMATION, DELEGATION_CONFIRMATION_DROPPED,
-    DELEGATION_CONFIRMATION_EXPIRED, DELEGATION_HOST_REFUSED, DELEGATION_LATE,
-    DELEGATION_NO_CEREMONY, DELEGATION_NOT_CONFIRMED, DELEGATION_SESSION_NOT_NAMED, Handover,
-    Internal, Owner, Record, SPEECH_TAINTED, Why, hand_over,
-};
+use super::{Handover, Internal, Owner, Record, Why, hand_over};
 use crate::voice::confirm::{Challenge, Known, reason};
+use kr_protocol::voice_host::VoiceNote;
 
 /// A challenge the person is being asked about.
 pub(super) struct Confirming {
@@ -73,14 +69,14 @@ pub(super) struct Sealing {
 /// What the model is told of a confirmation that was stopped, for `why`.
 fn dropped_words(why: Why) -> &'static str {
     match why {
-        Why::LateFragment => DELEGATION_LATE,
-        Why::NotConfirmed => DELEGATION_NOT_CONFIRMED,
-        Why::NoCeremony => DELEGATION_NO_CEREMONY,
-        Why::ChallengeMismatch => DELEGATION_CHALLENGE_MISMATCH,
-        Why::ConfirmationExpired => DELEGATION_CONFIRMATION_EXPIRED,
-        Why::SessionNotNamed => DELEGATION_SESSION_NOT_NAMED,
-        why if why.taints() => SPEECH_TAINTED,
-        _ => DELEGATION_CONFIRMATION_DROPPED,
+        Why::LateFragment => VoiceNote::DelegationLate.words(),
+        Why::NotConfirmed => VoiceNote::DelegationNotConfirmed.words(),
+        Why::NoCeremony => VoiceNote::DelegationNoCeremony.words(),
+        Why::ChallengeMismatch => VoiceNote::DelegationChallengeMismatch.words(),
+        Why::ConfirmationExpired => VoiceNote::DelegationConfirmationExpired.words(),
+        Why::SessionNotNamed => VoiceNote::DelegationSessionNotNamed.words(),
+        why if why.taints() => VoiceNote::SpeechTainted.words(),
+        _ => VoiceNote::DelegationConfirmationDropped.words(),
     }
 }
 
@@ -98,7 +94,7 @@ impl Owner {
             // not take the confirmation. The person is not asked a second time.
             self.unsettled.remove(id);
             self.set_row(id, "host_refused", Some("confirmation_not_taken"));
-            self.tell_delegation(id, DELEGATION_HOST_REFUSED.to_owned());
+            self.tell_delegation(id, VoiceNote::DelegationHostRefused.words().to_owned());
             return;
         }
         if self.confirming.contains_key(id) {
@@ -155,7 +151,7 @@ impl Owner {
         let (shared, open) = (Arc::clone(&self.shared), Arc::new(AtomicBool::new(true)));
         let still_open = Arc::clone(&open);
         self.set_row(id, "confirmation_required", None);
-        self.tell_delegation(id, DELEGATION_CONFIRMATION.to_owned());
+        self.tell_delegation(id, VoiceNote::DelegationConfirmation.words().to_owned());
         self.confirming.insert(
             id.to_owned(),
             Confirming {

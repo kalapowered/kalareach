@@ -57,10 +57,13 @@ use kr_protocol::voice::{
     VoiceDelegationId, VoiceDelegationOutcome, VoiceSessionControl, VoiceSessionDescriptor,
     VoiceStartOutcome, VoiceStartParams, VoiceStartResult,
 };
+use kr_protocol::voice_host::VoiceNote;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 mod ceremony;
+#[cfg(test)]
+mod note_tests;
 
 use super::advice::MuteAdvice;
 use super::cause::Cause;
@@ -76,111 +79,19 @@ use crate::commands::{MUTATION_TTL, NoPreconditions};
 use crate::connection::Unopened;
 use crate::error::{CommandError, Result};
 
-/// What the model is told, once, as the call is attached: this version does not act on the host.
-const HOST_ACTIONS_UNAVAILABLE: &str = "In this version the phone cannot act on the person's \
-    computer. If the person asks for something to be done there, say that nothing can be done \
-    from this call. Do not say or imply that anything was done.";
-
-/// What the model is told, once, as the call is attached, when spoken requests may reach the host.
-const HOST_ACTIONS_AVAILABLE: &str = "The phone can ask the person's computer to read some things \
-    when the person says so clearly. What you are told about each such request is all that is \
-    known of it: do not say or imply that anything was done that you were not told was done.";
-
-/// What the model is told of a spoken request this device would not hand to the host.
-const DELEGATION_REFUSED: &str = "Nothing was done on the person's computer: what was said could \
-    not be used as a request. Say so, and ask the person to say it again.";
-
-/// What the model is told of a spoken request that was not written to the host.
-const DELEGATION_NOT_SENT: &str = "Nothing was done on the person's computer: the request was not \
-    sent. Say so, and ask the person to say it again.";
-
-/// What the model is told of a request that may have been written to the host.
-const DELEGATION_UNKNOWN: &str = "It is not known whether this was done on the person's \
-    computer. Do not say it was done and do not say it was not. Say that it is not known.";
-
-/// What the model is told of a request the host took and did not say it carried out.
-const DELEGATION_ADMITTED: &str = "The person's computer accepted the request. Whether it was \
-    carried out is not known. Do not say it was done.";
-
-/// What the model is told of a request that needs the person's confirmation on the phone, once
-/// the phone is asking for it.
-const DELEGATION_CONFIRMATION: &str = "This needs the person's confirmation on the phone's unlocked \
-    screen, which the phone is asking for now. Nothing was done yet. Do not say it was done.";
-
-/// What the model is told when the person did not confirm.
-const DELEGATION_NOT_CONFIRMED: &str = "The person did not confirm it on the phone, so nothing was \
-    done. Say so, and say it can be asked for again.";
-
-/// What the model is told when the phone could not ask the person to confirm.
-const DELEGATION_NO_CEREMONY: &str = "Nothing was done: this phone cannot ask the person to confirm \
-    on its unlocked screen. Say so.";
-
-/// What the model is told when the computer's request for a confirmation was not one the phone
-/// could put to the person.
-const DELEGATION_CHALLENGE_MISMATCH: &str = "Nothing was done: what the computer asked the person to \
-    confirm was not what was said, so the person was not asked. Say so, and ask the person to say it \
-    again.";
-
-/// What the model is told when the phone's own clock says the confirmation ran out.
-const DELEGATION_CONFIRMATION_EXPIRED: &str = "Nothing was done: this phone's clock says the \
-    confirmation ran out. Say so, and ask the person to say it again.";
-
-/// What the model is told when the number of the session a confirmation is for could not be read
-/// from the computer, so the person could not be told which session it is about.
-const DELEGATION_SESSION_NOT_NAMED: &str = "Nothing was done: this phone could not read the \
-    session's number from the person's computer, so the person was not asked. Say so, and ask the \
-    person to say it again.";
-
-/// What the model is told when the confirmation was dropped before it was sent.
-const DELEGATION_CONFIRMATION_DROPPED: &str = "Nothing was done: the confirmation was not sent. Say \
-    so, and ask the person to say it again.";
-
-/// What the model is told of a request the host refused.
-const DELEGATION_HOST_REFUSED: &str = "The person's computer refused the request. Nothing was \
-    done. Say so.";
-
-/// What the model is told of a request that more speech then showed was not complete.
-const DELEGATION_LATE: &str = "More was said that belongs to this request after it was read, so \
-    the request is not carried out. Say so, and ask the person to say it again.";
-
-/// What the model is told, once, when the call can no longer hand a spoken request to the host.
-const SPEECH_TAINTED: &str = "This call can no longer act on what the person says: part of it \
-    may not have been heard or recorded here. Nothing is done on the person's computer from this \
-    call. Say so if asked.";
-
 /// What a person is told, once, of the same.
 const SPEECH_TAINTED_PERSON: &str = "This call can no longer act on spoken requests: part of what \
     was said may not have been heard or read. Nothing more is asked of the computer by voice in \
     this call.";
 
-/// What leads a result the host performed, which is then the host's own bounded summary.
-const DELEGATION_PERFORMED: &str = "The person's computer read it. Say what it reports:";
-
 /// What an end says of requests that may have been written and not answered.
 pub(super) const REQUESTS_UNSETTLED: &str = "A request you spoke may or may not have been carried out: look \
     at the session list.";
-
-/// What the model is told when the host is back and spoken requests may reach it: it does not say
-/// that nothing was done, since a request written before the loss may have been.
-const HOST_BACK_ACCEPTING: &str = "The phone is in contact with the person's computer again.";
-
-/// What the model is told of a delegation: nothing was done.
-const NOTHING_WAS_DONE: &str = "Nothing was done on the person's computer: this version does not \
-    act on spoken requests. Say so.";
 
 /// What a person is told while the check of a host path that was lost does not reach the host, in the
 /// place of what an earlier check said.
 const HOST_NOT_REACHED: &str =
     "The host could not be reached. So it is not known whether the host still has the call.";
-
-/// What the model is told when the phone has lost the host.
-const HOST_LOST: &str = "The phone has lost contact with the person's computer. The call goes on, \
-    but nothing can be read from or done on the computer until it is back. Do not say or imply \
-    that anything was done there.";
-
-/// What the model is told when the host is back.
-const HOST_BACK: &str = "The phone is in contact with the person's computer again. Nothing was \
-    done there while it was away.";
 
 /// What a person is told of a revocation a process left owed while a call ran: it ended, and may
 /// not have told the host.
@@ -1634,15 +1545,19 @@ impl Owner {
                         VoiceCommand::Instructions,
                         None,
                         if self.accepting {
-                            HOST_ACTIONS_AVAILABLE
+                            VoiceNote::HostActionsAvailable.words()
                         } else {
-                            HOST_ACTIONS_UNAVAILABLE
+                            VoiceNote::HostActionsUnavailable.words()
                         },
                     );
                     self.give_the_host_context();
                     // A call that was tainted before its control attached tells the model now.
                     if self.taint_told {
-                        self.tell_model(VoiceCommand::Instructions, None, SPEECH_TAINTED);
+                        self.tell_model(
+                            VoiceCommand::Instructions,
+                            None,
+                            VoiceNote::SpeechTainted.words(),
+                        );
                     }
                 }
                 for delegation_id in delegations {
@@ -1704,7 +1619,7 @@ impl Owner {
                 .send(
                     VoiceCommand::Commentary,
                     Some(&delegation_id),
-                    Some(NOTHING_WAS_DONE),
+                    Some(VoiceNote::NothingWasDone.words()),
                 )
                 .await
                 .is_ok();
@@ -1927,10 +1842,18 @@ impl Owner {
             // What was not written before the loss stays unwritten; what may have been is asked
             // about again, now that there is a connection to ask on.
             self.unsent = Arc::new(AtomicBool::new(false));
-            self.tell_model(VoiceCommand::Instructions, None, HOST_BACK_ACCEPTING);
+            self.tell_model(
+                VoiceCommand::Instructions,
+                None,
+                VoiceNote::HostBackAccepting.words(),
+            );
             self.ask_after_attempts();
         } else {
-            self.tell_model(VoiceCommand::Instructions, None, HOST_BACK);
+            self.tell_model(
+                VoiceCommand::Instructions,
+                None,
+                VoiceNote::HostBack.words(),
+            );
         }
     }
 
@@ -1939,7 +1862,11 @@ impl Owner {
         if !self.host_lost {
             self.host_lost = true;
             self.view(|state| state.host = "lost".to_owned());
-            self.tell_model(VoiceCommand::Instructions, None, HOST_LOST);
+            self.tell_model(
+                VoiceCommand::Instructions,
+                None,
+                VoiceNote::HostLost.words(),
+            );
             if self.accepting {
                 self.host_path_lost();
             }
@@ -2019,7 +1946,11 @@ impl Owner {
                 SPEECH_TAINTED_PERSON.to_owned(),
             )
         });
-        self.tell_model(VoiceCommand::Instructions, None, SPEECH_TAINTED);
+        self.tell_model(
+            VoiceCommand::Instructions,
+            None,
+            VoiceNote::SpeechTainted.words(),
+        );
     }
 
     /// Changes the row of the delegation `id`: what became of it, and why.
@@ -2062,9 +1993,9 @@ impl Owner {
         self.tell_delegation(
             id,
             if why.taints() {
-                SPEECH_TAINTED
+                VoiceNote::SpeechTainted.words()
             } else {
-                DELEGATION_REFUSED
+                VoiceNote::DelegationRefused.words()
             }
             .to_owned(),
         );
@@ -2076,9 +2007,9 @@ impl Owner {
         self.tell_delegation(
             id,
             if why.taints() {
-                SPEECH_TAINTED
+                VoiceNote::SpeechTainted.words()
             } else {
-                DELEGATION_NOT_SENT
+                VoiceNote::DelegationNotSent.words()
             }
             .to_owned(),
         );
@@ -2366,13 +2297,13 @@ impl Owner {
             Delivered::Refused => {
                 self.unsettled.remove(id);
                 self.set_row(id, "host_refused", Some("host_answer"));
-                self.tell_delegation(id, DELEGATION_HOST_REFUSED.to_owned());
+                self.tell_delegation(id, VoiceNote::DelegationHostRefused.words().to_owned());
             }
             // A receipt shows that the host holds the action and never what became of it, so it is
             // no decision: the person and the model are told it is not known.
             Delivered::Receipt => {
                 self.set_row(id, "unknown", Some("receipt"));
-                self.tell_delegation(id, DELEGATION_UNKNOWN.to_owned());
+                self.tell_delegation(id, VoiceNote::DelegationUnknown.words().to_owned());
             }
             Delivered::Withheld(why) => {
                 self.unsettled.remove(id);
@@ -2387,7 +2318,7 @@ impl Owner {
             }
             Delivered::Unknown => {
                 self.set_row(id, "unknown", None);
-                self.tell_delegation(id, DELEGATION_UNKNOWN.to_owned());
+                self.tell_delegation(id, VoiceNote::DelegationUnknown.words().to_owned());
                 if let Some(composed) = composed {
                     self.attempts.insert(
                         id.to_owned(),
@@ -2771,20 +2702,22 @@ fn answered_as(outcome: &VoiceDelegationOutcome) -> (&'static str, Option<&'stat
         VoiceDelegationOutcome::Performed { summary, .. } => (
             "performed",
             None,
-            format!("{DELEGATION_PERFORMED} {summary}"),
+            format!("{} {summary}", VoiceNote::DelegationPerformed.words()),
         ),
-        VoiceDelegationOutcome::Admitted { .. } => {
-            ("admitted", None, DELEGATION_ADMITTED.to_owned())
-        }
+        VoiceDelegationOutcome::Admitted { .. } => (
+            "admitted",
+            None,
+            VoiceNote::DelegationAdmitted.words().to_owned(),
+        ),
         VoiceDelegationOutcome::ConfirmationRequired { .. } => (
             "confirmation_required",
             None,
-            DELEGATION_CONFIRMATION.to_owned(),
+            VoiceNote::DelegationConfirmation.words().to_owned(),
         ),
         VoiceDelegationOutcome::Refused { reason, .. } => (
             "host_refused",
             Some(reason.as_str()),
-            DELEGATION_HOST_REFUSED.to_owned(),
+            VoiceNote::DelegationHostRefused.words().to_owned(),
         ),
     }
 }
@@ -3225,14 +3158,20 @@ mod tests {
         });
         assert_eq!((state, cause), ("admitted", None));
         assert!(told.contains("not known"), "{told}");
-        assert!(!told.starts_with(DELEGATION_PERFORMED), "{told}");
+        assert!(
+            !told.starts_with(VoiceNote::DelegationPerformed.words()),
+            "{told}"
+        );
 
         let (state, _, told) = answered_as(&VoiceDelegationOutcome::Performed {
             action_id,
             summary: "session one is running".to_owned(),
         });
         assert_eq!(state, "performed");
-        assert!(told.starts_with(DELEGATION_PERFORMED), "{told}");
+        assert!(
+            told.starts_with(VoiceNote::DelegationPerformed.words()),
+            "{told}"
+        );
         assert!(told.ends_with("session one is running"), "{told}");
 
         let (state, cause, _) = answered_as(&VoiceDelegationOutcome::Refused {
