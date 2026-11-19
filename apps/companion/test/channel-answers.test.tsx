@@ -13,6 +13,7 @@ import userEvent from '@testing-library/user-event'
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
+import { endsAsChannelAnswer } from '../src/model/receipts'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
@@ -75,5 +76,19 @@ describe('an answer a channel took', () => {
     await waitFor(() => {
       expect(controls.releasedActions).toHaveLength(1)
     })
+  })
+})
+
+describe('an unknown outcome that is not a channel end', () => {
+  const unknown = { receipt: null, value: null, action_id: 'action-1', answer_lost: false }
+
+  it('keeps the host’s own words and is never let go, whatever the package', () => {
+    // The host's own word that it cannot tell, for a package that confirms answers: not a channel end.
+    expect(endsAsChannelAnswer(unknown, false)).toBe(false)
+    // The same word for a channel package is one.
+    expect(endsAsChannelAnswer(unknown, true)).toBe(true)
+    // A lost answer is not one for any package.
+    expect(endsAsChannelAnswer({ ...unknown, answer_lost: true }, true)).toBe(false)
+    expect(endsAsChannelAnswer({ ...unknown, answer_lost: true }, false)).toBe(false)
   })
 })
