@@ -37,9 +37,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kr_plugin_sdk::hook_events::{CONTACT_REQUEST_MEMBER, HookEvent, HookEvents, HookReport};
-use serde::de::{
-    DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Unexpected, Visitor,
-};
+use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
 use crate::exchange::Exchange;
 use crate::registration::{Bridge, Paths, Registration};
@@ -340,27 +338,34 @@ pub fn answered_after(diagnostic: &str) -> Option<Duration> {
 /// its session-start hooks have finished. A thread's report is then held until
 /// [`THREAD_REPORT_LINGER`] after `started`.
 fn observe(application: &Application, started: std::time::Instant) -> Result<(), String> {
-    kr_ipc::install::this_process().map_err(|error| error.to_string())?;
+    let held = kr_ipc::install::this_process()
+        .map(|_| ())
+        .map_err(|error| error.to_string());
     // Before the input is read: the forwarder of the worker's own release is given it. It is a
     // reason to go on directly when that one cannot be started.
     #[cfg(unix)]
-    let _ = crate::helper::hand_over(REGISTRATION_WAIT, Some((started, HOOK_DEADLINE)));
+    if held.is_ok() {
+        let _ = crate::helper::hand_over(REGISTRATION_WAIT, Some((started, HOOK_DEADLINE)));
+    }
+    // However the run ends from here on, the application's write of its input completes: what
+    // ends the run without a report reads the input to its end first.
     let mut stdin = std::io::stdin().lock();
+    if let Err(error) = held {
+        return end_unreported(&mut stdin, error);
+    }
     // Outside a launch there is nobody to tell, and the answer is the same neutral one.
     let Some(paths) = Paths::from_environment() else {
         return drain_input(&mut stdin);
     };
     // The registration comes first: the events the launch's package declares decide how the input
-    // is read. A run that reports nothing still reads its input to the end, so the application's
-    // write completes.
+    // is read.
     let registration = match Registration::read(&paths, REGISTRATION_WAIT) {
         Ok(registration) => registration,
-        Err(error) => {
-            drain_input(&mut stdin)?;
-            return Err(error.to_string());
-        }
+        Err(error) => return end_unreported(&mut stdin, error.to_string()),
     };
-    let input = read_input(&mut stdin, &registration.events)?;
+    let Some(input) = read_input(&mut stdin, &registration.events)? else {
+        return Ok(());
+    };
     let Some(observation) = observation(&registration.events, &input) else {
         return Ok(());
     };
@@ -392,6 +397,15 @@ fn drain_input(input: impl std::io::Read) -> Result<(), String> {
     std::io::copy(&mut input.take(MAX_HOOK_INPUT_BYTES), &mut std::io::sink())
         .map(|_| ())
         .map_err(|error| format!("the hook's input could not be read: {error}"))
+}
+
+/// Ends a run that reports nothing and says `why`, once the input is read to its end.
+///
+/// What went wrong is what the run says; a failure to read the rest of the input has nothing to add
+/// to it.
+fn end_unreported(input: impl std::io::Read, why: String) -> Result<(), String> {
+    let _ = drain_input(input);
+    Err(why)
 }
 
 /// Delivers one observation over an exchange whose hello has just been written, and waits until the
@@ -500,6 +514,11 @@ impl Node {
         !self.slots.is_empty() && self.slots.iter().all(|slot| *slot == Slot::RequestId)
     }
 
+    /// Whether the event is read at this member or below it.
+    fn reaches_event(&self) -> bool {
+        self.slots.contains(&Slot::Event) || self.children.values().any(Self::reaches_event)
+    }
+
     fn at(&mut self, names: &[&str]) -> &mut Self {
         let mut node = self;
         for name in names {
@@ -545,33 +564,54 @@ impl Node {
     }
 }
 
+/// What the read of one input has found.
+#[derive(Default)]
+struct Reading {
+    /// The strings at the places the events name.
+    found: BTreeMap<Slot, String>,
+    /// The first fault of a member, kept and not raised: an event the map does not name is no
+    /// concern of the map's, whatever else its input holds.
+    fault: Option<String>,
+}
+
+impl Reading {
+    fn fault(&mut self, fault: String) {
+        self.fault.get_or_insert(fault);
+    }
+}
+
 /// Reads a hook's input along the tree, holding the strings at the places it names and skipping
 /// everything else.
 struct Descend<'a> {
     node: &'a Node,
-    found: &'a mut BTreeMap<Slot, String>,
+    reading: &'a mut Reading,
 }
 
 impl Descend<'_> {
-    fn required(&self) -> bool {
-        self.node
-            .slots
-            .iter()
-            .any(|slot| matches!(slot, Slot::Event | Slot::Thread))
+    /// What this member is read as, for what is said of one that holds something else.
+    fn expected(&self) -> &'static str {
+        if self.node.children.is_empty() {
+            "a string"
+        } else {
+            "a hook's input"
+        }
+    }
+
+    /// A member that holds `held`, where `self.expected()` is read.
+    fn wrong(&mut self, held: &str) {
+        let fault = format!("a member holds {held}, where {} is read", self.expected());
+        self.reading.fault(fault);
     }
 
     /// A value that is not a string. A member that is only the contact's request identifier takes
     /// it as no value, and so does the contact tool's input, which is read for one member and
     /// skipped when it is not an object; every other place the events name refuses it.
-    fn not_a_string<E: serde::de::Error>(self, what: Unexpected<'_>) -> Result<(), E> {
+    fn not_a_string(mut self, held: &str) {
         if self.node.lenient() {
-            self.found.remove(&Slot::RequestId);
-            return Ok(());
+            self.reading.found.remove(&Slot::RequestId);
+        } else if !self.node.contact_input {
+            self.wrong(held);
         }
-        if self.node.contact_input {
-            return Ok(());
-        }
-        Err(E::invalid_type(what, &self))
     }
 }
 
@@ -590,21 +630,18 @@ impl<'de> Visitor<'de> for Descend<'_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(if self.node.children.is_empty() {
-            "a string"
-        } else {
-            "a hook's input"
-        })
+        formatter.write_str(self.expected())
     }
 
-    fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+    fn visit_map<A>(mut self, mut map: A) -> Result<(), A::Error>
     where
         A: MapAccess<'de>,
     {
         if self.node.children.is_empty() {
             // A member read as a string, holding an object.
             while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-            return self.not_a_string(Unexpected::Map);
+            self.not_a_string("an object");
+            return Ok(());
         }
         let mut seen: Vec<String> = Vec::new();
         while let Some(key) = map.next_key::<String>()? {
@@ -613,12 +650,17 @@ impl<'de> Visitor<'de> for Descend<'_> {
                 continue;
             };
             if !child.lenient() && seen.contains(&key) {
-                return Err(A::Error::custom(format!("duplicate field `{key}`")));
+                let fault = format!("`{key}` is held twice");
+                // Which of two events the input names cannot be told.
+                if child.reaches_event() {
+                    return Err(A::Error::custom(fault));
+                }
+                self.reading.fault(fault);
             }
             seen.push(key);
             map.next_value_seed(Descend {
                 node: child,
-                found: &mut *self.found,
+                reading: &mut *self.reading,
             })?;
         }
         Ok(())
@@ -629,100 +671,125 @@ impl<'de> Visitor<'de> for Descend<'_> {
         A: SeqAccess<'de>,
     {
         while sequence.next_element::<IgnoredAny>()?.is_some() {}
-        self.not_a_string(Unexpected::Seq)
+        self.not_a_string("an array");
+        Ok(())
     }
 
-    fn visit_str<E>(self, value: &str) -> Result<(), E>
+    fn visit_str<E>(mut self, value: &str) -> Result<(), E>
     where
         E: serde::de::Error,
     {
         if self.node.slots.is_empty() {
             // A member the events read below it, holding a string.
-            return if self.node.contact_input {
-                Ok(())
-            } else {
-                Err(E::invalid_type(Unexpected::Str(value), &self))
-            };
+            if !self.node.contact_input {
+                self.wrong("a string");
+            }
+            return Ok(());
         }
         for slot in &self.node.slots {
-            self.found.insert(*slot, value.to_owned());
+            self.reading.found.insert(*slot, value.to_owned());
         }
         Ok(())
     }
 
-    fn visit_bool<E>(self, value: bool) -> Result<(), E>
+    fn visit_bool<E>(self, _: bool) -> Result<(), E>
     where
         E: serde::de::Error,
     {
-        self.not_a_string(Unexpected::Bool(value))
+        self.not_a_string("a boolean");
+        Ok(())
     }
 
-    fn visit_i64<E>(self, value: i64) -> Result<(), E>
+    fn visit_i64<E>(self, _: i64) -> Result<(), E>
     where
         E: serde::de::Error,
     {
-        self.not_a_string(Unexpected::Signed(value))
+        self.not_a_string("a number");
+        Ok(())
     }
 
-    fn visit_u64<E>(self, value: u64) -> Result<(), E>
+    fn visit_u64<E>(self, _: u64) -> Result<(), E>
     where
         E: serde::de::Error,
     {
-        self.not_a_string(Unexpected::Unsigned(value))
+        self.not_a_string("a number");
+        Ok(())
     }
 
-    fn visit_f64<E>(self, value: f64) -> Result<(), E>
+    fn visit_f64<E>(self, _: f64) -> Result<(), E>
     where
         E: serde::de::Error,
     {
-        self.not_a_string(Unexpected::Float(value))
+        self.not_a_string("a number");
+        Ok(())
     }
 
-    fn visit_unit<E>(self) -> Result<(), E>
+    fn visit_unit<E>(mut self) -> Result<(), E>
     where
         E: serde::de::Error,
     {
-        if self.required() {
-            return Err(E::invalid_type(Unexpected::Unit, &"a string"));
-        }
-        if self.node.lenient() {
-            self.found.remove(&Slot::RequestId);
+        if self
+            .node
+            .slots
+            .iter()
+            .any(|slot| matches!(slot, Slot::Event | Slot::Thread))
+        {
+            self.wrong("null");
+        } else if self.node.lenient() {
+            self.reading.found.remove(&Slot::RequestId);
         }
         Ok(())
     }
 }
 
 /// Reads and parses one hook's input at the places `events` names, bounded by
-/// [`MAX_HOOK_INPUT_BYTES`].
+/// [`MAX_HOOK_INPUT_BYTES`], and reads the rest of it however the read ends, so an application's
+/// write of a large input completes.
 ///
 /// A member the events do not name is skipped as it is read. A member they name is a string, or
-/// null where it is optional, or absent; an event and a session that are absent, null or not a
-/// string, a named member held twice and a named object that is not one are not an event this
-/// bridge reads.
+/// null where it is optional, or absent. `None` is an event the events do not name: it reports
+/// nothing and is no fault, whatever else its input holds. An input that is not JSON, an event
+/// that is absent, null, not a string or named twice, and, for an event the events name, a session
+/// that is absent, null or not a string, a named member of the wrong type or held twice and a
+/// named object that is not one are not an event this bridge reads.
 ///
 /// # Errors
 ///
 /// Returns what went wrong for a payload that is not a hook's input or is past the bound.
-pub fn read_input(input: impl std::io::Read, events: &HookEvents) -> Result<Observed, String> {
+pub fn read_input(
+    input: impl std::io::Read,
+    events: &HookEvents,
+) -> Result<Option<Observed>, String> {
     let tree = Node::of(events);
-    let mut found = BTreeMap::new();
-    let reader = std::io::BufReader::new(input.take(MAX_HOOK_INPUT_BYTES));
-    let mut deserializer = serde_json::Deserializer::from_reader(reader);
-    Descend {
-        node: &tree,
-        found: &mut found,
-    }
-    .deserialize(&mut deserializer)
-    .and_then(|()| deserializer.end())
-    .map_err(|error| format!("the hook's input is not an event this bridge reads: {error}"))?;
-    let mut take = |slot| found.remove(&slot);
-    let (Some(event), Some(thread)) = (take(Slot::Event), take(Slot::Thread)) else {
-        return Err(
-            "the hook's input is not an event this bridge reads: it names no event or no session"
-                .to_owned(),
-        );
+    let mut reading = Reading::default();
+    let mut reader = std::io::BufReader::new(input.take(MAX_HOOK_INPUT_BYTES));
+    let parsed = {
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+        Descend {
+            node: &tree,
+            reading: &mut reading,
+        }
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
     };
-    Ok(Observed {
+    let drained = drain_input(&mut reader);
+    let refused = |why: &str| format!("the hook's input is not an event this bridge reads: {why}");
+    parsed.map_err(|error| refused(&error.to_string()))?;
+    drained?;
+    let Some(event) = reading.found.remove(&Slot::Event) else {
+        return Err(refused(reading.fault.as_deref().unwrap_or("it names no event")));
+    };
+    if !events.events.iter().any(|named| named.name == event) {
+        return Ok(None);
+    }
+    if let Some(fault) = &reading.fault {
+        return Err(refused(fault));
+    }
+    let Some(thread) = reading.found.remove(&Slot::Thread) else {
+        return Err(refused("it names no session"));
+    };
+    let mut take = |slot| reading.found.remove(&slot);
+    Ok(Some(Observed {
         thread,
         event,
         start_source: take(Slot::StartSource),
@@ -737,7 +804,7 @@ pub fn read_input(input: impl std::io::Read, events: &HookEvents) -> Result<Obse
             .map_or(0, |contact| contact.agreeing.len()))
             .map(|index| take(Slot::Agreeing(index)))
             .collect(),
-    })
+    }))
 }
 
 /// Translates one hook's input into the observation the worker reads, or `None` for an event
@@ -1452,7 +1519,7 @@ mod tests {
     }
 
     fn translated(events: &HookEvents, payload: &serde_json::Value) -> Option<serde_json::Value> {
-        let input = read_input(payload.to_string().as_bytes(), events).expect("a hook's input");
+        let input = read_input(payload.to_string().as_bytes(), events).expect("a hook's input")?;
         observation(events, &input).map(|frame| frame["kr_observation"].clone())
     }
 
@@ -1516,7 +1583,8 @@ mod tests {
                         .as_bytes(),
                     &events,
                 )
-                .expect("a hook's input");
+                .expect("a hook's input")
+                .expect("an event the map names");
                 assert_eq!(
                     reports_thread(&events, &input),
                     matches!(
@@ -1775,7 +1843,7 @@ mod tests {
         fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
             let events = HookEvents::claude_code();
             let input =
-                read_input(payload.to_string().as_bytes(), &events).expect("a hook's input");
+                read_input(payload.to_string().as_bytes(), &events).expect("a hook's input")?;
             observation(&events, &input).map(|frame| frame["kr_observation"].clone())
         }
 
@@ -1887,7 +1955,7 @@ mod tests {
         fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
             let events = HookEvents::claude_code();
             let input =
-                read_input(payload.to_string().as_bytes(), &events).expect("a hook's input");
+                read_input(payload.to_string().as_bytes(), &events).expect("a hook's input")?;
             observation(&events, &input).map(|frame| frame["kr_observation"].clone())
         }
 
@@ -2109,14 +2177,18 @@ mod tests {
         ] {
             assert!(refused(text), "{text}");
         }
-        let read = |text: &str| read_input(text.as_bytes(), &events).expect(text);
+        let read = |text: &str| {
+            read_input(text.as_bytes(), &events)
+                .expect(text)
+                .expect(text)
+        };
         assert_eq!(
             read(r#"{"session_id":"s","hook_event_name":"SessionStart","source":null}"#)
                 .start_source,
             None
         );
         assert_eq!(
-            read(r#"{"session_id":"s","hook_event_name":"X","other":1,"other":2}"#).thread,
+            read(r#"{"session_id":"s","hook_event_name":"SessionStart","other":1,"other":2}"#).thread,
             "s"
         );
         for text in [
@@ -2211,7 +2283,9 @@ mod tests {
                 let outcome = read(&members);
                 assert!(outcome.is_err(), "{role} {members}: {outcome:?}");
             }
-            let alone = read(&format!(r#""request_id":"{held}""#)).expect("one string value");
+            let alone = read(&format!(r#""request_id":"{held}""#))
+                .expect("one string value")
+                .expect("a named event");
             assert_eq!(alone.tool_request_id.as_deref(), Some(held), "{role}");
             let named = if role == "event" {
                 Some(alone.event.as_str())
@@ -2219,6 +2293,129 @@ mod tests {
                 alone.tool_name.as_deref()
             };
             assert_eq!(named, Some(held), "{role}");
+        }
+    }
+
+    /// An event the events do not name reports nothing and is no fault, whatever else its input
+    /// holds: a member of the wrong type, one held twice, or no session at all. The same faults in
+    /// an event they name are refused. An event that cannot be told, because the input is not JSON
+    /// or the event is not one string, is refused either way.
+    #[test]
+    fn an_event_the_map_does_not_name_is_no_fault_whatever_else_the_input_holds() {
+        let events = HookEvents::claude_code();
+        let faults = [
+            r#","source":3"#,
+            r#","source":["a"]"#,
+            r#","source":{"a":1}"#,
+            r#","source":"a","source":"b""#,
+            r#","session_id":["s"]"#,
+            r#","session_id":null"#,
+            r#","session_id":"s","session_id":"t""#,
+            r#","mcp_server":"kalareach""#,
+            r#","tool_input":{"request_id":{"a":1}}"#,
+        ];
+        for fault in faults {
+            let input = |event: &str| format!(r#"{{"hook_event_name":"{event}"{fault}}}"#);
+            let unnamed = read_input(input("Elsewhere").as_bytes(), &events);
+            assert!(matches!(unnamed, Ok(None)), "{fault}: {unnamed:?}");
+        }
+        let unnamed_without_a_session =
+            read_input(&br#"{"hook_event_name":"Elsewhere"}"#[..], &events);
+        assert!(matches!(unnamed_without_a_session, Ok(None)));
+        for fault in &faults[..8] {
+            let named = format!(r#"{{"session_id":"s","hook_event_name":"SessionStart"{fault}}}"#);
+            let read = read_input(named.as_bytes(), &events);
+            assert!(read.is_err(), "{fault}: {read:?}");
+        }
+        for text in [
+            "not json",
+            r#"{"hook_event_name":3}"#,
+            r#"{"hook_event_name":null}"#,
+            r#"{"hook_event_name":["Elsewhere"]}"#,
+            r#"{"hook_event_name":"Elsewhere","hook_event_name":"Elsewhere"}"#,
+            r#"{"hook_event_name":"Elsewhere"} {}"#,
+            r#"{"hook_event_name":"Elsewhere""#,
+        ] {
+            let read = read_input(text.as_bytes(), &events);
+            assert!(read.is_err(), "{text}: {read:?}");
+        }
+    }
+
+    /// A reader that counts what it has given.
+    struct Counted<R> {
+        inner: R,
+        given: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for Counted<R> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read = self.inner.read(buffer)?;
+            self.given.set(self.given.get() + read);
+            Ok(read)
+        }
+    }
+
+    /// However a read ends, whether the input is not JSON, names its event twice, holds a member of
+    /// the wrong type, holds something after its object, or is for an event the events do not name,
+    /// the whole of the input has been read when it returns: an application's write of a large
+    /// input does not complete until it is.
+    #[test]
+    fn a_read_ends_only_at_the_end_of_the_input_however_it_goes() {
+        let events = HookEvents::claude_code();
+        let tail = 1024 * 1024;
+        for (name, prefix, suffix, shape) in [
+            ("not json", "not json", "", "refused"),
+            (
+                "an event named twice",
+                r#"{"hook_event_name":"SessionStart","hook_event_name":"SessionEnd","tool_response":""#,
+                r#""}"#,
+                "refused",
+            ),
+            (
+                "a member of the wrong type",
+                r#"{"session_id":"s","hook_event_name":"SessionStart","source":3,"tool_response":""#,
+                r#""}"#,
+                "refused",
+            ),
+            (
+                "something after the object",
+                r#"{"session_id":"s","hook_event_name":"SessionStart"} "#,
+                "",
+                "refused",
+            ),
+            (
+                "an event the events do not name",
+                r#"{"session_id":"s","hook_event_name":"Elsewhere","source":3,"tool_response":""#,
+                r#""}"#,
+                "unnamed",
+            ),
+            (
+                "an event they name",
+                r#"{"session_id":"s","hook_event_name":"SessionStart","tool_response":""#,
+                r#""}"#,
+                "read",
+            ),
+        ] {
+            let given = std::rc::Rc::new(std::cell::Cell::new(0));
+            let reader = Counted {
+                inner: prefix
+                    .as_bytes()
+                    .chain(std::io::repeat(b'x').take(tail as u64))
+                    .chain(suffix.as_bytes()),
+                given: given.clone(),
+            };
+            let read = read_input(reader, &events);
+            let found = match &read {
+                Err(_) => "refused",
+                Ok(None) => "unnamed",
+                Ok(Some(_)) => "read",
+            };
+            assert_eq!(found, shape, "{name}: {read:?}");
+            assert_eq!(
+                given.get(),
+                prefix.len() + tail + suffix.len(),
+                "{name}: the input is read to its end"
+            );
         }
     }
 }

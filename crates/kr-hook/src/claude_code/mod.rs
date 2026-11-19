@@ -22,7 +22,7 @@ mod tests {
     fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
         let events = kr_plugin_sdk::hook_events::HookEvents::claude_code();
         let input = crate::hook::read_input(payload.to_string().as_bytes(), &events)
-            .expect("a hook's input");
+            .expect("a hook's input")?;
         crate::hook::observation(&events, &input).map(|frame| frame["kr_observation"].clone())
     }
 
