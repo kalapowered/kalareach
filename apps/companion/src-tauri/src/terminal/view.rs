@@ -1515,9 +1515,11 @@ impl View {
 
     /// Tells the page of moves that have settled since it was last told, when the screen it draws
     /// holds them. A screen that waits for its answer is not the page's yet, so nothing is told
-    /// with it.
+    /// with it. While a restore has shown no screen, the state carries none, and the moves it
+    /// settled are told without one.
     fn tell(&mut self) {
-        if !self.held && self.window.told(self.drawn) != self.told {
+        let screenless = !self.showing && self.window.holds_restore();
+        if (!self.held || screenless) && self.window.told(self.drawn) != self.told {
             self.publish_state();
         }
     }
