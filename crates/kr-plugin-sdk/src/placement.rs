@@ -186,6 +186,8 @@ pub enum PlacementRefusal {
     TailDuplicate,
     /// The placement names no file, or more than eight.
     NoFile,
+    /// A file's shape has a root that is not an object or a map.
+    FileNotAnObject,
     /// A shape nests deeper than eight.
     ShapeTooDeep,
     /// An object shape names a member twice.
@@ -216,6 +218,7 @@ impl PlacementRefusal {
             Self::TailNotPlain => "placement.tail_not_plain",
             Self::TailDuplicate => "placement.tail_duplicate",
             Self::NoFile => "placement.no_file",
+            Self::FileNotAnObject => "placement.file_not_an_object",
             Self::ShapeTooDeep => "placement.shape_too_deep",
             Self::ShapeMemberDuplicate => "placement.shape_member_duplicate",
             Self::ShapeHasNoCommand => "placement.shape_has_no_command",
@@ -540,6 +543,16 @@ impl Placement {
                 found.push(PlacementError::new(
                     PlacementRefusal::TailDuplicate,
                     format!("{:?} is named twice", placed.tail),
+                ));
+            }
+            if !matches!(placed.shape, Shape::Object { .. } | Shape::Map { .. }) {
+                found.push(PlacementError::new(
+                    PlacementRefusal::FileNotAnObject,
+                    format!(
+                        "{:?} has a shape whose root is not an object or a map; the root of a \
+                         placed file must be one of the two",
+                        placed.tail
+                    ),
                 ));
             }
             placed.shape.refusals(1, &mut found);

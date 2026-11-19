@@ -6631,6 +6631,57 @@ fn a_declared_shape_cannot_hide_a_command_from_the_walker() {
     assert_eq!(site.tree(), before, "nothing was written");
 }
 
+/// KR-REQ-11.44: a file a declared placement gives an array for its root is read exactly, whole,
+/// like every other: a name repeated in an object inside it refuses the file, in either order and
+/// when the repeat is spelt with an escape, and nothing is written. The placement is held here
+/// directly, as a controller that did not check the table would hold it: the strict reader is the
+/// floor under the declaration's own check.
+#[cfg(unix)]
+#[test]
+fn a_registration_file_with_an_array_root_and_a_repeated_member_is_refused_before_any_write() {
+    for (what, hooks) in [
+        (
+            "the forwarder last",
+            r#"[{"type": "command", "command": "other", "command": "{kr_hook} quill-cli hook"}]"#,
+        ),
+        (
+            "the forwarder first",
+            r#"[{"type": "command", "command": "{kr_hook} quill-cli hook", "command": "other"}]"#,
+        ),
+        (
+            "spelt with an escape",
+            r#"[{"type": "command", "comm\u0061nd": "other", "command": "{kr_hook} quill-cli hook"}]"#,
+        ),
+    ] {
+        let site = QuillSite::new();
+        site.package(hooks.as_bytes());
+        let mut placement = quill_placement(&[".quill"]);
+        for file in &mut placement.files {
+            if file.tail == "hooks/hooks.json" {
+                file.shape = serde_json::from_value(serde_json::json!({
+                    "kind": "array", "items": {"kind": "command_handler"}
+                }))
+                .expect("a shape");
+            }
+        }
+        let release = site.release(
+            "kalareach/quill",
+            "quill-bridge",
+            Declared::Placement(Box::new(placement)),
+        );
+        let before = site.tree();
+        let settled = site
+            .bridges()
+            .reconcile(&quill_id(), Some(&release))
+            .expect("reconciles");
+        assert!(
+            matches!(&settled, Settled::Refused(reason) if reason.contains("no repeated member")),
+            "{what}: {settled:?}"
+        );
+        assert_eq!(site.tree(), before, "{what}: nothing was written");
+    }
+}
+
 /// KR-REQ-11.44: the compiled layouts the host holds as data are the layouts an earlier controller
 /// places by, field by field; a default that moves away from what an installed package was written
 /// for fails here.

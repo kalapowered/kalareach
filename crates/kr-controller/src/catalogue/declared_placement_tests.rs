@@ -111,6 +111,17 @@ fn a_table_that_does_not_validate_is_refused_and_never_defaulted() {
 }
 
 #[test]
+fn a_table_whose_file_has_no_object_at_its_root_is_refused_and_never_defaulted() {
+    let mut array = gemini_placement();
+    array["files"][2]["shape"] = json!({"kind": "array", "items": {"kind": "command_handler"}});
+    let declared = read(">=0.1.9, <0.2.0", &gemini_table(Some(array)), None);
+    assert!(
+        refusal(&declared).contains("placement.file_not_an_object"),
+        "{declared:?}"
+    );
+}
+
+#[test]
 fn a_package_with_no_connector_table_takes_the_labels_default() {
     let mut manifest = bundled_manifest();
     manifest["payloads"]

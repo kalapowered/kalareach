@@ -1143,6 +1143,11 @@ fn check_placement(
         else {
             continue;
         };
+        // The file is read for a repeated member name before any value is made of it: a value
+        // keeps the last of two, and the host places the bytes.
+        if let Ok(text) = std::str::from_utf8(bytes) {
+            check_duplicate_members(source.as_str(), text, report);
+        }
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
             report.push(Finding::at(
                 FindingCode::BridgeRecipeInvalid,
