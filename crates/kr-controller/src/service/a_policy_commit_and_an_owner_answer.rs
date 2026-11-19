@@ -39,8 +39,8 @@ const BOUND: Duration = Duration::from_secs(30);
 /// own.
 pub(super) struct Rig {
     pub(super) runtime: tokio::runtime::Runtime,
-    pub(super) temp: kr_ipc::testing::TempHost,
     pub(super) controller: Arc<Controller>,
+    pub(super) temp: kr_ipc::testing::TempHost,
 }
 
 impl Rig {
