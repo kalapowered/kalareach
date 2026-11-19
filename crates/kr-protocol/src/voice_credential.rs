@@ -30,7 +30,7 @@ pub enum VoiceCredentialKind {
 }
 
 impl VoiceCredentialKind {
-    /// The name a person types and reads.
+    /// The name the stored item and the JSON form carry.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

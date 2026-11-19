@@ -21,6 +21,8 @@
 //! | [`diff`] | `kr diff`: reading changes, and applying or reverting one at a named destination |
 //! | [`device`] | `kr device`: the paired devices, and revoking one |
 //! | [`destination`] | `kr destination`: the places notifications go besides paired devices |
+//! | [`voice_credential`] | `kr voice credential`: the key this host keeps for voice calls on the owner's own account |
+//! | [`secret_input`] | Reading a secret from a terminal that shows nothing, or from a pipe |
 //! | [`machine`] | `kr host machine`: the machine group an environment records, and the steps that change it |
 //! | [`plugin`] | `kr plugin`: plugin packages and the repositories they come from |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
@@ -86,6 +88,7 @@ pub mod question;
 pub mod render;
 pub mod report;
 pub mod resolve;
+pub mod secret_input;
 pub mod service_manager;
 pub mod session;
 pub mod share;
@@ -97,6 +100,7 @@ pub mod terminal;
 pub mod terminal_profile;
 pub mod unknown;
 pub mod update;
+pub mod voice_credential;
 pub mod windows;
 pub mod workflow;
 pub mod workspace;

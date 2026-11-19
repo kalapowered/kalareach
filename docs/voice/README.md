@@ -91,6 +91,18 @@ The host owner keeps one OpenAI key in this host's secret store with `voice.cred
 deletes it with `voice.credential.remove`. Both are served on the local socket only, and no answer
 carries the key. A call does not use the key.
 
+## The OpenAI key on this host
+
+`kr voice credential set --provider openai-live` keeps an OpenAI key in this host's secret store and
+replaces the one it holds. The command reads the key from standard input, either typed where nothing
+is shown or piped in. It takes the key from no argument and no environment variable, because both
+stay in your shell's history or in the process list. `kr voice credential remove --provider
+openai-live` deletes the key.
+
+A key is 20 to 256 printable ASCII characters with no space. The host checks that shape and asks
+OpenAI nothing, so a key that OpenAI would refuse is kept as it is. Neither command prints the key,
+and neither needs an account with the managed service.
+
 ## What the managed operator can see
 
 Managed voice gives KalaReach technical access to the conversation. The service's own channel to

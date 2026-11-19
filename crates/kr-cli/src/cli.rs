@@ -115,6 +115,9 @@ pub enum Command {
     /// webhook, Slack, Discord, Telegram or email.
     #[command(subcommand)]
     Destination(DestinationCommand),
+    /// Manage what this host holds for voice calls.
+    #[command(subcommand)]
+    Voice(VoiceCommand),
     /// Enrol this host in an organisation's policy, or show what it holds for each.
     #[command(subcommand)]
     Organisation(OrganisationCommand),
@@ -890,6 +893,55 @@ pub struct DestinationRemoveArguments {
     /// The destination, by identifier. A paired device's is named by the device's identifier:
     /// removing it ends delivery to the device without unpairing it.
     pub destination: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// One `kr voice` operation.
+#[derive(Subcommand)]
+pub enum VoiceCommand {
+    /// Keep or delete the key this host holds for voice calls on your own provider account.
+    #[command(subcommand)]
+    Credential(VoiceCredentialCommand),
+}
+
+/// One `kr voice credential` operation.
+#[derive(Subcommand)]
+pub enum VoiceCredentialCommand {
+    /// Keep a provider's key on this host, replacing the one it holds.
+    ///
+    /// The key is read from standard input and never from an argument: type it where nothing is
+    /// shown, or pipe it in. This host keeps it in its secret store and never prints it.
+    Set(VoiceCredentialSetArguments),
+    /// Delete the key this host holds for a provider.
+    Remove(VoiceCredentialRemoveArguments),
+}
+
+/// `kr voice credential set`.
+#[derive(Args)]
+pub struct VoiceCredentialSetArguments {
+    /// The provider the key is for. Only openai-live is accepted.
+    ///
+    /// A plain word and not a list the parser checks, because a parser that refuses a value
+    /// repeats it, and a key typed here by mistake would be shown.
+    #[arg(long, value_name = "PROVIDER")]
+    pub provider: String,
+    /// Anything a person types here instead of using standard input. It is never shown, and
+    /// the command refuses it without repeating it.
+    #[arg(hide = true, trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+    pub refused: Vec<std::ffi::OsString>,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr voice credential remove`.
+#[derive(Args)]
+pub struct VoiceCredentialRemoveArguments {
+    /// The provider whose key to delete. Only openai-live is accepted.
+    #[arg(long, value_name = "PROVIDER")]
+    pub provider: String,
     /// The environment.
     #[command(flatten)]
     pub selector: EnvironmentSelector,

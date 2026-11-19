@@ -213,6 +213,15 @@ mod console {
             })
         }
 
+        /// Sets the console's input mode and leaves its output mode as it is.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error when the console refuses the mode.
+        pub fn set_input_mode(&self, mode: u32) -> Result<()> {
+            set_console_mode(&self.input, mode)
+        }
+
         /// Reads the console's size.
         ///
         /// # Errors

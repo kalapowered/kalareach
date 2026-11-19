@@ -792,6 +792,10 @@ async fn run(cli: Cli) -> Result<Completion> {
             kr_cli::destination::run(&paths, command, cli.json).await?;
             Ok(Completion::Done)
         }
+        Command::Voice(command) => {
+            kr_cli::voice_credential::run(&paths, command, cli.json).await?;
+            Ok(Completion::Done)
+        }
         Command::Organisation(command) => {
             kr_cli::organisation::run(&paths, command, cli.json).await?;
             Ok(Completion::Done)
