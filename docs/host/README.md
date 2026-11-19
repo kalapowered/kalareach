@@ -4536,30 +4536,31 @@ observed.
 A new action identifier cannot silently take an uncertain outcome's place. The journal stores a
 **subject digest** beside the payload digest: the method and version, the complete target and the
 parameters that select the resource, and nothing that differs between a first attempt and the later
-request that supersedes it. The subject of a `plugin.action.invoke` call is the package, the action, the draft and the resource it names, and not its `parameters`. So a fresh identifier for a subject that already carries an uncertain outcome is refused unless
-its preconditions name that action and the receipt revision the caller read it at. A service that
-wanted to hide the uncertainty would have to name the receipt it was hiding. The control daemon
-applies a narrower rule to a share it makes itself (`grant.create`), which is described with the
-authority changes it claims.
+request that supersedes it. So a fresh identifier for a subject that already carries an uncertain
+outcome is refused unless its preconditions name that action and the receipt revision the caller
+read it at. A service that wanted to hide the uncertainty would have to name the receipt it was
+hiding. The control daemon applies a narrower rule to a share it makes itself (`grant.create`),
+which is described with the authority changes it claims.
 
-The subject of a `question.answer`, a `question.cancel`, a `question.cancel_own`, a
-`question.create` and an `alert.create` is the target alone, so a digest cannot tell two requests of
-one of these methods apart. The worker reads the envelope the receipt kept instead. An uncertain
-request holds back a request of the same method only when both carry the same identity: the question
-an answer, a cancellation or a source's own cancellation names, the request identifier a question is
-asked under, or the de-duplication identifier an alert is raised under. A request with another
-identity is admitted. A request that names an uncertain request with another identity names nothing
-it has to show, and is refused. The envelope of a source's cancellation keeps no caller token, and
-no envelope keeps which application sent a question or an alert, so two applications of one actor
-that use the same identifier hold each other back. A receipt whose identity the worker cannot read
-holds back every request of its method by the actor in the session, as the rule above does: its
-envelope is gone (privacy mode removes it once an action settles), does not decode, or is not a
-request of that method. A receipt that a migration left without a subject digest (the earlier build
-kept no envelope, or one this build cannot read) holds back every request of its method by its
-actor, since no subject says which ask it was; for the five methods above, an envelope this build
-can read still decides. Every uncertain request of a method also holds back a request of that method
-whose parameters do not parse, as the rule above does. Every other method keeps the rule above, with
-the addition for a receipt that has no subject digest.
+The subject of a `plugin.action.invoke` call is the package, the action, the draft and the resource
+it names, and not its `parameters`. The subject of a `question.answer`, a `question.cancel`, a
+`question.cancel_own`, a `question.create` and an `alert.create` is the target alone, so a digest
+cannot tell two requests of one of these methods apart. The worker reads the envelope the receipt
+kept instead. An uncertain request holds back a request of the same method only when both carry the
+same identity: the question an answer, a cancellation or a source's own cancellation names, the
+request identifier a question is asked under, or the de-duplication identifier an alert is raised
+under. A request with another identity is admitted. A request that names an uncertain request with
+another identity names nothing it has to show, and is refused. The envelope of a source's
+cancellation keeps no caller token, and no envelope keeps which application sent a question or an
+alert, so two applications of one actor that use the same identifier hold each other back. A receipt
+whose identity the worker cannot read holds back every request of its method by the actor in the
+session, as the rule above does: its envelope is gone (privacy mode removes it once an action
+settles), does not decode, or is not a request of that method. A receipt that a migration left
+without a subject digest (the earlier build kept no envelope, or one this build cannot read) holds
+back every request of its method by its actor, since no subject says which ask it was; for the five
+methods above, an envelope this build can read still decides. Every uncertain request of a method
+also holds back a request of that method whose parameters do not parse, as the rule above does.
+Every other method keeps the rule above, with the addition for a receipt that has no subject digest.
 
 When a subject carries several uncertain outcomes, a request has to show the one the journal
 recorded last. For the five methods above that is the last recorded of the outcomes that hold the
@@ -9825,7 +9826,8 @@ from the parameter the action names for it, must be one the interpretation offer
 is issued. Who writes the answer depends on who read the request: a request the connector's table
 read is answered from the connection's own table under the approval's claim, and a request a
 component read is answered by that component, as `agent.approval.respond` does. The method answers
-with its own result, the mutation and the action.
+with its own result, the mutation and the action. An action that answers no request names no
+resource, and a call that names one is refused before anything is sent.
 
 A history belongs to one instance and ends with it. An instance's identifier is its own for good, so
 no cursor of another life of the host is read as one of this instance's, and no number is given
