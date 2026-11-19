@@ -3467,6 +3467,10 @@ struct HeldWrite {
 }
 
 impl kr_client::transport::ControlTransport for HeldWrite {
+    fn host_states_placement_reading(&self) -> bool {
+        false
+    }
+
     fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
         kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([42; 16]))
     }

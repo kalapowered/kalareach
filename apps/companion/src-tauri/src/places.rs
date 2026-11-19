@@ -466,6 +466,10 @@ impl Placed {
 }
 
 impl ControlTransport for Placed {
+    fn host_states_placement_reading(&self) -> bool {
+        self.inner.host_states_placement_reading()
+    }
+
     fn connection_id(&self) -> ConnectionId {
         self.inner.connection_id()
     }
@@ -540,11 +544,16 @@ mod tests {
         DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([byte; 16]))
     }
 
-    /// A transport that is only closed, as a connection that carries a place is.
+    /// A transport that is only closed, as a connection that carries a place is, and that says
+    /// whether its host stated the placement reading.
     #[derive(Debug)]
-    struct Closed;
+    struct Closed(bool);
 
     impl ControlTransport for Closed {
+        fn host_states_placement_reading(&self) -> bool {
+            self.0
+        }
+
         fn connection_id(&self) -> ConnectionId {
             unreachable!("a case that only closes")
         }
@@ -647,6 +656,10 @@ mod tests {
     }
 
     impl ControlTransport for Streaming {
+        fn host_states_placement_reading(&self) -> bool {
+            false
+        }
+
         fn connection_id(&self) -> ConnectionId {
             unreachable!("a case that only opens streams and closes")
         }
@@ -782,6 +795,18 @@ mod tests {
         );
     }
 
+    /// A connection that holds a place says what the transport under it says of its host's hello:
+    /// a wrapper that dropped the flag would show every statement under the publisher's caption.
+    #[tokio::test]
+    async fn a_placed_connection_says_what_its_transport_says_of_the_hosts_reading() {
+        let places = Places::new(2);
+        for says in [true, false] {
+            let place = places.try_take(host(1), Kind::Other).expect("a place");
+            let connection = Placed::over(Arc::new(Closed(says)), place);
+            assert_eq!(connection.host_states_placement_reading(), says);
+        }
+    }
+
     /// KR-REQ-19.08: a connection gives its place back when it is closed, and a dial that was
     /// waiting for one is given it then, not when its own delay ends.
     #[tokio::test]
@@ -790,7 +815,7 @@ mod tests {
         // Two places for the other kinds, and the third is the main link's.
         let first = places.try_take(host(1), Kind::Other).expect("a place");
         let second = places.try_take(host(1), Kind::Other).expect("a place");
-        let connection = Placed::over(Arc::new(Closed), first);
+        let connection = Placed::over(Arc::new(Closed(false)), first);
         let waiting = tokio::spawn({
             let places = Arc::clone(&places);
             async move {
@@ -836,7 +861,7 @@ mod tests {
             "an open takes no place of its own"
         );
         let streamless = Placed::over(
-            Arc::new(Closed),
+            Arc::new(Closed(false)),
             places.try_take(host(2), Kind::Other).expect("a place"),
         );
         assert!(

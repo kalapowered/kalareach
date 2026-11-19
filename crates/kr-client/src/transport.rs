@@ -184,11 +184,10 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
     fn revoke_streams(&self);
 
     /// Whether the host's hello says it writes the placement reading under its own label and
-    /// refuses that label in a publisher's words. A transport that has no hello of a host says no,
-    /// and a statement it carries is then read whole as the publisher's.
-    fn host_states_placement_reading(&self) -> bool {
-        false
-    }
+    /// refuses that label in a publisher's words. Every transport states it: one that has no hello
+    /// of a host says no, so a statement it carries is read whole as the publisher's, and one that
+    /// wraps another says what the transport it wraps says.
+    fn host_states_placement_reading(&self) -> bool;
 
     /// Ends the connection.
     fn close(&self);

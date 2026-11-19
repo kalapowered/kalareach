@@ -63,6 +63,10 @@ struct SilentHost {
 }
 
 impl ControlTransport for SilentHost {
+    fn host_states_placement_reading(&self) -> bool {
+        false
+    }
+
     fn connection_id(&self) -> ConnectionId {
         self.inner.connection_id()
     }

@@ -288,6 +288,11 @@ impl IpcTransport {
 }
 
 impl ControlTransport for IpcTransport {
+    fn host_states_placement_reading(&self) -> bool {
+    // A local socket carries no hello, so there is no host to state it.
+        false
+    }
+
     fn connection_id(&self) -> ConnectionId {
         self.connection_id
     }
