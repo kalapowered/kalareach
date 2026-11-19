@@ -2615,6 +2615,7 @@ pub async fn voice_allow(
             receipt: None,
             action_id: None,
             value: Some(encode(&allowed_from(&answer)?)?),
+            answer_lost: false,
         }),
         other => submitted(other),
     }
