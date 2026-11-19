@@ -809,20 +809,34 @@ impl Installer {
                 self.planned_entry_digest(document),
             )
         });
-        let recorded_document = record.manifest.operations.iter().find_map(|operation| {
-            if let ChangeOperation::AddConfigurationEntry {
-                path,
-                entry,
-                digest,
-                ..
-            } = operation
-            {
-                Some((path.clone(), entry.clone(), *digest))
-            } else {
-                None
-            }
-        });
-        let same = declared_root == record.manifest.root && declared_document == recorded_document;
+        // The entry the record wrote, or noted that it was writing when the installation stopped:
+        // the entry may be in the document, so it is where the record's place is.
+        let recorded_document = record
+            .manifest
+            .operations
+            .iter()
+            .chain(record.pending.iter())
+            .find_map(|operation| {
+                if let ChangeOperation::AddConfigurationEntry {
+                    path,
+                    entry,
+                    digest,
+                    ..
+                } = operation
+                {
+                    Some((path.clone(), entry.clone(), *digest))
+                } else {
+                    None
+                }
+            });
+        // An installation that stopped before it planned its entry noted no entry, and never wrote
+        // one: that is an installation to finish, not a package whose declaration moved. A record
+        // of an installation that finished with no entry is a different thing, and a declaration
+        // that now names one moved.
+        let before_its_entry =
+            !record.is_complete() && recorded_document.is_none() && declared_document.is_some();
+        let same = declared_root == record.manifest.root
+            && (declared_document == recorded_document || before_its_entry);
         if same {
             return Ok(());
         }
@@ -4387,6 +4401,174 @@ mod tests {
         );
         let formats = project_of(true, "json_local_command_list").expect_err("another format");
         assert!(formats.contains("in different formats"), "{formats}");
+    }
+
+    /// KR-REQ-11.01 (E15): an installation of a declared word that stopped before its entry was
+    /// planned is finished by installing again, with the declaration it had; a declaration that
+    /// names a document the finished record never had, and a skills folder that moved, are each a
+    /// moved place.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_installation_that_stopped_before_its_entry_was_planned_is_repaired() {
+        let configuration = || {
+            Some(
+                json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+            )
+        };
+        let tree = Tree::create();
+        let installer = tree.installer().with_declaration(
+            Some(declared(configuration(), &[".amp", "skills"])),
+            Vec::new(),
+        );
+        let request = params(amp(), InstallScope::User);
+        installer.install(&request).expect("installs");
+
+        // Stopped after the files and before the entry was planned: no entry in the record, none
+        // in the document, and the installation open.
+        let path = installer.record_path(&request);
+        let mut record =
+            read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+        record.manifest.operations.retain(|operation| {
+            !matches!(operation, ChangeOperation::AddConfigurationEntry { .. })
+        });
+        record.state = InstallationRecord::INSTALLING.to_owned();
+        let write = |record: &InstallationRecord| {
+            std::fs::write(
+                &path,
+                serde_json::to_string_pretty(record).expect("encodes"),
+            )
+            .expect("writes");
+        };
+        write(&record);
+        std::fs::remove_file(tree.home().join(".amp").join("mcp.json")).expect("no document yet");
+
+        // A skills folder that is not the recorded one is a moved place, interrupted or not.
+        let elsewhere = tree.installer().with_declaration(
+            Some(declared(configuration(), &[".amp", "other"])),
+            Vec::new(),
+        );
+        let moved = elsewhere
+            .install(&request)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert!(
+            moved
+                .as_ref()
+                .is_err_and(|said| said.contains("run kr skill remove --agent amp")),
+            "{moved:?}"
+        );
+
+        let repaired = installer
+            .install(&request)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert_eq!(repaired, Ok(()), "the interrupted installation is finished");
+        let finished = installer
+            .recorded(&request)
+            .expect("reads")
+            .expect("a record");
+        assert!(finished.is_complete());
+        assert!(
+            finished
+                .manifest
+                .operations
+                .iter()
+                .any(|operation| matches!(
+                    operation,
+                    ChangeOperation::AddConfigurationEntry { .. }
+                )),
+            "the entry is owned"
+        );
+
+        // A finished installation that had no entry, under a declaration that now names a document,
+        // is not an interruption.
+        let tree = Tree::create();
+        let without = tree
+            .installer()
+            .with_declaration(Some(declared(None, &[".amp", "skills"])), Vec::new());
+        without
+            .install(&request)
+            .expect("installs with no document");
+        let with = tree.installer().with_declaration(
+            Some(declared(configuration(), &[".amp", "skills"])),
+            Vec::new(),
+        );
+        let moved = with
+            .install(&request)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert!(
+            moved
+                .as_ref()
+                .is_err_and(|said| said.contains("run kr skill remove --agent amp")),
+            "{moved:?}"
+        );
+    }
+
+    /// KR-REQ-11.01 (E15): an installation of a declared word that stopped while its entry was
+    /// pending is finished by installing again with the declaration it had, and is a moved place
+    /// under a declaration that names the entry elsewhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_declared_installation_that_stopped_while_its_entry_was_pending_is_repaired() {
+        let configuration = |name: &str| {
+            Some(json!({ "path": [".amp", name], "format": "json_command_args", "shared": false }))
+        };
+        let tree = Tree::create();
+        let installer = tree.installer().with_declaration(
+            Some(declared(configuration("mcp.json"), &[".amp", "skills"])),
+            Vec::new(),
+        );
+        let request = params(amp(), InstallScope::User);
+        installer.install(&request).expect("installs");
+
+        // Stopped after the entry was written and before it was recorded: the note is pending.
+        let path = installer.record_path(&request);
+        let mut record =
+            read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+        let written = record
+            .manifest
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(operation, ChangeOperation::AddConfigurationEntry { .. })
+            })
+            .expect("an entry was written");
+        record.pending = vec![record.manifest.operations.remove(written)];
+        record.state = InstallationRecord::INSTALLING.to_owned();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("encodes"),
+        )
+        .expect("writes");
+
+        let elsewhere = tree.installer().with_declaration(
+            Some(declared(configuration("other.json"), &[".amp", "skills"])),
+            Vec::new(),
+        );
+        let moved = elsewhere
+            .install(&request)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert!(
+            moved
+                .as_ref()
+                .is_err_and(|said| said.contains("run kr skill remove --agent amp")),
+            "{moved:?}"
+        );
+
+        let repaired = installer
+            .install(&request)
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert_eq!(repaired, Ok(()), "the pending entry is finished");
+        assert!(
+            installer
+                .recorded(&request)
+                .expect("reads")
+                .expect("a record")
+                .is_complete()
+        );
     }
 
     /// KR-REQ-11.01: an entry that another record of this host claims with other contents is not
