@@ -400,6 +400,10 @@ mod tests {
     }
 
     impl ControlTransport for Refused {
+        fn host_states_placement_reading(&self) -> bool {
+            false
+        }
+
         fn connection_id(&self) -> ConnectionId {
             ConnectionId::new(Uuid::from_bytes([7; 16]))
         }

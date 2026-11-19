@@ -2097,6 +2097,10 @@ impl Tapped {
 }
 
 impl kr_client::transport::ControlTransport for Tapped {
+    fn host_states_placement_reading(&self) -> bool {
+        self.inner.host_states_placement_reading()
+    }
+
     fn connection_id(&self) -> kr_protocol::ids::ConnectionId {
         self.inner.connection_id()
     }

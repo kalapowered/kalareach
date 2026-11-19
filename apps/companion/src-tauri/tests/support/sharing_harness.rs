@@ -71,6 +71,10 @@ struct Lossy {
 }
 
 impl ControlTransport for Lossy {
+    fn host_states_placement_reading(&self) -> bool {
+        self.inner.host_states_placement_reading()
+    }
+
     fn connection_id(&self) -> ConnectionId {
         self.inner.connection_id()
     }

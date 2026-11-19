@@ -880,6 +880,10 @@ async fn a_transport_with_no_data_streams_is_refused_before_the_probe() {
     struct Streamless(Arc<Mutex<u64>>);
 
     impl ControlTransport for Streamless {
+        fn host_states_placement_reading(&self) -> bool {
+            false
+        }
+
         fn connection_id(&self) -> ConnectionId {
             ConnectionId::new(Uuid::from_bytes([9; 16]))
         }
@@ -1498,6 +1502,10 @@ impl StreamOpener for CountingOpener {
 }
 
 impl ControlTransport for Counted {
+    fn host_states_placement_reading(&self) -> bool {
+        false
+    }
+
     fn connection_id(&self) -> ConnectionId {
         self.inner.connection_id()
     }
@@ -1562,6 +1570,10 @@ enum Break {
 }
 
 impl ControlTransport for Ending {
+    fn host_states_placement_reading(&self) -> bool {
+        false
+    }
+
     fn connection_id(&self) -> ConnectionId {
         self.inner.connection_id()
     }
