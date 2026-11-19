@@ -12,6 +12,13 @@ pub(super) const LEFT_TO_HOST: &str = "The call has ended on this phone. This ho
     the call at OpenAI two minutes after it last heard from this phone; if it cannot confirm \
     that, the call may keep running on your OpenAI account until OpenAI ends it.";
 
+/// What a person is told when a call on the host's own key has ended and the host, which lost its
+/// connection to OpenAI and could not restore it, did not confirm that it closed the call: the host
+/// has already tried to close it, and nothing of a running host tries again.
+pub(super) const HOST_UNCONFIRMED: &str = "The call has ended on this phone. The host could not \
+    confirm that OpenAI closed the call, so the call may keep running on your OpenAI account until \
+    OpenAI ends it.";
+
 /// What a person is told when this phone heard nothing from the host for as long as the host waits
 /// before it closes a call, and the host has since said, in its answer to the stop, that the call is
 /// over.
@@ -195,6 +202,16 @@ impl Cause {
         match self {
             Self::Step(_) if !words.ends_with(['.', '!', '?']) => format!("{words}."),
             _ => words,
+        }
+    }
+
+    /// What a call left to the host is left to, in words, by how this end came about: a host that
+    /// lost its connection to OpenAI has tried to close the call and does not try again, and any
+    /// other end waits for the host's own rule about a phone it has not heard from.
+    pub(super) const fn left_to_host_words(&self) -> &'static str {
+        match self {
+            Self::Host(HostEnding::Reason(VoiceEndReason::SidebandLost)) => HOST_UNCONFIRMED,
+            _ => LEFT_TO_HOST,
         }
     }
 

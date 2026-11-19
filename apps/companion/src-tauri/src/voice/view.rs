@@ -354,15 +354,20 @@ impl OwedView {
         self.kind != Self::HOST_CLOSE && self.until_ms <= now_ms
     }
 
-    /// A call on the host's own key that this phone left to the host: the host closes it at the
-    /// provider two minutes after it last heard from this phone, and this device cannot learn
-    /// whether it did. `until_ms` is when the call's grant ends, and the entry stands after that,
-    /// until the host's answer or the person's next start shows the call closed.
+    /// A call on the host's own key that this phone left to the host, for the reason `words`: this
+    /// device cannot learn whether the host closed it at the provider. `until_ms` is when the call's
+    /// grant ends, and the entry stands after that, until the host's answer or the person's next
+    /// start shows the call closed.
     #[must_use]
-    pub fn left_to_host(voice_session_id: VoiceSessionId, until_ms: u64, host: &CallHost) -> Self {
+    pub fn left_to_host(
+        voice_session_id: VoiceSessionId,
+        until_ms: u64,
+        words: &str,
+        host: &CallHost,
+    ) -> Self {
         Self {
             kind: Self::HOST_CLOSE.to_owned(),
-            words: super::cause::LEFT_TO_HOST.to_owned(),
+            words: words.to_owned(),
             action_id: None,
             voice_session_id: Some(voice_session_id.to_string()),
             until_ms,

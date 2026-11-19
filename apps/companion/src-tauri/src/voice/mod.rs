@@ -1118,7 +1118,12 @@ impl Shared {
             kept.voice_session_id,
             &kept.host,
         ) {
-            owed.push(OwedView::left_to_host(id, until_ms, host));
+            owed.push(OwedView::left_to_host(
+                id,
+                until_ms,
+                cause::LEFT_TO_HOST,
+                host,
+            ));
         }
         if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
             owed.push(OwedView::start_unknown(

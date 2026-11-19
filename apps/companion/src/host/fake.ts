@@ -4007,11 +4007,12 @@ export type VoiceTermsState = 'published' | 'closed' | 'unread' | 'own_key' | 'o
 /** What the call this device is holding is doing. */
 function voiceCallState(voice: VoiceState): VoiceCallState {
   const running = voice.call
-  // What has lapsed is forgotten, as the device forgets it.
+  // What has lapsed is forgotten, as the device forgets it, but for a call left to the host, which
+  // the device keeps until the host says the call is closed.
   const left = {
     ended: voice.ended,
     problems: voice.problems,
-    owed: voice.owed.filter((owed) => owed.until_ms > Date.now()),
+    owed: voice.owed.filter((owed) => owed.kind === 'host_close' || owed.until_ms > Date.now()),
     finalising: voice.finalising
   }
   if (!running) {
