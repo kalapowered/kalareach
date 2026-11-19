@@ -10261,6 +10261,11 @@ fn a_held_detail_stays_owed_while_the_push_retries_and_is_given_up_with_it() {
         the_object_is_owed(&environment, object),
         "the object is owed while the push retries"
     );
+    assert_eq!(
+        transport.asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the first pass asked the placer once"
+    );
 
     assert_eq!(pass_at(&environment, &gateway, now + 10 * 60_000), 1);
     assert_eq!(gateway.held_at_the_push(), [0, 0], "two pushes, no detail");
@@ -10277,8 +10282,9 @@ fn a_held_detail_stays_owed_while_the_push_retries_and_is_given_up_with_it() {
     assert_eq!(service.asked(), 0, "the mailbox service was never reached");
     assert_eq!(
         transport.asked.load(std::sync::atomic::Ordering::SeqCst),
-        1,
-        "the retry did not ask the placer again: the transport was asked once, by the first pass"
+        2,
+        "each pass asks the placer once, and the transport stops each request before it is sent: \
+         the first pass and the retry"
     );
 }
 
