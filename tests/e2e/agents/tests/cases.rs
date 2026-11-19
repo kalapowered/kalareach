@@ -5475,7 +5475,9 @@ fn a_running_agent_keeps_its_build_through_an_upgrade_and_the_newer_build_gets_t
             );
         }
 
-        installation.upgrade(&newer.prefix);
+        installation
+            .upgrade(stage.run, &newer.prefix)
+            .unwrap_or_else(|why| panic!("{why}"));
         let second_session = open_session(
             stage.host,
             stage.owner,

@@ -105,7 +105,7 @@ use kr_e2e_agents::held::{
 use kr_e2e_agents::outcome::Outcome;
 use kr_e2e_agents::session_environment::{self, Expected};
 use kr_e2e_agents::stage::{
-    Installation, PlacedProgram, closed_port, scan_rules, session_variables,
+    Installation, PlacedProgram, closed_port, inode_of, scan_rules, session_variables, text_image,
 };
 use kr_e2e_agents::stub::RequestStub;
 use kr_e2e_m1b::device::{Device, PairedHost, Remote, RequestError};
@@ -125,15 +125,18 @@ use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::matching::{Architecture, OperatingSystem};
 use kr_plugin_sdk::text::Label;
 use kr_protocol::agent::{
-    AgentApprovalRespondParams, AgentApprovalRespondResult, AgentBindingState,
+    AgentApprovalRespondParams, AgentApprovalRespondResult, AgentBindingState, AgentCancelParams,
     AgentCapabilitiesParams, AgentCapabilitiesResult, AgentMutationResult, AgentMutationTarget,
     AgentPromptParams, AgentSubject, PromptText,
 };
+use kr_protocol::broker::{InstanceCapabilityIdentity, InstanceCapabilityState};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::PendingState;
+use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
-    ApplicationInstanceId, PendingResourceId, PluginId, SessionEpoch, SessionId,
+    AgentBindingRevision, AgentTurnId, ApplicationInstanceId, PendingResourceId, PluginId,
+    SessionEpoch, SessionId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::recovery::{AgentInstancesParams, AgentInstancesResult};
@@ -788,6 +791,19 @@ struct Context {
     work: Option<PlacedDirectory>,
     /// The device's reads of the host's list of application instances.
     polls: Polls,
+    /// Whether the run holds a second, newer build behind the installation's link, for a case that
+    /// upgrades the agent (stand-in route).
+    upgrade: bool,
+    /// Whether the launcher the worker gives the shell is the forging launcher, with the real one
+    /// beside it.
+    forge: bool,
+    /// The installation the upgrade case switches.
+    installation: Option<Installation>,
+    /// The newer build's file and version, where the run placed one.
+    newer: Option<(PathBuf, String)>,
+    /// The programs of the stand-in route that every typed launch may run, by their place below
+    /// the run's directory, each recorded when it was placed.
+    placed_files: Vec<PathBuf>,
 }
 
 impl Context {
@@ -808,6 +824,11 @@ impl Context {
             bin: PathBuf::new(),
             work: None,
             polls: Polls::new(),
+            upgrade: false,
+            forge: false,
+            installation: None,
+            newer: None,
+            placed_files: Vec::new(),
         }
     }
 
@@ -820,10 +841,54 @@ impl Context {
         let work = PlacedDirectory::record(run.root(), run.pin(), Path::new("w"))
             .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
         run.place_built("kr-hook", &run.binary("kr-hook"), &["--version"]);
+        let mut forge_files = Vec::new();
+        if self.forge {
+            // The real launcher is placed at `b/h/kr-hook` and runs once there, where no step has a
+            // time limit; the forging launcher takes the place the worker gives the shell its
+            // launcher at, and runs once there too (it runs the real one in place).
+            let real = run.root().join("b/h");
+            kr_ipc::paths::create_private_tree(run.root(), &real)
+                .expect("a directory for the launcher");
+            run.place_built("kr-hook", &real.join("kr-hook"), &["--version"]);
+            std::fs::remove_file(run.binary("kr-hook")).expect("the copied launcher is replaced");
+            run.place_built("kr-e2e-forge", &run.binary("kr-hook"), &["--version"]);
+            run.note_placed(Path::new("b/h/kr-hook"))
+                .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+            forge_files.push(PathBuf::from("b/h/kr-hook"));
+        }
         // The launcher the worker gives the shell is run by every typed launch.
         run.note_placed(&binary_place("kr-hook"))
             .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        let mut placed_files = forge_files;
+        let mut installation = None;
+        let mut newer = None;
         let (executable, bin) = match &self.route {
+            Route::StandIn if self.upgrade => {
+                // Two installed builds behind the link `agent/current`: the pinned stand-in and the
+                // newer one, each a program built from the stand-in's source, each at
+                // `t/<prefix>/bin/codex`; the link names the first.
+                let (first, second) = (run.root().join("t/a"), run.root().join("t/b"));
+                for prefix in [&first, &second] {
+                    kr_ipc::paths::create_private_tree(run.root(), &prefix.join("bin"))
+                        .expect("a directory for the programs");
+                }
+                run.place_built("codex-stand-in", &first.join("bin/codex"), &["--version"]);
+                run.place_built(
+                    "codex-stand-in-newer",
+                    &second.join("bin/codex"),
+                    &["--version"],
+                );
+                for relative in ["t/a/bin/codex", "t/b/bin/codex"] {
+                    run.note_placed(Path::new(relative))
+                        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+                    placed_files.push(PathBuf::from(relative));
+                }
+                let linked = Installation::link(run, &first, &[]);
+                let bin = linked.bin();
+                installation = Some(linked);
+                newer = Some((second.join("bin/codex"), "0.156.1".to_owned()));
+                (first.join("bin/codex"), bin)
+            }
             Route::StandIn => {
                 let tools = run.root().join("t");
                 kr_ipc::paths::create_private_tree(run.root(), &tools)
@@ -832,6 +897,7 @@ impl Context {
                 // The shell finds the stand-in by its name on a search path, as it finds the build.
                 run.note_placed(Path::new(STAND_IN_PLACE))
                     .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+                placed_files.push(PathBuf::from(STAND_IN_PLACE));
                 (tools.join("codex"), tools)
             }
             Route::Real(real) => {
@@ -873,6 +939,9 @@ impl Context {
         self.executable = executable;
         self.bin = bin;
         self.work = Some(work);
+        self.placed_files = placed_files;
+        self.installation = installation;
+        self.newer = newer;
     }
 
     /// Fails the case unless each executable the run placed that a typed launch runs is still the
@@ -898,9 +967,7 @@ impl Context {
                 )
             });
         let mut files = vec![binary_place("kr-hook")];
-        if matches!(self.route, Route::StandIn) {
-            files.push(PathBuf::from(STAND_IN_PLACE));
-        }
+        files.extend(self.placed_files.iter().cloned());
         for file in files {
             self.run
                 .placed_as_it_was(&file)
@@ -933,12 +1000,10 @@ impl Context {
             },
             |environment| {
                 let (distribution, version) = self.qualified_as();
-                self.runtime.block_on(install_codex(
-                    environment,
-                    &self.executable,
-                    distribution,
-                    &version,
-                ));
+                let mut builds = vec![(self.executable.clone(), version)];
+                builds.extend(self.newer.iter().cloned());
+                self.runtime
+                    .block_on(install_codex(environment, &builds, distribution));
             },
         )
     }
@@ -1226,6 +1291,36 @@ impl Context {
         ))
     }
 
+    /// Asks the host to cancel the turn `turn` of an instance at the revision of `binding`: a
+    /// cancel on an instance with no turn running cannot request model work.
+    fn cancels(
+        &self,
+        remote: &Remote,
+        session_id: SessionId,
+        instance: ApplicationInstanceId,
+        binding_revision: AgentBindingRevision,
+        turn: &str,
+    ) -> Result<AgentMutationResult, RequestError> {
+        let binding = AgentBindingState {
+            binding_revision,
+            thread_id: Nullable::null(),
+            turn_id: Nullable::null(),
+            profile_id: Nullable::null(),
+            mode: kr_protocol::broker::IntegrationMode::NativeTerminal,
+            rich_mutations_suspended: false,
+            suspension_reason: Nullable::null(),
+        };
+        let (target, mutation_target) = Self::target(remote, session_id, instance, &binding);
+        self.runtime.block_on(remote.mutate(
+            Method::AgentTurnCancel,
+            target,
+            &AgentCancelParams {
+                target: mutation_target,
+                turn_id: AgentTurnId::new(turn).expect("a turn"),
+            },
+        ))
+    }
+
     /// Closes the host and checks that nothing the run started is still running.
     fn close(&self, host: &Host<'_>) {
         host.stop().expect("the host stops");
@@ -1249,34 +1344,37 @@ fn subject(session_id: SessionId, instance: ApplicationInstanceId) -> AgentSubje
 /// the grants it asks for, as the owner's confirmation of that exact installation does.
 async fn install_codex(
     environment: &EnvironmentPaths,
-    executable: &Path,
+    executables: &[(PathBuf, String)],
     distribution: &str,
-    version: &str,
 ) {
-    let digest = PayloadDigest::of(&std::fs::read(executable).expect("the placed agent"));
-    let build = QualifiedBuild {
-        application: Label::new("codex").expect("a label"),
-        distribution: Label::new(distribution).expect("a label"),
-        version: kr_plugin_sdk::version::PackageVersion::parse(version).expect("a version"),
-        os: if cfg!(target_os = "macos") {
-            OperatingSystem::MacOs
-        } else {
-            OperatingSystem::Linux
-        },
-        architecture: if std::env::consts::ARCH == "aarch64" {
-            Architecture::Aarch64
-        } else {
-            Architecture::X86_64
-        },
-        executable_digest: digest,
-    };
+    let builds: Vec<QualifiedBuild> = executables
+        .iter()
+        .map(|(executable, version)| QualifiedBuild {
+            application: Label::new("codex").expect("a label"),
+            distribution: Label::new(distribution).expect("a label"),
+            version: kr_plugin_sdk::version::PackageVersion::parse(version).expect("a version"),
+            os: if cfg!(target_os = "macos") {
+                OperatingSystem::MacOs
+            } else {
+                OperatingSystem::Linux
+            },
+            architecture: if std::env::consts::ARCH == "aarch64" {
+                Architecture::Aarch64
+            } else {
+                Architecture::X86_64
+            },
+            executable_digest: PayloadDigest::of(
+                &std::fs::read(executable).expect("the placed agent"),
+            ),
+        })
+        .collect();
     let home = environment.state_dir().join("generation-source");
     std::fs::create_dir_all(&home).expect("a directory for the generation");
     let generation = generations::Generation::build(
         &home,
         generations::GenerationSpec {
             package: Some(codex_package()),
-            builds: vec![build],
+            builds,
             ..generations::GenerationSpec::default()
         },
     )
@@ -1357,7 +1455,9 @@ impl Person {
         let mut variables = if known.is_empty() {
             ctx.prepare_variables(host)
         } else {
-            ctx.variables(host)
+            // A second person's shell is given no login: the first person's is the agent's
+            // session's alone.
+            ctx.without_login(&ctx.variables(host))
         };
         variables.extend(given.iter().cloned());
         let expected = ctx.expects(host, &variables);
@@ -2138,6 +2238,15 @@ struct Session<'a> {
     _paired: PairedHost,
     /// Whether the shell's environment was read before the agent's first start.
     environment_read: std::cell::Cell<bool>,
+    /// A second person on the same host and device, in a second session, with a connection of
+    /// the device's of its own (a connection is fixed to one session by the host).
+    second: Option<Second>,
+}
+
+/// The second person of a [`Session::open_two`], with the device's second connection.
+struct Second {
+    person: Person,
+    remote: Remote,
 }
 
 impl<'a> Session<'a> {
@@ -2160,6 +2269,44 @@ impl<'a> Session<'a> {
             _device: device,
             _paired: paired,
             environment_read: std::cell::Cell::new(false),
+            second: None,
+        }
+    }
+
+    /// Opens two sessions on one host and one device before anything of the agent starts: the
+    /// device's two connections are made first, one for each session, the first person enters, then
+    /// the second person enters with the sessions seen before (and so is the session that entry
+    /// added), and both shells' environments are read at their prompts.
+    fn open_two(ctx: &'a Context, variants: &str) -> Self {
+        let host = ctx.host();
+        let (device, paired, remote) = ctx.pair(&host);
+        let second_remote = ctx
+            .runtime
+            .block_on(device.connect(&paired))
+            .unwrap_or_else(|why| panic!("the device's second connection: {why}"));
+        let person = Person::enters(ctx, &host, &ctx.stand_in_variables(variants, &[]), &[]);
+        let second = Person::enters(
+            ctx,
+            &host,
+            &ctx.stand_in_variables("", &[]),
+            &[person.session_id],
+        );
+        match second.reads_the_environment(&second.expected) {
+            Ok(compared) => eprintln!("{compared}"),
+            Err(why) => panic!("{why}"),
+        }
+        Self {
+            ctx,
+            host,
+            remote,
+            person,
+            _device: device,
+            _paired: paired,
+            environment_read: std::cell::Cell::new(false),
+            second: Some(Second {
+                person: second,
+                remote: second_remote,
+            }),
         }
     }
 
@@ -2691,6 +2838,27 @@ fn run_case(
     variants: &str,
     body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
 ) {
+    run_case_in(Setup::default(), leg, case, test, variants, body);
+}
+
+/// What a case's run holds beyond the one agent and one session of the rest.
+#[derive(Clone, Copy, Default)]
+struct Setup {
+    /// Two installed builds behind the installation's link and two sessions (6b).
+    upgrade: bool,
+    /// The forging launcher at the place of the worker's launcher, the real one beside it (8b).
+    forge: bool,
+}
+
+/// [`run_case`], with the run `setup` asks for.
+fn run_case_in(
+    setup: Setup,
+    leg: &str,
+    case: &str,
+    test: &str,
+    variants: &str,
+    body: impl FnOnce(&Context, &Session<'_>) -> serde_json::Value,
+) {
     let real_asked = std::env::var_os(BUILD_VARIABLE).is_some_and(|value| !value.is_empty());
     let shell = match shells::managed_zsh() {
         Ok(shell) => shell,
@@ -2722,9 +2890,24 @@ fn run_case(
         Err(panic) => fails_before_its_run(route, case, test, panic),
     };
     let mut ctx = Context::new(shell, route, run, runtime);
+    ctx.upgrade = setup.upgrade;
+    ctx.forge = setup.forge;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         ctx.place();
-        let session = Session::open(&ctx, variants);
+        let session = if setup.upgrade {
+            Session::open_two(&ctx, variants)
+        } else if setup.forge {
+            // The root every path the forging launcher reads must lie below, given in the
+            // environment the session is created with (a name outside the host's reserved prefix).
+            let root = std::fs::canonicalize(ctx.run.root()).expect("the run's directory");
+            Session::open_with(
+                &ctx,
+                variants,
+                &[("KALAREACH_E2E_FORGE_ROOT", root.display().to_string())],
+            )
+        } else {
+            Session::open(&ctx, variants)
+        };
         let shows = body(&ctx, &session);
         ctx.close(&session.host);
         shows
@@ -2737,6 +2920,782 @@ fn run_case(
     } = ctx;
     drop(runtime);
     ends(route, Some(run), case, test, result);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Part 6b: an upgrade leaves the first process its own build, and a build outside the range is
+// refused the typed routes.
+// ---------------------------------------------------------------------------------------------
+
+/// Every process below `root` in `table`, `root` excluded, with its command line.
+fn below(table: &[kr_e2e_m1b::run::Entry], root: u32) -> Vec<(u32, String)> {
+    let mut found: Vec<(u32, String)> = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for entry in table.iter().filter(|entry| entry.parent == parent) {
+            if !found.iter().any(|(pid, _)| *pid == entry.pid) {
+                found.push((entry.pid, entry.command.clone()));
+                frontier.push(entry.pid);
+            }
+        }
+    }
+    found
+}
+
+/// The identity of every process below any of the `workers` whose command line names an
+/// application server, added to `servers` where it is not there yet. A process that starts and ends
+/// between two reads is not seen.
+fn servers_seen(workers: &[u32], servers: &mut Vec<ProcessStartIdentity>) -> Result<(), String> {
+    let table = kr_e2e_m1b::run::process_table()?;
+    for worker in workers {
+        for (pid, command) in below(&table, *worker) {
+            if command.contains("app-server")
+                && let Ok(identity) = kr_ipc::identity::process_start_identity(pid)
+                && !servers.contains(&identity)
+            {
+                servers.push(identity);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The process below `worker` that maps the file with `inode` (and whose command line holds
+/// `containing`, where one is given), waited for within [`LIVENESS`] by reads of the process table
+/// every 25 ms, with the servers below `workers` collected on every read. The wait ends on the
+/// condition: the deadline is a limit.
+fn process_mapping_within(
+    worker: u32,
+    inode: u64,
+    containing: Option<&str>,
+    workers: &[u32],
+    servers: &mut Vec<ProcessStartIdentity>,
+) -> Result<ProcessStartIdentity, String> {
+    let started = Instant::now();
+    loop {
+        servers_seen(workers, servers)?;
+        let table = kr_e2e_m1b::run::process_table()?;
+        for (pid, command) in below(&table, worker) {
+            if containing.is_none_or(|needle| command.contains(needle))
+                && text_image(pid).is_ok_and(|(_, found)| found == inode)
+                && let Ok(identity) = kr_ipc::identity::process_start_identity(pid)
+            {
+                return Ok(identity);
+            }
+        }
+        if started.elapsed() >= LIVENESS {
+            return Err(format!(
+                "no process below worker {worker} maps inode {inode} within {LIVENESS:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Waits until `person`'s screen shows `needle`, within [`LIVENESS`].
+fn shows_within(person: &Person, needle: &str) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        let rows = person.window.screen();
+        if rows.iter().any(|row| row.contains(needle)) {
+            return Ok(());
+        }
+        if started.elapsed() >= LIVENESS {
+            return Err(format!(
+                "the screen does not show {needle:?} after {LIVENESS:?}:\n{}",
+                rows.join("\n")
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The identity the host holds for an instance and how many of its capabilities are usable, read
+/// through the connection of the device that is fixed to the instance's session.
+fn capability_identity(
+    ctx: &Context,
+    remote: &Remote,
+    session_id: SessionId,
+    instance: ApplicationInstanceId,
+) -> Result<
+    (
+        Option<InstanceCapabilityIdentity>,
+        usize,
+        AgentBindingRevision,
+    ),
+    RequestError,
+> {
+    let read: AgentCapabilitiesResult = ctx.runtime.block_on(remote.read(
+        Method::AgentCapabilities,
+        &AgentCapabilitiesParams {
+            subject: subject(session_id, instance),
+        },
+    ))?;
+    let usable = read
+        .capabilities
+        .records
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.state,
+                InstanceCapabilityState::QualifiedAvailable
+                    | InstanceCapabilityState::VersionQualified
+            )
+        })
+        .count();
+    Ok((
+        read.capabilities
+            .records
+            .first()
+            .map(|record| record.identity.clone()),
+        usable,
+        read.binding.binding_revision,
+    ))
+}
+
+/// Waits for an approval that is pending, interpreted under the package's decoder and not one of
+/// `seen`, within [`LIVENESS`].
+fn fresh_approval_within(
+    ctx: &Context,
+    remote: &Remote,
+    session_id: SessionId,
+    seen: &[PendingResourceId],
+) -> Result<kr_protocol::gateway::PendingResource, String> {
+    let fresh = |resource: &kr_protocol::gateway::PendingResource| {
+        resource.state == PendingState::Pending
+            && resource.interpretation_verified
+            && !seen.contains(&resource.resource_id)
+    };
+    ctx.instances_within(remote, session_id, "a fresh approval", |read| {
+        read.agent_resources.resources.iter().any(fresh)
+    })
+    .map(|read| {
+        read.agent_resources
+            .resources
+            .iter()
+            .find(|resource| fresh(resource))
+            .cloned()
+            .expect("the approval the wait found")
+    })
+}
+
+/// Why a process is not one served through the gateway with the pinned build's own table.
+#[derive(Debug, PartialEq, Eq)]
+enum Cause {
+    /// The host announces no gateway for it.
+    NoGateway,
+    /// It runs another image than the pinned build's.
+    NotThePinnedImage,
+}
+
+/// The control of 6b: this process is the pinned build, served through the gateway.
+fn check_served(through_a_gateway: bool, image: u64, pinned: u64) -> Result<(), Cause> {
+    if !through_a_gateway {
+        return Err(Cause::NoGateway);
+    }
+    if image != pinned {
+        return Err(Cause::NotThePinnedImage);
+    }
+    Ok(())
+}
+
+/// The package's table is bound to the build a process started as, not to the build installed
+/// now: a process started on the pinned build keeps its image, its binding and its table across an
+/// upgrade of the installation, and what it is asked after the upgrade is interpreted by that
+/// table; a process started after the upgrade runs the newer build, which the package's range does
+/// not admit, so the host serves it no gateway and the typed routes refuse it.
+///
+/// KR-REQ-12.15, the binding keeps the binary identity across an upgrade: the first process, its
+/// binding's identity fields and its image are those of before; KR-REQ-12.17, the pinned schemas:
+/// an approval the pinned server asks after the upgrade is interpreted under the pinned decoder.
+/// Not claimed: that the screen of the refused launch names the range (it names that the backend
+/// refused it).
+#[test]
+fn gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_the_build_outside_the_range_is_refused_the_typed_routes()
+ {
+    const TEST: &str = "gateway_a_process_started_after_an_upgrade_keeps_the_first_its_own_build_and_the_build_outside_the_range_is_refused_the_typed_routes";
+    run_case_in(
+        Setup {
+            upgrade: true,
+            ..Setup::default()
+        },
+        "gateway-upgrade",
+        "6b",
+        TEST,
+        "leave-unanswered,two-approvals,stay",
+        |ctx, session| {
+            assert!(
+                matches!(ctx.route, Route::StandIn),
+                "the real arm of this part runs once the newer build's own isolation set is \
+                 recorded and its configuration directory is placed; the stand-in route is the \
+                 one this build runs"
+            );
+            let second = session.second.as_ref().expect("two sessions");
+            let first_session = session.session_id();
+            let second_session = second.person.session_id;
+            let pinned_inode = inode_of(&ctx.executable);
+            let newer_inode = inode_of(&ctx.newer.as_ref().expect("a newer build").0);
+            // The workers of both sessions, by the identities the run records.
+            let workers = [
+                u32::try_from(ctx.run.worker_of(&first_session.to_string()).pid.get())
+                    .expect("a pid"),
+                u32::try_from(ctx.run.worker_of(&second_session.to_string()).pid.get())
+                    .expect("a pid"),
+            ];
+            let mut servers: Vec<ProcessStartIdentity> = Vec::new();
+
+            // Step 5: the first agent starts on the pinned build, and its identity is recorded.
+            let instance = session.starts_the_agent(&[], None, &[]);
+            let held = session.interpreted_approval();
+            let first_process = process_mapping_within(
+                workers[0],
+                pinned_inode,
+                Some("--remote"),
+                &workers,
+                &mut servers,
+            );
+            let before = capability_identity(ctx, &session.remote, first_session, instance);
+            let summary_before = ctx
+                .instances(&session.remote, first_session)
+                .agent_instances
+                .instances
+                .into_iter()
+                .find(|summary| summary.application_instance_id == instance)
+                .expect("the first instance is announced");
+
+            // Step 6: the installation is upgraded through the held handle.
+            let upgraded = ctx
+                .installation
+                .as_ref()
+                .expect("an installation")
+                .upgrade(&ctx.run, &ctx.run.root().join("t/b"));
+
+            // Step 7: the second shell types the agent's name: right before the typing the route
+            // is checked, and the process table is read from before it until the second program
+            // is seen running as typed, and once more after.
+            ctx.checks_the_placed_files();
+            let _ = servers_seen(&workers, &mut servers);
+            second.person.types("codex");
+            let second_process =
+                process_mapping_within(workers[1], newer_inode, None, &workers, &mut servers);
+            let as_typed = shows_within(&second.person, RAN_AS_TYPED);
+            let _ = servers_seen(&workers, &mut servers);
+
+            // Step 8: fresh traffic through the pinned adapter, made after the upgrade: the device
+            // answers the held approval, and the pinned server asks a second one that did not exist
+            // before the upgrade.
+            let binding = ctx.binding(&session.remote, first_session, instance);
+            let answered = ctx.answers(
+                &session.remote,
+                first_session,
+                instance,
+                &binding,
+                held.resource_id,
+                ACCEPT,
+            );
+            let fresh =
+                fresh_approval_within(ctx, &session.remote, first_session, &[held.resource_id]);
+
+            // Reads for the assertions.
+            let after = capability_identity(ctx, &session.remote, first_session, instance);
+            let second_read = ctx.instances_within(
+                &second.remote,
+                second_session,
+                "the second instance",
+                |read| !read.agent_instances.instances.is_empty(),
+            );
+            let second_summary = second_read
+                .as_ref()
+                .ok()
+                .and_then(|read| read.agent_instances.instances.first().cloned());
+            let second_capabilities = second_summary.as_ref().map(|summary| {
+                capability_identity(
+                    ctx,
+                    &second.remote,
+                    second_session,
+                    summary.application_instance_id,
+                )
+            });
+            let cancel = second_summary.as_ref().map(|summary| {
+                ctx.cancels(
+                    &second.remote,
+                    second_session,
+                    summary.application_instance_id,
+                    AgentBindingRevision::new(1),
+                    "turn-6b-test",
+                )
+            });
+            let first_image = first_process
+                .as_ref()
+                .ok()
+                .and_then(|identity| text_image(u32::try_from(identity.pid.get()).ok()?).ok())
+                .map(|(_, inode)| inode);
+            let first_gateway = summary_before.mode.uses_gateway();
+            let second_gateway = second_summary
+                .as_ref()
+                .is_some_and(|summary| summary.mode.uses_gateway());
+
+            // The assertions, each in this body.
+            assert!(
+                upgraded.is_ok(),
+                "the upgrade through the held handle: {upgraded:?}"
+            );
+            assert!(
+                first_process.is_ok(),
+                "the first agent's terminal is running on the pinned image: {first_process:?}"
+            );
+            // 9a: the first process is the same process and runs the pinned image.
+            let still = first_process.as_ref().ok().and_then(|identity| {
+                kr_ipc::identity::process_start_identity(u32::try_from(identity.pid.get()).ok()?)
+                    .ok()
+                    .map(|now| now == *identity)
+            });
+            assert_eq!(
+                still,
+                Some(true),
+                "the first process is the same process after the upgrade"
+            );
+            assert_eq!(
+                first_image,
+                Some(pinned_inode),
+                "the first process still runs the pinned image"
+            );
+            // 9b: the identity fields of its binding are those of before (the revision, thread and
+            // turn are not compared: step 8 changes them).
+            let (before, after) = (
+                before
+                    .as_ref()
+                    .expect("the first identity before the upgrade"),
+                after
+                    .as_ref()
+                    .expect("the first identity after the upgrade"),
+            );
+            let (identity_before, identity_after) = (
+                before.0.as_ref().expect("an identity before"),
+                after.0.as_ref().expect("an identity after"),
+            );
+            assert!(
+                identity_before.profile_id.0.is_some()
+                    && identity_before.binary_digest.0.is_some()
+                    && identity_before.package_digest.0.is_some(),
+                "the first binding holds a profile, a binary digest and a package digest: {identity_before:?}"
+            );
+            assert_eq!(identity_after.profile_id, identity_before.profile_id);
+            assert_eq!(identity_after.binary_digest, identity_before.binary_digest);
+            assert_eq!(
+                identity_after.package_digest,
+                identity_before.package_digest
+            );
+            // 9c: what the pinned server asked after the upgrade is a request that did not exist
+            // before, and it is interpreted under the pinned decoder.
+            assert!(
+                answered.is_ok(),
+                "the device's answer to the held approval: {answered:?}"
+            );
+            let fresh = fresh
+                .as_ref()
+                .expect("a fresh approval, interpreted by the pinned table");
+            assert_ne!(fresh.resource_id, held.resource_id);
+            // 9d: the second process runs the newer image.
+            let second_identity = second_process.as_ref().expect("the second program runs");
+            let second_image = text_image(u32::try_from(second_identity.pid.get()).expect("a pid"))
+                .map(|(_, inode)| inode);
+            assert_eq!(
+                second_image,
+                Ok(newer_inode),
+                "the second process runs the newer image"
+            );
+            assert_ne!(newer_inode, pinned_inode);
+            assert!(
+                as_typed.is_ok(),
+                "the second program runs as typed: {as_typed:?}"
+            );
+            // 9e: the host announced no gateway for it, and no capability of it is usable.
+            let second_summary = second_summary.expect("the second instance is announced");
+            assert!(
+                !second_gateway,
+                "the host announced a gateway for the newer build: {second_summary:?}"
+            );
+            if let Some(Ok((_, usable, _))) = &second_capabilities {
+                assert_eq!(
+                    *usable, 0,
+                    "no typed capability of the newer build is usable"
+                );
+            }
+            // 9f: both profile identifiers are present and unequal.
+            assert!(
+                summary_before.profile_id.0.is_some() && second_summary.profile_id.0.is_some(),
+                "both instances hold a profile"
+            );
+            assert_ne!(summary_before.profile_id, second_summary.profile_id);
+            // 9g: the cancel of a well-formed turn is refused with the code of an unsupported
+            // capability and no other.
+            let cancel = cancel.expect("a cancel was sent");
+            assert_eq!(
+                cancel.as_ref().err().and_then(RequestError::refusal),
+                Some(ErrorCode::UnsupportedCapability),
+                "the cancel of the newer build's instance: {cancel:?}"
+            );
+            // 9i: one server for the two workers.
+            assert_eq!(servers.len(), 1, "one application server: {servers:?}");
+            // 10: the control separates the two processes by the gateway.
+            assert_eq!(
+                check_served(first_gateway, pinned_inode, pinned_inode),
+                Ok(())
+            );
+            assert_eq!(
+                check_served(second_gateway, newer_inode, pinned_inode),
+                Err(Cause::NoGateway)
+            );
+            assert!(ctx.run.root().is_dir());
+            serde_json::json!({
+                "first_process_image_unchanged": true,
+                "fresh_approval_interpreted_by_the_pinned_table": true,
+                "second_process_runs_the_newer_image": true,
+                "second_instance_has_no_gateway": true,
+                "servers": servers.len(),
+            })
+        },
+    );
+}
+
+/// What `Installation::upgrade` does where the agent changed the directory `agent` of the run
+/// before it: the upgrade is refused, and nothing is made or removed outside the directory that
+/// was recorded.
+fn an_installation_the_agent_changed(how: &str) {
+    let run = Run::start("gateway-upgrade-guard");
+    let (first, second) = (run.root().join("t/a"), run.root().join("t/b"));
+    for prefix in [&first, &second] {
+        kr_ipc::paths::create_private_tree(run.root(), &prefix.join("bin"))
+            .expect("a directory for a build");
+    }
+    let installation = Installation::link(&run, &first, &[]);
+    let agent = run.root().join("agent");
+    let elsewhere = run.root().join("elsewhere");
+    let moved = run.root().join("agent-moved");
+    match how {
+        "link" => {
+            std::fs::create_dir(&elsewhere).expect("another directory");
+            std::fs::rename(&agent, &moved).expect("the directory moved");
+            std::os::unix::fs::symlink(&elsewhere, &agent).expect("a link in its place");
+        }
+        "directory" => {
+            std::fs::rename(&agent, &moved).expect("the directory moved");
+            std::fs::create_dir(&agent).expect("another directory in its place");
+        }
+        "next" => {
+            std::os::unix::fs::symlink(&first, agent.join("current.next")).expect("a link");
+        }
+        other => panic!("{other}"),
+    }
+    let refused = installation.upgrade(&run, &second);
+    assert!(
+        refused.is_err(),
+        "the upgrade after the agent changed `agent` ({how}) is refused"
+    );
+    match how {
+        "link" => assert_eq!(
+            std::fs::read_dir(&elsewhere)
+                .expect("the other directory")
+                .count(),
+            0,
+            "nothing is made in the directory the link names"
+        ),
+        "directory" => assert_eq!(
+            std::fs::read_dir(&agent)
+                .expect("the new directory")
+                .count(),
+            0,
+            "nothing is made in the directory that took its place"
+        ),
+        _ => {
+            // The link that was there is not unlinked by name, and `current` still names the first.
+            assert_eq!(
+                std::fs::read_link(agent.join("current.next")).expect("the link kept"),
+                first
+            );
+            assert_eq!(
+                std::fs::read_link(agent.join("current")).expect("current"),
+                first
+            );
+        }
+    }
+    run.closing_check().expect("nothing runs");
+}
+
+/// A link left at `agent` is not followed by the upgrade.
+#[test]
+fn gateway_an_upgrade_is_refused_where_the_agent_replaced_the_installation_directory_by_a_link() {
+    an_installation_the_agent_changed("link");
+}
+
+/// Another directory at `agent` is not the one the run made.
+#[test]
+fn gateway_an_upgrade_is_refused_where_the_agent_replaced_the_installation_directory_by_another() {
+    an_installation_the_agent_changed("directory");
+}
+
+/// A `current.next` that is already there stops the upgrade, and nothing is unlinked by name.
+#[test]
+fn gateway_an_upgrade_is_refused_where_a_link_for_the_next_build_is_already_there() {
+    an_installation_the_agent_changed("next");
+}
+
+/// A newer build's file replaced by a link after it was placed is found by the check that runs
+/// right before each typing.
+#[test]
+fn gateway_a_newer_build_the_agent_replaced_is_not_run_by_the_next_start() {
+    let run = Run::start("gateway-upgrade-newer");
+    let tools = run.root().join("t/b/bin");
+    kr_ipc::paths::create_private_tree(run.root(), &tools).expect("a directory for the build");
+    run.place_built("codex-stand-in-newer", &tools.join("codex"), &["--version"]);
+    let place = Path::new("t/b/bin/codex");
+    run.note_placed(place).expect("the newer build is placed");
+    run.placed_as_it_was(place).expect("as it was placed");
+    let elsewhere = run.root().join("elsewhere");
+    std::fs::write(&elsewhere, b"another program").expect("another file");
+    std::fs::remove_file(tools.join("codex")).expect("the file removed");
+    std::os::unix::fs::symlink(&elsewhere, tools.join("codex")).expect("a link in its place");
+    let why = run
+        .placed_as_it_was(place)
+        .expect_err("a replaced newer build is not as it was placed");
+    assert!(why.contains("symbolic link"), "{why}");
+    run.closing_check().expect("nothing runs");
+}
+
+/// What the agent left in the working directory before the harness releases the stand-in or makes
+/// a pipe there does not decide where the harness writes: a file is made only where none is (by
+/// exclusive creation), a link at the name is not followed and nothing is written through it, a
+/// pipe is read only where it is the pipe that was made, and a directory that is not the recorded
+/// one is refused.
+#[test]
+fn gateway_a_release_or_a_pipe_is_made_only_through_the_recorded_directory_and_never_over_what_the_agent_left()
+ {
+    let run = Run::start("gateway-release-guard");
+    let work = PlacedDirectory::record(run.root(), run.pin(), Path::new("w"))
+        .expect("the working directory is a directory of the run");
+    let (root, pin) = (run.root(), run.pin());
+    work.create_new(root, pin, "release", b"go")
+        .expect("the release is made where none is");
+    assert_eq!(
+        std::fs::read(run.work().join("release")).expect("the release"),
+        b"go"
+    );
+    assert!(
+        work.create_new(root, pin, "release", b"again").is_err(),
+        "a release over a file that is there is refused"
+    );
+    let outside = run.root().join("outside");
+    std::fs::write(&outside, b"theirs").expect("a file outside the directory");
+    std::os::unix::fs::symlink(&outside, run.work().join("linked")).expect("a link");
+    assert!(
+        work.create_new(root, pin, "linked", b"go").is_err(),
+        "a release at a link is refused"
+    );
+    assert_eq!(
+        std::fs::read(&outside).expect("the file the link names"),
+        b"theirs",
+        "nothing was written through the link"
+    );
+    assert!(
+        work.create_new(root, pin, "../escape", b"go").is_err(),
+        "a name that is not one name is refused"
+    );
+    let made = work
+        .make_fifo(root, pin, "f")
+        .expect("the pipe is made where none is");
+    assert!(
+        work.make_fifo(root, pin, "f").is_err(),
+        "a pipe over a name that is there is refused"
+    );
+    work.open_fifo_for_reading(root, pin, "f", made)
+        .expect("the pipe that was made is opened");
+    // The agent replaces the pipe by a link to another pipe: the reader is refused.
+    std::fs::remove_file(run.work().join("f")).expect("the pipe removed");
+    std::os::unix::fs::symlink(&outside, run.work().join("f")).expect("a link in its place");
+    assert!(
+        work.open_fifo_for_reading(root, pin, "f", made).is_err(),
+        "a link at the pipe's name is refused"
+    );
+    // The agent moves the directory away and puts another in its place.
+    std::fs::rename(run.work(), run.root().join("w-moved")).expect("the directory moved");
+    std::fs::create_dir(run.work()).expect("another directory");
+    assert!(
+        work.create_new(root, pin, "release", b"go").is_err(),
+        "a release in a directory that is not the recorded one is refused"
+    );
+    run.closing_check().expect("nothing runs");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Part 8b: a forged credential fails at the check where the host's own registration for the same
+// launch passes.
+// ---------------------------------------------------------------------------------------------
+
+/// Waits until the bytes the window was sent after `mark` hold `needle`, within [`LIVENESS`], and
+/// returns them. The bytes are read, not the rendered screen, which a full-screen program can
+/// overdraw.
+fn bytes_show_within(person: &Person, mark: usize, needle: &str) -> Result<Vec<u8>, String> {
+    let started = Instant::now();
+    loop {
+        let bytes = person.window.collected().since(mark);
+        if String::from_utf8_lossy(&bytes).contains(needle) {
+            return Ok(bytes);
+        }
+        if started.elapsed() >= LIVENESS {
+            return Err(format!(
+                "the terminal's bytes after the typing do not hold {needle:?} within {LIVENESS:?}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The pid and the start value of the helper's line `pid <n> start <s> forged presentation ...`.
+fn helper_identity(text: &str) -> Option<(u32, u64)> {
+    let line = text
+        .lines()
+        .find(|line| line.contains("kr-e2e-forge: pid ") && line.contains("forged presentation"))?;
+    let mut words = line.split_whitespace();
+    words.find(|word| *word == "pid")?;
+    let pid = words.next()?.parse().ok()?;
+    words.find(|word| *word == "start")?;
+    let start = words.next()?.parse().ok()?;
+    Some((pid, start))
+}
+
+/// A launch whose first presentation carries a credential that is not the backend's is refused at
+/// the check of the credential, and the same launch, presented a second time by the same process
+/// with the host's own credential, is admitted: the host serves the instance through its gateway.
+/// The two presentations differ in nothing but the credential (one backend, one root-shell child,
+/// one process identity, one executable, one vector, one environment), so only that check tells
+/// them apart.
+///
+/// KR-REQ-12.14 is evidence only: this is the launch admission's check, not the native gateway
+/// listener's. Not claimed: that a refusal's text is shown (the host drops it).
+#[test]
+fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refused_at_the_launch_check_and_the_hosts_own_credential_for_the_same_launch_is_admitted()
+ {
+    const TEST: &str = "gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refused_at_the_launch_check_and_the_hosts_own_credential_for_the_same_launch_is_admitted";
+    run_case_in(
+        Setup {
+            forge: true,
+            ..Setup::default()
+        },
+        "gateway-credential",
+        "8b",
+        TEST,
+        "stay",
+        |ctx, session| {
+            assert!(
+                matches!(ctx.route, Route::StandIn),
+                "the real arm of this part runs with no login once the build's launch is admitted \
+                 behind the gateway; the stand-in route is the one this build runs"
+            );
+            let stand_in_inode = inode_of(&ctx.executable);
+            let worker = u32::try_from(
+                ctx.run
+                    .worker_of(&session.session_id().to_string())
+                    .pid
+                    .get(),
+            )
+            .expect("a pid");
+            // The shell's environment is read at its prompt before the agent's first start, as for
+            // every case, and the mode of this case was chosen before any key was acquired: it
+            // takes no login.
+            match session
+                .person
+                .reads_the_environment(&session.person.expected)
+            {
+                Ok(compared) => eprintln!("{compared}"),
+                Err(why) => panic!("{why}"),
+            }
+            session.environment_read.set(true);
+            session.host.agent_starts();
+            ctx.checks_the_placed_files();
+            // One typed launch: the line is typed once, with a mark on the byte stream before it.
+            let mark = session.person.window.collected().mark();
+            session.person.types("codex");
+            let line = bytes_show_within(&session.person, mark, "forged presentation");
+            let text = line
+                .as_ref()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .unwrap_or_default();
+            let identity = helper_identity(&text);
+            let mut servers: Vec<ProcessStartIdentity> = Vec::new();
+            let instance = ctx.instances_within(
+                &session.remote,
+                session.session_id(),
+                "an instance served through the gateway",
+                |read| {
+                    let _ = servers_seen(&[worker], &mut servers);
+                    read.agent_instances
+                        .instances
+                        .iter()
+                        .any(|summary| summary.mode.uses_gateway())
+                },
+            );
+            let _ = servers_seen(&[worker], &mut servers);
+            let after = String::from_utf8_lossy(&session.person.window.collected().since(mark))
+                .into_owned();
+
+            // (a) the forged presentation is refused: the helper's line says so, once, with the
+            // identity it presented as.
+            assert!(line.is_ok(), "the helper's line: {line:?}");
+            assert_eq!(
+                text.matches("forged presentation refused").count(),
+                1,
+                "the forged presentation is refused, once: {text}"
+            );
+            assert!(
+                !text.contains("forged presentation admitted"),
+                "the forged presentation was admitted: {text}"
+            );
+            let (pid, start) = identity.expect("the helper's line names its pid and its start");
+            // (b) one process identity: the process with the helper's pid and start is the program
+            // (helper, launcher and program are one process).
+            let now = kr_ipc::identity::process_start_identity(pid);
+            assert_eq!(
+                now.as_ref().map(|now| now.start_value.get()).ok(),
+                Some(start),
+                "the process the helper presented as is still running with its start: {now:?}"
+            );
+            assert_eq!(
+                text_image(pid).map(|(_, inode)| inode),
+                Ok(stand_in_inode),
+                "the process that presented the forged credential now runs the program"
+            );
+            // (c) the host announces an instance served through a gateway for the session: the
+            // genuine presentation of the same launch was admitted.
+            assert!(
+                instance.is_ok(),
+                "the instance served through the gateway: {instance:?}"
+            );
+            // (d) the program did not run as typed.
+            assert!(
+                !after.contains(RAN_AS_TYPED),
+                "the line ran as typed: {after}"
+            );
+            // (e) one application server for the session's worker.
+            assert_eq!(servers.len(), 1, "one application server: {servers:?}");
+            // (f) no `kr` ran after the agent started.
+            assert!(
+                session
+                    .host
+                    .kr_after_the_agent_started()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "no `kr` ran after the agent started"
+            );
+            serde_json::json!({
+                "forged_presentation_refused": true,
+                "one_process_identity": true,
+                "gateway_served_after_the_same_launch_was_admitted": true,
+                "servers": servers.len(),
+            })
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

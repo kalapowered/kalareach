@@ -12,6 +12,12 @@ publish.workspace = true
 name = "codex-stand-in"
 path = "src/main.rs"
 
+# The same program built again as the newer release: one source, a second program with another
+# digest and another version (`NEWER`), so a case can install it beside the first and upgrade to it.
+[[bin]]
+name = "codex-stand-in-newer"
+path = "src/main.rs"
+
 [dependencies]
 futures-util.workspace = true
 http.workspace = true
