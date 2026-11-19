@@ -240,6 +240,7 @@ fn a_declared_name_outside_the_shape_is_refused_by_name() {
     assert_eq!(too_long.len(), 65);
     for name in [
         "example_no_x",
+        "EXAMPLE_no_x",
         "EXAMPLE",
         "PATH",
         "HOME",
