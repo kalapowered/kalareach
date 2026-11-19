@@ -1374,6 +1374,22 @@ impl PlacedDirectory {
     ///
     /// Returns what is not as it was placed, as a class and no name outside the run.
     pub fn place_for_a_start(&self, root: &Path, pin: &RootPin) -> Result<PathBuf, String> {
+        let handle = self.open(root, pin)?;
+        current_place(&handle).ok_or_else(|| {
+            format!(
+                "the directory {} is not as the run placed it: the system names no place for it",
+                self.relative.display()
+            )
+        })
+    }
+
+    /// The held handle of the directory: reached again by the walk from the pin that follows no
+    /// link, and the directory that was recorded, by its device and inode on the same handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns what is not as it was placed, as a class and no name outside the run.
+    pub fn open(&self, root: &Path, pin: &RootPin) -> Result<std::os::fd::OwnedFd, String> {
         let said = |what: &dyn std::fmt::Display| {
             format!(
                 "the directory {} is not as the run placed it: {what}",
@@ -1385,8 +1401,121 @@ impl PlacedDirectory {
         if (i128::from(stat.st_dev), i128::from(stat.st_ino)) != (self.device, self.inode) {
             return Err(said(&"it is another directory"));
         }
-        current_place(&handle).ok_or_else(|| said(&"the system names no place for it"))
+        Ok(handle)
     }
+
+    /// Makes the file `name` in the directory with `bytes`, through the held handle: the file must
+    /// not exist (exclusive creation), no link is followed at its name, and the mode is private.
+    /// Where the agent left anything at the name, the creation is refused and nothing is written.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the directory is not as it was placed, the name is not one name, or the file was
+    /// not created and written.
+    pub fn create_new(
+        &self,
+        root: &Path,
+        pin: &RootPin,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        use std::io::Write as _;
+        let name = one_name(name)?;
+        let handle = self.open(root, pin)?;
+        let made = rustix::fs::openat(
+            &handle,
+            name.as_str(),
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .map_err(|error| format!("the file {name} is not created: {error}"))?;
+        std::fs::File::from(made)
+            .write_all(bytes)
+            .map_err(|error| format!("the file {name} is not written: {error}"))
+    }
+
+    /// Makes the named pipe `name` in the directory, and returns its device and inode as made. The
+    /// directory is the held handle's own place (the place of the handle that was checked, which
+    /// no link names, as for a program started in it), the name must not exist (the pipe is made
+    /// by a call that refuses an existing name), and what is at the name afterwards is looked at
+    /// through the handle with no link followed and must be a pipe.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the directory is not as it was placed, or the pipe was not made.
+    pub fn make_fifo(&self, root: &Path, pin: &RootPin, name: &str) -> Result<(u64, u64), String> {
+        let name = one_name(name)?;
+        let handle = self.open(root, pin)?;
+        let place = current_place(&handle)
+            .ok_or_else(|| "the system names no place for the directory".to_owned())?;
+        let made = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(place.join(&name))
+            .status()
+            .map_err(|error| format!("mkfifo does not start: {error}"))?;
+        if !made.success() {
+            return Err(format!(
+                "the pipe {name} is not made: mkfifo ended with {made}"
+            ));
+        }
+        let stat = rustix::fs::statat(
+            &handle,
+            name.as_str(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .map_err(|error| format!("the pipe {name} is not looked at: {error}"))?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Fifo {
+            return Err(format!("{name} is not a pipe after it was made"));
+        }
+        Ok((u64::from(stat.st_dev as u64), stat.st_ino))
+    }
+
+    /// Opens the pipe `name` for reading without waiting for a writer, through the held handle,
+    /// with no link followed at its name; the object opened must be the pipe made (`made`, from
+    /// [`PlacedDirectory::make_fifo`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns why the directory is not as it was placed, or what is at the name is not the pipe
+    /// that was made.
+    pub fn open_fifo_for_reading(
+        &self,
+        root: &Path,
+        pin: &RootPin,
+        name: &str,
+        made: (u64, u64),
+    ) -> Result<std::fs::File, String> {
+        let name = one_name(name)?;
+        let handle = self.open(root, pin)?;
+        let opened = rustix::fs::openat(
+            &handle,
+            name.as_str(),
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(|error| format!("the pipe {name} is not opened: {error}"))?;
+        let stat = rustix::fs::fstat(&opened).map_err(|error| error.to_string())?;
+        if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Fifo
+            || (u64::from(stat.st_dev as u64), stat.st_ino) != made
+        {
+            return Err(format!("{name} is not the pipe that was made"));
+        }
+        Ok(std::fs::File::from(opened))
+    }
+}
+
+/// A name that is one component of a directory: not empty, no separator, not a dot entry.
+fn one_name(name: &str) -> Result<String, String> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+        return Err(format!("{name:?} is not one name"));
+    }
+    Ok(name.to_owned())
 }
 
 /// Opens the directory `relative` below the run's directory `root` by the walk of [`parent_below`]:
