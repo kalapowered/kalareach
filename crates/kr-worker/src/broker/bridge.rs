@@ -77,6 +77,25 @@ pub fn forwarder_application(declared: &str) -> Option<&'static str> {
         .map(|(_, reported)| *reported)
 }
 
+/// The registrations the installed forwarder, `kr-hook`, answers to: the application name it is
+/// started with, and the surface it is started for. A registration for any other pair starts a
+/// forwarder that refuses its command line, so the host places none. This stands until the
+/// forwarder serves an application by the word it is started with.
+pub const SERVED_INVOCATIONS: [(&str, BridgeSurface); 4] = [
+    ("claude-code", BridgeSurface::Hook),
+    ("claude-code", BridgeSurface::Channel),
+    ("gemini-cli", BridgeSurface::Hook),
+    ("qoder-cli", BridgeSurface::Hook),
+];
+
+/// Returns whether the installed forwarder answers to `application` started for `surface`.
+#[must_use]
+pub fn forwarder_serves(application: &str, surface: BridgeSurface) -> bool {
+    SERVED_INVOCATIONS
+        .iter()
+        .any(|(word, served)| *word == application && *served == surface)
+}
+
 /// One of the registrations an installed bridge put into the application's configuration.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize, serde::Serialize,
@@ -1191,6 +1210,58 @@ mod tests {
         BridgeDeclaration {
             application: application.to_owned(),
             surface,
+        }
+    }
+
+    /// KR-REQ-11.44: each invocation the host lists as one the forwarder serves names an
+    /// application by a plain word and is listed once.
+    #[test]
+    fn kr_req_11_44_each_served_invocation_is_a_plain_word_named_once() {
+        let mut seen = BTreeSet::new();
+        for (word, surface) in SERVED_INVOCATIONS {
+            assert!(
+                !word.is_empty()
+                    && !word.starts_with('-')
+                    && word.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'-'),
+                "{word:?} is not a plain word"
+            );
+            assert!(
+                seen.insert((word, surface)),
+                "{word} {surface:?} is listed twice"
+            );
+        }
+    }
+
+    /// KR-REQ-11.44: the forwarder serves each listed pair and no other: not an application it has
+    /// no hook for, not a surface it serves only to another application, not a label, and not a
+    /// word that starts with a hyphen.
+    #[test]
+    fn kr_req_11_44_the_forwarder_serves_each_listed_pair_and_no_other() {
+        for (word, surface) in [
+            ("claude-code", BridgeSurface::Hook),
+            ("claude-code", BridgeSurface::Channel),
+            ("gemini-cli", BridgeSurface::Hook),
+            ("qoder-cli", BridgeSurface::Hook),
+        ] {
+            assert!(
+                forwarder_serves(word, surface),
+                "{word} {surface:?} is served"
+            );
+        }
+        for (word, surface) in [
+            ("amp", BridgeSurface::Hook),
+            ("gemini-cli", BridgeSurface::Channel),
+            ("qoder-cli", BridgeSurface::Channel),
+            ("Claude Code", BridgeSurface::Hook),
+            ("-amp", BridgeSurface::Hook),
+            ("--help", BridgeSurface::Hook),
+        ] {
+            assert!(
+                !forwarder_serves(word, surface),
+                "{word} {surface:?} is not served"
+            );
         }
     }
 

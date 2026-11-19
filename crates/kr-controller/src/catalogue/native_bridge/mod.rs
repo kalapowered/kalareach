@@ -68,7 +68,7 @@ use kr_plugin_sdk::version::PackageVersion;
 use kr_protocol::ids::PluginId;
 use kr_protocol::scalars::Digest256;
 pub use kr_worker::broker::bridge::BridgeSurface;
-use kr_worker::broker::bridge::forwarder_application;
+use kr_worker::broker::bridge::{forwarder_application, forwarder_serves};
 pub use kr_worker::broker::connectors::{BridgeFacts, QualifiedExecutable};
 
 pub use self::check::{check, unread_check};
@@ -2414,8 +2414,7 @@ fn registration(
     forwarder: &Path,
     application: &str,
 ) -> std::result::Result<Option<RecordedFacts>, String> {
-    let mut applications = BTreeSet::new();
-    let mut surfaces = BTreeSet::new();
+    let mut pairs = BTreeSet::new();
     for (destination, bytes) in sources {
         // Every file a recipe installs is JSON this host reads, whatever its name says: an
         // application may read a file more leniently than this host does, or run it as a script,
@@ -2425,7 +2424,7 @@ fn registration(
                 "{destination} cannot be read as JSON, so what it registers cannot be checked"
             ));
         };
-        invocations(&value, destination, &mut applications, &mut surfaces)?;
+        invocations(&value, destination, &mut pairs)?;
         // Then the file's own shape, which is closed: what the commands are is read above, and
         // what else the file asks the application to do is only what this host names for it.
         let (directory, tail) = destination
@@ -2439,6 +2438,10 @@ fn registration(
             )
         })?;
     }
+    let applications: BTreeSet<&str> = pairs
+        .iter()
+        .map(|(application, _)| application.as_str())
+        .collect();
     let mut named = applications.into_iter();
     let Some(application) = named.next() else {
         return Ok(None);
@@ -2448,9 +2451,20 @@ fn registration(
             "the registration starts the forwarder for {application} and for {other}"
         ));
     }
+    // The forwarder refuses a command line it does not serve, so a registration for one would
+    // place an application's hook that can never run: it is refused before anything is written.
+    for (word, surface) in &pairs {
+        if !forwarder_serves(word, *surface) {
+            return Err(format!(
+                "the registration starts `kr-hook {word} {}`, which the installed forwarder does \
+                 not accept",
+                surface.as_str()
+            ));
+        }
+    }
     Ok(Some(RecordedFacts {
-        application,
-        surfaces: surfaces.into_iter().collect(),
+        application: application.to_owned(),
+        surfaces: pairs.iter().map(|(_, surface)| *surface).collect(),
         forwarder: forwarder.to_path_buf(),
     }))
 }
@@ -2480,8 +2494,7 @@ fn expanded(
 fn invocations(
     value: &serde_json::Value,
     destination: &str,
-    applications: &mut BTreeSet<String>,
-    surfaces: &mut BTreeSet<BridgeSurface>,
+    pairs: &mut BTreeSet<(String, BridgeSurface)>,
 ) -> std::result::Result<(), String> {
     match value {
         serde_json::Value::Object(members) => {
@@ -2521,8 +2534,10 @@ fn invocations(
                         })
                         .unwrap_or_default();
                     match (words.as_slice(), arguments.map(Vec::len)) {
-                        ([application, "hook"], Some(2)) => (*application, BridgeSurface::Hook),
-                        ([application, "channel"], Some(2)) => {
+                        ([application, "hook"], Some(2)) if plain_word(application) => {
+                            (*application, BridgeSurface::Hook)
+                        }
+                        ([application, "channel"], Some(2)) if plain_word(application) => {
                             (*application, BridgeSurface::Channel)
                         }
                         _ => return Err(unaccepted()),
@@ -2548,8 +2563,7 @@ fn invocations(
                         _ => return Err(unaccepted()),
                     }
                 };
-                applications.insert(surface.0.to_owned());
-                surfaces.insert(surface.1);
+                pairs.insert((surface.0.to_owned(), surface.1));
             }
             for (name, nested) in members {
                 // The placeholder stands where a command starts and nowhere else: a key or a value
@@ -2563,13 +2577,13 @@ fn invocations(
                     ));
                 }
                 if name != "command" {
-                    invocations(nested, destination, applications, surfaces)?;
+                    invocations(nested, destination, pairs)?;
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                invocations(item, destination, applications, surfaces)?;
+                invocations(item, destination, pairs)?;
             }
         }
         serde_json::Value::String(text) if text.contains(forwarder::PLACEHOLDER) => {
@@ -2924,9 +2938,11 @@ fn plain_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-/// True for a word of lower-case letters, digits and hyphens, which a shell reads as itself.
+/// True for a word of lower-case letters, digits and hyphens that does not begin with a hyphen,
+/// which a shell reads as itself and the forwarder never reads as an option.
 fn plain_word(word: &str) -> bool {
-    !word.is_empty()
+    !word.starts_with('-')
+        && !word.is_empty()
         && word
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')

@@ -5389,6 +5389,157 @@ fn kr_req_11_42_every_command_a_registration_runs_is_the_forwarder_in_a_form_the
 }
 
 // ---------------------------------------------------------------------------------------------
+// The application a registration starts the forwarder for
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-11.44: a registration that starts an invocation the installed forwarder does not accept
+/// is refused before anything is written, naming the invocation: an application it serves no hook
+/// for, and a surface it serves only to another application. The line the package ships is the
+/// control.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_44_a_registration_the_forwarder_does_not_accept_is_refused_before_anything_is_written()
+{
+    for invocation in ["kr-hook amp hook", "kr-hook gemini-cli channel"] {
+        let site = GeminiSite::new();
+        let before = site.tree();
+        let target = gemini_target_with_hooks(&site, &gemini_hooks(&[invocation]));
+        let settled = site
+            .bridges()
+            .reconcile(&gemini(), Some(&target))
+            .expect("reconciles");
+        match settled {
+            Settled::Refused(reason) => {
+                assert!(
+                    reason.contains(&format!("`{invocation}`")),
+                    "{invocation}: the refusal names the invocation: {reason}"
+                );
+                assert!(
+                    reason.contains("the installed forwarder does not accept"),
+                    "{invocation}: refused because the forwarder does not accept it: {reason}"
+                );
+                assert!(
+                    !reason.contains("arguments it does not accept")
+                        && !reason.contains("not the application"),
+                    "{invocation}: refused by the forwarder's list and no other check: {reason}"
+                );
+            }
+            other => panic!("{invocation}: not refused: {other:?}"),
+        }
+        assert_eq!(site.tree(), before, "{invocation}: nothing was written");
+    }
+    // The control: the invocation the package ships is applied.
+    let site = GeminiSite::new();
+    let target = gemini_target_with_hooks(&site, &gemini_hooks(&["kr-hook gemini-cli hook"]));
+    let settled = site
+        .bridges()
+        .reconcile(&gemini(), Some(&target))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied);
+}
+
+/// KR-REQ-11.44: a registration that starts the forwarder for two applications is refused naming
+/// both, though each is one the forwarder serves, and nothing is written.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_44_a_registration_for_two_served_applications_is_refused_naming_both() {
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let target = gemini_target_with_hooks(
+        &site,
+        &gemini_hooks(&["kr-hook gemini-cli hook", "kr-hook qoder-cli hook"]),
+    );
+    let settled = site
+        .bridges()
+        .reconcile(&gemini(), Some(&target))
+        .expect("reconciles");
+    match settled {
+        Settled::Refused(reason) => assert!(
+            reason.contains("gemini-cli") && reason.contains("qoder-cli"),
+            "the refusal names both applications: {reason}"
+        ),
+        other => panic!("not refused: {other:?}"),
+    }
+    assert_eq!(site.tree(), before, "nothing was written");
+}
+
+/// KR-REQ-11.44: an application word in an argument list is held to the same plain-word rule as
+/// one in a line: a word with a space in it is a command the host does not read, and nothing is
+/// written. The unchanged release is the control.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_44_an_application_word_in_an_argument_list_is_a_plain_word_or_refused() {
+    let site = Site::new();
+    let before = site.tree();
+    let target = site.release_registering("odd", "a b");
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&target))
+        .expect("reconciles");
+    match settled {
+        Settled::Refused(reason) => assert!(
+            reason.contains(UNREAD_COMMAND),
+            "refused as a command the host does not read: {reason}"
+        ),
+        other => panic!("not refused: {other:?}"),
+    }
+    assert_eq!(site.tree(), before, "nothing was written");
+
+    let site = Site::new();
+    let settled = site
+        .bridges()
+        .reconcile(&plugin(), Some(&site.release()))
+        .expect("reconciles");
+    assert_eq!(settled, Settled::Applied);
+}
+
+/// KR-REQ-11.44: a word that starts with a hyphen is never an application, in an argument list or
+/// in a line: the forwarder would read it as an option. Each is a command the host does not read,
+/// and nothing is written.
+#[cfg(unix)]
+#[test]
+fn kr_req_11_44_an_application_word_that_starts_with_a_hyphen_is_refused_in_every_form() {
+    for word in ["-amp", "--help", "--version", "--"] {
+        let site = Site::new();
+        let before = site.tree();
+        let target = site.release_registering("odd", word);
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&target))
+            .expect("reconciles");
+        match settled {
+            Settled::Refused(reason) => assert!(
+                reason.contains(UNREAD_COMMAND),
+                "{word} in an argument list: refused as a command the host does not read: {reason}"
+            ),
+            other => panic!("{word} in an argument list: not refused: {other:?}"),
+        }
+        assert_eq!(
+            site.tree(),
+            before,
+            "{word} in an argument list: nothing was written"
+        );
+
+        let site = GeminiSite::new();
+        let before = site.tree();
+        let line = format!("kr-hook {word} hook");
+        let target = gemini_target_with_hooks(&site, &gemini_hooks(&[line.as_str()]));
+        let settled = site
+            .bridges()
+            .reconcile(&gemini(), Some(&target))
+            .expect("reconciles");
+        match settled {
+            Settled::Refused(reason) => assert!(
+                reason.contains(UNREAD_COMMAND),
+                "{word} in a line: refused as a command the host does not read: {reason}"
+            ),
+            other => panic!("{word} in a line: not refused: {other:?}"),
+        }
+        assert_eq!(site.tree(), before, "{word} in a line: nothing was written");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // What the doctor reports of the bridges
 // ---------------------------------------------------------------------------------------------
 
