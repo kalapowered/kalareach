@@ -151,14 +151,27 @@ record code, and a record longer than a signed record can be is refused before i
 With no proxy selected, iroh builds the clients for its relay latency probe and captive-portal
 check with no proxy, so those two requests go directly, whatever the environment names.
 
-A proxy that needs credentials is not supported. `ProxyUrl` refuses an address that names a user or
-a password, even an empty one, rather than using the proxy with the credential dropped.
+`ProxyUrl` refuses an address that names a user or a password, even an empty one, rather than using
+the proxy with the credential dropped. A login the proxy asks for is stored apart from the address,
+in the secret store, with `kr host network --proxy-login --proxy-credential-file <file>`, and the
+daemon uses it from its next start.
 
-This build installs no log subscriber, so it writes no iroh log. iroh's relay client logs the proxy
-address, and would log a credential in it and the whole `CONNECT` request, at debug level, from
-the module `iroh_relay::client::tls`. A build that installs a subscriber must hold that module at
-info or above, and a proxy that needs credentials waits for that filter and for a case that shows
-it.
+While a login is held, iroh does not receive it. This build runs a forwarder on the loopback
+address that admits only a `CONNECT` carrying the forwarder's own secret to a relay in the endpoint's
+map, and opens each tunnel through the one function that writes the login. The login goes to the
+proxy and to nothing else, only as a Basic `Proxy-Authorization` header. A proxy that signs in by
+another method is not supported: run a local proxy that signs in for this host and name it in
+`network.proxy_url`. While this host holds a login for its proxy, the captive-portal check is not
+sent, and an `http` relay gets no latency probe; where no QUIC address probe answers (always so for a
+host that reaches the network only through relays), this host does not choose that relay as its home
+relay and does not connect to it. Use an `https` relay.
+
+This build installs no log subscriber, so it writes no iroh log. iroh's relay client logs the
+request it sends to the forwarder, which holds the forwarder's secret and never the login, at debug
+level, from the module `iroh_relay::client::tls`. The login is held in the secret store and written
+by two functions only, one in `kr-transport` and one in `kr-client`. A build that installs a subscriber or
+a `log` logger must hold `iroh_relay::client::tls` at info or above and
+`iroh::address_lookup::pkarr` at error.
 
 A network that blocks WebSocket upgrades lets the relay's HTTPS through and answers the relay
 connection's upgrade with something other than `101 Switching Protocols`, such as `403`. The relay

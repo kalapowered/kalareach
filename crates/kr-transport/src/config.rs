@@ -159,7 +159,8 @@ pub struct EndpointConfig {
     /// adds trust rather than replacing it. An empty list is the ordinary case.
     pub relay_ca_roots: Vec<Vec<u8>>,
     /// The HTTP proxy this endpoint reaches its relays and Pkarr servers through: the relay
-    /// connection, the relay latency probe and captive-portal check, and the Pkarr publisher and
+    /// connection, the relay latency probe and captive-portal check (not sent while the proxy holds
+    /// a login), and the Pkarr publisher and
     /// resolver. Nothing else the endpoint sends uses it.
     ///
     /// It is this machine's own choice. A pairing invitation and a host bundle never carry it, and
@@ -305,7 +306,7 @@ pub enum ProxyUrlError {
     #[error("{0}")]
     Unparsable(url::ParseError),
     /// The URL names a user or a password.
-    #[error("a proxy that needs credentials is not supported")]
+    #[error("a proxy is named by its address alone, with no user name or password")]
     Credentials,
     /// The scheme is neither `http` nor `https`.
     #[error("the scheme must be http or https")]
@@ -562,7 +563,7 @@ mod tests {
     }
 
     /// KR-REQ-10.02: a proxy is named by its origin and names no credential. A user or a password
-    /// is refused as a proxy that needs credentials, before anything else about the address is
+    /// is refused for naming a user or a password, before anything else about the address is
     /// decided, and no refusal repeats the address.
     #[test]
     fn a_proxy_is_an_origin_that_carries_no_credential() {
