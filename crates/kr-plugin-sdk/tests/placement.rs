@@ -631,7 +631,7 @@ fn a_table_that_declares_a_placement_is_refused_by_the_package_check_by_name() {
 
 #[test]
 fn the_arrival_table_lists_placement_at_the_sdk_version() {
-    assert_eq!(SDK_VERSION, "0.1.9");
+    assert_eq!(SDK_VERSION, "0.1.10");
     let contract = package_contract();
     let listed: Vec<&Value> = contract["arrivals"]
         .as_array()
