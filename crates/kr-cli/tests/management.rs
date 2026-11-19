@@ -2474,7 +2474,13 @@ async fn a_share_is_revoked_by_its_identifier_while_a_grants_row_that_cannot_be_
         "the list refuses the row it cannot read: {listed}"
     );
     let lasting_text = lasting.to_string();
-    let revoked = host.kr_json(&["share", "revoke", &lasting_text]);
+    let (status, revoked) = json(&host.temp, &["share", "revoke", &lasting_text]);
+    assert_eq!(
+        status,
+        Some(0),
+        "the revocation goes on by the identifier: {revoked}"
+    );
+    assert_eq!(revoked["ok"], Value::Bool(true), "{revoked}");
     assert!(
         revoked.to_string().contains(&lasting_text),
         "the revocation names the grant: {revoked}"
