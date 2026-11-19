@@ -1479,7 +1479,7 @@ impl Calls {
         // What an earlier launch left owed this host is asked once the file can be read, which is
         // each time the host is reached until it can.
         shared.read_again();
-        let owed: Vec<(VoiceSessionId, u64)> = shared
+        let owed: Vec<(VoiceSessionId, u64, bool)> = shared
             .view
             .lock()
             .expect("the view lock is not poisoned")
@@ -1666,6 +1666,7 @@ impl Calls {
                 host.paired.host_device_id,
                 host.environment_id,
                 &voice_session_id.to_string(),
+                &end,
             );
         }
         Ok(Closed {
