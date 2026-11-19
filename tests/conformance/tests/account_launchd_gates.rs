@@ -1109,8 +1109,9 @@ fn statements(tokens: &[Token], body: &std::ops::Range<usize>) -> Vec<std::ops::
 /// The functions of the helper that refuse a launch in every run that did not ask, each with the
 /// number of arguments it takes: only the unconditional `require`. The wrappers that refuse for the
 /// arguments or the text they are given (`require_for_command`, `require_for_arguments`,
-/// `require_for_text`) and `require_given` refuse nothing when their arguments are empty or their
-/// value is none, so a call of one of them is no guard of a daemon's start.
+/// `require_for_text`) refuse nothing when their arguments are empty, and `require_given` refuses
+/// nothing when its caller passes `macos = false` or a value that asks, so a call of one of them is no
+/// guard of a daemon's start.
 const GUARDS: [(&str, usize); 1] = [("require", 1)];
 
 /// The tokens of each argument of the call whose `(` is `tokens[open]`, split at the commas of its
@@ -1141,10 +1142,12 @@ fn call_arguments(tokens: &[Token], open: usize) -> Option<(Vec<&[Token]>, &[Tok
     None
 }
 
-/// Whether a statement is a call of one of the helper's guard functions, by the path that names the
-/// module, with the arguments the function takes, each a string for what would load a job, and the
-/// end `;`. A statement that is not one call, a call in a closure, a `let ... else`, a call with
-/// another end (`.unwrap()`, `.ok()`, `?`) and a call of a conditional wrapper are no guard.
+/// Whether a statement is a call of one of the helper's guard functions, by the whole path that names
+/// the module (`kr_ipc::testing::account_launchd::`), with the arguments the function takes, each a
+/// string for what would load a job, and the end `;`. A statement that is not one call, a call in a
+/// closure, a `let ... else`, a call with another end (`.unwrap()`, `.ok()`, `?`), a call of a
+/// conditional wrapper, a call by a shorter path (a local module of that name can hold a function that
+/// does nothing) and a call with an attribute on it are no guard.
 fn is_guard(tokens: &[Token], statement: &std::ops::Range<usize>) -> bool {
     let statement = &tokens[statement.clone()];
     let mut path = Vec::new();
@@ -1158,11 +1161,10 @@ fn is_guard(tokens: &[Token], statement: &std::ops::Range<usize>) -> bool {
             break;
         }
     }
-    let named = match path.as_slice() {
-        ["account_launchd", name] | ["kr_ipc", "testing", "account_launchd", name] => *name,
-        _ => return false,
+    let ["kr_ipc", "testing", "account_launchd", named] = path.as_slice() else {
+        return false;
     };
-    let Some(&(_, arity)) = GUARDS.iter().find(|guard| guard.0 == named) else {
+    let Some(&(_, arity)) = GUARDS.iter().find(|guard| guard.0 == *named) else {
         return false;
     };
     if !statement.get(at).is_some_and(|open| open.is_punct('(')) {
@@ -1239,6 +1241,30 @@ fn launch_forms(tokens: &[Token], body: &std::ops::Range<usize>) -> Vec<usize> {
     forms
 }
 
+/// The index of the first token of `statement` after its leading attributes (`#[...]`, `#![...]`).
+fn after_attributes(tokens: &[Token], statement: &std::ops::Range<usize>) -> usize {
+    let mut at = statement.start;
+    while tokens.get(at).is_some_and(|token| token.is_punct('#')) && at < statement.end {
+        at += 1;
+        if tokens.get(at).is_some_and(|token| token.is_punct('!')) {
+            at += 1;
+        }
+        let mut depth = 0_i32;
+        while at < statement.end {
+            match tokens[at].tok {
+                Tok::Punct('[') => depth += 1,
+                Tok::Punct(']') => depth -= 1,
+                _ => {}
+            }
+            at += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    at
+}
+
 /// What is wrong with the guard of every definition of `function` in `source`, or nothing.
 fn guard_problems(source: &str, function: &str, way: Way) -> Vec<String> {
     let tokens = code_tokens(source);
@@ -1255,8 +1281,9 @@ fn guard_problems(source: &str, function: &str, way: Way) -> Vec<String> {
         let first = list
             .iter()
             .position(|statement| {
-                !matches!(tokens[statement.start].ident(), Some("use"))
-                    && !tokens[statement.start].is_punct('#')
+                !tokens
+                    .get(after_attributes(&tokens, statement))
+                    .is_some_and(|token| token.ident() == Some("use"))
             })
             .unwrap_or(list.len());
         let guarded = match way {
@@ -1337,10 +1364,35 @@ fn every_launch_function_holds_its_guard_statement_first_or_before_its_first_for
     let guard = "kr_ipc::testing::account_launchd::require(\"x\");";
     let first = |body: &str| format!("pub fn start() {{\n{body}\n}}");
     assert!(guard_problems(&first(&format!("{guard}\n{launch}")), "start", Way::First).is_empty());
-    // The same call by the module's short path.
+    // An attribute on a `use` before the guard is no statement of the function.
+    assert!(
+        guard_problems(
+            &first(&format!(
+                "#[allow(unused_imports)] use std::fmt;\n{guard}\n{launch}"
+            )),
+            "start",
+            Way::First
+        )
+        .is_empty()
+    );
     let short = "account_launchd::require(\"x\");";
-    assert!(guard_problems(&first(&format!("{short}\n{launch}")), "start", Way::First).is_empty());
     for (what, body) in [
+        (
+            "a call by the module's short path",
+            format!("{short}\n{launch}"),
+        ),
+        (
+            "a launch with an attribute on it, before the guard",
+            format!("#[allow(unused_must_use)] {launch}\n{guard}"),
+        ),
+        (
+            "a launch with a cfg attribute on it, before the guard",
+            format!("#[cfg(target_os = \"macos\")] {launch}\n{guard}"),
+        ),
+        (
+            "a guard with an attribute on it",
+            format!("#[allow(unused)] {guard}\n{launch}"),
+        ),
         ("a guard after the launch", format!("{launch}\n{guard}")),
         ("a guard in a comment", format!("// {guard}\n{launch}")),
         (
@@ -1357,11 +1409,13 @@ fn every_launch_function_holds_its_guard_statement_first_or_before_its_first_for
         ),
         (
             "a guard that is not a call of the rule",
-            format!("account_launchd::asked();\n{launch}"),
+            format!("kr_ipc::testing::account_launchd::asked();\n{launch}"),
         ),
         (
             "a wrapper that refuses only for a command that makes a session",
-            format!("account_launchd::require_for_command(\"x\", program, &arguments);\n{launch}"),
+            format!(
+                "kr_ipc::testing::account_launchd::require_for_command(\"x\", program, &arguments);\n{launch}"
+            ),
         ),
         (
             "a wrapper given no arguments, which never refuses",
@@ -1377,53 +1431,65 @@ fn every_launch_function_holds_its_guard_statement_first_or_before_its_first_for
         ),
         (
             "a wrapper given no text, which never refuses",
-            format!("account_launchd::require_for_text(\"x\", \"\");\n{launch}"),
+            format!("kr_ipc::testing::account_launchd::require_for_text(\"x\", \"\");\n{launch}"),
         ),
         (
             "a wrapper given a text",
-            format!("account_launchd::require_for_text(\"x\", command);\n{launch}"),
+            format!(
+                "kr_ipc::testing::account_launchd::require_for_text(\"x\", command);\n{launch}"
+            ),
         ),
         (
             "a conditional refusal given a value that is not none",
-            format!("account_launchd::require_given(asked, true, \"x\")?;\n{launch}"),
+            format!(
+                "kr_ipc::testing::account_launchd::require_given(asked, true, \"x\")?;\n{launch}"
+            ),
         ),
         (
             "a conditional refusal ended with a question mark",
             format!(
-                "account_launchd::require_given(asked.as_deref(), cfg!(target_os = \"macos\"), \"x\")?;\n{launch}"
+                "kr_ipc::testing::account_launchd::require_given(asked.as_deref(), cfg!(target_os = \"macos\"), \"x\")?;\n{launch}"
             ),
         ),
         (
             "a refusal that never refuses, ended with unwrap",
-            format!("account_launchd::require_given(None, false, \"x\").unwrap();\n{launch}"),
+            format!(
+                "kr_ipc::testing::account_launchd::require_given(None, false, \"x\").unwrap();\n{launch}"
+            ),
         ),
         (
             "a refusal given none and a platform that is not a Mac",
-            format!("account_launchd::require_given(None, false, \"x\")?;\n{launch}"),
+            format!(
+                "kr_ipc::testing::account_launchd::require_given(None, false, \"x\")?;\n{launch}"
+            ),
         ),
         (
             "a refusal given a value and a platform that is not a Mac",
-            format!("account_launchd::require_given(asked, false, \"x\")?;\n{launch}"),
+            format!(
+                "kr_ipc::testing::account_launchd::require_given(asked, false, \"x\")?;\n{launch}"
+            ),
         ),
         (
             "a refusal whose result is left",
-            format!("account_launchd::require_given(asked, true, \"x\");\n{launch}"),
+            format!(
+                "kr_ipc::testing::account_launchd::require_given(asked, true, \"x\");\n{launch}"
+            ),
         ),
         (
             "a name that only begins as a guard does",
-            format!("account_launchd::require_given_up(\"x\");\n{launch}"),
+            format!("kr_ipc::testing::account_launchd::require_given_up(\"x\");\n{launch}"),
         ),
         (
             "a guard with another end",
-            format!("account_launchd::require(\"x\").ok();\n{launch}"),
+            format!("kr_ipc::testing::account_launchd::require(\"x\").ok();\n{launch}"),
         ),
         (
             "a guard with an argument too many",
-            format!("account_launchd::require(\"x\", 1);\n{launch}"),
+            format!("kr_ipc::testing::account_launchd::require(\"x\", 1);\n{launch}"),
         ),
         (
             "a guard that is given no string",
-            format!("account_launchd::require(what);\n{launch}"),
+            format!("kr_ipc::testing::account_launchd::require(what);\n{launch}"),
         ),
         (
             "a let that returns where the host is not made",
@@ -1466,7 +1532,9 @@ fn every_launch_function_holds_its_guard_statement_first_or_before_its_first_for
         format!("let f = || {{ {guard} }};\n{launch}"),
         format!("let Some(host) = Some(ServiceHost::create()) else {{ return; }};\n{launch}"),
         format!("let None = ServiceHost::create() else {{ return; }};\n{launch}"),
-        format!("account_launchd::require_given(None, false, \"x\").unwrap();\n{launch}"),
+        format!(
+            "kr_ipc::testing::account_launchd::require_given(None, false, \"x\").unwrap();\n{launch}"
+        ),
     ] {
         assert!(
             !guard_problems(&case(&body), "a_case", Way::Before).is_empty(),
@@ -1590,74 +1658,6 @@ fn shell_launches(line: &str) -> bool {
         || (line.contains("\"$kr\"") && words.contains(&"new"))
 }
 
-/// Whether `line` of the attach script starts a process or makes a file.
-fn python_launches(line: &str) -> bool {
-    ["tempfile.", "Popen(", "open("]
-        .iter()
-        .any(|word| line.contains(word))
-}
-
-/// Each script asks before it launches: its call comes before the first line that builds, makes a
-/// temporary directory, or starts a daemon or a session.
-#[test]
-fn the_scripts_that_start_a_daemon_and_sessions_ask_before_they_launch() {
-    let mut missing = Vec::new();
-    for script in SCRIPTS {
-        let text = read(script);
-        let python = script.ends_with(".py");
-        let (comment, call) = if python {
-            ("#", "require_account_launchd(sys.platform")
-        } else {
-            ("#", "require_account_launchd \"$(uname -s)\"")
-        };
-        // The Python file defines the function before `main`, and its own text holds `open(` in the
-        // docstring of nothing; only the body of `main` is read.
-        let from = if python {
-            text.find("def main(").unwrap_or(0)
-        } else {
-            0
-        };
-        let tail = &text[from..];
-        let skipped = text[..from].lines().count();
-        let called = first_line(tail, comment, |line| line.contains(call));
-        let launched = first_line(tail, comment, |line| {
-            if python {
-                python_launches(line)
-            } else {
-                shell_launches_in(line, &launching)
-            }
-        });
-        match (called, launched) {
-            (Some(called), Some(launched)) if called < launched => {}
-            (Some(_), None) => {}
-            _ => missing.push(format!("{script} (line {})", skipped + 1)),
-        }
-    }
-    assert!(
-        missing.is_empty(),
-        "these scripts do not ask for the account's own launchd before they start a daemon: {missing:?}"
-    );
-
-    // The reading refuses a call after the launch and a script with none.
-    let before = "require_account_launchd \"$(uname -s)\"\ncargo build -p x\n";
-    let after = "cargo build -p x\nrequire_account_launchd \"$(uname -s)\"\n";
-    let call = "require_account_launchd \"$(uname -s)\"";
-    let order = |text: &str| {
-        let called = first_line(text, "#", |line| line.contains(call));
-        let launched = first_line(text, "#", |line| shell_launches_in(line, &launching));
-        matches!((called, launched), (Some(called), Some(launched)) if called < launched)
-    };
-    assert!(order(before));
-    assert!(!order(after));
-    // A temporary folder made in a command substitution is a launch too.
-    let temp_before = "require_account_launchd \"$(uname -s)\"\nwork=\"$(mktemp -d x)\"\n";
-    let temp_after = "work=\"$(mktemp -d x)\"\nrequire_account_launchd \"$(uname -s)\"\n";
-    assert!(order(temp_before));
-    assert!(!order(temp_after));
-    assert!(!order("cargo build -p x\n"));
-    assert!(!order(
-        "# require_account_launchd \"$(uname -s)\"\ncargo build -p x\n"
-    ));
 /// The names of the functions of the shell script `text` that launch: a function whose body holds a
 /// line that launches, by `shell_launches` or by a first word that names a function that launches.
 /// `self_test` is none, by its name: it runs the check only against the stand-in for `kr`, which
@@ -1731,6 +1731,106 @@ fn shell_launches_in(line: &str, launching: &[String]) -> bool {
             .is_some_and(|word| launching.iter().any(|name| name == word))
 }
 
+/// Whether `line` of the attach script starts a process or makes a file.
+fn python_launches(line: &str) -> bool {
+    ["tempfile.", "Popen(", "open("]
+        .iter()
+        .any(|word| line.contains(word))
+}
+
+/// Each script asks before it launches: its call comes before the first line that builds, makes a
+/// temporary directory, or starts a daemon or a session.
+#[test]
+fn the_scripts_that_start_a_daemon_and_sessions_ask_before_they_launch() {
+    let mut missing = Vec::new();
+    for script in SCRIPTS {
+        let text = read(script);
+        let python = script.ends_with(".py");
+        let (comment, call) = if python {
+            ("#", "require_account_launchd(sys.platform")
+        } else {
+            ("#", "require_account_launchd \"$(uname -s)\"")
+        };
+        // The Python file defines the function before `main`, and its own text holds `open(` in the
+        // docstring of nothing; only the body of `main` is read.
+        let from = if python {
+            text.find("def main(").unwrap_or(0)
+        } else {
+            0
+        };
+        let tail = &text[from..];
+        let skipped = text[..from].lines().count();
+        let launching = if python {
+            Vec::new()
+        } else {
+            launching_functions(&text)
+        };
+        let called = first_line(tail, comment, |line| line.contains(call));
+        let launched = first_line(tail, comment, |line| {
+            if python {
+                python_launches(line)
+            } else {
+                shell_launches_in(line, &launching)
+            }
+        });
+        match (called, launched) {
+            (Some(called), Some(launched)) if called < launched => {}
+            (Some(_), None) => {}
+            _ => missing.push(format!("{script} (line {})", skipped + 1)),
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these scripts do not ask for the account's own launchd before they start a daemon: {missing:?}"
+    );
+
+    // The reading refuses a call after the launch and a script with none.
+    let before = "require_account_launchd \"$(uname -s)\"\ncargo build -p x\n";
+    let after = "cargo build -p x\nrequire_account_launchd \"$(uname -s)\"\n";
+    let call = "require_account_launchd \"$(uname -s)\"";
+    let order = |text: &str| {
+        let launching = launching_functions(text);
+        let called = first_line(text, "#", |line| line.contains(call));
+        let launched = first_line(text, "#", |line| shell_launches_in(line, &launching));
+        matches!((called, launched), (Some(called), Some(launched)) if called < launched)
+    };
+    assert!(order(before));
+    assert!(!order(after));
+    // A temporary folder made in a command substitution is a launch too.
+    let temp_before = "require_account_launchd \"$(uname -s)\"\nwork=\"$(mktemp -d x)\"\n";
+    let temp_after = "work=\"$(mktemp -d x)\"\nrequire_account_launchd \"$(uname -s)\"\n";
+    assert!(order(temp_before));
+    assert!(!order(temp_after));
+    assert!(!order("cargo build -p x\n"));
+    assert!(!order(
+        "# require_account_launchd \"$(uname -s)\"\ncargo build -p x\n"
+    ));
+    // A call of a function that launches is a launch where it stands: the guard after the call of
+    // the check, in the function that runs the check, is refused, and before it is not.
+    let script = |main: &str| {
+        format!(
+            "main() {{\n{main}}}\nstart_and_check() {{\n    work=\"$(mktemp -d x)\"\n}}\nself_test() {{\n    start_and_check x\n}}\nprepare() {{\n    echo ready\n}}\nrelay() {{\n    start_and_check \"$1\"\n}}\nmain \"$@\"\n"
+        )
+    };
+    let guard = "    require_account_launchd \"$(uname -s)\"\n";
+    assert!(order(&script(&format!(
+        "{guard}    start_and_check \"$kr\"\n"
+    ))));
+    assert!(!order(&script(&format!(
+        "    start_and_check \"$kr\"\n{guard}"
+    ))));
+    assert!(!order(&script(&format!("    relay \"$kr\"\n{guard}"))));
+    // The stand-in's run is no launch by its name, and a function that holds no launch is none.
+    assert!(order(&script(&format!(
+        "    self_test\n    prepare\n{guard}    start_and_check \"$kr\"\n"
+    ))));
+    assert_eq!(
+        launching_functions(&script("")),
+        ["start_and_check", "relay"]
+    );
+    assert!(!order(
+        &script(&format!("    self_test\n{guard}")).replace("self_test", "stand_in")
+    ));
 }
 
 /// The refusal of the shell library: a Mac that did not ask is refused with the script's name and
@@ -1760,11 +1860,6 @@ fn the_script_functions_refuse_a_mac_run_that_did_not_ask_and_pass_every_other()
         let said = String::from_utf8_lossy(&refused.stderr);
         assert!(
             said.contains("KR_ALLOW_ACCOUNT_LAUNCHD=1") && said.contains("probe.sh"),
-        let launching = if python {
-            Vec::new()
-        } else {
-            launching_functions(&text)
-        };
             "{said}"
         );
     }
@@ -1789,7 +1884,6 @@ fn the_start_checks_self_test_passes_where_the_run_did_not_ask() {
         .current_dir(repository())
         .args(["scripts/check-host-start.sh", "self-test"])
         .env_remove("KR_ALLOW_ACCOUNT_LAUNCHD")
-        let launching = launching_functions(text);
         .stdin(std::process::Stdio::null())
         .output()
         .expect("bash runs");
@@ -1805,32 +1899,6 @@ fn the_start_checks_self_test_passes_where_the_run_did_not_ask() {
 }
 
 /// The refusal of the attach script: only a Mac run that did not ask raises, by the script's own
-    // A call of a function that launches is a launch where it stands: the guard after the call of
-    // the check, in the function that runs the check, is refused, and before it is not.
-    let script = |main: &str| {
-        format!(
-            "main() {{\n{main}}}\nstart_and_check() {{\n    work=\"$(mktemp -d x)\"\n}}\nself_test() {{\n    start_and_check x\n}}\nprepare() {{\n    echo ready\n}}\nrelay() {{\n    start_and_check \"$1\"\n}}\nmain \"$@\"\n"
-        )
-    };
-    let guard = "    require_account_launchd \"$(uname -s)\"\n";
-    assert!(order(&script(&format!(
-        "{guard}    start_and_check \"$kr\"\n"
-    ))));
-    assert!(!order(&script(&format!(
-        "    start_and_check \"$kr\"\n{guard}"
-    ))));
-    assert!(!order(&script(&format!("    relay \"$kr\"\n{guard}"))));
-    // The stand-in's run is no launch by its name, and a function that holds no launch is none.
-    assert!(order(&script(&format!(
-        "    self_test\n    prepare\n{guard}    start_and_check \"$kr\"\n"
-    ))));
-    assert_eq!(
-        launching_functions(&script("")),
-        ["start_and_check", "relay"]
-    );
-    assert!(!order(
-        &script(&format!("    self_test\n{guard}")).replace("self_test", "stand_in")
-    ));
 /// function, imported as a module so that nothing starts.
 #[test]
 #[cfg(unix)]
