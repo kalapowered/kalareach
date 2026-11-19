@@ -358,6 +358,46 @@ async fn a_failed_request_to_an_address_the_start_never_tested_is_rechecked_at_t
     drop(watch);
 }
 
+/// KR-REQ-10.02: a proxy whose re-checks meet no refusal is not asked again at once: a suspicion
+/// that repeats three times is met by three checks, each at least one interval after the one
+/// before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rechecks_that_meet_no_refusal_are_at_least_one_interval_apart() {
+    let (_held, checked) = target().await;
+    let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+    let right = credential("user", "password");
+    let tls = proxy_tls(&[]).expect("verification");
+    let interval = Duration::from_millis(300);
+    let watch = Watch::start(
+        proxy_at(&proxy, Some(right.clone())),
+        tls,
+        Timing {
+            deadline: Duration::from_secs(5),
+            interval,
+        },
+    )
+    .expect("a watch");
+    for round in 1..=3_u64 {
+        right.suspicion().suspect(checked.clone());
+        until("the round's check", || watch.checks_done() >= round).await;
+    }
+    let calls = proxy.calls();
+    assert_eq!(
+        calls.len(),
+        3,
+        "one request for each check, and no other: {calls:?}"
+    );
+    assert!(right.stopped().is_none(), "no check met a refusal");
+    for pair in calls.windows(2) {
+        let apart = pair[1].at.duration_since(pair[0].at);
+        assert!(
+            apart >= interval,
+            "two checks were {apart:?} apart, less than the interval {interval:?}"
+        );
+    }
+    drop(watch);
+}
+
 /// The daemon of a case: the controller, started over the folders of a temporary host.
 async fn start_controller(
     host: &kr_ipc::testing::TempHost,
