@@ -730,17 +730,80 @@ fn kr_req_11_42_a_misplaced_placeholder_refuses_the_recipe_before_anything_is_wr
     }
 }
 
-/// KR-REQ-11.42: the text of an escape in a value or a key is only text. A hook whose name, and an
-/// event whose name, is the characters `\u007bkr_hook}` (a JSON file spells them with an escaped
-/// backslash) is no placeholder in a place that is not a command, and the file is installed as it
-/// stands.
+/// KR-REQ-11.42: the text of an escape in a value or a key is refused as a place. A hook whose name,
+/// and an event whose name, is the characters `\u007bkr_hook}` (a JSON file spells them with an
+/// escaped backslash) holds a backslash, which makes it a place for a program that reads the file,
+/// so the file is refused whole and nothing is written.
 #[cfg(unix)]
 #[test]
-fn kr_req_11_42_the_text_of_an_escape_in_a_value_or_a_key_is_only_text() {
+fn kr_req_11_42_the_text_of_an_escape_in_a_value_or_a_key_is_refused_as_a_place() {
     let handler = r#"{"hooks": [{"type": "command", "name": "\\u007bkr_hook}", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}"#;
-    let hooks =
-        format!(r#"{{"hooks": {{"SessionStart": [{handler}], "\\u007bkr_hook}}": [{handler}]}}}}"#);
-    let site = Site::new();
+    let plain = r#"{"hooks": [{"type": "command", "name": "kalareach", "command": "{kr_hook}", "args": ["claude-code", "hook"], "timeout": 5}]}"#;
+    let in_a_name = format!(r#"{{"hooks": {{"SessionStart": [{handler}]}}}}"#);
+    let in_a_key = format!(r#"{{"hooks": {{"\\u007bkr_hook}}": [{plain}]}}}}"#);
+    for (what, hooks) in [("a name", in_a_name), ("a key", in_a_key)] {
+        let site = Site::new();
+        let before = site.tree();
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&site.release_with_hooks("literal", &hooks)))
+            .expect("reconciles");
+        assert!(
+            refused(&settled).contains("holds a slash, a backslash"),
+            "{what}: {settled:?}"
+        );
+        assert_eq!(site.tree(), before, "{what}: nothing was written");
+    }
+}
+
+/// KR-REQ-11.42: no name or text of a registration file is a place, whatever the shape: each of the
+/// six marks and the two dot names, in a value, a member name and a key, for Claude Code's and Gemini
+/// CLI's files, is refused before anything is written.
+#[cfg(unix)]
+#[test]
+fn a_registration_string_that_names_a_place_is_refused_whatever_the_shape() {
+    for mark in ["/", "\\\\", ":", "~", "$", "`"] {
+        let in_a_value = format!(
+            r#"{{"hooks": {{"SessionStart": [{{"matcher": "a{mark}b", "hooks": [{{"type": "command", "command": "{{kr_hook}}", "args": ["claude-code", "hook"], "timeout": 5}}]}}]}}}}"#
+        );
+        let in_a_name = format!(
+            r#"{{"hooks": {{"SessionStart": [{{"hooks": [{{"type": "command", "name": "a{mark}b", "command": "{{kr_hook}}", "args": ["claude-code", "hook"], "timeout": 5}}]}}]}}}}"#
+        );
+        let in_a_key = format!(
+            r#"{{"hooks": {{"Event{mark}": [{{"hooks": [{{"type": "command", "command": "{{kr_hook}}", "args": ["claude-code", "hook"], "timeout": 5}}]}}]}}}}"#
+        );
+        for (what, hooks) in [("a value", in_a_value), ("a name", in_a_name), ("a key", in_a_key)] {
+            let site = Site::new();
+            let before = site.tree();
+            let settled = site
+                .bridges()
+                .reconcile(&plugin(), Some(&site.release_with_hooks("place", &hooks)))
+                .expect("reconciles");
+            assert!(
+                refused(&settled).contains("holds a slash, a backslash"),
+                "{mark} in {what}: {settled:?}"
+            );
+            assert_eq!(site.tree(), before, "{mark} in {what}: nothing was written");
+        }
+    }
+    for lone in [".", ".."] {
+        let hooks = format!(
+            r#"{{"hooks": {{"SessionStart": [{{"matcher": "{lone}", "hooks": [{{"type": "command", "command": "{{kr_hook}}", "args": ["claude-code", "hook"], "timeout": 5}}]}}]}}}}"#
+        );
+        let site = Site::new();
+        let settled = site
+            .bridges()
+            .reconcile(&plugin(), Some(&site.release_with_hooks("lone", &hooks)))
+            .expect("reconciles");
+        assert!(
+            refused(&settled).contains("or is a dot or two dots"),
+            "{lone}: {settled:?}"
+        );
+    }
+    let gemini_hooks = r#"{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "name": "a/b", "command": "{kr_hook} gemini-cli hook", "timeout": 5000}]}]}}"#;
+    let site = GeminiSite::new();
+    let before = site.tree();
+    let target = gemini_target_with_hooks(&site, gemini_hooks.as_bytes());
     let settled = site
         .bridges()
         .reconcile(&plugin(), Some(&site.release_with_hooks("literal", &hooks)))
