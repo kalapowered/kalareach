@@ -4715,7 +4715,7 @@ fn a_folder_the_account_cannot_list_fails_the_scan() {
     restore();
     // An account that cannot be denied a listing (the superuser on Unix) shows nothing here.
     if cfg!(unix) && listed.is_ok() {
-        eprintln!("this account can list a folder whatever its mode: nothing is shown");
+        eprintln!("skipped: this account can list a folder whatever its mode, so nothing is shown");
         return;
     }
     assert!(

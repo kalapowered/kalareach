@@ -4576,7 +4576,9 @@ fn a_user_service_manager_that_does_not_answer_fails_the_start_and_is_not_skippe
         .iter()
         .any(|program| Path::new(program).is_file())
     {
-        eprintln!("this machine has no systemd, so a manager of the test's own cannot be tried");
+        eprintln!(
+            "skipped: this machine has no systemd, so a manager of the test's own cannot be tried"
+        );
         return;
     }
     let place_named = |directory: &Path, name: &str, body: &str| {

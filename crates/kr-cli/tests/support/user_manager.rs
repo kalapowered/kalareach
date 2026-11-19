@@ -32,7 +32,7 @@ pub fn not_tested_here(why: &str) {
         std::env::var_os(REQUIRE_SERVICE_MANAGER).is_none(),
         "{REQUIRE_SERVICE_MANAGER} is set and the service start cannot be tested here: {why}"
     );
-    eprintln!("the service start is not tested here: {why}");
+    eprintln!("skipped: the service start is not tested here: {why}");
 }
 
 /// How long a user manager of a test's own is given to come up.

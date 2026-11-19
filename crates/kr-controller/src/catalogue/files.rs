@@ -767,7 +767,7 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         let Some(group) = another_group(directory.path()) else {
             println!(
-                "this user belongs to one group only, so the group case runs as a decision here"
+                "skipped: this user belongs to one group only, so the group case runs as a decision here"
             );
             return;
         };
@@ -856,7 +856,9 @@ pub(crate) mod tests {
             made(directory.path())
         );
         let Some(group) = another_group(directory.path()) else {
-            println!("this user belongs to one group only, so no directory passes another on here");
+            println!(
+                "not exercised: this user belongs to one group only, so no directory passes another on here"
+            );
             return;
         };
         let passing = directory.path().join("passing");

@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(bound.ip(), registered.ip());
         let Some(outward) = outward_address() else {
             println!(
-                "this machine has no address outside loopback; the reachability half is skipped"
+                "not exercised: this machine has no address outside loopback, so the reachability half did not run"
             );
             return;
         };

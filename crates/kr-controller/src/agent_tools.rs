@@ -4081,7 +4081,7 @@ mod tests {
         let tree = Tree::create();
         let Some(group) = crate::catalogue::files::another_group(&tree.home()) else {
             println!(
-                "this user belongs to one group only, so the group case runs as a decision here"
+                "skipped: this user belongs to one group only, so the group case runs as a decision here"
             );
             return;
         };

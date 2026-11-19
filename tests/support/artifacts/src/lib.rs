@@ -940,7 +940,7 @@ mod tests {
                 std::env::var_os("CI").is_none(),
                 "a hosted run reaches {share}, and it could not"
             );
-            eprintln!("{share} cannot be reached here: the share case is not run");
+            eprintln!("skipped: {share} cannot be reached here, so the share case did not run");
             return;
         }
         let canonical = std::fs::canonicalize(&share).expect("canonical");

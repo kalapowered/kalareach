@@ -463,7 +463,7 @@ impl Standalone {
         {
             let asked = std::env::var_os(ALLOW_ACCOUNT_LAUNCHD);
             if let Err(why) = account_launchd(asked.as_deref()) {
-                eprintln!("the daemon start is not tested here: {why}");
+                eprintln!("skipped: the daemon start is not tested here: {why}");
                 return None;
             }
         }
@@ -4293,7 +4293,7 @@ fn the_user_manager_kr_checks_is_the_one_it_asks() {
                 std::env::var_os(REQUIRE_SERVICE_MANAGER).is_none(),
                 "a second manager with a bus of its own could not be started: {why}"
             );
-            eprintln!("the manager choice is not tested here: {why}");
+            eprintln!("not exercised: the manager choice is not tested here: {why}");
             return;
         }
     };
