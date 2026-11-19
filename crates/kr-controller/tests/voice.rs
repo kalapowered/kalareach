@@ -4386,8 +4386,37 @@ async fn a_start_whose_token_step_passes_the_send_limit_sends_nothing() {
                 None,
                 "a start that sent nothing leaves no hold"
             );
-            // The next start has all its time again, and the service is asked once.
+            // The action that was refused is sent again. The host cannot say that the first attempt
+            // sent nothing, so it does not perform the action again and says so, and the service
+            // still has been asked nothing.
             world.token.disarm();
+            let refused_action = world
+                .session
+                .submitted_actions()
+                .await
+                .last()
+                .expect("the refused action is on the book")
+                .action_id;
+            let repeated = world
+                .session
+                .mutate_continuing(
+                    refused_action,
+                    Method::VoiceStart,
+                    ActionTarget::environment(world.environment_id),
+                    None,
+                    &kr_protocol::envelope::ParamsValue::empty(),
+                    &world.params,
+                    NETWORK_LIFETIME,
+                )
+                .await
+                .expect_err("the repeat of the refused action is not performed again");
+            assert!(
+                repeated.to_string().contains("it is not performed again"),
+                "{repeated}"
+            );
+            assert_eq!(world.calls_asked(), 0, "the repeat sent nothing");
+            assert_eq!(world.hold(), None, "and left no hold");
+            // A fresh action has all its time again, and the service is asked once.
             let next = world.start(None).await.expect("the next start is admitted");
             assert!(matches!(
                 outcome_of(&next),
