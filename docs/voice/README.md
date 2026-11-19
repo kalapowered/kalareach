@@ -130,6 +130,10 @@ progress of the send arrives with the heartbeat's news. A call has one send at a
 A host that hears nothing from the phone for two minutes begins to close the call. The host keeps
 what a heartbeat needs of a call that has ended for ten minutes, so a phone that was away learns why
 it ended; the record holds states and counts and no content.
+The final status of a call on the host's own key says whether OpenAI confirmed that the call
+closed: the host waits for the provider's side channel to report the close, and a close that is
+still unreported one minute after the call's end is told as not confirmed at the next heartbeat or
+sweep.
 
 ## What the managed operator can see
 
@@ -334,9 +338,10 @@ A stop that names a voice session the host holds no record of is refused with th
 unknown session. This may happen because the call has ended, the host has restarted, or the call
 belongs to another device. It is also used when a phone that could not finish revoking a call's
 grant asks again; in this case, the phone wants to know whether there is anything to stop on the
-host side, and the answer tells it there is nothing left to stop there. This code does not say
-anything about the grant or the fence the host owes its workers. If the host refuses the stop before
-it looks at the call, the refusal keeps its own code.
+host side, and the answer tells it there is nothing left to stop there. That code does not say that
+OpenAI closed the call: a phone that needs to know reads the call's final status. This code does
+not say anything about the grant or the fence the host owes its workers. If the host refuses the
+stop before it looks at the call, the refusal keeps its own code.
 
 ## Closing a session by voice
 

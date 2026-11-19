@@ -2754,6 +2754,10 @@ export type VoiceControlResult =
           | {
               closed: {
                 /**
+                 * Whether the provider's close of the call was confirmed.
+                 */
+                provider_close: 'confirmed' | 'unconfirmed'
+                /**
                  * What ended it.
                  */
                 reason:
@@ -2891,6 +2895,10 @@ export type VoiceHostCallState =
   | {
       closed: {
         /**
+         * Whether the provider's close of the call was confirmed.
+         */
+        provider_close: 'confirmed' | 'unconfirmed'
+        /**
          * What ended it.
          */
         reason:
@@ -3014,6 +3022,10 @@ export type VoiceNewsItem =
   | {
       ended: {
         /**
+         * Whether the provider's close of the call was confirmed.
+         */
+        provider_close: 'confirmed' | 'unconfirmed'
+        /**
          * What ended it.
          */
         reason:
@@ -3068,6 +3080,10 @@ export type VoicePrepareProvider =
         message: string
       }
     }
+/**
+ * Whether the provider confirmed that it closed a call on the host's own key.
+ */
+export type VoiceProviderClose = 'confirmed' | 'unconfirmed'
 /**
  * Where a call's control is reached, as the host tells the device when it starts a call.
  *
@@ -3836,6 +3852,7 @@ export interface KalaReachProtocol {
   voice_prepare_params?: VoicePrepareParams
   voice_prepare_provider?: VoicePrepareProvider
   voice_prepare_result?: VoicePrepareResult
+  voice_provider_close?: VoiceProviderClose
   voice_rate?: VoiceRate1
   voice_session_control?: VoiceSessionControl
   voice_session_descriptor?: VoiceSessionDescriptor
@@ -32628,6 +32645,10 @@ export interface VoiceNews {
       }
     | {
         ended: {
+          /**
+           * Whether the provider's close of the call was confirmed.
+           */
+          provider_close: 'confirmed' | 'unconfirmed'
           /**
            * What ended it.
            */

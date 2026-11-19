@@ -476,7 +476,33 @@ pub enum VoiceHostCallState {
     Closed {
         /// What ended it.
         reason: VoiceEndReason,
+        /// Whether the provider's close of the call was confirmed.
+        provider_close: VoiceProviderClose,
     },
+}
+
+/// Whether the provider confirmed that it closed a call on the host's own key.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceProviderClose {
+    /// The provider said the call closed, or the host's hang-up of it was confirmed.
+    Confirmed,
+    /// The host did not learn that the provider closed the call: the call may still run on the
+    /// owner's account.
+    Unconfirmed,
+}
+
+impl VoiceProviderClose {
+    /// The stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Confirmed => "confirmed",
+            Self::Unconfirmed => "unconfirmed",
+        }
+    }
 }
 
 /// What ended a call on the host's own key.
@@ -563,6 +589,8 @@ pub enum VoiceNewsItem {
     Ended {
         /// What ended it.
         reason: VoiceEndReason,
+        /// Whether the provider's close of the call was confirmed.
+        provider_close: VoiceProviderClose,
     },
 }
 
@@ -684,6 +712,51 @@ mod tests {
             serde_json::from_str::<VoiceNote>("\"phone_silent\"").is_err(),
             "a device cannot name the host's own note"
         );
+    }
+
+    fn ended(close: &str) -> serde_json::Value {
+        serde_json::json!({"ended": {"reason": "stop", "provider_close": close}})
+    }
+
+    fn closed(close: &str) -> serde_json::Value {
+        serde_json::json!({"closed": {"reason": "stop", "provider_close": close}})
+    }
+
+    #[test]
+    fn an_ended_item_and_a_closed_state_carry_whether_the_provider_close_was_confirmed() {
+        for word in ["confirmed", "unconfirmed"] {
+            let item: VoiceNewsItem = serde_json::from_value(ended(word)).expect("an ended item");
+            assert_eq!(
+                serde_json::to_value(&item).expect("it serialises"),
+                ended(word)
+            );
+            let state: VoiceHostCallState =
+                serde_json::from_value(closed(word)).expect("a closed state");
+            assert_eq!(
+                serde_json::to_value(state).expect("it serialises"),
+                closed(word)
+            );
+        }
+    }
+
+    #[test]
+    fn an_ended_item_without_the_provider_close_is_refused() {
+        let item = serde_json::json!({"ended": {"reason": "stop"}});
+        assert!(serde_json::from_value::<VoiceNewsItem>(item).is_err());
+    }
+
+    #[test]
+    fn a_closed_state_without_the_provider_close_is_refused() {
+        let state = serde_json::json!({"closed": {"reason": "stop"}});
+        assert!(serde_json::from_value::<VoiceHostCallState>(state).is_err());
+    }
+
+    #[test]
+    fn a_provider_close_outside_its_two_words_is_refused() {
+        for word in ["maybe", "Confirmed", ""] {
+            assert!(serde_json::from_value::<VoiceNewsItem>(ended(word)).is_err());
+            assert!(serde_json::from_value::<VoiceHostCallState>(closed(word)).is_err());
+        }
     }
 
     #[test]

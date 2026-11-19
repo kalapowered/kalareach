@@ -42240,13 +42240,18 @@
             "closed": {
               "additionalProperties": false,
               "properties": {
+                "provider_close": {
+                  "$ref": "#/$defs/VoiceProviderClose",
+                  "description": "Whether the provider's close of the call was confirmed."
+                },
                 "reason": {
                   "$ref": "#/$defs/VoiceEndReason",
                   "description": "What ended it."
                 }
               },
               "required": [
-                "reason"
+                "reason",
+                "provider_close"
               ],
               "type": "object"
             }
@@ -42579,13 +42584,18 @@
             "ended": {
               "additionalProperties": false,
               "properties": {
+                "provider_close": {
+                  "$ref": "#/$defs/VoiceProviderClose",
+                  "description": "Whether the provider's close of the call was confirmed."
+                },
                 "reason": {
                   "$ref": "#/$defs/VoiceEndReason",
                   "description": "What ended it."
                 }
               },
               "required": [
-                "reason"
+                "reason",
+                "provider_close"
               ],
               "type": "object"
             }
@@ -42890,6 +42900,21 @@
         "provider"
       ],
       "type": "object"
+    },
+    "VoiceProviderClose": {
+      "description": "Whether the provider confirmed that it closed a call on the host's own key.",
+      "oneOf": [
+        {
+          "const": "confirmed",
+          "description": "The provider said the call closed, or the host's hang-up of it was confirmed.",
+          "type": "string"
+        },
+        {
+          "const": "unconfirmed",
+          "description": "The host did not learn that the provider closed the call: the call may still run on the\nowner's account.",
+          "type": "string"
+        }
+      ]
     },
     "VoiceRate": {
       "additionalProperties": false,
@@ -47515,6 +47540,9 @@
     },
     "voice_prepare_result": {
       "$ref": "#/$defs/VoicePrepareResult"
+    },
+    "voice_provider_close": {
+      "$ref": "#/$defs/VoiceProviderClose"
     },
     "voice_rate": {
       "$ref": "#/$defs/VoiceRate"

@@ -224,6 +224,56 @@ impl Phone {
     async fn start(&self) -> Result<VoiceStartResult, ProtocolError> {
         self.start_as(ActionId::new(kr_ipc::new_uuid())).await
     }
+
+    /// The phone's heartbeat for a call, asked through `voice.control`.
+    async fn beat(
+        &self,
+        voice_session_id: kr_protocol::ids::VoiceSessionId,
+    ) -> kr_protocol::voice_host::VoiceControlResult {
+        self.raw
+            .mutate(
+                Method::VoiceControl,
+                ActionId::new(kr_ipc::new_uuid()),
+                self.target.clone(),
+                &kr_protocol::voice_host::VoiceControlParams {
+                    voice_session_id,
+                    arm: kr_protocol::voice_host::VoiceControlArm::Heartbeat {
+                        after_seq: kr_protocol::scalars::U64::new(0),
+                    },
+                },
+            )
+            .await
+            .expect("a heartbeat is answered")
+            .to_typed()
+            .expect("a control result")
+    }
+}
+
+/// Every `provider_close` word a result carries, read from its wire form: the `ended` item and the
+/// `closed` state.
+fn provider_closes(result: &kr_protocol::voice_host::VoiceControlResult) -> Vec<String> {
+    fn walk(value: &serde_json::Value, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(members) => {
+                for (name, member) in members {
+                    match (name.as_str(), member) {
+                        ("provider_close", serde_json::Value::String(word)) => {
+                            found.push(word.clone());
+                        }
+                        _ => walk(member, found),
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    walk(
+        &serde_json::to_value(result).expect("a result serialises"),
+        &mut found,
+    );
+    found
 }
 
 fn rows_of(daemon: &Daemon) -> Vec<kr_client::services::CallRow> {
@@ -1825,4 +1875,57 @@ async fn a_hand_edited_document_naming_both_providers_is_refused_at_load_with_it
     );
     host.stop().await;
     drop(placed);
+}
+
+/// A key removal ends the calls the host holds. The first reply of the phone that carries the
+/// `ended` item says whether the provider's close was confirmed: a hang-up the provider confirmed
+/// is confirmed, and one it answered with a failure is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credential_removal_tells_the_phone_whether_the_providers_close_was_confirmed() {
+    for confirmed in [true, false] {
+        let mut daemon = daemon().await;
+        let phone = phone(&daemon, &MANAGER).await;
+        let call = started(phone.start().await).voice_session_id;
+        daemon.stand_in.answer_close(confirmed);
+        if !confirmed {
+            daemon
+                .stand_in
+                .script_hangup(HangupScript::Answer(500, None));
+        }
+        let _ = remove_key(&mut daemon.control, &daemon.host).await;
+
+        let answer = phone.beat(call).await;
+        let kr_protocol::voice_host::VoiceControlResult::Heartbeat { state, news, .. } = &answer
+        else {
+            panic!("a heartbeat answer: {answer:?}");
+        };
+        assert!(
+            matches!(
+                state,
+                kr_protocol::voice_host::VoiceHostCallState::Closed {
+                    reason: kr_protocol::voice_host::VoiceEndReason::CredentialRemoved,
+                    ..
+                }
+            ),
+            "confirmed {confirmed}: {state:?}"
+        );
+        assert!(matches!(
+            news.last().map(|item| &item.item),
+            Some(kr_protocol::voice_host::VoiceNewsItem::Ended {
+                reason: kr_protocol::voice_host::VoiceEndReason::CredentialRemoved,
+                ..
+            })
+        ));
+        let word = if confirmed {
+            "confirmed"
+        } else {
+            "unconfirmed"
+        };
+        assert_eq!(
+            provider_closes(&answer),
+            [word, word],
+            "the ended item and the closed state agree (confirmed {confirmed})"
+        );
+        daemon.host.stop().await;
+    }
 }
