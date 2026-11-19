@@ -3474,6 +3474,7 @@ mod tests {
             action_id,
             note: "accepted".to_owned(),
         });
+        let told = told.managed_words();
         assert_eq!((state, cause), ("admitted", None));
         assert!(told.contains("not known"), "{told}");
         assert!(
@@ -3485,6 +3486,7 @@ mod tests {
             action_id,
             summary: "session one is running".to_owned(),
         });
+        let told = told.managed_words();
         assert_eq!(state, "performed");
         assert!(
             told.starts_with(VoiceNote::DelegationPerformed.words()),

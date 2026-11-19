@@ -30,7 +30,7 @@ impl From<VoiceNote> for Said {
 
 impl Said {
     /// The words a managed control writes: the table's sentence, and the summary after it.
-    fn managed_words(&self) -> String {
+    pub(in crate::voice) fn managed_words(&self) -> String {
         match &self.summary {
             Some(summary) => format!("{} {summary}", self.note.words()),
             None => self.note.words().to_owned(),
