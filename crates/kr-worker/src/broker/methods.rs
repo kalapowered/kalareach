@@ -165,7 +165,9 @@ pub struct UpstreamOutcome {
 /// Handing bytes to a queue, writing them to a socket and the upstream acting on them are three
 /// different facts, and a transport that answered the first as though it were the third would let
 /// a receipt say `applied` for an operation that never left this host. So a transport answers with
-/// this, and what comes back from it is what the upstream actually did.
+/// this, and what comes back from it is what the upstream actually did. A channel's completed
+/// write is not that: the channel reports it as [`BrokerError::ChannelEnd`], which settles
+/// `unknown`.
 pub struct PendingTransmission {
     flight: Flight,
     /// What an operation that was given up on claims the upstream's answer with, where the

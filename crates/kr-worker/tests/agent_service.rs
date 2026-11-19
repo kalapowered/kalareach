@@ -3730,8 +3730,8 @@ fn channel_answer(
 /// KR-REQ-12.18, KR-REQ-12.09 and KR-REQ-11.34: with the Claude Code package bound as the
 /// installation's binder will bind it, `plugin.action.invoke` of its answer action writes the
 /// application's own verdict on the channel, once, from the table's decision destination with no
-/// component involved, and returns the action's own result with a receipt that says it was applied,
-/// the result naming the host's authenticated bridge as the way it went.
+/// component involved. A channel confirms nothing, so the answer ends as an outcome nobody can
+/// establish: the receipt reads unknown and the request is held as uncertain, never as applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_action() {
     let host = host().await;
@@ -3742,20 +3742,10 @@ async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_ac
     let mutation = channel_answer(&client, &host, &channel.connector, 60, resource_id, "allow");
     let action_id = mutation.action_id;
     let outcome = send(&mut client, mutation).await;
-    let Outcome::Ok(result) = outcome else {
-        panic!("the answer is carried: {outcome:?}");
+    let Outcome::Error(error) = outcome else {
+        panic!("the answer ends as an outcome nobody can establish: {outcome:?}");
     };
-    let result: kr_protocol::agent::PluginActionInvokeResult =
-        result.to_typed().expect("the action's own result");
-    assert_eq!(result.action.as_str(), "approval.answer");
-    assert_eq!(
-        result
-            .mutation
-            .as_ref()
-            .expect("the answer went upstream")
-            .provenance,
-        kr_protocol::broker::ActionProvenance::AuthenticatedHookResponse
-    );
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
     assert_eq!(
         channel.next().await,
         serde_json::json!({
@@ -3765,7 +3755,7 @@ async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_ac
     );
     assert_eq!(
         receipt(&mut client, action_id).await.state,
-        ReceiptState::Applied
+        ReceiptState::Unknown
     );
     assert_eq!(
         host.service
@@ -3773,7 +3763,7 @@ async fn kr_req_12_18_a_plugin_answer_goes_out_on_the_channel_and_reports_the_ac
             .pending(resource_id)
             .expect("held")
             .state,
-        kr_protocol::gateway::PendingState::Resolved
+        kr_protocol::gateway::PendingState::Uncertain
     );
 
     // Once: the resource has its answer, and a second one is refused before its marker.
@@ -5049,4 +5039,212 @@ async fn kr_req_10_51_an_answering_action_is_held_to_the_callers_history() {
     .await
     .expect("a history that reaches back to the request answers it");
     assert_eq!(carried(), 2, "the reached approval's answer was carried");
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-12.18: an answer a channel took ends unknown for good, and does not hold the next one back
+// ---------------------------------------------------------------------------------------------
+
+/// One `plugin.action.invoke` of the channel package's action `action`, naming `resource_id` when
+/// there is one.
+fn channel_action(
+    client: &LocalClient,
+    host: &Host,
+    connector: &kr_worker::broker::connectors::InstalledConnector,
+    request_id: u64,
+    action: &str,
+    resource_id: Option<kr_protocol::ids::PendingResourceId>,
+    envelope_of: kr_protocol::ids::PendingResourceId,
+) -> MutationRequest {
+    let mut mutation = channel_answer(client, host, connector, request_id, envelope_of, "allow");
+    mutation.params = ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
+        target: AgentMutationTarget {
+            subject: subject(host.session_id, instance()),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        plugin_id: connector.plugin_id(),
+        action: kr_protocol::broker::ActionName::new(action).expect("valid"),
+        draft_id: Nullable::null(),
+        resource_id: resource_id.map_or_else(Nullable::null, Nullable::some),
+        parameters: kr_protocol::scalars::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({ "decision": "allow" })).expect("encodes"),
+        ),
+    })
+    .expect("encodes");
+    mutation
+}
+
+/// What the broker holds of a pending resource.
+fn resource_state(
+    host: &Host,
+    resource_id: kr_protocol::ids::PendingResourceId,
+) -> kr_protocol::gateway::PendingState {
+    host.service
+        .broker()
+        .pending(resource_id)
+        .expect("held")
+        .state
+}
+
+/// KR-REQ-12.18: two requests wait on one channel and each is answered through the decoder's own
+/// answer. Each answer is written to the channel, each ends as an outcome nobody can establish
+/// (the channel confirms nothing), and the first does not hold the second back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_two_answers_on_one_channel_each_reach_it_and_each_ends_unknown() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let first = channel.relay(&host, "abcde").await;
+    let second = channel.relay(&host, "fghij").await;
+    let mut client = cli(&host).await;
+
+    for (index, (resource_id, request)) in [(first, "abcde"), (second, "fghij")]
+        .into_iter()
+        .enumerate()
+    {
+        let mutation = approval_mutation(&client, &host, 60 + index as u64, resource_id);
+        let action_id = mutation.action_id;
+        let outcome = send(&mut client, mutation).await;
+        let Outcome::Error(error) = outcome else {
+            panic!("answer {index} ends as an outcome nobody can establish: {outcome:?}");
+        };
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown, "answer {index}");
+        assert_eq!(
+            channel.next().await,
+            serde_json::json!({
+                "method": "notifications/claude/channel/permission",
+                "params": { "request_id": request, "behavior": "allow" }
+            }),
+            "answer {index} is the next frame on the channel"
+        );
+        assert_eq!(
+            receipt(&mut client, action_id).await.state,
+            ReceiptState::Unknown,
+            "answer {index}"
+        );
+        assert_eq!(
+            resource_state(&host, resource_id),
+            kr_protocol::gateway::PendingState::Uncertain,
+            "answer {index}"
+        );
+    }
+}
+
+/// KR-REQ-12.18: the same holds through the package's own answer action. After the first answer
+/// ended unknown, the second request's answer is admitted and written, and a later action of the
+/// package that names no request is not held back by the first answer either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_a_plugin_answer_to_a_second_request_is_admitted_after_the_first_ended_unknown()
+ {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let first = channel.relay(&host, "abcde").await;
+    let second = channel.relay(&host, "fghij").await;
+    let mut client = cli(&host).await;
+
+    for (index, (resource_id, request)) in [(first, "abcde"), (second, "fghij")]
+        .into_iter()
+        .enumerate()
+    {
+        let mutation = channel_answer(
+            &client,
+            &host,
+            &channel.connector,
+            60 + index as u64,
+            resource_id,
+            "allow",
+        );
+        let action_id = mutation.action_id;
+        let outcome = send(&mut client, mutation).await;
+        let Outcome::Error(error) = outcome else {
+            panic!("answer {index} ends as an outcome nobody can establish: {outcome:?}");
+        };
+        assert_eq!(error.code, ErrorCode::OutcomeUnknown, "answer {index}");
+        assert_eq!(
+            channel.next().await,
+            serde_json::json!({
+                "method": "notifications/claude/channel/permission",
+                "params": { "request_id": request, "behavior": "allow" }
+            }),
+            "answer {index} is the next frame on the channel"
+        );
+        assert_eq!(
+            receipt(&mut client, action_id).await.state,
+            ReceiptState::Unknown,
+            "answer {index}"
+        );
+    }
+
+    // An action of the package that names no request has the same subject as the answers. It is
+    // not held back by them: the channel refuses it for its own reason.
+    let later = channel_action(
+        &client,
+        &host,
+        &channel.connector,
+        70,
+        "turn.cancel",
+        None,
+        first,
+    );
+    let Outcome::Error(error) = send(&mut client, later).await else {
+        panic!("a channel carries no other action of the package");
+    };
+    assert_ne!(
+        error.code,
+        ErrorCode::DraftConflict,
+        "a channel end does not hold the next action of its subject"
+    );
+}
+
+/// KR-REQ-12.18: after an answer ended unknown, a second answer to the same request is refused
+/// before its marker and nothing second is written; the same identifier sent again returns the
+/// retained receipt and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_the_same_request_answered_twice_is_refused_before_its_marker() {
+    let host = host().await;
+    let mut channel = ServedChannel::open(&host).await;
+    let resource_id = channel.relay(&host, "abcde").await;
+    let other = channel.relay(&host, "fghij").await;
+    let mut client = cli(&host).await;
+
+    let mutation = approval_mutation(&client, &host, 60, resource_id);
+    let action_id = mutation.action_id;
+    let again_same_id = mutation.clone();
+    let Outcome::Error(error) = send(&mut client, mutation).await else {
+        panic!("the answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
+    channel.next().await;
+
+    // A second answer to the same request, under a new identifier.
+    let second = approval_mutation(&client, &host, 61, resource_id);
+    let second_id = second.action_id;
+    assert!(matches!(send(&mut client, second).await, Outcome::Error(_)));
+    assert_eq!(
+        receipt(&mut client, second_id).await.state,
+        ReceiptState::Rejected,
+        "refused before its marker"
+    );
+
+    // The first identifier sent again is answered from the retained receipt and written nowhere.
+    let Outcome::Error(again) = send(&mut client, again_same_id).await else {
+        panic!("a retained unknown receipt is returned as the same outcome");
+    };
+    assert_eq!(again.code, ErrorCode::OutcomeUnknown);
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Unknown
+    );
+    // Nothing second was written: the next frame on the channel is the answer to another request.
+    let next = approval_mutation(&client, &host, 62, other);
+    let Outcome::Error(_) = send(&mut client, next).await else {
+        panic!("the other request's answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(
+        channel.next().await,
+        serde_json::json!({
+            "method": "notifications/claude/channel/permission",
+            "params": { "request_id": "fghij", "behavior": "allow" }
+        }),
+        "no frame came between the first answer and the other request's"
+    );
 }

@@ -2085,6 +2085,8 @@ async fn kr_req_12_26_an_answer_is_encoded_from_an_offered_decision_for_the_pend
         "nothing changed the approval"
     );
 
+    // The decision is written to the channel, which confirms nothing: the answer ends as an
+    // outcome nobody can establish, and the request is held as uncertain.
     let answered = broker
         .agent_approval_respond(
             &caller(),
@@ -2092,9 +2094,15 @@ async fn kr_req_12_26_an_answer_is_encoded_from_an_offered_decision_for_the_pend
             TimestampMs::new(6),
         )
         .await
-        .expect("the offered decision is carried")
-        .0;
-    assert_eq!(answered.state, PendingState::Resolved);
+        .expect_err("the answer ends as an outcome nobody can establish");
+    assert_eq!(
+        answered.code(),
+        kr_protocol::error::ErrorCode::OutcomeUnknown
+    );
+    assert_eq!(
+        broker.pending(resource.resource_id).expect("held").state,
+        PendingState::Uncertain
+    );
     assert_eq!(
         channel.next().await,
         Some(serde_json::json!({

@@ -61,6 +61,18 @@ pub enum BrokerError {
     /// reported under is that refusal's own.
     #[error("{0}")]
     NotTransmitted(Box<BrokerError>),
+    /// A channel took the operation and nothing will ever say what became of it.
+    ///
+    /// The operation was queued for the channel's writer, so it may well have been written, and a
+    /// channel acknowledges nothing: neither the end of its write nor a later word establishes that
+    /// the application took it. The outcome is unknown for good, which is not the unknown of a
+    /// transport whose answer may still come, so the journal records it as a channel end and a
+    /// later request for the same subject is not held back by it.
+    #[error("{detail}")]
+    ChannelEnd {
+        /// What the channel did, and what a person can do about it.
+        detail: String,
+    },
     /// The resource was settled before this answer's marker was written: a native answer took its
     /// one transmission, or the server said the request was cleared.
     ///
@@ -251,6 +263,7 @@ impl BrokerError {
                 ErrorCode::UnsupportedCapability
             }
             Self::NotTransmitted(refusal) => refusal.code(),
+            Self::ChannelEnd { .. } => ErrorCode::OutcomeUnknown,
             Self::AnswerOvertaken { .. } => ErrorCode::QuestionResolved,
             Self::Arbitration(error) => match error {
                 ArbitrationError::AlreadyResolved { .. } | ArbitrationError::AlreadyClaimed => {
@@ -309,6 +322,15 @@ mod tests {
             detail: "the framing connection ended mid-frame".to_owned(),
         };
         assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+    }
+
+    #[test]
+    fn a_channel_end_is_an_outcome_nobody_can_establish_and_is_not_proven_unsent() {
+        let error = BrokerError::ChannelEnd {
+            detail: "the channel confirms nothing".to_owned(),
+        };
+        assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+        assert!(!error.proven_unsent());
     }
 
     #[test]

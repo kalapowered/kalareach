@@ -7222,7 +7222,8 @@ impl WorkerService {
         let settled = match outcome {
             // The upstream answered and this is what it said. Nothing earlier than its own
             // acknowledgement reaches here: a queue that took the bytes and a socket that wrote
-            // them are two facts about this host, and neither of them is the upstream acting.
+            // them are two facts about this host, and neither of them is the upstream acting: a
+            // channel's completed write comes here as a channel end and not as this.
             Ok(value) => {
                 let bytes = kr_cbor::encode(value.as_value());
                 journal.settle(
@@ -7231,6 +7232,16 @@ impl WorkerService {
                     kr_protocol::receipt::ReceiptState::Applied,
                     Some(&bytes),
                     None,
+                    now,
+                )
+            }
+            // A channel took the operation and confirms nothing: the receipt is unknown for good,
+            // and says so, so that the next request for its subject is not held back by it.
+            Err(error @ WorkerError::Broker(crate::broker::BrokerError::ChannelEnd { .. })) => {
+                journal.settle_channel_end(
+                    actor_id.clone(),
+                    action_id,
+                    error.to_protocol_error(),
                     now,
                 )
             }
