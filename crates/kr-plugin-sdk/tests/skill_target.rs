@@ -133,7 +133,7 @@ fn a_skill_target_naming_a_compiled_word_is_refused_by_name() {
 #[test]
 fn a_skill_target_word_outside_the_grammar_is_refused_by_name() {
     let long = "a".repeat(33);
-    for word in ["Amp", "a b", "../x", "amp_", "", long.as_str()] {
+    for word in ["Amp", "aMp", "a b", "a/b", "../x", "amp_", "", long.as_str()] {
         assert!(
             refused_by(&with(|target| target["word"] = json!(word)), "word_shape"),
             "{word:?}"
