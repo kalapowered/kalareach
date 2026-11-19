@@ -2259,16 +2259,26 @@ fn reply_of(answer: Result<super::http::StatusAnswer>) -> std::result::Result<Re
         .map_err(|_| Lost)
 }
 
-/// How many items of the library's stream one read ahead takes, control frames counted.
+/// What the adapter takes from the library's stream ahead of its consumer, control frames counted.
 ///
 /// A message the library holds, or the socket has ready, when a write begins is out of reach once
 /// that write fails: a failed write ends the library's reading, buffered messages and all. So
-/// every poll of a read or a write first takes what is ready into [`WebSocketSideband::ahead`], at
-/// most this many items. Two limits stay, and for both the hangup's answer decides, as it does for
-/// a closure still in transit: a closure behind more than this many ready items is not read when a
-/// write then fails; and a closure that reaches the socket after the last read ahead of a poll,
-/// within that poll, is not read when that poll's write fails.
+/// every poll of a write, and every poll of a read that finds [`WebSocketSideband::ahead`] empty,
+/// first takes what is ready into it. Each read-ahead call takes at most this many library items,
+/// and `ahead` holds at most this many messages across all polls and operations: while it is full
+/// no more is read, and reading goes on when the consumer takes one. Three limits stay, and for
+/// all of them the hangup's answer decides, as it does for a closure still in transit: a closure
+/// behind more than this many ready items is not read when a write then fails; a closure behind a
+/// full queue (`ahead` full, or [`UNFLUSHED_PINGS`] Pings read) can stay unread when the write
+/// fails; and a closure that reaches the socket after the last read ahead of a poll, within that
+/// poll, is not read when that poll's write fails.
 const READ_AHEAD_MESSAGES: usize = 256;
+
+/// The most Pings that are read since the last flush that finished. The library queues a Pong for
+/// each Ping it reads and keeps the queue without a limit until a flush writes it. At this many
+/// the adapter reads no more input: the flush goes on with the task's context, and the poll waits
+/// for it. Reading goes on when a flush has finished, which writes every Pong queued.
+const UNFLUSHED_PINGS: usize = 512;
 
 /// The stream of a side channel, whose writes can be held back. While they are, a write that the
 /// library makes by itself neither reaches the stream nor fails: it waits. A flush passes: the
@@ -2339,6 +2349,8 @@ struct WebSocketSideband<S = crate::wss::Io> {
     /// Messages a read ahead took, in the order they came, and not yet handed on. A closing
     /// frame or a failure the read ahead met is the last of them.
     ahead: VecDeque<SocketRead>,
+    /// Pings read since the last flush that finished: the library holds a Pong for each of them.
+    pings: usize,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketSideband<S> {
@@ -2346,12 +2358,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketSideband<S> {
         Self {
             socket,
             ahead: VecDeque::new(),
+            pings: 0,
         }
     }
 
     /// What one item of the library's stream is to the call: a text message, the end of the
-    /// socket, or nothing (a control or binary message).
+    /// socket, or nothing (a control or binary message). A Ping is counted: the library queued a
+    /// Pong for it.
     fn read_of(
+        &mut self,
         item: Option<std::result::Result<tokio_websockets::Message, tokio_websockets::Error>>,
     ) -> Option<SocketRead> {
         match item {
@@ -2361,14 +2376,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketSideband<S> {
                     .map_or(SocketRead::Closed, |text| SocketRead::Text(text.to_owned())),
             ),
             Some(Ok(message)) if message.is_close() => Some(SocketRead::Closed),
-            Some(Ok(_)) => None,
+            Some(Ok(message)) => {
+                if message.is_ping() {
+                    self.pings += 1;
+                }
+                None
+            }
             Some(Err(_)) | None => Some(SocketRead::Closed),
         }
     }
 
     /// Takes what the library holds or the socket has ready into `ahead`, without waiting, outside
-    /// the task's cooperative budget, and stops at the first end or after
-    /// [`READ_AHEAD_MESSAGES`].
+    /// the task's cooperative budget, and stops at the first end, after [`READ_AHEAD_MESSAGES`]
+    /// items, when `ahead` is full, or when [`UNFLUSHED_PINGS`] Pings are read.
     ///
     /// The library answers a Ping by queueing a Pong that its next read writes before it reads
     /// anything, and a write that fails ends its reading. So the stream's writes are held while
@@ -2380,12 +2400,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketSideband<S> {
         use futures_util::StreamExt;
         self.socket.get_mut().held = true;
         let mut taken = 0;
-        while taken < READ_AHEAD_MESSAGES {
+        while taken < READ_AHEAD_MESSAGES
+            && self.ahead.len() < READ_AHEAD_MESSAGES
+            && self.pings < UNFLUSHED_PINGS
+        {
             let Some(item) = tokio::task::unconstrained(self.socket.next()).now_or_never() else {
                 break;
             };
             taken += 1;
-            if let Some(read) = Self::read_of(item) {
+            if let Some(read) = self.read_of(item) {
                 let ended = read == SocketRead::Closed;
                 self.ahead.push_back(read);
                 if ended {
@@ -2420,7 +2443,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SidebandSocket for WebSocketSideb
                     }
                 }
             }
-            self.socket.poll_flush_unpin(cx).map(|done| done.is_ok())
+            match self.socket.poll_flush_unpin(cx) {
+                Poll::Ready(Ok(())) => {
+                    self.pings = 0;
+                    Poll::Ready(true)
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(false),
+                Poll::Pending => Poll::Pending,
+            }
         }))
     }
 
@@ -2431,14 +2461,26 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SidebandSocket for WebSocketSideb
     /// waits or fails holds back nothing that was read ahead. Only then does the pass poll the
     /// library, with the writes held: a Ping it meets queues a Pong that waits, and the closure
     /// behind it is read; the library hands the Ping on as an item, so the loop goes round and
-    /// flushes. The hold is let go before the poll returns, whatever it returns.
+    /// flushes. The hold is let go before the poll returns, whatever it returns. With nothing read
+    /// ahead and [`UNFLUSHED_PINGS`] Pings read, a flush that waits is all the pass waits for: it
+    /// gives `Pending` with that flush's waker, and reads no more until a flush has finished; a
+    /// flush that failed goes on to the library, whose reading the failed write has ended.
     fn next(&mut self) -> TransportFuture<'_, SocketRead> {
         use futures_util::{SinkExt, StreamExt};
         Box::pin(std::future::poll_fn(move |cx| {
             loop {
                 if self.ahead.is_empty() {
                     self.read_ahead();
-                    let _ = self.socket.poll_flush_unpin(cx);
+                    let flushed = self.socket.poll_flush_unpin(cx);
+                    if matches!(flushed, Poll::Ready(Ok(()))) {
+                        self.pings = 0;
+                    }
+                    if self.ahead.is_empty()
+                        && self.pings >= UNFLUSHED_PINGS
+                        && flushed.is_pending()
+                    {
+                        return Poll::Pending;
+                    }
                 }
                 if let Some(read) = self.ahead.pop_front() {
                     return Poll::Ready(read);
@@ -2449,7 +2491,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> SidebandSocket for WebSocketSideb
                 match item {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(item) => {
-                        if let Some(read) = Self::read_of(item) {
+                        if let Some(read) = self.read_of(item) {
                             return Poll::Ready(read);
                         }
                     }
