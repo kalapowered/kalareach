@@ -10,7 +10,7 @@
 
 mod net_support;
 
-#[path = "../../kr-client/tests/support/connect_proxy.rs"]
+#[path = "../../kr-client/src/services/http/connect_proxy.rs"]
 mod connect_proxy;
 
 use std::time::Duration;
@@ -124,6 +124,11 @@ async fn local_client(host: &kr_ipc::testing::TempHost) -> kr_ipc::client::Local
 
 /// The detail of the network check of the diagnostics the daemon answers.
 async fn network_detail(host: &kr_ipc::testing::TempHost) -> String {
+    check_detail(host, "configuration-network").await
+}
+
+/// The detail of the check `id` of the diagnostics the daemon answers.
+async fn check_detail(host: &kr_ipc::testing::TempHost, id: &str) -> String {
     let mut client = local_client(host).await;
     let answer = client
         .request(Method::HostDoctor, &())
@@ -134,8 +139,8 @@ async fn network_detail(host: &kr_ipc::testing::TempHost) -> String {
     doctor
         .checks
         .iter()
-        .find(|check| check.id() == "configuration-network")
-        .expect("the network check")
+        .find(|check| check.id() == id)
+        .unwrap_or_else(|| panic!("the {id} check"))
         .detail()
         .to_owned()
 }
@@ -648,15 +653,18 @@ async fn a_request_the_proxy_refuses_without_a_word_is_found_by_the_recheck_at_i
     assert!(!log.contains(PASSWORD), "the daemon's log holds the login");
 }
 
-/// KR-REQ-10.02: a login the proxy refuses is written once although a release matrix read is
-/// configured: the check's own request is the only one the proxy reads, and a read the diagnostics
-/// ask for afterwards sends nothing.
+/// KR-REQ-10.02: a login the proxy refuses is written once although the release matrix, the
+/// authority feed and the mailbox reader are configured and each asks at once: the check's own
+/// request is the only one the proxy reads, and the rows of the feed and of the reader say that the
+/// proxy's login stopped them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_wrong_login_is_sent_once_although_the_release_matrix_is_configured() {
+async fn a_wrong_login_is_sent_once_although_the_matrix_the_feed_and_the_mailbox_each_ask() {
     let proxy = ConnectProxy::authenticating("user", PASSWORD, "Basic realm=\"proxy\"").await;
     let (origin, _) = unused_origin().await;
+    let (feed_origin, _) = unused_origin().await;
     let (host, _relay, tested) = host_behind_with(&proxy, |document| {
         document.relay.origin = Nullable::some(origin.clone());
+        document.authority.origin = Nullable::some(feed_origin.clone());
     })
     .await;
     store_login(&host, &proxy, "user", "not-the-password");
@@ -679,8 +687,18 @@ async fn a_wrong_login_is_sent_once_although_the_release_matrix_is_configured() 
     })
     .await
     .expect("the diagnostics said that the proxy refused the login");
-    for _ in 0..2 {
-        network_detail(&host).await;
+    let clause = kr_transport::proxy::ProxyLoginKind::Refused.clause();
+    for carrier in ["authority-feed", "mailbox-reader"] {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                if check_detail(&host, carrier).await.contains(clause) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the {carrier} row said the proxy's login stopped it"));
     }
     let calls = proxy.calls();
     assert_eq!(
@@ -698,7 +716,7 @@ async fn a_wrong_login_is_sent_once_although_the_release_matrix_is_configured() 
 /// proxy: the check does not run on a trust it could not build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_trust_anchor_that_cannot_be_read_ends_the_start_with_its_own_error_and_sends_nothing() {
-    let proxy = ConnectProxy::authenticating("user", "password", "Basic realm=\"proxy\"").await;
+    let proxy = ConnectProxy::authenticating("user", PASSWORD, "Basic realm=\"proxy\"").await;
     let (host, _relay, _) = host_behind_with(&proxy, |document| {
         let missing = std::env::temp_dir().join("kr-no-such-anchor.der");
         document.network.relay_trust_anchors =

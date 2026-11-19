@@ -432,7 +432,7 @@ impl Drop for StopOnDrop {
 
 // The stand-in proxy and the certificates of the suites that run it from `tests/`.
 #[cfg(test)]
-#[path = "../../kr-client/tests/support/connect_proxy.rs"]
+#[path = "../../kr-client/src/services/http/connect_proxy.rs"]
 mod connect_proxy;
 #[cfg(test)]
 #[path = "../../kr-controller/tests/net_support/pooled_origin.rs"]
@@ -814,6 +814,62 @@ mod tests {
             suspected.port, second_port,
             "the address queued is the one that failed, not the one that answered"
         );
+    }
+
+    /// A redirect of a publication (`307`, `308`) or of a lookup (`302`) to a plain `http` address
+    /// is refused at the hop while a login is held: the origin answered once, the proxy saw the one
+    /// connection and no other, and no verdict was set.
+    ///
+    /// Covers KR-REQ-10.02.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pkarr_redirect_to_plain_http_is_refused_at_the_hop() {
+        let authority = tls::Authority::new("a pkarr origin authority");
+        for (method, status) in [("PUT", 307_u16), ("PUT", 308), ("GET", 302)] {
+            let proxy = ConnectProxy::authenticating("user", "password", "Basic").await;
+            let first = super::pooled_origin::PooledOrigin::answering(
+                tokio_rustls::TlsAcceptor::from(authority.server_config("127.0.0.1")),
+                format!(
+                    "HTTP/1.1 {status} Redirect\r\nLocation: http://127.0.0.1:9/key\r\nContent-Length: 0\r\n\r\n"
+                )
+                .into_bytes(),
+            )
+            .await;
+            let login = login("password");
+            let url = proxy
+                .url
+                .parse::<ProxyUrl>()
+                .expect("a proxy address")
+                .with_login(login.clone());
+            let builder = reqwest::Client::builder()
+                .timeout(REQUEST_TIMEOUT)
+                .tls_backend_preconfigured(
+                    (*tls::client_config(std::slice::from_ref(&authority.der))).clone(),
+                );
+            let client = proxy::proxied(builder, &url)
+                .expect("a proxy the library takes")
+                .build()
+                .expect("a client");
+            let request = client
+                .request(
+                    method.parse().expect("a method"),
+                    format!("https://127.0.0.1:{}/key", first.port),
+                )
+                .build()
+                .expect("a request");
+            let refused = send(&client, Some(&url), request)
+                .await
+                .expect_err("the hop to plain http is refused");
+            assert!(
+                matches!(
+                    refused,
+                    PkarrError::ProxyLogin(ProxyLoginKind::ClearTextTarget)
+                ),
+                "{method} {status}: {refused}"
+            );
+            assert_eq!(first.requests(), 1, "{method} {status}: one answer");
+            assert_eq!(proxy.accepted(), 1, "{method} {status}: one connection");
+            assert!(login.stopped().is_none(), "{method} {status}: no verdict");
+        }
     }
 
     /// A Pkarr client writes the login to an `https` proxy only after the proxy's certificate has

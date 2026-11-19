@@ -362,7 +362,7 @@ async fn a_repeated_set_and_a_repeated_clear_leave_the_state_the_first_one_made(
     );
 
     for round in ["first", "second"] {
-        let cleared = control
+        let cleared = match control
             .mutate(
                 Method::NetworkProxyLoginClear,
                 ActionId::new(kr_ipc::new_uuid()),
@@ -371,7 +371,10 @@ async fn a_repeated_set_and_a_repeated_clear_leave_the_state_the_first_one_made(
             )
             .await
             .expect("the call reaches the daemon")
-            .unwrap_or_else(|error| panic!("the {round} clear is accepted: {error}"));
+        {
+            Ok(cleared) => cleared,
+            Err(error) => panic!("the {round} clear is accepted: {error}"),
+        };
         assert!(
             cleared
                 .to_typed::<NetworkProxyLoginResult>()
