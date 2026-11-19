@@ -372,6 +372,14 @@ impl Route {
 }
 
 impl Real {
+    /// Whether the agent's configuration names the provider the entry routes the pinned build to
+    /// (the subscription proxy): only a run with a login does. A run with none is given the
+    /// switches alone, so the build has no provider and sends no request of a model, whatever it
+    /// does at its start ([`Account::configuration_without_provider`]).
+    fn names_a_provider(&self) -> bool {
+        self.ledger.is_some()
+    }
+
     /// The run's directory for the agent's configuration and conversations.
     fn config(run: &Run) -> PathBuf {
         run.root().join(CONFIG_DIRECTORY)
@@ -438,16 +446,31 @@ impl Real {
                 .expect("the run's configuration directory");
         }
         let (root, work) = Self::places(host.run());
-        let files = self
-            .account
-            .configuration_with_switches("config.toml", &root, &work)
-            .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
+        let files = if self.names_a_provider() {
+            self.account
+                .configuration_with_switches("config.toml", &root, &work)
+        } else {
+            self.account
+                .configuration_without_provider("config.toml", &root, &work)
+        }
+        .unwrap_or_else(|why| panic!("{ISOLATION_UNPROVEN} {why}"));
         for (relative, content) in &files {
             let path = directory.join(relative);
             assert!(
                 path.starts_with(&directory) && !relative.contains(".."),
                 "a configuration file stays in its directory: {relative}"
             );
+            // A run with no login writes no provider: what is read back through the run's handles
+            // before every probe and every typing is this file, so the build has none to send a
+            // request to.
+            if !self.names_a_provider() && relative.ends_with(".toml") {
+                let named = provider_keys_in(content);
+                assert!(
+                    named.is_empty(),
+                    "{ISOLATION_UNPROVEN} the configuration of a run with no login names a provider \
+                     ({named:?} in {relative})"
+                );
+            }
             std::fs::write(&path, content).expect("writes the configuration file");
             // What the probes vouch for: the file as it is now, read back through the run's handles.
             let place = Path::new(CONFIG_DIRECTORY).join(relative);
@@ -900,6 +923,19 @@ const STAND_IN_PLACE: &str = "t/codex";
 
 /// How many reads of the host's list of application instances a failure's text keeps.
 const POLLS_KEPT: usize = 20;
+
+/// The top-level keys of a configuration file that name the provider the build sends its requests
+/// to: the provider's name, its table, and any address of a service.
+fn provider_keys_in(text: &str) -> Vec<String> {
+    let Ok(document) = text.parse::<toml_edit::DocumentMut>() else {
+        return vec!["a file that is not TOML".to_owned()];
+    };
+    document
+        .iter()
+        .map(|(key, _)| key.to_owned())
+        .filter(|key| key.starts_with("model_provider") || key.ends_with("_base_url"))
+        .collect()
+}
 
 /// What one probe answered.
 struct Answer {
@@ -4284,7 +4320,9 @@ fn gateway_a_launch_whose_first_presentation_carries_a_forged_credential_is_refu
             // genuine presentation of the same launch was admitted.
             assert!(
                 instance.is_ok(),
-                "the instance served through the gateway: {instance:?}"
+                "the instance served through the gateway (the real launcher runs from `b/h/kr-hook` \
+                 as a loose build, and a worker that refused it would end the launch here): \
+                 {instance:?}"
             );
             // (d) the program did not run as typed: the stand-in's marker is absent; the real
             // build reaches its first screen with the gateway behind it.
@@ -6235,4 +6273,27 @@ fn a_probe_only_record_names_the_expectation_of_the_pinned_entry_the_answer_miss
             .is_some_and(|text| text.len() == RECORDED_LINE_CHARS)
     }));
     assert_eq!(record["line_count"], RECORDED_LINES * 2);
+}
+
+/// A configuration names a provider by the key of its name, by its table, and by any address of a
+/// service, and by nothing else.
+#[test]
+fn a_configuration_names_a_provider_by_its_name_its_table_or_an_address() {
+    assert!(
+        provider_keys_in("approval_policy = \"on-request\"\n[features]\nhooks = false\n")
+            .is_empty()
+    );
+    assert_eq!(
+        provider_keys_in("model_provider = \"local\"\n"),
+        vec!["model_provider".to_owned()]
+    );
+    assert_eq!(
+        provider_keys_in("a = 1\n[model_providers.local]\nname = \"x\"\n"),
+        vec!["model_providers".to_owned()]
+    );
+    assert_eq!(
+        provider_keys_in("chatgpt_base_url = \"http://127.0.0.1:1\"\n"),
+        vec!["chatgpt_base_url".to_owned()]
+    );
+    assert!(!provider_keys_in("not = = toml").is_empty());
 }
