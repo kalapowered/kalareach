@@ -2932,7 +2932,7 @@ fn place_is_free(
             // layouts keep what the installed packages were written for: a folder that holds
             // only this registration is taken.
             if declared {
-                return Err(not_made_by_this_host(&path, application));
+                return Err(not_made_by_this_host(&path, application.as_str()));
             }
             if !holds_only(existing.path(), "", &registration)
                 .map_err(|error| format!("{path} cannot be read: {error}"))?
