@@ -576,3 +576,156 @@ fn the_record_path_is_the_one_text_the_walk_lets_through() {
         Some(shape @ Shape::Object { .. }) if shape.holds_record_path()
     ));
 }
+
+fn quill_bridge(label: &str) -> kr_plugin_sdk::plugin::NativeBridge {
+    let mut bridge: Value = serde_json::from_slice(
+        &std::fs::read(bundled("gemini-cli").join("plugin.json")).expect("reads"),
+    )
+    .expect("JSON");
+    let mut bridge = bridge["native_bridge"].take();
+    bridge["application"] = json!(label);
+    let step = |destination: &str, digest: &str| {
+        json!({
+            "type": "install_file",
+            "source": "bridge/x.json",
+            "destination": destination,
+            "digest": digest,
+        })
+    };
+    let digest = "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb";
+    bridge["install"] = json!([
+        step("plugins/quill-bridge/plugin.json", digest),
+        step("plugins/quill-bridge/hooks/hooks.json", digest),
+    ]);
+    bridge["remove"] = json!([
+        { "type": "remove_file", "destination": "plugins/quill-bridge/hooks/hooks.json", "digest": digest },
+        { "type": "remove_file", "destination": "plugins/quill-bridge/plugin.json", "digest": digest },
+    ]);
+    serde_json::from_value(bridge).expect("a recipe")
+}
+
+fn quill_placement() -> Placement {
+    let mut table = claude();
+    table["directory"] = json!([".quill"]);
+    table["area"] = json!("plugins");
+    table["files"] = json!([
+        { "tail": "plugin.json", "shape": claude()["files"][0]["shape"] },
+        { "tail": "hooks/hooks.json", "shape": claude()["files"][2]["shape"] },
+    ]);
+    table["one_per_name"]["manifest"] = json!("plugin.json");
+    placement(&table)
+}
+
+#[test]
+fn the_host_states_what_it_reads_of_a_placement_in_its_own_words() {
+    let placement = quill_placement();
+    assert!(placement.refusals().is_empty(), "{:?}", placement.refusals());
+    let text = placement.statement(&quill_bridge("Quill CLI")).expect("a reading");
+    assert_eq!(
+        text,
+        "This package places files for \"Quill CLI\" in a folder it chose: \
+         .quill/plugins/quill-bridge/ under your home folder, files plugin.json, hooks/hooks.json. \
+         \"Quill CLI\", or any other program that reads that folder, can run what the files hold, \
+         as you, with your permissions and outside the plugin sandbox. The host places these \
+         files only after it has checked that each is JSON with no repeated member name, that \
+         every entry named command in them starts the KalaReach forwarder by its path, and that \
+         no other name or text in them holds a slash, a backslash, a colon, a tilde, a dollar \
+         sign or a backtick or is a lone dot or two dots. The host does not check what \
+         \"Quill CLI\", or another program, does with the other settings in these files, and a \
+         plain file name in them can be read by a program as a path. Removing the package takes \
+         out only what this host placed; a file that has changed since stays in place, and the \
+         host reports what it cannot remove."
+    );
+}
+
+#[test]
+fn an_application_label_that_is_not_plain_is_refused_for_the_statement() {
+    for label in ["Quill \"CLI\"", "Quill/CLI"] {
+        let found = quill_placement().statement(&quill_bridge(label));
+        assert!(
+            found.is_err_and(|error| error.refusal == PlacementRefusal::ApplicationNotPlain),
+            "{label:?}"
+        );
+    }
+}
+
+#[test]
+fn a_publishers_words_holding_the_placement_label_are_refused() {
+    let validated = gemini_package(">=0.1.9, <0.2.0", |_| {});
+    assert!(validated.report.is_valid(), "{:?}", validated.report.findings);
+    let home = tempfile::tempdir().expect("a directory");
+    let directory = home.path().join("package");
+    copy_tree(&bundled("gemini-cli"), &directory);
+    let manifest_path = directory.join("plugin.json");
+    let mut manifest: Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).expect("reads")).expect("JSON");
+    manifest["native_bridge"]["grant_statement"] = json!(format!(
+        "Harmless. {} Reads nothing.",
+        kr_protocol::confirmation::PLACEMENT_STATEMENT_LABEL
+    ));
+    std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    let refused = validate_package_directory(&directory);
+    assert!(
+        refused.report.findings.iter().any(|finding| {
+            finding.code == FindingCode::BridgeRecipeInvalid
+                && finding.detail.contains("before its own reading of a placement")
+        }),
+        "{:?}",
+        refused.report.findings
+    );
+}
+
+#[test]
+fn the_statement_bound_is_the_sum_of_the_contract_limits() {
+    use kr_protocol::confirmation::{INTEGRATION_STATEMENT_LABEL, STATEMENT_CHARS};
+    assert_eq!(
+        STATEMENT_CHARS,
+        kr_plugin_sdk::text::Summary::LIMIT
+            + 1
+            + INTEGRATION_STATEMENT_LABEL.len()
+            + 1
+            + kr_plugin_sdk::integration::MAX_STATEMENT_CHARS,
+        "today's sum"
+    );
+    assert_eq!(STATEMENT_CHARS, 5054);
+}
+
+#[test]
+fn the_longest_reading_of_a_placement_is_the_bound_and_one_more_is_refused() {
+    let component = "n".repeat(64);
+    let mut table = claude();
+    table["directory"] = json!([component, component, component]);
+    table["area"] = json!(component);
+    let shape = claude()["files"][2]["shape"].clone();
+    let tails: Vec<Value> = (0..8)
+        .map(|number| {
+            let tail = format!("{}/{}/{number:0>64}", "t".repeat(64), "u".repeat(64));
+            let shape = if number == 0 {
+                json!({ "kind": "record_path" })
+            } else {
+                shape.clone()
+            };
+            json!({ "tail": tail, "shape": shape })
+        })
+        .collect();
+    table["files"] = json!(tails);
+    table.as_object_mut().unwrap().remove("one_per_name");
+    let placement = placement(&table);
+    let folder = "f".repeat(128);
+    let mut bridge = serde_json::to_value(quill_bridge(&"A".repeat(64))).expect("a value");
+    bridge["install"] = json!([
+        {
+            "type": "install_file", "source": "bridge/x.json", "digest": "ed5b5291f2e39bf679e945135210c5aee7863b8b8dbaa049dd53598507f172cb",
+            "destination": format!("{component}/{folder}/{}", tails[0]["tail"].as_str().unwrap()),
+        },
+        { "type": "add_configuration_key", "file": "settings.json", "key": format!("enabledPlugins.{folder}@skills-dir"), "value": "true" },
+    ]);
+    let bridge: kr_plugin_sdk::plugin::NativeBridge = serde_json::from_value(bridge).expect("a recipe");
+    let found = placement.statement(&bridge);
+    let text = found.expect("the longest reading is within the bound");
+    assert_eq!(
+        text.chars().count(),
+        kr_plugin_sdk::placement::MAX_PLACEMENT_STATEMENT_CHARS,
+        "the bound is the longest reading"
+    );
+}
