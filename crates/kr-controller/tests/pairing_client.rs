@@ -3462,11 +3462,24 @@ async fn a_recovery_that_proves_another_authorisation_key_is_refused_at_the_bind
     })
     .await
     .expect("the device connects as the device it was committed as");
-    let failure = tokio::time::timeout(WATCHDOG, attempt)
-        .await
-        .expect("the attempt ends")
-        .expect("the attempt ran")
-        .expect_err("not paired");
+    // The attempt ends at the first refusal; a device that connects again before it ends is the
+    // failure, and the case sees that connection as it happens instead of waiting out its end.
+    let ended = tokio::time::timeout(WATCHDOG, async {
+        tokio::select! {
+            ended = attempt => Some(ended),
+            () = async {
+                while link.paired_connects.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            } => None,
+        }
+    })
+    .await
+    .expect("the attempt ends or the device connects again");
+    let Some(ended) = ended else {
+        panic!("a refusal at the binding is the host's word: the device connected again");
+    };
+    let failure = ended.expect("the attempt ran").expect_err("not paired");
     assert_eq!(failure.kind, FailureKind::ApprovalUnknown);
     assert_eq!(
         link.paired_connects.load(Ordering::SeqCst),
@@ -3583,11 +3596,14 @@ async fn a_recovery_that_reaches_no_connection_is_followed_by_another() {
     })
     .await
     .expect("the device connects as the device it was committed as");
-    let paired = tokio::time::timeout(Duration::from_secs(150), attempt)
+    let ended = tokio::time::timeout(Duration::from_secs(150), attempt)
         .await
         .expect("the attempt ends")
-        .expect("the attempt ran")
-        .expect("the device ends paired and not unknown");
+        .expect("the attempt ran");
+    let paired = match ended {
+        Ok(paired) => paired,
+        Err(failure) => panic!("the device ends paired and not unknown: {failure:?}"),
+    };
     assert_eq!(paired.device_id, confirmed.device_id);
     assert!(
         link.paired_connects.load(Ordering::SeqCst) >= 5,

@@ -3739,17 +3739,15 @@ mod tests {
 
     const SECOND: Duration = Duration::from_secs(1);
 
-    fn paired_host(waited: &Waited) -> &PairedHost {
-        match &waited.outcome {
-            Some(Ok(host)) => host,
-            other => panic!("the attempt did not end paired: {other:?}"),
-        }
+    fn ended_paired(waited: &Waited) -> bool {
+        matches!(waited.outcome, Some(Ok(_)))
     }
 
-    fn failure_kind(waited: &Waited) -> FailureKind {
+    /// The kind of failure the attempt ended with; none when it has not ended or ended paired.
+    fn failure_kind(waited: &Waited) -> Option<FailureKind> {
         match &waited.outcome {
-            Some(Err(failure)) => failure.kind,
-            other => panic!("the attempt did not end as a failure: {other:?}"),
+            Some(Err(failure)) => Some(failure.kind),
+            _ => None,
         }
     }
 
@@ -3765,7 +3763,9 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        let host = paired_host(&run);
+        let Some(Ok(host)) = &run.outcome else {
+            panic!("the attempt ends paired: {:?}", run.outcome);
+        };
         assert_eq!(
             host.device_id, run.derived,
             "the device is the one derived for it"
@@ -3795,7 +3795,11 @@ mod tests {
             Duration::from_secs(200),
         )
         .await;
-        paired_host(&run);
+        assert!(
+            ended_paired(&run),
+            "the attempt ends paired: {:?}",
+            run.outcome
+        );
         assert_eq!(
             run.connects.len(),
             13,
@@ -3827,9 +3831,37 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        assert_eq!(failure_kind(&run), FailureKind::ApprovalUnknown);
+        assert_eq!(
+            failure_kind(&run),
+            Some(FailureKind::ApprovalUnknown),
+            "{:?}",
+            run.outcome
+        );
         assert!(!run.record, "nothing was recorded");
         assert_eq!(run.connects.len(), 1, "the refusal is not asked again");
+    }
+
+    /// KR-REQ-10.37: a connection the host refuses with a code that permits a retry is not the
+    /// host's word: the recovery connects again and ends paired.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_connect_of_a_recovery_with_a_transient_code_is_tried_again() {
+        let run = recovering(
+            Reply::Refused(ErrorCode::PermissionDenied),
+            vec![
+                Paired::Refused(ErrorCode::ResourceUnavailable),
+                Paired::Committed,
+            ],
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(
+            ended_paired(&run),
+            "the attempt ends paired: {:?}",
+            run.outcome
+        );
+        assert_eq!(run.connects.len(), 2, "{:?}", run.connects);
+        assert!(run.record, "the record of the host was written");
     }
 
     /// KR-REQ-10.37: this device's own budget, the host's admission refusal, a membership lease the
@@ -3849,7 +3881,11 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        paired_host(&run);
+        assert!(
+            ended_paired(&run),
+            "the attempt ends paired: {:?}",
+            run.outcome
+        );
         assert_eq!(run.connects.len(), 4, "{:?}", run.connects);
     }
 
@@ -3880,7 +3916,9 @@ mod tests {
         .await;
         assert_eq!(
             failure_kind(&run),
-            refused_by_host(ErrorCode::PairingExpired, true)
+            Some(refused_by_host(ErrorCode::PairingExpired, true)),
+            "{:?}",
+            run.outcome
         );
         assert!(run.connects.is_empty(), "no recovery started");
     }
@@ -3897,7 +3935,12 @@ mod tests {
             Duration::from_secs(120),
         )
         .await;
-        assert_eq!(failure_kind(&run), FailureKind::ApprovalUnknown);
+        assert_eq!(
+            failure_kind(&run),
+            Some(FailureKind::ApprovalUnknown),
+            "{:?}",
+            run.outcome
+        );
         assert!(run.sessions > 0, "the question was reached");
         assert_eq!(run.sessions, run.closed, "no session was left open");
         assert!(!run.record, "no record before the authorised answer");
@@ -3917,7 +3960,12 @@ mod tests {
             Duration::from_secs(60),
         )
         .await;
-        assert_eq!(failure_kind(&run), FailureKind::ApprovalUnknown);
+        assert_eq!(
+            failure_kind(&run),
+            Some(FailureKind::ApprovalUnknown),
+            "{:?}",
+            run.outcome
+        );
         assert!(run.record, "the record the host committed is kept");
         assert_eq!(run.connects.len(), 1);
     }
@@ -3941,7 +3989,11 @@ mod tests {
                 Duration::from_secs(60),
             )
             .await;
-            paired_host(&run);
+            assert!(
+                ended_paired(&run),
+                "the attempt ends paired: {:?}",
+                run.outcome
+            );
             assert_eq!(run.connects.len(), 2, "{held:?}: {:?}", run.connects);
             assert!(run.record);
         }
@@ -3964,7 +4016,11 @@ mod tests {
                     Duration::from_secs(60),
                 )
                 .await;
-                paired_host(&run);
+                assert!(
+                    ended_paired(&run),
+                    "{code:?} {held:?}: the attempt ends paired: {:?}",
+                    run.outcome
+                );
                 assert_eq!(
                     run.connects.len(),
                     2,
@@ -3996,8 +4052,9 @@ mod tests {
             .await;
             assert_eq!(
                 failure_kind(&derived),
-                FailureKind::ApprovalUnknown,
-                "{answer:?}"
+                Some(FailureKind::ApprovalUnknown),
+                "{answer:?}: {:?}",
+                derived.outcome
             );
             assert!(!derived.record, "{answer:?}: nothing was recorded");
             let told = recovering(
@@ -4009,7 +4066,12 @@ mod tests {
             .await;
             // The held connection names a device ([7; 16]) that the second answer repeats only for
             // the identity it was built with, so a `Told` device meets a mismatch on both.
-            assert_eq!(failure_kind(&told), FailureKind::HostMismatch, "{answer:?}");
+            assert_eq!(
+                failure_kind(&told),
+                Some(FailureKind::HostMismatch),
+                "{answer:?}: {:?}",
+                told.outcome
+            );
         }
     }
 
@@ -4057,7 +4119,7 @@ mod tests {
             "the question kept for the last call did not go at it: {:?}",
             run.asked
         );
-        assert_eq!(failure_kind(run), FailureKind::HostUnreachable);
+        assert_eq!(failure_kind(run), Some(FailureKind::HostUnreachable));
         assert!(run.record, "the record the host committed is kept");
     }
 

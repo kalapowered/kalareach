@@ -2067,9 +2067,10 @@ async fn a_second_connection_of_the_candidate_is_not_told_it_is_committed() {
         calls::confirm_candidate(environment, &mut client, invited.invitation_id, &owner)
             .await
             .expect("the owner approves");
-    let told = status_on(&mut proved, invited.invitation_id)
-        .await
-        .expect("the proving connection is answered");
+    let told = match status_on(&mut proved, invited.invitation_id).await {
+        Ok(told) => told,
+        refused => panic!("the proving connection is answered, not {refused:?}"),
+    };
     assert!(
         matches!(told.status, PairStatus::Committed { device_id, .. } if device_id == confirmed.device_id),
         "{:?}",
@@ -2123,9 +2124,10 @@ async fn a_confirmation_that_fails_after_its_commitment_tells_only_the_proving_c
         }
         other => panic!("the second connection is refused, not {other:?}"),
     }
-    let told = status_on(&mut proved, invited.invitation_id)
-        .await
-        .expect("the proving connection is answered");
+    let told = match status_on(&mut proved, invited.invitation_id).await {
+        Ok(told) => told,
+        refused => panic!("the proving connection is answered, not {refused:?}"),
+    };
     let PairStatus::Committed { device_id, .. } = told.status else {
         panic!(
             "the proving connection is told it is committed: {:?}",
