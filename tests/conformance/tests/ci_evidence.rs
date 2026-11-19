@@ -1226,54 +1226,76 @@ fn job_names(workflow: &str) -> Vec<String> {
     names
 }
 
-/// The tests that start a daemon through the user's service manager load jobs into the account's
-/// own launchd on macOS, and stand down, or run detached, in a run that does not set
-/// `KR_ALLOW_ACCOUNT_LAUNCHD`, as a person's own Mac does. Every macOS job of the landing workflow
-/// that runs the workspace's tests, the end-to-end demonstrations or the performance measurements
-/// sets it for the whole job, and so does the macOS job of the conformance workflow, so that those
-/// runs happen on the runner whose account is for the run alone and are not reported as passed
-/// without having run.
-#[test]
-fn the_macos_runs_of_the_workspace_tests_ask_for_the_accounts_launchd() {
-    let variable = "KR_ALLOW_ACCOUNT_LAUNCHD: \"1\"";
-    let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
-        .expect("the landing workflow");
-    let asking: Vec<String> = job_names(&landing)
+/// The scripts a macOS job runs that start a daemon and sessions, besides every `cargo test`.
+const SCRIPTS_THAT_START_A_DAEMON: [&str; 2] = ["scripts/end-to-end.sh", "scripts/performance.sh"];
+
+/// The jobs of `workflow` that can run on macOS and run tests: the runner is a macOS one, or
+/// `matrix.` something while the job's own matrix names a macOS one, and a step runs `cargo test` in
+/// any form (a package, a target, a filter, one inside a command substitution) or one of
+/// [`SCRIPTS_THAT_START_A_DAEMON`].
+fn macos_jobs_that_run_tests(workflow: &str) -> Vec<String> {
+    job_names(workflow)
         .into_iter()
         .filter(|name| {
-            let text = job(&landing, name);
-            header(&text)
-                .lines()
-                .any(|line| line.trim().starts_with("runs-on: macos"))
+            let text = job(workflow, name);
+            let head = header(&text);
+            let on_macos = head.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("runs-on:")
+                    && (line.contains("macos")
+                        || (line.contains("matrix.") && head.contains("macos")))
+            });
+            on_macos
                 && steps_of(&text).iter().any(|step| {
                     step.lines().any(|line| {
-                        [
-                            "cargo test --locked --workspace",
-                            "scripts/end-to-end.sh",
-                            "scripts/performance.sh",
-                        ]
-                        .iter()
-                        .any(|tool| starts(line, tool))
+                        without_comment(line).contains("cargo test")
+                            || SCRIPTS_THAT_START_A_DAEMON
+                                .iter()
+                                .any(|tool| starts(line, tool))
                     })
                 })
         })
-        .collect();
-    // A selection that finds nothing would pass for every job: the two jobs that exist are named.
-    for name in ["macos", "macos-reference"] {
+        .collect()
+}
+
+/// Whether job `name` of `workflow` sets the opt-in for the whole job, among its own keys and ahead of
+/// its steps, so that every step that runs tests has it.
+fn asks_for_the_accounts_launchd(workflow: &str, name: &str) -> bool {
+    header(&job(workflow, name))
+        .lines()
+        .any(|line| line.trim() == "KR_ALLOW_ACCOUNT_LAUNCHD: \"1\"")
+}
+
+/// The tests that start a daemon through the user's service manager load jobs into the account's
+/// own launchd on macOS, and stand down, or run detached, in a run that does not set
+/// `KR_ALLOW_ACCOUNT_LAUNCHD`, as a person's own Mac does. Every job of the landing workflow that can
+/// run on macOS and runs a `cargo test` in any form, the end-to-end demonstrations or the
+/// performance measurements, a matrix leg among them, sets it for the whole job, and so does the
+/// macOS job of the conformance workflow, so that those runs happen on the runner whose account is
+/// for the run alone and are not reported as passed without having run.
+#[test]
+fn the_macos_runs_of_the_workspace_tests_ask_for_the_accounts_launchd() {
+    let landing = fs::read_to_string(repository().join(".github/workflows/core-ci.yml"))
+        .expect("the landing workflow");
+    let running = macos_jobs_that_run_tests(&landing);
+    // A selection that finds nothing would pass for every job: the jobs that exist are named.
+    for name in [
+        "macos",
+        "macos-reference",
+        "macos-powershell",
+        "macos-shell-packages",
+        "companion",
+    ] {
         assert!(
-            asking.iter().any(|found| found == name),
-            "the {name} job of the landing workflow is no macOS job that runs the workspace's tests, \
-             the demonstrations or the measurements; found {asking:?}"
+            running.iter().any(|found| found == name),
+            "the {name} job of the landing workflow is no macOS job that runs tests; found {running:?}"
         );
     }
-    for name in &asking {
+    for name in &running {
         assert!(
-            header(&job(&landing, name))
-                .lines()
-                .any(|line| line.trim() == variable),
-            "the {name} job of the landing workflow runs the workspace's tests, the end-to-end \
-             demonstrations or the measurements on macOS and does not ask for the account's own \
-             launchd in its own environment"
+            asks_for_the_accounts_launchd(&landing, name),
+            "the {name} job of the landing workflow runs tests on macOS and does not ask for the \
+             account's own launchd in its own environment"
         );
     }
     let report = fs::read_to_string(repository().join(".github/workflows/conformance.yml"))
@@ -1281,12 +1303,62 @@ fn the_macos_runs_of_the_workspace_tests_ask_for_the_accounts_launchd() {
     // Among the job's own keys, in its environment ahead of its steps, so that every step that runs
     // tests has it.
     assert!(
-        header(&job(&report, "macos"))
-            .lines()
-            .any(|line| line.trim() == variable),
+        asks_for_the_accounts_launchd(&report, "macos"),
         "the macOS job of the conformance workflow does not ask for the account's own launchd in \
          its own environment"
     );
+}
+
+/// The selection finds a macOS job in each form it can take, and no other job, and the job that
+/// does not set the opt-in is the one the check names.
+#[test]
+fn the_macos_selection_finds_every_form_of_a_test_run_and_the_job_that_does_not_ask() {
+    let workflow = |strategy: &str, runs_on: &str, env: &str, step: &str| {
+        format!(
+            "jobs:\n  a:\n    name: a\n{strategy}    runs-on: {runs_on}\n{env}    steps:\n      - name: t\n        run: {step}\n"
+        )
+    };
+    let ask = "    env:\n      KR_ALLOW_ACCOUNT_LAUNCHD: \"1\"\n";
+    let matrix = "    strategy:\n      matrix:\n        os: [ubuntu-24.04, macos-15]\n";
+    for step in [
+        "cargo test --locked -p kr-cli",
+        "cargo test --locked --workspace",
+        "cases=\"$(cargo test --locked -p x -- --list)\"",
+        "KR_CASE=\"$id\" cargo test --locked -p x --test y",
+        "bash scripts/end-to-end.sh",
+        "bash scripts/performance.sh",
+    ] {
+        let missing = workflow("", "macos-15", "", step);
+        assert_eq!(macos_jobs_that_run_tests(&missing), ["a"], "{step}");
+        assert!(!asks_for_the_accounts_launchd(&missing, "a"), "{step}");
+        let asking = workflow("", "macos-15", ask, step);
+        assert_eq!(macos_jobs_that_run_tests(&asking), ["a"], "{step}");
+        assert!(asks_for_the_accounts_launchd(&asking, "a"), "{step}");
+    }
+    // A matrix leg: the runner is the matrix's, and the matrix names a macOS one.
+    let leg = workflow(
+        matrix,
+        "${{ matrix.os }}",
+        "",
+        "cargo test --locked -p kr-client",
+    );
+    assert_eq!(macos_jobs_that_run_tests(&leg), ["a"]);
+    assert!(!asks_for_the_accounts_launchd(&leg, "a"));
+    // No other job is selected: a Linux runner, a matrix with no macOS leg, a macOS job that only
+    // builds, and a step that names the command only in a comment.
+    for other in [
+        workflow("", "ubuntu-24.04", "", "cargo test --locked -p x"),
+        workflow(
+            "    strategy:\n      matrix:\n        os: [ubuntu-24.04]\n",
+            "${{ matrix.os }}",
+            "",
+            "cargo test --locked -p x",
+        ),
+        workflow("", "macos-15", "", "cargo build --locked --workspace"),
+        workflow("", "macos-15", "", "echo done # cargo test is not run here"),
+    ] {
+        assert!(macos_jobs_that_run_tests(&other).is_empty(), "{other}");
+    }
 }
 
 /// The reference host's job builds the release profile in hours when its cargo cache is gone, and a
