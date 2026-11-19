@@ -38,8 +38,8 @@ use crate::catalogue::files::{
     display, guard_access_controls, hex, home_directory, missing_ancestors, read_digest, storage,
     sync_directory, write_atomically,
 };
+use crate::catalogue::native_bridge::anchor;
 use crate::catalogue::native_bridge::json;
-mod anchor;
 pub(crate) mod declared;
 use crate::error::{ControllerError, Result};
 use crate::given::Recorded;
@@ -4223,6 +4223,7 @@ mod tests {
 
     /// KR-REQ-11.01: a link at any component of a declared place is refused before the first
     /// write, at either scope and at the last name, and nothing is written where the link leads.
+    #[cfg(unix)]
     #[test]
     fn a_declared_place_with_a_link_at_any_component_is_refused_before_the_first_write() {
         use std::os::unix::fs::symlink;
@@ -4249,7 +4250,8 @@ mod tests {
                 std::fs::create_dir_all(parent).expect("a parent");
             }
             symlink(&elsewhere, &link).expect("a link");
-            let target = declared(Some(document()), &[".amp", "skills"]);
+            let mut target = declared(Some(document()), &[".amp", "skills"]);
+            target.project = target.user.clone();
             let installer = tree.installer().with_declaration(Some(target), Vec::new());
             let request = if scope == InstallScope::User {
                 params(amp(), scope)
@@ -4276,6 +4278,7 @@ mod tests {
 
     /// KR-REQ-11.01: a write or a removal through the handle follows no link that took a folder's
     /// name after the check, so the check by path is not the only protection.
+    #[cfg(unix)]
     #[test]
     fn a_write_through_the_handle_follows_no_link_made_after_the_check() {
         use std::os::unix::fs::symlink;
@@ -4309,6 +4312,7 @@ mod tests {
 
     /// KR-REQ-11.01: a removal follows no link either: a record whose place was replaced by a link
     /// after the installation is refused by name, and what the link leads to is left whole.
+    #[cfg(unix)]
     #[test]
     fn a_removal_follows_no_link_either() {
         use std::os::unix::fs::symlink;
