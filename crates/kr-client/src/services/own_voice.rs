@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use kr_protocol::delivery::SecretText;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, DeviceId};
@@ -82,9 +83,10 @@ pub const HANGUP_BOUND: Duration = Duration::from_secs(15);
 /// How long a close waits for the provider to say the session closed before it hangs up.
 pub const DRAIN_BOUND: Duration = Duration::from_secs(5);
 
-/// How many messages are read from a channel that is about to be let go, looking for the
-/// provider's closure among them.
-const QUEUED_READS: usize = 256;
+/// The longest a channel that is about to be let go is read for the provider's closure: it is
+/// read until it holds nothing more, and a provider that never stops sending is read no longer
+/// than this.
+const QUEUED_READ_BOUND: Duration = Duration::from_secs(5);
 
 /// How much longer than a transport's own bound the provider waits before it counts the answer
 /// lost, for a transport that does not keep to its bound itself.
@@ -1177,6 +1179,17 @@ impl OwnVoiceProvider {
                 ));
             }
             Err(_) => {
+                // The channel that failed may hold the provider's closure: it is read before the
+                // call is hung up, and a closure that came is the end of the creation.
+                if task.read_queued().await {
+                    core.mark_closed(&call.call_id);
+                    let fenced = core.registry.epoch() != epoch;
+                    core.registry.finished(ticket, late_end(fenced, true));
+                    return Ok(refused(
+                        VoiceRefusalReason::ReadinessUnavailable,
+                        words::NOT_READY.to_owned(),
+                    ));
+                }
                 // The call exists and is not usable: it is hung up, and the row says what came
                 // of it.
                 let closed = core.hang_up_and_mark(&call.call_id, &session_id).await;
@@ -1646,6 +1659,10 @@ impl CallTask {
             }
             tokio::time::sleep_until(at).await;
         }
+        // A fence can come while the probe waits for its turn.
+        if self.core.registry.epoch() != self.epoch {
+            return Err(NotReady::Unavailable);
+        }
         let key = match self.core.keys.key() {
             Ok(Some(key)) => key,
             _ => return Err(NotReady::Unavailable),
@@ -1686,9 +1703,9 @@ impl CallTask {
             }
         }
         // A fence can come while the attach or the first events are awaited: a task of an older
-        // epoch writes nothing to the channel it just opened.
+        // epoch writes nothing to the channel it just opened. The channel is kept, so that its
+        // caller reads what it holds before it lets the channel go.
         if self.core.registry.epoch() != self.epoch {
-            self.socket = None;
             return Err(NotReady::Unavailable);
         }
         // The probe restates the mute state rather than changing it, and is answered under its
@@ -1962,26 +1979,39 @@ impl CallTask {
         }
     }
 
-    /// Reads what the channel already holds, without waiting for more, and says whether a
-    /// recognised closure was among it. A channel is not let go before this: the provider's
-    /// closure may have come while a write waited, and a host that did not read it would hang the
-    /// call up and learn nothing from the answer.
+    /// Reads what the channel already holds, until it holds nothing more or
+    /// [`QUEUED_READ_BOUND`] has passed, without waiting for more, and says whether a recognised
+    /// closure was among it. A channel is not let go before this, on any exit: the provider's
+    /// closure may have come while a write waited or an attachment was fenced, and a host that did
+    /// not read it would hang the call up and learn nothing from the answer.
+    ///
+    /// Each read is made outside the task's cooperative budget, so a long queue is not read as an
+    /// empty one.
     async fn read_queued(&mut self) -> bool {
-        for _ in 0..QUEUED_READS {
+        let began = std::time::Instant::now();
+        let mut read = 0_u32;
+        loop {
             let Some(socket) = self.socket.as_mut() else {
                 return false;
             };
-            match tokio::time::timeout(Duration::ZERO, socket.next()).await {
-                Ok(SocketRead::Text(text)) => {
+            let next = tokio::task::unconstrained(socket.next()).now_or_never();
+            match next {
+                Some(SocketRead::Text(text)) => {
                     if self.read(&text).closed {
                         self.closed_seen = true;
                         return true;
                     }
                 }
-                Ok(SocketRead::Closed) | Err(_) => return false,
+                Some(SocketRead::Closed) | None => return false,
+            }
+            if began.elapsed() >= QUEUED_READ_BOUND {
+                return false;
+            }
+            read += 1;
+            if read.is_multiple_of(64) {
+                tokio::task::yield_now().await;
             }
         }
-        false
     }
 
     /// The side channel was lost. It is attached again at once under a higher revision, for as
@@ -2046,7 +2076,7 @@ impl CallTask {
             // closure may have come while the write waited. Only a close that was written is
             // waited on for the answer.
             let drained = if sent {
-                tokio::time::timeout(DRAIN_BOUND, async {
+                let answered = tokio::time::timeout(DRAIN_BOUND, async {
                     loop {
                         match self.socket_next().await {
                             SocketRead::Closed => return false,
@@ -2058,8 +2088,13 @@ impl CallTask {
                         }
                     }
                 })
-                .await
-                .unwrap_or(false)
+                .await;
+                match answered {
+                    Ok(closed) => closed,
+                    // The wait ran out: what the channel holds in its last moment is read before
+                    // the call is hung up.
+                    Err(_) => self.read_queued().await,
+                }
             } else {
                 self.read_queued().await
             };

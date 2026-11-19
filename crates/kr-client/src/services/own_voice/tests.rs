@@ -1384,6 +1384,137 @@ async fn a_close_whose_write_waits_out_its_bound_still_reads_a_closure_the_chann
     assert!(world.ledger.rows().expect("rows").is_empty());
 }
 
+/// A closure that stands behind a long queue is read all the same: the channel is read until it
+/// holds nothing more, so the call is closed by the provider's word and no hangup is sent, though
+/// a hangup would have been answered by an empty 404.
+#[tokio::test(start_paused = true)]
+async fn a_closure_behind_more_than_256_messages_is_read_before_the_channel_is_let_go() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    for _ in 0..80 {
+        world.stand_in.fail_attach(AttachFault::Unavailable);
+    }
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    for _ in 0..300 {
+        world
+            .stand_in
+            .event(&json!({ "type": "session.usage.updated" }));
+    }
+    world.stand_in.event(&closed_event("expired", None));
+    let frame = VoiceContextFrame::new("w-1", VoiceCommand::Thinking, None, Some("x".to_owned()))
+        .expect("frame");
+    assert_eq!(
+        control.write(control.revision(), frame).await,
+        Err(WriteRefusal::Lost)
+    );
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed),
+        "the closure behind 300 messages was read"
+    );
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+}
+
+/// A readiness probe whose write is held gives up at the readiness bound, and a closure that came
+/// while it was held ends the creation: nothing is hung up, though a hangup would have been
+/// answered by an empty 404 and left the row unresolved.
+#[tokio::test(start_paused = true)]
+async fn a_closure_that_came_while_the_first_probe_was_held_ends_the_creation_with_nothing_hung_up()
+{
+    let world = fresh();
+    world
+        .stand_in
+        .hold_send(Arc::new(tokio::sync::Notify::new()));
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    let request = request(1);
+    let attempt = world.provider.begin(&request).await.expect("begin");
+    let dispatch = world.provider.dispatch(attempt, &request);
+    let closing = async {
+        // The channel is attached, and the probe's write is held: the provider closes the call.
+        for _ in 0..1_000 {
+            if world.stand_in.recorded().attaches == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            world.stand_in.recorded().attaches,
+            1,
+            "the channel attached"
+        );
+        world.stand_in.event(&closed_event("expired", None));
+    };
+    let (outcome, ()) = tokio::join!(dispatch, closing);
+    assert!(matches!(
+        outcome.expect("an answer"),
+        VoiceStart::Refused(_)
+    ));
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+    assert_eq!(world.provider.registry().state(), RegistryState::Idle);
+}
+
+/// A fence that comes while a reattachment is awaited lets go of the channel only after it was
+/// read: the closure it held ends the call by the provider's word, and nothing is hung up.
+#[tokio::test(start_paused = true)]
+async fn a_closure_on_a_channel_a_fence_overtook_is_read_before_the_channel_is_let_go() {
+    let world = fresh();
+    let own = started(&world).await;
+    let control = world.provider.host_control(&own.call_id).expect("control");
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, None));
+    let release = Arc::new(tokio::sync::Notify::new());
+    world.stand_in.hold_attach(Arc::clone(&release));
+    world.stand_in.drop_socket();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(control.state(), SidebandState::Recovering);
+    assert_eq!(
+        world.stand_in.recorded().attaches_asked,
+        2,
+        "the attach is held"
+    );
+    // The fence comes while the attach is awaited, and the channel it gives holds the closure.
+    let fenced = world.provider.registry().fence().expect("a fence");
+    world.stand_in.close_at_attach(true);
+    release.notify_one();
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        control.state(),
+        SidebandState::Closed(SidebandEnd::ProviderClosed),
+        "the closure on the channel the fence overtook was read"
+    );
+    assert!(
+        world.stand_in.recorded().hangups.is_empty(),
+        "a closure the provider told is not hung up"
+    );
+    assert!(world.ledger.rows().expect("rows").is_empty());
+    let _ = fenced;
+    world.provider.registry().unfence();
+}
+
 /// A reattachment writes its probe under the call's one pace: after a burst it waits for its
 /// turn, and writes nothing until then.
 #[tokio::test(start_paused = true)]
