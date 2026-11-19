@@ -62,7 +62,9 @@ describe('an answer a channel took', () => {
   it('keeps the ordinary words, and does not let go, for an answer that was lost on the way back', async () => {
     const controls = start(1)
     await allow()
-    expect(await screen.findByText(/could not confirm what became of that/)).toBeInTheDocument()
+    // Either words stand in the same place, so the wait ends the same way whatever the page says.
+    const words = await screen.findByText(/could not confirm what became of that|does not confirm answers/)
+    expect(words).toHaveTextContent('The host could not confirm what became of that.')
     expect(screen.queryByText(/does not confirm answers/)).toBeNull()
     await act(async () => {
       await Promise.resolve()
@@ -91,11 +93,13 @@ describe('an answer the host cannot tell was taken, on a paired route', () => {
     const controls = start(0, 1)
     await allow()
     expect(await screen.findByText(/does not confirm answers/)).toBeInTheDocument()
+    // The page has acted on the answer once it has asked for the receipt or asked to release.
     await waitFor(() => {
-      expect(controls.readActions).toHaveLength(1)
+      expect(controls.readActions.length + controls.releaseAttempts).toBeGreaterThan(0)
     })
     await settle()
     // The read answered NOT_FOUND: the worker never held the answer, so there is nothing to let go of.
+    expect(controls.readActions).toHaveLength(1)
     expect(controls.releasedActions).toHaveLength(0)
     expect(controls.releaseAttempts).toBe(0)
   })
@@ -123,9 +127,6 @@ describe('a release that is still on its way', () => {
     await allow()
     // The request now stands as a line beside the others, which the read after the answer drew.
     await screen.findByTestId('approval-unconfirmed')
-    await waitFor(() => {
-      expect(controls.releaseAttempts).toBe(1)
-    })
     await settle()
     expect(controls.releaseAttempts).toBe(1)
     finish()
@@ -152,9 +153,9 @@ describe('the lines that stay beside the requests', () => {
       expect(line).toHaveTextContent(new RegExp(`^Request earlier-${String(7 - index)}, asked .+ ago\\.`))
       expect(line).toHaveTextContent(/cannot tell whether Claude Code took the answer to this request/)
     })
-    expect(screen.getByTestId('approval-unconfirmed-more')).toHaveTextContent(
-      /^2 more answers are in the same state/
-    )
+    const more = screen.queryByTestId('approval-unconfirmed-more')
+    expect(more).not.toBeNull()
+    expect(more?.textContent ?? '').toMatch(/^2 more answers are in the same state/)
   })
 
   it('keep one line for each of up to five, and no count line', async () => {
