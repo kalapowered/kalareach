@@ -158,13 +158,15 @@ impl VoiceCallState {
         }
     }
 
-    /// Notes something owed until its `until_ms`, and forgets what has lapsed by `now_ms`.
+    /// Notes something owed until its `until_ms`, and forgets what has lapsed by `now_ms`: a call
+    /// left to the host does not lapse, and stands until the host's answer or a later start shows it
+    /// closed.
     ///
     /// Nothing that has not lapsed is dropped to make room: a grant the host may still hold open is
     /// told to the person until it ends, however many there are. The list is bounded by time, as
     /// each entry ends by itself, and by the calls a device can make in that time.
     pub fn owe(&mut self, now_ms: u64, owed: OwedView) {
-        self.owed.retain(|each| each.until_ms > now_ms);
+        self.owed.retain(|each| !each.lapsed(now_ms));
         self.owed.push(owed);
     }
 }
@@ -309,14 +311,26 @@ impl OwedView {
         }
     }
 
+    /// The kind of an entry for a call on the host's own key that this phone left to the host.
+    pub const HOST_CLOSE: &'static str = "host_close";
+
+    /// Whether this entry has ended by itself by `now_ms`. A call left to the host does not end by
+    /// itself: the phone cannot learn whether the host closed it at the provider, and the grant
+    /// ending says nothing of that. It stands until the host's answer, or a start the host accepts,
+    /// shows the call closed.
+    #[must_use]
+    pub fn lapsed(&self, now_ms: u64) -> bool {
+        self.kind != Self::HOST_CLOSE && self.until_ms <= now_ms
+    }
+
     /// A call on the host's own key that this phone left to the host: the host closes it at the
     /// provider two minutes after it last heard from this phone, and this device cannot learn
-    /// whether it did. It stands until the call's grant has ended, and no later than the host's
-    /// answer or the person's next start shows it closed.
+    /// whether it did. `until_ms` is when the call's grant ends, and the entry stands after that,
+    /// until the host's answer or the person's next start shows the call closed.
     #[must_use]
     pub fn left_to_host(voice_session_id: VoiceSessionId, until_ms: u64, host: &CallHost) -> Self {
         Self {
-            kind: "host_close".to_owned(),
+            kind: Self::HOST_CLOSE.to_owned(),
             words: super::cause::LEFT_TO_HOST.to_owned(),
             action_id: None,
             voice_session_id: Some(voice_session_id.to_string()),
@@ -461,6 +475,63 @@ mod tests {
             host_name: "A host".to_owned(),
             host: None,
         }
+    }
+
+    /// What is owed ends by itself at its moment, except a call left to the host, which stands until
+    /// the host's answer or a later start shows it closed: the grant ending says nothing of the
+    /// provider's closure.
+    #[test]
+    fn what_is_owed_lapses_at_its_moment_but_a_call_left_to_the_host_does_not() {
+        let mut left = owed(1_000);
+        left.kind = OwedView::HOST_CLOSE.to_owned();
+        assert!(
+            owed(1_000).lapsed(1_000),
+            "a revocation ends with the grant"
+        );
+        assert!(!owed(1_000).lapsed(999));
+        assert!(
+            !left.lapsed(1_000),
+            "a call left to the host stands past the grant"
+        );
+        assert!(!left.lapsed(u64::MAX));
+        let mut state = VoiceCallState::no_call();
+        state.owe(0, left);
+        state.owe(5_000, owed(10_000));
+        state.owe(20_000, owed(30_000));
+        let kinds: Vec<&str> = state.owed.iter().map(|each| each.kind.as_str()).collect();
+        assert_eq!(kinds, [OwedView::HOST_CLOSE, "revocation"], "{kinds:?}");
+    }
+
+    /// The host's answer to a stop says the call is closed only when the provider confirmed it or
+    /// the host holds no such call: a revoked grant with the closure unconfirmed does not.
+    #[test]
+    fn a_revoked_grant_is_a_closed_call_only_when_the_provider_confirmed_it() {
+        let revoked = |broker_notified| HostEnd::Revoked {
+            fence: VoiceFence::NotOwed,
+            broker_notified,
+        };
+        assert!(revoked(true).closes_the_call());
+        assert!(!revoked(false).closes_the_call());
+        assert!(revoked(false).settles(), "the grant is gone either way");
+        assert!(
+            HostEnd::NotHeld {
+                words: String::new()
+            }
+            .closes_the_call()
+        );
+        assert!(
+            !HostEnd::Refused {
+                words: String::new()
+            }
+            .closes_the_call()
+        );
+        assert!(
+            !HostEnd::NotTold {
+                words: String::new()
+            }
+            .closes_the_call()
+        );
+        assert!(!HostEnd::NotNeeded.closes_the_call());
     }
 
     /// Each problem a call met is kept: a later one of another kind is beside the first and does not

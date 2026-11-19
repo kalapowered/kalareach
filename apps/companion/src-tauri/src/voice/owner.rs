@@ -1092,6 +1092,13 @@ impl Owner {
         };
         let descriptor = (**session).clone();
         self.descriptor = Some(descriptor.clone());
+        // The host makes a call on its own key only when it holds none other, so a start it
+        // accepts shows the calls this device left to it closed.
+        if let (VoiceSessionControl::Host { .. }, Some(host)) =
+            (&descriptor.control, self.host.as_ref())
+        {
+            self.shared.left_calls_are_closed(host);
+        }
         self.shared.keep_for_emergency(
             self.id,
             Some(call.clone()),

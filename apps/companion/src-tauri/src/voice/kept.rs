@@ -134,7 +134,6 @@ impl Kept {
             owed: document
                 .owed
                 .into_iter()
-                .filter(|entry| entry.until_ms > now_ms)
                 .map(|entry| OwedView {
                     kind: entry.kind,
                     words: entry.words,
@@ -145,6 +144,7 @@ impl Kept {
                     host_name: entry.host_name,
                     host: entry.host_device_id.zip(entry.environment_id),
                 })
+                .filter(|owed| !owed.lapsed(now_ms))
                 .collect(),
             note: document.note,
         })

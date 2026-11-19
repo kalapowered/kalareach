@@ -8422,6 +8422,169 @@ async fn a_grant_the_host_revoked_without_the_provider_confirming_the_close_leav
     }
 }
 
+/// The kinds of what a call left owed, as the page reads them.
+fn owed_kinds_of(state: &serde_json::Value) -> Vec<String> {
+    state["owed"]
+        .as_array()
+        .map(|owed| {
+            owed.iter()
+                .filter_map(|entry| entry["kind"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A call left to the host stays owed past the end of its grant, with the host's rule, until the
+/// host says the call is closed: a revoked grant whose closure the provider did not confirm does not
+/// say that, and a host that holds no such call does. What is owed to a host that is reached is asked
+/// again, as a stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_left_to_the_host_stays_owed_past_its_grant_until_the_host_says_it_is_closed() {
+    let mut scene = own_scene(own_timings()).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
+    let prepared = scene.prepared().await;
+    let answer = scene
+        .call("voice_start", scene.own_start_request(&prepared))
+        .expect("an own-key call starts");
+    let live: kr_protocol::ids::VoiceSessionId = answer
+        .pointer("/value/outcome/started/session/voice_session_id")
+        .and_then(serde_json::Value::as_str)
+        .expect("a voice session")
+        .parse()
+        .expect("an identifier");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    let this_host = (host.host_device_id, connection.environment_id());
+    let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let long_past = now_ms().saturating_sub(3_600_000);
+    let owed = |kind: &str, id: kr_protocol::ids::VoiceSessionId| companion_tauri::voice::OwedView {
+        kind: kind.to_owned(),
+        words: "The host's rule.".to_owned(),
+        action_id: None,
+        voice_session_id: Some(id.to_string()),
+        until_ms: long_past,
+        host_reference: "a-host".to_owned(),
+        host_name: "A host".to_owned(),
+        host: Some(this_host),
+    };
+    let lapsed_revocation = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let directory = scene.phone.data.path().join("relaunch-left-to-host");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice {
+            owed: vec![
+                owed("host_close", live),
+                owed("host_close", unknown),
+                owed("revocation", lapsed_revocation),
+            ],
+            note: None,
+        })
+        .expect("the file is written");
+    let relaunched = calls_on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    );
+    let ids = |calls: &Calls| -> Vec<(String, Option<String>)> {
+        calls
+            .state(None)
+            .owed
+            .iter()
+            .map(|entry| (entry.kind.clone(), entry.voice_session_id.clone()))
+            .collect()
+    };
+    assert_eq!(
+        ids(&relaunched),
+        [
+            ("host_close".to_owned(), Some(live.to_string())),
+            ("host_close".to_owned(), Some(unknown.to_string())),
+        ],
+        "a grant that ended long ago ends the revocation owed and not the call left to the host"
+    );
+
+    // The host revokes the live call's grant and the provider does not confirm the closure: that is
+    // no word that the call is closed. The host holds no call by the other name, which is.
+    openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Answer(
+        500, None,
+    ));
+    relaunched.host_reached(this_host.0, this_host.1, connection.session());
+    tokio::time::timeout(WATCHDOG, async {
+        while ids(&relaunched).len() != 1 || scene.link.sent(HostMethod::VoiceStop) < 2 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host was asked about both calls and settled the one it holds no record of");
+    assert_eq!(
+        ids(&relaunched),
+        [("host_close".to_owned(), Some(live.to_string()))],
+        "a revoked grant with the closure unconfirmed leaves the call to the host"
+    );
+
+    // The host holds no such call now, which is its word that the call is over.
+    relaunched.host_reached(this_host.0, this_host.1, connection.session());
+    tokio::time::timeout(WATCHDOG, async {
+        while !ids(&relaunched).is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host holds no such call, and the entry was settled");
+    scene.stop_host().await;
+}
+
+/// A start the host accepts shows the calls this device left to it closed: the host makes a call on
+/// its own key only when it holds no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_the_host_accepts_takes_back_the_notice_of_a_call_left_to_it() {
+    let mut scene = own_scene(own_timings()).await;
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    // The host acts on the stop and its answer is lost: the call is left to the host.
+    scene.link.lose_the_answer_to(Some(HostMethod::VoiceStop));
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let left = scene
+        .state_where("the call left to the host", |state| {
+            state["ended"]["broker"] == "left_to_host"
+        })
+        .await;
+    assert!(
+        owed_kinds_of(&left).contains(&"host_close".to_owned()),
+        "{left}"
+    );
+
+    scene.link.lose_the_answer_to(None);
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "the host accepts another start: {answer:?}");
+    let started = scene
+        .state_where("the notice taken back", |state| {
+            state["running"] == true && !owed_kinds_of(state).contains(&"host_close".to_owned())
+        })
+        .await;
+    assert_eq!(started["running"], true, "{started}");
+    scene.stop_host().await;
+}
+
 /// A call the host ended and swept out of its list before this phone's stop reached it was closed by
 /// the host: the phone shows only the host's own words, and nothing about the call running on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
