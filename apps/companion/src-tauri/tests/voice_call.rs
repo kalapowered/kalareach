@@ -8771,11 +8771,17 @@ async fn a_managed_start_the_host_makes_on_its_own_key_is_ended_and_closed_throu
                 state["ended"]["cause"] == "step_failed" && state["setting_up"] == false
             })
             .await;
-        assert_eq!(
-            ended["ended"]["words"],
-            "The call could not be set up on this device: the host started the call on another provider than the one this device showed, so the call was ended",
-            "{ended}"
-        );
+        let mismatch = "The call could not be set up on this device: the host started the call on another provider than the one this device showed, so the call was ended";
+        let words = ended["ended"]["words"].as_str().unwrap_or_default();
+        if stop_answered {
+            assert_eq!(words, mismatch, "{ended}");
+        } else {
+            // A stop the host did not answer leaves the call to it, and the sentence says so.
+            assert!(
+                words.starts_with(mismatch) && words.ends_with(LEFT_TO_HOST_WORDS),
+                "{ended}"
+            );
+        }
         assert!(scene.platform.count("stop") >= 1, "the media is stopped");
         let kinds = owed_kinds_of(&ended);
         assert!(!kinds.contains(&"service_close".to_owned()), "{kinds:?}");
@@ -8930,7 +8936,18 @@ async fn the_owner_ends_its_context_state_on_progress_news_through_recovery_dead
                 state["ended"]["cause"] == word
             })
             .await;
-        assert_eq!(ended["ended"]["words"], words, "({cause}) {ended}");
+        if cause == "deadline" {
+            // The phone's own clock may end the call before the host's news of its deadline: the host
+            // then revokes the grant while its sender is held and cannot confirm the provider's
+            // closure, and the call is left to it.
+            let shown = ended["ended"]["words"].as_str().unwrap_or_default();
+            assert!(
+                shown == words || shown == format!("{words} {LEFT_TO_HOST_WORDS}"),
+                "({cause}) {ended}"
+            );
+        } else {
+            assert_eq!(ended["ended"]["words"], words, "({cause}) {ended}");
+        }
         assert!(
             scene.platform.count("stop") >= 1,
             "the host's end closes the media ({cause})"
