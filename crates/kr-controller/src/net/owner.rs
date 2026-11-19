@@ -180,6 +180,11 @@ impl Caller {
     /// live lease on an exclusively organisation-managed host, which it can come to in the waits
     /// between the door's decision and the record of what the caller asked or answered. Any other
     /// caller is as it was decided.
+    ///
+    /// The question takes the policy's lock, which a policy commit holds while it writes to the
+    /// device directory: it must not be asked inside a transaction on the directory, nor by a
+    /// holder of anything that a commit waits for. [`Self::lease_serves`] is the question that may
+    /// be asked there.
     #[must_use]
     pub fn decided_now(&self) -> Self {
         match &self.closed_now {
