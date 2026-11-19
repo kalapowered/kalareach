@@ -123,12 +123,9 @@ impl Anchor {
         }
         match held {
             Some(directory) => Ok(Some(directory)),
-            None => Ok(Some(self.reopened()?)),
+            // The root itself: the handle this walk holds, never its name again.
+            None => Ok(Some(self.root.duplicate().map_err(storage)?)),
         }
-    }
-
-    fn reopened(&self) -> Result<Dir> {
-        Dir::open(&self.path).map_err(storage)
     }
 
     /// Refuses a link or a file at any folder on the way to `path`, a link at its last name, and a
@@ -290,10 +287,21 @@ impl Anchor {
         Ok(())
     }
 
-    /// Writes `bytes` to the file at `path`: under a temporary name beside it, flushed, and renamed
-    /// into place, the folder flushed after. A file that is there keeps its permission bits; a new
+    /// Writes `bytes` to the file at `path`: under a temporary name beside it, flushed, and
+    /// published, the folder flushed after. A file that is there keeps its permission bits; a new
     /// one gets `default_mode`. A folder, a link or a special file at the name is refused.
-    pub(crate) fn write(&self, path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
+    ///
+    /// `replaces` is the digest of the file the caller checked at `path`, or `None` where it found
+    /// nothing. Nothing is replaced that is not that file: where nothing stood, the file is
+    /// published only if the name is still free, and where a file stood, it is published over a
+    /// file whose contents are still the ones the caller checked.
+    pub(crate) fn write(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        default_mode: u32,
+        replaces: Option<Digest256>,
+    ) -> Result<()> {
         let place = self.place(path)?;
         let Some(parent) = self.parent(&place, true)? else {
             return Err(refused(format!(
@@ -301,9 +309,16 @@ impl Anchor {
                 path.display()
             )));
         };
+        let changed = || {
+            refused(format!(
+                "{} is not what it was when this installation checked it, and an installation                  replaces only the file it checked",
+                path.display()
+            ))
+        };
         let mode = match parent.fetch(place.name, MAX_FILE_BYTES).map_err(storage)? {
-            Fetched::Absent => default_mode,
-            Fetched::File(read) => read.mode,
+            Fetched::Absent if replaces.is_none() => default_mode,
+            Fetched::File(read) if replaces == Some(digest_of(&read.bytes)) => read.mode,
+            Fetched::Absent | Fetched::File(_) => return Err(changed()),
             Fetched::NotRegular | Fetched::TooLarge => {
                 return Err(refused(format!(
                     "{} is not a regular file an installation can replace",
@@ -322,9 +337,27 @@ impl Anchor {
             }
             return Err(storage(unstaged.error));
         }
-        if let Err(error) = parent.rename_over(&temporary, place.name) {
+        #[cfg(test)]
+        publish_pause::run(path);
+        let published = match replaces {
+            None => parent.rename_new(&temporary, place.name).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    changed()
+                } else {
+                    storage(error)
+                }
+            }),
+            Some(expected) => match parent.fetch(place.name, MAX_FILE_BYTES) {
+                Ok(Fetched::File(read)) if digest_of(&read.bytes) == expected => {
+                    parent.rename_over(&temporary, place.name).map_err(storage)
+                }
+                Ok(_) => Err(changed()),
+                Err(error) => Err(storage(error)),
+            },
+        };
+        if let Err(error) = published {
             let _ = parent.remove_file(&temporary);
-            return Err(storage(error));
+            return Err(error);
         }
         parent.flush().map_err(storage)
     }
@@ -354,5 +387,30 @@ impl Anchor {
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
         parent.remove_directory(place.name)?;
         parent.flush()
+    }
+}
+
+/// What the unit tests run in a write after its file is staged and before it is published, to make
+/// the change another process could make between the two.
+#[cfg(test)]
+pub(crate) mod publish_pause {
+    use std::cell::RefCell;
+    use std::path::Path;
+
+    type Then = Box<dyn FnOnce(&Path)>;
+
+    thread_local! {
+        static BEFORE_PUBLISH: RefCell<Option<Then>> = const { RefCell::new(None) };
+    }
+
+    /// Runs `then` once, the next time a write on this thread has staged its file.
+    pub(crate) fn once(then: impl FnOnce(&Path) + 'static) {
+        BEFORE_PUBLISH.with(|before| *before.borrow_mut() = Some(Box::new(then)));
+    }
+
+    pub(crate) fn run(path: &Path) {
+        if let Some(then) = BEFORE_PUBLISH.with(|before| before.borrow_mut().take()) {
+            then(path);
+        }
     }
 }

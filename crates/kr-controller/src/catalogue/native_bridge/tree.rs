@@ -159,6 +159,16 @@ mod platform {
             &self.path
         }
 
+        /// Returns a second handle on this open directory. It is the same directory whatever has
+        /// happened to the name this one was reached by since.
+        pub(in crate::catalogue::native_bridge) fn duplicate(&self) -> std::io::Result<Self> {
+            Ok(Self {
+                handle: self.handle.try_clone()?,
+                identity: self.identity,
+                path: self.path.clone(),
+            })
+        }
+
         /// Returns the path of one name in this directory.
         pub(in crate::catalogue::native_bridge) fn join(&self, name: &str) -> PathBuf {
             self.path.join(name)
@@ -514,6 +524,10 @@ mod platform {
 
         pub(in crate::catalogue::native_bridge) fn path(&self) -> &Path {
             &self.path
+        }
+
+        pub(in crate::catalogue::native_bridge) fn duplicate(&self) -> std::io::Result<Self> {
+            Err(unsupported())
         }
 
         pub(in crate::catalogue::native_bridge) fn join(&self, name: &str) -> PathBuf {

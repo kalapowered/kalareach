@@ -173,6 +173,9 @@ enum Fs {
     Paths,
     /// From one handle on the selected root.
     Walk(std::sync::Arc<anchor::Anchor>),
+    /// The selected root was not there when the request began: everything below it is absent, and
+    /// nothing is written. No path is followed from here.
+    Absent(PathBuf),
 }
 
 impl Fs {
@@ -180,6 +183,7 @@ impl Fs {
         match self {
             Self::Paths => read_digest(path),
             Self::Walk(walk) => walk.digest(path),
+            Self::Absent(_) => Ok(None),
         }
     }
 
@@ -187,13 +191,24 @@ impl Fs {
         match self {
             Self::Paths => read_to_string(path),
             Self::Walk(walk) => walk.read_text(path),
+            Self::Absent(_) => Ok(None),
         }
     }
 
-    fn write(&self, path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
+    /// Writes `bytes` to the file at `path`. `replaces` is the digest of the file the caller
+    /// checked there, or `None` where it found nothing; a declared word's walk replaces nothing
+    /// else.
+    fn write(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        default_mode: u32,
+        replaces: Option<Digest256>,
+    ) -> Result<()> {
         match self {
             Self::Paths => write_atomically(path, bytes, default_mode),
-            Self::Walk(walk) => walk.write(path, bytes, default_mode),
+            Self::Walk(walk) => walk.write(path, bytes, default_mode, replaces),
+            Self::Absent(root) => Err(no_folder_to_write(root)),
         }
     }
 
@@ -207,6 +222,7 @@ impl Fs {
                 Ok(())
             }
             Self::Walk(walk) => walk.remove_file(path),
+            Self::Absent(_) => Ok(()),
         }
     }
 
@@ -223,6 +239,7 @@ impl Fs {
                 Err(_) => Ok(false),
             },
             Self::Walk(walk) => Ok(walk.remove_directory(path).is_ok()),
+            Self::Absent(_) => Ok(false),
         }
     }
 
@@ -230,6 +247,7 @@ impl Fs {
         match self {
             Self::Paths => Ok(path.is_dir()),
             Self::Walk(walk) => walk.is_directory(path),
+            Self::Absent(_) => Ok(false),
         }
     }
 
@@ -237,6 +255,7 @@ impl Fs {
         match self {
             Self::Paths => Ok(path.exists()),
             Self::Walk(walk) => walk.exists(path),
+            Self::Absent(_) => Ok(false),
         }
     }
 
@@ -244,6 +263,7 @@ impl Fs {
         match self {
             Self::Paths => Ok(missing_ancestors(path)),
             Self::Walk(walk) => walk.missing_folders(path),
+            Self::Absent(root) => Err(no_folder_to_write(root)),
         }
     }
 
@@ -256,6 +276,7 @@ impl Fs {
                 walk.make_folders(path)?;
                 Ok(!there)
             }
+            Self::Absent(root) => Err(no_folder_to_write(root)),
         }
     }
 
@@ -264,8 +285,14 @@ impl Fs {
         match self {
             Self::Paths => std::fs::create_dir_all(path).map_err(storage),
             Self::Walk(walk) => walk.make_folders(path),
+            Self::Absent(root) => Err(no_folder_to_write(root)),
         }
     }
+}
+
+/// The refusal of a write below a root that is not there.
+fn no_folder_to_write(root: &Path) -> ControllerError {
+    ControllerError::InvalidArgument(NOT_A_FOLDER_TO_WRITE.replace("{path}", &display(root)))
 }
 
 /// Installs, inspects and removes the contact skill for one agent.
@@ -341,8 +368,8 @@ impl Installer {
 
     /// This installer with its places reached the way the request's word needs: by path for one of
     /// the six compiled words, and from one handle on the selected root for a declared one. A root
-    /// that is not there is no handle for a read, which then finds every place gone, and a refusal
-    /// for a write.
+    /// that is not there is no handle for a read or a removal, which then find every place gone,
+    /// and a refusal for a write; no path is followed from it.
     fn on_handle(&self, params: &AgentToolsParams, writing: bool) -> Result<Self> {
         use kr_protocol::skill::InstallScope;
 
@@ -367,12 +394,8 @@ impl Installer {
         let mut walking = self.clone();
         walking.fs = match anchor::Anchor::open(&root)? {
             Some(anchor) => Fs::Walk(std::sync::Arc::new(anchor)),
-            None if writing => {
-                return Err(ControllerError::InvalidArgument(
-                    NOT_A_FOLDER_TO_WRITE.replace("{path}", &display(&root)),
-                ));
-            }
-            None => Fs::Paths,
+            None if writing => return Err(no_folder_to_write(&root)),
+            None => Fs::Absent(root),
         };
         Ok(walking)
     }
@@ -471,14 +494,16 @@ impl Installer {
         }
         for (name, contents) in files() {
             let path = root.join(name);
+            let replaced = self.fs.read_digest(&path)?;
             let operation = ChangeOperation::WriteFile {
                 path: display(&path),
                 digest: digest_of(contents.as_bytes()),
-                replaced_digest: Nullable(self.fs.read_digest(&path)?),
+                replaced_digest: Nullable(replaced),
             };
             self.confirm_existing(params, &mut record, &operation)?;
             self.begin(params, &mut record, operation.clone())?;
-            self.fs.write(&path, contents.as_bytes(), READABLE)?;
+            self.fs
+                .write(&path, contents.as_bytes(), READABLE, replaced)?;
             self.finish(params, &mut record, operation)?;
         }
         // A note about a directory this run did not create resolves to nothing: the directory is
@@ -1058,7 +1083,9 @@ impl Installer {
     }
 
     fn write_toml_entry(&self, path: &Path, deadline: Option<&Deadline>) -> Result<Digest256> {
-        let text = self.fs.read_text(path)?.unwrap_or_default();
+        let read = self.fs.read_text(path)?;
+        let replaces = text_digest(read.as_deref());
+        let text = read.unwrap_or_default();
         let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
             ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
         })?;
@@ -1093,7 +1120,7 @@ impl Installer {
         }
         table.insert(SERVER_NAME, toml_edit::Item::Table(entry));
         self.fs
-            .write(path, document.to_string().as_bytes(), PRIVATE)?;
+            .write(path, document.to_string().as_bytes(), PRIVATE, replaces)?;
         self.entry_digest_under(path, Format::CodexToml.key())?
             .ok_or_else(|| {
                 ControllerError::InvalidArgument(format!(
@@ -1118,7 +1145,9 @@ impl Installer {
         let members = [key, SERVER_NAME];
         let value = self.entry_value(format, deadline);
         let entry = value.to_string();
-        let edited = match read_exact(&self.fs, path)? {
+        let read = read_exact(&self.fs, path)?;
+        let replaces = read.as_ref().map(|(text, _)| digest_of(text.as_bytes()));
+        let edited = match read {
             // A document this host creates holds the entry and the container on the way to it.
             None => {
                 let text = serde_json::to_string_pretty(&json!({ key: { SERVER_NAME: value } }))
@@ -1148,7 +1177,7 @@ impl Installer {
             }
         };
         if let Some(edited) = edited {
-            self.fs.write(path, edited.as_bytes(), PRIVATE)?;
+            self.fs.write(path, edited.as_bytes(), PRIVATE, replaces)?;
         }
         self.entry_digest_under(path, key)?.ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
@@ -1497,7 +1526,9 @@ impl Installer {
             )));
         }
         if key == Format::CodexToml.key() {
-            let text = self.fs.read_text(path)?.unwrap_or_default();
+            let read = self.fs.read_text(path)?;
+            let replaces = text_digest(read.as_deref());
+            let text = read.unwrap_or_default();
             let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
                 ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
             })?;
@@ -1513,9 +1544,11 @@ impl Installer {
             // file holds nothing of theirs. The JSON branch below can delete one because it reads
             // the document exactly and can see that it holds nothing at all.
             self.fs
-                .write(path, document.to_string().as_bytes(), PRIVATE)?;
+                .write(path, document.to_string().as_bytes(), PRIVATE, replaces)?;
         } else {
-            let text = self.fs.read_text(path)?.unwrap_or_default();
+            let read = self.fs.read_text(path)?;
+            let replaces = text_digest(read.as_deref());
+            let text = read.unwrap_or_default();
             // Only the entry the record names, the one member it spliced in. In a document this
             // host created, whose container it made too, the container goes with the entry when
             // nothing else is left in it; in anybody else's the container stays, as the TOML table
@@ -1535,7 +1568,7 @@ impl Installer {
                 self.fs.remove_file(path)?;
                 return Ok(Removal::Removed);
             }
-            self.fs.write(path, edited.as_bytes(), PRIVATE)?;
+            self.fs.write(path, edited.as_bytes(), PRIVATE, replaces)?;
         }
         Ok(Removal::Removed)
     }
@@ -2569,6 +2602,11 @@ fn read_to_string(path: &Path) -> Result<Option<String>> {
 /// A document this reader cannot read exactly is refused, naming it and why: one that names a
 /// member twice in any object among them, because which of the two a reader keeps is the reader's
 /// choice.
+/// The digest of the text a read returned, or none where nothing was there.
+fn text_digest(text: Option<&str>) -> Option<Digest256> {
+    text.map(|text| digest_of(text.as_bytes()))
+}
+
 fn read_exact(fs: &Fs, path: &Path) -> Result<Option<(String, json::Document)>> {
     let Some(text) = fs.read_text(path)? else {
         return Ok(None);
@@ -4331,7 +4369,7 @@ mod tests {
         std::fs::create_dir_all(&elsewhere).expect("a folder");
         symlink(&elsewhere, tree.home().join(".amp")).expect("a link");
         let refused = fs
-            .write(&tree.home().join(".amp/mcp.json"), b"{}", PRIVATE)
+            .write(&tree.home().join(".amp/mcp.json"), b"{}", PRIVATE, None)
             .expect_err("a link is not followed");
         assert!(
             matches!(refused, ControllerError::PermissionDenied { .. }),
@@ -4384,6 +4422,257 @@ mod tests {
                 .join("SKILL.md")
                 .exists(),
             "what the link leads to is left whole"
+        );
+    }
+
+    /// KR-REQ-11.01: the root a walk holds is the folder it opened, whatever its name leads to
+    /// afterwards. A root moved away and replaced by a link is not followed for a place directly in
+    /// it any more than for one below it: a read, a write and a removal all reach the folder that was
+    /// opened, and what the link leads to is left whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_replaced_by_a_link_after_the_walk_opened_it_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let fs = Fs::Walk(std::sync::Arc::new(walk));
+        let moved = tree.root.join("home-moved");
+        std::fs::rename(tree.home(), &moved).expect("moves the root");
+        let elsewhere = tree.root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("a folder");
+        symlink(&elsewhere, tree.home()).expect("a link");
+        std::fs::write(moved.join(".mcp.json"), b"held").expect("a file");
+        std::fs::write(elsewhere.join(".mcp.json"), b"linked").expect("a file");
+        let document = tree.home().join(".mcp.json");
+
+        assert_eq!(
+            fs.read_text(&document).expect("reads").as_deref(),
+            Some("held"),
+            "a read comes from the folder the walk holds"
+        );
+        fs.write(&document, b"{}", PRIVATE, Some(digest_of(b"held")))
+            .expect("writes into the folder the walk holds");
+        assert_eq!(
+            std::fs::read(moved.join(".mcp.json")).expect("a file"),
+            b"{}"
+        );
+        assert_eq!(
+            std::fs::read(elsewhere.join(".mcp.json")).expect("a file"),
+            b"linked",
+            "what the link leads to is not written"
+        );
+        fs.write(&tree.home().join(".new.json"), b"{}", PRIVATE, None)
+            .expect("a new file is made in the folder the walk holds");
+        assert!(moved.join(".new.json").exists());
+        assert!(
+            !elsewhere.join(".new.json").exists(),
+            "and not where the link leads"
+        );
+        fs.remove_file(&document)
+            .expect("removes from the folder the walk holds");
+        assert!(!moved.join(".mcp.json").exists());
+        assert!(
+            elsewhere.join(".mcp.json").exists(),
+            "what the link leads to is left whole"
+        );
+    }
+
+    /// KR-REQ-11.01: a root that was not there when a request began is followed by no path once
+    /// something takes its name: a read or a removal below it finds nothing and touches nothing, and
+    /// a write is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_was_not_there_is_reached_by_no_path_once_something_takes_its_name() {
+        use std::os::unix::fs::symlink;
+        let tree = Tree::create();
+        let project = tree.root.join("project");
+        let target = declared(
+            Some(
+                json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+            ),
+            &[".amp", "skills"],
+        );
+        let installer = tree.installer().with_declaration(Some(target), Vec::new());
+        let request = project_params(amp(), &project);
+        installer
+            .on_handle(&request, true)
+            .expect_err("a write below a root that is not there is refused");
+        let reading = installer
+            .on_handle(&request, false)
+            .expect("a read of a root that is not there");
+
+        let elsewhere = tree.root.join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(".amp")).expect("a folder");
+        std::fs::write(elsewhere.join(".amp/mcp.json"), b"{}").expect("a file");
+        symlink(&elsewhere, &project).expect("a link");
+        let place = project.join(".amp/mcp.json");
+        assert_eq!(reading.fs.read_text(&place).expect("reads"), None);
+        assert_eq!(reading.fs.read_digest(&place).expect("reads"), None);
+        assert!(!reading.fs.exists(&place).expect("looks"));
+        assert!(
+            !reading
+                .fs
+                .is_directory(&place.with_file_name("skills"))
+                .expect("looks")
+        );
+        reading
+            .fs
+            .remove_file(&place)
+            .expect("a name below a root that is not there is already gone");
+        assert!(
+            elsewhere.join(".amp/mcp.json").exists(),
+            "what the link leads to is left whole"
+        );
+        reading
+            .fs
+            .write(&place, b"x", PRIVATE, None)
+            .expect_err("nothing is written below a root that was not there");
+        assert_eq!(
+            std::fs::read(elsewhere.join(".amp/mcp.json")).expect("a file"),
+            b"{}"
+        );
+    }
+
+    /// KR-REQ-11.01: a file is published only over the one the caller checked. Where nothing stood
+    /// it is published only if the name is still free, so a file another process made between the
+    /// check and the publication is left as it is; where a file stood, only a file whose contents
+    /// are still the checked ones is replaced.
+    #[cfg(unix)]
+    #[test]
+    fn a_publication_replaces_only_the_file_that_was_checked() {
+        let tree = Tree::create();
+        let walk = anchor::Anchor::open(&tree.home())
+            .expect("opens")
+            .expect("a root");
+        let place = tree.home().join("doc.json");
+        let others = |expected: &str, what: &str| {
+            assert_eq!(
+                std::fs::read_to_string(&place).expect("a file"),
+                expected,
+                "{what}"
+            );
+            let left: Vec<String> = std::fs::read_dir(tree.home())
+                .expect("the folder")
+                .map(|entry| {
+                    entry
+                        .expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            assert_eq!(left, ["doc.json"], "{what}: no temporary file is left");
+        };
+        let refusal = |result: Result<()>, what: &str| {
+            let refused = result.expect_err(what);
+            assert!(
+                matches!(&refused, ControllerError::PermissionDenied { detail }
+                    if detail.contains("replaces only the file it checked")),
+                "{what}: {refused}"
+            );
+        };
+
+        // Nothing stood, and nothing is there: published, as a new file.
+        walk.write(&place, b"one", 0o600, None).expect("a new file");
+        others("one", "a new file");
+
+        // Nothing stood, but a file is there: left as it is.
+        refusal(
+            walk.write(&place, b"two", 0o600, None),
+            "a file where none stood",
+        );
+        others("one", "a file where none stood");
+
+        // Nothing stood at the check, and a file is made before the publication.
+        std::fs::remove_file(&place).expect("removes");
+        let unowned = place.clone();
+        anchor::publish_pause::once(move |_| {
+            std::fs::write(&unowned, b"theirs").expect("another process writes it");
+        });
+        refusal(
+            walk.write(&place, b"two", 0o600, None),
+            "a file made between the check and the publication",
+        );
+        others(
+            "theirs",
+            "a file made between the check and the publication",
+        );
+
+        // A file stood, and its contents are the checked ones: replaced, keeping its mode.
+        walk.write(&place, b"three", 0o600, Some(digest_of(b"theirs")))
+            .expect("the checked file is replaced");
+        others("three", "the checked file");
+
+        // A file stood, and other contents are there at the check.
+        refusal(
+            walk.write(&place, b"four", 0o600, Some(digest_of(b"theirs"))),
+            "other contents than the checked ones",
+        );
+        others("three", "other contents than the checked ones");
+
+        // A file stood, and its contents change before the publication.
+        let changed = place.clone();
+        anchor::publish_pause::once(move |_| {
+            std::fs::write(&changed, b"theirs again").expect("another process writes it");
+        });
+        refusal(
+            walk.write(&place, b"four", 0o600, Some(digest_of(b"three"))),
+            "contents changed between the check and the publication",
+        );
+        others(
+            "theirs again",
+            "contents changed between the check and the publication",
+        );
+
+        // A file stood, and it is gone before the publication.
+        let gone = place.clone();
+        anchor::publish_pause::once(move |_| {
+            std::fs::remove_file(&gone).expect("another process removes it");
+        });
+        refusal(
+            walk.write(&place, b"five", 0o600, Some(digest_of(b"theirs again"))),
+            "a file removed between the check and the publication",
+        );
+        assert!(
+            !place.exists(),
+            "nothing is made where the checked file was"
+        );
+    }
+
+    /// KR-REQ-11.01: an installation for a declared word does not replace a file another process
+    /// made at one of its names between the check and the publication.
+    #[cfg(unix)]
+    #[test]
+    fn an_installation_does_not_replace_a_file_made_between_its_check_and_its_publication() {
+        let tree = Tree::create();
+        let target = declared(
+            Some(
+                json!({ "path": [".amp", "mcp.json"], "format": "json_command_args", "shared": false }),
+            ),
+            &[".amp", "skills"],
+        );
+        let installer = tree.installer().with_declaration(Some(target), Vec::new());
+        let made = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+        let writing = std::rc::Rc::clone(&made);
+        anchor::publish_pause::once(move |path| {
+            std::fs::write(path, b"not written by this host").expect("another process writes it");
+            *writing.borrow_mut() = Some(path.to_path_buf());
+        });
+        let refused = installer
+            .install(&params(amp(), InstallScope::User))
+            .expect_err("a file that was not there at the check is not replaced");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused}"
+        );
+        let made = made.borrow().clone().expect("a file was made");
+        assert_eq!(
+            std::fs::read(&made).expect("the file"),
+            b"not written by this host",
+            "{}",
+            made.display()
         );
     }
 
