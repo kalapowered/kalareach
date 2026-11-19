@@ -716,11 +716,15 @@ fn say_what_is_asked(display: &ConfirmationDisplay) {
                 output::line(&stdout_line!("{}", Shown::said(notice)));
             }
             if let Some(statement) = &grant_statement.0 {
-                // The statement holds the publisher's words about a bridge and the host's reading
-                // of an integration, told apart at the label the host writes before its reading.
-                // This command line shows what the daemon it is installed with sends, and takes no hello
-                // of a paired link, so no host here states the placement label: the part stays in
-                // the publisher's words until the link states it.
+                // The statement holds the publisher's words about a bridge, the host's reading of
+                // a placement and the host's reading of an integration. This command line asks the
+                // daemon over its local socket, which carries no hello that says whether the
+                // daemon writes the placement label, and a daemon built before that label lets a
+                // publisher's words hold it. So the line shows the integration reading under the
+                // host's label, as the daemon has always written it, and shows the placement part
+                // whole in the publisher's line with its label as text: it is never captioned as
+                // the host's here. A device that is paired with the host gets the caption from
+                // the link's own hello.
                 let parts = split_install_statement(grant, statement, false);
                 if let Some(words) = parts.publisher {
                     output::line(&stdout_line!(

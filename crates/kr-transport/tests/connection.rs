@@ -152,6 +152,14 @@ async fn a_paired_pair_completes_the_handshake_over_loopback() {
     );
     assert_eq!(selection.boot_epoch, epochs().boot_epoch);
     assert_eq!(selection.clock_epoch, epochs().clock_epoch);
+    // Both ends are this build, which writes the placement reading under the host's own label, so
+    // the host selects the capability that says so and the device that is told takes the label as
+    // the host's.
+    assert!(
+        kr_protocol::confirmation::states_placement_reading(&selection.capabilities),
+        "{:?}",
+        selection.capabilities
+    );
 }
 
 /// KR-REQ-10.02: the relay path works through a relay whose certificate chains to an explicitly

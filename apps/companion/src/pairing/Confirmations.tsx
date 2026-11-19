@@ -283,6 +283,14 @@ export function Confirmations({ surface = 'desktop' }: { readonly surface?: Surf
                   <blockquote className="small">{request.statement}</blockquote>
                 </figure>
               ) : null}
+              {request.placement !== null ? (
+                <figure className="confirmation-statement" data-testid="confirmation-placement">
+                  <figcaption className="small muted">
+                    This host&apos;s exact reading of the placement
+                  </figcaption>
+                  <blockquote className="small">{request.placement}</blockquote>
+                </figure>
+              ) : null}
               {request.reading !== null ? (
                 <figure className="confirmation-statement" data-testid="confirmation-reading">
                   <figcaption className="small muted">

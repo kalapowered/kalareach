@@ -329,6 +329,7 @@ describe("the owner's confirmations on a phone", () => {
     facts: [],
     notice: null,
     statement: null,
+    placement: null,
     reading: null,
     expires_at_ms: Date.now() + 110_000,
     checkable: true

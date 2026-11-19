@@ -86,6 +86,10 @@ pub struct RequestView {
     /// What the publisher says in its own words about what the release does. The page quotes it
     /// apart from the host's own words, so it is never read as the host's.
     pub statement: Option<String>,
+    /// What this host reads of where the release's bridge is placed, exactly, where the release
+    /// declares a placement and the host says that it writes that reading. The page captions it as
+    /// the host's. Where the host does not say so, the text stays in the publisher's statement.
+    pub placement: Option<String>,
     /// What this host reads of the release's command integration, exactly, where the request
     /// would grant one. The page captions it as the host's, apart from the publisher's words.
     pub reading: Option<String>,
@@ -540,7 +544,11 @@ fn held_now<'a>(holding: &'a [Listed], shown: &Listed) -> Held<'a> {
         .iter()
         .find(|held| held.request.confirmation_id == shown.request.confirmation_id)
     {
-        Some(current) if current.request == shown.request && current.subject == shown.subject => {
+        Some(current)
+            if current.request == shown.request
+                && current.subject == shown.subject
+                && current.host_states_placement_reading == shown.host_states_placement_reading =>
+        {
             Held::Unchanged(current)
         }
         Some(_) => Held::Changed,
@@ -562,6 +570,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         facts: Vec::new(),
         notice: None,
         statement: None,
+        placement: None,
         reading: None,
         expires_at_ms,
         checkable: false,
@@ -598,7 +607,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
     };
     // What a request names beyond its sentence is shown as the host wrote it or not at all: text
     // this page could not show exactly makes the request one that is not confirmed here.
-    let Some(particulars) = particulars(subject) else {
+    let Some(particulars) = particulars(subject, listed.host_states_placement_reading) else {
         return unchecked(title);
     };
     let value = match subject {
@@ -622,6 +631,7 @@ fn describe(reference: &str, host_name: &str, listed: &Listed, now_ms: u64) -> R
         facts: particulars.facts,
         notice: particulars.notice,
         statement: particulars.statement,
+        placement: particulars.placement,
         reading: particulars.reading,
         expires_at_ms,
         checkable: true,
@@ -633,19 +643,21 @@ struct Particulars {
     facts: Vec<Fact>,
     notice: Option<String>,
     statement: Option<String>,
+    placement: Option<String>,
     reading: Option<String>,
 }
 
-/// The facts, the host's notice, the publisher's statement and the host's reading for an
+/// The facts, the host's notice, the publisher's statement and the host's readings for an
 /// enrolment or an installation, the organisation a grant answers to for an invitation or a
 /// device, and nothing for any other request. `None` when a word the host or the publisher wrote
 /// could not be shown exactly as it was written.
-fn particulars(subject: &Subject) -> Option<Particulars> {
+fn particulars(subject: &Subject, host_states_placement_reading: bool) -> Option<Particulars> {
     match subject {
         Subject::CatalogueAdd(plan) => Some(Particulars {
             facts: enrolment_facts(plan)?,
             notice: None,
             statement: None,
+            placement: None,
             reading: None,
         }),
         Subject::PluginInstall(plan) => {
@@ -659,13 +671,14 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
                 Some(words) => Some(plain(words, STATEMENT_CHARS)?),
                 None => None,
             };
-            let split = parts
-                .as_deref()
-                .map(|statement| split_install_statement(&grant, statement, false));
+            let split = parts.as_deref().map(|statement| {
+                split_install_statement(&grant, statement, host_states_placement_reading)
+            });
             Some(Particulars {
                 facts: installation_facts(plan)?,
                 notice: (!notices.is_empty()).then(|| notices.join(" ")),
                 statement: split.and_then(|split| split.publisher).map(str::to_owned),
+                placement: split.and_then(|split| split.placement).map(str::to_owned),
                 reading: split.and_then(|split| split.reading).map(str::to_owned),
             })
         }
@@ -684,6 +697,7 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
             ],
             notice: None,
             statement: None,
+            placement: None,
             reading: None,
         }),
         Subject::EnrolOrganisation(plan) => Some(Particulars {
@@ -694,6 +708,7 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
             ],
             notice: None,
             statement: None,
+            placement: None,
             reading: None,
         }),
         Subject::IssueInvitation { proposed_grant, .. }
@@ -704,12 +719,14 @@ fn particulars(subject: &Subject) -> Option<Particulars> {
                 .collect(),
             notice: None,
             statement: None,
+            placement: None,
             reading: None,
         }),
         _ => Some(Particulars {
             facts: Vec::new(),
             notice: None,
             statement: None,
+            placement: None,
             reading: None,
         }),
     }
@@ -980,6 +997,7 @@ mod tests {
                 proposed_grant,
             }),
             answered: false,
+            host_states_placement_reading: false,
         }
     }
 
@@ -1423,7 +1441,7 @@ mod tests {
 
         let only = view_of(
             &["command_integration.launch"],
-            install_statement(None, Some(reading)),
+            install_statement(None, None, Some(reading)),
         );
         assert!(only.checkable);
         assert_eq!(only.notice.as_deref(), Some(COMMAND_INTEGRATION_NOTICE));
@@ -1440,7 +1458,7 @@ mod tests {
 
         let both = view_of(
             &["command_integration.launch", "native_bridge.install"],
-            install_statement(Some(PUBLISHER), Some(reading)),
+            install_statement(Some(PUBLISHER), None, Some(reading)),
         );
         assert!(both.checkable);
         assert_eq!(
@@ -1454,6 +1472,47 @@ mod tests {
             both.reading.as_deref(),
             Some(reading),
             "the publisher's words and the host's reading are two parts, told apart at the label"
+        );
+    }
+
+    /// KR-REQ-11.44: the host's reading of a placement is the host's part of the statement, captioned
+    /// as the host's, only where the link's hello says the host writes it. Where it does not (a host
+    /// built before the label), the same text stays whole in the publisher's statement, with no host
+    /// caption, because a publisher's words can hold the label there.
+    #[test]
+    fn the_placement_reading_is_the_hosts_part_only_where_the_host_states_it_writes_it() {
+        use kr_protocol::confirmation::{PLACEMENT_STATEMENT_LABEL, install_statement};
+        let placement = "This package places files for \"Quill CLI\" in a folder it chose.";
+        let statement = install_statement(Some(PUBLISHER), Some(placement), None);
+        let view_of = |states: bool| {
+            let plan = PluginInstallPlan {
+                grant: ["native_bridge.install".to_owned()].into_iter().collect(),
+                grant_statement: statement.clone(),
+                ..installation()
+            };
+            let mut listed = listed_subject(
+                Subject::PluginInstall(plan),
+                SensitiveAction::GrantExecutableCapability,
+            );
+            listed.host_states_placement_reading = states;
+            describe("a reference", "studio", &listed, NOW)
+        };
+
+        let with = view_of(true);
+        assert!(with.checkable);
+        assert_eq!(with.statement.as_deref(), Some(PUBLISHER));
+        assert_eq!(with.placement.as_deref(), Some(placement));
+
+        let without = view_of(false);
+        assert!(without.checkable);
+        assert_eq!(
+            without.placement, None,
+            "no host caption without the host's word"
+        );
+        let whole = without.statement.expect("the publisher's statement");
+        assert!(
+            whole.contains(PLACEMENT_STATEMENT_LABEL) && whole.contains(placement),
+            "the text stays in the publisher's part: {whole}"
         );
     }
 
