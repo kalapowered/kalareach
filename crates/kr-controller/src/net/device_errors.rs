@@ -102,10 +102,18 @@ const COMMAND_WORDS: [&str; 6] = ["chmod", "chown", "sudo", "doas", "systemctl",
 /// The last two quote what a task holds, which was written by whoever registered it, where it
 /// differs from the one this installation registers.
 ///
+/// The first is a grants row this host cannot read: its sentence names the row's key, which is an
+/// identifier of a grant that may belong to another device, so a device is told the fact and not the
+/// key (a device's own subtree is never named by a damaged row's key to it).
+///
 /// The markers of the last seven are the wording the code that writes those refusals uses
 /// ([`crate::supervision::windows`]), so a change to a refusal there is a change to its marker here,
 /// and not a refusal the rule below would read as a message that names nothing.
-const KNOWN_REASONS: [(&[&str], &str); 9] = [
+const KNOWN_REASONS: [(&[&str], &str); 10] = [
+    (
+        &["the grants row of grant ", " cannot be read: "],
+        "a grants row of this host cannot be read",
+    ),
     (
         &["a filesystem is mounted at "],
         "a filesystem is mounted inside the location the grant names",

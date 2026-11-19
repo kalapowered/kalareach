@@ -415,6 +415,33 @@ pub struct GrantRevocation {
     /// an earlier change had withdrawn with such a close still on its way: one row for the whole
     /// change, retired only by a barrier that follows it.
     pub debt: Option<DebtId>,
+    /// True when a row that cannot be read and names no grant was marked revoked, so the fence has
+    /// no names to give and reaches every connection.
+    pub reaches_every_connection: bool,
+    /// How many rows that cannot be read this call marked revoked.
+    pub marked: u32,
+    /// How many readable grants that trace to no root this call revoked.
+    pub withdrawn_unplaced: u32,
+}
+
+impl GrantRevocation {
+    /// A revocation that withdrew nothing, for `grant_id`.
+    #[must_use]
+    pub fn empty(grant_id: GrantId) -> Self {
+        Self {
+            grant_id,
+            revoked: Vec::new(),
+            reached: Vec::new(),
+            reached_holding_leases: BTreeSet::new(),
+            devices: BTreeSet::new(),
+            sessions: BTreeSet::new(),
+            covers_every_session: false,
+            debt: None,
+            reaches_every_connection: false,
+            marked: 0,
+            withdrawn_unplaced: 0,
+        }
+    }
 }
 
 /// The identity of one restrictive change's fence debt.
@@ -1187,6 +1214,9 @@ impl GrantDirectory {
     /// under, so a repeated revocation cannot rewrite the record of the first one. A descendant
     /// that was already revoked on its own is left as it was, for the same reason.
     ///
+    /// This takes the named subtree and nothing else ([`Scope::Subtree`]): what a paired device's
+    /// revocation and a voice stop may take. [`Self::revoke_claimed`] takes the scope.
+    ///
     /// `still_admitted` is run inside the transaction, once this call holds the store's lock and
     /// once it has read what it is about to withdraw, immediately before the first write. A
     /// request is admitted with a deadline, and the wait for that lock and the read that follows
@@ -1196,14 +1226,15 @@ impl GrantDirectory {
     /// # Errors
     ///
     /// Returns an error when the rows cannot be read or written, when `still_admitted` refuses,
-    /// and [`ControllerError::InvalidArgument`] when this host holds no such grant.
+    /// when the named grant is a row that cannot be read and the scope is [`Scope::Subtree`], and
+    /// [`ControllerError::InvalidArgument`] when this host holds no such grant.
     pub fn revoke(
         &self,
         grant_id: GrantId,
         now_ms: u64,
         still_admitted: impl FnOnce() -> Result<()>,
     ) -> Result<GrantRevocation> {
-        self.revoke_claimed(grant_id, now_ms, still_admitted, None)
+        self.revoke_claimed(grant_id, Scope::Subtree, now_ms, still_admitted, None)
     }
 
     /// Revokes a grant and every grant delegated from it, as [`Self::revoke`] does, for the action
@@ -1219,27 +1250,22 @@ impl GrantDirectory {
     pub fn revoke_claimed(
         &self,
         grant_id: GrantId,
+        scope: Scope,
         now_ms: u64,
         still_admitted: impl FnOnce() -> Result<()>,
         claim: Option<&ClaimHold>,
     ) -> Result<GrantRevocation> {
-        // The subtree is read and updated inside one transaction. A child written between the read
+        // The rows are read and updated inside one transaction. A child written between the read
         // and the update would otherwise escape the cascade entirely, and a crash part way through
         // the loop would leave a subtree half revoked.
         self.in_transaction(|connection| {
-            // Read first, check second, write third. Reading a subtree walks every grant this host
-            // holds, so a check made before it is a check with a read still to come.
-            let subtree = Self::subtree_to_revoke(connection, grant_id)?;
-            still_admitted()?;
-            let now_ms = next_moment(connection, now_ms)?;
-            let revocation = Self::revoke_subtree(
+            let revocation = self.withdraw(
                 connection,
-                grant_id,
-                &subtree,
+                Roots::Grant(grant_id),
+                scope,
                 now_ms,
-                &mut None,
+                still_admitted,
                 &format!("the revocation of grant {grant_id}"),
-                &self.held_closes(),
             )?;
             if let Some(hold) = claim {
                 record_withdrawal(connection, hold, &revocation.revoked)?;
@@ -1248,13 +1274,15 @@ impl GrantDirectory {
         })
     }
 
-    /// Revokes every grant one device holds, and their descendants.
+    /// Revokes every grant one device holds, and their descendants, with what an owner's
+    /// revocation also takes ([`Scope::Host`]): every live grant that traces to no root, and every
+    /// row that cannot be read, marked revoked.
     ///
     /// One transaction for the whole set, for the same reason one revocation is: a grant issued to
     /// that device between two of these would survive its own device's revocation.
     ///
-    /// `still_admitted` is as [`Self::revoke`]: run inside the transaction, after every subtree
-    /// this would withdraw has been read and before the first of them is withdrawn. `claim` is as
+    /// `still_admitted` is as [`Self::revoke`]: run inside the transaction, after every row this
+    /// would withdraw has been read and before the first of them is withdrawn. `claim` is as
     /// [`Self::revoke_claimed`]: the claim of the action performing this, which is written what it
     /// withdrew, an empty list included, in the same transaction.
     ///
@@ -1270,51 +1298,137 @@ impl GrantDirectory {
         claim: Option<&ClaimHold>,
     ) -> Result<GrantRevocation> {
         self.in_transaction(|connection| {
-            let held = read_for_device(connection, device_id)?;
-            let mut merged = GrantRevocation {
-                grant_id: held.first().map_or_else(
-                    || GrantId::new(kr_protocol::scalars::Uuid::NIL),
-                    |record| record.grant.grant_id,
-                ),
-                revoked: Vec::new(),
-                reached: Vec::new(),
-                reached_holding_leases: BTreeSet::new(),
-                devices: BTreeSet::new(),
-                sessions: BTreeSet::new(),
-                covers_every_session: false,
-                debt: None,
-            };
-            merged.devices.insert(device_id);
-            // Every subtree is read before any of them is written, so the check below is the last
-            // thing between this call and the first withdrawal rather than the first of several
-            // reads. Revoking a grant changes no parent link, so a subtree read now is the same
-            // subtree the writes act on.
-            let subtrees = Self::subtrees_to_revoke(connection, &held)?;
-            still_admitted()?;
-            // One change, one debt, however many subtrees it withdraws.
-            let covers = format!("the revocation of device {device_id}'s grants");
-            let now_ms = next_moment(connection, now_ms)?;
-            let mut debt = None;
-            let held = self.held_closes();
-            for (grant_id, subtree) in &subtrees {
-                let one = Self::revoke_subtree(
-                    connection, *grant_id, subtree, now_ms, &mut debt, &covers, &held,
-                )?;
-                merged.revoked.extend(one.revoked);
-                merged.reached.extend(one.reached);
-                merged
-                    .reached_holding_leases
-                    .extend(one.reached_holding_leases);
-                merged.devices.extend(one.devices);
-                merged.sessions.extend(one.sessions);
-                merged.covers_every_session |= one.covers_every_session;
-            }
-            merged.debt = debt;
+            let mut revocation = self.withdraw(
+                connection,
+                Roots::Device(device_id),
+                Scope::Host,
+                now_ms,
+                still_admitted,
+                &format!("the revocation of device {device_id}'s grants"),
+            )?;
+            revocation.devices.insert(device_id);
             if let Some(hold) = claim {
-                record_withdrawal(connection, hold, &merged.revoked)?;
+                record_withdrawal(connection, hold, &revocation.revoked)?;
             }
-            Ok(merged)
+            Ok(revocation)
         })
+    }
+
+    /// Withdraws what `roots` name, inside the caller's transaction: reads every row once, decides
+    /// what to take ([`plan_withdrawal`]), checks `still_admitted` after the last read and before
+    /// the first write, and writes. One debt row for the whole change, however many parts it has.
+    fn withdraw(
+        &self,
+        connection: &Connection,
+        roots: Roots,
+        scope: Scope,
+        now_ms: u64,
+        still_admitted: impl FnOnce() -> Result<()>,
+        covers: &str,
+    ) -> Result<GrantRevocation> {
+        let scan = scan_all(connection)?;
+        let plan = plan_withdrawal(&scan, roots, scope)?;
+        still_admitted()?;
+        let now_ms = next_moment(connection, now_ms)?;
+        let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
+        let mut debt = None;
+        let held = self.held_closes();
+        // The grant a revocation is reported under: the one named, or the first a device holds.
+        let named = match roots {
+            Roots::Grant(grant_id) => grant_id,
+            Roots::Device(device_id) => scan
+                .readable
+                .iter()
+                .filter(|record| record.grant.recipient_device_id == device_id)
+                .map(|record| record.grant.grant_id)
+                .min()
+                .unwrap_or_else(|| GrantId::new(kr_protocol::scalars::Uuid::NIL)),
+            Roots::None => GrantId::new(kr_protocol::scalars::Uuid::NIL),
+        };
+        let mut merged = GrantRevocation::empty(named);
+        for subtree in &plan.subtrees {
+            let one = Self::revoke_subtree(
+                connection,
+                subtree.under,
+                &subtree.rows,
+                now_ms,
+                &mut debt,
+                covers,
+                &held,
+            )?;
+            if subtree.unplaced {
+                merged.withdrawn_unplaced = merged
+                    .withdrawn_unplaced
+                    .saturating_add(u32::try_from(one.revoked.len()).unwrap_or(u32::MAX));
+            }
+            merged.revoked.extend(one.revoked);
+            merged.reached.extend(one.reached);
+            merged
+                .reached_holding_leases
+                .extend(one.reached_holding_leases);
+            merged.devices.extend(one.devices);
+            merged.sessions.extend(one.sessions);
+            merged.covers_every_session |= one.covers_every_session;
+        }
+        // A row that cannot be read confers no authority on any path, so it is marked revoked, in
+        // its own right: nobody can say which parent it hangs below. The release before this one
+        // reads some of these rows as live grants, and a mark that only restricts keeps them from
+        // being live there. A valid mark is left as it was; a mark that is not an integer, which
+        // that release cannot read either, is replaced by one.
+        let readable: BTreeSet<GrantId> = scan
+            .readable
+            .iter()
+            .map(|record| record.grant.grant_id)
+            .collect();
+        let mut named_by_damage = false;
+        for row in &plan.damaged {
+            if row.damage.marked {
+                continue;
+            }
+            let changed = connection
+                .execute(
+                    "UPDATE grants SET revoked_at_ms = ?1, revoked_by_parent = NULL
+                      WHERE rowid = ?2
+                        AND (revoked_at_ms IS NULL OR typeof(revoked_at_ms) <> 'integer')",
+                    params![moment, row.rowid],
+                )
+                .map_err(ControllerError::registry)?;
+            if changed == 0 {
+                continue;
+            }
+            merged.marked = merged.marked.saturating_add(1);
+            // The identifier the record names stands for the row only when no readable row holds
+            // it: a damaged alias beside a readable grant must not withdraw that grant's offer.
+            let alias_free = row
+                .damage
+                .decoded
+                .map(|decoded| decoded.id)
+                .filter(|id| !readable.contains(id));
+            connection
+                .execute(
+                    "UPDATE session_invitations SET state = 'cancelled'
+                      WHERE state = 'open'
+                        AND (grant_id = (SELECT grant_id FROM grants WHERE rowid = ?1)
+                             OR grant_id = ?2)",
+                    params![row.rowid, alias_free.map(|id| id.get().as_bytes().to_vec())],
+                )
+                .map_err(ControllerError::registry)?;
+            let names: Vec<GrantId> = row.damage.key.into_iter().chain(alias_free).collect();
+            if names.is_empty() {
+                merged.reaches_every_connection = true;
+            }
+            for name in names {
+                // A row that cannot be read cannot show which rights it held.
+                merged.reached.push(name);
+                merged.reached_holding_leases.insert(name);
+                named_by_damage = true;
+            }
+        }
+        if debt.is_none() && (named_by_damage || merged.reaches_every_connection) {
+            debt = Some(owe_within(connection, covers, now_ms)?);
+        }
+        merged.debt = debt;
+        Ok(merged)
     }
 
     /// The sessions an invitation is waiting over at `now_ms`: one nobody has redeemed or
@@ -1508,65 +1622,7 @@ impl GrantDirectory {
         Ok(subtree)
     }
 
-    /// What a device's revocation withdraws, read for all of the device's grants at once: for each
-    /// of `held` that is not revoked and that no earlier one reaches, in the order `held` lists
-    /// them, that grant and the grants below it that no earlier one has taken, breadth first, as
-    /// [`Self::subtree_to_revoke`] reads them one grant at a time.
-    ///
-    /// Each of them is found by its identifier, one row read for each, as the revocation of that
-    /// grant alone finds it, so a held record whose grant no row is keyed by refuses the whole
-    /// revocation as it refuses that one. The grants below them are read once, however many the
-    /// device holds and in whatever order `held` lists them, and only when a held grant is to be
-    /// walked: a device with nothing left to withdraw reads none. A walk does not go below a grant
-    /// an earlier walk took, because everything below that grant was taken with it. A grant reached
-    /// from two of the device's roots is kept once, under the first root that reaches it, which is
-    /// the root its record would have named anyway: the write takes each row only while it is
-    /// still live, so a second root never revoked it twice.
-    fn subtrees_to_revoke(
-        connection: &Connection,
-        held: &[GrantRecord],
-    ) -> Result<Vec<(GrantId, Box<[GrantRecord]>)>> {
-        let mut children_of: Option<BTreeMap<GrantId, Vec<GrantRecord>>> = None;
-        let mut claimed: BTreeSet<GrantId> = BTreeSet::new();
-        let mut subtrees = Vec::new();
-        for listed in held {
-            if listed.revoked_at_ms.is_some() {
-                continue;
-            }
-            let grant_id = listed.grant.grant_id;
-            let Some(root) = read_one(connection, grant_id)? else {
-                return Err(ControllerError::InvalidArgument(
-                    "this host holds no such grant".to_owned(),
-                ));
-            };
-            if !claimed.insert(root.grant.grant_id) {
-                continue;
-            }
-            let children = if let Some(children) = &children_of {
-                children
-            } else {
-                children_of.insert(children_by_parent(connection)?)
-            };
-            let mut found = Vec::new();
-            let mut queue = VecDeque::from([root]);
-            while let Some(record) = queue.pop_front() {
-                if let Some(next) = children.get(&record.grant.grant_id) {
-                    for child in next {
-                        if claimed.insert(child.grant.grant_id) {
-                            queue.push_back(child.clone());
-                        }
-                    }
-                }
-                found.push(record);
-            }
-            // A boxed slice: the vector is cut to its length, so what is held for the writes holds
-            // no spare capacity.
-            subtrees.push((grant_id, found.into_boxed_slice()));
-        }
-        Ok(subtrees)
-    }
-
-    /// Withdraws a subtree [`Self::subtree_to_revoke`] read, inside the caller's transaction.
+    /// Withdraws one subtree of a [`Plan`], inside the caller's transaction.
     ///
     /// The first live grant it withdraws that owes a fence, or the first voice grant it finds
     /// already withdrawn with a close held under it, writes the change's one debt row into `debt`,
@@ -1668,7 +1724,6 @@ impl GrantDirectory {
             revoked.push(record.grant.grant_id);
         }
         Ok(GrantRevocation {
-            grant_id,
             revoked,
             reached,
             reached_holding_leases,
@@ -1676,6 +1731,7 @@ impl GrantDirectory {
             sessions,
             covers_every_session,
             debt: *debt,
+            ..GrantRevocation::empty(grant_id)
         })
     }
 
@@ -4248,6 +4304,7 @@ fn read_all(connection: &Connection) -> Result<Vec<GrantRecord>> {
 }
 
 /// Every grant one device holds, on a connection the caller is already holding.
+#[cfg(test)]
 fn read_for_device(connection: &Connection, device_id: DeviceId) -> Result<Vec<GrantRecord>> {
     let mut statement = connection
         .prepare(concat!(
@@ -4342,7 +4399,8 @@ pub(crate) struct Damage {
     pub decoded: Option<Decoded>,
     /// The recipient column, when it is an identifier.
     pub recipient_column: Option<DeviceId>,
-    /// Whether the revocation column holds anything but NULL, of whatever type.
+    /// Whether the revocation column holds an integer: a mark both this build and the release
+    /// before it read.
     pub marked: bool,
     /// The decoder's own words, for a record that does not decode: shown in the refusal only.
     detail: Option<String>,
@@ -4389,7 +4447,7 @@ fn judge_row(row: &rusqlite::Row<'_>) -> Result<Judged> {
         ValueRef::Blob(bytes) => uuid_of(bytes),
         _ => None,
     };
-    let marked = !matches!(cell(3)?, ValueRef::Null);
+    let marked = matches!(cell(3)?, ValueRef::Integer(_));
     let (grant, detail): (Option<Grant>, Option<String>) = match cell(0)? {
         ValueRef::Blob(bytes) => {
             match kr_cbor::from_canonical_slice::<Grant>(bytes, &kr_cbor::Limits::DEFAULT) {
@@ -4573,6 +4631,194 @@ fn scan_all(connection: &Connection) -> Result<Scan> {
         }
     }
     Ok(scan)
+}
+
+/// How far a revocation reaches beyond what it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The owner's revocation: the named grants, every live grant that traces to no root, and every
+    /// row that cannot be read, which is marked revoked.
+    Host,
+    /// A paired device's revocation or a voice stop: the named readable subtree and nothing else.
+    Subtree,
+}
+
+/// What a withdrawal starts from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Roots {
+    /// The grants a device holds that are not revoked.
+    Device(DeviceId),
+    /// One named grant, revoked or not.
+    Grant(GrantId),
+    /// No named root: only what traces to no root.
+    None,
+}
+
+/// One subtree a withdrawal takes: the grant it is revoked under, and its rows in the order the
+/// walk met them.
+#[derive(Clone, Debug)]
+pub(crate) struct Subtree {
+    /// The grant the rows are revoked under: a named root, or a placeholder for the parent no row
+    /// holds.
+    pub under: GrantId,
+    /// Whether the rows trace to no root.
+    pub unplaced: bool,
+    /// The rows.
+    pub rows: Vec<GrantRecord>,
+}
+
+/// What a withdrawal does, decided from one scan and nothing else.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Plan {
+    /// The subtrees to withdraw, each row once.
+    pub subtrees: Vec<Subtree>,
+    /// The rows that cannot be read, which an owner's revocation marks revoked.
+    pub damaged: Vec<Damaged>,
+    /// Whether the named grant is a row that cannot be read.
+    pub named_damaged: bool,
+}
+
+/// Walks `root` and everything below it, level by level, over the readable rows by their records'
+/// parent. A row an earlier walk took is not taken again, which also ends a walk that loops.
+fn walk_below(
+    below: &BTreeMap<GrantId, Vec<&GrantRecord>>,
+    root: &GrantRecord,
+    taken: &mut BTreeSet<GrantId>,
+) -> Vec<GrantRecord> {
+    let mut rows = Vec::new();
+    if !taken.insert(root.grant.grant_id) {
+        return rows;
+    }
+    let mut level = vec![root];
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for record in level {
+            rows.push(record.clone());
+            for child in below.get(&record.grant.grant_id).into_iter().flatten() {
+                if taken.insert(child.grant.grant_id) {
+                    next.push(*child);
+                }
+            }
+        }
+        level = next;
+    }
+    rows
+}
+
+/// Decides what a withdrawal takes, from `scan` alone: it reads nothing and writes nothing, so a
+/// preview and the writing half cannot disagree.
+///
+/// # Errors
+///
+/// Returns an error when a named grant is a row that cannot be read and the scope is
+/// [`Scope::Subtree`], or when no row names it.
+pub(crate) fn plan_withdrawal(scan: &Scan, roots: Roots, scope: Scope) -> Result<Plan> {
+    let mut below: BTreeMap<GrantId, Vec<&GrantRecord>> = BTreeMap::new();
+    for record in &scan.readable {
+        if let Some(parent) = record.grant.parent_grant_id.as_ref().copied() {
+            below.entry(parent).or_default().push(record);
+        }
+    }
+    // A grant's children are walked in the order of their identifiers, as the store lists them.
+    for children in below.values_mut() {
+        children.sort_by_key(|record| record.grant.grant_id);
+    }
+    let by_id: BTreeMap<GrantId, &GrantRecord> = scan
+        .readable
+        .iter()
+        .map(|record| (record.grant.grant_id, record))
+        .collect();
+    let mut plan = Plan::default();
+    let mut taken: BTreeSet<GrantId> = BTreeSet::new();
+    let mut named: Vec<&GrantRecord> = Vec::new();
+    match roots {
+        Roots::Device(device_id) => {
+            named = scan
+                .readable
+                .iter()
+                .filter(|record| {
+                    record.grant.recipient_device_id == device_id && record.revoked_at_ms.is_none()
+                })
+                .collect();
+            named.sort_by_key(|record| record.grant.grant_id);
+        }
+        Roots::Grant(grant_id) => {
+            if let Some(record) = by_id.get(&grant_id) {
+                named.push(record);
+            } else if let Some(row) = scan.damaged.iter().find(|row| {
+                row.damage.key == Some(grant_id)
+                    || row
+                        .damage
+                        .decoded
+                        .is_some_and(|decoded| decoded.id == grant_id)
+            }) {
+                if scope == Scope::Subtree {
+                    return Err(row.damage.refusal());
+                }
+                plan.named_damaged = true;
+            } else {
+                return Err(ControllerError::InvalidArgument(
+                    "this host holds no such grant".to_owned(),
+                ));
+            }
+        }
+        Roots::None => {}
+    }
+    for root in named {
+        let rows = walk_below(&below, root, &mut taken);
+        if !rows.is_empty() {
+            plan.subtrees.push(Subtree {
+                under: root.grant.grant_id,
+                unplaced: false,
+                rows,
+            });
+        }
+        if scope == Scope::Subtree {
+            return Ok(plan);
+        }
+    }
+    if scope == Scope::Subtree {
+        return Ok(plan);
+    }
+    let placed = scan.placed();
+    let unplaced: BTreeMap<GrantId, &GrantRecord> = by_id
+        .iter()
+        .filter(|(id, _)| !placed.contains(id))
+        .map(|(id, record)| (*id, *record))
+        .collect();
+    // The tops of what traces to no root: rows whose parent is not a row of that set. Each is
+    // revoked under the parent its record names, which no readable row holds.
+    for record in scan
+        .readable
+        .iter()
+        .filter(|record| unplaced.contains_key(&record.grant.grant_id))
+    {
+        let parent = record.grant.parent_grant_id.as_ref().copied();
+        if parent.is_some_and(|parent| !unplaced.contains_key(&parent)) {
+            let rows = walk_below(&below, record, &mut taken);
+            if !rows.is_empty() {
+                plan.subtrees.push(Subtree {
+                    under: parent.unwrap_or(record.grant.grant_id),
+                    unplaced: true,
+                    rows,
+                });
+            }
+        }
+    }
+    // What is left of the set hangs below a loop: its least key is the root of its own subtree.
+    while let Some(record) = unplaced
+        .values()
+        .find(|record| !taken.contains(&record.grant.grant_id))
+    {
+        let rows = walk_below(&below, record, &mut taken);
+        plan.subtrees.push(Subtree {
+            under: record.grant.grant_id,
+            unplaced: true,
+            rows,
+        });
+    }
+    plan.damaged = scan.damaged.clone();
+    Ok(plan)
 }
 
 /// Whether withdrawing `grant` always owes a fence: whether a worker can hold work under it.
@@ -5528,6 +5774,7 @@ mod a_previous_holder_that_is_letting_go {
 #[cfg(test)]
 mod a_devices_revocation {
     mod damaged_rows;
+    mod withdrawal;
 
     use super::*;
     use kr_protocol::grant::{EnvironmentSelector, HistoryScope, SessionSelector};
@@ -5761,109 +6008,6 @@ mod a_devices_revocation {
         store
     }
 
-    /// How a case builds a store afresh, so that two stores built alike can be compared.
-    type Build = Box<dyn Fn() -> GrantDirectory>;
-
-    /// The stores an edit by hand can leave, each with whether the device's revocation is refused.
-    /// Every grant of them is the device's. A revocation is refused for each store whose row keyed
-    /// 3 carries grant 4: the device's own read refuses that row.
-    fn stores_edited_by_hand() -> Vec<(String, Build, bool)> {
-        let held = |number: u32, parent: Option<u32>| Node {
-            number,
-            parent,
-            holder: DEVICE,
-        };
-        let stores: Vec<(&str, Build, bool)> = vec![
-            (
-                "a held row whose key is not the identifier of its grant",
-                Box::new(move || {
-                    store_written_by_hand(&[
-                        (held(1, None), None),
-                        (held(2, Some(1)), None),
-                        (held(3, None), Some(4)),
-                    ])
-                }),
-                true,
-            ),
-            (
-                "two held rows whose grants have one identifier and different parents",
-                Box::new(move || {
-                    store_written_by_hand(&[
-                        (held(3, None), Some(4)),
-                        (held(4, Some(6)), None),
-                        (held(5, Some(4)), None),
-                        (held(6, None), None),
-                    ])
-                }),
-                true,
-            ),
-            (
-                "a row that is its own parent and a cycle of two rows, each with a child",
-                Box::new(move || {
-                    store_written_by_hand(&[
-                        (held(1, None), None),
-                        (held(2, Some(1)), None),
-                        (held(3, Some(3)), None),
-                        (held(4, Some(3)), None),
-                        (held(5, Some(6)), None),
-                        (held(7, Some(5)), None),
-                        (held(6, Some(5)), None),
-                        (held(8, Some(6)), None),
-                    ])
-                }),
-                false,
-            ),
-        ];
-        stores
-            .into_iter()
-            .map(|(name, build, refused)| (name.to_owned(), build, refused))
-            .collect()
-    }
-
-    /// A store with two faults at once, both in rows of another device, so that the device's own
-    /// read meets neither: a row keyed 3 that carries grant 4 (no row is keyed 4), and a row keyed 9
-    /// that holds no grant at all. The device holds two grants of its own. A revocation walks each
-    /// of them and reads the whole table by key to do so, so it returns the first fault in the order
-    /// of the keys. This store is not in `every_store`: its revocation is refused by the walk, and
-    /// the device's read does not refuse it.
-    fn store_with_two_faults() -> GrantDirectory {
-        let node = |number: u32, holder: u8| Node {
-            number,
-            parent: None,
-            holder,
-        };
-        let store = store_written_by_hand(&[
-            (node(1, DEVICE), None),
-            (node(2, DEVICE), None),
-            (node(3, OTHER_DEVICE), Some(4)),
-        ]);
-        store
-            .in_transaction(|connection| {
-                write_grant(
-                    connection,
-                    &record_of(&node(9, OTHER_DEVICE)),
-                    b"not a grant",
-                )
-            })
-            .expect("the other device's row is written");
-        store
-    }
-
-    /// Every store the comparison cases run: the shapes at `size` grants, then the stores an edit
-    /// by hand leaves, each with whether the device's revocation is refused.
-    fn every_store(size: u32) -> Vec<(String, Build, bool)> {
-        let mut stores: Vec<(String, Build, bool)> = shapes(size)
-            .into_iter()
-            .map(|shape| {
-                let name = shape.name.to_owned();
-                let build: Build = Box::new(move || store_of(&shape));
-                (name, build, false)
-            })
-            .collect();
-        stores.extend(stores_edited_by_hand());
-        stores
-    }
-
     /// A device's revocation decodes each grant row of the store a bounded number of times, however
     /// many grants the device holds and in whatever order the store lists them: a revocation that
     /// reads the whole store again for every grant the device holds does work that grows with the
@@ -5921,7 +6065,7 @@ mod a_devices_revocation {
     /// What a device's revocation reads to withdraw, as it was read before the grants were read
     /// once for all of the device's roots: each grant the device holds that is not revoked is read
     /// with everything below it, the whole store each time, and what an earlier read took is
-    /// dropped afterwards. The cases below compare [`GrantDirectory::subtrees_to_revoke`] with it.
+    /// dropped afterwards. The cases below compare the plan of a device's revocation with it.
     fn subtrees_read_one_root_at_a_time(
         connection: &Connection,
         held: &[GrantRecord],
@@ -5953,18 +6097,10 @@ mod a_devices_revocation {
     ) -> Result<GrantRevocation> {
         store.in_transaction(|connection| {
             let held = read_for_device(connection, device_id)?;
-            let mut merged = GrantRevocation {
-                grant_id: held
-                    .first()
+            let mut merged = GrantRevocation::empty(
+                held.first()
                     .map_or_else(|| GrantId::new(Uuid::NIL), |record| record.grant.grant_id),
-                revoked: Vec::new(),
-                reached: Vec::new(),
-                reached_holding_leases: BTreeSet::new(),
-                devices: BTreeSet::new(),
-                sessions: BTreeSet::new(),
-                covers_every_session: false,
-                debt: None,
-            };
+            );
             merged.devices.insert(device_id);
             let subtrees = subtrees_read_one_root_at_a_time(connection, &held)?;
             let covers = format!("the revocation of device {device_id}'s grants");
@@ -6075,7 +6211,17 @@ mod a_devices_revocation {
         store
             .in_transaction(|connection| {
                 Ok((
-                    GrantDirectory::subtrees_to_revoke(connection, held)
+                    scan_all(connection)
+                        .and_then(|scan| {
+                            plan_withdrawal(&scan, Roots::Device(device_of(DEVICE)), Scope::Host)
+                        })
+                        .map(|plan| {
+                            plan.subtrees
+                                .into_iter()
+                                .filter(|subtree| !subtree.unplaced)
+                                .map(|subtree| (subtree.under, subtree.rows.into_boxed_slice()))
+                                .collect::<Vec<_>>()
+                        })
                         .map_err(|error| error.to_string()),
                     subtrees_read_one_root_at_a_time(connection, held)
                         .map(|entries| {
@@ -6099,55 +6245,16 @@ mod a_devices_revocation {
     #[test]
     fn withdraws_what_a_walk_from_each_of_its_grants_in_turn_withdrew_whatever_the_order_and_the_shape()
      {
-        for (name, build, refused) in every_store(64) {
-            let store = build();
-            let held =
-                store.in_transaction(|connection| read_for_device(connection, device_of(DEVICE)));
-            if refused {
-                let Err(refusal) = held else {
-                    panic!(
-                        "{name}: the device's read refuses the row keyed 3 that carries grant 4"
-                    );
-                };
-                assert!(
-                    refusal.to_string().contains(&id_of(3).to_string()),
-                    "{name}: the refusal names the key of the row: {refusal}"
-                );
-                continue;
-            }
-            let held = held.expect("the device's grants read");
-            for (order, held) in orders(&held) {
-                let (now, before) = both_readings(&store, &held);
-                assert!(
-                    now == before,
-                    "{name}, {order}: what is read to be withdrawn"
-                );
-            }
-        }
-    }
-
-    /// In a store with two faults at once, both in rows of another device, the two readings return
-    /// the first of them in the order of the keys (the row keyed 3, before the row keyed 9), in
-    /// each order the device's grants are listed in. The device's own read meets neither fault; each
-    /// walk reads the whole table by key and stops at the first row it refuses.
-    #[test]
-    fn returns_the_first_fault_in_the_order_of_the_keys_whatever_the_order_the_grants_are_listed_in()
-     {
-        let store = store_with_two_faults();
-        let held = store
-            .in_transaction(|connection| read_for_device(connection, device_of(DEVICE)))
-            .expect("the device's grants read");
-        assert!(held.len() > 1, "the device holds more than one grant");
-        for (order, held) in orders(&held) {
+        for shape in shapes(64) {
+            let name = shape.name;
+            let store = store_of(&shape);
+            let held = store
+                .in_transaction(|connection| read_for_device(connection, device_of(DEVICE)))
+                .expect("the device's grants read");
+            // The plan takes a device's roots in the order of their keys, which is the order the
+            // store lists them in; the walk it is compared with takes them in the order listed.
             let (now, before) = both_readings(&store, &held);
-            let Err(first) = &now else {
-                panic!("{order}: the walk reads the rows of both faults");
-            };
-            assert!(now == before, "{order}: the two readings return one fault");
-            assert!(
-                first.contains(&id_of(3).to_string()) && !first.contains(&id_of(9).to_string()),
-                "{order}: the first fault in the order of the keys: {first}"
-            );
+            assert!(now == before, "{name}: what is read to be withdrawn");
         }
     }
 
@@ -6169,27 +6276,18 @@ mod a_devices_revocation {
                 })
                 .map_err(|error| error.to_string())
         };
-        for (name, build, refused) in every_store(64) {
-            let (before, now) = (build(), build());
+        for shape in shapes(64) {
+            let name = shape.name;
+            let (before, now) = (store_of(&shape), store_of(&shape));
             let device = device_of(DEVICE);
             let one = revoke_device_one_root_at_a_time(&before, device, 5_000);
             let other = now.revoke_device(device, 5_000, || Ok(()), None);
-            assert_eq!(
-                other.is_err(),
-                refused,
-                "{name}: whether the revocation is refused"
-            );
+            assert!(other.is_ok(), "{name}: the revocation is not refused");
             assert!(told(one) == told(other), "{name}: what it returned");
             assert!(
                 rows_of(&before) == rows_of(&now),
                 "{name}: the rows it left"
             );
-            if refused {
-                assert!(
-                    rows_of(&now) == rows_of(&build()),
-                    "{name}: a refused revocation writes nothing"
-                );
-            }
         }
     }
 }
@@ -6349,30 +6447,29 @@ mod a_grants_row_whose_key_is_not_its_own {
         assert_eq!(real_row.grant.grant_id, real());
     }
 
+    /// The owner's revocation of the grant beside the alias withdraws the grant and marks the alias
+    /// revoked; the grant's own invitation is cancelled with it.
     #[test]
-    fn a_revocation_of_the_grant_beside_the_alias_is_refused_before_any_write() {
+    fn a_revocation_of_the_grant_beside_the_alias_withdraws_it_and_marks_the_alias() {
         let store = store_with_an_alias();
-        let refused = store
-            .revoke(real(), 2_000, || Ok(()))
-            .expect_err("a revocation does not walk past a damaged row");
-        assert!(
-            refused.to_string().contains(&texts().0),
-            "the refusal names the key the row sits under: {refused}"
-        );
-        assert_eq!(revoked_rows(&store), 0, "no row was written");
+        let revocation = store
+            .revoke_claimed(real(), Scope::Host, 2_000, || Ok(()), None)
+            .expect("a revocation is not refused for a row it cannot read");
+        assert_eq!(revocation.revoked, vec![real()]);
+        assert_eq!(revocation.marked, 1);
+        assert_eq!(revoked_rows(&store), 2, "the grant and the alias");
     }
 
+    /// The owner's revocation of the device that holds the real row withdraws it and marks the alias.
     #[test]
-    fn a_revocation_of_the_device_that_holds_the_real_row_is_refused_before_any_write() {
+    fn a_revocation_of_the_device_that_holds_the_real_row_withdraws_it_and_marks_the_alias() {
         let store = store_with_an_alias();
-        let refused = store
+        let revocation = store
             .revoke_device(holder(), 2_000, || Ok(()), None)
-            .expect_err("a revocation does not walk past a damaged row");
-        assert!(
-            refused.to_string().contains(&texts().0),
-            "the refusal names the key the row sits under: {refused}"
-        );
-        assert_eq!(revoked_rows(&store), 0, "no row was written");
+            .expect("a revocation is not refused for a row it cannot read");
+        assert_eq!(revocation.revoked, vec![real()]);
+        assert_eq!(revocation.marked, 1);
+        assert_eq!(revoked_rows(&store), 2, "the grant and the alias");
     }
 
     #[test]

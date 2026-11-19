@@ -8,11 +8,11 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The key literal of the grant numbered `number`.
-fn key(number: u32) -> String {
+pub(super) fn key(number: u32) -> String {
     format!("X'{}'", hex(id_of(number).get().as_bytes()))
 }
 
-fn device_literal(byte: u8) -> String {
+pub(super) fn device_literal(byte: u8) -> String {
     format!("X'{}'", hex(device_of(byte).get().as_bytes()))
 }
 
@@ -27,7 +27,7 @@ pub(super) fn run(store: &GrantDirectory, sql: &str) {
         .expect("the raw statement runs");
 }
 
-fn held(number: u32, parent: Option<u32>, holder: u8) -> (Node, Option<u32>) {
+pub(super) fn held(number: u32, parent: Option<u32>, holder: u8) -> (Node, Option<u32>) {
     (
         Node {
             number,
