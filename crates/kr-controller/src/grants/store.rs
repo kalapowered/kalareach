@@ -595,6 +595,7 @@ impl GrantDirectory {
         migrate_revocation_answers(&connection)?;
         migrate_delegation_answers(&connection)?;
         migrate_voice_barrier_answers(&connection)?;
+        migrate_voice_start_answers(&connection)?;
         migrate_grants(&connection)?;
         migrate_policy(&connection)?;
         migrate_fence_debt(&connection)?;
@@ -3828,6 +3829,141 @@ fn migrate_voice_barrier_answers(connection: &Connection) -> Result<()> {
     transaction.commit().map_err(ControllerError::registry)
 }
 
+/// Brings the kept answers of `voice.start` to the shape this build reads.
+///
+/// The one kept type that moved is `VoiceStartResult`, through the `VoiceSessionDescriptor` of its
+/// `started` outcome: an earlier build kept the managed broker's origin, the control path and the
+/// heartbeat interval as three members of the descriptor, and this build keeps how the device
+/// reaches the call's control as one union, `control`. A call that earlier build started was
+/// controlled at the broker, so each such answer is written with `control.broker` holding those
+/// three values. Every other outcome of the answer is unchanged, and so is every other kept type.
+///
+/// An older release that reads an answer this step rewrote does not decode it: a repeat of that
+/// start under such a release meets an answer it cannot read, and the release answers as it does
+/// for any kept answer it cannot read (`unreadable_voice_record`, which keeps the start from being
+/// performed again).
+///
+/// One immediate transaction, so two processes opening one store change a row once; an answer is
+/// written only when its new shape decodes as this build's `VoiceStartResult`, and one already in
+/// this build's shape does not decode as the earlier one and is not touched, so a second open
+/// writes nothing.
+///
+/// Remove this upgrade, with [`EarlierVoiceStartResult`], once no supported upgrade starts from a
+/// build that kept a start's descriptor with the broker's members.
+fn migrate_voice_start_answers(connection: &Connection) -> Result<()> {
+    use kr_protocol::voice::{
+        VoiceSessionControl, VoiceSessionDescriptor, VoiceStartOutcome, VoiceStartResult,
+    };
+
+    let transaction =
+        rusqlite::Transaction::new_unchecked(connection, rusqlite::TransactionBehavior::Immediate)
+            .map_err(ControllerError::registry)?;
+    let candidates: Vec<(String, Vec<u8>)> = transaction
+        .prepare(
+            "SELECT actor_id, action_id FROM authority_receipts
+              WHERE result IS NOT NULL
+                AND instr(result, CAST('broker_origin' AS BLOB)) > 0",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(ControllerError::registry)?;
+    let mut brought = 0_usize;
+    for (actor_id, action_id) in candidates {
+        let stored: Vec<u8> = transaction
+            .query_row(
+                "SELECT result FROM authority_receipts WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let limits = kr_cbor::Limits::DEFAULT;
+        let Ok(earlier) =
+            kr_cbor::from_canonical_slice::<EarlierVoiceStartResult>(&stored, &limits)
+        else {
+            continue;
+        };
+        let EarlierVoiceStartOutcome::Started { session } = earlier.outcome;
+        let current = VoiceStartResult {
+            outcome: VoiceStartOutcome::Started {
+                session: Box::new(VoiceSessionDescriptor {
+                    voice_session_id: session.voice_session_id,
+                    grant_id: session.grant_id,
+                    statement: session.statement,
+                    session_ids: session.session_ids,
+                    call_id: session.call_id,
+                    provider_session_id: session.provider_session_id,
+                    answer_sdp: session.answer_sdp,
+                    model: session.model,
+                    control: VoiceSessionControl::Broker {
+                        origin: session.broker_origin,
+                        control_path: session.control_path,
+                        heartbeat_seconds: session.heartbeat_seconds,
+                    },
+                    closes_at_ms: session.closes_at_ms,
+                    disclosure: session.disclosure,
+                }),
+            },
+        };
+        let written = kr_cbor::to_canonical_vec(&current)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // Only an answer this build reads is written.
+        if kr_cbor::from_canonical_slice::<VoiceStartResult>(&written, &limits).is_err() {
+            continue;
+        }
+        transaction
+            .execute(
+                "UPDATE authority_receipts SET result = ?3 WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id, action_id, written],
+            )
+            .map_err(ControllerError::registry)?;
+        brought += 1;
+    }
+    if brought > 0 {
+        eprintln!(
+            "kr-controller: {brought} stored voice start answer{} brought to the shape this build reads",
+            if brought == 1 { "" } else { "s" },
+        );
+    }
+    transaction.commit().map_err(ControllerError::registry)
+}
+
+/// A started voice session's answer as earlier builds stored it: the broker's members beside the
+/// rest of the descriptor. It lives inside the upgrade and nowhere else.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierVoiceStartResult {
+    outcome: EarlierVoiceStartOutcome,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum EarlierVoiceStartOutcome {
+    Started {
+        session: Box<EarlierVoiceSessionDescriptor>,
+    },
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierVoiceSessionDescriptor {
+    voice_session_id: kr_protocol::ids::VoiceSessionId,
+    grant_id: GrantId,
+    statement: kr_protocol::voice::VoiceGrantStatement,
+    session_ids: kr_protocol::scalars::CanonicalSet<SessionId>,
+    call_id: String,
+    provider_session_id: String,
+    answer_sdp: String,
+    model: String,
+    broker_origin: String,
+    control_path: String,
+    heartbeat_seconds: u32,
+    closes_at_ms: TimestampMs,
+    disclosure: Vec<String>,
+}
+
 /// A voice stop's answer as earlier builds stored it: no barrier. It lives inside the upgrade and
 /// nowhere else.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4879,6 +5015,93 @@ mod tests {
         let written = (read(1), read(2));
         drop(GrantDirectory::open(&path).expect("the store opens again"));
         assert_eq!((read(1), read(2)), written, "nothing is upgraded twice");
+    }
+
+    /// KR-REQ-09.12: the answer kept for a `voice.start` that began a call at the managed broker, as
+    /// an earlier build stored it with the broker's members beside the descriptor, comes forward
+    /// once when the store opens, as `control.broker` holding those values and every other member
+    /// as it was. An outcome that holds no descriptor is as it was, and a second open writes
+    /// nothing.
+    #[test]
+    fn a_start_answer_an_earlier_build_kept_comes_forward_once_with_the_broker_in_control() {
+        use kr_protocol::ids::VoiceSessionId;
+        use kr_protocol::voice::{
+            VoiceAction, VoiceGrantStatement, VoiceSessionControl, VoiceStartOutcome,
+            VoiceStartResult,
+        };
+
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let path = directory.path().join("registry.db");
+        drop(GrantDirectory::open(&path).expect("the store is created"));
+
+        let actions: kr_protocol::scalars::CanonicalSet<VoiceAction> =
+            [VoiceAction::Status].into_iter().collect();
+        let earlier = EarlierVoiceStartResult {
+            outcome: EarlierVoiceStartOutcome::Started {
+                session: Box::new(EarlierVoiceSessionDescriptor {
+                    voice_session_id: VoiceSessionId::new(Uuid::from_bytes([0x81; 16])),
+                    grant_id: GrantId::new(Uuid::from_bytes([0x82; 16])),
+                    statement: VoiceGrantStatement::of(&actions),
+                    session_ids: [SessionId::new(Uuid::from_bytes([0x83; 16]))]
+                        .into_iter()
+                        .collect(),
+                    call_id: "call_1".to_owned(),
+                    provider_session_id: "live_1".to_owned(),
+                    answer_sdp: "v=0".to_owned(),
+                    model: "gpt-live-1".to_owned(),
+                    broker_origin: "https://voice.example".to_owned(),
+                    control_path: "/v1/calls/call_1/control".to_owned(),
+                    heartbeat_seconds: 7,
+                    closes_at_ms: TimestampMs::new(1_700_000_900_000),
+                    disclosure: vec!["a line".to_owned()],
+                }),
+            },
+        };
+        let stored = kr_cbor::to_canonical_vec(&earlier).expect("the earlier shape encodes");
+        assert!(
+            kr_cbor::from_canonical_slice::<VoiceStartResult>(&stored, &kr_cbor::Limits::DEFAULT)
+                .is_err(),
+            "this build's reader refuses what the earlier build stored"
+        );
+        write_raw_receipt(&path, 1, &stored);
+        let unavailable = kr_cbor::to_canonical_vec(&VoiceStartResult {
+            outcome: VoiceStartOutcome::CreationUnknown {
+                attempt_id: "attempt_1".to_owned(),
+                message: "unknown".to_owned(),
+            },
+        })
+        .expect("encodes");
+        write_raw_receipt(&path, 2, &unavailable);
+
+        drop(GrantDirectory::open(&path).expect("the store opens and brings the row forward"));
+
+        let read = |action: u8| raw_receipt(&path, action).0;
+        let started: VoiceStartResult =
+            kr_cbor::from_canonical_slice(&read(1), &kr_cbor::Limits::DEFAULT)
+                .expect("a start answer this build reads");
+        let VoiceStartOutcome::Started { session } = started.outcome else {
+            panic!("the answer is still a started call");
+        };
+        assert_eq!(
+            session.control,
+            VoiceSessionControl::Broker {
+                origin: "https://voice.example".to_owned(),
+                control_path: "/v1/calls/call_1/control".to_owned(),
+                heartbeat_seconds: 7,
+            }
+        );
+        assert_eq!(session.call_id, "call_1");
+        assert_eq!(session.provider_session_id, "live_1");
+        assert_eq!(session.closes_at_ms, TimestampMs::new(1_700_000_900_000));
+        assert_eq!(
+            read(2),
+            unavailable,
+            "an answer with no descriptor is as it was"
+        );
+
+        let written = read(1);
+        drop(GrantDirectory::open(&path).expect("the store opens again"));
+        assert_eq!(read(1), written, "nothing is upgraded twice");
     }
 
     /// A revocation's answer in the shape an earlier build stored: every list whole.
