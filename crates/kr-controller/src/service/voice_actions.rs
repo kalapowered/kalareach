@@ -1429,6 +1429,8 @@ mod tests {
             None,
         );
         let actions = [VoiceAction::Status];
+        let managed_before = live_voice_grants(&controller, managed_device.device_id);
+        let own_before = live_voice_grants(&controller, own_device.device_id);
         let _ = call_over_on(
             &controller,
             managed.clone(),
@@ -1451,9 +1453,12 @@ mod tests {
         .await;
         let coordinator = controller.voice().coordinator();
         assert_eq!(coordinator.live_sessions(), 2);
-        let managed_grants = live_voice_grants(&controller, managed_device.device_id);
         let own_grants = live_voice_grants(&controller, own_device.device_id);
-        assert!(managed_grants > 0 && own_grants > 0);
+        assert!(
+            live_voice_grants(&controller, managed_device.device_id) > managed_before
+                && own_grants > own_before,
+            "each call has a grant of its own"
+        );
 
         let callback = super::VoiceCalls {
             module: Arc::downgrade(controller.voice()),
@@ -1469,7 +1474,7 @@ mod tests {
         assert_eq!(own.closed(), 0, "the own-key call was not closed");
         assert_eq!(
             live_voice_grants(&controller, managed_device.device_id),
-            0,
+            managed_before,
             "the account call's grant is revoked"
         );
         assert_eq!(
@@ -1500,6 +1505,7 @@ mod tests {
             &[ActionRight::SessionView, ActionRight::HostManage],
             None,
         );
+        let before = live_voice_grants(&controller, device.device_id);
         let _ = call_over_on(
             &controller,
             own.clone(),
@@ -1514,7 +1520,7 @@ mod tests {
         let coordinator = module.coordinator();
         assert!(module.host_calls().is_empty());
         assert_eq!(coordinator.live_sessions(), 1);
-        assert!(live_voice_grants(&controller, device.device_id) > 0);
+        assert!(live_voice_grants(&controller, device.device_id) > before);
         assert!(
             module.needs_tick(),
             "a call the coordinator holds on the owner's own key needs the tick"
@@ -1525,7 +1531,7 @@ mod tests {
         assert_eq!(own.closed(), 1);
         assert_eq!(
             live_voice_grants(&controller, device.device_id),
-            0,
+            before,
             "the call's grant is revoked"
         );
         assert!(!module.needs_tick(), "nothing is left to watch");

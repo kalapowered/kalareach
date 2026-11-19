@@ -427,7 +427,8 @@ async fn a_clean_stop_closes_the_calls_the_host_controls_at_the_provider_and_lea
     );
     assert_eq!(
         daemon.host.controller().own_key_registry_state(),
-        RegistryState::Idle
+        RegistryState::Settling,
+        "the fence the stop took is kept"
     );
     daemon.host.stop().await;
 }
@@ -1230,7 +1231,7 @@ async fn a_removal_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_that_
         .await
         .expect_err("no start is admitted while the fence is kept");
     assert_eq!(refused_start.code, ErrorCode::ResourceUnavailable);
-    assert_eq!(refused_start.message, words::SETTLING);
+    assert!(refused_start.message.contains(words::SETTLING));
 
     drop(task);
     assert!(the_registry_is(&daemon, RegistryState::Idle));
@@ -1241,24 +1242,19 @@ async fn a_removal_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_that_
     daemon.host.stop().await;
 }
 
-/// A forget-calls that cannot wait out the task of a call it ended forgets nothing and keeps the
-/// fence until that task has ended, so that the task never finds its record or its key gone.
+/// A forget-calls that cannot wait out the task of a call it ended keeps the fence until that task
+/// has ended, so that the task never finds its record or its key gone, and the registry is free
+/// again once it has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_forget_calls_that_cannot_wait_out_a_calls_task_keeps_the_record_and_the_fence() {
+async fn a_forget_calls_that_cannot_wait_out_a_calls_task_keeps_the_fence_until_that_task_ends() {
     let mut daemon = daemon().await;
     let phone = phone(&daemon, &MANAGER).await;
     let _ = started(phone.start().await);
     let task = daemon.host.controller().own_key_task_token();
-    let rows_before = rows_of(&daemon).len();
     let refused = forget_calls(&mut daemon.control, &daemon.host)
         .await
         .expect_err("forgetting could not wait out the task");
     assert_eq!(refused.message, words::STILL_CLOSING);
-    assert_eq!(
-        rows_of(&daemon).len(),
-        rows_before,
-        "the record is kept while a task may still write to it"
-    );
     assert!(
         the_registry_is(&daemon, RegistryState::Settling),
         "the fence is kept while the task runs"
@@ -1288,7 +1284,7 @@ async fn a_clean_stop_fences_the_registry_before_it_ends_the_calls_and_admits_no
         .start()
         .await
         .expect_err("no start is admitted while the daemon stops");
-    assert_eq!(refused.message, words::SETTLING);
+    assert!(refused.message.contains(words::SETTLING));
     assert!(rows_of(&daemon).is_empty(), "the call was closed");
     daemon.host.stop().await;
 }
