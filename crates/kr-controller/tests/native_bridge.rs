@@ -6238,7 +6238,7 @@ fn a_declared_placement_places_a_registration_for_an_application_the_host_does_n
     };
     let text = String::from_utf8(bytes.clone()).expect("text");
     assert!(
-        text.contains(&format!("{} quill-cli hook", site.forwarder().display())),
+        text.contains(&format!("'{}' quill-cli hook", site.forwarder().display())),
         "the forwarder's path is written where the package names it: {text}"
     );
     assert!(
