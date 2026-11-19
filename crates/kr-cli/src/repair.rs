@@ -59,7 +59,7 @@ fn said(refusal: Refusal) -> Shown {
         Refusal::LeftoverFile(path) => shown!(
             "A file from an earlier undo is in the way: {}. Remove it, then run this command \
              again. Nothing is changed.",
-            Shown::host_path(&path)
+            Shown::root(&path)
         ),
         Refusal::ReplaceFailed(error) => shown!(
             "The registry could not be replaced: {}. Nothing is changed.",
@@ -173,7 +173,7 @@ fn repair_grants(registry: &std::path::Path, apply: bool) -> Result<Completion> 
     };
     output::say(&shown!(
         "Copy of the registry before the repair: {}.",
-        Shown::host_path(&repaired.copy)
+        Shown::root(&repaired.copy)
     ));
     for line in lines_of(&repaired.found, true) {
         output::say(&line);
@@ -186,12 +186,12 @@ fn repair_grants(registry: &std::path::Path, apply: bool) -> Result<Completion> 
     output::say(&shown!(
         "To undo: kr host repair-grants --undo {} --apply. Everything written to the registry \
          after this copy was made is lost with it.",
-        Shown::host_path(&repaired.copy)
+        Shown::root(&repaired.copy)
     ));
     output::say(&shown!(
         "The copy stays until you remove it: remove the folder {} yourself when you no longer \
          need it.",
-        Shown::host_path(&repaired.folder)
+        Shown::root(&repaired.folder)
     ));
     Ok(Completion::Done)
 }
