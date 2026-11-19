@@ -1609,17 +1609,39 @@ jobs:
           node-version: 22.23.1
           package-manager-cache: false
 
+      # The workspace's packages, installed once for the two steps below that run TypeScript: the
+      # interface's build and the evidence directory reader's tests.
+      - name: Install the workspace's packages
+        id: install-packages
+        if: ${{ !cancelled() && matrix.part == 'first' }}
+        run: pnpm install --frozen-lockfile
+
       - name: Build the desktop application
         if: ${{ !cancelled() && matrix.part == 'first' }}
         run: |
-          pnpm install --frozen-lockfile
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           pnpm -C apps/companion build
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked -p companion-tauri --release --features custom-protocol --target-dir "$env:RUNNER_TEMP/desktop-application"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $executable = Get-Item "$env:RUNNER_TEMP/desktop-application/release/kalareach-companion.exe" -ErrorAction Stop
           "$($executable.FullName): $($executable.Length) bytes"
+
+      # The TypeScript reader of the evidence directory has three cases that run only on Windows
+      # (`skipIf(!windows)`) and are skipped on every other platform, and a skipped case does not
+      # fail a run. Vitest's own exit cannot say that they ran here, so the check reads Vitest's
+      # report and refuses a run in which one of them was skipped, is missing or did not pass. The
+      # check runs whatever Vitest's exit was, and the step then exits with Vitest's own code if it
+      # was not zero.
+      - name: Test the TypeScript reader of the evidence directory
+        if: ${{ !cancelled() && matrix.part == 'first' && steps.install-packages.outcome == 'success' }}
+        run: |
+          $report = Join-Path $env:RUNNER_TEMP 'artefacts-dir-vitest.json'
+          pnpm -C apps/companion exec vitest run test/artefacts-dir.test.ts --reporter=default --reporter=json "--outputFile.json=$report"
+          $vitest = $LASTEXITCODE
+          node apps/companion/scripts/artefacts-dir-windows-cases.mjs $report
+          $cases = $LASTEXITCODE
+          if ($vitest -ne 0) { exit $vitest }
+          exit $cases
 
       # Whatever the tests wrote to the artefact directory, kept whether the run passed or not: a
       # failure on this platform is the only evidence of how it failed here. A run whose tests
