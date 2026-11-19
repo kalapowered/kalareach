@@ -40,6 +40,8 @@ pub(super) enum Doing {
     Staging,
     Linking,
     RemovingStaging,
+    RemovingAside,
+    Settling,
     RecordingWritten,
     MovingAside,
     PuttingBack,
@@ -55,6 +57,8 @@ impl Doing {
             Self::Staging => "staging the file",
             Self::Linking => "giving the file its name",
             Self::RemovingStaging => "removing the staging file",
+            Self::RemovingAside => "removing the file that was moved aside",
+            Self::Settling => "finishing what an earlier run began",
             Self::RecordingWritten => "recording the file as written",
             Self::MovingAside => "moving the file aside",
             Self::PuttingBack => "putting the file back",
@@ -207,10 +211,19 @@ fn io(doing: Doing) -> impl Fn(std::io::Error) -> StepError {
 
 fn flush(directory: &Path, doing: Doing) -> Result<()> {
     match kr_flush::flush_directory(directory, NameKind::File) {
-        // A directory that is not there has no name in it to lose.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // A directory that is not there, or that is not a directory, has no name in it to lose.
+        Err(error) if missing(&error) => Ok(()),
         other => other.map_err(io(doing)),
     }
+}
+
+/// Whether an error says the name is not there: absent, or under something that is not a
+/// directory.
+fn missing(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 fn write_record(run: &Run, record: &Record, doing: Doing) -> Result<()> {
@@ -322,7 +335,7 @@ fn write_record_removing(run: &mut Run) -> Result<()> {
 
 fn move_aside(run: &mut Run) -> Result<()> {
     match std::fs::symlink_metadata(&run.paths.file) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if missing(&error) => {
             run.moved = Moved::Nothing;
             Ok(())
         }
@@ -424,7 +437,9 @@ pub(super) enum Mode {
 pub(super) enum Settled {
     /// The record has nothing under way now.
     Done,
-    /// The file is not vouched for: nothing was changed, and the record keeps what is under way.
+    /// The file is not vouched for: the record keeps what is under way. The leftovers were
+    /// settled by their own rules first, so an aside may have been put back where the file was
+    /// missing.
     Changed,
 }
 
@@ -466,7 +481,7 @@ pub(super) fn settle(run: &mut Run, record: &Record, mode: Mode) -> Result<Settl
     if mode == Mode::Install && matches!(after, Place::Unvouched) {
         return Ok(Settled::Changed);
     }
-    flush(run.directory(), Doing::RemovingStaging)?;
+    flush(run.directory(), Doing::Settling)?;
     let new = match disk(&run.paths.file) {
         Disk::Bytes(bytes) if bytes == record.new_bytes().as_bytes() => record.new_bytes(),
         _ => &record.contents,
@@ -498,9 +513,13 @@ fn leftover(run: &mut Run, record: &Record, which: Leftover) -> Result<()> {
         }
         Disk::Bytes(bytes) => bytes,
     };
+    let doing = match which {
+        Leftover::Staging => Doing::RemovingStaging,
+        Leftover::Aside => Doing::RemovingAside,
+    };
     let remove = |run: &mut Run| -> Result<()> {
-        std::fs::remove_file(&path).map_err(io(Doing::RemovingStaging))?;
-        flush(run.directory(), Doing::RemovingStaging)?;
+        std::fs::remove_file(&path).map_err(io(doing))?;
+        flush(run.directory(), doing)?;
         run.events.push(Event::Removed(path.clone()));
         Ok(())
     };
