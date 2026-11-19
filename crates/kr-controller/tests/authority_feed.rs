@@ -8997,3 +8997,110 @@ async fn a_feed_request_naming_a_readable_grant_beside_a_damaged_row_is_carried_
         "the owner's revocation marks the row it cannot read"
     );
 }
+
+/// A request whose grant target was withdrawn already, beside a row that cannot be read and that a
+/// revocation had marked, writes nothing when it is carried out: it is refused as superseded, as
+/// it is where no row is damaged. A row that is not marked yet would be marked by the request,
+/// which moves the revision, and the request would be numbered and acknowledged instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_whose_grant_targets_were_withdrawn_already_is_refused_as_superseded_beside_a_damaged_row()
+ {
+    let rig = Rig::start().await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    let session_id = net_support::an_open_session(&rig.host).0;
+    let role =
+        || kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer);
+    let named = net_support::worker::share(&rig.host, session_id, &kept.0, &kept.1, role()).await;
+    let damaged = net_support::worker::share(&rig.host, session_id, &kept.0, &kept.1, role()).await;
+    rig.until_the_carrier_is_idle().await;
+    // The row cannot be read, and carries a valid revocation mark: nothing is left to mark.
+    registry_statement(
+        &rig.host,
+        &format!(
+            "UPDATE grants SET parent_grant_id = X'00', revoked_at_ms = 1000, revoked_by_parent = NULL \
+             WHERE grant_id = {};",
+            key_literal(damaged.grant_id)
+        ),
+    );
+    rig.revokes_a_share_at_the_machine(named.grant_id).await;
+    rig.until_the_carrier_is_idle().await;
+
+    let request = rig
+        .owner_publishes(
+            0xa6,
+            RevocationTarget::Grants {
+                grant_ids: [named.grant_id].into_iter().collect::<CanonicalSet<_>>(),
+            },
+        )
+        .await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&request).await.rejected.0,
+        Some(RejectionReason::Superseded),
+        "what the request names was withdrawn already"
+    );
+}
+
+/// A damaged request on the first page of the feed and a device request on the second are both
+/// carried out, over two passes of one scan: the damaged request does not end the pass that reads
+/// the first page before the second page is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_damaged_request_on_page_one_and_a_device_request_on_page_two_are_both_carried_out_across_passes()
+ {
+    let rig = Rig::start().await;
+    let kept = rig.pairs(&[ActionRight::SessionView]).await;
+    let other = rig.pairs(&[ActionRight::SessionView]).await;
+    let session_id = net_support::an_open_session(&rig.host).0;
+    let share = net_support::worker::share(
+        &rig.host,
+        session_id,
+        &kept.0,
+        &kept.1,
+        kr_protocol::sharing::RoleSelection::plain(kr_protocol::sharing::SessionRole::Viewer),
+    )
+    .await;
+    rig.until_the_carrier_is_idle().await;
+    registry_statement(
+        &rig.host,
+        &format!(
+            "UPDATE grants SET grant = X'00' WHERE grant_id = {};",
+            key_literal(share.grant_id)
+        ),
+    );
+    rig.runtime().read_at_most_pages(1);
+    let first = rig
+        .owner_publishes(
+            0xb4,
+            RevocationTarget::Grants {
+                grant_ids: [share.grant_id].into_iter().collect::<CanonicalSet<_>>(),
+            },
+        )
+        .await;
+    rig.publishes_filler(65).await;
+    let second = rig.owner_publishes(0xb5, devices(other.1.device_id)).await;
+
+    for _ in 0..4 {
+        if rig.has_revoked(other.1.device_id).await {
+            break;
+        }
+        one_pass(&rig).await;
+    }
+    let complete = |held: kr_client::services::authority::AuthorityFeedRecord| {
+        held.acknowledgement
+            .0
+            .as_ref()
+            .map(|acknowledged| acknowledged.completion)
+    };
+    assert_eq!(
+        complete(rig.held(&first).await),
+        Some(RevocationCompletion::Complete),
+        "the damaged request on the first page is acknowledged"
+    );
+    assert_eq!(
+        complete(rig.held(&second).await),
+        Some(RevocationCompletion::Complete),
+        "the device request on the second page is acknowledged"
+    );
+    assert!(revoked_in_the_registry(&rig.host, share.grant_id));
+    assert!(rig.has_revoked(other.1.device_id).await);
+}

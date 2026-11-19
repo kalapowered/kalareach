@@ -80,6 +80,29 @@ impl Controller {
         carried: Option<&crate::authority::AdmittedMutation>,
         claim: Option<&crate::grants::ClaimHold>,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
+        self.revoke_grant_proving(grant_id, audience, carried, claim)
+            .await
+            .map(|(answer, _)| answer)
+    }
+
+    /// [`Self::revoke_grant`], with the proof that the revocation's own debt withdrew the whole
+    /// host when it did ([`super::barrier::HostWithdrawal`]): an owner's revocation beside a row
+    /// that names no grant reaches every connection, the owner's own among them, and the caller
+    /// that holds the owner's connection needs the proof to answer it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::revoke_grant`].
+    pub(super) async fn revoke_grant_proving(
+        &self,
+        grant_id: kr_protocol::ids::GrantId,
+        audience: Audience,
+        carried: Option<&crate::authority::AdmittedMutation>,
+        claim: Option<&crate::grants::ClaimHold>,
+    ) -> Result<(
+        kr_protocol::sharing::RevocationResult,
+        Option<super::barrier::HostWithdrawal>,
+    )> {
         let now_ms = self.settled_now_ms();
         // The owner's revocation takes what traces to no root and marks what cannot be read; a
         // paired device's takes the subtree it names and nothing else.
@@ -110,8 +133,11 @@ impl Controller {
                 .sharing
                 .revoke(grant_id, scope, now_ms, || Ok(()), claim)?,
         };
+        if audience == Audience::Host {
+            Self::report_grants_passed_over(revocation.marked, revocation.withdrawn_unplaced);
+        }
         let own = self.publish_debts(&Self::under_the_grants(&revocation));
-        self.complete_revocation(
+        self.complete_revocation_proving(
             audience,
             Some(grant_id),
             revocation.revoked.iter().copied().collect(),
@@ -262,6 +288,7 @@ impl Controller {
                 claim,
             )?;
             // The transaction that revoked is the restriction, and it has committed.
+            Self::report_grants_passed_over(revocation.marked, revocation.withdrawn_unplaced);
             let own = self.publish_debts(&Self::for_the_device_grants(&revocation));
             // The device record is marked revoked before the revision advances, so nothing can be
             // authorised against it in between. The directory is a view on this daemon's own

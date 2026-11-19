@@ -78,6 +78,7 @@ async fn the_diagnostics_keep_every_established_check_and_add_the_configuration(
         "configuration-ceilings",
         "configuration-secrets",
         "catalogue",
+        "grants-readable",
     ] {
         assert!(ids.contains(&added), "{added} is missing: {ids:?}");
     }

@@ -1320,7 +1320,7 @@ impl Controller {
                 }
                 Method::GrantRedeem => self.grant_redeem(mutation, caller, carried, &hold).await,
                 Method::GrantRevoke => {
-                    self.grant_revoke(actor_id, caller, mutation, carried, &hold)
+                    self.grant_revoke(actor_id, caller, mutation, carried, &hold, withdrew)
                         .await
                 }
                 Method::GrantTransfer => {
@@ -1868,6 +1868,7 @@ impl Controller {
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
         hold: &crate::grants::ClaimHold,
+        withdrew: &mut Option<HostWithdrawal>,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantRevokeParams = parse(&mutation.params)?;
         // A paired device revokes what it delegated, and what was delegated on from that: a grant
@@ -1878,16 +1879,16 @@ impl Controller {
         if let AuthorityCaller::Device(device_id) = caller {
             self.require_delegating_ancestor(device_id, params.grant_id)?;
         }
-        encode(
-            &self
-                .revoke_grant(
-                    params.grant_id,
-                    Audience::of(actor_id),
-                    Some(&carried),
-                    Some(hold),
-                )
-                .await?,
-        )
+        let (revoked, proof) = self
+            .revoke_grant_proving(
+                params.grant_id,
+                Audience::of(actor_id),
+                Some(&carried),
+                Some(hold),
+            )
+            .await?;
+        *withdrew = proof;
+        encode(&revoked)
     }
 
     /// Hands a session's control to another paired device, on the owner's confirmation.

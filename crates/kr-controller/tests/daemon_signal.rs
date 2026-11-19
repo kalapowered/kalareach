@@ -745,3 +745,56 @@ async fn a_stop_asked_on_the_local_socket_ends_the_daemon_after_its_answer_and_n
         "the daemon started again found the session: {listed:?}"
     );
 }
+
+/// A revocation of the owner's beside a grants row that cannot be read marks the row and says so
+/// once in the daemon's own log, by counts and no key; the repeat finds the row marked and says
+/// nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owners_revocation_beside_a_damaged_row_writes_the_line_once_to_the_daemons_log() {
+    let mut host = Host::create();
+    host.run().await;
+    let registry = rusqlite::Connection::open(host.tree.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    registry
+        .execute_batch(
+            "INSERT INTO grants (grant_id, recipient_device_id, grant, issued_at_ms)
+             VALUES (X'00', X'11111111111111111111111111111111', X'00', 1);",
+        )
+        .expect("a row that names no grant");
+
+    let device =
+        kr_protocol::ids::DeviceId::new(kr_protocol::scalars::Uuid::from_bytes([0x33; 16]));
+    for action in [0xa1_u8, 0xa2] {
+        let mut client = host.client().await;
+        let mutation = client
+            .compose(
+                Method::DeviceRevoke,
+                ActionId::new(kr_protocol::scalars::Uuid::from_bytes([action; 16])),
+                ActionTarget::environment(host.tree.environment_id()),
+                &kr_protocol::sharing::DeviceRevokeParams { device_id: device },
+            )
+            .await
+            .expect("the revocation is composed");
+        client
+            .repeat(&mutation)
+            .await
+            .expect("the daemon answers")
+            .expect("a row that cannot be read does not stop the revocation");
+    }
+    let said = std::fs::read_to_string(host.tree.root().join("daemon.log")).unwrap_or_default();
+    let lines: Vec<&str> = said
+        .lines()
+        .filter(|line| line.contains("a revocation marked"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "kr-controller: a revocation marked 1 grants rows that cannot be read as revoked and \
+             withdrew 0 grants that trace to no root; see the grants check of kr doctor"
+        ],
+        "said once, on the first revocation only: {said}"
+    );
+}

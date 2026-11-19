@@ -2398,3 +2398,96 @@ async fn a_share_is_revoked_by_its_identifier_while_the_host_will_not_list_its_g
     assert!(revoked_at(lasting).is_some(), "the grant was revoked");
     assert!(revoked_at(ending).is_none(), "the other grant was not");
 }
+
+/// `kr share revoke` goes on by the identifier when the host will not list its grants because a
+/// grants row cannot be read: its recipient column does not match its record, which the list
+/// refuses as an invalid row. The revocation takes the readable grant, and the row stays as the
+/// host's own revocation marks it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_share_is_revoked_by_its_identifier_while_a_grants_row_that_cannot_be_read_stops_the_list()
+ {
+    use kr_controller::grants::GrantRecord;
+
+    let host = Host::start().await;
+    let device = DeviceId::new(Uuid::from_bytes([0xf1; 16]));
+    let lasting = GrantId::new(Uuid::from_bytes([0x76; 16]));
+    let damaged = GrantId::new(Uuid::from_bytes([0x77; 16]));
+    for grant_id in [lasting, damaged] {
+        host.controller
+            .sharing()
+            .grants()
+            .issue(
+                &GrantRecord {
+                    grant: Grant {
+                        grant_id,
+                        parent_grant_id: Nullable::null(),
+                        issuer_device_id: device,
+                        recipient_device_id: device,
+                        authority_revision: host.controller.policy().authority_revision(),
+                        environment_selector: EnvironmentSelector::Any,
+                        session_selector: SessionSelector::Any,
+                        actions: [ActionRight::SessionView].into_iter().collect(),
+                        history: HistoryScope {
+                            lower_bound_ms: Nullable::null(),
+                            include_live_screen: false,
+                            named_questions: CanonicalSet::new(),
+                            named_approvals: CanonicalSet::new(),
+                        },
+                        expiry: GrantExpiry::Never,
+                        organisation: Nullable::null(),
+                    },
+                    session_id: None,
+                    issued_at_ms: 1_000,
+                    activated_at_ms: Some(1_000),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("the grant is written");
+    }
+    let key = |grant_id: GrantId| {
+        let hex: String = grant_id
+            .get()
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!("X'{hex}'")
+    };
+    let registry = rusqlite::Connection::open(host.temp.environment().registry_database())
+        .expect("opens the registry");
+    registry
+        .busy_timeout(std::time::Duration::from_secs(10))
+        .expect("waits for the daemon's own writes");
+    registry
+        .execute_batch(&format!(
+            "UPDATE grants SET recipient_device_id = X'{}' WHERE grant_id = {};",
+            "ee".repeat(16),
+            key(damaged)
+        ))
+        .expect("the row's recipient column no longer matches its record");
+
+    let listed = host.refused(&["share", "list"]);
+    assert!(
+        text(&listed["message"]).contains("cannot be read"),
+        "the list refuses the row it cannot read: {listed}"
+    );
+    let lasting_text = lasting.to_string();
+    let revoked = host.kr_json(&["share", "revoke", &lasting_text]);
+    assert!(
+        revoked.to_string().contains(&lasting_text),
+        "the revocation names the grant: {revoked}"
+    );
+    assert!(
+        host.controller
+            .sharing()
+            .grants()
+            .record(lasting)
+            .expect("the grant store reads")
+            .expect("the grant is held")
+            .revoked_at_ms
+            .is_some(),
+        "the grant was revoked"
+    );
+}

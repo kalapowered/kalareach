@@ -1039,6 +1039,19 @@ impl GrantDirectory {
         row.transpose()
     }
 
+    /// Every grants row, each read and judged once, for the host's doctor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the table cannot be read.
+    pub(crate) fn scan(&self) -> Result<Scan> {
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scan_all(&connection)
+    }
+
     /// Returns every grant, in identity order.
     ///
     /// # Errors
@@ -1330,9 +1343,38 @@ impl GrantDirectory {
         let plan = plan_withdrawal(&scan, roots, scope)?;
         still_admitted()?;
         let now_ms = next_moment(connection, now_ms)?;
+        Self::write_withdrawal(
+            connection,
+            &scan,
+            &plan,
+            roots,
+            Disposal::Mark,
+            now_ms,
+            &self.held_closes(),
+            covers,
+        )
+    }
+
+    /// The write half of a withdrawal, for a plan read in the caller's transaction: each subtree
+    /// revoked, each row that cannot be read disposed of as `disposal` says, and one debt for the
+    /// whole change. `now_ms` is [`next_moment`]'s, and `held` the closes outstanding at a worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a row cannot be written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_withdrawal(
+        connection: &Connection,
+        scan: &Scan,
+        plan: &Plan,
+        roots: Roots,
+        disposal: Disposal,
+        now_ms: u64,
+        held: &BTreeSet<GrantId>,
+        covers: &str,
+    ) -> Result<GrantRevocation> {
         let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
         let mut debt = None;
-        let held = self.held_closes();
         // The grant a revocation is reported under: the one named, or the first a device holds.
         let named = match roots {
             Roots::Grant(grant_id) => grant_id,
@@ -1354,7 +1396,7 @@ impl GrantDirectory {
                 now_ms,
                 &mut debt,
                 covers,
-                &held,
+                held,
             )?;
             if subtree.unplaced {
                 merged.withdrawn_unplaced = merged
@@ -1382,28 +1424,32 @@ impl GrantDirectory {
             .collect();
         let mut named_by_damage = false;
         for row in &plan.damaged {
-            if row.damage.marked {
+            if disposal == Disposal::Mark && row.damage.marked {
                 continue;
             }
-            let changed = connection
-                .execute(
-                    "UPDATE grants SET revoked_at_ms = ?1, revoked_by_parent = NULL
-                      WHERE rowid = ?2
-                        AND (revoked_at_ms IS NULL OR typeof(revoked_at_ms) <> 'integer')",
-                    params![moment, row.rowid],
-                )
-                .map_err(ControllerError::registry)?;
-            if changed == 0 {
-                continue;
-            }
-            merged.marked = merged.marked.saturating_add(1);
-            // The identifier the record names stands for the row only when no readable row holds
-            // it: a damaged alias beside a readable grant must not withdraw that grant's offer.
+            // Its offers are cancelled first, while the row still names them: a removed row is
+            // gone from the key the cancellation reads. The identifier the record names stands
+            // for the row only when no readable row holds it: a damaged alias beside a readable
+            // grant must not withdraw that grant's offer.
             let alias_free = row
                 .damage
                 .decoded
                 .map(|decoded| decoded.id)
                 .filter(|id| !readable.contains(id));
+            let changed = match disposal {
+                Disposal::Mark => connection
+                    .execute(
+                        "UPDATE grants SET revoked_at_ms = ?1, revoked_by_parent = NULL
+                          WHERE rowid = ?2
+                            AND (revoked_at_ms IS NULL OR typeof(revoked_at_ms) <> 'integer')",
+                        params![moment, row.rowid],
+                    )
+                    .map_err(ControllerError::registry)?,
+                Disposal::Remove => 1,
+            };
+            if changed == 0 {
+                continue;
+            }
             connection
                 .execute(
                     "UPDATE session_invitations SET state = 'cancelled'
@@ -1413,6 +1459,12 @@ impl GrantDirectory {
                     params![row.rowid, alias_free.map(|id| id.get().as_bytes().to_vec())],
                 )
                 .map_err(ControllerError::registry)?;
+            if disposal == Disposal::Remove {
+                connection
+                    .execute("DELETE FROM grants WHERE rowid = ?1", params![row.rowid])
+                    .map_err(ControllerError::registry)?;
+            }
+            merged.marked = merged.marked.saturating_add(1);
             let names: Vec<GrantId> = row.damage.key.into_iter().chain(alias_free).collect();
             if names.is_empty() {
                 merged.reaches_every_connection = true;
@@ -4561,7 +4613,6 @@ pub(crate) struct Scan {
 #[derive(Clone, Debug)]
 pub(crate) struct Damaged {
     /// The row's 1-based position in the table's order: a pointer for the person, never a selector.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub place: u64,
     /// The row's rowid in this scan's transaction.
     pub rowid: i64,
@@ -4595,7 +4646,6 @@ impl Scan {
     }
 
     /// The readable rows that are not revoked and are not reachable from a root.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn unplaced_live(&self) -> Vec<&GrantRecord> {
         let placed = self.placed();
         self.readable
@@ -4608,7 +4658,7 @@ impl Scan {
 }
 
 /// Reads and judges every grants row once, in the table's order.
-fn scan_all(connection: &Connection) -> Result<Scan> {
+pub(crate) fn scan_all(connection: &Connection) -> Result<Scan> {
     let mut statement = connection
         .prepare(concat!(
             "SELECT ",
@@ -4636,6 +4686,15 @@ fn scan_all(connection: &Connection) -> Result<Scan> {
     Ok(scan)
 }
 
+/// What a withdrawal does with a row that cannot be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Disposal {
+    /// Marks it revoked and keeps it: a host's own revocation.
+    Mark,
+    /// Removes it: the repair, which the person asks for.
+    Remove,
+}
+
 /// How far a revocation reaches beyond what it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scope {
@@ -4654,7 +4713,6 @@ pub(crate) enum Roots {
     /// One named grant, revoked or not.
     Grant(GrantId),
     /// No named root: only what traces to no root.
-    #[cfg_attr(not(test), allow(dead_code))]
     None,
 }
 
@@ -4912,7 +4970,7 @@ fn owes_a_fence(grant: &Grant) -> bool {
 /// is the moment its change recorded its debt at. Moments no two changes share keep that match
 /// exact: a second change in the same millisecond, a clock stepped back, or a debt written after
 /// another change's was completed cannot stand for a grant whose own fence is done.
-fn next_moment(connection: &Connection, now_ms: u64) -> Result<u64> {
+pub(crate) fn next_moment(connection: &Connection, now_ms: u64) -> Result<u64> {
     let latest: Option<i64> = connection
         .query_row(
             "SELECT MAX(moment) FROM (
@@ -6028,16 +6086,6 @@ mod a_devices_revocation {
             .count()
     }
 
-    /// How many of the shape's grants the device holds.
-    fn held(shape: &Shape) -> u64 {
-        let held = shape
-            .nodes
-            .iter()
-            .filter(|node| node.holder == DEVICE)
-            .count();
-        u64::try_from(held).expect("a count")
-    }
-
     /// A store holding `shape`.
     fn store_of(shape: &Shape) -> GrantDirectory {
         let store = GrantDirectory::in_memory().expect("a grant store");
@@ -6081,8 +6129,8 @@ mod a_devices_revocation {
     /// many grants the device holds and in whatever order the store lists them: a revocation that
     /// reads the whole store again for every grant the device holds does work that grows with the
     /// square of what the device holds, and a tree of the most grants a notice names takes minutes
-    /// to revoke that way. A device with nothing left to withdraw decodes its own rows and no
-    /// other.
+    /// to revoke that way. Every revocation decodes each row of the store once, whatever there is to
+    /// withdraw.
     #[test]
     fn reads_each_grant_row_a_bounded_number_of_times_whatever_the_shape() {
         const SMALL: u32 = 64;
@@ -6112,11 +6160,10 @@ mod a_devices_revocation {
                         shape.name
                     ));
                 }
-                if withdrawn == 0 && reads != held(shape) {
+                if reads != rows {
                     failures.push(format!(
-                        "{}: nothing left to withdraw, and {reads} rows decoded for {} held",
-                        shape.name,
-                        held(shape)
+                        "{}: {rows} grants in the store and {reads} rows decoded, not one decode of each",
+                        shape.name
                     ));
                 }
                 decoded.push(reads);
