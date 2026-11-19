@@ -628,10 +628,9 @@ pub enum VoiceContextSendResult {
     /// The host's sender took the selection. Proves admission to the sender, not provider
     /// execution.
     Queued {
-        /// How many appends the sender will write.
+        /// How many appends the sender will write: the selection split into appends, which is
+        /// refused whole when it needs more than a call carries.
         appends: u32,
-        /// How many appends the selection was split into.
-        of: u32,
     },
     /// The host did not take it.
     Refused {

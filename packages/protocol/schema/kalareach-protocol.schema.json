@@ -41332,21 +41332,14 @@
               "additionalProperties": false,
               "properties": {
                 "appends": {
-                  "description": "How many appends the sender will write.",
-                  "format": "uint32",
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "of": {
-                  "description": "How many appends the selection was split into.",
+                  "description": "How many appends the sender will write: the selection split into appends, which is\nrefused whole when it needs more than a call carries.",
                   "format": "uint32",
                   "minimum": 0,
                   "type": "integer"
                 }
               },
               "required": [
-                "appends",
-                "of"
+                "appends"
               ],
               "type": "object"
             }

@@ -2600,13 +2600,10 @@ export type VoiceContextSendResult =
   | {
       queued: {
         /**
-         * How many appends the sender will write.
+         * How many appends the sender will write: the selection split into appends, which is
+         * refused whole when it needs more than a call carries.
          */
         appends: number
-        /**
-         * How many appends the selection was split into.
-         */
-        of: number
       }
     }
   | {
