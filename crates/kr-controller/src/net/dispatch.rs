@@ -421,3 +421,6 @@ mod an_answer_that_cannot_be_recorded;
 
 #[cfg(test)]
 mod an_attempt_that_has_not_finished;
+
+#[cfg(test)]
+mod a_subscription_under_a_row_that_cannot_be_read;
