@@ -275,8 +275,8 @@ struct CallState {
     ended: Option<RecordedEnd>,
     /// The call's final status, built in the locked step that settles the call: the call is
     /// settled once its side channel has reported the close, or the wait for the report is over.
-    /// It is kept here until the registry holds it, so a heartbeat that meets the settlement
-    /// answers from it.
+    /// It is kept here for the life of the call, so a heartbeat that meets the settlement answers
+    /// from it.
     settled: Option<Kept>,
     /// The send of context that runs now, at most one.
     sending: Option<SendProgress>,
@@ -324,6 +324,10 @@ struct Registry {
 
 struct Shared {
     registry: Mutex<Registry>,
+    /// Where this module's own tests stop a heartbeat after it took the call from the registry and
+    /// before it reads the call.
+    #[cfg(test)]
+    after_the_call_is_taken: crate::attention::Pause,
 }
 
 /// The calls the host holds on the owner's own key, and what it kept of the ones that ended.
@@ -351,6 +355,8 @@ impl HostCalls {
         Self {
             shared: Arc::new(Shared {
                 registry: Mutex::new(Registry::default()),
+                #[cfg(test)]
+                after_the_call_is_taken: crate::attention::Pause::default(),
             }),
         }
     }
@@ -457,7 +463,9 @@ impl HostCalls {
     /// `closing` until its close settles, and the heartbeat that finds it settled answers
     /// `closed`, with the matching `ended` item, in the same reply. A call that ended answers
     /// `closed` from the final status, to its own device alone, until the device acknowledges the
-    /// `ended` item or the record is [`FINAL_STATUS_KEEP_MS`] old. After that it is unknown.
+    /// `ended` item or the record is [`FINAL_STATUS_KEEP_MS`] old. After that it is unknown. The
+    /// acknowledgement of the `ended` item makes the registry forget the call and its status, in
+    /// whichever of the two it is held, and a settlement that comes after keeps no status.
     #[must_use]
     pub fn heartbeat(
         &self,
@@ -477,8 +485,14 @@ impl HostCalls {
                 }
                 let call = Arc::clone(call);
                 drop(registry);
+                #[cfg(test)]
+                self.shared.after_the_call_is_taken.wait();
                 call.settle_if_due(now_ms);
-                return call.heartbeat(after_seq, now_ms);
+                let (answer, acknowledged) = call.heartbeat(after_seq, now_ms);
+                if acknowledged {
+                    self.forget(&call);
+                }
+                return answer;
             }
             let Some(at) = registry
                 .finals
@@ -510,6 +524,24 @@ impl HostCalls {
                 dropped: false,
             }
         }
+    }
+
+    /// Forgets a call whose device acknowledged its final item, and the status the registry kept
+    /// of it, in one step under the registry's lock. A settlement that comes after finds the call
+    /// gone and keeps no status; one that came before has put its status in `finals`, and it goes
+    /// too. The call's own copy stays for the readers that hold the call.
+    fn forget(&self, call: &Arc<HostCall>) {
+        let mut registry = self.registry();
+        if registry
+            .calls
+            .get(&call.voice_session_id)
+            .is_some_and(|held| Arc::ptr_eq(held, call))
+        {
+            registry.calls.remove(&call.voice_session_id);
+        }
+        registry
+            .finals
+            .retain(|kept| kept.status.voice_session_id != call.voice_session_id);
     }
 
     /// The calls whose phone has not been heard from for [`HOST_CLIENT_ABSENT_SECONDS`]: the
@@ -757,6 +789,15 @@ impl HostCall {
             return;
         };
         let mut registry = shared.registry.lock().expect("the host call registry");
+        // A device that acknowledged the status from this call's own copy has made the registry
+        // forget the call: nothing is left to keep.
+        if !registry
+            .calls
+            .get(&self.voice_session_id)
+            .is_some_and(|held| std::ptr::eq(Arc::as_ptr(held), self))
+        {
+            return;
+        }
         registry.calls.remove(&self.voice_session_id);
         registry.finals.push_back(kept);
         while registry.finals.len() > FINAL_STATUS_RECORDS {
@@ -786,16 +827,18 @@ impl HostCall {
         self.state_of(ended, channel, now_ms)
     }
 
-    /// Answers a heartbeat. A call that is settled answers `closed` from its final status. Any
-    /// other call answers its state and its news from one look at its record: it stamps the
-    /// phone's liveness while the call is open or recovering and its end is not recorded, drops
-    /// the news the device acknowledged and returns the rest.
-    fn heartbeat(&self, after_seq: u64, now_ms: u64) -> VoiceControlResult {
+    /// Answers a heartbeat, and says whether it acknowledged the call's final item. A call that is
+    /// settled answers `closed` from its final status, and the heartbeat acknowledges the final
+    /// item when its cursor is at or past the status's last item. Any other call answers its state
+    /// and its news from one look at its record: it stamps the phone's liveness while the call is
+    /// open or recovering and its end is not recorded, drops the news the device acknowledged and
+    /// returns the rest.
+    fn heartbeat(&self, after_seq: u64, now_ms: u64) -> (VoiceControlResult, bool) {
         let channel = self.control.state();
         let mut state = self.state();
         if let Some(kept) = &state.settled {
             let status = &kept.status;
-            return VoiceControlResult::Heartbeat {
+            let answer = VoiceControlResult::Heartbeat {
                 state: VoiceHostCallState::Closed {
                     reason: status.reason,
                     provider_close: status.provider_close,
@@ -809,6 +852,7 @@ impl HostCall {
                     .collect(),
                 dropped: false,
             };
+            return (answer, after_seq >= status.last_seq);
         }
         let call_state = self.state_of(state.ended.is_some(), channel, now_ms);
         if matches!(
@@ -826,13 +870,14 @@ impl HostCall {
         }
         let news: Vec<VoiceNews> = state.news.iter().cloned().collect();
         let dropped = after_seq < state.dropped_through;
-        VoiceControlResult::Heartbeat {
+        let answer = VoiceControlResult::Heartbeat {
             state: call_state,
             remaining_seconds: u32::try_from(self.closes_at_ms.saturating_sub(now_ms) / 1_000)
                 .unwrap_or(u32::MAX),
             news,
             dropped,
-        }
+        };
+        (answer, false)
     }
 
     /// Runs the phone-absence rules. Returns true when the phone has been silent long enough that
@@ -3650,7 +3695,7 @@ mod tests {
             std::thread::spawn(move || call.settle(Some(SidebandEnd::HostClosed)))
         };
         arrived
-            .recv()
+            .recv_timeout(crate::attention::Pause::HOLDS_AT_MOST)
             .expect("the settling thread reached the pause");
         assert_eq!(calls.len(), 1, "the registry has not taken the call out");
         assert_eq!(calls.kept_final_statuses(), 0, "nor taken the status in");
@@ -3676,6 +3721,109 @@ mod tests {
         assert_eq!(calls.kept_final_statuses(), 1);
     }
 
+    /// The device reads the final item from the call's own copy and acknowledges it while the
+    /// registry has not taken the status yet. The settlement that comes after keeps no status.
+    #[test]
+    fn a_final_item_acknowledged_before_the_registry_takes_the_status_leaves_no_status_to_keep() {
+        let (calls, call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::HostClosed));
+        let (arrived, go) = call.between_the_locks.arm();
+        let settler = {
+            let call = Arc::clone(&call);
+            std::thread::spawn(move || call.settle(Some(SidebandEnd::HostClosed)))
+        };
+        arrived
+            .recv_timeout(crate::attention::Pause::HOLDS_AT_MOST)
+            .expect("the settling thread reached the pause");
+        let VoiceControlResult::Heartbeat { news, .. } =
+            calls.heartbeat(voice_session(1), device(7), 0, OPENED + 2_000)
+        else {
+            panic!("a closed answer");
+        };
+        let last = news.last().expect("the ended item").seq.get();
+        assert_eq!(last, 1);
+        let _ = calls.heartbeat(voice_session(1), device(7), last, OPENED + 3_000);
+        go.send(()).expect("the settling thread waits");
+        settler.join().expect("the settling thread");
+        assert_eq!(calls.len(), 0, "the call left the registry");
+        assert_eq!(
+            calls.kept_final_statuses(),
+            0,
+            "no status stays after the acknowledgement"
+        );
+        assert_eq!(
+            calls.heartbeat(voice_session(1), device(7), 0, OPENED + 5_000),
+            VoiceControlResult::Refused {
+                reason: VoiceHostRefusal::UnknownCall
+            }
+        );
+    }
+
+    /// A heartbeat that took the call from the registry before the settlement moved its status
+    /// into the registry, and that acknowledges the final item after the move, takes the status
+    /// out again.
+    #[test]
+    fn a_final_item_acknowledged_by_a_heartbeat_that_took_the_call_before_the_status_moved_leaves_no_status_to_keep()
+     {
+        let (calls, call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::HostClosed));
+        let (arrived, let_the_settlement_go) = call.between_the_locks.arm();
+        let settler = {
+            let call = Arc::clone(&call);
+            std::thread::spawn(move || call.settle(Some(SidebandEnd::HostClosed)))
+        };
+        arrived
+            .recv_timeout(crate::attention::Pause::HOLDS_AT_MOST)
+            .expect("the settling thread reached the pause");
+        let (taken, let_the_heartbeat_go) = calls.shared.after_the_call_is_taken.arm();
+        let heartbeat = {
+            let calls = calls.clone();
+            std::thread::spawn(move || {
+                calls.heartbeat(voice_session(1), device(7), 1, OPENED + 3_000)
+            })
+        };
+        taken
+            .recv_timeout(crate::attention::Pause::HOLDS_AT_MOST)
+            .expect("the heartbeat took the call");
+        let_the_settlement_go
+            .send(())
+            .expect("the settling thread waits");
+        settler.join().expect("the settling thread");
+        assert_eq!(
+            calls.kept_final_statuses(),
+            1,
+            "the settlement put its status in the registry after the heartbeat took the call"
+        );
+        let_the_heartbeat_go
+            .send(())
+            .expect("the heartbeat thread waits");
+        let answer = heartbeat.join().expect("the heartbeat thread");
+        assert_eq!(
+            answer,
+            VoiceControlResult::Heartbeat {
+                state: VoiceHostCallState::Closed {
+                    reason: VoiceEndReason::Stop,
+                    provider_close: VoiceProviderClose::Confirmed
+                },
+                remaining_seconds: 0,
+                news: Vec::new(),
+                dropped: false,
+            }
+        );
+        assert_eq!(calls.len(), 0, "the call left the registry");
+        assert_eq!(
+            calls.kept_final_statuses(),
+            0,
+            "no status stays after the acknowledgement"
+        );
+        assert_eq!(
+            calls.heartbeat(voice_session(1), device(7), 0, OPENED + 5_000),
+            VoiceControlResult::Refused {
+                reason: VoiceHostRefusal::UnknownCall
+            }
+        );
+    }
+
     /// The call answers `closed` from the status it kept itself when the registry cannot take it.
     #[test]
     fn a_settled_call_answers_closed_from_its_own_copy_when_the_registry_is_gone() {
@@ -3683,7 +3831,7 @@ mod tests {
         drop(calls);
         close(&sideband, SidebandEnd::Lost);
         assert_eq!(
-            call.heartbeat(0, OPENED + 2_000),
+            call.heartbeat(0, OPENED + 2_000).0,
             VoiceControlResult::Heartbeat {
                 state: VoiceHostCallState::Closed {
                     reason: VoiceEndReason::SidebandLost,
