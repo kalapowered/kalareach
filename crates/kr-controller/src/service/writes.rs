@@ -82,6 +82,8 @@ impl LocalWrite {
             | Method::DeliveryDestinationConfigure
             | Method::DeliveryDestinationRemove
             | Method::DeliveryDestinationSecretSet
+            | Method::NetworkProxyLoginSet
+            | Method::NetworkProxyLoginClear
             | Method::OrganisationEnrol
             | Method::OrganisationExclusiveSet
             | Method::OrganisationWithdraw => Self::Authority,

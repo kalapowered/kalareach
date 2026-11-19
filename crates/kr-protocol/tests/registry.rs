@@ -348,6 +348,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         ("delivery.destination.remove", EffectClass::Write),
         ("delivery.destination.list", EffectClass::Read),
         ("delivery.destination.secret.set", EffectClass::Write),
+        ("network.proxy_login.set", EffectClass::Write),
+        ("network.proxy_login.clear", EffectClass::Write),
     ];
     for (name, effect) in delivery {
         let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));

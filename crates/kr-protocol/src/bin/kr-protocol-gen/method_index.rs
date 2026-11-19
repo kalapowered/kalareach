@@ -130,6 +130,9 @@ pub(crate) const fn described_in(method: Method) -> Section {
         | Method::DeliveryDestinationRemove
         | Method::DeliveryDestinationList => at(DELIVERY, "Configuring and removing a destination"),
         Method::DeliveryDestinationSecretSet => at(DELIVERY, "Credentials"),
+        Method::NetworkProxyLoginSet | Method::NetworkProxyLoginClear => {
+            at(HOST, "The proxy login")
+        }
         Method::PrivacySet | Method::PrivacyStatus | Method::PrivacyRetainedDelete => {
             at(HOST, "Privacy mode")
         }

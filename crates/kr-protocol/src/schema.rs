@@ -151,6 +151,9 @@ use crate::machine::{
 };
 use crate::mailbox::{EnvelopePlaintext, SealedEnvelope};
 use crate::method::REGISTRY;
+use crate::network_proxy::{
+    NetworkProxyLoginClearParams, NetworkProxyLoginResult, NetworkProxyLoginSetParams,
+};
 use crate::organisation::{
     ExclusiveManagementEvent, HostPolicyConfirmParams, HostPolicyConfirmResult,
     MembershipPresentParams, MembershipPresentResult, OrganisationEnrolParams,
@@ -873,6 +876,9 @@ pub fn protocol_schema() -> Value {
         "external_destination_kind" => ExternalDestinationKind,
         "delivery_destination_secret_set_params" => DeliveryDestinationSecretSetParams,
         "delivery_destination_secret_set_result" => DeliveryDestinationSecretSetResult,
+        "network_proxy_login_set_params" => NetworkProxyLoginSetParams,
+        "network_proxy_login_clear_params" => NetworkProxyLoginClearParams,
+        "network_proxy_login_result" => NetworkProxyLoginResult,
         "destination_secret" => DestinationSecret,
         "destination_secret_kind" => DestinationSecretKind,
         "mail_account" => MailAccount,

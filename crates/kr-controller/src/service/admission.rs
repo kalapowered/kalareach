@@ -20,7 +20,8 @@ use crate::given::Given;
 use crate::registry::Registry;
 
 use super::authority_changes::{
-    configure_params, destination_identifier, remove_params, secret_params, validate_configuration,
+    configure_params, destination_identifier, proxy_login_clear_params, proxy_login_params,
+    remove_params, secret_params, validate_configuration,
 };
 use super::{Controller, net, parse};
 
@@ -1405,6 +1406,24 @@ impl Controller {
                 destination_identifier(&params.destination_id)?;
                 crate::push::external::check_secret(&params.secret)
                     .map_err(ControllerError::InvalidArgument)?;
+            }
+            // The login a proxy asks for belongs to this host's environment. The parameters are
+            // read here, before the action is claimed, so a login of the wrong shape is refused
+            // without holding its action identifier.
+            Method::NetworkProxyLoginSet | Method::NetworkProxyLoginClear => {
+                if mutation.target.session_id.as_ref().is_some()
+                    || mutation.target.application_instance_id.is_present()
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "the proxy login belongs to this environment, not to one session"
+                            .to_owned(),
+                    ));
+                }
+                if method == Method::NetworkProxyLoginSet {
+                    proxy_login_params(&mutation.params)?;
+                } else {
+                    proxy_login_clear_params(&mutation.params)?;
+                }
             }
             // The host's sign-ins, the managed account's and the storage account's, belong to the
             // environment, not to a session.

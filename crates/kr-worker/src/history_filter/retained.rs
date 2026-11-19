@@ -192,6 +192,8 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::DeliveryDestinationConfigure
         | Method::DeliveryDestinationRemove
         | Method::DeliveryDestinationSecretSet
+        | Method::NetworkProxyLoginSet
+        | Method::NetworkProxyLoginClear
         | Method::PrivacySet
         | Method::PrivacyRetainedDelete
         | Method::HostPolicyConfirm
