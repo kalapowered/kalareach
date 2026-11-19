@@ -390,7 +390,7 @@ impl Scene {
             "durationSeconds": 600,
             "reasoningBudgetMinor": null,
             "prepared": prepared["prepared"],
-            "expectedRateVersion": prepared["managed"]["rate"]["version"],
+            "expectedRateVersion": prepared["provider"]["managed"]["terms"]["rate"]["version"],
         })
     }
 
@@ -3613,7 +3613,7 @@ fn request_of(scene: &Scene, prepared: &serde_json::Value) -> companion_tauri::v
         duration_seconds: 600,
         reasoning_budget_minor: None,
         prepared: serde_json::from_value(prepared["prepared"].clone()).expect("a digest"),
-        expected_rate_version: prepared["managed"]["rate"]["version"]
+        expected_rate_version: prepared["provider"]["managed"]["terms"]["rate"]["version"]
             .as_str()
             .map(str::to_owned),
         subject: companion_tauri::target::Subject::default(),
