@@ -3350,33 +3350,65 @@ async fn a_sync_of_an_index_listing_the_skill_target_raises_the_format_in_its_ac
     );
 }
 
-/// An authority that lets the first commit it is asked for through, which writes the index
-/// document, and refuses the second, which activates the generation.
-#[derive(Debug, Default)]
-struct RefusesTheActivation {
-    commits: std::sync::atomic::AtomicUsize,
+/// Where an authority stops a sync that publishes an index.
+#[derive(Clone, Copy, Debug)]
+enum StopsAt {
+    /// It refuses to let the index be written.
+    TheIndexWrite,
+    /// It lets the index be written and then cannot confirm its own order.
+    AfterTheIndexWrite,
+    /// It lets the index be written and refuses the commit that activates the generation.
+    TheActivation,
 }
 
-impl Authority for RefusesTheActivation {
+/// An authority that stops a sync where `stop` says, by the effect it is asked to commit, and
+/// lets every other commit through.
+#[derive(Debug)]
+struct StopsTheSync {
+    stop: StopsAt,
+    indexed: std::sync::atomic::AtomicBool,
+}
+
+impl StopsTheSync {
+    fn at(stop: StopsAt) -> Self {
+        Self {
+            stop,
+            indexed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+impl Authority for StopsTheSync {
     fn check(&self) -> CatalogueResult<()> {
         Ok(())
     }
 
     fn commit(
         &self,
-        _effect: &Effect,
+        effect: &Effect,
         commit: &mut dyn FnMut() -> CatalogueResult<()>,
     ) -> CatalogueResult<()> {
-        if self
-            .commits
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            == 0
-        {
-            return commit();
-        }
-        Err(CatalogueError::PermissionDenied {
+        use std::sync::atomic::Ordering::SeqCst;
+        let withdrawn = || CatalogueError::PermissionDenied {
             detail: "the authority behind this action was withdrawn".to_owned(),
-        })
+        };
+        match (self.stop, effect) {
+            (StopsAt::TheIndexWrite, Effect::Index(_)) => Err(withdrawn()),
+            (StopsAt::AfterTheIndexWrite, Effect::Index(_)) => {
+                commit()?;
+                Err(CatalogueError::StorageUnavailable {
+                    detail: "the order the change ran under could not be released".to_owned(),
+                })
+            }
+            (StopsAt::TheActivation, Effect::Records) if self.indexed.load(SeqCst) => {
+                Err(withdrawn())
+            }
+            (_, Effect::Index(_)) => {
+                self.indexed.store(true, SeqCst);
+                commit()
+            }
+            _ => commit(),
+        }
     }
 
     fn owner_confirmed(&self) -> bool {
@@ -3390,31 +3422,31 @@ impl Authority for RefusesTheActivation {
 /// the generation.
 #[tokio::test]
 async fn a_sync_that_stops_before_its_activation_leaves_the_format_as_it_was() {
-    let refusing: [(&str, Box<dyn Authority>); 3] = [
-        (
-            "refuses the index write",
-            Box::new(WithdrawnAtCommit::default()),
-        ),
-        ("fails after the index write", Box::new(FailsAfterCommit)),
-        (
-            "refuses the activation",
-            Box::new(RefusesTheActivation::default()),
-        ),
-    ];
-    for (what, authority) in refusing {
+    for stop in [
+        StopsAt::TheIndexWrite,
+        StopsAt::AfterTheIndexWrite,
+        StopsAt::TheActivation,
+    ] {
         let (home, _generation, mut catalogue) = publishing(true).await;
-        catalogue
-            .sync_with(&repository(), &mut Change::new(authority.as_ref()))
-            .await
-            .expect_err(what);
+        let authority = StopsTheSync::at(stop);
+        let stopped = catalogue
+            .sync_with(&repository(), &mut Change::new(&authority))
+            .await;
+        assert!(stopped.is_err(), "a sync stopped at {stop:?} is refused");
+        if !matches!(stop, StopsAt::TheIndexWrite) {
+            assert!(
+                authority.indexed.load(std::sync::atomic::Ordering::SeqCst),
+                "a sync stopped at {stop:?} wrote its index first"
+            );
+        }
         assert_eq!(
             recorded_format(home.path()),
             kr_plugin_catalogue::db::BASELINE_SCHEMA_VERSION,
-            "an authority that {what}"
+            "a sync stopped at {stop:?}"
         );
         assert!(
             catalogue.active(&repository()).expect("enrolled").is_none(),
-            "an authority that {what} activates nothing"
+            "a sync stopped at {stop:?} activates nothing"
         );
     }
 }
