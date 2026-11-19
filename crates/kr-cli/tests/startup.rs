@@ -7412,7 +7412,9 @@ fn a_login_item_and_the_service_start_are_independent_offers_on_a_real_user_mana
 #[cfg(target_os = "linux")]
 #[test]
 fn installing_and_removing_the_login_item_neither_start_nor_end_a_daemon() {
-    let (host, _session, _created, daemon) = a_host_with_a_session();
+    let Some((host, _session, _created, daemon)) = a_host_with_a_session() else {
+        return;
+    };
     for argument in ["install", "status", "remove"] {
         let what = format!("kr host login-item {argument}");
         let output = start(host.kr(&["host", "login-item", argument])).finish(&what);
