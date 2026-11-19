@@ -69,7 +69,6 @@ async fn a_real_worker_gives_back_a_kept_row_and_says_when_it_is_gone() {
         })
         .await;
     let kept = left["anchor"].clone();
-    assert_ne!(kept, Value::Null, "the view is in the history");
     let first = Page::lines(&left)[0].clone();
     assert!(first.starts_with("row "), "a numbered row: {first:?}");
     page.close(&reading).await;
@@ -85,6 +84,8 @@ async fn a_real_worker_gives_back_a_kept_row_and_says_when_it_is_gone() {
     assert_eq!(back["note"], Value::Null, "{back}");
     assert_eq!(Page::lines(&back)[0], first, "the same first row");
     assert_eq!(back["anchor"]["row"], kept["row"]);
+    // Last of what is read of the place, so that a view with no place fails on the row it shows.
+    assert_ne!(kept, Value::Null, "the view is in the history");
     page.close(&returned).await;
 
     // The scrollback is erased: the row is gone.
@@ -136,7 +137,6 @@ async fn a_real_worker_never_shows_other_text_after_a_width_change_without_sayin
             .await;
     }
     let kept = left["anchor"].clone();
-    assert_ne!(kept, Value::Null, "the view is in the history");
     let first = Page::lines(&left)[0].clone();
     assert!(!first.is_empty(), "a first row with text");
     page.close(&reading).await;
@@ -181,5 +181,7 @@ async fn a_real_worker_never_shows_other_text_after_a_width_change_without_sayin
         ),
         Some(note) => assert_eq!(note, "different", "{shown}"),
     }
+    // Last of what is read of the place, so that a view with no place fails on the text it shows.
+    assert_ne!(kept, Value::Null, "the view is in the history");
     hosted.close().await;
 }
