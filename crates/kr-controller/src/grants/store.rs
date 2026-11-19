@@ -4397,8 +4397,6 @@ pub(crate) struct Damage {
     pub class: DamageClass,
     /// The record's own identity, whenever the record decodes.
     pub decoded: Option<Decoded>,
-    /// The recipient column, when it is an identifier.
-    pub recipient_column: Option<DeviceId>,
     /// Whether the revocation column holds an integer: a mark both this build and the release
     /// before it read.
     pub marked: bool,
@@ -4418,7 +4416,11 @@ impl Damage {
 }
 
 /// What one row of the grants table is.
+///
+/// A row is judged and consumed at once, so the difference in size between the two variants costs
+/// nothing that boxing the record would save.
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Judged {
     /// A grant this build reads.
     Readable(GrantRecord),
@@ -4467,7 +4469,6 @@ fn judge_row(row: &rusqlite::Row<'_>) -> Result<Judged> {
             key: key.map(GrantId::new),
             class,
             decoded,
-            recipient_column: recipient_column.map(DeviceId::new),
             marked,
             detail,
         }))
@@ -4489,12 +4490,12 @@ fn judge_row(row: &rusqlite::Row<'_>) -> Result<Judged> {
         (4, "revoked_by_parent"),
         (5, "activated_at_ms"),
     ] {
-        let fits = match (index, cell(index)?) {
-            (1 | 4, ValueRef::Null | ValueRef::Blob(_)) => true,
-            (3 | 5, ValueRef::Null | ValueRef::Integer(_)) => true,
-            (2, ValueRef::Integer(_)) => true,
-            _ => false,
-        };
+        let fits = matches!(
+            (index, cell(index)?),
+            (1 | 4, ValueRef::Null | ValueRef::Blob(_))
+                | (3 | 5, ValueRef::Null | ValueRef::Integer(_))
+                | (2, ValueRef::Integer(_))
+        );
         if !fits {
             return damaged(DamageClass::ColumnOfAnotherType(name), None);
         }
@@ -4560,6 +4561,7 @@ pub(crate) struct Scan {
 #[derive(Clone, Debug)]
 pub(crate) struct Damaged {
     /// The row's 1-based position in the table's order: a pointer for the person, never a selector.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub place: u64,
     /// The row's rowid in this scan's transaction.
     pub rowid: i64,
@@ -4593,6 +4595,7 @@ impl Scan {
     }
 
     /// The readable rows that are not revoked and are not reachable from a root.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn unplaced_live(&self) -> Vec<&GrantRecord> {
         let placed = self.placed();
         self.readable
@@ -4651,6 +4654,7 @@ pub(crate) enum Roots {
     /// One named grant, revoked or not.
     Grant(GrantId),
     /// No named root: only what traces to no root.
+    #[cfg_attr(not(test), allow(dead_code))]
     None,
 }
 
@@ -6188,44 +6192,6 @@ mod a_devices_revocation {
             merged.debt = debt;
             Ok(merged)
         })
-    }
-
-    /// The orders a device's grants can be listed in: the store's own, the reverse of it, the
-    /// second half before the first, every other grant before the rest, and a fixed shuffle.
-    fn orders(held: &[GrantRecord]) -> Vec<(&'static str, Vec<GrantRecord>)> {
-        let half = held.len() / 2;
-        let mut shuffled: Vec<(u64, GrantRecord)> = held
-            .iter()
-            .enumerate()
-            .map(|(place, record)| {
-                let place = u64::try_from(place).expect("a count");
-                (
-                    place.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 7,
-                    record.clone(),
-                )
-            })
-            .collect();
-        shuffled.sort_by_key(|(key, _)| *key);
-        vec![
-            ("as the store lists them", held.to_vec()),
-            ("reversed", held.iter().rev().cloned().collect()),
-            (
-                "the second half first",
-                held[half..].iter().chain(&held[..half]).cloned().collect(),
-            ),
-            (
-                "every other grant first",
-                held.iter()
-                    .step_by(2)
-                    .chain(held.iter().skip(1).step_by(2))
-                    .cloned()
-                    .collect(),
-            ),
-            (
-                "shuffled",
-                shuffled.into_iter().map(|(_, record)| record).collect(),
-            ),
-        ]
     }
 
     /// A grant row as it is stored, read with no decode (a row this build refuses is still a row):
