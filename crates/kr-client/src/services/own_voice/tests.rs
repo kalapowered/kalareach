@@ -286,6 +286,38 @@ async fn a_stop_marks_the_row_closed_before_it_is_deleted_and_hangs_up_only_when
         .expect("a recorded 404 is a closure");
 }
 
+/// A close of a call whose task has ended is answered by its row. A record that cannot be read is
+/// not an empty record: the close is not confirmed, and nothing is hung up on a guess.
+#[tokio::test(start_paused = true)]
+async fn a_close_of_a_call_whose_task_ended_is_not_confirmed_by_a_record_that_cannot_be_read() {
+    let world = fresh();
+    world.stand_in.answer_close(false);
+    world
+        .stand_in
+        .script_hangup(HangupScript::Answer(404, Some(Vec::new())));
+    let own = started(&world).await;
+    assert!(world.provider.close(&own.call_id).await.is_err());
+    assert_eq!(states(&world), [CallState::Unresolved]);
+    assert!(
+        world.provider.host_control(&own.call_id).is_none(),
+        "the call's task has ended"
+    );
+    let hangups = world.stand_in.recorded().hangups.len();
+    world.ledger.failing("rows", true);
+    let closed = world.provider.close(&own.call_id).await;
+    world.ledger.failing("rows", false);
+    assert!(
+        closed.is_err(),
+        "a record that cannot be read does not confirm a close"
+    );
+    assert_eq!(
+        world.stand_in.recorded().hangups.len(),
+        hangups,
+        "no row was read, so none was tried again"
+    );
+    assert_eq!(states(&world), [CallState::Unresolved]);
+}
+
 #[tokio::test(start_paused = true)]
 async fn readiness_needs_the_configuration_back_as_asked_and_the_probe_under_its_own_id() {
     // A configuration that came back different.

@@ -1393,14 +1393,19 @@ impl VoiceProviderService for OwnVoiceProvider {
                 }
             } else {
                 // The call is over, or this host never held it. A row that stands for it is
-                // tried once more; a row that is gone says it was closed.
-                let rows = self.core.ledger.rows().unwrap_or_default();
-                match rows.iter().find(|row| row.call.call_id == call_id) {
-                    None => true,
-                    Some(row) if row.state == CallState::Closed => true,
-                    Some(row) => match row.provider_session_id.as_deref() {
-                        Some(session_id) => self.core.hang_up_and_mark(call_id, session_id).await,
-                        None => false,
+                // tried once more; a row that is gone says it was closed. A record that cannot be
+                // read says nothing, so the close is not confirmed.
+                match self.core.ledger.rows() {
+                    Err(_) => false,
+                    Ok(rows) => match rows.iter().find(|row| row.call.call_id == call_id) {
+                        None => true,
+                        Some(row) if row.state == CallState::Closed => true,
+                        Some(row) => match row.provider_session_id.as_deref() {
+                            Some(session_id) => {
+                                self.core.hang_up_and_mark(call_id, session_id).await
+                            }
+                            None => false,
+                        },
                     },
                 }
             };
