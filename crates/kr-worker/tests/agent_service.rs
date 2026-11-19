@@ -3233,9 +3233,11 @@ fn decision_parameters() -> serde_json::Value {
     })
 }
 
-/// Registers the plugin action the resource tests below call, on the approval tests' binding: a
-/// component's `upstream.prompt` that names the pending resource it acts on.
-fn register_answer_action(host: &Host) {
+/// Registers a plugin action that answers no request, on the approval tests' binding: a
+/// component's `upstream.prompt` named `approval.answer`. It declares the decision parameter an
+/// answer would carry, and nothing about it answers: the answer actions are those of
+/// [`register_class_actions`].
+fn register_component_prompt(host: &Host) {
     let declared: kr_plugin_sdk::effect::ActionDeclaration =
         serde_json::from_value(serde_json::json!({
             "id": "approval.answer",
@@ -3317,72 +3319,43 @@ fn offer_elsewhere(host: &Host) -> kr_protocol::ids::PendingResourceId {
         .resource_id
 }
 
-/// Sends one `plugin.action.invoke` naming a pending resource, or none, and returns the refusal
-/// code and the state of the receipt it left.
+/// Sends one `plugin.action.invoke` of `action` naming a pending resource, or none, and returns
+/// the refusal code and the state of the receipt it left.
 async fn plugin_answer(
     client: &mut Client<impl Codec>,
     host: &Host,
     request_id: u64,
+    action: &str,
     resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
 ) -> (ErrorCode, ReceiptState) {
-    let (error, action_id) = plugin_refusal(client, host, request_id, resource_id).await;
+    let (error, action_id) = plugin_refusal(client, host, request_id, action, resource_id).await;
     (error.code, receipt(client, action_id).await.state)
 }
 
-/// Sends one `plugin.action.invoke` naming a pending resource, or none, and returns its refusal
-/// and the action it was ([`send_until_decided`]).
+/// Sends one `plugin.action.invoke` of `action` naming a pending resource, or none, and returns its
+/// refusal and the action it was ([`send_until_decided`]).
 async fn plugin_refusal(
     client: &mut Client<impl Codec>,
     host: &Host,
     request_id: u64,
+    action: &str,
     resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
 ) -> (kr_protocol::error::ProtocolError, ActionId) {
     let (outcome, action_id) = send_until_decided(client, host, |client| {
-        plugin_answer_request(client, host, request_id, resource_id)
+        plugin_invocation(
+            host,
+            request_id,
+            client.action_window().action_window_id.clone(),
+            action,
+            resource_id,
+            br#"{"decision":"allow"}"#,
+        )
     })
     .await;
     let Outcome::Error(error) = outcome else {
         panic!("this host transmits no plugin action: {outcome:?}");
     };
     (error, action_id)
-}
-
-/// One `plugin.action.invoke` that answers the pending resource `resource_id`, or none.
-fn plugin_answer_request(
-    client: &Client<impl Codec>,
-    host: &Host,
-    request_id: u64,
-    resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
-) -> MutationRequest {
-    MutationRequest {
-        request_id: RequestId::new(request_id),
-        method: Method::PluginActionInvoke.into(),
-        method_version: MethodVersion::V1,
-        action_id: ActionId::new(kr_ipc::new_uuid()),
-        grant_id: Nullable::null(),
-        target: ActionTarget {
-            environment_id: host.environment_id,
-            session_id: Nullable::some(host.session_id),
-            session_epoch: Nullable::some(SessionEpoch::V1),
-            application_instance_id: Nullable::some(instance()),
-            agent_binding_revision: Nullable::some(AgentBindingRevision::new(1)),
-        },
-        expected: ParamsValue::empty(),
-        action_window_id: client.action_window().action_window_id.clone(),
-        requested_ttl_ms: DurationMs::new(60_000),
-        params: ParamsValue::from_typed(&kr_protocol::agent::PluginActionInvokeParams {
-            target: AgentMutationTarget {
-                subject: subject(host.session_id, instance()),
-                binding_revision: AgentBindingRevision::new(1),
-            },
-            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
-            action: kr_protocol::broker::ActionName::new("approval.answer").expect("valid"),
-            draft_id: Nullable::null(),
-            resource_id,
-            parameters: kr_protocol::scalars::Bytes::from(br#"{"decision":"allow"}"#.to_vec()),
-        })
-        .expect("encodes"),
-    }
 }
 
 /// Section 5: an action the package's component prepares is admitted as any other, and refused
@@ -3396,9 +3369,10 @@ async fn an_action_whose_component_is_not_registered_is_refused_before_its_marke
         &host,
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
     );
-    register_answer_action(&host);
+    register_component_prompt(&host);
     let mut client = cli(&host).await;
-    let (error, action_id) = plugin_refusal(&mut client, &host, 40, Nullable::null()).await;
+    let (error, action_id) =
+        plugin_refusal(&mut client, &host, 40, "approval.answer", Nullable::null()).await;
     // The link has not registered the component yet, and will: asking again can succeed.
     assert_eq!(error.code, ErrorCode::ResourceUnavailable);
     assert!(
@@ -3414,11 +3388,11 @@ async fn an_action_whose_component_is_not_registered_is_refused_before_its_marke
     );
 }
 
-/// KR-REQ-12.18 and section 9: a plugin action that names a pending resource is checked against
-/// that resource before its dispatch marker. An unknown resource, one that belongs to another
-/// instance and one already answered are each refused for that reason, with a receipt that says
-/// so. Naming none, or one this instance can still answer, passes the check and meets the refusal
-/// every plugin action meets here, and the resource is left exactly as it was.
+/// KR-REQ-12.18 and section 9: a plugin action that answers a request names the pending resource
+/// it answers, and the answer is checked against that resource before its dispatch marker. Naming
+/// none, an unknown resource, one that belongs to another instance and one already answered are
+/// each refused for that reason, with a receipt that says so, and the resource is left exactly as
+/// it was.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
     let host = host().await;
@@ -3428,21 +3402,25 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
     );
     let live = offer_approval(&host, Arc::clone(&upstream));
-    register_answer_action(&host);
+    register_class_actions(&host);
     let foreign = offer_elsewhere(&host);
     let unknown = kr_protocol::ids::PendingResourceId::new(Uuid::from_bytes([0x5a; 16]));
     let mut client = cli(&host).await;
 
-    // The controls: the resource check passes, and the refusal is the one every plugin action
-    // meets here, that its component is not registered with the plugin runtime. Nothing about the
-    // live resource changed.
-    assert_eq!(
-        plugin_answer(&mut client, &host, 40, Nullable::null()).await,
-        (ErrorCode::ResourceUnavailable, ReceiptState::Rejected)
+    // An answer that names no resource is refused for that.
+    let (error, action_id) =
+        plugin_refusal(&mut client, &host, 40, "request.answer", Nullable::null()).await;
+    assert_eq!(error.code, ErrorCode::InvalidArgument, "{}", error.message);
+    assert!(
+        error
+            .message
+            .contains("answers a pending request, and this call names none"),
+        "{}",
+        error.message
     );
     assert_eq!(
-        plugin_answer(&mut client, &host, 41, Nullable::some(live)).await,
-        (ErrorCode::ResourceUnavailable, ReceiptState::Rejected)
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Rejected
     );
     assert_eq!(
         host.service
@@ -3451,16 +3429,30 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
             .expect("the resource is still held")
             .state,
         kr_protocol::gateway::PendingState::Pending,
-        "a checked resource is not claimed"
+        "a refused call does not claim the resource"
     );
 
     // Each refusal names the resource's own reason.
     assert_eq!(
-        plugin_answer(&mut client, &host, 42, Nullable::some(unknown)).await,
+        plugin_answer(
+            &mut client,
+            &host,
+            42,
+            "request.answer",
+            Nullable::some(unknown)
+        )
+        .await,
         (ErrorCode::StaleSession, ReceiptState::Rejected)
     );
     assert_eq!(
-        plugin_answer(&mut client, &host, 43, Nullable::some(foreign)).await,
+        plugin_answer(
+            &mut client,
+            &host,
+            43,
+            "request.answer",
+            Nullable::some(foreign)
+        )
+        .await,
         (ErrorCode::PermissionDenied, ReceiptState::Rejected)
     );
     host.service
@@ -3473,7 +3465,14 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
         )
         .expect("the native answer is carried");
     assert_eq!(
-        plugin_answer(&mut client, &host, 44, Nullable::some(live)).await,
+        plugin_answer(
+            &mut client,
+            &host,
+            44,
+            "request.answer",
+            Nullable::some(live)
+        )
+        .await,
         (ErrorCode::QuestionResolved, ReceiptState::Rejected)
     );
 
@@ -3481,6 +3480,120 @@ async fn kr_req_12_18_a_plugin_answer_is_refused_for_the_resource_it_names() {
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "nothing was carried to the upstream"
+    );
+}
+
+/// KR-REQ-12.18: a call that names a pending resource on an action that answers no request is
+/// refused before its dispatch marker, whatever the resource is. The action is a prompt its
+/// component prepares, which this suite never registers with a plugin runtime: with no resource it
+/// is refused for that, and with a live resource it is refused for the resource, before its
+/// component is looked for. Nothing is carried, the receipt is a rejection, and the resource is
+/// left as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resource_named_on_an_action_that_answers_no_request_is_refused_before_its_marker() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let live = offer_approval(&host, Arc::clone(&upstream));
+    register_component_prompt(&host);
+    let mut client = cli(&host).await;
+
+    // The control: with no resource the call reaches the component's own refusal.
+    let (error, _) =
+        plugin_refusal(&mut client, &host, 60, "approval.answer", Nullable::null()).await;
+    assert_eq!(
+        error.code,
+        ErrorCode::ResourceUnavailable,
+        "{}",
+        error.message
+    );
+
+    let (error, action_id) = plugin_refusal(
+        &mut client,
+        &host,
+        61,
+        "approval.answer",
+        Nullable::some(live),
+    )
+    .await;
+    assert_eq!(error.code, ErrorCode::InvalidArgument, "{}", error.message);
+    assert!(
+        error
+            .message
+            .contains("approval.answer answers no pending request, and this call names one"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Rejected
+    );
+    let (state, events) = durable(&host, action_id);
+    assert_eq!(state.as_deref(), Some("rejected"));
+    assert!(
+        !events.iter().any(|event| event == "dispatching"),
+        "no dispatch marker was written: {events:?}"
+    );
+    assert_eq!(
+        host.service
+            .broker()
+            .pending(live)
+            .expect("the resource is still held")
+            .state,
+        kr_protocol::gateway::PendingState::Pending,
+        "a refused call does not claim the resource"
+    );
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing was carried to the upstream"
+    );
+}
+
+/// KR-REQ-11.47: the rule that a call names a resource only for an action that answers one stands
+/// before every route, the presentation route included, which the broker's write-path check never
+/// reaches: a presentation action that names a pending resource is refused with the rule's own
+/// sentence, before the route that carries it out, and its receipt is a rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resource_named_on_a_presentation_action_is_refused_by_the_rule_before_its_route() {
+    let host = host().await;
+    let upstream = Arc::new(CountingUpstream::default());
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    // A pending approval the owner reaches, so that the call gets past the reach check that
+    // comes first and meets the rule.
+    let live = offer_approval(&host, Arc::clone(&upstream));
+    let (_bound, _packages) = bind_the_example(&host);
+    let mut client = cli(&host).await;
+
+    let mutation = refresh_invocation_with(
+        &host,
+        140,
+        client.action_window().action_window_id.clone(),
+        "kalareach/example-declarative",
+        Nullable::some(live),
+    );
+    let action_id = mutation.action_id;
+    let outcome = send(&mut client, mutation).await;
+    let Outcome::Error(error) = outcome else {
+        panic!("a presentation action that names a resource is refused: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument, "{}", error.message);
+    assert!(
+        error
+            .message
+            .contains("status.refresh answers no pending request, and this call names one"),
+        "{}",
+        error.message
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Rejected
     );
 }
 
@@ -3497,7 +3610,7 @@ async fn kr_req_12_18_an_answer_to_an_approval_whose_run_ended_is_rejected_as_en
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
     );
     let resource_id = offer_approval(&host, Arc::clone(&upstream));
-    register_answer_action(&host);
+    register_class_actions(&host);
     host.service
         .broker()
         .native_answer_through(
@@ -3517,7 +3630,14 @@ async fn kr_req_12_18_an_answer_to_an_approval_whose_run_ended_is_rejected_as_en
 
     let mut client = cli(&host).await;
     assert_eq!(
-        plugin_answer(&mut client, &host, 50, Nullable::some(resource_id)).await,
+        plugin_answer(
+            &mut client,
+            &host,
+            50,
+            "request.answer",
+            Nullable::some(resource_id)
+        )
+        .await,
         (ErrorCode::QuestionResolved, ReceiptState::Rejected)
     );
     let (outcome, action_id) = send_until_decided(&mut client, &host, |client| {
@@ -4843,6 +4963,24 @@ fn refresh_invocation(
     request_id: u64,
     action_window_id: kr_protocol::ids::ActionWindowId,
 ) -> MutationRequest {
+    refresh_invocation_with(
+        host,
+        request_id,
+        action_window_id,
+        "kalareach/example-declarative",
+        Nullable::null(),
+    )
+}
+
+/// One `plugin.action.invoke` of `status.refresh` of the package `plugin` on the suite's
+/// instance, naming the pending resource `resource_id`, or none.
+fn refresh_invocation_with(
+    host: &Host,
+    request_id: u64,
+    action_window_id: kr_protocol::ids::ActionWindowId,
+    plugin: &str,
+    resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
+) -> MutationRequest {
     let mut mutation = plugin_invocation(
         host,
         request_id,
@@ -4856,10 +4994,10 @@ fn refresh_invocation(
             subject: subject(host.session_id, instance()),
             binding_revision: AgentBindingRevision::new(1),
         },
-        plugin_id: PluginId::new("kalareach/example-declarative").expect("valid"),
+        plugin_id: PluginId::new(plugin).expect("valid"),
         action: kr_protocol::broker::ActionName::new("status.refresh").expect("valid"),
         draft_id: Nullable::null(),
-        resource_id: Nullable::null(),
+        resource_id,
         parameters: kr_protocol::scalars::Bytes::from(
             kr_cbor::to_canonical_vec(&serde_json::json!({ "detail": "summary" }))
                 .expect("the action's parameters"),

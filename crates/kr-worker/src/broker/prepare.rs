@@ -279,6 +279,31 @@ impl Broker {
         read_arguments(declared, &Self::executable_arguments(params)?).map(|_| ())
     }
 
+    /// Checks that an invocation names a pending request only when its action answers one.
+    ///
+    /// The resource an invocation names says which request an answer resolves, and it is part of
+    /// the subject a plugin action is held under. An action that answers nothing therefore names
+    /// none: a call could otherwise change the subject of a prompt by naming an open approval, and
+    /// pass the hold an uncertain prompt leaves. An answer that names none is refused where the
+    /// answer is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the action answers no pending request and the
+    /// call names one.
+    pub fn check_resource_named(
+        declared: &RegisteredAction,
+        params: &PluginActionInvokeParams,
+    ) -> Result<()> {
+        if declared.decision.is_none() && params.resource_id.is_present() {
+            return Err(BrokerError::invalid(format!(
+                "{} answers no pending request, and this call names one",
+                params.action
+            )));
+        }
+        Ok(())
+    }
+
     /// Checks what can be checked of a component's action before anything is prepared, and
     /// returns what preparing it needs.
     ///

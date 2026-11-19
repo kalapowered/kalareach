@@ -27464,7 +27464,7 @@
               "type": "null"
             }
           ],
-          "description": "The pending resource this invocation answers.\n\nAn action whose effect class is `approval.respond` answers exactly one pending request,\nand this names it. Every other action names none. The caller never supplies the upstream's\nown request identifier: an answer carries the identifier the named resource recorded when\nthe request arrived, so it can resolve only the request it names."
+          "description": "The pending resource this invocation answers.\n\nAn action that answers a pending request, through the connector table's decision\ndestination, answers exactly one, and this names it. Every other action names none, and a\ncall that names one is refused before anything is admitted. The caller never supplies the\nupstream's own request identifier: an answer carries the identifier the named resource\nrecorded when the request arrived, so it can resolve only the request it names."
         },
         "target": {
           "$ref": "#/$defs/AgentMutationTarget",

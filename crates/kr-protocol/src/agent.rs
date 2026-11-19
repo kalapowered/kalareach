@@ -423,10 +423,11 @@ pub struct PluginActionInvokeParams {
     pub draft_id: Nullable<DraftId>,
     /// The pending resource this invocation answers.
     ///
-    /// An action whose effect class is `approval.respond` answers exactly one pending request,
-    /// and this names it. Every other action names none. The caller never supplies the upstream's
-    /// own request identifier: an answer carries the identifier the named resource recorded when
-    /// the request arrived, so it can resolve only the request it names.
+    /// An action that answers a pending request, through the connector table's decision
+    /// destination, answers exactly one, and this names it. Every other action names none, and a
+    /// call that names one is refused before anything is admitted. The caller never supplies the
+    /// upstream's own request identifier: an answer carries the identifier the named resource
+    /// recorded when the request arrived, so it can resolve only the request it names.
     pub resource_id: Nullable<PendingResourceId>,
     /// The action's parameters, canonically encoded by the caller.
     ///
