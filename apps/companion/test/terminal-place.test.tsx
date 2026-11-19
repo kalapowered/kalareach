@@ -21,6 +21,7 @@ import { MOVES_LATER } from '../src/terminal/modes'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const ACTION = '00000000-0000-4000-8000-00000000abcd'
+const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
 type Controls = ReturnType<typeof fakeHost>['controls']
 
@@ -412,10 +413,139 @@ describe('a terminal view keeps its place across a pane change', () => {
       const sentence = screen.getByTestId('terminal-mode-sentence')
       expect(sentence.getAttribute('data-moves')).toBeNull()
       expect(sentence.textContent).not.toBe(MOVES_LATER)
-      wheel(-16)
+      // The page's own buttons move it too: one with room is enabled, and its move is sent.
+      const up = screen.getByRole('button', { name: 'Move the window up' })
+      expect(up).toBeEnabled()
+      await userEvent.setup().click(up)
       await waitFor(() => {
         expect(view?.moves).toHaveLength(1)
       })
+      wheel(-16)
+      await waitFor(() => {
+        expect(view?.moves).toHaveLength(2)
+      })
+    } finally {
+      restore()
+    }
+  })
+
+  it('does not wait for a place the opening never asked for, though the store held one when it began', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await scrolledUp(controls)
+      // The second view holds its moves once it has its first screen.
+      controls.holdTerminalMoves()
+      await awayAndBack(person)
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      await waitFor(() => {
+        expect(firstRow()).toBe('$ echo earlier 11')
+      })
+      // The person takes control and the return to the live screen is never settled: the opening
+      // keeps the live place, which is the first line and column, and drops its frame.
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      await waitFor(() => {
+        expect(controls.terminalViews[1]?.moves.at(-1)).toMatchObject({ live: true })
+      })
+      controls.holdTerminalViews()
+      act(() => {
+        controls.terminalViews[1]?.end('The session closed.')
+      })
+      await person.click(await screen.findByRole('button', { name: /Attach again/ }))
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(3)
+      })
+      const view = controls.terminalViews[2]
+      act(() => {
+        view?.attach()
+      })
+      // The store held the window's place when the attempt began, and holds none now: the opening
+      // asked for none, so it has no place to wait for.
+      expect(view?.anchor).toBeNull()
+      const sentence = screen.getByTestId('terminal-mode-sentence')
+      expect(sentence.getAttribute('data-moves')).toBeNull()
+      expect(sentence.textContent).not.toBe(MOVES_LATER)
+    } finally {
+      restore()
+    }
+  })
+
+  it('waits for the live place the last opening kept, with no frame to move', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port, { view: 'session', sessionId: SESSION_BUILD, pane: 'terminal' })
+      const right = await screen.findByRole('button', { name: 'Move the window right' })
+      await waitFor(() => {
+        expect(right).toBeEnabled()
+      })
+      await person.click(right)
+      await waitFor(() => {
+        expect(controls.terminalViews[0]?.moves).toHaveLength(1)
+      })
+      // The second view restores the place and holds its moves once it has its first screen.
+      controls.holdTerminalMoves()
+      await awayAndBack(person)
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      expect(controls.terminalViews[1]?.anchor).toMatchObject({ row: null, column: 20 })
+      await waitFor(() => {
+        expect(screen.getByTestId('terminal-surface').getAttribute('aria-busy')).toBe('false')
+      })
+      // A return to the live screen that nothing settles leaves the window's place off the first
+      // column, and the retry has no frame: the opening asks for that place, and the window cannot
+      // move until it has it.
+      await person.click(screen.getByRole('button', { name: 'Take control' }))
+      await waitFor(() => {
+        expect(controls.terminalViews[1]?.moves.at(-1)).toMatchObject({ live: true })
+      })
+      controls.holdTerminalViews()
+      act(() => {
+        controls.terminalViews[1]?.end('The session closed.')
+      })
+      await person.click(await screen.findByRole('button', { name: /Attach again/ }))
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(3)
+      })
+      const view = controls.terminalViews[2]
+      expect(view?.anchor).toMatchObject({ row: null, column: 20 })
+      act(() => {
+        view?.attach()
+      })
+      const sentence = screen.getByTestId('terminal-mode-sentence')
+      expect(sentence.getAttribute('data-moves')).toBe('later')
+      expect(sentence.textContent).toBe(MOVES_LATER)
+    } finally {
+      restore()
+    }
+  })
+
+  it('stops waiting for a place when the view ends before its first screen', async () => {
+    const person = userEvent.setup()
+    const restore = laidOut()
+    try {
+      const { port, controls } = fakeHost()
+      open(port)
+      await scrolledUp(controls)
+      controls.holdTerminalViews()
+      await awayAndBack(person)
+      await waitFor(() => {
+        expect(controls.terminalViews).toHaveLength(2)
+      })
+      act(() => {
+        controls.terminalViews[1]?.attach()
+        controls.terminalViews[1]?.end('The session closed.')
+      })
+      expect(await screen.findByRole('button', { name: /Attach again/ })).toBeInTheDocument()
+      const sentence = screen.getByTestId('terminal-mode-sentence')
+      expect(sentence.getAttribute('data-moves')).toBeNull()
+      expect(sentence.textContent).not.toBe(MOVES_LATER)
     } finally {
       restore()
     }
