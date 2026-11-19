@@ -1227,11 +1227,22 @@ mod tests {
     enum Behaviour {
         /// Answer with this status and body, and state the body's length.
         Answer { status: u16, body: Vec<u8> },
-        /// Answer with a head stating this length, write this much of the body, and stop there.
+        /// Answer with this status and a head stating this length, write this much of the body,
+        /// and stop there.
         ///
         /// The answer's head is in the client's hands and its body never finishes, which is the
         /// one phase a deadline can cover that no earlier phase can.
-        HeadThenStall { stated: usize, body: Vec<u8> },
+        HeadThenStall {
+            status: u16,
+            stated: usize,
+            body: Vec<u8>,
+        },
+        /// As [`Self::HeadThenStall`], and then end the connection: the body is cut short.
+        HeadThenCut {
+            status: u16,
+            stated: usize,
+            body: Vec<u8>,
+        },
         /// Answer with this status and body and state no length, closing to mark the end.
         AnswerWithoutLength { status: u16, body: Vec<u8> },
         /// Answer with this status and body, stating the length and these extra headers.
@@ -1685,9 +1696,26 @@ mod tests {
                 stream.write_all(head.as_bytes()).await?;
                 stream.flush().await?;
             }
-            Behaviour::HeadThenStall { stated, body } => {
+            Behaviour::HeadThenCut {
+                status,
+                stated,
+                body,
+            } => {
                 let head = format!(
-                    "HTTP/1.1 200 \r\ncontent-type: application/json\r\ncontent-length: {stated}\r\n\r\n"
+                    "HTTP/1.1 {status} \r\ncontent-type: application/json\r\ncontent-length: {stated}\r\n\r\n"
+                );
+                stream.write_all(head.as_bytes()).await?;
+                stream.write_all(body).await?;
+                stream.flush().await?;
+                return Ok(false);
+            }
+            Behaviour::HeadThenStall {
+                status,
+                stated,
+                body,
+            } => {
+                let head = format!(
+                    "HTTP/1.1 {status} \r\ncontent-type: application/json\r\ncontent-length: {stated}\r\n\r\n"
                 );
                 stream.write_all(head.as_bytes()).await?;
                 stream.write_all(body).await?;
@@ -2742,6 +2770,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_that_never_finishes_arriving_fails_in_the_answer_phase() {
         let gateway = Gateway::start(Behaviour::HeadThenStall {
+            status: 200,
             stated: 4096,
             body: b"{\"part\":".to_vec(),
         })
@@ -2792,6 +2821,76 @@ mod tests {
             "the body started and did not finish: {} of 4096",
             gateway.body_bytes_written()
         );
+    }
+
+    /// The status a service answered survives an answer whose body stalls, and the body is given
+    /// the bound the call names and no more, whatever the total deadline allows.
+    #[tokio::test]
+    async fn a_status_survives_a_body_that_stalls_inside_the_bound_the_call_gives_it() {
+        for status in [201_u16, 401, 429, 503] {
+            let gateway = Gateway::start(Behaviour::HeadThenStall {
+                status,
+                stated: 4096,
+                body: b"{\"part\":".to_vec(),
+            })
+            .await;
+            let deadlines = HttpDeadlines {
+                connect: OUT_OF_REACH,
+                read: OUT_OF_REACH,
+                total: UNDER_TEST,
+            };
+            let reached = Arc::new(Reached::default());
+            let transport = gateway
+                .deadlined(deadlines)
+                .reporting_to(Arc::clone(&reached) as Arc<dyn ExchangeProgress>);
+            let url = gateway.url("/v1/realtime/calls");
+            let bound = Duration::from_secs(15);
+            let mut call = Box::pin(transport.post_json_keeping_status(&url, b"{}", &[], bound));
+            tokio::select! {
+                biased;
+                () = reached.phase(ExchangePhase::Answer) => {}
+                outcome = &mut call => panic!("this answer never finishes: {:?}", outcome.map(|answer| answer.status)),
+            }
+
+            tokio::time::pause();
+            let from = tokio::time::Instant::now();
+            let answer = call.await.expect("the status line arrived");
+            let advanced = tokio::time::Instant::now() - from;
+
+            assert_eq!(answer.status, status, "the status is kept");
+            assert!(answer.body.is_err(), "the body never finished");
+            assert!(
+                advanced <= bound + CLOCK_GRAIN,
+                "the body had the bound and no more: {advanced:?}"
+            );
+            tokio::time::resume();
+        }
+    }
+
+    /// The status survives a body that is cut short, and the failure comes at once: nothing waits
+    /// for the bound.
+    #[tokio::test]
+    async fn a_status_survives_a_body_that_is_cut_short() {
+        for status in [200_u16, 401, 500] {
+            let gateway = Gateway::start(Behaviour::HeadThenCut {
+                status,
+                stated: 4096,
+                body: b"{\"part\":".to_vec(),
+            })
+            .await;
+            let transport = gateway.deadlined(HttpDeadlines {
+                connect: OUT_OF_REACH,
+                read: OUT_OF_REACH,
+                total: UNDER_TEST,
+            });
+            let url = gateway.url("/v1/realtime/calls");
+            let answer = transport
+                .post_json_keeping_status(&url, b"{}", &[], OUT_OF_REACH)
+                .await
+                .expect("the status line arrived");
+            assert_eq!(answer.status, status, "the status is kept");
+            assert!(answer.body.is_err(), "the body was cut short");
+        }
     }
 
     #[tokio::test]

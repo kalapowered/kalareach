@@ -996,3 +996,40 @@ async fn every_counted_command_meets_one_pace_and_a_frame_over_the_limit_is_refu
         "the writer refuses a message over the limit"
     );
 }
+
+/// K6 and K15 at the mapping the transport makes: a status the exchange kept decides the class of
+/// the creation and of the hangup, whatever became of the answer's body.
+#[test]
+fn a_status_kept_across_a_failed_body_decides_the_class_of_the_creation_and_of_the_hangup() {
+    let kept = |status: u16| {
+        reply_of(Ok(crate::services::http::StatusAnswer {
+            status,
+            body: Err(ClientError::refusal(
+                ErrorCode::OutcomeUnknown,
+                Shown::said("the answer's body did not arrive"),
+            )),
+        }))
+    };
+    for status in [400_u16, 401, 403, 404, 302] {
+        assert_eq!(
+            classify_creation(&kept(status)),
+            Creation::Refused { status },
+            "a refusing status is a refusal whatever the body did"
+        );
+    }
+    for status in [201_u16, 429, 500, 503] {
+        assert_eq!(
+            classify_creation(&kept(status)),
+            Creation::Unknown,
+            "an unreadable success and a status that asks to wait keep the row"
+        );
+    }
+    assert!(
+        closure_recognised(&kept(200)),
+        "a hangup that answered 200 is confirmed whatever the body did"
+    );
+    assert!(
+        !closure_recognised(&kept(404)),
+        "a 404 with no body is not a recognised closure"
+    );
+}
