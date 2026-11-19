@@ -37,7 +37,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kr_plugin_sdk::hook_events::{CONTACT_REQUEST_MEMBER, HookEvent, HookEvents, HookReport};
-use serde::de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Unexpected, Visitor};
+use serde::de::{
+    DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Unexpected, Visitor,
+};
 
 use crate::exchange::Exchange;
 use crate::registration::{Bridge, Paths, Registration};
@@ -728,7 +730,10 @@ pub fn read_input(input: impl std::io::Read, events: &HookEvents) -> Result<Obse
         tool_request_id: take(Slot::RequestId),
         notification_kind: take(Slot::NotificationKind),
         notification_text: take(Slot::NotificationText),
-        agreeing: (0..events.contact.as_ref().map_or(0, |contact| contact.agreeing.len()))
+        agreeing: (0..events
+            .contact
+            .as_ref()
+            .map_or(0, |contact| contact.agreeing.len()))
             .map(|index| take(Slot::Agreeing(index)))
             .collect(),
     })
@@ -1498,7 +1503,12 @@ mod tests {
         assert!(THREAD_REPORT_LINGER < HOOK_DEADLINE);
         for application in &every() {
             let events = HookEvents::claude_code();
-            for HookEvent { name: event, report, .. } in &events.events {
+            for HookEvent {
+                name: event,
+                report,
+                ..
+            } in &events.events
+            {
                 let input = read_input(
                     serde_json::json!({"session_id": "t", "hook_event_name": event})
                         .to_string()
@@ -1508,7 +1518,10 @@ mod tests {
                 .expect("a hook's input");
                 assert_eq!(
                     reports_thread(&events, &input),
-                    matches!(report, HookReport::SessionStarted | HookReport::SessionEnded),
+                    matches!(
+                        report,
+                        HookReport::SessionStarted | HookReport::SessionEnded
+                    ),
                     "{} {event}",
                     application.name
                 );
@@ -1747,11 +1760,7 @@ mod tests {
         let events = HookEvents::claude_code();
         for word in ["claude-code", "gemini-cli", "qoder-cli", "amp"] {
             for (payload, expected) in &cases {
-                assert_eq!(
-                    translated(&events, payload),
-                    *expected,
-                    "{word} {payload}"
-                );
+                assert_eq!(translated(&events, payload), *expected, "{word} {payload}");
             }
         }
     }
@@ -1764,9 +1773,9 @@ mod tests {
 
         fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
             let events = HookEvents::claude_code();
-            let input = read_input(payload.to_string().as_bytes(), &events).expect("a hook's input");
-            observation(&events, &input)
-                .map(|frame| frame["kr_observation"].clone())
+            let input =
+                read_input(payload.to_string().as_bytes(), &events).expect("a hook's input");
+            observation(&events, &input).map(|frame| frame["kr_observation"].clone())
         }
 
         /// The payloads Qoder CLI 1.1.63 wrote for a session starting and ending, and the ones its hook
@@ -1876,9 +1885,9 @@ mod tests {
 
         fn translated(payload: &serde_json::Value) -> Option<serde_json::Value> {
             let events = HookEvents::claude_code();
-            let input = read_input(payload.to_string().as_bytes(), &events).expect("a hook's input");
-            observation(&events, &input)
-                .map(|frame| frame["kr_observation"].clone())
+            let input =
+                read_input(payload.to_string().as_bytes(), &events).expect("a hook's input");
+            observation(&events, &input).map(|frame| frame["kr_observation"].clone())
         }
 
         /// The payloads Gemini CLI 0.60.0 wrote for a session starting and ending, and the one its
@@ -2057,8 +2066,14 @@ mod tests {
             }
             translated(&events, &payload).expect("an observation")["contact_request"].clone()
         };
-        assert_eq!(finished("kalareach.ask_user", serde_json::Value::Null), "r-9");
-        assert_eq!(finished("kalareach.ask_user", serde_json::json!("kalareach")), "r-9");
+        assert_eq!(
+            finished("kalareach.ask_user", serde_json::Value::Null),
+            "r-9"
+        );
+        assert_eq!(
+            finished("kalareach.ask_user", serde_json::json!("kalareach")),
+            "r-9"
+        );
         assert!(finished("kalareach.ask_user", serde_json::json!("elsewhere")).is_null());
         assert!(finished("mcp__kalareach__ask_user", serde_json::Value::Null).is_null());
         assert!(finished("elsewhere.ask_user", serde_json::Value::Null).is_null());

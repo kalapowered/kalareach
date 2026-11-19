@@ -655,16 +655,17 @@ async fn a_vendor_hook_selects_the_thread_in_a_launch() {
             .map(|name| serde_json::json!({"type": "member", "name": name}))
             .collect::<Vec<_>>()})
     };
-    let events: kr_plugin_sdk::hook_events::HookEvents = serde_json::from_value(serde_json::json!({
-        "event": place(&["event", "name"]),
-        "thread": place(&["thread", "id"]),
-        "events": [
-            {"name": "session_open", "report": "session_started", "continued_by": "resume"},
-            {"name": "session_close", "report": "session_ended"},
-        ],
-        "details": {"start_source": place(&["origin"]), "end_reason": place(&["cause"])},
-    }))
-    .expect("events");
+    let events: kr_plugin_sdk::hook_events::HookEvents =
+        serde_json::from_value(serde_json::json!({
+            "event": place(&["event", "name"]),
+            "thread": place(&["thread", "id"]),
+            "events": [
+                {"name": "session_open", "report": "session_started", "continued_by": "resume"},
+                {"name": "session_close", "report": "session_ended"},
+            ],
+            "details": {"start_source": place(&["origin"]), "end_reason": place(&["cause"])},
+        }))
+        .expect("events");
     assert_eq!(events.refusals(), Vec::new());
     let placed = Placed::new();
     let mut launch = Launch::start_with_events(
@@ -712,5 +713,8 @@ async fn a_vendor_hook_selects_the_thread_in_a_launch() {
         assert_eq!(outcome.code, 0, "{named}: {}", outcome.stderr);
         assert_eq!(outcome.stdout, b"{}\n", "{named}");
     }
-    assert!(!observed.thread_selected, "the session closing leaves no thread selected");
+    assert!(
+        !observed.thread_selected,
+        "the session closing leaves no thread selected"
+    );
 }

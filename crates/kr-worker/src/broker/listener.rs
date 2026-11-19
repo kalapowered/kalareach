@@ -647,9 +647,9 @@ mod tests {
     /// file.
     #[test]
     fn a_registration_names_the_events_file_its_launch_wrote() {
-        let named =
-            registration()
-            .with_events(Some(std::path::PathBuf::from("/run/kr/c/a/hook-events.json")));
+        let named = registration().with_events(Some(std::path::PathBuf::from(
+            "/run/kr/c/a/hook-events.json",
+        )));
         let file = named.to_file_of(None);
         assert!(
             file.contains("\nevents=/run/kr/c/a/hook-events.json\n"),

@@ -246,7 +246,10 @@ fn outside_a_launch_the_input_is_drained_without_a_parse_and_without_a_diagnosti
             let case = format!("{} {} bytes", hooks.application, input.len());
             assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
             assert_eq!(ran.stdout, b"{}\n", "{case}");
-            assert_eq!(ran.stderr, "", "{case}: nothing is said about an input nobody reads");
+            assert_eq!(
+                ran.stderr, "",
+                "{case}: nothing is said about an input nobody reads"
+            );
             common::assert_answered_in_time(&ran.stderr, SHORTEST_TIMEOUT, &case);
         }
     }

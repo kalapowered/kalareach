@@ -1016,7 +1016,11 @@ fn check_closed_vocabularies(value: &serde_json::Value, report: &mut Report) {
 ///
 /// The worker and the forwarder call the same check on the value, so what passes here is what both
 /// accept.
-fn check_hook_events(manifest: &PluginManifest, connector: &ConnectorManifest, report: &mut Report) {
+fn check_hook_events(
+    manifest: &PluginManifest,
+    connector: &ConnectorManifest,
+    report: &mut Report,
+) {
     let Some(events) = &connector.hook_events else {
         return;
     };

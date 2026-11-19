@@ -53,7 +53,7 @@ fn package(
             }));
         manifest["command_integration"] = json!({
             "command": "example-agent",
-            "flags": [],
+            "flags": ["--example-flag"],
             "variables": [],
             "grant_statement": "Starts the agent in KalaReach sessions with what its bridge needs"
         });
@@ -311,24 +311,22 @@ fn a_contact_with_no_tool_name_place_is_refused_by_name() {
 
 #[test]
 fn a_map_over_eight_kib_is_refused_by_name() {
-    // Thirty-two names of sixty-four characters that a JSON writer escapes, so the value takes
-    // well over eight kibibytes while every other bound holds.
+    // Fifty members that name the contact's server, each a place of three members of sixty-four
+    // characters that a JSON writer escapes: every other bound holds, and the value takes well over
+    // eight kibibytes.
+    let long = |tag: char| format!("{}{tag}", "\"".repeat(62));
     let validated = declaring(edited(|map| {
-        map["events"] = Value::Array(
-            (0..32)
-                .map(|index| {
+        map["contact"]["agreeing"] = Value::Array(
+            ('a'..='z')
+                .chain('A'..='Z')
+                .map(|tag| {
                     json!({
-                        "name": format!("{}{index:02}", "\"".repeat(62)),
-                        "report": "notification",
+                        "place": place(&[&long(tag), &long(tag), &long(tag)]),
+                        "names": "server",
                     })
                 })
                 .collect(),
         );
-        map.as_object_mut().expect("an object").remove("contact");
-        map["details"]
-            .as_object_mut()
-            .expect("an object")
-            .remove("start_source");
     }));
     assert_refused_by_name(&validated, HookEventsRefusal::TooLarge);
 }
