@@ -2514,6 +2514,10 @@ jobs:
       matrix:
         os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && !inputs.macos && '["ubuntu-24.04"]' || '["ubuntu-24.04", "macos-15"]') }}
     runs-on: ${{ matrix.os }}
+    # The tests here run where the account is the run's alone, so the cases that load a launchd job
+    # run, as they do in the macos job; a run that does not ask for that launchd stands them down.
+    env:
+      KR_ALLOW_ACCOUNT_LAUNCHD: "1"
     steps:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -3310,6 +3314,10 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
     timeout-minutes: 195
+    # The tests here run where the account is the run's alone, so the cases that load a launchd job
+    # run, as they do in the macos job; a run that does not ask for that launchd stands them down.
+    env:
+      KR_ALLOW_ACCOUNT_LAUNCHD: "1"
     steps:
       - name: Check out
         timeout-minutes: 5
@@ -3430,6 +3438,10 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
     timeout-minutes: 160
+    # The tests here run where the account is the run's alone, so the cases that load a launchd job
+    # run, as they do in the macos job; a run that does not ask for that launchd stands them down.
+    env:
+      KR_ALLOW_ACCOUNT_LAUNCHD: "1"
     steps:
       - name: Check out
         timeout-minutes: 5
