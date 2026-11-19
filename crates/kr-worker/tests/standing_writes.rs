@@ -12,9 +12,10 @@
 //! functions declare has to be a counted name, an `outside` one, allowed for that body (the
 //! standard library's or another crate's) or declared with the file of the definition that the
 //! body calls, which is read as well; so a helper that a listed body reaches by either is held to
-//! the same rows. What the scan does not follow is named in the header of the reader. The functions that make the time contract's writes
-//! (the full check, the second raise, the kept reading) are listed by caller across the whole
-//! crate.
+//! the same rows. What the scan does not follow is named in the header of the reader. The functions
+//! that make the time contract's writes (the full check, the second raise, the kept reading) are
+//! listed by caller across the whole crate, except the contract's `take`, which only its own module
+//! can call and which is listed by caller in that file.
 //!
 //! The cases after the first plant a fault in the real source and show the scan reporting it with
 //! the one finding that names the place: a write in a function that may make none, each of the
@@ -269,6 +270,32 @@ fn a_new_caller_of_a_time_contract_writer_is_reported() {
     only_finding(
         &found,
         "service.rs rogue calls check_utc_deadline 1 time(s) and no row lists the caller",
+    );
+}
+
+#[test]
+fn a_new_caller_of_the_time_contracts_take_is_reported() {
+    let found = planted(
+        TIME,
+        "    fn tombstone(&self, object: &ExpiringObject, reason: ExpiryReason) -> ExpirationTombstone {",
+        "    fn rogue(&self) {\n        let _ = self.take();\n    }\n\n    fn tombstone(&self, object: &ExpiringObject, reason: ExpiryReason) -> ExpirationTombstone {",
+    );
+    only_finding(
+        &found,
+        "action/time.rs rogue calls take 1 time(s) and no row lists the caller",
+    );
+}
+
+#[test]
+fn a_second_take_in_a_listed_caller_of_the_time_contract_is_reported() {
+    let found = planted(
+        TIME,
+        "        let taken = self.take().narrow?;\n        let trust = self.lock().trust;",
+        "        let taken = self.take().narrow?;\n        let _again = self.take();\n        let trust = self.lock().trust;",
+    );
+    only_finding(
+        &found,
+        "action/time.rs checkpoint_at calls take 2 time(s) and its caller row says 1",
     );
 }
 
