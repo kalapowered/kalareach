@@ -1243,6 +1243,7 @@ pub mod fixture {
                 volatile_forwarding: false,
                 answers: false,
                 hook_events: None,
+placement: None,
             }
         }
 
@@ -1266,6 +1267,7 @@ pub mod fixture {
                 volatile_forwarding: false,
                 answers: false,
                 hook_events: None,
+placement: None,
             }
         }
 
@@ -1296,6 +1298,7 @@ pub mod fixture {
                 volatile_forwarding: true,
                 answers: false,
                 hook_events: None,
+placement: None,
             }
         }
 
@@ -1306,6 +1309,7 @@ pub mod fixture {
             Self {
                 answers: true,
                 hook_events: None,
+placement: None,
                 ..Self::codex_backend()
             }
         }
@@ -1327,6 +1331,7 @@ pub mod fixture {
                 volatile_forwarding: false,
                 answers: false,
                 hook_events: None,
+placement: None,
             }
         }
     }
@@ -1349,6 +1354,7 @@ pub mod fixture {
             volatile_forwarding: false,
             answers: false,
             hook_events: None,
+placement: None,
         }
     }
 
