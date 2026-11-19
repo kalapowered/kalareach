@@ -578,6 +578,17 @@ jobs:
             !/tmp/kr-test-artifacts/m1b-*
           if-no-files-found: error
 
+      # The programs a release ships hold none of the refusal that test builds carry for the
+      # account's own launchd: each is built alone, in a target directory of its own, as a release
+      # tree builds it (the debug profile holds the same features and builds in far less time), and
+      # its bytes are searched, after the test programs that carry the refusal are shown to hold it.
+      - name: The programs a release ships hold no launchd refusal
+        if: ${{ !cancelled() }}
+        timeout-minutes: 90
+        env:
+          KR_SHIPPED_PROFILE: debug
+        run: bash scripts/shipped-hold-gate.sh
+
       # What the disk had left once the build and every check above it were done, beside the
       # reading the first step took.
       - name: What the disk has left
