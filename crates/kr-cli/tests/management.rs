@@ -1190,6 +1190,10 @@ struct Seen {
 const STATEMENT: &str =
     "Adds one registration file under the application's own directory, which it runs.";
 
+/// What the placement part of the statement says, for the bridge installation cases.
+const PLACEMENT_READING: &str = "This package places files for \"Codex\" in a folder it chose: .codex/plugins/kalareach/ \
+     under your home folder, files plugin.json.";
+
 /// The host's reading of the command integration the installation cases name.
 const INTEGRATION_READING: &str = "Runs \"codex\" in KalaReach sessions with these arguments \
      added, in this order: \"--remote\" \"{gateway}\". It sets no environment variables.";
@@ -1273,7 +1277,11 @@ impl OwnerDevice {
                         .iter()
                         .any(|name| name == "native_bridge.install")
                         .then_some(STATEMENT),
-                    None,
+                    params
+                        .grant
+                        .iter()
+                        .any(|name| name == "native_bridge.install")
+                        .then_some(PLACEMENT_READING),
                     params
                         .grant
                         .iter()
@@ -1722,6 +1730,7 @@ async fn an_installation_confirmed_on_an_owner_device_is_installed_with_the_publ
 async fn an_installation_with_a_command_integration_is_shown_the_hosts_reading_of_it() {
     use kr_protocol::confirmation::{
         COMMAND_INTEGRATION_NOTICE, INTEGRATION_STATEMENT_LABEL, NATIVE_BRIDGE_NOTICE,
+        PLACEMENT_STATEMENT_LABEL,
     };
     // `--grant` takes one capability and is repeated for each.
     let mut both = command_integration_install_line();
@@ -1767,6 +1776,20 @@ async fn an_installation_with_a_command_integration_is_shown_the_hosts_reading_o
             said.contains(&format!("the publisher says: {STATEMENT}")),
             bridge,
             "the publisher's words are shown for a bridge, apart from the reading: {said}"
+        );
+        // This command line takes no hello of a paired link, so no host here states that it writes
+        // the placement reading: the part and its label stay in the publisher's line, and no line
+        // captions it as the host's.
+        assert_eq!(
+            said.contains(&format!(
+                "the publisher says: {STATEMENT} {PLACEMENT_STATEMENT_LABEL} {PLACEMENT_READING}"
+            )),
+            bridge,
+            "the placement part is shown whole in the publisher's line: {said}"
+        );
+        assert!(
+            !said.contains(&format!("  {PLACEMENT_STATEMENT_LABEL}")),
+            "no line captions the placement part as the host's: {said}"
         );
         serving.abort();
     }
