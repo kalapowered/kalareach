@@ -9491,3 +9491,151 @@ async fn a_rejection_under_privacy_mode_commits_the_receipt_without_the_envelope
         );
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-12.18, KR-REQ-23.24: an operation a channel carried ends unknown for good, and does not
+// stand in the way of the next request; every other unknown outcome still does
+// ---------------------------------------------------------------------------------------------
+
+/// Records an action for the approval-answer method and settles it as unknown at `at_ms`: as a
+/// channel end when `channel_end` is set, as any other unknown outcome when it is not.
+fn settled_unknown(
+    journal: &mut Journal,
+    action_byte: u8,
+    subject_byte: u8,
+    channel_end: bool,
+    at_ms: u64,
+) {
+    let phone = actor("device:phone");
+    journal
+        .accept(&submission(action_byte, action_byte, subject_byte))
+        .expect("an intent");
+    journal
+        .mark_dispatching(phone.clone(), action(action_byte), TimestampMs::new(at_ms))
+        .expect("the marker is committed");
+    let failure = kr_protocol::error::ProtocolError::new(
+        ErrorCode::OutcomeUnknown,
+        "nobody can establish what became of it",
+    );
+    let settled = if channel_end {
+        journal.settle_channel_end(
+            phone,
+            action(action_byte),
+            failure,
+            TimestampMs::new(at_ms + 1),
+        )
+    } else {
+        journal.settle(
+            phone,
+            action(action_byte),
+            ReceiptState::Unknown,
+            None,
+            Some(failure),
+            TimestampMs::new(at_ms + 1),
+        )
+    }
+    .expect("the outcome is recorded");
+    assert_eq!(
+        settled.state,
+        ReceiptState::Unknown,
+        "a channel end is an unknown receipt"
+    );
+}
+
+/// The action the hold would name for the approval-answer method and the subject `subject_byte`.
+fn held_by(journal: &Journal, subject_byte: u8) -> Option<ActionId> {
+    journal
+        .uncertain_for_subject(
+            &actor("device:phone"),
+            Method::AgentApprovalRespond,
+            Digest256::from_bytes([subject_byte; 32]),
+        )
+        .expect("reads")
+        .map(|(action_id, _)| action_id)
+}
+
+/// KR-REQ-12.18: a receipt that ended as a channel end stays `unknown`, and a fresh request for its
+/// subject is not held back by it.
+#[test]
+fn a_channel_end_stays_unknown_and_does_not_stand_in_the_way_of_a_fresh_request() {
+    let mut journal = Journal::in_memory().expect("a journal");
+    settled_unknown(&mut journal, 1, 7, true, 2_000);
+    assert_eq!(
+        held_by(&journal, 7),
+        None,
+        "nothing will ever change what a channel end says, so it has no result to show first"
+    );
+    let receipt = journal
+        .read(actor("device:phone"), action(1))
+        .expect("reads")
+        .expect("a receipt");
+    assert_eq!(receipt.state, ReceiptState::Unknown);
+    assert_eq!(
+        receipt.error.as_ref().map(|error| error.code),
+        Some(ErrorCode::OutcomeUnknown)
+    );
+}
+
+/// KR-REQ-23.24: the unknown outcome of any other transport still stands in the way of a fresh
+/// request for its subject, as it always did.
+#[test]
+fn an_unknown_outcome_that_is_not_a_channel_end_still_stands_in_the_way() {
+    let mut journal = Journal::in_memory().expect("a journal");
+    settled_unknown(&mut journal, 1, 7, false, 2_000);
+    assert_eq!(held_by(&journal, 7), Some(action(1)));
+}
+
+/// KR-REQ-23.24: a channel end hides no other unknown outcome of its subject, whichever of the two
+/// came last.
+#[test]
+fn a_channel_end_never_hides_another_unknown_outcome_of_the_same_subject() {
+    let mut journal = Journal::in_memory().expect("a journal");
+    settled_unknown(&mut journal, 1, 7, false, 2_000);
+    settled_unknown(&mut journal, 2, 7, true, 4_000);
+    assert_eq!(
+        held_by(&journal, 7),
+        Some(action(1)),
+        "the channel end is newer, and the older unknown outcome still holds"
+    );
+    settled_unknown(&mut journal, 3, 7, false, 6_000);
+    settled_unknown(&mut journal, 4, 7, true, 8_000);
+    assert_eq!(
+        held_by(&journal, 7),
+        Some(action(3)),
+        "the newest unknown outcome that is not a channel end is the one that holds"
+    );
+}
+
+/// KR-REQ-12.18: a journal an earlier build of this schema version wrote has no column for the
+/// mark. Opening it adds the column, keeps every unknown outcome it holds as one that stands in the
+/// way, and lets the next channel end be recorded.
+#[test]
+fn a_journal_without_the_channel_end_column_gets_it_when_opened() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let path = temp
+        .environment()
+        .journal_database(SessionId::new(kr_ipc::new_uuid()));
+    {
+        let mut journal = Journal::open(&path).expect("a journal");
+        settled_unknown(&mut journal, 1, 7, false, 2_000);
+    }
+    {
+        let connection = rusqlite::Connection::open(&path).expect("the file opens");
+        connection
+            .execute_batch("ALTER TABLE receipts DROP COLUMN channel_end;")
+            .expect("the column is gone, as an earlier build left the table");
+    }
+
+    let mut journal = Journal::open(&path).expect("the earlier journal opens");
+    assert_eq!(
+        held_by(&journal, 7),
+        Some(action(1)),
+        "an unknown outcome an earlier build recorded still stands in the way"
+    );
+    settled_unknown(&mut journal, 2, 8, true, 4_000);
+    assert_eq!(
+        held_by(&journal, 8),
+        None,
+        "the column is there, and a channel end recorded in it does not hold"
+    );
+}

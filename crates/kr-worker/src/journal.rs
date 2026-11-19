@@ -485,6 +485,7 @@ impl Journal {
     fn create_current_schema(&self) -> Result<()> {
         create_current_objects(&self.connection).map_err(|error| faulted(&self.health, error))?;
         self.add_delivery_generation()?;
+        self.add_channel_end()?;
         Ok(())
     }
 
@@ -828,6 +829,44 @@ impl Journal {
         self.connection
             .execute_batch(
                 "ALTER TABLE fence_delivery ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(())
+    }
+
+    /// Adds the column that records a receipt as a channel end to a journal an earlier build of
+    /// this schema version wrote without it.
+    ///
+    /// Nought is true of every receipt such a journal holds: before the column existed a channel's
+    /// completed write settled as applied, so no receipt ended as a channel end, and every unknown
+    /// receipt it has is one a later receipt may still settle and holds back a fresh request as it
+    /// always did.
+    ///
+    /// This runs outside the ladder, every time the journal is opened, and raises no version: a
+    /// build that reads the journal afterwards finds a column with a default and does not mind it,
+    /// which a version it refuses to read would not allow. Remove it once no supported upgrade
+    /// starts from a journal written without the column.
+    fn add_channel_end(&self) -> Result<()> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT name FROM pragma_table_info('receipts')")
+            .map_err(|error| faulted(&self.health, error))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| faulted(&self.health, error))?;
+        let mut present = false;
+        for column in columns {
+            if column.map_err(|error| faulted(&self.health, error))? == "channel_end" {
+                present = true;
+            }
+        }
+        drop(statement);
+        if present {
+            return Ok(());
+        }
+        self.connection
+            .execute_batch(
+                "ALTER TABLE receipts ADD COLUMN channel_end INTEGER NOT NULL DEFAULT 0;",
             )
             .map_err(|error| faulted(&self.health, error))?;
         Ok(())
@@ -1670,6 +1709,49 @@ impl Journal {
         error: Option<ProtocolError>,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
+        self.settle_marked(actor_id, action_id, state, result, error, false, now_ms)
+    }
+
+    /// Settles an operation a channel carried as `unknown`, and records that this is where the
+    /// operation ended for good.
+    ///
+    /// A channel confirms nothing and says nothing later, so nothing will ever change what this
+    /// receipt says. The mark is what tells it from the `unknown` of any other transport, which a
+    /// later receipt can still settle: a fresh request for the same subject is not held back by it
+    /// ([`Self::uncertain_for_subject`]), and every other unknown receipt holds as it always did.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transition is not permitted or the write fails.
+    pub fn settle_channel_end(
+        &mut self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        error: ProtocolError,
+        now_ms: TimestampMs,
+    ) -> Result<Receipt> {
+        self.settle_marked(
+            actor_id,
+            action_id,
+            ReceiptState::Unknown,
+            None,
+            Some(error),
+            true,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn settle_marked(
+        &mut self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        state: ReceiptState,
+        result: Option<&[u8]>,
+        error: Option<ProtocolError>,
+        channel_end: bool,
+        now_ms: TimestampMs,
+    ) -> Result<Receipt> {
         let mut receipt = self
             .read(actor_id.clone(), action_id)?
             .ok_or_else(|| WorkerError::InvalidArgument(format!("no receipt for {action_id}")))?;
@@ -1687,7 +1769,7 @@ impl Journal {
         transaction
             .execute(
                 "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
-                     error_message = ?7, updated_at_ms = ?8
+                     error_message = ?7, updated_at_ms = ?8, channel_end = ?9
                  WHERE actor_id = ?1 AND action_id = ?2",
                 params![
                     receipt.actor_id.as_str(),
@@ -1701,6 +1783,7 @@ impl Journal {
                         .map(|error| error.code.as_str().to_owned()),
                     receipt.error.as_ref().map(|error| error.message.clone()),
                     i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
+                    i64::from(channel_end),
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
@@ -2850,13 +2933,17 @@ impl Journal {
     ///
     /// Two lookups and not one condition joined by `OR`, so that each uses the index on actor,
     /// subject and state: with the `OR` every first admission reads every receipt of the actor.
+    ///
+    /// A receipt that is a channel end is left out: nothing will ever change what it says, so it
+    /// has no result to show a caller before a fresh request.
     const IN_THE_WAY: &'static str = "(SELECT actor_id, action_id, revision, intent, rowid AS rid
                 FROM receipts
-                WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3
+                WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3 AND channel_end = 0
               UNION ALL
               SELECT actor_id, action_id, revision, intent, rowid AS rid
                 FROM receipts
                 WHERE actor_id = ?1 AND subject_digest IS NULL AND state = ?3 AND method = ?4
+                  AND channel_end = 0
              ) AS r";
 
     /// Orders the receipts selected as `r` with the state `?3` newest first: the receipt whose
@@ -5000,6 +5087,7 @@ pub(crate) fn create_current_objects(connection: &Connection) -> rusqlite::Resul
                      error_message        TEXT,
                      created_at_ms        INTEGER NOT NULL,
                      updated_at_ms        INTEGER NOT NULL,
+                     channel_end          INTEGER NOT NULL DEFAULT 0,
                      PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);
