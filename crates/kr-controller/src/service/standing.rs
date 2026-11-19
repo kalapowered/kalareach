@@ -138,10 +138,9 @@ impl Controller {
     ) {
         candidate.publish_leases(held);
         between(&candidate);
-        self.local_owner_standing
-            .store(std::sync::Arc::new(
-                candidate.local_owner_standing(self.local_owner_device()),
-            ));
+        self.local_owner_standing.store(std::sync::Arc::new(
+            candidate.local_owner_standing(self.local_owner_device()),
+        ));
         **held = candidate;
     }
 
