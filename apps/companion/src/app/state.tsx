@@ -339,7 +339,14 @@ export function useApp(): AppValue {
 
 /** What a raw terminal view keeps of its place for the next one: read once at open, written at close. */
 export interface KeptPlace {
-  readonly read: () => TerminalPlace | null
+  /** Begins an opening of the view: the place it restores, and its one right to keep the place it ends at. */
+  readonly begin: () => KeptOpening
+}
+
+export interface KeptOpening {
+  /** The place the session's last view was left at. */
+  readonly place: TerminalPlace | null
+  /** Keeps the place this opening ended at, unless the session was forgotten after the opening began. */
   readonly keep: (place: TerminalPlace | null) => void
 }
 
@@ -352,13 +359,19 @@ export function useKeptPlace(sessionId: string): KeptPlace {
   const { sessions } = useApp()
   return useMemo(
     () => ({
-      read: () => sessions.get(sessionId).terminal,
-      keep: (place: TerminalPlace | null) => {
-        // A tab that was closed has forgotten its place: the view that closes with it keeps nothing.
-        if (!sessions.holds(sessionId)) return
-        sessions.update(sessionId, (current) =>
-          current.terminal === place ? current : { ...current, terminal: place }
-        )
+      begin: () => {
+        const began = sessions.forgotten(sessionId)
+        return {
+          place: sessions.get(sessionId).terminal,
+          keep: (place: TerminalPlace | null) => {
+            // A tab that was closed after this opening began has forgotten its place, though its
+            // state is held for what is still owed: the view that closes with it keeps nothing.
+            if (sessions.forgotten(sessionId) !== began) return
+            sessions.update(sessionId, (current) =>
+              current.terminal === place ? current : { ...current, terminal: place }
+            )
+          }
+        }
       }
     }),
     [sessions, sessionId]

@@ -11,6 +11,8 @@ import { describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
+import type { Receipt } from '@kalareach/protocol'
+
 import { App } from '../src/App'
 import { AppProvider, type Place } from '../src/app/state'
 import { fakeHost } from '../src/host/fake'
@@ -18,8 +20,26 @@ import type { HostPort } from '../src/host/port'
 import { MOVES_LATER } from '../src/terminal/modes'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+const ACTION = '00000000-0000-4000-8000-00000000abcd'
 
 type Controls = ReturnType<typeof fakeHost>['controls']
+
+/** The host's record of a prompt's action when it cannot establish the outcome either. */
+function unknownReceipt(action: string): Receipt {
+  return {
+    action_id: action,
+    actor_id: 'owner:local',
+    error: null,
+    method: 'agent.prompt.submit',
+    method_version: 1,
+    payload_digest: '0'.repeat(64),
+    reason: null,
+    revision: '1',
+    state: 'unknown',
+    updated_at_ms: '0',
+    accepted_deadline_ms: null
+  }
+}
 
 function open(
   port: HostPort,
@@ -430,21 +450,44 @@ describe('a terminal view keeps its place across a pane change', () => {
     }
   })
 
-  it("forgets a closed tab's place: the session opens again with none", async () => {
+  it.each([
+    { owed: false, title: "forgets a closed tab's place: the session opens again with none" },
+    {
+      owed: true,
+      title: "forgets a closed tab's place though a prompt with no outcome keeps its state: the session opens again with none"
+    }
+  ])('$title', async ({ owed }) => {
     const person = userEvent.setup()
     const restore = laidOut()
     try {
       const { port, controls } = fakeHost()
-      open(port, { view: 'sessions' })
+      // A prompt whose outcome nobody knows: closing the tab keeps what is owed for it.
+      const unconfirmed: HostPort = {
+        ...port,
+        composerSubmit: () => Promise.resolve({ receipt: null, value: null, action_id: ACTION }),
+        actionRead: (params) =>
+          Promise.resolve({ receipt: unknownReceipt(params.action_id), result: null })
+      }
+      open(owed ? unconfirmed : port, { view: 'sessions' })
       await person.click(await screen.findByTestId('session-row-2'))
       await screen.findByText('Session 2 · Working')
       await person.click(screen.getByRole('button', { name: 'Sessions' }))
       await person.click(await screen.findByTestId('session-row-1'))
       await screen.findByText('Session 1 · Waiting for you')
+      if (owed) {
+        await person.type(await screen.findByTestId('composer-input'), 'run the migration')
+        await waitFor(() => {
+          expect(screen.getByTestId('composer-send')).toBeEnabled()
+        })
+        await person.click(screen.getByTestId('composer-send'))
+        await waitFor(() => {
+          expect(screen.getByTestId('composer-reason')).toHaveTextContent(/no confirmed outcome yet/)
+        })
+      }
       await person.click(screen.getByRole('tab', { name: 'Terminal' }))
       await scrolledUp(controls)
       // The tab closes with the view still open: the view's cleanup runs after the session was
-      // forgotten, and must not make it again.
+      // forgotten, and must not make its place again, though the state is held for the prompt.
       await person.click(screen.getByRole('button', { name: /Close the tab for session 01/ }))
       await person.click(await screen.findByTestId('session-row-1'))
       await screen.findByText('Session 1 · Waiting for you')
@@ -454,6 +497,15 @@ describe('a terminal view keeps its place across a pane change', () => {
       })
       expect(controls.terminalViews[1]?.sessionId).toBe(SESSION_MAIN)
       expect(controls.terminalViews[1]?.anchor).toBeNull()
+      if (owed) {
+        // What is owed stays: the prompt is still held, and the draft is still the person's.
+        await person.click(screen.getByRole('tab', { name: 'Conversation' }))
+        await waitFor(() => {
+          expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
+        })
+        expect(screen.getByTestId('composer-send')).toBeDisabled()
+        expect(screen.getByTestId('composer-reason')).toHaveTextContent(/no confirmed outcome yet/)
+      }
     } finally {
       restore()
     }
