@@ -1342,6 +1342,10 @@ impl Controller {
                     self.delivery_destination_secret_set(mutation, carried)
                         .await
                 }
+                Method::VoiceCredentialSet => self.voice_credential_set(mutation, carried).await,
+                Method::VoiceCredentialRemove => {
+                    self.voice_credential_remove(mutation, carried).await
+                }
                 Method::DeliveryDestinationConfigure => {
                     self.delivery_destination_configure(mutation, carried).await
                 }
@@ -1413,6 +1417,58 @@ impl Controller {
                 .who_can_read()
                 .to_owned(),
         })
+    }
+
+    /// Keeps the key for voice calls on the owner's own account in the host's secret store.
+    ///
+    /// The key goes to the secret store and nowhere else: not to a journal, and not to anything
+    /// this returns. The mutation is claimed like every authority change here, by a digest over
+    /// the whole request, which covers a window identifier this host never writes down, so the
+    /// retained digest cannot be used to test a guess of the key.
+    ///
+    /// The admission is asked again under the registry lock, which is held across the write, so a
+    /// withdrawal that completes while this waited stops it.
+    async fn voice_credential_set(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params = voice_credential_set_params(&mutation.params)?;
+        kr_protocol::voice_credential::check_voice_key(&params.key)
+            .map_err(|rule| ControllerError::InvalidArgument(rule.to_owned()))?;
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        self.voice_credentials.put(params.kind, &params.key)?;
+        drop(registry);
+        encode(&kr_protocol::voice_credential::VoiceCredentialSetResult {
+            kind: params.kind,
+            in_force: true,
+        })
+    }
+
+    /// Deletes the key for voice calls on the owner's own account.
+    ///
+    /// Removing a key that is not held answers as removing one that is, with `removed` false, so a
+    /// repeat is harmless.
+    async fn voice_credential_remove(
+        &self,
+        mutation: &MutationRequest,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::voice_credential::VoiceCredentialRemoveParams =
+            mutation.params.to_typed().map_err(|_| {
+                ControllerError::InvalidArgument(VOICE_REMOVE_PARAMS_REFUSAL.to_owned())
+            })?;
+        let registry = self.registry.lock().await;
+        self.check_admission(&registry, &carried)?;
+        let removed = self.voice_credentials.delete(params.kind)?;
+        drop(registry);
+        encode(
+            &kr_protocol::voice_credential::VoiceCredentialRemoveResult {
+                kind: params.kind,
+                removed,
+            },
+        )
     }
 
     /// Creates or replaces an external notification destination.
@@ -3010,6 +3066,26 @@ pub(super) fn secret_params(
     params
         .to_typed()
         .map_err(|_| ControllerError::InvalidArgument(SECRET_PARAMS_REFUSAL.to_owned()))
+}
+
+/// The one refusal of parameters that do not read as `voice.credential.set`'s.
+const VOICE_SET_PARAMS_REFUSAL: &str = "voice.credential.set takes one provider and one key: \
+     {kind: openai_live, key}";
+
+/// The one refusal of parameters that do not read as `voice.credential.remove`'s.
+const VOICE_REMOVE_PARAMS_REFUSAL: &str = "voice.credential.remove takes one provider: {kind: \
+     openai_live}";
+
+/// Reads the parameters of `voice.credential.set`.
+///
+/// They carry a key, and a decoder's own account of what it could not read quotes what it was
+/// given, so every refusal here is one fixed sentence that repeats nothing the request carried.
+pub(super) fn voice_credential_set_params(
+    params: &ParamsValue,
+) -> Result<kr_protocol::voice_credential::VoiceCredentialSetParams> {
+    params
+        .to_typed()
+        .map_err(|_| ControllerError::InvalidArgument(VOICE_SET_PARAMS_REFUSAL.to_owned()))
 }
 
 /// The one refusal of parameters that do not read as `delivery.destination.configure`'s.

@@ -21,6 +21,7 @@
 
 mod authority;
 mod context;
+mod credentials;
 mod host;
 mod submit;
 mod worker_half;
@@ -40,6 +41,7 @@ pub use authority::GrantAuthority;
 pub use context::{
     FilteredContext, SessionFacts, SessionSnapshot, filtered, snapshot_of, snapshot_with,
 };
+pub use credentials::VoiceCredentials;
 pub use host::{ControllerDispatch, ControllerFacts};
 pub use submit::{HostDispatch, ProposalSubmitter, method_for};
 pub use worker_half::{

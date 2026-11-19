@@ -1022,6 +1022,8 @@ pub struct Controller {
     pub(crate) descriptions: Arc<crate::describe::DescribeModule>,
     /// The environment's notification delivery service.
     pub delivery: Arc<crate::push::DeliveryModule>,
+    /// The key this host holds for voice calls on the owner's own account, in the secret store.
+    pub(crate) voice_credentials: crate::voice::VoiceCredentials,
     /// The loop that drives it: recovery at start, then a pass on every tick.
     delivery_runtime: Arc<crate::push::runtime::DeliveryRuntime>,
     /// The gateways a paired device may name in the credential it hands this host: the official

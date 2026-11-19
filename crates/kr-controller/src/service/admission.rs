@@ -1406,6 +1406,33 @@ impl Controller {
                 crate::push::external::check_secret(&params.secret)
                     .map_err(ControllerError::InvalidArgument)?;
             }
+            // The key for voice calls on the owner's own account belongs to this environment, not
+            // to a session. Its shape is checked here, before the action is claimed, so a key of
+            // the wrong shape is refused without holding its action identifier.
+            Method::VoiceCredentialSet => {
+                if mutation.target.session_id.as_ref().is_some()
+                    || mutation.target.application_instance_id.is_present()
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "a voice key belongs to this environment, not to one session".to_owned(),
+                    ));
+                }
+                let params =
+                    super::authority_changes::voice_credential_set_params(&mutation.params)?;
+                kr_protocol::voice_credential::check_voice_key(&params.key)
+                    .map_err(|rule| ControllerError::InvalidArgument(rule.to_owned()))?;
+            }
+            Method::VoiceCredentialRemove => {
+                if mutation.target.session_id.as_ref().is_some()
+                    || mutation.target.application_instance_id.is_present()
+                {
+                    return Err(ControllerError::InvalidArgument(
+                        "a voice key belongs to this environment, not to one session".to_owned(),
+                    ));
+                }
+                let _: kr_protocol::voice_credential::VoiceCredentialRemoveParams =
+                    parse(&mutation.params)?;
+            }
             // The host's sign-ins, the managed account's and the storage account's, belong to the
             // environment, not to a session.
             Method::AccountSignIn

@@ -506,6 +506,8 @@ pub fn retained_answers() -> Vec<(kr_protocol::method::Method, &'static str)> {
             Method::DeliveryDestinationSecretSet,
             "DeliveryDestinationSecretSetResult",
         ),
+        (Method::VoiceCredentialSet, "VoiceCredentialSetResult"),
+        (Method::VoiceCredentialRemove, "VoiceCredentialRemoveResult"),
         (Method::DevicePushRegister, "DevicePushRegisterResult"),
         (Method::OrganisationEnrol, "OrganisationEnrolResult"),
         (
@@ -539,7 +541,7 @@ pub fn table() -> Vec<Store> {
     use kr_protocol::{
         action, archive, attention, automation, catalogue, changeset, delivery, describe, desktop,
         grant, hostinfo, identity, invitation, machine, mailbox, organisation, pairing, privacy,
-        project, push, session, sharing, skill, test_report, transfer, voice,
+        project, push, session, sharing, skill, test_report, transfer, voice, voice_credential,
     };
 
     let mut stores = vec![
@@ -673,6 +675,10 @@ pub fn table() -> Vec<Store> {
                 protocol::<describe::DescriptionSetup>("DescriptionSetup"),
                 protocol::<delivery::DeliveryDestinationSecretSetResult>(
                     "DeliveryDestinationSecretSetResult",
+                ),
+                protocol::<voice_credential::VoiceCredentialSetResult>("VoiceCredentialSetResult"),
+                protocol::<voice_credential::VoiceCredentialRemoveResult>(
+                    "VoiceCredentialRemoveResult",
                 ),
                 protocol::<identity::EnvironmentEnrolResult>("EnvironmentEnrolResult"),
                 protocol::<identity::EnvironmentForgetResult>("EnvironmentForgetResult"),

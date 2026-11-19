@@ -87,6 +87,10 @@ service with content at all; the only calls it makes are reading the terms the s
 creating a call and ending one. When a call's control first attaches, the phone reads the
 selection for the call's first session and sends exactly that as the call's opening context.
 
+The host owner keeps one OpenAI key in this host's secret store with `voice.credential.set` and
+deletes it with `voice.credential.remove`. Both are served on the local socket only, and no answer
+carries the key. A call does not use the key.
+
 ## What the managed operator can see
 
 Managed voice gives KalaReach technical access to the conversation. The service's own channel to

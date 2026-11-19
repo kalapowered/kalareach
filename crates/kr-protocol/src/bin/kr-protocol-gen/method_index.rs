@@ -330,6 +330,7 @@ pub(crate) const fn described_in(method: Method) -> Section {
         Method::VoiceGrant => at(VOICE, "The voice grant"),
         Method::VoiceDelegate => at(VOICE, "What a delegation carries, and who reads it"),
         Method::VoiceContext => at(VOICE, "What the coordinator may read"),
+        Method::VoiceCredentialSet | Method::VoiceCredentialRemove => at(VOICE, "Where it goes"),
 
         Method::WorkflowInstall
         | Method::WorkflowEnable

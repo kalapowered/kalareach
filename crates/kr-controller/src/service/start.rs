@@ -1027,6 +1027,8 @@ impl Controller {
         };
         // External destinations' credentials are kept in the same store as this host's own keys,
         // in a scope of their own, and never in the delivery journal.
+        let voice_credentials =
+            crate::voice::VoiceCredentials::new(Arc::clone(&secret_store), setup.environment_id);
         let destination_secrets = crate::push::secrets::DestinationSecrets::new(
             Arc::clone(&secret_store),
             setup.environment_id,
@@ -1389,6 +1391,7 @@ impl Controller {
             privacy,
             descriptions,
             delivery,
+            voice_credentials,
             delivery_runtime,
             gateways,
             #[cfg(feature = "testing")]

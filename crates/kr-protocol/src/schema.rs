@@ -271,6 +271,10 @@ use crate::voice::{
     VoicePrepareParams, VoicePrepareResult, VoiceRate, VoiceSessionDescriptor, VoiceStartParams,
     VoiceStartResult, VoiceStopParams, VoiceStopResult,
 };
+use crate::voice_credential::{
+    VoiceCredentialKind, VoiceCredentialRemoveParams, VoiceCredentialRemoveResult,
+    VoiceCredentialSetParams, VoiceCredentialSetResult,
+};
 use crate::worker::{
     AuthorityRevisionAck, AuthorityRevisionNotice, ControllerGenerationToken, GenerationAccepted,
     GenerationChallenge, WorkerDescriptor, WorkerLaunchSpec, WorkerReady, WorkerRendezvous,
@@ -873,6 +877,11 @@ pub fn protocol_schema() -> Value {
         "external_destination_kind" => ExternalDestinationKind,
         "delivery_destination_secret_set_params" => DeliveryDestinationSecretSetParams,
         "delivery_destination_secret_set_result" => DeliveryDestinationSecretSetResult,
+        "voice_credential_set_params" => VoiceCredentialSetParams,
+        "voice_credential_set_result" => VoiceCredentialSetResult,
+        "voice_credential_remove_params" => VoiceCredentialRemoveParams,
+        "voice_credential_remove_result" => VoiceCredentialRemoveResult,
+        "voice_credential_kind" => VoiceCredentialKind,
         "destination_secret" => DestinationSecret,
         "destination_secret_kind" => DestinationSecretKind,
         "mail_account" => MailAccount,

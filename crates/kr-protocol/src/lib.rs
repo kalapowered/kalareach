@@ -185,6 +185,7 @@ pub mod transfer;
 pub mod update;
 pub mod vectors;
 pub mod voice;
+pub mod voice_credential;
 pub mod wire;
 pub mod worker;
 pub mod worker_surface;

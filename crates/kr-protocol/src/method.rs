@@ -449,6 +449,21 @@ methods! {
           secret store, under the destination's identifier. It is never answered back, and it \
           goes when the destination does.";
 
+    VoiceCredentialSet = "voice.credential.set", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Keep the OpenAI key for voice calls on the owner's own account in this host's secret \
+          store, replacing any key it holds. The host takes it on its local socket only, and \
+          never answers with it.";
+
+    VoiceCredentialRemove = "voice.credential.remove", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Delete the OpenAI key this host holds for voice calls on the owner's own account. \
+          Removing a key the host does not hold is answered as removing one it does.";
+
     PrivacySet = "privacy.set", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
     selectors: [Environment],
@@ -2210,6 +2225,10 @@ mod tests {
             "delivery.destination.secret.set",
             &[ActionRight::HostManage],
         ),
+        // The key a voice call on the owner's own account spends: setting or removing it is host
+        // management, at this machine.
+        ("voice.credential.set", &[ActionRight::HostManage]),
+        ("voice.credential.remove", &[ActionRight::HostManage]),
         // Privacy mode: switching this host's retention, and reading what it kept and what left.
         ("privacy.set", &[ActionRight::HostManage]),
         ("privacy.status", &[ActionRight::HostManage]),

@@ -2590,6 +2590,10 @@ export type StreamKind =
  */
 export type VoiceContextClass = 'environment_variables' | 'terminal_scrollback'
 /**
+ * The providers a key can be kept for.
+ */
+export type VoiceCredentialKind = 'openai_live'
+/**
  * One thing a voice session may ask the host to do.
  *
  * Section 15 ¶13 divides these three ways, and the divisions are the methods on this type rather
@@ -3325,6 +3329,11 @@ export interface KalaReachProtocol {
   voice_context_params?: VoiceContextParams
   voice_context_result?: VoiceContextResult
   voice_context_selection?: VoiceContextSelection1
+  voice_credential_kind?: VoiceCredentialKind
+  voice_credential_remove_params?: VoiceCredentialRemoveParams
+  voice_credential_remove_result?: VoiceCredentialRemoveResult
+  voice_credential_set_params?: VoiceCredentialSetParams
+  voice_credential_set_result?: VoiceCredentialSetResult
   voice_delegate_params?: VoiceDelegateParams
   voice_delegate_result?: VoiceDelegateResult
   voice_grant_params?: VoiceGrantParams
@@ -19376,6 +19385,8 @@ export interface MethodEntry {
     | 'delivery.destination.remove'
     | 'delivery.destination.list'
     | 'delivery.destination.secret.set'
+    | 'voice.credential.set'
+    | 'voice.credential.remove'
     | 'privacy.set'
     | 'privacy.status'
     | 'privacy.retained.delete'
@@ -28508,6 +28519,8 @@ export interface ServiceRequestPayload {
     | 'delivery.destination.remove'
     | 'delivery.destination.list'
     | 'delivery.destination.secret.set'
+    | 'voice.credential.set'
+    | 'voice.credential.remove'
     | 'privacy.set'
     | 'privacy.status'
     | 'privacy.retained.delete'
@@ -31915,6 +31928,54 @@ export interface VoiceContextSelection1 {
    * The current working directory.
    */
   working_directory: string
+}
+/**
+ * Parameters of `voice.credential.remove`.
+ */
+export interface VoiceCredentialRemoveParams {
+  /**
+   * Which provider's key to delete.
+   */
+  kind: 'openai_live'
+}
+/**
+ * The result of `voice.credential.remove`.
+ */
+export interface VoiceCredentialRemoveResult {
+  /**
+   * Which provider's key the answer is about.
+   */
+  kind: 'openai_live'
+  /**
+   * Whether the host held a key that this call deleted.
+   */
+  removed: boolean
+}
+/**
+ * Parameters of `voice.credential.set`.
+ */
+export interface VoiceCredentialSetParams {
+  /**
+   * The key: printable ASCII with no whitespace, 20 to 256 bytes.
+   */
+  key: string
+  /**
+   * Which provider the key is for.
+   */
+  kind: 'openai_live'
+}
+/**
+ * The result of `voice.credential.set`. It never carries the key.
+ */
+export interface VoiceCredentialSetResult {
+  /**
+   * Whether this host holds the key now.
+   */
+  in_force: boolean
+  /**
+   * Which provider the key is for.
+   */
+  kind: 'openai_live'
 }
 /**
  * Parameters of `voice.delegate`.

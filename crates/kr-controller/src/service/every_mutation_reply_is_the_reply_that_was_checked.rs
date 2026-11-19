@@ -363,6 +363,8 @@ const WITHOUT_A_FIXTURE: &[Method] = &[
     Method::DeliveryDestinationConfigure,
     Method::DeliveryDestinationRemove,
     Method::DeliveryDestinationSecretSet,
+    Method::VoiceCredentialSet,
+    Method::VoiceCredentialRemove,
     Method::AccountSignIn,
     Method::AccountStorageSignIn,
     Method::AccountStorageSignOut,

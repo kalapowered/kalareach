@@ -22683,6 +22683,16 @@
           "type": "string"
         },
         {
+          "const": "voice.credential.set",
+          "description": "Keep the OpenAI key for voice calls on the owner's own account in this host's secret store, replacing any key it holds. The host takes it on its local socket only, and never answers with it.",
+          "type": "string"
+        },
+        {
+          "const": "voice.credential.remove",
+          "description": "Delete the OpenAI key this host holds for voice calls on the owner's own account. Removing a key the host does not hold is answered as removing one it does.",
+          "type": "string"
+        },
+        {
           "const": "privacy.set",
           "description": "Turn privacy mode on or off for this environment, at the host itself: a paired device whose grant carries `host.manage` reads where it stands with `privacy.status`, and no paired device can turn it on or off. The change is recorded, and the generation advanced, before any subsystem is touched; the answer says where it stands.",
           "type": "string"
@@ -41228,6 +41238,87 @@
       ],
       "type": "object"
     },
+    "VoiceCredentialKind": {
+      "description": "The providers a key can be kept for.",
+      "oneOf": [
+        {
+          "const": "openai_live",
+          "description": "OpenAI's live voice sessions.",
+          "type": "string"
+        }
+      ]
+    },
+    "VoiceCredentialRemoveParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.credential.remove`.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/VoiceCredentialKind",
+          "description": "Which provider's key to delete."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "VoiceCredentialRemoveResult": {
+      "additionalProperties": false,
+      "description": "The result of `voice.credential.remove`.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/VoiceCredentialKind",
+          "description": "Which provider's key the answer is about."
+        },
+        "removed": {
+          "description": "Whether the host held a key that this call deleted.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "kind",
+        "removed"
+      ],
+      "type": "object"
+    },
+    "VoiceCredentialSetParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `voice.credential.set`.",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/SecretText",
+          "description": "The key: printable ASCII with no whitespace, 20 to 256 bytes."
+        },
+        "kind": {
+          "$ref": "#/$defs/VoiceCredentialKind",
+          "description": "Which provider the key is for."
+        }
+      },
+      "required": [
+        "kind",
+        "key"
+      ],
+      "type": "object"
+    },
+    "VoiceCredentialSetResult": {
+      "additionalProperties": false,
+      "description": "The result of `voice.credential.set`. It never carries the key.",
+      "properties": {
+        "in_force": {
+          "description": "Whether this host holds the key now.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/VoiceCredentialKind",
+          "description": "Which provider the key is for."
+        }
+      },
+      "required": [
+        "kind",
+        "in_force"
+      ],
+      "type": "object"
+    },
     "VoiceDelegateParams": {
       "additionalProperties": false,
       "description": "Parameters of `voice.delegate`.\n\nSection 15 ¶7 and ¶22: the delegation event supplies an identifier and a timeline offset, and\nthe coordinator uses the accumulated transcripts and the host's state. The paired device is the\nonly thing that sees the provider's data channel, so it is the one that hands the host the\ntranscript: the fragments of what the person said, which the device vouches for from its own\nrecord of when the microphone was open. **The host reads them.** There is no field in which the\ndevice or the model names the action, the session or anything else the host acts on; the host's\ngrammar derives those once, from the words, and says what it derived in the answer.",
@@ -46244,6 +46335,21 @@
     },
     "voice_context_selection": {
       "$ref": "#/$defs/VoiceContextSelection"
+    },
+    "voice_credential_kind": {
+      "$ref": "#/$defs/VoiceCredentialKind"
+    },
+    "voice_credential_remove_params": {
+      "$ref": "#/$defs/VoiceCredentialRemoveParams"
+    },
+    "voice_credential_remove_result": {
+      "$ref": "#/$defs/VoiceCredentialRemoveResult"
+    },
+    "voice_credential_set_params": {
+      "$ref": "#/$defs/VoiceCredentialSetParams"
+    },
+    "voice_credential_set_result": {
+      "$ref": "#/$defs/VoiceCredentialSetResult"
     },
     "voice_delegate_params": {
       "$ref": "#/$defs/VoiceDelegateParams"
