@@ -5880,6 +5880,11 @@ const COMMAND_RIGHTS: [ActionRight; 4] = [
     ActionRight::WorkspaceManage,
 ];
 
+/// The command of a node that makes the file `marker`, so that a case can tell the node ran.
+fn the_command_that_touches(marker: &Path) -> String {
+    format!("touch {}", marker.display())
+}
+
 /// A `shell_command` node that runs `command` in this host's own environment.
 fn command_node(host: &Host, node_id: &str, command: &str) -> WorkflowNode {
     WorkflowNode {
@@ -6724,7 +6729,7 @@ async fn the_wait_ends_while_the_create_waits_for_the_registry(
     } else {
         (
             COMMAND_RIGHTS.to_vec(),
-            command_node(&host, "command", &format!("touch {}", marker.display())),
+            command_node(&host, "command", &the_command_that_touches(&marker)),
         )
     };
     host.issue(grant_id(number), &grant);
@@ -6888,7 +6893,7 @@ async fn a_grant_withdrawn_at_the_door_starts_nothing(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_grant_withdrawn_before_the_worker_claims_its_launch_runs_no_command() {
     a_grant_withdrawn_at_the_door_starts_nothing(32, &COMMAND_RIGHTS, |host, marker| {
-        command_node(host, "command", &format!("touch {}", marker.display()))
+        command_node(host, "command", &the_command_that_touches(&marker))
     })
     .await;
 }
@@ -7013,7 +7018,7 @@ async fn a_wait_that_ends_at_the_door_cancels_a_command_that_never_runs() {
     a_wait_that_ends_at_the_door_makes_no_session(
         40,
         &COMMAND_RIGHTS,
-        |host, marker| command_node(host, "command", &format!("touch {}", marker.display())),
+        |host, marker| command_node(host, "command", &the_command_that_touches(&marker)),
         NodeStatus::Cancelled,
     )
     .await;
@@ -7817,6 +7822,24 @@ fn the_command_that_writes_its_environment_to(written: &Path) -> String {
     )
 }
 
+/// The command of a node that makes a file, run with a folder whose name holds a quote and a space,
+/// makes the file where it was told to: it reads the path as one word.
+#[cfg(unix)]
+#[test]
+fn the_command_that_touches_a_marker_reads_a_path_with_a_quote_and_a_space() {
+    let temp = teardown::Tree::create();
+    let folder = temp.root().join("it's a folder");
+    std::fs::create_dir(&folder).expect("a folder whose name holds a quote and a space");
+    let marker = folder.join("a command ran");
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", &the_command_that_touches(&marker)])
+        .env("PATH", "/usr/bin:/bin")
+        .output()
+        .expect("a shell");
+    assert!(output.status.success(), "{output:?}");
+    assert!(marker.is_file(), "the command made the marker: {output:?}");
+}
+
 /// The text of a startup file that appends the name it was read as and the home it was read under
 /// to the file `record`, whose path is quoted for the shell that reads it.
 #[cfg(unix)]
@@ -8268,7 +8291,7 @@ async fn a_session_does_not_start_after_its_grants_end_though_its_wait_has_time_
         let node = if shell {
             create_session_node(&host, Some("/bin/sh"))
         } else {
-            command_node(&host, "command", &format!("touch {}", marker.display()))
+            command_node(&host, "command", &the_command_that_touches(&marker))
         };
         let mut document = definition(workflow_id(number), grant_id(number), "a node", node);
         document.deadlines = WorkflowDeadlines {
@@ -8410,7 +8433,7 @@ async fn a_run_cancelled_at_the_door_starts_nothing(
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn a_run_cancelled_before_the_worker_claims_its_launch_runs_no_command() {
     a_run_cancelled_at_the_door_starts_nothing(52, &COMMAND_RIGHTS, |host, marker| {
-        command_node(host, "command", &format!("touch {}", marker.display()))
+        command_node(host, "command", &the_command_that_touches(&marker))
     })
     .await;
 }
@@ -8454,7 +8477,7 @@ async fn a_run_cancelled_while_its_node_writes_down_what_it_owns_leaves_nothing_
         workflow_id(54),
         grant_id(54),
         "a command",
-        command_node(&host, "command", &format!("touch {}", marker.display())),
+        command_node(&host, "command", &the_command_that_touches(&marker)),
     );
     install(&mut control, &host, &document).await;
     enable(&mut control, &host, &document).await;
