@@ -339,6 +339,7 @@ impl Registration {
             &directory,
             &credential_path,
             credential_name,
+            "the credential file",
             MAX_CREDENTIAL_BYTES,
             deadline,
             within,
@@ -503,7 +504,7 @@ fn wait_for_whole(
         // Whether the deadline has passed is decided before the read, so the last read is taken
         // after it: a registration published whole by then is found.
         let expired = Instant::now() >= deadline;
-        match read_bounded(directory, name, MAX_REGISTRATION_BYTES) {
+        match read_bounded(directory, name, MAX_REGISTRATION_BYTES, "the registration") {
             Ok((content, _)) => {
                 if let Some(text) = String::from_utf8(content).ok().filter(|text| whole(text)) {
                     return Ok(text);
@@ -549,8 +550,8 @@ pub fn whole(text: &str) -> bool {
         })
 }
 
-/// Reads the credential file the worker writes, waiting for it until the deadline, and refuses one
-/// somebody other than this user can read.
+/// Reads a file the worker writes beside the registration, which `what` names, waiting for it until
+/// the deadline, and refuses one somebody other than this user can read.
 ///
 /// The file is opened through the registration's directory, without following a link, and its
 /// owner and mode are read from the opened file: what is checked is what is read.
@@ -558,13 +559,14 @@ fn wait_for(
     directory: &cap_std::fs::Dir,
     path: &Path,
     name: &std::ffi::OsStr,
+    what: &str,
     limit: u64,
     deadline: Instant,
     within: Duration,
 ) -> Result<Vec<u8>, RegistrationError> {
     loop {
         let expired = Instant::now() >= deadline;
-        match read_bounded(directory, name, limit) {
+        match read_bounded(directory, name, limit, what) {
             Ok((content, standing)) => {
                 check_owner_only(path, &standing)?;
                 return Ok(content);
@@ -599,11 +601,13 @@ type Standing = cap_std::fs::Metadata;
 type Standing = Result<(), kr_ipc::paths::AccessListRefusal>;
 
 /// Reads at most `limit` bytes of one file in `directory`, refusing a link and a file longer than
-/// that, and returns what the opened file itself says about who may read it.
+/// that, and returns what the opened file itself says about who may read it, in the words of
+/// `what` where the platform reports it in words.
 fn read_bounded(
     directory: &cap_std::fs::Dir,
     name: &std::ffi::OsStr,
     limit: u64,
+    what: &str,
 ) -> std::io::Result<(Vec<u8>, Standing)> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use std::io::Read as _;
@@ -627,7 +631,7 @@ fn read_bounded(
     #[cfg(windows)]
     let standing = {
         use std::os::windows::io::AsHandle as _;
-        kr_ipc::paths::check_access_list(file.as_handle(), "the credential file", false)
+        kr_ipc::paths::check_access_list(file.as_handle(), what, false)
     };
     let mut content = Vec::new();
     file.take(limit + 1).read_to_end(&mut content)?;
@@ -638,7 +642,11 @@ fn read_bounded(
         ));
     }
     #[cfg(unix)]
-    let standing = metadata;
+    let standing = {
+        // The mode bits are checked by the caller and need no words here.
+        let _ = what;
+        metadata
+    };
     Ok((content, standing))
 }
 
@@ -653,7 +661,15 @@ fn read_events(
 ) -> Result<HookEvents, RegistrationError> {
     check_named_beside(registration, path, "the hook events file")?;
     let name = path.file_name().unwrap_or_default();
-    let bytes = wait_for(directory, path, name, MAX_EVENTS_BYTES, deadline, within)?;
+    let bytes = wait_for(
+        directory,
+        path,
+        name,
+        "the hook events file",
+        MAX_EVENTS_BYTES,
+        deadline,
+        within,
+    )?;
     let events: HookEvents =
         serde_json::from_slice(&bytes).map_err(|error| RegistrationError::Malformed {
             detail: format!(
