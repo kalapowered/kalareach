@@ -97,6 +97,27 @@ impl Transmitter {
     }
 }
 
+/// What a transition does to a resource's dispatch marker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Marker {
+    /// Leaves the marker as it is.
+    Keep,
+    /// Sets the marker: an answer may have gone.
+    Set,
+    /// Clears the marker: an answer that was marked is proven not to have gone, so the resource
+    /// is one nobody has answered.
+    Clear,
+}
+
+impl Marker {
+    /// Returns the marker a transition keeps for a resource whose marker is `set`: set when it is,
+    /// and untouched when it is not.
+    #[must_use]
+    pub const fn kept(set: bool) -> Self {
+        if set { Self::Set } else { Self::Keep }
+    }
+}
+
 /// What a claim gives its holder.
 ///
 /// The identifier is the point. Checking only the actor would let a claim that was released
@@ -128,8 +149,8 @@ pub struct Transition {
     claim: Option<Claim>,
     /// Whether the transition takes the claim or gives it up.
     holds_claim: bool,
-    /// Whether this transition also sets the dispatch marker.
-    dispatched: bool,
+    /// What this transition does to the dispatch marker.
+    marker: Marker,
     /// The writer this transition admits to transmit, when it admits one.
     transmitter: Option<Transmitter>,
     /// True when this transition gives the resource's transmission admission back.
@@ -143,10 +164,10 @@ impl Transition {
         self.claim.as_ref()
     }
 
-    /// Returns true when this transition sets the dispatch marker.
+    /// Returns what this transition does to the dispatch marker.
     #[must_use]
-    pub const fn sets_marker(&self) -> bool {
-        self.dispatched
+    pub const fn marker(&self) -> Marker {
+        self.marker
     }
 }
 
@@ -390,7 +411,7 @@ impl Arbitration {
                 claimed_at: now,
             }),
             holds_claim: true,
-            dispatched: false,
+            marker: Marker::Keep,
             transmitter: None,
             releases_transmitter: false,
         })
@@ -419,7 +440,7 @@ impl Arbitration {
             from: pending.resource.state,
             claim: Some(claim.clone()),
             holds_claim: true,
-            dispatched: false,
+            marker: Marker::Keep,
             transmitter: Some(Transmitter::Rich(claim.claim_id)),
             releases_transmitter: false,
         })
@@ -455,7 +476,7 @@ impl Arbitration {
             from: pending.resource.state,
             claim: Some(claim.clone()),
             holds_claim: true,
-            dispatched: true,
+            marker: Marker::Set,
             transmitter: Some(Transmitter::Rich(claim.claim_id)),
             releases_transmitter: false,
         })
@@ -530,7 +551,7 @@ impl Arbitration {
             from: pending.resource.state,
             claim: None,
             holds_claim: false,
-            dispatched: true,
+            marker: Marker::Set,
             transmitter: Some(writer),
             releases_transmitter: false,
         })
@@ -565,7 +586,7 @@ impl Arbitration {
             from: pending.resource.state,
             claim: None,
             holds_claim: false,
-            dispatched: true,
+            marker: Marker::Set,
             transmitter: None,
             releases_transmitter: false,
         })
@@ -586,6 +607,40 @@ impl Arbitration {
         // The reservation goes back with the claim. A resource whose transmission admission was
         // still held by a writer that sent nothing would be answerable by nobody.
         let mut transition = self.plan_from_claim(claim, PendingState::Pending, false)?;
+        transition.releases_transmitter = true;
+        Ok(transition)
+    }
+
+    /// Plans giving a claim back after its marker, because the transport proves that nothing went:
+    /// no byte of the answer was queued.
+    ///
+    /// The marker is cleared with the claim and the transmission admission goes back, so the
+    /// resource is one nobody has answered. On a connection that is still open it is answerable
+    /// again; on one that has closed it is cancelled, as a closing connection settles a resource
+    /// no answer went for. Only the claim that holds the admission can do this, and only after its
+    /// marker: before it, [`Arbitration::plan_release`] is the way back.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when another claim holds the resource,
+    /// [`BrokerError::Arbitration`] when this claim holds no marked admission, and the contract's
+    /// own refusal when the resource has already ended.
+    pub fn plan_unsent(
+        &self,
+        claim: &Claim,
+        connection_open: impl Fn(kr_protocol::ids::GatewayConnectionId) -> bool,
+    ) -> Result<Transition> {
+        let pending = self.claimed_by(claim)?;
+        if !pending.dispatched || pending.transmitter != Some(Transmitter::Rich(claim.claim_id)) {
+            return Err(BrokerError::Arbitration(ArbitrationError::AlreadyClaimed));
+        }
+        let to = if connection_open(pending.resource.request.connection) {
+            PendingState::Pending
+        } else {
+            PendingState::Cancelled
+        };
+        let mut transition = self.plan_from_claim(claim, to, false)?;
+        transition.marker = Marker::Clear;
         transition.releases_transmitter = true;
         Ok(transition)
     }
@@ -647,7 +702,7 @@ impl Arbitration {
             from: pending.resource.state,
             claim: None,
             holds_claim: false,
-            dispatched: pending.dispatched,
+            marker: Marker::kept(pending.dispatched),
             transmitter: None,
             releases_transmitter: false,
         })
@@ -674,7 +729,11 @@ impl Arbitration {
         } else {
             None
         };
-        pending.dispatched = pending.dispatched || transition.dispatched;
+        pending.dispatched = match transition.marker {
+            Marker::Keep => pending.dispatched,
+            Marker::Set => true,
+            Marker::Clear => false,
+        };
         if transition.releases_transmitter {
             pending.transmitter = None;
         } else if let Some(admitted) = transition.transmitter {
@@ -752,7 +811,7 @@ impl Arbitration {
                 from: pending.resource.state,
                 claim: None,
                 holds_claim: false,
-                dispatched: pending.dispatched,
+                marker: Marker::kept(pending.dispatched),
                 transmitter: None,
                 releases_transmitter: false,
             });
@@ -877,7 +936,7 @@ impl Arbitration {
             from: pending.resource.state,
             claim: Some(claim.clone()),
             holds_claim: false,
-            dispatched,
+            marker: Marker::kept(dispatched),
             transmitter: None,
             releases_transmitter: false,
         })
@@ -1010,6 +1069,74 @@ mod tests {
             claim(&mut arbitration, resource_id, "device-2", 4).is_err(),
             "a resolved resource takes no further claim"
         );
+    }
+
+    /// A marked claim whose answer the transport proves was never queued goes back with its
+    /// marker. The resource is answerable again while its connection is open, and cancelled once
+    /// it has closed; an answer that went is still never undone.
+    #[test]
+    fn a_marked_claim_proven_unsent_goes_back_on_an_open_connection_and_cancels_on_a_closed_one() {
+        let marked_claim = |arbitration: &mut Arbitration, resource_id| {
+            let held = claim(arbitration, resource_id, "device-1", 2).expect("claimed");
+            let reserved = arbitration.plan_dispatch(&held).expect("reserved");
+            arbitration.commit(reserved).expect("committed");
+            let marked = arbitration.plan_dispatched(&held).expect("marked");
+            arbitration.commit(marked).expect("committed");
+            held
+        };
+        for open in [true, false] {
+            let mut arbitration = Arbitration::new();
+            let resource = resource(7, "11");
+            let resource_id = resource.resource_id;
+            arbitration.record(resource, None, None).expect("recorded");
+            let held = marked_claim(&mut arbitration, resource_id);
+            assert!(
+                arbitration.get(resource_id).expect("held").dispatched,
+                "the marker is set"
+            );
+            assert!(
+                arbitration.plan_release(&held).is_err(),
+                "a plain release refuses a marked claim: the marker says an answer may have gone"
+            );
+
+            let unsent = arbitration
+                .plan_unsent(&held, |_| open)
+                .expect("the marked claim is given back");
+            assert_eq!(unsent.marker(), Marker::Clear);
+            arbitration.commit(unsent).expect("committed");
+
+            let after = arbitration.get(resource_id).expect("held");
+            assert!(!after.dispatched, "the marker is cleared with the claim");
+            assert_eq!(after.claim, None);
+            assert_eq!(after.transmitter, None);
+            if open {
+                assert_eq!(after.resource.state, PendingState::Pending);
+                let again = marked_claim(&mut arbitration, resource_id);
+                let resolve = arbitration.plan_resolve(&again).expect("planned");
+                arbitration.commit(resolve).expect("committed");
+                assert_eq!(
+                    state_of(&arbitration, resource_id),
+                    PendingState::Resolved,
+                    "the next answer is admitted and settles it"
+                );
+            } else {
+                assert_eq!(after.resource.state, PendingState::Cancelled);
+            }
+            assert!(
+                arbitration.plan_unsent(&held, |_| open).is_err(),
+                "a claim that was given back gives nothing back twice"
+            );
+        }
+
+        // A claim that holds no marker has nothing to undo: it is released the plain way.
+        let mut arbitration = Arbitration::new();
+        let resource = resource(8, "12");
+        let resource_id = resource.resource_id;
+        arbitration.record(resource, None, None).expect("recorded");
+        let held = claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
+        let reserved = arbitration.plan_dispatch(&held).expect("reserved");
+        arbitration.commit(reserved).expect("committed");
+        assert!(arbitration.plan_unsent(&held, |_| true).is_err());
     }
 
     #[test]

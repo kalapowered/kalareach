@@ -5423,6 +5423,125 @@ async fn kr_req_12_18_an_answer_the_queue_took_is_a_channel_end_before_the_call_
     release.send(()).expect("the call is let go");
 }
 
+/// KR-REQ-12.18: an answer a live channel's full queue refuses was never queued, so the host
+/// establishes that it did not go. The receipt says refused, nothing is written for it, its request
+/// is answerable again and not left uncertain beside a line that says nobody can tell, and the
+/// next answer to it is admitted and written.
+///
+/// The writer is held before its first write, so the queue holds what it can take and the answer
+/// after them meets a full queue by arrangement and not by timing: the writer's own held answer
+/// and the queue's capacity are taken, the next is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_18_an_answer_a_full_live_queue_refuses_is_refused_and_its_request_stays_answerable()
+ {
+    use kr_worker::broker::channels::MAX_QUEUED_ANSWERS;
+    // A request identifier of the five letters a channel's application gives, one for each number.
+    fn identifier(number: usize) -> String {
+        const LETTERS: &[u8] = b"abcdefghijkmnopqrstuvwxyz";
+        format!(
+            "aaa{}{}",
+            char::from(LETTERS[number / LETTERS.len()]),
+            char::from(LETTERS[number % LETTERS.len()])
+        )
+    }
+    let host = host().await;
+    let broker = Arc::clone(host.service.broker());
+    let mut channel = ServedChannel::open(&host).await;
+    // The writer holds one answer and the queue holds its capacity: one more is refused.
+    let taken = MAX_QUEUED_ANSWERS + 1;
+    let mut resources = Vec::new();
+    for number in 0..=taken {
+        resources.push(channel.relay(&host, &identifier(number)).await);
+    }
+    let refused_resource = resources[taken];
+    let (arrived, release) = broker.pause_before_channel_write();
+    let mut arrived = Some(arrived);
+    let caller = kr_worker::broker::Caller {
+        actor_id: kr_protocol::ids::ActorId::new("device-1").expect("valid"),
+        grant_id: None,
+        ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+        device_id: None,
+    };
+    let mut held = Vec::new();
+    for resource_id in resources.iter().copied().take(taken) {
+        let params = kr_protocol::agent::AgentApprovalRespondParams {
+            target: AgentMutationTarget {
+                subject: subject(host.session_id, instance()),
+                binding_revision: AgentBindingRevision::new(1),
+            },
+            resource_id,
+            option_id: "allow".to_owned(),
+        };
+        let admitted = broker
+            .admit_approval(&caller, &params, kr_ipc::now_ms())
+            .expect("the answer is admitted");
+        held.push(
+            broker
+                .record_approval(&admitted, kr_ipc::now_ms())
+                .expect("the queue takes the answer"),
+        );
+        if let Some(arrived) = arrived.take() {
+            // The writer has the first answer in hand before the queue is filled behind it.
+            tokio::time::timeout(LIVENESS_DEADLINE, arrived)
+                .await
+                .expect("the writer reached the first answer")
+                .expect("the pause is armed");
+        }
+    }
+
+    let mut client = cli(&host).await;
+    let mutation = approval_mutation(&client, &host, 60, refused_resource);
+    let action_id = mutation.action_id;
+    let Outcome::Error(error) = send(&mut client, mutation).await else {
+        panic!("an answer a full queue refuses is not an applied one");
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::UpstreamUnavailable,
+        "the host says it did not go, and not that the outcome is unknown: {error:?}"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        ReceiptState::Refused
+    );
+    assert_eq!(
+        resource_state(&host, refused_resource),
+        kr_protocol::gateway::PendingState::Pending,
+        "nothing went for the request, so it is not left uncertain"
+    );
+
+    let _ = release.send(());
+    for answer in held {
+        answer
+            .settled(kr_ipc::now_ms())
+            .await
+            .expect_err("a channel confirms nothing");
+    }
+    let mut written = Vec::new();
+    for _ in 0..taken {
+        written.push(channel.next().await["params"]["request_id"].clone());
+    }
+    assert!(
+        !written.contains(&serde_json::json!(identifier(taken))),
+        "no frame was written for the refused answer"
+    );
+
+    let next = approval_mutation(&client, &host, 61, refused_resource);
+    let Outcome::Error(error) = send(&mut client, next).await else {
+        panic!("the next answer ends as an outcome nobody can establish");
+    };
+    assert_eq!(
+        error.code,
+        ErrorCode::OutcomeUnknown,
+        "the next answer to the request is admitted and goes: {error:?}"
+    );
+    assert_eq!(
+        channel.next().await["params"]["request_id"],
+        serde_json::json!(identifier(taken)),
+        "and the frame written next is the one for it"
+    );
+}
+
 /// KR-REQ-12.09: each action records its provenance, and an answer written on a channel is one:
 /// the worker stores, with the receipt that says unknown, that the answer went by the host's own
 /// authenticated bridge. The record is read from the journal's file, as a later run reads it.

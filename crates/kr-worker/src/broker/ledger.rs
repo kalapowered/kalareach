@@ -52,6 +52,7 @@ use kr_protocol::session::Durability;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::broker::PackageIdentity;
+use crate::broker::arbitration::Marker;
 use crate::broker::error::{BrokerError, Result};
 use crate::persistence::fault::JournalHealth;
 use crate::persistence::stores::ContentClass;
@@ -1226,6 +1227,9 @@ impl Ledger {
     /// rather than silently ignored, because the caller's memory and this ledger disagreeing is
     /// exactly the condition that must not be papered over.
     ///
+    /// `marker` says what the write does to the row's dispatch marker: nothing, setting it, or
+    /// clearing it for an answer the transport proved was never queued.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the row is not in the expected state or the
@@ -1234,10 +1238,15 @@ impl Ledger {
         &self,
         resource: &PendingResource,
         expected: PendingState,
-        dispatched: bool,
+        marker: Marker,
         now: TimestampMs,
         event: &TransitionEvent,
     ) -> Result<()> {
+        let marker = match marker {
+            Marker::Keep => None,
+            Marker::Set => Some(1_i64),
+            Marker::Clear => Some(0_i64),
+        };
         // One transaction for the change and for the record that announces it. Section 24 makes
         // those one write because a crash between two writes loses an event about a change that
         // did happen, and nothing later can tell that it did.
@@ -1249,7 +1258,7 @@ impl Ledger {
             .execute(
                 "UPDATE broker_pending
                  SET state = ?3, durability = ?4, record = ?5,
-                     dispatched = MAX(dispatched, ?6),
+                     dispatched = COALESCE(?6, dispatched),
                      resolved_at_ms = CASE WHEN ?7 THEN ?8 ELSE resolved_at_ms END
                  WHERE resource_id = ?1 AND state = ?2",
                 params![
@@ -1258,7 +1267,7 @@ impl Ledger {
                     resource.state.as_str(),
                     resource.durability.as_str(),
                     encode(resource)?,
-                    i64::from(dispatched),
+                    marker,
                     resource.state.is_terminal(),
                     i64::try_from(now.get()).unwrap_or(i64::MAX),
                 ],
@@ -2886,7 +2895,7 @@ mod tests {
             .settle_pending(
                 &claimed,
                 PendingState::Pending,
-                false,
+                Marker::Keep,
                 TimestampMs::new(12),
                 &event(1, &claimed),
             )
@@ -2896,7 +2905,7 @@ mod tests {
             .settle_pending(
                 &resolved,
                 PendingState::Claimed,
-                true,
+                Marker::Set,
                 TimestampMs::new(13),
                 &event(2, &resolved),
             )
@@ -2906,7 +2915,7 @@ mod tests {
         let stale = ledger.settle_pending(
             &claimed,
             PendingState::Pending,
-            false,
+            Marker::Keep,
             TimestampMs::new(14),
             &event(3, &claimed),
         );
@@ -2956,7 +2965,7 @@ mod tests {
                 .settle_pending(
                     &claimed,
                     PendingState::Pending,
-                    false,
+                    Marker::Keep,
                     TimestampMs::new(12),
                     &event(1, &claimed),
                 )

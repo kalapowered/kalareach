@@ -3084,6 +3084,40 @@ impl Broker {
         self.state().release_claim_in(claim, now)
     }
 
+    /// Gives a marked claim back, because the transport proves that no byte of the answer was
+    /// queued.
+    ///
+    /// The marker is committed before the transport is asked, so a failure after it is uncertain
+    /// unless the transport can prove nothing went. Where it can, the answer never left this host
+    /// and the claim goes back with its marker: the resource is answerable again while its
+    /// connection is open, and cancelled once it has closed, as a closing connection cancels a
+    /// resource no answer went for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Arbitration`] or [`BrokerError::PermissionDenied`] as the claim
+    /// requires: a resource that a closing connection has already settled is settled, and what it
+    /// was settled as is the truthful state.
+    pub(crate) fn unsent(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+        let mut state = self.state();
+        let transition = {
+            let gateway = &state.gateway;
+            state
+                .arbitration
+                .plan_unsent(claim, |connection| gateway.contains(connection))?
+        };
+        let actor_id = Some(claim.actor_id.clone());
+        // Undoing the marker records what did not happen, so it happens whether or not the store
+        // can record it, as giving a claim back does.
+        state.commit_transition(
+            transition,
+            now,
+            crate::broker::ledger::TransitionCause::RichClaim,
+            actor_id,
+            OnStoreFault::CarryOn,
+        )
+    }
+
     /// Leaves a claimed resource uncertain: an answer went and nothing confirmed it.
     ///
     /// # Errors
@@ -5716,7 +5750,7 @@ impl BrokerState {
         self.ledger.settle_pending(
             &transition.resource,
             transition.from,
-            transition.sets_marker(),
+            transition.marker(),
             now,
             event,
         )

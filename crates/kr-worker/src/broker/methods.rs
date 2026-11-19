@@ -838,10 +838,20 @@ impl<'a> MarkedAnswer<'a> {
         }
     }
 
-    /// The transport refused the answer after its marker: the resource is left uncertain, and the
-    /// refusal is returned for the caller to report.
+    /// The transport refused the answer after its marker, and the refusal is returned for the
+    /// caller to report.
+    ///
+    /// A refusal that proves nothing was queued gives the claim back with its marker, so the
+    /// resource is answerable again on an open connection and cancelled on one that has closed:
+    /// the answer never left this host, and nothing is uncertain. Any other refusal leaves the
+    /// resource uncertain, because the marker says the answer may have gone.
     #[must_use]
-    pub fn refused(self, error: BrokerError) -> BrokerError {
+    pub fn refused(mut self, error: BrokerError) -> BrokerError {
+        if error.proven_unsent()
+            && let Some(claim) = self.claim.take()
+        {
+            crate::broker::settled(self.broker.unsent(&claim, kr_ipc::now_ms()));
+        }
         drop(self);
         error
     }
