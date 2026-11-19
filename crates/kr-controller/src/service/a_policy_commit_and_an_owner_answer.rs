@@ -498,17 +498,17 @@ async fn the_local_owner_standing_follows_every_change_the_policy_commits() {
     controller
         .update_policy(|policy| policy.set_exclusively_managed(true))
         .expect("exclusive management is set");
-    host.agrees("exclusive management with no lease", true, &[]);
     assert!(controller.local_owner_is_closed());
+    host.agrees("exclusive management with no lease", true, &[]);
 
     // The host's lease is presented, and the owner is served until its first end.
     let first = host.present();
+    assert!(!controller.local_owner_is_closed());
     host.agrees(
         "the host's lease is installed by its presentation",
         true,
         &[first],
     );
-    assert!(!controller.local_owner_is_closed());
     host.pass(Duration::from_millis(
         MEMBERSHIP_LEASE_MAX_LIFETIME_MS - LEASE_CLOCK_MARGIN_MS - 1_000,
     ));
@@ -545,8 +545,8 @@ async fn the_local_owner_standing_follows_every_change_the_policy_commits() {
     controller
         .update_policy(|policy| policy.set_exclusively_managed(false))
         .expect("exclusive management ends");
-    host.agrees("exclusive management ended", false, &[]);
     assert!(!controller.local_owner_is_closed());
+    host.agrees("exclusive management ended", false, &[]);
 
     // Set again with a live lease, then the enrolment withdrawn: the value loaded before the
     // withdrawal still answers that the owner is served, and the new one that it is not.
@@ -563,11 +563,11 @@ async fn the_local_owner_standing_follows_every_change_the_policy_commits() {
     controller
         .update_policy(|policy| policy.withdraw(organisation_id))
         .expect("the enrolment is withdrawn");
-    host.agrees("the enrolment withdrawn", true, &[]);
     assert!(
         controller.local_owner_is_closed(),
         "no lease answers for the local owner once its enrolment is gone"
     );
+    host.agrees("the enrolment withdrawn", true, &[]);
     assert_ne!(
         retained.bound(controller.clock.now(), host.wall.load(Ordering::SeqCst)),
         crate::grants::policy::LocalOwnerBound::Closed,
