@@ -234,41 +234,6 @@ impl ReadPause {
     }
 }
 
-/// A step this host's own tests run at one place in a voice start: set once, run once there.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct OnceStep(std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>);
-
-#[cfg(test)]
-impl std::fmt::Debug for OnceStep {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_struct("OnceStep").finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-impl OnceStep {
-    /// Sets the step the next start runs at this place.
-    pub(crate) fn set(&self, step: impl FnOnce() + Send + 'static) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(step));
-    }
-
-    /// Runs the step when one is set, once.
-    pub(crate) fn run(&self) {
-        let step = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(step) = step {
-            step();
-        }
-    }
-}
-
 /// A point in a step that blocks its thread, which this host's own tests can stop it at: the step
 /// says it has arrived and waits there, on its thread, until the test lets it go. Armed once, it
 /// fires once. The wait uses the standard library's channels, so it can stop a step that runs
@@ -962,16 +927,6 @@ pub struct Controller {
     /// record the action in between. Compiled away in every shipped build.
     #[cfg(test)]
     before_a_voice_change_claims: ReadPause,
-    /// Where this host's own tests stop a voice start whose answer is known, before the claim it
-    /// answers under is settled, so that the store the settlement writes to can be held in
-    /// between. Compiled away in every shipped build.
-    #[cfg(test)]
-    before_a_voice_claim_settles: ReadPause,
-    /// Where this host's own tests run a step in a voice start once its first reading of the
-    /// continuous clock is taken, so that the clock can move before the wall clock is read.
-    /// Compiled away in every shipped build.
-    #[cfg(test)]
-    after_a_start_reads_its_first_moment: OnceStep,
     /// Set by this host's own tests to make the next look at where a session starts end as a task
     /// that panicked does, which the create waiting for it meets as a failure to join. The flag is
     /// taken by the first look. Compiled away in every shipped build.
