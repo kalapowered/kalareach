@@ -370,7 +370,7 @@ export interface ToastMessage {
    * is better said another way, such as an address said as words.
    */
   readonly spoken?: string
-  readonly tone: 'success' | 'danger' | 'pending'
+  readonly tone: 'success' | 'danger' | 'pending' | 'neutral'
   readonly action?: ToastAction
   /**
    * What the message is about. A message on the topic of the one showing takes its place in place,
@@ -583,13 +583,19 @@ function ToastCard({
           className={
             message.tone === 'danger'
               ? 'danger-text'
-              : message.tone === 'pending'
+              : message.tone === 'pending' || message.tone === 'neutral'
                 ? 'faint'
                 : 'success-text'
           }
           aria-hidden="true"
         >
-          {message.tone === 'danger' ? '!' : message.tone === 'pending' ? '…' : '✓'}
+          {message.tone === 'danger'
+            ? '!'
+            : message.tone === 'pending'
+              ? '…'
+              : message.tone === 'neutral'
+                ? 'i'
+                : '✓'}
         </span>
         <span
           className="toast-text"

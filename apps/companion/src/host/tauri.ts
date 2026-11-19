@@ -353,6 +353,7 @@ export function tauriPort(): HostPort {
 
     historyPage: (params, opening) => readIn('history_page', params, opening),
     actionRead: (params, opening) => readIn('action_read', params, opening),
+    settleAction: (params, opening) => readIn<void>('agent_action_settle', params, opening),
     // Attention and review belong to the environment, so an acknowledgement names no session.
     attentionRead: (params) => read('attention_read', params),
     attentionAcknowledge: (params) => mutate('attention_acknowledge', params, {}),

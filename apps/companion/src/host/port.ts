@@ -1392,6 +1392,19 @@ export interface Settled<T = unknown> {
    * outcome is unknown is still one the interface can ask about rather than resubmit.
    */
   readonly action_id: string | null
+  /**
+   * Whether the answer to the request was lost: the connection ended after it was sent, so the host
+   * may hold no receipt for it, or one that can still become a refusal. False is the worker's own
+   * word, an outcome it could not establish included. Absent is read as lost: only a word the host
+   * gave settles an outcome as final.
+   */
+  readonly answer_lost?: boolean
+}
+
+/** What the page names to release an action from the connection's book of unresolved ones. */
+export interface ActionSettleParams {
+  readonly session_id: string
+  readonly action_id: string
 }
 
 /** What a person's answer to a question came to. */
@@ -1974,6 +1987,13 @@ export interface HostPort {
    * the session's own link.
    */
   actionRead(params: ActionReadParams, opening?: string): Promise<ActionReadResult>
+  /**
+   * Lets the session's connection stop counting an action whose outcome the host's own word ended
+   * for good. Nothing is sent to the worker, whose receipt stays as it was; past the connection's
+   * bound of unresolved actions it refuses every new mutation, so a transport that confirms
+   * nothing releases what it can never settle. The opening is the one the action's call used.
+   */
+  settleAction(params: ActionSettleParams, opening?: string): Promise<void>
   attentionRead(params: AttentionReadParams): Promise<AttentionReadResult>
   /** Records that items were seen, each at the revision shown. An environment's, not a session's. */
   attentionAcknowledge(params: AttentionAcknowledgeParams): Promise<Settled<AttentionAcknowledgeResult>>

@@ -30,11 +30,18 @@ import {
   actionableApprovals,
   capabilityRecords,
   composerOffers,
+  isChannelPackage,
   subjectOf,
   targetOf
 } from '../model/agent'
 import { describeElapsed } from '../model/attention'
-import { outcomeMessage, outcomeTone } from '../model/receipts'
+import {
+  CHANNEL_ANSWER_LINE,
+  CHANNEL_ANSWER_WORDS,
+  endsAsChannelAnswer,
+  outcomeMessage,
+  outcomeTone
+} from '../model/receipts'
 
 /** How much of a request's original bytes is shown before the rest is counted instead. */
 const SHOWN_SOURCE_CHARS = 4096
@@ -44,6 +51,8 @@ interface Waiting {
   readonly resource: PendingResource
   readonly inspection: AgentApprovalInspectResult
   readonly facts: AgentCapabilitiesResult
+  /** Whether the request's instance takes answers over a channel that confirms nothing. */
+  readonly channel: boolean
 }
 
 /** The request the agent sent, as text a person can read, and how much of it is not shown. */
@@ -77,6 +86,8 @@ export function ApprovalRequests({
   const [waiting, setWaiting] = useState<{
     readonly visit: object
     readonly requests: readonly Waiting[]
+    /** Approvals of a channel instance that were answered and that the host still lists as uncertain. */
+    readonly held: readonly PendingResource[]
     readonly atMs: number
   } | null>(null)
   const [failure, setFailure] = useState<{ readonly visit: object; readonly words: string } | null>(
@@ -89,11 +100,42 @@ export function ApprovalRequests({
   const reads = useRef<Watch | null>(null)
   const again = useRef<() => void>(() => undefined)
 
+  // Answers a channel took end for good on the host's own word, and the connection stops counting
+  // them. A release that fails is kept and tried again with the next read.
+  const unreleased = useRef(new Set<string>())
+  const release = useCallback(
+    (actionId: string | null) => {
+      if (actionId !== null) unreleased.current.add(actionId)
+      for (const id of [...unreleased.current]) {
+        port.settleAction({ session_id: sessionId, action_id: id }).then(
+          () => {
+            unreleased.current.delete(id)
+          },
+          () => undefined
+        )
+      }
+    },
+    [port, sessionId]
+  )
+
   const load = useCallback((): Promise<void> => {
     const current = reads.current?.read() ?? null
     if (current === null) return Promise.resolve()
-    return ask(async (): Promise<readonly Waiting[]> => {
+    // A release that did not reach the session is tried again with each read.
+    release(null)
+    return ask(async () => {
       const agents = await port.sessionAgents(sessionId)
+      const channelInstances = new Set(
+        agents.instances.instances
+          .filter((instance) => isChannelPackage(instance.plugin_id))
+          .map((instance) => instance.application_instance_id)
+      )
+      const held = agents.resources.filter(
+        (resource) =>
+          resource.kind === 'approval' &&
+          resource.state === 'uncertain' &&
+          channelInstances.has(resource.application_instance_id)
+      )
       const open = actionableApprovals(agents.resources)
       const instances = [...new Set(open.map((resource) => resource.application_instance_id))]
       const facts = new Map(
@@ -107,13 +149,14 @@ export function ApprovalRequests({
           )
         )
       )
-      return await Promise.all(
-        open.map(async (resource) => {
+      const requests = await Promise.all(
+        open.map(async (resource): Promise<Waiting> => {
           const instanceFacts = facts.get(resource.application_instance_id)
           if (instanceFacts === undefined) throw new Error('an instance was not read')
           return {
             resource,
             facts: instanceFacts,
+            channel: channelInstances.has(resource.application_instance_id),
             inspection: await port.approvalInspect({
               subject: subjectOf(sessionId, resource.application_instance_id),
               resource_id: resource.resource_id
@@ -121,17 +164,18 @@ export function ApprovalRequests({
           }
         })
       )
+      return { requests, held }
     })
-      .then((requests) => {
+      .then(({ requests, held }) => {
         if (!current()) return
-        setWaiting({ visit, requests, atMs: Date.now() })
+        setWaiting({ visit, requests, held, atMs: Date.now() })
         setFailure(null)
       })
       .catch((error: unknown) => {
         if (!current()) return
         setFailure({ visit, words: failureMessage(error) })
       })
-  }, [port, sessionId, visit])
+  }, [port, sessionId, visit, release])
 
   useEffect(() => {
     const cadence = readOnCadence(load, AGENT_READ_CADENCE_MS)
@@ -161,6 +205,14 @@ export function ApprovalRequests({
     )
       .then((settled) => {
         // The completion feedback waits for the host: what it answered, not what the network did.
+        // An answer a channel took and the host's own word left unknown says so, and the
+        // connection stops counting it; a lost answer, and any other unknown outcome, say what the
+        // host could not confirm.
+        if (endsAsChannelAnswer(settled, request.channel)) {
+          say(CHANNEL_ANSWER_WORDS, 'neutral')
+          if (settled.action_id !== null) release(settled.action_id)
+          return
+        }
         say(outcomeMessage(`You chose “${decision.label}”`, settled), outcomeTone(settled))
       })
       .catch((error: unknown) => {
@@ -188,10 +240,17 @@ export function ApprovalRequests({
       />
     )
   }
-  if (requests === null || requests.length === 0) return null
+  const held = shown?.held ?? []
+  if (requests === null || (requests.length === 0 && held.length === 0)) return null
 
   return (
-    <section className="approvals" aria-label="Waiting for your decision" data-testid="approvals">
+    <section
+      className="approvals"
+      aria-label={
+        requests.length > 0 ? 'Waiting for your decision' : 'Answers Claude Code did not confirm'
+      }
+      data-testid="approvals"
+    >
       {requests.map((request) => {
         const { resource, inspection, facts } = request
         const decoding = inspection.decoding
@@ -255,6 +314,16 @@ export function ApprovalRequests({
           </article>
         )
       })}
+      {held.map((resource) => (
+        <p
+          key={resource.resource_id}
+          className="small muted"
+          data-resource={resource.resource_id}
+          data-testid="approval-unconfirmed"
+        >
+          {CHANNEL_ANSWER_LINE}
+        </p>
+      ))}
     </section>
   )
 }

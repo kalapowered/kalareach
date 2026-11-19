@@ -599,6 +599,10 @@ export interface FakeHostControls {
     environmentId: string,
     options?: { readonly refuseSessionList?: boolean; readonly refuseEnvironmentList?: boolean }
   ): void
+  /** The actions the page released from the connection's book of unresolved ones, in order. */
+  readonly releasedActions: readonly string[]
+  /** Makes the next `count` releases fail before one is taken, as a link that cannot be reached does. */
+  failReleases(count: number): void
   /** Sets what the connection may do, and says so as native code does. */
   setRights(rights: readonly ActionRight[]): void
   /**
@@ -1619,6 +1623,10 @@ export function fakeHost(
   let submissions = 0
   let heldSends: (() => void)[] | null = null
   let nextSendUnconfirmed = false
+  /** The actions the page released from the connection's book, in order. */
+  const releasedActions: string[] = []
+  /** How many of the next releases fail before one is taken. */
+  let settleActionFails = 0
   const answeredWhenReleased = <T>(answer: T): Promise<T> => {
     const waiting = heldSends
     return waiting === null
@@ -2198,6 +2206,16 @@ export function fakeHost(
       requireConnection()
       checkOpening('actionRead', params.session_id ?? '', opening)
       return refuse('NOT_FOUND', 'The host holds no receipt for that action.')
+    },
+    settleAction: (params, opening) => {
+      requireConnection()
+      checkOpening('settleAction', params.session_id, opening)
+      if (settleActionFails > 0) {
+        settleActionFails -= 1
+        return Promise.reject(new Error('The release did not reach the session.'))
+      }
+      releasedActions.push(params.action_id)
+      return Promise.resolve()
     },
     historyPage: (params, opening) =>
       reading('historyPage', () => {
@@ -3604,6 +3622,10 @@ export function fakeHost(
     },
     descriptionConfigures,
     descriptionDownloads,
+    releasedActions,
+    failReleases(count) {
+      settleActionFails = count
+    },
     setRights(next) {
       rights = next
       // A session opened as the owner holds what the connection holds, and is told when it changes.

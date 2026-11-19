@@ -391,6 +391,20 @@ export function attachOffer({ connected, paired, rights }: AttachFacts): Offer {
 const ATTACH_RIGHTS: readonly string[] = ['files.upload', 'agent.prompt']
 
 /**
+ * The packages whose instances take approvals and messages over a channel that confirms nothing.
+ *
+ * A presentation policy, not a host fact and not an authority check: it decides which words and
+ * which line the page shows for an outcome the host's own word left unknown, and nothing the host
+ * admits is decided by it.
+ */
+export const CHANNEL_PACKAGES: readonly string[] = ['kalareach/claude-code']
+
+/** Whether `pluginId` is a package of [`CHANNEL_PACKAGES`]. */
+export function isChannelPackage(pluginId: string | null): boolean {
+  return pluginId !== null && CHANNEL_PACKAGES.includes(pluginId)
+}
+
+/**
  * The requests a person can answer now: approvals whose interpretation a granted decoder verified
  * and that are still pending. Section 11: an opaque request is not an actionable approval until
  * then.

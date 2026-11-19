@@ -1,0 +1,79 @@
+/**
+ * An answer a channel took ends as an outcome nobody can establish, and says so (KR-REQ-12.18).
+ *
+ * These render the real application against the scripted host, whose Claude Code instance answers
+ * as the desktop host tells such an answer: the action and nothing else, the request held as
+ * uncertain.
+ */
+
+import { describe, expect, it } from 'vitest'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+
+import { App } from '../src/App'
+import { AppProvider } from '../src/app/state'
+import { fakeHost } from '../src/host/fake'
+
+const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+function start(lostAnswers: number): ReturnType<typeof fakeHost>['controls'] {
+  const { port, controls } = fakeHost()
+  controls.records.useChannel(SESSION_MAIN, lostAnswers)
+  render(
+    <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+      <App />
+    </AppProvider>
+  )
+  return controls
+}
+
+async function allow(): Promise<void> {
+  const approval = await screen.findByTestId('approval')
+  await userEvent.click(within(approval).getByRole('button', { name: 'Allow once' }))
+}
+
+describe('an answer a channel took', () => {
+  it('says the host cannot tell whether it was taken, lets go of the action, and keeps a line beside the request', async () => {
+    const controls = start(0)
+    await allow()
+    expect(await screen.findByText(/does not confirm answers/)).toBeInTheDocument()
+    expect(screen.queryByText(/could not confirm what became of that/)).toBeNull()
+    await waitFor(() => {
+      expect(controls.releasedActions).toHaveLength(1)
+    })
+    expect(controls.records.agentOf(SESSION_MAIN).resources[0]?.state).toBe('uncertain')
+    // The request leaves the list of what a person can answer; the line that stays does not.
+    await waitFor(() => {
+      expect(screen.queryByTestId('approval')).toBeNull()
+    })
+    expect(await screen.findByTestId('approval-unconfirmed')).toHaveTextContent(
+      /cannot tell whether Claude Code took the answer to this request/
+    )
+  })
+
+  it('keeps the ordinary words, and does not let go, for an answer that was lost on the way back', async () => {
+    const controls = start(1)
+    await allow()
+    expect(await screen.findByText(/could not confirm what became of that/)).toBeInTheDocument()
+    expect(screen.queryByText(/does not confirm answers/)).toBeNull()
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(controls.releasedActions).toHaveLength(0)
+  })
+
+  it('tries a release again with the next read when the first did not reach the session', async () => {
+    const { port, controls } = fakeHost()
+    controls.records.useChannel(SESSION_MAIN, 0)
+    controls.failReleases(1)
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
+        <App />
+      </AppProvider>
+    )
+    await allow()
+    await waitFor(() => {
+      expect(controls.releasedActions).toHaveLength(1)
+    })
+  })
+})

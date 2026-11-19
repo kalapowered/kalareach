@@ -87,7 +87,7 @@ interface AppValue {
    */
   readonly say: (
     text: string,
-    tone?: 'success' | 'danger' | 'pending',
+    tone?: 'success' | 'danger' | 'pending' | 'neutral',
     action?: ToastAction,
     spoken?: string
   ) => void
@@ -149,7 +149,7 @@ export function AppProvider({
   const say = useCallback(
     (
       text: string,
-      tone: 'success' | 'danger' | 'pending' = 'success',
+      tone: 'success' | 'danger' | 'pending' | 'neutral' = 'success',
       action?: ToastAction,
       spoken?: string
     ) => {
