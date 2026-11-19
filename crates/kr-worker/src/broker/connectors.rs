@@ -1223,6 +1223,10 @@ pub mod fixture {
         /// The hook events the package's connector table declares, as JSON, where it declares
         /// any: the package then states an `sdk_range` from the SDK version the member arrived at.
         pub hook_events: Option<serde_json::Value>,
+        /// The launch variables the package's connector table declares, as JSON, where it
+        /// declares any: the package then states an `sdk_range` that starts at the SDK this crate
+        /// implements, which admits no SDK before the member arrived.
+        pub launch_variables: Option<serde_json::Value>,
     }
 
     impl Shape {
@@ -1243,6 +1247,27 @@ pub mod fixture {
                 volatile_forwarding: false,
                 answers: false,
                 hook_events: None,
+                launch_variables: None,
+            }
+        }
+
+        /// A Gemini CLI package written for launch variables: its connector table declares
+        /// `GEMINI_CLI_NO_RELAUNCH` set to `1`, which its integration sets, under a range that
+        /// admits no SDK before the member arrived. `1` is not the pair the compiled list holds, so
+        /// only the declaration permits it.
+        #[must_use]
+        pub fn gemini_cli_declaring() -> Self {
+            let mut integration = released_integration(RELEASED_GEMINI_CLI);
+            integration["variables"] =
+                serde_json::json!([{ "name": "GEMINI_CLI_NO_RELAUNCH", "value": "1" }]);
+            Self {
+                integration: Some(integration),
+                launch_variables: Some(serde_json::json!([{
+                    "name": "GEMINI_CLI_NO_RELAUNCH",
+                    "value": "1",
+                    "reason": "Keeps the session in the process that was launched"
+                }])),
+                ..Self::gemini_cli(&[])
             }
         }
 
@@ -1266,6 +1291,7 @@ pub mod fixture {
                 volatile_forwarding: false,
                 answers: false,
                 hook_events: None,
+                launch_variables: None,
             }
         }
 
@@ -1296,6 +1322,7 @@ pub mod fixture {
                 volatile_forwarding: true,
                 answers: false,
                 hook_events: None,
+                launch_variables: None,
             }
         }
 
@@ -1327,6 +1354,7 @@ pub mod fixture {
                 volatile_forwarding: false,
                 answers: false,
                 hook_events: None,
+                launch_variables: None,
             }
         }
     }
@@ -1349,6 +1377,7 @@ pub mod fixture {
             volatile_forwarding: false,
             answers: false,
             hook_events: None,
+            launch_variables: None,
         }
     }
 
@@ -1907,6 +1936,13 @@ pub mod fixture {
             // `hook_events` arrived in 0.1.8.
             manifest["sdk_range"] = serde_json::json!(">=0.1.8, <0.2.0");
         }
+        if shape.launch_variables.is_some() {
+            // A table that declares launch variables states a range that admits no SDK before the
+            // member arrived: one that starts at this crate's own SDK, which no later release
+            // lowers.
+            manifest["sdk_range"] =
+                serde_json::json!(format!(">={}, <0.2.0", kr_plugin_sdk::version::SDK_VERSION));
+        }
         serde_json::to_string_pretty(&manifest).expect("a literal manifest encodes")
     }
 
@@ -1974,14 +2010,18 @@ pub mod fixture {
         } else {
             connector_json_for(&plugin_id)
         };
-        let connector = match &shape.hook_events {
-            Some(events) => {
-                let mut table: serde_json::Value =
-                    serde_json::from_str(&connector).expect("a literal table decodes");
+        let connector = if shape.hook_events.is_some() || shape.launch_variables.is_some() {
+            let mut table: serde_json::Value =
+                serde_json::from_str(&connector).expect("a literal table decodes");
+            if let Some(events) = &shape.hook_events {
                 table["hook_events"] = events.clone();
-                serde_json::to_string_pretty(&table).expect("a literal table encodes")
             }
-            None => connector,
+            if let Some(declared) = &shape.launch_variables {
+                table["launch_variables"] = declared.clone();
+            }
+            serde_json::to_string_pretty(&table).expect("a literal table encodes")
+        } else {
+            connector
         };
         package_with_connector(root, forwarder, shape, connector)
     }
