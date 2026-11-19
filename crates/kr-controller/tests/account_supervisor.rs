@@ -65,8 +65,14 @@ fn a_daemon_of_a_run_that_did_not_ask_gets_the_detached_supervisor() {
 }
 
 /// A daemon of a run that asked gets the launchd supervisor the platform names.
+///
+/// The case reads the account's own launchd and runs a child with the variable set, so it stands
+/// down where the run did not ask, and the value its child gets is the run's own.
 #[test]
 fn a_daemon_of_a_run_that_asked_gets_the_launchd_supervisor_the_platform_names() {
+    if kr_ipc::testing::account_launchd::stands_down("the launchd supervisor's choice") {
+        return;
+    }
     assert!(
         LaunchdSupervisor::available(),
         "this host's launchd is not there to be had, so the case shows nothing"
