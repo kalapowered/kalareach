@@ -7932,9 +7932,10 @@ bound to a voice session; when a live session already holds it; or when this hos
 service confirmed the close. The row stays when the outcome may have been carried out and is not
 known, when the service did not confirm a close, when the result could not be kept, when the row
 could not be deleted, and when the task that held the start was dropped; it then ends at its bound
-or when a start names it. A refusal that the host could not keep does not keep the row. An answer
-the host cannot read leaves no row, except a 502 or 504 from a gateway: the request may still have
-reached the service, so the row stays.
+or when a start names it. A refusal that the host could not keep does not keep the row by itself:
+the start's effect still ends it. An unreadable success, or an unreadable 502 or 504 from a gateway,
+keeps the row, because the request may have reached the service. Other unreadable answers count as
+refusals.
 
 The hold has a bound: the call's length (at most 1,800 seconds, the service's maximum) plus 120
 seconds. Those 120 seconds are the 30 seconds a start may wait before its request is written, the 50
