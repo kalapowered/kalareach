@@ -592,7 +592,10 @@ export function VoiceRoute({
   // What this device owes lapses by itself, and the device stops saying it then: the screen reads
   // again at the first lapse it is waiting for, so a warning does not outlive what it warns of.
   const nextLapse = useMemo(() => {
-    const ends = (left?.owed ?? []).map((owed) => owed.until_ms)
+    // A call left to the host does not lapse: it stands until the host says it is closed.
+    const ends = (left?.owed ?? [])
+      .filter((owed) => owed.kind !== 'host_close')
+      .map((owed) => owed.until_ms)
     return ends.length === 0 ? null : Math.min(...ends)
   }, [left])
   const [lapseTries, setLapseTries] = useState(0)

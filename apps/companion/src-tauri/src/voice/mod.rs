@@ -752,24 +752,47 @@ impl Shared {
         }
     }
 
-    /// Takes a revocation out of what is owed, because the host it is owed to has revoked the grant.
-    /// Only an entry owed to that host and environment goes: another host's answer says nothing of
-    /// what a different host holds.
+    /// Takes what the host's answer to a stop settles out of what is owed for that call: the
+    /// revocation, when the host revoked the grant or holds no such call, and the call left to the
+    /// host, when the host says the call is closed. Only an entry owed to that host and environment
+    /// goes: another host's answer says nothing of what a different host holds.
     fn settled(
         &self,
         host: kr_protocol::ids::DeviceId,
         environment: kr_protocol::ids::EnvironmentId,
         voice_session_id: &str,
+        answer: &HostEnd,
     ) {
         self.read_again();
         let removed = {
             let mut view = self.view.lock().expect("the view lock is not poisoned");
             let before = view.owed.len();
             view.owed.retain(|owed| {
-                owed.kind != "revocation"
-                    || owed.voice_session_id.as_deref() != Some(voice_session_id)
-                    || owed.host != Some((host, environment))
+                let this_call = owed.voice_session_id.as_deref() == Some(voice_session_id)
+                    && owed.host == Some((host, environment));
+                let settled = match owed.kind.as_str() {
+                    "revocation" => answer.settles(),
+                    OwedView::HOST_CLOSE => answer.closes_the_call(),
+                    _ => false,
+                };
+                !(this_call && settled)
             });
+            view.owed.len() != before
+        };
+        if removed {
+            self.keep();
+        }
+    }
+
+    /// Takes the calls left to `host` out of what is owed, because the host has made a call on its
+    /// own key: it makes none while it holds another, so the calls before it are closed.
+    pub(crate) fn left_calls_are_closed(&self, host: &CallHost) {
+        let pair = Some((host.paired.host_device_id, host.environment_id));
+        let removed = {
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            let before = view.owed.len();
+            view.owed
+                .retain(|owed| owed.kind != OwedView::HOST_CLOSE || owed.host != pair);
             view.owed.len() != before
         };
         if removed {
@@ -1434,9 +1457,12 @@ impl Calls {
 
     /// Says that the host a call left a grant at is reached, over `session`, so that what this
     /// device owes it is asked once more: each revocation owed to `host` in `environment` that has
-    /// not lapsed goes to the host again. That the host revoked the grant, or holds no such
-    /// call, settles it; any other refusal, or no answer, leaves it owed until the grant lapses,
-    /// because such a refusal does not say the grant is gone. It runs on a task of its own and the screen does not wait for it.
+    /// not lapsed, and each call left to it, goes to the host as a stop again. That the host revoked
+    /// the grant, or holds no such call, settles a revocation; any other refusal, or no answer,
+    /// leaves it owed until the grant lapses, because such a refusal does not say the grant is gone.
+    /// A call left to the host is settled only by an answer that says it is closed: a revoked grant
+    /// the provider did not confirm closing leaves it owed. It runs on a task of its own and the
+    /// screen does not wait for it.
     pub fn host_reached(
         &self,
         host: kr_protocol::ids::DeviceId,
@@ -1455,26 +1481,33 @@ impl Calls {
             .expect("the view lock is not poisoned")
             .owed
             .iter()
-            .filter(|owed| owed.kind == "revocation" && owed.host == Some((host, environment)))
+            .filter(|owed| {
+                matches!(owed.kind.as_str(), "revocation" | OwedView::HOST_CLOSE)
+                    && owed.host == Some((host, environment))
+            })
             .filter_map(|owed| {
                 Some((
                     owed.voice_session_id.as_deref()?.parse().ok()?,
                     owed.until_ms,
+                    owed.kind == OwedView::HOST_CLOSE,
                 ))
             })
             .collect();
         // One question for each voice session: two entries for one call (a crash between two
         // writes can leave them) are one thing owed, and one answer settles both.
         let mut owed = owed;
+        // A call left to the host is asked whenever it stands, and whether the grant has lapsed
+        // does not matter to it; so is a call that has both entries, asked once.
+        owed.sort_by_key(|(_, _, left_to_host)| std::cmp::Reverse(*left_to_host));
         let mut asked = std::collections::BTreeSet::new();
-        owed.retain(|(voice_session_id, _)| asked.insert(*voice_session_id));
+        owed.retain(|(voice_session_id, _, _)| asked.insert(*voice_session_id));
         if owed.is_empty() {
             return;
         }
         tokio::spawn(async move {
-            for (voice_session_id, until_ms) in owed {
-                // What has lapsed is not asked: the grant has ended by itself.
-                if until_ms <= now_ms() {
+            for (voice_session_id, until_ms, left_to_host) in owed {
+                // A revocation that has lapsed is not asked: the grant has ended by itself.
+                if !left_to_host && until_ms <= now_ms() {
                     continue;
                 }
                 let end = host::revoke(
@@ -1484,11 +1517,11 @@ impl Calls {
                     shared.timings.host_within,
                 )
                 .await;
-                // Only a revocation done, or a host that holds no such call, settles it: another
-                // refusal may come from a host that did not look at the session, and the grant is
-                // then still live.
+                // Only a revocation done, or a host that holds no such call, settles a revocation:
+                // another refusal may come from a host that did not look at the session, and the
+                // grant is then still live.
                 if end.settles() {
-                    shared.settled(host, environment, &voice_session_id.to_string());
+                    shared.settled(host, environment, &voice_session_id.to_string(), &end);
                 }
             }
         });
@@ -1686,7 +1719,7 @@ impl Calls {
         state.setting_up = busy && !state.running;
         state.ending = state.setting_up && state.ending;
         let now = now_ms();
-        state.owed.retain(|owed| owed.until_ms > now);
+        state.owed.retain(|owed| !owed.lapsed(now));
         let remembered = shared
             .note
             .lock()
