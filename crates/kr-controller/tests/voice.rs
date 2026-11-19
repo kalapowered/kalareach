@@ -3734,3 +3734,188 @@ async fn a_phone_not_heard_from_for_two_minutes_has_its_call_closed_by_the_hosts
         }
     );
 }
+
+/// A beat from the phone on the call, asked through `voice.control`.
+async fn beat(
+    voice: &RawVoice,
+    call: kr_protocol::ids::VoiceSessionId,
+) -> kr_protocol::voice_host::VoiceControlResult {
+    voice
+        .control(
+            ActionId::new(kr_ipc::new_uuid()),
+            call,
+            kr_protocol::voice_host::VoiceControlArm::Heartbeat {
+                after_seq: U64::new(0),
+            },
+        )
+        .await
+        .expect("a heartbeat is answered")
+}
+
+/// A second call of the same provider has a side channel of its own: it registers open, though
+/// the first call's channel closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_call_of_the_same_stand_in_registers_open_after_the_first_closed() {
+    use kr_protocol::voice_host::{VoiceControlResult, VoiceHostCallState};
+    let (provider, voice, first) = own_key_call().await;
+    let _: kr_protocol::voice::VoiceStopResult = voice
+        .raw
+        .mutate(
+            Method::VoiceStop,
+            ActionId::new(kr_ipc::new_uuid()),
+            voice.target.clone(),
+            &kr_protocol::voice::VoiceStopParams {
+                voice_session_id: first,
+            },
+        )
+        .await
+        .expect("the first call is stopped")
+        .to_typed()
+        .expect("a stop result");
+    assert_eq!(provider.closed(), ["own-1"]);
+    let started: kr_protocol::voice::VoiceStartResult = voice
+        .raw
+        .mutate(
+            Method::VoiceStart,
+            ActionId::new(kr_ipc::new_uuid()),
+            voice.target.clone(),
+            &voice.start,
+        )
+        .await
+        .expect("a second call is created")
+        .to_typed()
+        .expect("a start result");
+    let VoiceStartOutcome::Started { session } = started.outcome else {
+        panic!("the second call runs: {:?}", started.outcome);
+    };
+    assert_ne!(session.voice_session_id, first);
+    let VoiceControlResult::Heartbeat { state, .. } = beat(&voice, session.voice_session_id).await
+    else {
+        panic!("a heartbeat answer");
+    };
+    assert_eq!(state, VoiceHostCallState::Open);
+}
+
+/// The host ends a call whose phone went silent, and the revocation of its grant fails: the
+/// session and the grant stay and the provider's call runs. The host holds the call as closing,
+/// tells it ended once the wait for the provider's report is over, and a later close of the call
+/// makes no second status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_revocation_keeps_the_call_closing_until_the_threshold_then_tells_it_ended() {
+    use kr_protocol::voice_host::{
+        VoiceControlResult, VoiceEndReason, VoiceHostCallState, VoiceNewsItem,
+    };
+    let (provider, voice, call) = own_key_call().await;
+    let module = Arc::clone(voice.host.controller().voice());
+    module.refuse_grant_revocations(true);
+    let now = kr_ipc::now_ms().get();
+
+    module.tick(now + 125_000).await;
+    assert!(
+        provider.closed().is_empty(),
+        "the revocation failed, so the provider's call runs"
+    );
+    let VoiceControlResult::Heartbeat { state, news, .. } = beat(&voice, call).await else {
+        panic!("a heartbeat answer");
+    };
+    assert_eq!(state, VoiceHostCallState::Closing);
+    assert!(
+        !news
+            .iter()
+            .any(|item| matches!(item.item, VoiceNewsItem::Ended { .. })),
+        "the end is not told while the close is open"
+    );
+
+    module.tick(now + 125_000 + 60_000).await;
+    let VoiceControlResult::Heartbeat { state, news, .. } = beat(&voice, call).await else {
+        panic!("a heartbeat answer");
+    };
+    assert_eq!(
+        state,
+        VoiceHostCallState::Closed {
+            reason: VoiceEndReason::Silence
+        }
+    );
+    assert!(matches!(
+        news.last().map(|item| &item.item),
+        Some(VoiceNewsItem::Ended {
+            reason: VoiceEndReason::Silence
+        })
+    ));
+
+    // The refusal is lifted, and the sweep at the call's deadline closes the call: the host
+    // makes no second status.
+    module.refuse_grant_revocations(false);
+    module.tick(now + 24 * 3_600_000).await;
+    assert_eq!(provider.closed(), ["own-1"]);
+    assert_eq!(module.host_calls().kept_final_statuses(), 1);
+}
+
+/// A call whose end is recorded while the revocation failed takes nothing from the phone: the
+/// heartbeat is answered and writes nothing to the side channel, and a mute is refused as closing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_heartbeat_after_a_silence_end_whose_revocation_failed_writes_nothing_more_to_the_channel()
+ {
+    use kr_protocol::voice_host::{
+        VoiceControlArm, VoiceControlResult, VoiceHostCallState, VoiceHostRefusal,
+    };
+    let (provider, voice, call) = own_key_call().await;
+    let module = Arc::clone(voice.host.controller().voice());
+    module.refuse_grant_revocations(true);
+    let now = kr_ipc::now_ms().get();
+    module.tick(now + 125_000).await;
+    // The model was told that the phone is silent.
+    let written = provider.sideband().written();
+    assert_eq!(written.len(), 1);
+
+    let VoiceControlResult::Heartbeat { state, .. } = beat(&voice, call).await else {
+        panic!("a heartbeat answer");
+    };
+    assert_eq!(state, VoiceHostCallState::Closing);
+    assert_eq!(
+        voice
+            .control(
+                ActionId::new(kr_ipc::new_uuid()),
+                call,
+                VoiceControlArm::Mute { muted: true },
+            )
+            .await
+            .expect("a refusal is an answer"),
+        VoiceControlResult::Refused {
+            reason: VoiceHostRefusal::Closing
+        }
+    );
+    assert_eq!(
+        provider.sideband().written(),
+        written,
+        "no back note and no mute reached the provider"
+    );
+}
+
+/// A delegation the side channel heard is refused once the call's end is recorded, while the
+/// revocation failed and the session stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_heard_delegation_is_refused_after_the_end_while_the_revocation_failed() {
+    let (provider, voice, call) = own_key_call().await;
+    voice.reads_everything_as(voice.submitting_a_prompt());
+    let params = voice.prompt(call, "d-heard");
+    provider.sideband().hear(params.delegation_id.as_str(), 0);
+    let module = Arc::clone(voice.host.controller().voice());
+    module.refuse_grant_revocations(true);
+    let now = kr_ipc::now_ms().get();
+    module.tick(now + 125_000).await;
+
+    let refused = voice
+        .delegate(ActionId::new(kr_ipc::new_uuid()), &params)
+        .await
+        .expect_err("a delegation after the end is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::PermissionDenied
+    );
+    assert!(
+        refused.message.contains("never announced"),
+        "the refusal is the unannounced one: {}",
+        refused.message
+    );
+}

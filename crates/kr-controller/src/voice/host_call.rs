@@ -39,6 +39,13 @@ pub const FINAL_STATUS_RECORDS: usize = 16;
 /// How long the host keeps a call's final status after it ends, unless the device acknowledges it.
 pub const FINAL_STATUS_KEEP_MS: u64 = 10 * 60 * 1_000;
 
+/// How long a call whose end is recorded waits for its side channel to report the close before the
+/// host tells the end as it stands, with the close not confirmed. A threshold, not a deadline: the
+/// next tick or heartbeat after it applies it. The longest close the client runs on its own takes
+/// about 35.5 seconds, so a close that is still unreported after this long is one the host could
+/// not confirm.
+pub const FINAL_STATUS_CLOSE_WAIT_MS: u64 = 60_000;
+
 /// The most delegations a call remembers.
 const DELEGATIONS_KEPT: usize = 64;
 
@@ -198,6 +205,15 @@ struct SendProgress {
     in_flight: bool,
 }
 
+/// The reason a side channel's own end gives.
+const fn reason_of(end: SidebandEnd) -> VoiceEndReason {
+    match end {
+        SidebandEnd::ProviderClosed => VoiceEndReason::ProviderClosed,
+        SidebandEnd::HostClosed => VoiceEndReason::Stop,
+        SidebandEnd::Lost => VoiceEndReason::SidebandLost,
+    }
+}
+
 /// The stop a call's end is for a send that was still running.
 const fn stop_of(reason: VoiceEndReason) -> VoiceContextStop {
     match reason {
@@ -219,6 +235,13 @@ struct Told {
     finished: bool,
 }
 
+/// An end the host recorded, and when.
+#[derive(Clone, Copy, Debug)]
+struct RecordedEnd {
+    reason: VoiceEndReason,
+    at_ms: u64,
+}
+
 #[derive(Debug)]
 struct CallState {
     next_seq: u64,
@@ -236,7 +259,14 @@ struct CallState {
     call_notes: BTreeSet<VoiceNote>,
     writes: VecDeque<(String, ActionId)>,
     write_count: u64,
-    ended: Option<VoiceEndReason>,
+    /// The end the host recorded, from the first request to end the call or the first report of
+    /// the side channel. The first one stands.
+    ended: Option<RecordedEnd>,
+    /// The call's final status, built in the locked step that settles the call: the call is
+    /// settled once its side channel has reported the close, or the wait for the report is over.
+    /// It is kept here until the registry holds it, so a heartbeat that meets the settlement
+    /// answers from it.
+    settled: Option<Kept>,
     /// The send of context that runs now, at most one.
     sending: Option<SendProgress>,
     /// What the provider said of the appends of that send.
@@ -254,6 +284,10 @@ pub struct HostCall {
     /// ends, so the sender looks again.
     progress: tokio::sync::Notify,
     calls: Weak<Shared>,
+    /// Where this module's own tests stop a settlement after the call's own record is made and
+    /// before the registry takes the status.
+    #[cfg(test)]
+    between_the_locks: crate::attention::Pause,
 }
 
 impl std::fmt::Debug for HostCall {
@@ -265,9 +299,17 @@ impl std::fmt::Debug for HostCall {
     }
 }
 
+#[derive(Clone, Debug)]
 struct Kept {
     status: FinalStatus,
     ended_ms: u64,
+}
+
+/// What a call answers to a heartbeat, and whether the answer took the last of its final status.
+struct Answer {
+    result: VoiceControlResult,
+    /// Whether the call is settled and the device has acknowledged its last item.
+    final_acknowledged: bool,
 }
 
 #[derive(Default)]
@@ -340,11 +382,14 @@ impl HostCalls {
                 writes: VecDeque::new(),
                 write_count: 0,
                 ended: None,
+                settled: None,
                 sending: None,
                 acks: BTreeMap::new(),
             }),
             progress: tokio::sync::Notify::new(),
             calls: Arc::downgrade(&self.shared),
+            #[cfg(test)]
+            between_the_locks: crate::attention::Pause::default(),
         });
         self.registry()
             .calls
@@ -355,6 +400,8 @@ impl HostCalls {
                 call.on_event(event);
             }
         }));
+        // A channel that closed before the listener was set told nobody: look once.
+        call.settle_if_due(started_ms);
         call
     }
 
@@ -363,34 +410,50 @@ impl HostCalls {
     /// # Errors
     ///
     /// [`VoiceHostRefusal::UnknownCall`] when the host holds no such call and kept no final status
-    /// for it, and [`VoiceHostRefusal::NotThisDevice`] when it is another device's.
+    /// for it, [`VoiceHostRefusal::NotThisDevice`] when it is another device's, and
+    /// [`VoiceHostRefusal::Closing`] when the host recorded the call's end and its close is not
+    /// settled yet: such a call answers a heartbeat and nothing else.
     pub fn of_device(
         &self,
         voice_session_id: VoiceSessionId,
         device_id: DeviceId,
     ) -> Result<Arc<HostCall>, VoiceHostRefusal> {
-        let registry = self.registry();
-        match registry.calls.get(&voice_session_id) {
-            Some(call) if call.device_id == device_id => Ok(Arc::clone(call)),
-            Some(_) => Err(VoiceHostRefusal::NotThisDevice),
-            None => Err(VoiceHostRefusal::UnknownCall),
+        let call = {
+            let registry = self.registry();
+            match registry.calls.get(&voice_session_id) {
+                Some(call) if call.device_id == device_id => Arc::clone(call),
+                Some(_) => return Err(VoiceHostRefusal::NotThisDevice),
+                None => return Err(VoiceHostRefusal::UnknownCall),
+            }
+        };
+        if call.state().ended.is_some() {
+            return Err(VoiceHostRefusal::Closing);
         }
+        Ok(call)
     }
 
-    /// Ends a call: its final status is kept, in memory, for [`FINAL_STATUS_KEEP_MS`], and the call
-    /// is no longer one the host holds. Called before the call's grant is revoked.
+    /// Records that a call is ending, and why. The first reason stands: a call ends once.
+    ///
+    /// The call stays held, and answers `closing`, until its side channel reports the close. Its
+    /// final status is then built and kept for [`FINAL_STATUS_KEEP_MS`], with the close confirmed
+    /// or not as the channel reported it. A close the channel has not reported
+    /// [`FINAL_STATUS_CLOSE_WAIT_MS`] after the end is told as it stands at the next tick or
+    /// heartbeat. Called before the call's grant is revoked.
     pub fn end(&self, voice_session_id: VoiceSessionId, reason: VoiceEndReason, now_ms: u64) {
         let call = self.registry().calls.get(&voice_session_id).cloned();
         if let Some(call) = call {
-            call.finish(reason, now_ms);
+            call.record_end(reason, now_ms);
+            call.settle_if_due(now_ms);
         }
     }
 
     /// Answers a heartbeat.
     ///
-    /// A call that is held answers its state and its news. A call that ended answers `closed` from
-    /// the final status, to its own device alone, until the device acknowledges the `ended` item or
-    /// the record is [`FINAL_STATUS_KEEP_MS`] old. After that it is unknown.
+    /// A call that is held answers its state and its news. A call whose end is recorded answers
+    /// `closing` until its close settles, and the heartbeat that finds it settled answers
+    /// `closed`, with the matching `ended` item, in the same reply. A call that ended answers
+    /// `closed` from the final status, to its own device alone, until the device acknowledges the
+    /// `ended` item or the record is [`FINAL_STATUS_KEEP_MS`] old. After that it is unknown.
     #[must_use]
     pub fn heartbeat(
         &self,
@@ -410,7 +473,16 @@ impl HostCalls {
                 }
                 let call = Arc::clone(call);
                 drop(registry);
-                return call.heartbeat(after_seq, now_ms);
+                call.settle_if_due(now_ms);
+                let answer = call.heartbeat(after_seq, now_ms);
+                if answer.final_acknowledged {
+                    // The status may not be in the registry yet, when the settling thread has not
+                    // handed it over: it is then kept until its time is up.
+                    self.registry()
+                        .finals
+                        .retain(|kept| kept.status.voice_session_id != voice_session_id);
+                }
+                return answer.result;
             }
             let Some(at) = registry
                 .finals
@@ -444,9 +516,15 @@ impl HostCalls {
     }
 
     /// The calls whose phone has not been heard from for [`HOST_CLIENT_ABSENT_SECONDS`]: the
-    /// caller begins their closure. A phone silent for two beats is told to the model, once.
+    /// caller begins their closure. A phone silent for two beats is told to the model, once. A
+    /// call whose side channel reported its close, or whose wait for the report is over, is
+    /// settled first.
     pub async fn tick(&self, now_ms: u64) -> Vec<VoiceSessionId> {
         let calls: Vec<Arc<HostCall>> = self.registry().calls.values().cloned().collect();
+        // Settles every call whose close is reported or whose wait is over, before any await.
+        for call in &calls {
+            call.settle_if_due(now_ms);
+        }
         let mut absent = Vec::new();
         for call in calls {
             if call.tick(now_ms).await {
@@ -565,89 +643,171 @@ impl HostCall {
                     state.writes.remove(at);
                 }
             }
-            HostCallEvent::State(SidebandState::Closed(end)) => {
-                let reason = match end {
-                    SidebandEnd::ProviderClosed => VoiceEndReason::ProviderClosed,
-                    SidebandEnd::HostClosed => VoiceEndReason::Stop,
-                    SidebandEnd::Lost => VoiceEndReason::SidebandLost,
-                };
-                self.finish(reason, self.last_seen_ms());
-            }
+            HostCallEvent::State(SidebandState::Closed(end)) => self.settle(Some(end)),
             HostCallEvent::State(_) => self.progress.notify_one(),
         }
     }
 
-    fn last_seen_ms(&self) -> u64 {
-        self.state().last_beat_ms
+    /// Records the end of the call: the running send is stopped, and counted as unconfirmed when
+    /// an append of it was written and not answered, as it is when the channel is lost. The
+    /// caller wakes the sender after it has dropped the lock.
+    fn note_end(state: &mut CallState, reason: VoiceEndReason, at_ms: u64) {
+        state.ended = Some(RecordedEnd { reason, at_ms });
+        if let Some(mut send) = state.sending.take() {
+            if send.in_flight {
+                send.unconfirmed += 1;
+            }
+            Self::upsert_context(
+                state,
+                send,
+                VoiceContextState::Stopped {
+                    stopped_by: stop_of(reason),
+                },
+            );
+        }
     }
 
-    /// Records the end of the call and hands its final status to the registry. The first reason
-    /// stands: a call ends once.
-    fn finish(&self, reason: VoiceEndReason, now_ms: u64) {
-        let status = {
+    /// Records that the host ends the call. The first end stands, and the call stays held: its
+    /// final status is built when the side channel reports the close, or when the wait for it is
+    /// over.
+    fn record_end(&self, reason: VoiceEndReason, now_ms: u64) {
+        {
             let mut state = self.state();
             if state.ended.is_some() {
                 return;
             }
-            state.ended = Some(reason);
-            if let Some(mut send) = state.sending.take() {
-                // An append that was written and not answered when the call ended is counted as
-                // unconfirmed, as it is when the channel is lost, and never written again.
-                if send.in_flight {
-                    send.unconfirmed += 1;
-                }
-                Self::upsert_context(
-                    &mut state,
-                    send,
-                    VoiceContextState::Stopped {
-                        stopped_by: stop_of(reason),
-                    },
-                );
-            }
-            Self::push_news(&mut state, VoiceNewsItem::Ended { reason });
-            FinalStatus {
-                voice_session_id: self.voice_session_id,
-                device_id: self.device_id,
-                reason,
-                news: state.news.iter().cloned().collect(),
-                last_seq: state.next_seq - 1,
-            }
-        };
+            Self::note_end(&mut state, reason, now_ms);
+        }
         self.progress.notify_one();
+    }
+
+    /// Settles the call when its side channel reports the close, or when its end is recorded and
+    /// [`FINAL_STATUS_CLOSE_WAIT_MS`] has passed without a report. Reads the channel outside the
+    /// call's lock.
+    fn settle_if_due(&self, now_ms: u64) {
+        if let SidebandState::Closed(end) = self.control.state() {
+            self.settle(Some(end));
+            return;
+        }
+        let due = self.state().ended.is_some_and(|recorded| {
+            now_ms >= recorded.at_ms.saturating_add(FINAL_STATUS_CLOSE_WAIT_MS)
+        });
+        if due {
+            self.settle(None);
+        }
+    }
+
+    /// Builds the call's final status and hands it to the registry, once. `end` is how the side
+    /// channel closed, or `None` when the wait for the close is over. A call whose end was not
+    /// recorded ends by the channel alone. The first reason stands, except that an end the
+    /// coordinator recorded for a provider that closed the call is only an inference, and the
+    /// channel's own end gives the reason.
+    ///
+    /// The status is built and kept on the call in the one locked step that settles it, so a
+    /// heartbeat that meets the settlement answers from it; the registry takes it after.
+    fn settle(&self, end: Option<SidebandEnd>) {
+        let (kept, wake) = {
+            let mut state = self.state();
+            if state.settled.is_some() {
+                return;
+            }
+            let mut wake = false;
+            let reason = match (state.ended, end) {
+                (Some(recorded), Some(end))
+                    if recorded.reason == VoiceEndReason::ProviderClosed =>
+                {
+                    reason_of(end)
+                }
+                (Some(recorded), _) => recorded.reason,
+                (None, Some(end)) => {
+                    let reason = reason_of(end);
+                    let at_ms = state.last_beat_ms;
+                    Self::note_end(&mut state, reason, at_ms);
+                    wake = true;
+                    reason
+                }
+                (None, None) => return,
+            };
+            let at_ms = state.ended.map_or(0, |recorded| recorded.at_ms);
+            Self::push_news(&mut state, VoiceNewsItem::Ended { reason });
+            let kept = Kept {
+                status: FinalStatus {
+                    voice_session_id: self.voice_session_id,
+                    device_id: self.device_id,
+                    reason,
+                    news: state.news.iter().cloned().collect(),
+                    last_seq: state.next_seq - 1,
+                },
+                ended_ms: at_ms,
+            };
+            state.settled = Some(kept.clone());
+            (kept, wake)
+        };
+        if wake {
+            self.progress.notify_one();
+        }
+        #[cfg(test)]
+        self.between_the_locks.wait();
         let Some(shared) = self.calls.upgrade() else {
             return;
         };
         let mut registry = shared.registry.lock().expect("the host call registry");
         registry.calls.remove(&self.voice_session_id);
-        registry.finals.push_back(Kept {
-            status,
-            ended_ms: now_ms,
-        });
+        registry.finals.push_back(kept);
         while registry.finals.len() > FINAL_STATUS_RECORDS {
             registry.finals.pop_front();
         }
     }
 
-    fn call_state(&self, now_ms: u64) -> VoiceHostCallState {
-        match self.control.state() {
+    /// The state the call answers: `closing` once its end is recorded, whatever the channel says,
+    /// then the channel's own. A channel that is closed is read as closing here, because the
+    /// callers settle a closed channel first, and `closed` is only answered from a final status.
+    fn state_of(&self, ended: bool, channel: SidebandState, now_ms: u64) -> VoiceHostCallState {
+        if ended {
+            return VoiceHostCallState::Closing;
+        }
+        match channel {
             SidebandState::Ready if now_ms < self.closes_at_ms => VoiceHostCallState::Open,
-            SidebandState::Ready | SidebandState::Closing => VoiceHostCallState::Closing,
+            SidebandState::Ready | SidebandState::Closing | SidebandState::Closed(_) => {
+                VoiceHostCallState::Closing
+            }
             SidebandState::Recovering => VoiceHostCallState::Recovering,
-            SidebandState::Closed(end) => VoiceHostCallState::Closed {
-                reason: match end {
-                    SidebandEnd::ProviderClosed => VoiceEndReason::ProviderClosed,
-                    SidebandEnd::HostClosed => VoiceEndReason::Stop,
-                    SidebandEnd::Lost => VoiceEndReason::SidebandLost,
-                },
-            },
         }
     }
 
-    /// Answers a heartbeat: stamps the phone's liveness while the call is open or recovering,
-    /// drops the news the device acknowledged and returns the rest.
-    fn heartbeat(&self, after_seq: u64, now_ms: u64) -> VoiceControlResult {
-        let call_state = self.call_state(now_ms);
+    fn call_state(&self, now_ms: u64) -> VoiceHostCallState {
+        let channel = self.control.state();
+        let ended = self.state().ended.is_some();
+        self.state_of(ended, channel, now_ms)
+    }
+
+    /// Answers a heartbeat. A call that is settled answers `closed` from its final status. Any
+    /// other call answers its state and its news from one look at its record: it stamps the
+    /// phone's liveness while the call is open or recovering and its end is not recorded, drops
+    /// the news the device acknowledged and returns the rest.
+    fn heartbeat(&self, after_seq: u64, now_ms: u64) -> Answer {
+        let channel = self.control.state();
         let mut state = self.state();
+        if let Some(kept) = &state.settled {
+            let status = &kept.status;
+            return Answer {
+                result: VoiceControlResult::Heartbeat {
+                    state: VoiceHostCallState::Closed {
+                        reason: status.reason,
+                    },
+                    remaining_seconds: 0,
+                    news: status
+                        .news
+                        .iter()
+                        .filter(|item| item.seq.get() > after_seq)
+                        .cloned()
+                        .collect(),
+                    dropped: false,
+                },
+                final_acknowledged: after_seq >= status.last_seq,
+            };
+        }
+        let call_state = self.state_of(state.ended.is_some(), channel, now_ms);
         if matches!(
             call_state,
             VoiceHostCallState::Open | VoiceHostCallState::Recovering
@@ -663,12 +823,15 @@ impl HostCall {
         }
         let news: Vec<VoiceNews> = state.news.iter().cloned().collect();
         let dropped = after_seq < state.dropped_through;
-        VoiceControlResult::Heartbeat {
-            state: call_state,
-            remaining_seconds: u32::try_from(self.closes_at_ms.saturating_sub(now_ms) / 1_000)
-                .unwrap_or(u32::MAX),
-            news,
-            dropped,
+        Answer {
+            result: VoiceControlResult::Heartbeat {
+                state: call_state,
+                remaining_seconds: u32::try_from(self.closes_at_ms.saturating_sub(now_ms) / 1_000)
+                    .unwrap_or(u32::MAX),
+                news,
+                dropped,
+            },
+            final_acknowledged: false,
         }
     }
 
@@ -713,8 +876,11 @@ impl HostCall {
     /// Writes one automatic note. Says whether the note is done with: written, or refused for a
     /// reason a later try would not change (too large, or refused by the provider). A refusal that
     /// a later try can change (the call's pace, a side channel that is not ready, one that was
-    /// lost) leaves the note owed.
+    /// lost) leaves the note owed. A call whose end is recorded takes no note, and owes none.
     async fn write_automatic_note(&self, note: HostNote) -> bool {
+        if self.state().ended.is_some() {
+            return true;
+        }
         let id = self.next_write_id(None);
         let Ok(frame) = VoiceContextFrame::new(
             id,
@@ -760,6 +926,10 @@ impl HostCall {
     pub async fn phone_is_back(&self, now_ms: u64) {
         let owed = {
             let mut state = self.state();
+            // A call whose end is recorded is not the phone's to wake: no stamp, no note.
+            if state.ended.is_some() {
+                return;
+            }
             if state.silent_told {
                 state.silent_told = false;
                 state.back_owed = true;
@@ -776,8 +946,9 @@ impl HostCall {
         match self.call_state(now_ms) {
             VoiceHostCallState::Open => Ok(self.control.revision()),
             VoiceHostCallState::Recovering => Err(VoiceHostRefusal::NotReady),
-            VoiceHostCallState::Closing => Err(VoiceHostRefusal::Closing),
-            VoiceHostCallState::Closed { .. } => Err(VoiceHostRefusal::UnknownCall),
+            VoiceHostCallState::Closing | VoiceHostCallState::Closed { .. } => {
+                Err(VoiceHostRefusal::Closing)
+            }
         }
     }
 
@@ -1106,8 +1277,8 @@ impl HostCall {
     /// Why a running send must stop now, when it must: the call ended, its deadline passed, or the
     /// side channel is not the one the send began on.
     fn send_stop(&self, revision: u64, now_ms: u64) -> Option<VoiceContextStop> {
-        if let Some(reason) = self.state().ended {
-            return Some(stop_of(reason));
+        if let Some(recorded) = self.state().ended {
+            return Some(stop_of(recorded.reason));
         }
         if now_ms >= self.closes_at_ms {
             return Some(VoiceContextStop::Deadline);
@@ -1365,6 +1536,8 @@ mod tests {
         ids: Mutex<Vec<String>>,
         acknowledged: AtomicU64,
         listener: Mutex<Option<HostCallListener>>,
+        /// A close the channel tells the listener the moment it is set.
+        tells_on_listen: Mutex<Option<SidebandEnd>>,
         revision: AtomicU64,
         refuses: std::sync::atomic::AtomicBool,
         /// Whether the provider's closure is read as soon as a write is taken, before the write's
@@ -1390,6 +1563,7 @@ mod tests {
                 ids: Mutex::new(Vec::new()),
                 acknowledged: AtomicU64::new(0),
                 listener: Mutex::new(None),
+                tells_on_listen: Mutex::new(None),
                 revision: AtomicU64::new(1),
                 refuses: std::sync::atomic::AtomicBool::new(false),
                 closes_with_the_write: std::sync::atomic::AtomicBool::new(false),
@@ -1525,7 +1699,11 @@ mod tests {
         }
 
         fn listen(&self, listener: HostCallListener) {
-            *self.listener.lock().expect("the listener") = Some(listener);
+            *self.listener.lock().expect("the listener") = Some(Arc::clone(&listener));
+            let told = *self.tells_on_listen.lock().expect("the end");
+            if let Some(end) = told {
+                listener(HostCallEvent::State(SidebandState::Closed(end)));
+            }
         }
     }
 
@@ -2174,8 +2352,9 @@ mod tests {
 
     #[test]
     fn a_heartbeat_after_the_call_ended_is_answered_from_the_final_status_to_its_own_device_only() {
-        let (calls, _call, _sideband) = held();
+        let (calls, _call, sideband) = held();
         calls.end(voice_session(1), VoiceEndReason::Deadline, 601_000);
+        close(&sideband, SidebandEnd::HostClosed);
         assert!(calls.is_empty());
         assert_eq!(calls.kept_final_statuses(), 1);
 
@@ -2225,8 +2404,15 @@ mod tests {
         let calls = HostCalls::new();
         for byte in 0..17u8 {
             let sideband = Sideband::new();
-            calls.register(voice_session(byte), device(7), OPENED, CLOSES, sideband);
+            calls.register(
+                voice_session(byte),
+                device(7),
+                OPENED,
+                CLOSES,
+                Arc::clone(&sideband) as Arc<dyn HostCallControl>,
+            );
             calls.end(voice_session(byte), VoiceEndReason::Stop, 10_000);
+            close(&sideband, SidebandEnd::HostClosed);
         }
         assert_eq!(calls.kept_final_statuses(), FINAL_STATUS_RECORDS);
         assert_eq!(
@@ -2998,6 +3184,493 @@ mod tests {
         assert_eq!(
             calls.of_device(voice_session(2), device(7)).unwrap_err(),
             VoiceHostRefusal::UnknownCall
+        );
+    }
+
+    /// The channel closes, as the side channel tells it.
+    fn close(sideband: &Sideband, end: SidebandEnd) {
+        sideband.set(SidebandState::Closed(end));
+        sideband.tell(HostCallEvent::State(SidebandState::Closed(end)));
+    }
+
+    fn ended_item(reason: VoiceEndReason, seq: u64) -> VoiceNews {
+        VoiceNews {
+            seq: U64::new(seq),
+            item: VoiceNewsItem::Ended { reason },
+        }
+    }
+
+    fn closing() -> VoiceControlResult {
+        VoiceControlResult::Refused {
+            reason: VoiceHostRefusal::Closing,
+        }
+    }
+
+    /// A call whose end is recorded is held until its side channel reports the close: it answers
+    /// `closing`, tells no `ended` item, and the phone's liveness is not stamped.
+    #[test]
+    fn a_host_end_inside_the_deadline_is_closing_until_the_side_channel_reports_the_close() {
+        let (calls, call, _sideband) = held();
+        calls.end(voice_session(1), VoiceEndReason::Silence, OPENED + 3_000);
+        let (state, remaining, news, _) = heartbeat(&calls, 0, OPENED + 4_000);
+        assert_eq!(state, VoiceHostCallState::Closing);
+        assert!(remaining > 0, "the call is inside its deadline");
+        assert!(
+            !news
+                .iter()
+                .any(|item| matches!(item.item, VoiceNewsItem::Ended { .. })),
+            "no ended item before the close is reported"
+        );
+        assert_eq!(calls.kept_final_statuses(), 0);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(call.state().last_beat_ms, OPENED, "no liveness stamped");
+    }
+
+    #[test]
+    fn a_call_whose_end_is_recorded_is_refused_as_closing_to_its_device() {
+        let (calls, _call, _sideband) = held();
+        calls.end(voice_session(1), VoiceEndReason::Silence, OPENED + 3_000);
+        assert_eq!(
+            calls.of_device(voice_session(1), device(7)).unwrap_err(),
+            VoiceHostRefusal::Closing
+        );
+        assert_eq!(
+            calls.of_device(voice_session(1), device(8)).unwrap_err(),
+            VoiceHostRefusal::NotThisDevice
+        );
+    }
+
+    /// A caller that held the call before its end was recorded writes nothing after it, and the
+    /// phone is not woken: no stamp and no note, whatever the channel reads.
+    #[tokio::test]
+    async fn a_held_call_refuses_every_write_once_its_end_is_recorded() {
+        for channel in [SidebandState::Ready, SidebandState::Recovering] {
+            let (calls, call, sideband) = held();
+            // The model was told that the phone is silent before the end.
+            assert!(calls.tick(OPENED + 45_000).await.is_empty());
+            let written = sideband.written();
+            assert_eq!(written.len(), 1, "the silence note");
+            calls.end(voice_session(1), VoiceEndReason::Silence, OPENED + 46_000);
+            sideband.set(channel);
+            let beat = call.state().last_beat_ms;
+            let support = Reads(Ok("a summary".to_owned()));
+            assert_eq!(
+                call.mute(action(1), true, OPENED + 47_000).await,
+                closing(),
+                "{channel:?}"
+            );
+            assert_eq!(
+                call.note(
+                    action(2),
+                    VoiceNote::HostActionsAvailable,
+                    None,
+                    &support,
+                    OPENED + 47_001
+                )
+                .await,
+                closing(),
+                "{channel:?}"
+            );
+            assert_eq!(
+                call.send_context(action(3), send_params(), Support::of(1), OPENED + 47_002)
+                    .await,
+                VoiceContextSendResult::Refused {
+                    reason: VoiceHostRefusal::Closing
+                },
+                "{channel:?}"
+            );
+            assert_eq!(
+                call.heard("d1", OPENED + 47_003).await,
+                closing(),
+                "{channel:?}"
+            );
+            assert_eq!(
+                sideband.written(),
+                written,
+                "nothing was written after the end, the back note included ({channel:?})"
+            );
+            assert_eq!(
+                call.state().last_beat_ms,
+                beat,
+                "no liveness stamped ({channel:?})"
+            );
+        }
+        // A channel that closed whose event was not told yet: the call is closing, not unknown.
+        let (_calls, call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::Lost));
+        assert_eq!(call.mute(action(1), true, OPENED + 2_000).await, closing());
+        assert!(sideband.written().is_empty());
+    }
+
+    #[test]
+    fn a_recovering_channel_with_a_recorded_end_answers_closing_and_stamps_no_liveness() {
+        let (calls, call, sideband) = held();
+        sideband.set(SidebandState::Recovering);
+        calls.end(voice_session(1), VoiceEndReason::Revocation, OPENED + 3_000);
+        let (state, _, _, _) = heartbeat(&calls, 0, OPENED + 4_000);
+        assert_eq!(state, VoiceHostCallState::Closing);
+        assert_eq!(call.state().last_beat_ms, OPENED, "no liveness stamped");
+    }
+
+    /// The wait for a close that is never reported is one minute from the end, and a tick that
+    /// finds it over tells the end as it stands.
+    #[tokio::test]
+    async fn an_end_whose_close_never_reports_settles_after_the_wait() {
+        let (calls, _call, sideband) = held();
+        let t0 = OPENED + 3_000;
+        calls.end(voice_session(1), VoiceEndReason::Revocation, t0);
+        assert!(calls.tick(t0 + 59_999).await.is_empty());
+        assert_eq!((calls.len(), calls.kept_final_statuses()), (1, 0));
+        assert!(calls.tick(t0 + 60_000).await.is_empty());
+        assert_eq!((calls.len(), calls.kept_final_statuses()), (0, 1));
+        // A close that is reported after the wait changes nothing.
+        close(&sideband, SidebandEnd::HostClosed);
+        assert_eq!(calls.kept_final_statuses(), 1);
+        let (state, ..) = heartbeat(&calls, 0, t0 + 60_001);
+        assert_eq!(
+            state,
+            VoiceHostCallState::Closed {
+                reason: VoiceEndReason::Revocation
+            }
+        );
+        assert_eq!(FINAL_STATUS_CLOSE_WAIT_MS, 60_000);
+    }
+
+    /// A heartbeat that finds the channel closed settles the call and answers `closed` with the
+    /// matching `ended` item in the same reply, though the close was never told.
+    #[test]
+    fn a_heartbeat_settles_a_call_whose_close_event_was_missed_and_answers_closed_in_the_same_reply()
+     {
+        let (calls, _call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::HostClosed));
+        assert_eq!(
+            calls.heartbeat(voice_session(1), device(7), 0, OPENED + 2_000),
+            VoiceControlResult::Heartbeat {
+                state: VoiceHostCallState::Closed {
+                    reason: VoiceEndReason::Stop
+                },
+                remaining_seconds: 0,
+                news: vec![ended_item(VoiceEndReason::Stop, 1)],
+                dropped: false,
+            }
+        );
+        assert_eq!(calls.len(), 0);
+        assert_eq!(calls.kept_final_statuses(), 1);
+        // The device's acknowledgement of that reply is the last the host keeps of the call.
+        let _ = calls.heartbeat(voice_session(1), device(7), 1, OPENED + 3_000);
+        assert_eq!(calls.kept_final_statuses(), 0);
+    }
+
+    /// The same for a wait that ran out: the heartbeat that finds it over answers `closed`.
+    #[test]
+    fn a_heartbeat_settles_an_expired_wait_and_answers_closed_in_the_same_reply() {
+        let calls = HostCalls::new();
+        for byte in [1u8, 2] {
+            calls.register(
+                voice_session(byte),
+                device(7),
+                OPENED,
+                CLOSES,
+                Sideband::new(),
+            );
+        }
+        let t0 = OPENED + 3_000;
+        for byte in [1u8, 2] {
+            calls.end(voice_session(byte), VoiceEndReason::Revocation, t0);
+        }
+        let beat = |byte: u8, at: u64| calls.heartbeat(voice_session(byte), device(7), 0, at);
+        assert!(matches!(
+            beat(1, t0 + 59_999),
+            VoiceControlResult::Heartbeat {
+                state: VoiceHostCallState::Closing,
+                ..
+            }
+        ));
+        assert_eq!(
+            beat(2, t0 + 60_000),
+            VoiceControlResult::Heartbeat {
+                state: VoiceHostCallState::Closed {
+                    reason: VoiceEndReason::Revocation
+                },
+                remaining_seconds: 0,
+                news: vec![ended_item(VoiceEndReason::Revocation, 1)],
+                dropped: false,
+            }
+        );
+        assert_eq!(calls.len(), 1, "the other call is still held");
+    }
+
+    #[test]
+    fn a_channel_that_closed_before_registration_is_settled_by_registration() {
+        let calls = HostCalls::new();
+        let sideband = Sideband::new();
+        sideband.set(SidebandState::Closed(SidebandEnd::Lost));
+        calls.register(
+            voice_session(1),
+            device(7),
+            OPENED,
+            CLOSES,
+            Arc::clone(&sideband) as Arc<dyn HostCallControl>,
+        );
+        assert_eq!(calls.len(), 0);
+        assert_eq!(calls.kept_final_statuses(), 1);
+        let (state, ..) = heartbeat(&calls, 0, OPENED + 1_000);
+        assert_eq!(
+            state,
+            VoiceHostCallState::Closed {
+                reason: VoiceEndReason::SidebandLost
+            }
+        );
+    }
+
+    /// A channel that tells its close to the listener the moment it is set, and whose state the
+    /// registration then reads closed, gives one status and one `ended` item.
+    #[test]
+    fn a_close_told_by_listen_and_seen_by_the_registration_snapshot_gives_one_status() {
+        let calls = HostCalls::new();
+        let sideband = Sideband::new();
+        sideband.set(SidebandState::Closed(SidebandEnd::Lost));
+        *sideband.tells_on_listen.lock().expect("the end") = Some(SidebandEnd::Lost);
+        calls.register(
+            voice_session(1),
+            device(7),
+            OPENED,
+            CLOSES,
+            Arc::clone(&sideband) as Arc<dyn HostCallControl>,
+        );
+        assert_eq!(calls.len(), 0);
+        assert_eq!(calls.kept_final_statuses(), 1);
+        let (_, _, news, _) = heartbeat(&calls, 0, OPENED + 1_000);
+        assert_eq!(news, vec![ended_item(VoiceEndReason::SidebandLost, 1)]);
+    }
+
+    #[tokio::test]
+    async fn a_closed_channel_whose_event_was_never_told_settles_on_the_next_tick() {
+        let (calls, _call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::HostClosed));
+        assert!(calls.tick(OPENED + 2_000).await.is_empty());
+        assert_eq!(calls.len(), 0);
+        assert_eq!(calls.kept_final_statuses(), 1);
+    }
+
+    #[test]
+    fn an_end_decided_after_the_channel_closed_settles_at_once() {
+        let (calls, _call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::HostClosed));
+        calls.end(voice_session(1), VoiceEndReason::Deadline, OPENED + 3_000);
+        assert_eq!(calls.len(), 0);
+        assert_eq!(calls.kept_final_statuses(), 1);
+        let (state, ..) = heartbeat(&calls, 0, OPENED + 4_000);
+        assert_eq!(
+            state,
+            VoiceHostCallState::Closed {
+                reason: VoiceEndReason::Deadline
+            }
+        );
+    }
+
+    /// A second end changes neither the reason nor the time the status is kept from.
+    #[tokio::test]
+    async fn a_second_end_with_another_reason_changes_neither_the_reason_nor_the_time() {
+        let (calls, _call, _sideband) = held();
+        let t0 = OPENED + 3_000;
+        calls.end(voice_session(1), VoiceEndReason::Deadline, t0);
+        calls.end(voice_session(1), VoiceEndReason::Revocation, t0 + 10_000);
+        assert!(calls.tick(t0 + 60_000).await.is_empty());
+        let (state, ..) = heartbeat(&calls, 0, t0 + FINAL_STATUS_KEEP_MS - 1);
+        assert_eq!(
+            state,
+            VoiceHostCallState::Closed {
+                reason: VoiceEndReason::Deadline
+            }
+        );
+        assert_eq!(
+            calls.heartbeat(voice_session(1), device(7), 0, t0 + FINAL_STATUS_KEEP_MS),
+            VoiceControlResult::Refused {
+                reason: VoiceHostRefusal::UnknownCall
+            },
+            "kept from the first end, not from the second or from the settlement"
+        );
+    }
+
+    /// The end wakes a sender that waits for its pace, and the sender stops before the channel
+    /// reports anything: the clock does not move, so only the wake can have stopped it.
+    #[tokio::test(start_paused = true)]
+    async fn a_recorded_end_wakes_a_waiting_sender_and_stops_it_before_the_channel_reports() {
+        let (calls, call, sideband) = held();
+        let _ = call
+            .send_context(action(5), send_params(), Support::of(14), OPENED + 1_000)
+            .await;
+        for _ in 0..10 {
+            settle().await;
+            sideband.acknowledge_all();
+        }
+        settle().await;
+        assert_eq!(sideband.written().len(), 10, "the burst");
+        let holders = Arc::strong_count(&call);
+        calls.end(voice_session(1), VoiceEndReason::Stop, OPENED + 3_000);
+        settle().await;
+        assert_eq!(
+            Arc::strong_count(&call),
+            holders - 1,
+            "the sender task ended with no step of the clock"
+        );
+        let (state, _, news, _) = heartbeat(&calls, 0, OPENED + 4_000);
+        assert_eq!(state, VoiceHostCallState::Closing);
+        assert!(news.iter().any(|item| matches!(
+            item.item,
+            VoiceNewsItem::Context {
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::Stop
+                },
+                ..
+            }
+        )));
+    }
+
+    /// A recorded end with an append written and not answered, and the channel's close after it:
+    /// one unconfirmed append, and the stop is the recorded reason's.
+    #[tokio::test(start_paused = true)]
+    async fn a_recorded_end_with_an_append_in_flight_then_the_channels_close_counts_one_unconfirmed_and_stops_with_the_recorded_reason()
+     {
+        let (calls, call, sideband) = held();
+        let _ = call
+            .send_context(action(5), send_params(), Support::of(2), OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(sideband.written().len(), 1);
+        calls.end(voice_session(1), VoiceEndReason::Stop, OPENED + 1_500);
+        settle().await;
+        close(&sideband, SidebandEnd::HostClosed);
+        settle().await;
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 0,
+                of: 3,
+                unconfirmed: 1,
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::Stop
+                }
+            }]
+        );
+    }
+
+    /// A channel that ended the call alone, found by a heartbeat that no event announced, counts
+    /// the append it never answered once.
+    #[tokio::test(start_paused = true)]
+    async fn a_channel_only_end_found_by_a_heartbeat_counts_an_unanswered_append_once() {
+        let (calls, call, sideband) = held();
+        let _ = call
+            .send_context(action(5), send_params(), Support::of(2), OPENED + 1_000)
+            .await;
+        settle().await;
+        assert_eq!(sideband.written().len(), 1);
+        sideband.set(SidebandState::Closed(SidebandEnd::Lost));
+        let _ = calls.heartbeat(voice_session(1), device(7), 0, OPENED + 1_500);
+        settle().await;
+        assert_eq!(
+            context_news(&calls),
+            [VoiceNewsItem::Context {
+                action_id: action(5),
+                appended: 0,
+                of: 3,
+                unconfirmed: 1,
+                state: VoiceContextState::Stopped {
+                    stopped_by: VoiceContextStop::SidebandLost
+                }
+            }]
+        );
+    }
+
+    /// An end the coordinator recorded as the provider's close is its inference: the channel's own
+    /// end gives the reason.
+    #[test]
+    fn a_recorded_provider_closed_takes_its_reason_from_the_channel() {
+        let (calls, _call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::Lost));
+        calls.end(
+            voice_session(1),
+            VoiceEndReason::ProviderClosed,
+            OPENED + 3_000,
+        );
+        let (state, ..) = heartbeat(&calls, 0, OPENED + 4_000);
+        assert_eq!(
+            state,
+            VoiceHostCallState::Closed {
+                reason: VoiceEndReason::SidebandLost
+            }
+        );
+    }
+
+    /// A heartbeat that meets another thread's settlement between its two locks, when the call is
+    /// settled and the registry does not hold the status yet, answers `closed` with zero time left
+    /// and the matching `ended` item.
+    #[test]
+    fn a_heartbeat_that_meets_a_settlement_between_its_two_locks_answers_closed_with_the_matching_ended_item()
+     {
+        let (calls, call, sideband) = held();
+        sideband.set(SidebandState::Closed(SidebandEnd::HostClosed));
+        let (arrived, go) = call.between_the_locks.arm();
+        let settler = {
+            let call = Arc::clone(&call);
+            std::thread::spawn(move || call.settle(Some(SidebandEnd::HostClosed)))
+        };
+        arrived
+            .recv()
+            .expect("the settling thread reached the pause");
+        assert_eq!(calls.len(), 1, "the registry has not taken the call out");
+        assert_eq!(calls.kept_final_statuses(), 0, "nor taken the status in");
+        assert_eq!(
+            calls.heartbeat(voice_session(1), device(7), 0, OPENED + 2_000),
+            VoiceControlResult::Heartbeat {
+                state: VoiceHostCallState::Closed {
+                    reason: VoiceEndReason::Stop
+                },
+                remaining_seconds: 0,
+                news: vec![ended_item(VoiceEndReason::Stop, 1)],
+                dropped: false,
+            }
+        );
+        go.send(()).expect("the settling thread waits");
+        settler.join().expect("the settling thread");
+        assert_eq!(calls.len(), 0);
+        assert_eq!(calls.kept_final_statuses(), 1);
+    }
+
+    /// The call answers `closed` from the status it kept itself when the registry cannot take it.
+    #[test]
+    fn a_settled_call_answers_closed_from_its_own_copy_when_the_registry_is_gone() {
+        let (calls, call, sideband) = held();
+        drop(calls);
+        close(&sideband, SidebandEnd::Lost);
+        assert_eq!(
+            call.heartbeat(0, OPENED + 2_000).result,
+            VoiceControlResult::Heartbeat {
+                state: VoiceHostCallState::Closed {
+                    reason: VoiceEndReason::SidebandLost
+                },
+                remaining_seconds: 0,
+                news: vec![ended_item(VoiceEndReason::SidebandLost, 1)],
+                dropped: false,
+            }
+        );
+    }
+
+    /// A back note that was claimed before the end is recorded is not written after it.
+    #[tokio::test]
+    async fn a_back_note_claimed_before_the_end_is_not_written_after_it() {
+        let (calls, call, sideband) = held();
+        assert!(calls.tick(OPENED + 45_000).await.is_empty());
+        let written = sideband.written();
+        assert_eq!(written.len(), 1, "the silence note");
+        calls.end(voice_session(1), VoiceEndReason::Silence, OPENED + 46_000);
+        call.tell_that_the_phone_is_back().await;
+        assert_eq!(sideband.written(), written);
+        assert!(
+            !call.state().back_owed,
+            "nothing is owed to a call that ended"
         );
     }
 }

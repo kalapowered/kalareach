@@ -168,14 +168,44 @@ impl VoiceProviderService for OfflineProvider {
 /// text.
 pub type Written = Vec<(String, Option<String>, Option<String>)>;
 
-/// A side channel the test steers: what the host wrote to it, and what it says it has heard.
-#[derive(Debug, Default)]
+/// A side channel the test steers: what the host wrote to it, what it says it has heard, and
+/// where it stands. It tells the host's listener when it closes.
 pub struct StandInSideband {
     written: std::sync::Mutex<Written>,
     heard: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    state: std::sync::Mutex<kr_client::services::host_call::SidebandState>,
+    listener: std::sync::Mutex<Option<kr_client::services::host_call::HostCallListener>>,
+}
+
+impl Default for StandInSideband {
+    fn default() -> Self {
+        Self {
+            written: std::sync::Mutex::default(),
+            heard: std::sync::Mutex::default(),
+            state: std::sync::Mutex::new(kr_client::services::host_call::SidebandState::Ready),
+            listener: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl std::fmt::Debug for StandInSideband {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StandInSideband")
+    }
 }
 
 impl StandInSideband {
+    /// Closes the channel as `end` and tells the host's listener, as the provider's side channel
+    /// does when the call's close is reported.
+    pub fn close(&self, end: kr_client::services::host_call::SidebandEnd) {
+        use kr_client::services::host_call::{HostCallEvent, SidebandState};
+        *self.state.lock().expect("the state") = SidebandState::Closed(end);
+        let listener = self.listener.lock().expect("the listener").clone();
+        if let Some(listener) = listener {
+            listener(HostCallEvent::State(SidebandState::Closed(end)));
+        }
+    }
+
     /// Makes the side channel say it heard `delegation_id`, `offset_ms` into the call.
     pub fn hear(&self, delegation_id: &str, offset_ms: u64) {
         self.heard
@@ -192,7 +222,7 @@ impl StandInSideband {
 
 impl kr_client::services::host_call::HostCallControl for StandInSideband {
     fn state(&self) -> kr_client::services::host_call::SidebandState {
-        kr_client::services::host_call::SidebandState::Ready
+        *self.state.lock().expect("the state")
     }
 
     fn revision(&self) -> u64 {
@@ -236,15 +266,33 @@ impl kr_client::services::host_call::HostCallControl for StandInSideband {
         Box::pin(async move { heard })
     }
 
-    fn listen(&self, _listener: kr_client::services::host_call::HostCallListener) {}
+    fn listen(&self, listener: kr_client::services::host_call::HostCallListener) {
+        *self.listener.lock().expect("the listener") = Some(listener);
+    }
+}
+
+/// What the stand-in's side channel reports when its provider is told to close a call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CloseReport {
+    /// The close is confirmed: the channel closes as the host's own close.
+    #[default]
+    Confirmed,
+    /// The channel is lost: it closes unconfirmed.
+    Lost,
+    /// The channel reports nothing.
+    Nothing,
 }
 
 /// A provider for a call on the owner's own key: it quotes a held key, spends it, answers a start
-/// with a call the host controls, and shows one side channel for it.
+/// with a call the host controls, and shows one side channel for each call, which reports the
+/// call's close as the test scripts it.
 #[derive(Debug, Default)]
 pub struct OwnKeyStandIn {
     closed: std::sync::Mutex<Vec<String>>,
-    sideband: std::sync::Arc<StandInSideband>,
+    sidebands:
+        std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<StandInSideband>>>,
+    started: std::sync::atomic::AtomicUsize,
+    report: std::sync::Mutex<CloseReport>,
 }
 
 impl OwnKeyStandIn {
@@ -253,9 +301,20 @@ impl OwnKeyStandIn {
         self.closed.lock().expect("what was closed").clone()
     }
 
-    /// The side channel it shows for its call.
+    /// The side channel of the call it started last.
     pub fn sideband(&self) -> std::sync::Arc<StandInSideband> {
-        std::sync::Arc::clone(&self.sideband)
+        let sidebands = self.sidebands.lock().expect("the side channels");
+        std::sync::Arc::clone(
+            sidebands
+                .values()
+                .next_back()
+                .expect("a call was started, so a side channel is shown"),
+        )
+    }
+
+    /// What the side channels report from now on when their call is closed.
+    pub fn reports(&self, report: CloseReport) {
+        *self.report.lock().expect("the report") = report;
     }
 }
 
@@ -292,9 +351,15 @@ impl VoiceProviderService for OwnKeyStandIn {
 
     fn host_control(
         &self,
-        _call_id: &str,
+        call_id: &str,
     ) -> Option<std::sync::Arc<dyn kr_client::services::host_call::HostCallControl>> {
-        Some(self.sideband() as std::sync::Arc<dyn kr_client::services::host_call::HostCallControl>)
+        let sideband = self
+            .sidebands
+            .lock()
+            .expect("the side channels")
+            .get(call_id)
+            .cloned()?;
+        Some(sideband as std::sync::Arc<dyn kr_client::services::host_call::HostCallControl>)
     }
 
     fn begin<'a>(
@@ -314,10 +379,20 @@ impl VoiceProviderService for OwnKeyStandIn {
         request: &'a VoiceSessionRequest,
     ) -> ServiceFuture<'a, VoiceStart> {
         let closes_at_ms = kr_ipc::now_ms().get() + u64::from(request.duration_seconds) * 1_000;
+        // Every call has its own identifier and its own side channel.
+        let number = self
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let call_id = format!("own-{number}");
+        self.sidebands
+            .lock()
+            .expect("the side channels")
+            .insert(call_id.clone(), std::sync::Arc::default());
         Box::pin(async move {
             Ok(VoiceStart::StartedOwn(Box::new(
                 kr_client::services::voice::OwnSession {
-                    call_id: "own-1".to_owned(),
+                    call_id,
                     provider_session_id: "sess_own_1".to_owned(),
                     answer_sdp: "v=0\r\n".to_owned(),
                     model: "gpt-live-1".to_owned(),
@@ -333,6 +408,22 @@ impl VoiceProviderService for OwnKeyStandIn {
             .lock()
             .expect("what was closed")
             .push(call_id.to_owned());
+        // The provider reports the close to the call's side channel before it answers.
+        let sideband = self
+            .sidebands
+            .lock()
+            .expect("the side channels")
+            .get(call_id)
+            .cloned();
+        let report = *self.report.lock().expect("the report");
+        if let Some(sideband) = sideband {
+            use kr_client::services::host_call::SidebandEnd;
+            match report {
+                CloseReport::Confirmed => sideband.close(SidebandEnd::HostClosed),
+                CloseReport::Lost => sideband.close(SidebandEnd::Lost),
+                CloseReport::Nothing => {}
+            }
+        }
         let call_id = call_id.to_owned();
         Box::pin(async move {
             Ok(VoiceClosure {
