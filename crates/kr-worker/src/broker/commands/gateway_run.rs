@@ -457,8 +457,9 @@ async fn handle(
     // It must still run what was hashed; the check reads files, so not on the runtime's threads.
     let verdict = {
         let backend = Arc::clone(backend);
+        let broker = Arc::clone(broker);
         let registration = Arc::clone(registration);
-        tokio::task::spawn_blocking(move || verify(&backend, &registration)).await
+        tokio::task::spawn_blocking(move || verify(&backend, &broker, &registration)).await
     };
     match verdict {
         Ok(Ok(())) => {}

@@ -3246,95 +3246,6 @@ fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
     assert!(broker.record_capability(signed).is_err());
 }
 
-/// KR-REQ-11.17: evidence is invalidated by the change it is about, an installed upgrade leaves a
-/// running binding's pinned evidence alone, and an action rechecks its own capability revision on
-/// the dispatch path rather than only when a client asks.
-#[test]
-fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned_binding() {
-    let broker = broker_with(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
-    broker
-        .record_capability(evidence(
-            "agent.prompt",
-            InstanceCapabilityState::QualifiedAvailable,
-            InstanceInvalidation::BinaryChanged,
-            instance(2),
-        ))
-        .expect("recorded");
-
-    let with_capability = |name: &str, read_at: Option<CapabilityRevision>| {
-        let mut prepared = invocation(instance(2), 1, "prompt.submit");
-        prepared.capability = Some((capability(name), read_at));
-        prepared
-    };
-
-    // The action path itself performs the recheck.
-    broker
-        .issue_token(
-            binding(9),
-            &with_capability("agent.prompt", Some(CapabilityRevision::new(1))),
-            TimestampMs::new(2),
-        )
-        .expect("the revision the caller read is the one held");
-    assert!(
-        broker
-            .issue_token(
-                binding(9),
-                &with_capability("agent.prompt", Some(CapabilityRevision::new(2))),
-                TimestampMs::new(3)
-            )
-            .is_err(),
-        "an action prepared against a revision that has moved is refused"
-    );
-
-    assert_eq!(
-        broker.invalidate_capabilities(
-            InstanceInvalidation::BinaryChanged,
-            "the executable was upgraded",
-            TimestampMs::new(20)
-        ),
-        1
-    );
-    assert!(
-        broker
-            .issue_token(
-                binding(9),
-                &with_capability("agent.prompt", None),
-                TimestampMs::new(21)
-            )
-            .is_err(),
-        "an upgraded binary invalidates the evidence that was about the binary"
-    );
-    broker
-        .issue_token(
-            binding(9),
-            &with_capability("agent.approval", None),
-            TimestampMs::new(22),
-        )
-        .expect("a running binding's pinned evidence survives an installed upgrade");
-
-    // And the recheck happens again when the token is spent, not only when it is issued: evidence
-    // withdrawn while the component was working is evidence the dispatch no longer has.
-    let token = broker
-        .issue_token(
-            binding(9),
-            &with_capability("agent.approval", None),
-            TimestampMs::new(23),
-        )
-        .expect("the token is issued");
-    assert_eq!(
-        broker.invalidate_capabilities(
-            InstanceInvalidation::BindingChanged,
-            "the selected thread changed",
-            TimestampMs::new(24)
-        ),
-        1
-    );
-    assert!(
-        broker.spend_token(&ActionTokenClaim::from(&token)).is_err(),
-        "a token whose capability evidence was withdrawn is not authority to dispatch"
-    );
-}
-
 /// KR-REQ-11.17, the binding clause: when the instance's binding moves to another conversation,
 /// the evidence that names the binding is ended with a reason, and evidence that does not name it
 /// is left as it was.
@@ -3697,10 +3608,10 @@ fn unconsumed_source_frames_are_bounded() {
     );
 }
 
-/// KR-REQ-11.16 and KR-REQ-11.17: evidence names the exact installation it was gathered against,
-/// and every field it names is compared with what this host established itself.
+/// KR-REQ-11.16: evidence names the exact installation it was gathered against, and every field it
+/// names is compared with what this host established itself.
 #[test]
-fn kr_req_11_17_evidence_names_the_package_publisher_schema_and_binary_it_was_gathered_against() {
+fn kr_req_11_16_evidence_names_the_package_publisher_schema_and_binary_it_was_gathered_against() {
     let broker = broker_with(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
 
     // A record that names the package, its bytes, its publisher, its schema and the binary this

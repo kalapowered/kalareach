@@ -2296,6 +2296,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::PreconditionFailed`] while rich work is fenced or suspended,
+    /// [`BrokerError::UnsupportedCapability`] for an instance that holds an image refusal,
     /// [`BrokerError::StaleBinding`] when the binding moved, [`BrokerError::UnknownSubject`] for an
     /// instance this broker no longer holds, and whatever the transport refuses.
     fn recheck_permit(
@@ -2342,6 +2343,13 @@ impl Broker {
             .ok_or_else(|| crate::broker::unknown_instance(application_instance_id))?;
         if let Some(reason) = instance.suspension_reason() {
             return Err(BrokerError::mutations_suspended(reason));
+        }
+        // An image refusal withdrew this instance's evidence after the admission, so a permit
+        // admitted before it is stopped here, with nothing sent.
+        if state.capabilities.is_held(application_instance_id) {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: "the host cannot confirm that this installation's program still runs the code it checked, so nothing is sent for it".to_owned(),
+            });
         }
         if instance.binding_revision != admitted.binding_revision() {
             return Err(BrokerError::StaleBinding {

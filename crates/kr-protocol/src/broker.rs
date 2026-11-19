@@ -1243,18 +1243,31 @@ impl fmt::Display for InstanceEvidenceSource {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum InstanceInvalidation {
+    // Raised by `Broker::image_refused` when the host cannot confirm that a process still runs the
+    // code it checked.
     /// The tested binary changed.
     BinaryChanged,
+    // Raised by `BrokerState::advance_binding` when an instance's binding moves.
     /// The active binding changed.
     BindingChanged,
+    // No broker writer names this cause and no detector raises it. It stays because it is part of
+    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
     /// The upstream schema or protocol version changed.
     SchemaChanged,
+    // No broker writer names this cause and no detector raises it. It stays because it is part of
+    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
     /// An operating-system permission changed.
     OsPermissionChanged,
+    // No broker writer names this cause and no detector raises it. It stays because it is part of
+    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
     /// The desktop session generation changed.
     DesktopGenerationChanged,
+    // No broker writer names this cause and no detector raises it. It stays because it is part of
+    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
     /// The signed qualification profile in the catalogue changed.
     QualificationProfileChanged,
+    // No broker writer names this cause and no detector raises it. It stays because it is part of
+    // level 0.78's wire form; it is removed when the protocol level moves past 0.78.
     /// The host's own launch profile changed.
     ///
     /// Separate from the catalogue's qualification profile, because a record gathered under one
@@ -1323,8 +1336,12 @@ pub struct InstanceCapabilityIdentity {
     /// A binding identifier alone names the binding, not the conversation it was bound to when the
     /// evidence was taken, and a thread selection changes what the upstream can do.
     pub binding_revision: Nullable<AgentBindingRevision>,
+    // No broker writer sets this field. It stays because it is part of level 0.78's wire form; it
+    // is removed when the protocol level moves past 0.78.
     /// The desktop session generation the evidence is bound to.
     pub desktop_generation: Nullable<U64>,
+    // No broker writer sets this field. It stays because it is part of level 0.78's wire form; it
+    // is removed when the protocol level moves past 0.78.
     /// Whether the operating-system permission the capability needs was held.
     pub os_permission_held: Nullable<bool>,
 }
@@ -1538,9 +1555,10 @@ impl CapabilityMap {
 
     /// Invalidates every record the change makes stale, returning how many were affected.
     ///
-    /// A record whose triggers do not name the change is left exactly as it was. That is what
-    /// keeps an installed upgrade from invalidating an old running process's pinned evidence: the
-    /// running binding's record names the binding, and the change names the binary.
+    /// A record whose triggers do not name the change is left exactly as it was. An installed
+    /// upgrade changes nothing here: the broker raises the binary change only when it cannot
+    /// confirm that a process still runs the code it checked, and an upgrade leaves a running
+    /// process's image as it was.
     pub fn invalidate(
         &mut self,
         change: InstanceInvalidation,

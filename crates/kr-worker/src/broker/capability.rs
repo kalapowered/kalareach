@@ -13,13 +13,15 @@
 //!   names an isolated test context. Nothing here mutates unrelated user data to find out whether
 //!   a capability works.
 //! * **Evidence is invalidated by the right change.** A record names the triggers that make it
-//!   stale, so an installed upgrade invalidates a record about the binary and leaves a running
-//!   binding's correctly pinned record exactly as it was.
+//!   stale. The broker raises two of them: a rebind (`BrokerState::advance_binding`) raises the
+//!   binding change, and a refused image check (`Broker::image_refused`) raises the binary change
+//!   and holds the instance, so nothing is recorded for it again. An installed upgrade raises
+//!   neither: the image check passes it, and a running process keeps the identity it was pinned to.
 //! * **Every action rechecks.** [`CapabilityOwner::recheck`] is called on the dispatch path with
 //!   the revision the caller read, so acting on evidence that has since changed is refused rather
 //!   than attempted.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kr_protocol::broker::{
     CapabilityMap, InstanceCapabilityRecord, InstanceCapabilityState, InstanceInvalidation,
@@ -88,6 +90,8 @@ impl Probe {
 #[derive(Debug, Default)]
 pub struct CapabilityOwner {
     maps: BTreeMap<ApplicationInstanceId, CapabilityMap>,
+    /// Instances whose program the host cannot confirm still runs the code it checked.
+    held: BTreeSet<ApplicationInstanceId>,
 }
 
 impl CapabilityOwner {
@@ -110,10 +114,16 @@ impl CapabilityOwner {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Capability`] when the record breaks one of section 11's rules: a
-    /// source that cannot establish a working capability claiming one, or an unusable state with
-    /// no reason a person can read.
+    /// Returns [`BrokerError::InvalidArgument`] when the instance is held, because the host cannot
+    /// confirm that its program still runs the code it checked, and [`BrokerError::Capability`] when the record breaks one
+    /// of section 11's rules: a source that cannot establish a working capability claiming one, or
+    /// an unusable state with no reason a person can read.
     pub fn record(&mut self, record: InstanceCapabilityRecord) -> Result<()> {
+        if self.held.contains(&record.application_instance_id) {
+            return Err(BrokerError::invalid(
+                "the host cannot confirm that this installation's program still runs the code it checked, so no evidence about it is recorded",
+            ));
+        }
         self.maps
             .entry(record.application_instance_id)
             .or_default()
@@ -137,24 +147,12 @@ impl CapabilityOwner {
         self.record(record)
     }
 
-    /// Invalidates every record one change makes stale, across every installation.
-    ///
-    /// Returns how many records were affected. A record whose triggers do not name the change is
-    /// untouched, which is what leaves an old running process's pinned evidence alone when the
-    /// executable on disk is replaced.
-    pub fn invalidate(
-        &mut self,
-        change: InstanceInvalidation,
-        reason: &str,
-        now: TimestampMs,
-    ) -> usize {
-        self.maps
-            .values_mut()
-            .map(|map| map.invalidate(change, reason, now))
-            .sum()
-    }
-
     /// Invalidates the records of one installation only.
+    ///
+    /// A record whose triggers do not name the change is untouched. The binary change also holds
+    /// the instance, whether or not it has a map yet: nothing is recorded about a program the host
+    /// cannot confirm still runs the code it checked, so [`Self::record`] refuses it until the
+    /// instance is forgotten.
     pub fn invalidate_instance(
         &mut self,
         application_instance_id: ApplicationInstanceId,
@@ -162,6 +160,9 @@ impl CapabilityOwner {
         reason: &str,
         now: TimestampMs,
     ) -> usize {
+        if change == InstanceInvalidation::BinaryChanged {
+            self.held.insert(application_instance_id);
+        }
         self.maps
             .get_mut(&application_instance_id)
             .map_or(0, |map| map.invalidate(change, reason, now))
@@ -224,9 +225,17 @@ impl CapabilityOwner {
             .is_some_and(|record| record.state == InstanceCapabilityState::QualifiedAvailable)
     }
 
-    /// Forgets one installation's map.
+    /// Returns true when the host cannot confirm that the instance's program still runs the code it
+    /// checked, so nothing is recorded for it.
+    #[must_use]
+    pub(crate) fn is_held(&self, application_instance_id: ApplicationInstanceId) -> bool {
+        self.held.contains(&application_instance_id)
+    }
+
+    /// Forgets one installation's map and the hold on it.
     pub fn forget(&mut self, application_instance_id: ApplicationInstanceId) {
         self.maps.remove(&application_instance_id);
+        self.held.remove(&application_instance_id);
     }
 }
 
@@ -360,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_invalidates_what_it_is_about_and_nothing_else() {
+    fn an_invalidation_changes_the_records_that_name_its_cause_and_nothing_else() {
         let mut owner = CapabilityOwner::new();
         owner
             .record(record(
@@ -377,9 +386,10 @@ mod tests {
             ))
             .expect("recorded");
         assert_eq!(
-            owner.invalidate(
+            owner.invalidate_instance(
+                instance(),
                 InstanceInvalidation::BinaryChanged,
-                "the executable was upgraded",
+                "the program changed",
                 TimestampMs::new(5)
             ),
             1
@@ -387,7 +397,138 @@ mod tests {
         assert!(!owner.is_usable(instance(), &capability("agent.prompt")));
         assert!(
             owner.is_usable(instance(), &capability("agent.approval")),
-            "a running binding's pinned evidence survives an installed upgrade"
+            "a record that does not name the cause is left as it was"
+        );
+    }
+
+    #[test]
+    fn a_binary_change_holds_the_instance_so_no_record_is_taken() {
+        let mut owner = CapabilityOwner::new();
+        owner
+            .record(record(
+                "agent.prompt",
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BinaryChanged,
+            ))
+            .expect("recorded");
+        owner.invalidate_instance(
+            instance(),
+            InstanceInvalidation::BinaryChanged,
+            "the program changed",
+            TimestampMs::new(5),
+        );
+        let refusal = owner
+            .record(record(
+                "agent.prompt",
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BinaryChanged,
+            ))
+            .expect_err("a held instance takes no record");
+        assert!(matches!(refusal, BrokerError::InvalidArgument(_)));
+        assert!(
+            refusal
+                .to_string()
+                .contains("the host cannot confirm that this installation's program still runs"),
+            "{refusal}"
+        );
+        assert!(
+            !owner.is_usable(instance(), &capability("agent.prompt")),
+            "the refused record did not make the evidence usable again"
+        );
+        let probed = owner.record_probe(
+            &probe("agent.prompt"),
+            record(
+                "agent.prompt",
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BinaryChanged,
+            ),
+        );
+        assert!(
+            matches!(probed, Err(BrokerError::InvalidArgument(_))),
+            "a probe's record is refused too"
+        );
+    }
+
+    #[test]
+    fn a_held_instance_with_no_record_refuses_the_next() {
+        let mut owner = CapabilityOwner::new();
+        assert_eq!(
+            owner.invalidate_instance(
+                instance(),
+                InstanceInvalidation::BinaryChanged,
+                "the program changed",
+                TimestampMs::new(5),
+            ),
+            0,
+            "there was no record to change"
+        );
+        assert!(
+            owner
+                .record(record(
+                    "agent.prompt",
+                    InstanceCapabilityState::QualifiedAvailable,
+                    InstanceInvalidation::BinaryChanged,
+                ))
+                .is_err(),
+            "the hold does not wait for a first record"
+        );
+    }
+
+    #[test]
+    fn a_binding_change_leaves_the_instance_takeable() {
+        let mut owner = CapabilityOwner::new();
+        owner
+            .record(record(
+                "agent.approval",
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BindingChanged,
+            ))
+            .expect("recorded");
+        owner.invalidate_instance(
+            instance(),
+            InstanceInvalidation::BindingChanged,
+            "the thread changed",
+            TimestampMs::new(5),
+        );
+        let mut next = record(
+            "agent.approval",
+            InstanceCapabilityState::QualifiedAvailable,
+            InstanceInvalidation::BindingChanged,
+        );
+        next.revision = CapabilityRevision::new(3);
+        owner.record(next).expect("a rebind holds nothing");
+        assert!(owner.is_usable(instance(), &capability("agent.approval")));
+    }
+
+    #[test]
+    fn forget_clears_the_hold() {
+        let mut owner = CapabilityOwner::new();
+        owner.invalidate_instance(
+            instance(),
+            InstanceInvalidation::BinaryChanged,
+            "the program changed",
+            TimestampMs::new(5),
+        );
+        assert!(
+            owner
+                .record(record(
+                    "agent.prompt",
+                    InstanceCapabilityState::QualifiedAvailable,
+                    InstanceInvalidation::BinaryChanged,
+                ))
+                .is_err(),
+            "the held instance refuses a record before it is forgotten"
+        );
+        owner.forget(instance());
+        assert!(
+            owner
+                .record(record(
+                    "agent.prompt",
+                    InstanceCapabilityState::QualifiedAvailable,
+                    InstanceInvalidation::BinaryChanged,
+                ))
+                .is_ok(),
+            "an instance that is forgotten and registered again starts with no hold"
         );
     }
 
