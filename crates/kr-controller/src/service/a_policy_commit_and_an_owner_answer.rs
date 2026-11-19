@@ -19,7 +19,7 @@ use kr_protocol::account::MEMBERSHIP_LEASE_MAX_LIFETIME_MS;
 use kr_protocol::ids::{AccountId, ActorId};
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs};
 use kr_protocol::sharing::OfflineValidityPolicy;
-use kr_transport::clock::{ContinuousClock, ManualClock};
+use kr_transport::clock::ManualClock;
 
 use super::a_transfer_left_unanswered::daemon;
 use super::an_owner_establishes_the_clock::{Door, distrusting, proven};
