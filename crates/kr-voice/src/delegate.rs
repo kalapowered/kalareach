@@ -211,8 +211,9 @@ impl std::fmt::Debug for Callback {
 
 /// Whether a replayed call is one this host may close, one a session holds, or one that waits.
 enum Replayed {
-    /// Nothing holds the call and no other device's start could.
-    Closable,
+    /// Nothing holds the call and no other device's start could. Carries the calls other starts
+    /// deferred for the same call, which this close resolves.
+    Closable(Vec<Ending>),
     /// A live voice session on this host holds the call.
     Held,
     /// Another device's start is in flight and may be about to hold the call.
@@ -1163,12 +1164,20 @@ impl Coordinator {
             // call this host has just told the caller to go on using; a call another start is
             // still waiting on is one that start will bind or close itself.
             let effect = match self.replayed_standing(&session.call_id, provider, device_id) {
-                Replayed::Closable => {
-                    if self.close_unbound(provider, &session.call_id).await {
+                Replayed::Closable(queued) => {
+                    let effect = if self.close_unbound(provider, &session.call_id).await {
                         BrokerEffect::Closed
                     } else {
                         BrokerEffect::Open
+                    };
+                    // The starts that deferred this call take the result of this one close: the
+                    // call is not closed a second time for them.
+                    for ending in queued {
+                        for Callback(closure) in ending.afterwards {
+                            closure(effect);
+                        }
                     }
+                    effect
                 }
                 Replayed::Held => {
                     self.remember_deferred(&session.call_id, provider, None);
@@ -1453,7 +1462,8 @@ impl Coordinator {
         }
     }
 
-    /// Where a replayed call stands: closable, held by a live session, or waiting.
+    /// Where a replayed call stands: closable, held by a live session, or waiting. A closable call
+    /// takes with it the entry other starts deferred for it, so that one close resolves both.
     ///
     /// Both questions are answered in one critical section, because a start records its session
     /// under the same lock: a call is left alone when a live voice session holds it, and when
@@ -1468,7 +1478,7 @@ impl Coordinator {
         provider: &Arc<dyn ManagedVoiceService>,
         device_id: DeviceId,
     ) -> Replayed {
-        let state = self.state.lock().expect("the coordinator's state");
+        let mut state = self.state.lock().expect("the coordinator's state");
         // A call belongs to the provider that created it. Two providers can name a call the same
         // thing, and two clients of one provider are the same provider, so what identifies a call
         // is its identifier and what the provider says it is.
@@ -1486,7 +1496,17 @@ impl Coordinator {
         } else if others_starting {
             Replayed::Waiting
         } else {
-            Replayed::Closable
+            let (queued, kept): (Vec<Ending>, Vec<Ending>) = std::mem::take(&mut state.deferred)
+                .into_iter()
+                .partition(|ending| {
+                    ending.call_id == call_id
+                        && ending
+                            .provider
+                            .as_ref()
+                            .is_some_and(|held| held.provider() == theirs)
+                });
+            state.deferred = kept;
+            Replayed::Closable(queued)
         }
     }
 
