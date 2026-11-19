@@ -3577,7 +3577,9 @@ impl ServedChannel {
                 connector.plugin_id(),
                 PublisherId::new("kalareach").expect("valid"),
                 connector.package_digest(),
-                BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+                // The package declares its semantic events as well as its decoder, so the host
+                // carries out the document-redrawing action it declares.
+                BrokerGrants::granted([BrokerGrant::Observation, BrokerGrant::ApprovalInterpreter]),
                 decoding_trust(&connector, TimestampMs::new(1)),
                 TimestampMs::new(1),
             )
