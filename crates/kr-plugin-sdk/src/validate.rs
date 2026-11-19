@@ -363,6 +363,7 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
         files,
         manifests,
         shell_forms,
+        sources,
     }) = scan(directory, &mut report)
     else {
         return Validated {
@@ -450,6 +451,7 @@ pub fn validate_package_directory(directory: &Path) -> Validated {
         check_connector(connector, &mut report);
         check_hook_events(&manifest, connector, &mut report);
     }
+    check_placement(&manifest, connector.as_ref(), &sources, &mut report);
 
     let package = presentation.map(|presentation| Package {
         manifest,
@@ -472,7 +474,14 @@ struct Scanned {
     manifests: BTreeMap<String, Vec<u8>>,
     /// The paths of the files that write the forwarder as a line a POSIX shell runs.
     shell_forms: BTreeSet<String>,
+    /// The bytes of the other small files, up to [`SOURCES_BYTES`] in all, which a bridge's
+    /// registration files are checked from without reading them again.
+    sources: BTreeMap<String, Vec<u8>>,
 }
+
+/// The most of a package's files the scan keeps for the checks of a bridge's registration files:
+/// no file over a mebibyte, and eight mebibytes in all.
+const SOURCES_BYTES: usize = 8 << 20;
 
 fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
     // The walk is anchored to a directory handle. Every open below resolves inside that handle, so
@@ -494,6 +503,8 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
     let mut files = Vec::new();
     let mut manifests: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut shell_forms: BTreeSet<String> = BTreeSet::new();
+    let mut sources: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut kept: usize = 0;
     let mut total: u64 = 0;
     let mut queue: Vec<(Dir, Vec<String>)> = vec![(root, Vec::new())];
     while let Some((current, prefix)) = queue.pop() {
@@ -608,6 +619,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     files,
                     manifests,
                     shell_forms,
+                    sources,
                 });
             }
             let limit = if is_manifest_name(path.as_str()) {
@@ -619,8 +631,14 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                 Ok(bytes) => {
                     if is_manifest_name(path.as_str()) {
                         manifests.insert(path.to_string(), bytes.clone());
-                    } else if std::str::from_utf8(&bytes).is_ok_and(forwarder::holds_shell_form) {
-                        shell_forms.insert(path.to_string());
+                    } else {
+                        if std::str::from_utf8(&bytes).is_ok_and(forwarder::holds_shell_form) {
+                            shell_forms.insert(path.to_string());
+                        }
+                        if bytes.len() <= 1 << 20 && kept + bytes.len() <= SOURCES_BYTES {
+                            kept += bytes.len();
+                            sources.insert(path.to_string(), bytes.clone());
+                        }
                     }
                     files.push(PackageFile {
                         path,
@@ -643,6 +661,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
                     files,
                     manifests,
                     shell_forms,
+                    sources,
                 });
             }
         }
@@ -652,6 +671,7 @@ fn scan(directory: &Path, report: &mut Report) -> Option<Scanned> {
         files,
         manifests,
         shell_forms,
+        sources,
     })
 }
 
@@ -1041,6 +1061,94 @@ fn check_hook_events(
                 crate::hook_events::HookEventsRefusal::NoForwarder.name()
             ),
         ));
+    }
+}
+
+/// Refuses a placement that a host could not place by, one that is not the layout its application's
+/// label has, and a bridge file that is not of the shape its placement names or that holds a name
+/// or text that is a place.
+///
+/// The files are the package's own: each file a recipe installs is read as the host reads it, and
+/// held to the shape of the declared placement, or of the label's own where none is declared. A
+/// label this crate holds no layout for and that declares none places nothing here, and the host
+/// refuses the recipe.
+fn check_placement(
+    manifest: &PluginManifest,
+    connector: Option<&ConnectorManifest>,
+    sources: &BTreeMap<String, Vec<u8>>,
+    report: &mut Report,
+) {
+    let declared = connector.and_then(|table| table.placement.as_ref());
+    let bridge = manifest.native_bridge.0.as_ref();
+    if let Some(placement) = declared {
+        for refusal in placement.refusals() {
+            report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                refusal.to_string(),
+            ));
+        }
+        match bridge {
+            Some(bridge) => {
+                for refusal in placement.refusals_for_label(bridge.application.as_str()) {
+                    report.push(Finding::at(
+                        FindingCode::ConnectorTableInvalid,
+                        CONNECTOR_FILE,
+                        refusal.to_string(),
+                    ));
+                }
+            }
+            None => report.push(Finding::at(
+                FindingCode::ConnectorTableInvalid,
+                CONNECTOR_FILE,
+                "the table declares a placement and the package installs no native bridge",
+            )),
+        }
+    }
+    let Some(bridge) = bridge else {
+        return;
+    };
+    let Some(placement) = declared
+        .cloned()
+        .or_else(|| crate::placement::Placement::for_label(bridge.application.as_str()))
+    else {
+        return;
+    };
+    for step in &bridge.install {
+        let BridgeStep::InstallFile {
+            source,
+            destination,
+            ..
+        } = step
+        else {
+            continue;
+        };
+        let Some(bytes) = sources.get(source.as_str()) else {
+            continue;
+        };
+        let Some((folder, tail)) = destination
+            .as_str()
+            .strip_prefix(placement.area.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                source.as_str(),
+                "a file a native bridge installs is not JSON, so what it registers cannot be checked",
+            ));
+            continue;
+        };
+        if let Err(why) = placement.check_file(tail, folder, &value) {
+            report.push(Finding::at(
+                FindingCode::BridgeRecipeInvalid,
+                source.as_str(),
+                format!("{destination} is not a file the placement names: {why}"),
+            ));
+        }
     }
 }
 

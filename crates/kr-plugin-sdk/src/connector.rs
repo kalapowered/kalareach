@@ -681,6 +681,17 @@ pub struct ConnectorManifest {
     /// hashes exactly as it did. A package that states it declares an `sdk_range` from SDK 0.1.8.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hook_events: Option<crate::hook_events::HookEvents>,
+    /// Where the files of the package's native bridge are placed under the account's home, and the
+    /// closed shape of each: the application's directory, the folder in it that holds one folder
+    /// for each plugin, and the files each holds.
+    ///
+    /// A table that does not state it leaves the member out, and the host places the bridge by the
+    /// layout it holds for the application's label, so a connector written before the member
+    /// existed reads and hashes exactly as it did. A package that states it declares an
+    /// `sdk_range` from SDK 0.1.9, and the installation statement the owner confirms says what the
+    /// host checks of the files and what it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<crate::placement::Placement>,
     /// Whether the connector has a tested volatile forwarding mode.
     ///
     /// Without one it is not a resilient managed gateway, so this host serves no gateway for it:
@@ -934,6 +945,7 @@ mod tests {
             observation: None,
             operations: None,
             hook_events: None,
+            placement: None,
             volatile_forwarding: false,
             qualification_note: Nullable(None),
         }

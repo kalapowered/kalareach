@@ -341,7 +341,7 @@ fn a_map_in_a_package_that_starts_no_forwarder_is_refused_by_name() {
 
 #[test]
 fn the_arrival_table_lists_hook_events_at_the_sdk_version() {
-    assert_eq!(SDK_VERSION, "0.1.8");
+    assert_eq!(SDK_VERSION, "0.1.9");
     let contract = package_contract();
     let listed: Vec<&Value> = contract["arrivals"]
         .as_array()

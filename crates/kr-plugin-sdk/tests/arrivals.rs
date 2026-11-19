@@ -42,7 +42,7 @@ fn fixtures_root() -> PathBuf {
 fn the_contract_lists_the_members_that_arrived_inside_a_level() {
     let contract = package_contract();
     assert_eq!(contract["sdk_version"], SDK_VERSION);
-    assert_eq!(SDK_VERSION, "0.1.8");
+    assert_eq!(SDK_VERSION, "0.1.9");
     assert_eq!(
         contract["arrivals"],
         json!([
@@ -55,6 +55,11 @@ fn the_contract_lists_the_members_that_arrived_inside_a_level() {
                 "definition": "ConnectorManifest",
                 "member": "hook_events",
                 "sdk_version": "0.1.8",
+            },
+            {
+                "definition": "ConnectorManifest",
+                "member": "placement",
+                "sdk_version": "0.1.9",
             },
         ])
     );
