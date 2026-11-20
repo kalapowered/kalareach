@@ -55,12 +55,6 @@ impl Mode {
     pub const fn is_terminal(self) -> bool {
         !matches!(self, Self::CustomTab)
     }
-
-    /// Whether the answer comes back on the private-use scheme rather than on HTTPS.
-    #[must_use]
-    pub const fn uses_private_scheme(self) -> bool {
-        matches!(self, Self::SessionScheme)
-    }
 }
 
 /// Why this device cannot carry a sign-in.
@@ -351,8 +345,6 @@ mod tests {
     fn ios_before_17_4_is_answered_on_the_private_scheme() {
         assert_eq!(mode(true), Mode::SessionHttps);
         assert_eq!(mode(false), Mode::SessionScheme);
-        assert!(Mode::SessionScheme.uses_private_scheme());
-        assert!(!Mode::SessionHttps.uses_private_scheme());
         assert!(Mode::SessionHttps.is_terminal() && Mode::AuthTab.is_terminal());
         assert!(!Mode::CustomTab.is_terminal());
     }
