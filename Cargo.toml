@@ -288,6 +288,10 @@ tower-layer = "=0.3.3"
 tower-service = "=0.3.3"
 tokio = { version = "=1.53.3", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
+# A message's text is folded to its compatibility form, and its invisible format characters
+# are dropped, before it is checked for text shaped like a channel tag.
+unicode-general-category = "=1.1.0"
+unicode-normalization = "=0.1.25"
 # Where a text can be cut without cutting a character a person sees: the end of a generated
 # activity line that ran out of room.
 unicode-segmentation = "=1.13.3"
