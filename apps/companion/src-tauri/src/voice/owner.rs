@@ -635,6 +635,38 @@ async fn collect_close_evidence(
     }
 }
 
+/// Starts to read what a control tells while its call closes, until the control is over: the end
+/// is kept, and the host's word of the provider's close is offered to `evidence`.
+fn drain_control_news(
+    mut feed: ControlFeed,
+    evidence: &CloseEvidence,
+) -> tokio::task::JoinHandle<Option<ControlEnd>> {
+    let evidence = evidence.clone();
+    tokio::spawn(async move {
+        let mut last = None;
+        while let Some(news) = feed.next().await {
+            note_while_closing(news, &mut last, &evidence);
+        }
+        last
+    })
+}
+
+/// The host's word of the provider's close, read once the host's control is stopped and everything
+/// it had told is read: its feed ends with the stop, and the drain is given `within`, the time a
+/// host is given to answer.
+async fn read_the_word_of_a_stopped_control(
+    control: Option<&HostControl>,
+    draining: Option<tokio::task::JoinHandle<Option<ControlEnd>>>,
+    evidence: &CloseEvidence,
+    within: Duration,
+) -> CloseWord {
+    if let Some(control) = control {
+        control.stop();
+    }
+    collect_close_evidence(draining, within).await;
+    CloseWord::of(evidence.get())
+}
+
 /// Waits for the control's next news, or for ever when there is no control.
 async fn next_news(events: &mut Option<ControlFeed>) -> Option<CallNews> {
     match events {
@@ -2867,16 +2899,10 @@ impl Owner {
             evidence.offer(*provider_close);
         }
         let own_key_call = self.descriptor.as_ref().is_some_and(is_host_controlled);
-        let mut draining = self.control_events.take().map(|mut events| {
-            let evidence = evidence.clone();
-            tokio::spawn(async move {
-                let mut last = None;
-                while let Some(news) = events.next().await {
-                    note_while_closing(news, &mut last, &evidence);
-                }
-                last
-            })
-        });
+        let mut draining = self
+            .control_events
+            .take()
+            .map(|events| drain_control_news(events, &evidence));
 
         let call = self.call.take();
         let already = self.media_stopped.unwrap_or(false);
@@ -2915,15 +2941,22 @@ impl Owner {
             may_have_reached: false,
         });
         let host_end = stopped.end;
-        // Everything the host's control had told is read before the word is: the control is
-        // stopped, its feed ends, and the drain is given the time a host is given to answer.
-        if own_key_call {
-            if let Some(CallControl::Host(control)) = &self.control {
-                control.stop();
-            }
-            collect_close_evidence(draining.take(), timings.host_within).await;
-        }
-        let word = CloseWord::of(evidence.get());
+        // Everything the host's control had told is read before the word is.
+        let word = if own_key_call {
+            let control = match &self.control {
+                Some(CallControl::Host(control)) => Some(control),
+                _ => None,
+            };
+            read_the_word_of_a_stopped_control(
+                control,
+                draining.take(),
+                &evidence,
+                timings.host_within,
+            )
+            .await
+        } else {
+            CloseWord::of(evidence.get())
+        };
         let closed = Closed {
             local: closed_locally,
             host: host_end.clone(),
@@ -4376,6 +4409,116 @@ mod tests {
             told(&lost, CloseWord::Unheard, &not_held, true),
             HOST_UNHEARD
         );
+    }
+
+    use crate::voice::host_control::{HostLink, LinkError, LinkFuture};
+    use kr_protocol::voice_host::{
+        VoiceContextSendParams, VoiceContextSendResult, VoiceControlAnswer, VoiceControlParams,
+        VoiceHostCallState,
+    };
+
+    /// A host that answers every heartbeat the same way: a call it closed, with this word of the
+    /// provider's close, or, with no word, a call that is still open.
+    struct HeartbeatAnswers(Option<VoiceProviderClose>);
+
+    impl HostLink for HeartbeatAnswers {
+        fn control<'a>(
+            &'a self,
+            _action_id: ActionId,
+            _params: &'a VoiceControlParams,
+        ) -> LinkFuture<'a, VoiceControlAnswer> {
+            let answer = match self.0 {
+                Some(word) => VoiceControlAnswer::Heartbeat {
+                    state: VoiceHostCallState::Closed {
+                        reason: VoiceEndReason::Stop,
+                    },
+                    remaining_seconds: 0,
+                    news: Vec::new(),
+                    dropped: false,
+                    provider_close: Nullable::some(word),
+                },
+                None => VoiceControlAnswer::Heartbeat {
+                    state: VoiceHostCallState::Open,
+                    remaining_seconds: 100,
+                    news: Vec::new(),
+                    dropped: false,
+                    provider_close: Nullable::null(),
+                },
+            };
+            Box::pin(async move { Ok(answer) })
+        }
+
+        fn send_context<'a>(
+            &'a self,
+            _action_id: ActionId,
+            _params: &'a VoiceContextSendParams,
+        ) -> LinkFuture<'a, VoiceContextSendResult> {
+            Box::pin(async { Err(LinkError::NotSent) })
+        }
+    }
+
+    /// A host control on a stand-in host, whose first heartbeat has been answered and told, and
+    /// whose feed nobody has read.
+    async fn a_control_whose_news_is_unread(host: HeartbeatAnswers) -> (HostControl, ControlFeed) {
+        let (control, events) = HostControl::open(
+            Arc::new(host),
+            VoiceSessionId::new(kr_ipc::new_uuid()),
+            HostLimits {
+                beat: Duration::from_secs(3_600),
+                miss_after: Duration::from_secs(10),
+                silent_after: Duration::from_secs(7_200),
+                within: Duration::from_secs(20),
+            },
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        (control, ControlFeed::Host(events))
+    }
+
+    /// The word is read after the news a stopped control still held: the closed call's end sits in
+    /// the feed when the word is asked for, and the word it told is the one read.
+    #[tokio::test(start_paused = true)]
+    async fn the_word_is_read_after_the_news_a_stopped_control_still_held() {
+        let evidence = CloseEvidence::default();
+        let (control, feed) =
+            a_control_whose_news_is_unread(HeartbeatAnswers(Some(VoiceProviderClose::Confirmed)))
+                .await;
+        let draining = super::drain_control_news(feed, &evidence);
+        let word = super::read_the_word_of_a_stopped_control(
+            Some(&control),
+            Some(draining),
+            &evidence,
+            Duration::from_secs(20),
+        )
+        .await;
+        assert_eq!(
+            word,
+            CloseWord::Confirmed,
+            "the word the stopped control had told is read before it is asked for"
+        );
+        assert_eq!(evidence.get(), Some(VoiceProviderClose::Confirmed));
+    }
+
+    /// A control that would tell for ever is stopped before its news is collected, so the collection
+    /// ends with its feed and not at its bound, and no word was told.
+    #[tokio::test(start_paused = true)]
+    async fn a_control_that_would_tell_for_ever_is_stopped_before_its_news_is_collected() {
+        let within = Duration::from_secs(20);
+        let evidence = CloseEvidence::default();
+        let (control, feed) = a_control_whose_news_is_unread(HeartbeatAnswers(None)).await;
+        let draining = super::drain_control_news(feed, &evidence);
+        let began = Instant::now();
+        let word = super::read_the_word_of_a_stopped_control(
+            Some(&control),
+            Some(draining),
+            &evidence,
+            within,
+        )
+        .await;
+        assert!(
+            began.elapsed() < within,
+            "the collection ends with the stopped control's feed and not at its bound"
+        );
+        assert_eq!(word, CloseWord::Unheard, "an open call told no word");
     }
 
     /// The news the host's control told while the call closed is read to its end before the word of
