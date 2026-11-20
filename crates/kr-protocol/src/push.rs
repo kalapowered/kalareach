@@ -1514,7 +1514,7 @@ mod tests {
     }
 
     #[test]
-    fn urgency_maps_to_both_providers() {
+    fn urgency_maps_to_apns_priority() {
         assert_eq!(PushUrgency::Attention.apns_priority(), "10");
         assert_eq!(PushUrgency::Deferred.apns_priority(), "5");
     }
