@@ -1056,6 +1056,23 @@ mod tests {
         }
     }
 
+    /// One queued message from the host's own account.
+    fn a_message(text: &str) -> UpstreamRequest {
+        request(
+            RichOperation::PromptQueue,
+            UpstreamBody::Prompt {
+                draft_id: None,
+                text: Some(text.to_owned()),
+                sender: crate::broker::channel_prompt::PromptSender {
+                    actor_id: kr_protocol::ids::ActorId::new("local:the-owner").expect("an actor"),
+                    ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+                    device_id: None,
+                    grant_id: None,
+                },
+            },
+        )
+    }
+
     /// A channel queues what it carries through the gate it is handed, so that a caller that stops
     /// waiting before the queue took it can say that nothing was sent.
     #[test]
@@ -1070,6 +1087,93 @@ mod tests {
         };
         assert!(
             channel.queues_through_gate(&request(RichOperation::PromptQueue, UpstreamBody::Cancel))
+        );
+    }
+
+    /// A message for a caller that has stopped waiting is refused as not sent and nothing is queued:
+    /// the channel queues through the gate it is handed and not around it, and the place the message
+    /// took goes back.
+    #[test]
+    fn a_channel_queues_nothing_for_a_caller_that_stopped_waiting() {
+        let package = crate::broker::channel_fixture::Package::laid_out();
+        let (queue, mut outgoing) = tokio::sync::mpsc::channel(MAX_QUEUED_ANSWERS);
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let channel = ChannelDispatch {
+            connection: GatewayConnectionId::new(7),
+            queue: Mutex::new(Some(queue)),
+            counted: None,
+            shape: ChannelEventShape::of(&package.connector).map(Arc::new),
+            prompts: Arc::clone(&prompts),
+        };
+        let gate = crate::broker::SubmitGate::default();
+        assert!(gate.give_up().is_none(), "nothing had queued");
+        let outcome = channel.submit_gated(&a_message("hello"), &gate);
+        assert!(outcome.is_err(), "a gate that has given up queues nothing");
+        let refusal = outcome.err().expect("refused");
+        assert!(refusal.proven_unsent(), "{refusal}");
+        assert!(
+            refusal.to_string().contains(
+                "The worker stopped waiting before the channel's queue took the message. \
+                 Nothing was sent."
+            ),
+            "{refusal}"
+        );
+        assert!(outgoing.try_recv().is_err(), "nothing was queued");
+        assert_eq!(
+            prompts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the message's place went back"
+        );
+    }
+
+    /// A message is refused in its own words when the channel's queue is full and when the
+    /// application's end has gone, and nothing is queued for it.
+    #[test]
+    fn a_message_is_refused_in_its_own_words_when_the_queue_is_full_or_its_end_has_gone() {
+        let package = crate::broker::channel_fixture::Package::laid_out();
+        let channel_with = |queue| ChannelDispatch {
+            connection: GatewayConnectionId::new(7),
+            queue: Mutex::new(Some(queue)),
+            counted: None,
+            shape: ChannelEventShape::of(&package.connector).map(Arc::new),
+            prompts: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let (queue, mut outgoing) = tokio::sync::mpsc::channel(1);
+        queue
+            .try_send(Outgoing {
+                frame: Vec::new(),
+                written: tokio::sync::oneshot::channel().0,
+                carried: Carried::Answer,
+                slot: None,
+            })
+            .expect("the queue takes one answer");
+        let outcome = channel_with(queue)
+            .submit_gated(&a_message("hello"), &crate::broker::SubmitGate::default());
+        assert!(outcome.is_err(), "a full queue takes no message");
+        let refusal = outcome.err().expect("refused");
+        assert!(refusal.proven_unsent(), "{refusal}");
+        assert!(
+            refusal
+                .to_string()
+                .contains("The message queue is full. Nothing was sent. Try again later."),
+            "{refusal}"
+        );
+        assert!(outgoing.try_recv().is_ok(), "only the answer is queued");
+        assert!(outgoing.try_recv().is_err(), "no message was queued");
+
+        let (queue, outgoing) = tokio::sync::mpsc::channel(MAX_QUEUED_ANSWERS);
+        drop(outgoing);
+        let outcome = channel_with(queue)
+            .submit_gated(&a_message("hello"), &crate::broker::SubmitGate::default());
+        assert!(outcome.is_err(), "a closed queue takes no message");
+        let refusal = outcome.err().expect("refused");
+        assert!(refusal.proven_unsent(), "{refusal}");
+        assert!(
+            refusal
+                .to_string()
+                .contains("The channel is closed. Nothing was sent."),
+            "{refusal}"
         );
     }
 
