@@ -2057,11 +2057,12 @@ mod tests {
             "a connection the host did not admit is a loss, whatever the lease says"
         );
         let full = refused_session(ErrorCode::ResourceUnavailable).await;
-        let Outcome::Refused { refusal, .. } =
+        let Outcome::Refused { refusal, request } =
             crate::connection::lease_stop_outcome(&full, &stopped)
         else {
-            panic!("a host with no room is a refusal");
+            panic!("a host with no room is a refusal of the connection");
         };
+        assert_eq!(request, Asked::Connection);
         assert_eq!(refusal.message, crate::places::host_full_error().message);
     }
 
