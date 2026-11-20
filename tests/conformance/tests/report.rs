@@ -716,6 +716,7 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
         error: None,
         blocked_by: None,
         observation: None,
+        timed_out: false,
     };
     let options = Options {
         root: PathBuf::from("/tmp/r"),

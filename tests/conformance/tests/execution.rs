@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use kr_conformance::plan::Platform;
 use kr_conformance::plan_file::Plan;
@@ -900,4 +902,208 @@ fn a_plan_run_in_parts_gives_each_part_the_set_up_step_its_steps_name() {
     assert_eq!(ids((1, 2)), ["variables"]);
     assert_eq!(ids((2, 2)), ["make-the-file", "made"]);
     assert_eq!(ids((1, 1)), ["make-the-file", "variables", "made"]);
+}
+
+/// The text of a step of the plan `time-limits` runs on the platforms that can end a step's
+/// processes: `limits` are its `timeout` and `budget` lines.
+#[cfg(unix)]
+fn timed_step(id: &str, reading: &str, command: &str, limits: &str) -> String {
+    format!(
+        "[[step]]\nid = '{id}'\ngroup = 'rust'\nwhat = 'the {id} step'\nplatforms = ['linux', 'macos']\nreading = '{reading}'\n{limits}\ncommand = [{command}]\n"
+    )
+}
+
+/// A plan of one group whose `budgets` and `steps` are the text of the tables given.
+#[cfg(unix)]
+fn timed_plan(budgets: &str, steps: &[String]) -> String {
+    plan_of(&["Cargo.toml"], &format!("{budgets}{}", steps.concat()))
+}
+
+/// The pids a fixture script recorded in `file`: `count` of them, when the step ran as far as the
+/// case needs.
+#[cfg(unix)]
+fn recorded_pids(file: &Path, count: usize) -> Vec<String> {
+    let text = std::fs::read_to_string(file).unwrap_or_default();
+    let pids: Vec<String> = text.lines().map(str::to_owned).collect();
+    assert_eq!(
+        pids.len(),
+        count,
+        "the step's processes did not all start before its time was spent: {text:?}"
+    );
+    pids
+}
+
+/// Whether the process `pid` exists: a process that has ended and is not reaped yet counts, which
+/// its parent or the system's first process ends.
+#[cfg(unix)]
+fn alive(pid: &str) -> bool {
+    Command::new("sh")
+        .args(["-c", &format!("kill -0 {pid} 2>/dev/null")])
+        .status()
+        .expect("a shell")
+        .success()
+}
+
+/// The processes of `pids` that still exist `within` a time after the call, looked at every tenth of
+/// a second. A case that fails ends them, so that it leaves none.
+#[cfg(unix)]
+fn left_after(pids: &[String], within: Duration) -> Vec<String> {
+    let until = Instant::now() + within;
+    loop {
+        let left: Vec<String> = pids.iter().filter(|pid| alive(pid)).cloned().collect();
+        if left.is_empty() || Instant::now() >= until {
+            for pid in &left {
+                let _ = Command::new("sh")
+                    .args(["-c", &format!("kill -9 {pid} 2>/dev/null")])
+                    .status();
+            }
+            return left;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// What a run of one step with a time limit that its tree outlasts must show: the step is failed
+/// with the limit's words, its exit status is none, the run fails, the log says so, and no process
+/// of what the step started is left.
+#[cfg(unix)]
+fn assert_ended_at_its_limit(ran: &Ran, seconds: u64, pids: &[String]) {
+    let step = &ran.document.steps[0];
+    let said = format!("ran out of its time limit: {seconds} s");
+    assert_eq!(
+        (step.exit, step.error.as_deref()),
+        (None, Some(said.as_str())),
+        "{step:?}"
+    );
+    // An order, with the slack a loaded host needs: the limit and the wait that ends the group, and
+    // not the 300 seconds the step's processes wait for.
+    assert!(
+        step.seconds < seconds + 30,
+        "the step ran {} s with a limit of {seconds} s",
+        step.seconds
+    );
+    assert!(!ran.document.passed());
+    assert_eq!(ran.document.summary.failed_steps, [1]);
+    let log = std::fs::read_to_string(ran.evidence.path().join(&step.log)).expect("the log");
+    assert!(log.contains(&format!("== {said}")), "{log}");
+    let left = left_after(pids, Duration::from_secs(10));
+    assert!(left.is_empty(), "processes of the step were left: {left:?}");
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a step whose time is spent is failed with
+/// the limit in its error, and every process it started that is in its group ends, though each
+/// ignores the signal that asks it to: the step's own, the child it starts and the child's own.
+#[cfg(unix)]
+#[test]
+fn a_step_whose_processes_ignore_the_first_signal_is_ended_with_every_process_of_its_group() {
+    let (_directory, root) = copy("time-limits");
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let pids = place.path().join("pids.txt");
+    let command = format!("'bash', 'scripts/tree-root.sh', '{}'", pids.display());
+    let text = timed_plan("", &[timed_step("tree", "build", &command, "timeout = 3")]);
+    let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let started = recorded_pids(&pids, 3);
+    assert_ended_at_its_limit(&ran, 3, &started);
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the group is ended whether or not its leader
+/// has gone: a step whose own process ends when it is asked to, and whose child ignores it, leaves
+/// no process either.
+#[cfg(unix)]
+#[test]
+fn a_leader_that_ends_when_asked_does_not_leave_the_process_of_its_group_that_ignored_it() {
+    let (_directory, root) = copy("time-limits");
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let pids = place.path().join("pids.txt");
+    let command = format!("'bash', 'scripts/leader-exits.sh', '{}'", pids.display());
+    let text = timed_plan("", &[timed_step("tree", "build", &command, "timeout = 3")]);
+    let ran = run(&root, &text).unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let started = recorded_pids(&pids, 3);
+    assert_ended_at_its_limit(&ran, 3, &started);
+}
+
+/// A plan of one `cargo test` step of the fixture `time-limits`, with `limits`, and `env` as the
+/// text of the inside of an inline table that adds to the step's variables. The step builds in
+/// `target`, a directory of the case's own: Cargo holds a lock on its target directory while a
+/// build waits, so two cases that build in one would wait for each other.
+#[cfg(unix)]
+fn cargo_plan(target: &Path, limits: &str, env: &str) -> String {
+    timed_plan(
+        "",
+        &[timed_step(
+            "cargo",
+            "cargo",
+            "'cargo', 'test', '--offline'",
+            &format!(
+                "{limits}\nenv = {{ CARGO_TARGET_DIR = '{}'{env} }}",
+                target.display()
+            ),
+        )],
+    )
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the step's time covers its build: a build
+/// that does not end is ended at the limit, with the process the build started, and the step has no
+/// tests. The fixture is built once without a limit first, so that the time the limit covers is
+/// the wait and not the compile.
+#[cfg(unix)]
+#[test]
+fn a_build_that_does_not_end_is_ended_at_the_steps_limit_with_the_process_it_started() {
+    let (_directory, root) = copy("time-limits");
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let target = tempfile::tempdir().expect("a target directory");
+    let pids = place.path().join("pids.txt");
+    let warm = run(&root, &cargo_plan(target.path(), "", ""))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    assert!(warm.document.passed(), "{:?}", warm.document.steps);
+    let env = format!(", KR_BLOCK = 'build', KR_BLOCK_PIDS = '{}'", pids.display());
+    let ran = run(&root, &cargo_plan(target.path(), "timeout = 8", &env))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let started = recorded_pids(&pids, 1);
+    assert_ended_at_its_limit(&ran, 8, &started);
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: the step's time covers the listing of its
+/// tests: a listing that does not end is ended at the limit, with the process it started, though
+/// the build before it ended in time.
+#[cfg(unix)]
+#[test]
+fn a_listing_that_does_not_end_is_ended_at_the_steps_limit_with_the_process_it_started() {
+    let (_directory, root) = copy("time-limits");
+    let place = tempfile::tempdir().expect("a directory for the pids");
+    let target = tempfile::tempdir().expect("a target directory");
+    let pids = place.path().join("pids.txt");
+    let warm = run(&root, &cargo_plan(target.path(), "", ""))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    assert!(warm.document.passed(), "{:?}", warm.document.steps);
+    let env = format!(
+        ", KR_BLOCK = 'listing', KR_BLOCK_PIDS = '{}'",
+        pids.display()
+    );
+    let ran = run(&root, &cargo_plan(target.path(), "timeout = 8", &env))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let started = recorded_pids(&pids, 1);
+    assert_ended_at_its_limit(&ran, 8, &started);
+}
+
+/// KR-REQ-29.01, the part about reproducible commands: a step with a limit that ends in time is
+/// read as one without: its build, its listing and its run each give what they give.
+#[cfg(unix)]
+#[test]
+fn a_step_that_ends_in_its_time_is_read_as_a_step_without_a_limit() {
+    let (_directory, root) = copy("time-limits");
+    let target = tempfile::tempdir().expect("a target directory");
+    let with = run(&root, &cargo_plan(target.path(), "timeout = 300", ""))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    let without = run(&root, &cargo_plan(target.path(), "", ""))
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    for (what, ran) in [("with", &with), ("without", &without)] {
+        let step = &ran.document.steps[0];
+        assert_eq!(
+            (step.exit, step.error.as_deref()),
+            (Some(0), None),
+            "{what}: {step:?}"
+        );
+        assert!(ran.document.passed(), "{what}: {:?}", ran.document.problems);
+    }
 }

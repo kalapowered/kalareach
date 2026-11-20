@@ -1,0 +1,11 @@
+# A tree the conformance report's own tests copy and run under a time limit: scripts that start
+# processes which ignore the first signal, and a build script that waits while the step builds or
+# while it lists its tests. It is a workspace of its own, so the repository's workspace never builds
+# it.
+[package]
+name = "timelimits"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
