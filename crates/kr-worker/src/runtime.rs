@@ -281,16 +281,17 @@ struct Terminal<'a, W: std::io::Write> {
 /// one write that refuses to wait, and the accounting for what that write sent. `fence` is the
 /// lease's fence, read inside that boundary; `wrote` is told what the application now has that it
 /// did not have before, which is what the write returned rather than what was offered, and it is
-/// told inside the boundary too. Nothing waits while the boundary is held, so a lease change never
-/// waits for a terminal or for a look at storage, and no write of an ended lease's bytes can begin
-/// after that change.
+/// told inside the boundary too. No wait for a terminal's room and no look at storage is made while
+/// the boundary is held, so a lease change never waits for either, and no write of an ended
+/// lease's bytes can begin after that change.
 ///
 /// `lapsed` says whether what the batch was accepted under has run out: the end of its authority
 /// and the end of an answer's lane. It is asked outside the boundary, before each piece is
 /// offered, because its answer can wait on storage: a UTC end is decided against a floor whose name
-/// is looked at. A change of the lease that happens meanwhile is caught by the fence read inside
-/// the boundary, before anything is written. What the boundary does not make one step with the
-/// write is that look, which still comes before every piece.
+/// is looked at, and the end on the continuous clock is read again once that look has answered. A
+/// change of the lease that happens meanwhile is caught by the fence read inside the boundary,
+/// before anything is written. What the boundary does not make one step with the write is that
+/// look, which still comes before every piece.
 ///
 /// What makes this a boundary and not a wait is that the write inside it cannot wait. Every terminal
 /// this host opens answers rather than waits - that is what the ConPTY module (`windows::conpty`)
