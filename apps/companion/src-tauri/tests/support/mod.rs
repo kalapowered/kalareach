@@ -1224,6 +1224,11 @@ struct LinkState {
     /// Whether the next answer to a `session.read` is for another session than the one asked for,
     /// as a host at fault would give.
     answering_read_for_another: bool,
+    /// Whether the next answer to a `voice.control` heartbeat is a refusal that the host holds no
+    /// such call, as a host that does not know the call for this device would give.
+    answering_control_unknown: bool,
+    /// The connections made so far, to be ended by [`LinkControl::end_live_connections`].
+    live: Vec<std::sync::Weak<Tapped>>,
     /// The method of the requests whose answer is replaced by a result nothing can read as that
     /// method's result: the host answers, and the caller is handed something else.
     garbling_answer_to: Option<String>,
@@ -1425,6 +1430,25 @@ impl LinkControl {
     /// all the same, and the caller is handed the receipt.
     pub fn answer_the_next_delegation_with_a_receipt(&self) {
         self.state.lock().expect("the record").receipting_delegate = true;
+    }
+
+    /// Makes the next answer to a `voice.control` heartbeat, once, a refusal that the host holds no
+    /// such call, as a host that does not know the call for this device gives, whether or not it
+    /// still holds the call.
+    pub fn answer_the_next_control_as_unknown_call(&self) {
+        self.state
+            .lock()
+            .expect("the record")
+            .answering_control_unknown = true;
+    }
+
+    /// Ends every connection made so far, as a network that drops them would: the next send or read
+    /// on each fails. Connections made afterwards are not touched.
+    pub fn end_live_connections(&self) {
+        let live = std::mem::take(&mut self.state.lock().expect("the record").live);
+        for connection in live.iter().filter_map(std::sync::Weak::upgrade) {
+            kr_client::transport::ControlTransport::close(&*connection);
+        }
     }
 
     /// Makes the next answer to a `session.read`, once, a read of another session than the one
@@ -1779,6 +1803,39 @@ impl LinkControl {
         Some(response)
     }
 
+    /// `response` as a refusal that the host holds no such call, taking the change, when it is the
+    /// answer to a heartbeat and the test asked for the next one to be changed.
+    fn control_made_unknown(
+        &self,
+        response: &kr_protocol::envelope::Response,
+    ) -> Option<kr_protocol::envelope::Response> {
+        use kr_protocol::voice_host::{VoiceControlAnswer, VoiceHostRefusal};
+        let kr_protocol::envelope::Outcome::Ok(value) = &response.outcome else {
+            return None;
+        };
+        let answer: VoiceControlAnswer = value.to_typed().ok()?;
+        if !matches!(answer, VoiceControlAnswer::Heartbeat { .. }) {
+            return None;
+        }
+        if !std::mem::take(
+            &mut self
+                .state
+                .lock()
+                .expect("the record")
+                .answering_control_unknown,
+        ) {
+            return None;
+        }
+        let mut response = response.clone();
+        response.outcome = kr_protocol::envelope::Outcome::Ok(
+            kr_protocol::envelope::ParamsValue::from_typed(&VoiceControlAnswer::Refused {
+                reason: VoiceHostRefusal::UnknownCall,
+            })
+            .ok()?,
+        );
+        Some(response)
+    }
+
     /// The request `frame` is, when its answer is to be garbled.
     fn garbled_request(&self, frame: &ControlFrame) -> Option<kr_protocol::ids::RequestId> {
         let method = method_of(frame)?;
@@ -1922,7 +1979,7 @@ impl ControlledLink {
         if ending {
             transport.close();
         }
-        Ok(Arc::new(Tapped {
+        let tapped = Arc::new(Tapped {
             inner: transport,
             control: Arc::clone(&self.control),
             garbled: Mutex::new(Vec::new()),
@@ -1930,7 +1987,14 @@ impl ControlledLink {
             asked: Mutex::new(std::collections::HashMap::new()),
             refusing_connection,
             refused: std::sync::atomic::AtomicBool::new(false),
-        }))
+        });
+        self.control
+            .state
+            .lock()
+            .expect("the record")
+            .live
+            .push(Arc::downgrade(&tapped));
+        Ok(tapped)
     }
 }
 
@@ -2269,6 +2333,7 @@ impl kr_client::transport::ControlTransport for Tapped {
                             .challenge_changed(&response)
                             .or_else(|| self.control.performed_changed(&response))
                             .or_else(|| self.control.session_read_changed(&response))
+                            .or_else(|| self.control.control_made_unknown(&response))
                         {
                             Some(changed) => ControlFrame::Response(changed),
                             None => ControlFrame::Response(response),

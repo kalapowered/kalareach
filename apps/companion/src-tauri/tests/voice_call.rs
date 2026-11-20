@@ -10223,3 +10223,530 @@ async fn the_hosts_news_of_its_deadline_ends_an_own_key_call_before_the_phones_o
     );
     scene.stop_host().await;
 }
+
+/// What native code's own end of a call says: it came from the notification, the system or the
+/// call's time limit.
+const NATIVE_ENDED_WORDS: &str =
+    "The call ended on this device: from its notification, by the system, or at its time limit.";
+
+/// Starts a call on the host's own key and waits until the phone's control of it is attached.
+async fn start_own_call(scene: &Scene) {
+    let prepared = scene.prepared().await;
+    let answer = scene.call("voice_start", scene.own_start_request(&prepared));
+    assert!(answer.is_ok(), "an own-key call starts: {answer:?}");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+}
+
+/// The words of the notice of a call left to the host that an end carries, if it carries one.
+fn left_to_host_notice(ended: &serde_json::Value) -> Option<serde_json::Value> {
+    ended["owed"]
+        .as_array()
+        .and_then(|owed| owed.iter().find(|each| each["kind"] == "host_close"))
+        .map(|each| each["words"].clone())
+}
+
+/// The host loses its connection to OpenAI and cannot restore it, and its own hang-up is lost: its
+/// call ends with the provider's close unconfirmed.
+fn lose_the_provider(openai: &OpenAi) {
+    for _ in 0..2 {
+        openai.script_hangup(kr_client::services::own_voice::stand_in::HangupScript::Lost);
+    }
+    for _ in 0..200 {
+        openai.fail_attach(kr_client::services::own_voice::AttachFault::Unavailable);
+    }
+    openai.drop_socket();
+}
+
+/// The host's sweep, run at once in place of at its tick, until its call is out of its list.
+async fn sweep_the_hosts_call(scene: &Scene) {
+    let voice = scene.host().controller().voice();
+    tokio::time::timeout(WATCHDOG, async {
+        while voice.coordinator().live_sessions() != 0 {
+            voice.tick(now_ms()).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host's sweep took the call out of its list");
+}
+
+/// The provider tells the host that it closed the call, so the host's own close is confirmed.
+fn the_provider_closes_the_call(openai: &OpenAi) {
+    openai.event(&json!({
+        "type": "session.closed", "event_id": "e-1", "reason": "expired",
+        "session": { "id": "live_1", "model": "gpt-live-1", "status": "active", "expires_at": 1 },
+        "usage": { "seconds": 3 },
+    }));
+}
+
+/// Waits until the phone's heartbeat has read the end of the host's call and stopped: the requests
+/// of its control to the host stop growing.
+async fn until_the_heartbeats_stop(scene: &Scene) {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let before = scene.link.sent(HostMethod::VoiceControl);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            if scene.link.sent(HostMethod::VoiceControl) == before {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("the phone's heartbeat read the end of the host's call");
+}
+
+/// The close that the host tells while this phone's stop waits is read from the news the phone's
+/// control held, whichever word it holds, when the host then refuses the stop: a call the host
+/// said OpenAI closed is closed by the host, and one it could not confirm is left to it, in the
+/// host's words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_close_the_host_tells_while_the_phones_stop_waits_is_read_when_the_stop_is_refused() {
+    for confirmed in [true, false] {
+        let mut scene = own_scene(own_timings()).await;
+        let openai = scene.openai.clone().expect("an own-key scene");
+        start_own_call(&scene).await;
+
+        // Native code ends the call, whose cause says nothing of the host's close, and the stop
+        // to the host waits.
+        scene.link.hold_next_request(HostMethod::VoiceStop);
+        scene.platform.tell(CallEvent::Ended);
+        scene.link.until_request_held().await;
+        // The host's call ends meanwhile, and the phone's heartbeat reads its end.
+        if confirmed {
+            the_provider_closes_the_call(&openai);
+        } else {
+            lose_the_provider(&openai);
+            sweep_the_hosts_call(&scene).await;
+        }
+        until_the_heartbeats_stop(&scene).await;
+        scene.link.refuse_request(Some((
+            HostMethod::VoiceStop,
+            kr_protocol::error::ProtocolError::new(
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "The host did not look at the call.",
+            ),
+        )));
+        scene.link.release_request();
+
+        let ended = scene
+            .state_where("the end native code brought", |state| {
+                state["ended"]["cause"] == "native_ended"
+            })
+            .await;
+        if confirmed {
+            assert_eq!(ended["ended"]["words"], NATIVE_ENDED_WORDS, "{ended}");
+            assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+            assert_eq!(left_to_host_notice(&ended), None, "{ended}");
+        } else {
+            assert_eq!(
+                ended["ended"]["words"],
+                format!("{NATIVE_ENDED_WORDS} {HOST_UNCONFIRMED_WORDS}"),
+                "{ended}"
+            );
+            assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+            assert_eq!(
+                left_to_host_notice(&ended),
+                Some(json!(HOST_UNCONFIRMED_WORDS)),
+                "{ended}"
+            );
+        }
+        scene.stop_host().await;
+    }
+}
+
+/// A stop whose answer confirms nothing while the host is still closing the call is followed by
+/// the host's final status: the call the host then says OpenAI closed is closed by the host, and
+/// the person is told only that they ended it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_that_revokes_the_grant_while_the_host_still_closes_the_call_finds_the_close_confirmed()
+ {
+    let mut scene = own_scene(own_timings()).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
+    // OpenAI does not confirm the close on the side channel, and the host's hang-up is held: the
+    // host answers the stop with the grant revoked and nothing confirmed, and closes the call
+    // when the hang-up goes.
+    openai.answer_close(false);
+    let release = Arc::new(tokio::sync::Notify::new());
+    openai.script_hangup(
+        kr_client::services::own_voice::stand_in::HangupScript::Held(
+            Arc::clone(&release),
+            Box::new(
+                kr_client::services::own_voice::stand_in::HangupScript::Answer(
+                    200,
+                    Some(Vec::new()),
+                ),
+            ),
+        ),
+    );
+    start_own_call(&scene).await;
+    let link = Arc::clone(&scene.link);
+    let letting_go = tokio::spawn(async move {
+        link.until_the_host_answers(1, HostMethod::VoiceStop).await;
+        release.notify_one();
+    });
+
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("the end the person asked for", |state| {
+            state["ended"]["cause"] == "requested"
+        })
+        .await;
+    letting_go.await.expect("the hang-up was let go");
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    assert_eq!(
+        ended["ended"]["host"]["broker_notified"], false,
+        "the stop's own answer confirmed nothing: {ended}"
+    );
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    assert_eq!(ended["ended"]["words"], "You ended the call.", "{ended}");
+    assert_eq!(left_to_host_notice(&ended), None, "{ended}");
+    scene.stop_host().await;
+}
+
+/// The look for the final status ends at the bound the device keeps for it: a host that still
+/// closes the call then is not asked any more, and the call is left to the host in its own words,
+/// though the host closes it a moment later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_is_still_closing_the_call_at_the_bound_of_the_look_leaves_it_to_the_host() {
+    let timings = Timings {
+        final_status_beat: Duration::from_millis(100),
+        final_status_within: Duration::from_secs(1),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
+    openai.answer_close(false);
+    let release = Arc::new(tokio::sync::Notify::new());
+    openai.script_hangup(
+        kr_client::services::own_voice::stand_in::HangupScript::Held(
+            Arc::clone(&release),
+            Box::new(
+                kr_client::services::own_voice::stand_in::HangupScript::Answer(
+                    200,
+                    Some(Vec::new()),
+                ),
+            ),
+        ),
+    );
+    start_own_call(&scene).await;
+    // The hang-up goes a few seconds after the host has answered the stop, and so after the look's
+    // bound of one second.
+    let link = Arc::clone(&scene.link);
+    let late = tokio::spawn(async move {
+        link.until_the_host_answers(1, HostMethod::VoiceStop).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        release.notify_one();
+    });
+
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("the end the person asked for", |state| {
+            state["ended"]["cause"] == "requested"
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+    assert_eq!(
+        ended["ended"]["words"],
+        format!("You ended the call. {HOST_UNCONFIRMED_WORDS}"),
+        "{ended}"
+    );
+    assert_eq!(
+        left_to_host_notice(&ended),
+        Some(json!(HOST_UNCONFIRMED_WORDS)),
+        "{ended}"
+    );
+    late.await.expect("the hang-up was let go");
+    scene.stop_host().await;
+}
+
+/// What a person is told when the phone could not find the call at the host and the host has since
+/// said that OpenAI closed it.
+const HOST_FOUND_CLOSED_WORDS: &str = "This phone could not find the call at the host, so the call ended on this phone. The host has since said that OpenAI closed the call.";
+
+/// A call the host ended and told the close of is closed by the host, though the answer to the
+/// phone's stop is lost: the word the host's news told stands, and the person is told only the
+/// cause.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_the_host_ended_and_told_the_close_of_is_closed_by_the_host_though_its_stop_is_not_answered()
+ {
+    let mut scene = own_scene(own_timings()).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
+    start_own_call(&scene).await;
+    scene.link.lose_the_answer_to(Some(HostMethod::VoiceStop));
+    the_provider_closes_the_call(&openai);
+
+    let ended = scene
+        .state_where("the end the host's news brings", |state| {
+            state["ended"]["cause"] == "provider_closed"
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "not_told", "{ended}");
+    assert_eq!(
+        ended["ended"]["words"], "OpenAI closed the call.",
+        "{ended}"
+    );
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    assert_eq!(left_to_host_notice(&ended), None, "{ended}");
+    scene.stop_host().await;
+}
+
+/// A stop sent after the connection the call began on has dropped, and the look for the final
+/// status that follows it, go over the connection that replaces it: the host's call, closed by
+/// OpenAI and swept before the stop, is found closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_after_the_connection_dropped_and_the_look_for_the_close_use_the_connection_that_replaced_it()
+ {
+    let timings = Timings {
+        final_status_beat: Duration::from_millis(100),
+        final_status_within: Duration::from_secs(3),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
+    start_own_call(&scene).await;
+    scene.link.end_live_connections();
+    the_provider_closes_the_call(&openai);
+    sweep_the_hosts_call(&scene).await;
+
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    let ended = scene
+        .state_where("the end the person asked for", |state| {
+            state["ended"]["cause"] == "requested"
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "not_held", "{ended}");
+    assert_eq!(ended["ended"]["words"], "You ended the call.", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    assert_eq!(left_to_host_notice(&ended), None, "{ended}");
+    scene.stop_host().await;
+}
+
+/// An owner that fails after the host revoked the grant asks the host for the final status of the
+/// call, and the end is told by the host's word. `closes` says whether the host closes the call
+/// within the look's bound.
+async fn an_owner_fails_after_the_host_revoked_the_grant(closes: bool) {
+    let timings = Timings {
+        final_status_beat: Duration::from_millis(100),
+        final_status_within: Duration::from_secs(1),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    let openai = scene.openai.clone().expect("an own-key scene");
+    // The host's hang-up is held, so its answer to the stop confirms nothing.
+    openai.answer_close(false);
+    let release = Arc::new(tokio::sync::Notify::new());
+    openai.script_hangup(
+        kr_client::services::own_voice::stand_in::HangupScript::Held(
+            Arc::clone(&release),
+            Box::new(
+                kr_client::services::own_voice::stand_in::HangupScript::Answer(
+                    200,
+                    Some(Vec::new()),
+                ),
+            ),
+        ),
+    );
+    let prepared = scene.prepared().await;
+    let reach = failing_reach(&scene, FailsAt::Pairing, 0);
+    let calls = scene.phone.companion.app.state::<Calls>();
+    let started = calls
+        .start(
+            own_request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await;
+    assert!(
+        matches!(started, Ok(companion_tauri::voice::Started::Result(_))),
+        "an own-key call starts"
+    );
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+    // The hang-up goes when the host has answered the stop, or only after the look's bound.
+    let link = Arc::clone(&scene.link);
+    let letting_go = tokio::spawn(async move {
+        link.until_the_host_answers(1, HostMethod::VoiceStop).await;
+        if !closes {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+        }
+        release.notify_one();
+    });
+    reach.told.store(1, Ordering::SeqCst);
+
+    let ended = scene
+        .state_where("the owner's failure", |state| {
+            state["ended"]["cause"] == "owner_failed" && state["setting_up"] == false
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    if closes {
+        assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+        assert_eq!(left_to_host_notice(&ended), None, "{ended}");
+    } else {
+        assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+        assert_eq!(ended["ended"]["words"], HOST_UNCONFIRMED_WORDS, "{ended}");
+        assert_eq!(
+            left_to_host_notice(&ended),
+            Some(json!(HOST_UNCONFIRMED_WORDS)),
+            "{ended}"
+        );
+    }
+    letting_go.await.expect("the hang-up was let go");
+    scene.stop_host().await;
+}
+
+/// An owner that fails after the host revoked the grant asks the host for the final status of the
+/// call: a call the host then closes is closed by the host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_fails_after_the_host_revoked_the_grant_finds_the_close_the_host_then_confirms()
+ {
+    an_owner_fails_after_the_host_revoked_the_grant(true).await;
+}
+
+/// A call the host has not closed within the look's bound is left to the host by the failed owner,
+/// in the host's words and with the notice kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_fails_after_the_host_revoked_the_grant_leaves_the_call_to_the_host_that_does_not_close_it_in_time()
+ {
+    an_owner_fails_after_the_host_revoked_the_grant(false).await;
+}
+
+/// A host that does not know the call for one heartbeat but still holds it ends the phone's control
+/// of the call; the phone's stop then reaches the call and the host confirms it closed: the call is
+/// closed by the host, and the person is told that the phone could not find it and the host has
+/// since said that OpenAI closed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_did_not_know_the_call_for_one_heartbeat_and_then_confirms_the_stop_is_found_to_have_closed_it()
+ {
+    let mut scene = own_scene(own_timings()).await;
+    start_own_call(&scene).await;
+    scene.link.answer_the_next_control_as_unknown_call();
+
+    let ended = scene
+        .state_where("the end the lost call brings", |state| {
+            state["ended"]["cause"] == "host_lost_call"
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    assert_eq!(
+        ended["ended"]["host"]["broker_notified"], true,
+        "the host's own answer to the stop confirmed the close: {ended}"
+    );
+    assert_eq!(ended["ended"]["words"], HOST_FOUND_CLOSED_WORDS, "{ended}");
+    assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+    assert_eq!(left_to_host_notice(&ended), None, "{ended}");
+    scene.stop_host().await;
+}
+
+/// A call given up while native code has not yet accepted it, after the host closed and swept it,
+/// is ended through the owner: the stop finds no call at the host, the look for the final status
+/// finds the close, and the person is told by its word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_given_up_in_its_setup_looks_for_the_close_of_the_call_the_host_swept() {
+    for confirmed in [true, false] {
+        let mut scene = own_scene(own_timings()).await;
+        let openai = scene.openai.clone().expect("an own-key scene");
+        scene.platform.hold("accept");
+        let _holding = scene.platform.release_when_done("accept");
+        let prepared = scene.prepared().await;
+        let starting = scene
+            .phone
+            .companion
+            .start_call("voice_start", scene.own_start_request(&prepared));
+        tokio::time::timeout(WATCHDOG, async {
+            while scene.platform.count("accept") == 0 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("native code was asked to accept the call");
+        // The host closes the call, and sweeps it, before the call is up.
+        if confirmed {
+            the_provider_closes_the_call(&openai);
+        } else {
+            lose_the_provider(&openai);
+        }
+        sweep_the_hosts_call(&scene).await;
+
+        let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+        scene.platform.release("accept");
+        let _ = starting.await;
+        let ended = scene
+            .state_where("the end of the call given up", |state| {
+                state["setting_up"] == false && !state["ended"].is_null()
+            })
+            .await;
+        assert_eq!(ended["ended"]["cause"], "requested", "{ended}");
+        assert_eq!(ended["ended"]["host"]["kind"], "not_held", "{ended}");
+        if confirmed {
+            assert_eq!(ended["ended"]["words"], "You ended the call.", "{ended}");
+            assert_eq!(ended["ended"]["broker"], "closed_by_host", "{ended}");
+            assert_eq!(left_to_host_notice(&ended), None, "{ended}");
+        } else {
+            assert_eq!(
+                ended["ended"]["words"],
+                format!("You ended the call. {HOST_UNCONFIRMED_WORDS}"),
+                "{ended}"
+            );
+            assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+            assert_eq!(
+                left_to_host_notice(&ended),
+                Some(json!(HOST_UNCONFIRMED_WORDS)),
+                "{ended}"
+            );
+        }
+        scene.stop_host().await;
+    }
+}
+
+/// A host the person forgets while a call on its key runs is not asked to stop the call: the call
+/// ends on this phone, all the phone can say is the host's own rule, and the notice of it is kept
+/// with the revocation the host is owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_the_host_of_an_own_key_call_leaves_the_call_to_the_hosts_own_rule_and_keeps_the_notice()
+ {
+    let timings = Timings {
+        host_within: Duration::from_secs(3),
+        ..own_timings()
+    };
+    let mut scene = own_scene(timings).await;
+    start_own_call(&scene).await;
+    let reference = scene
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen")["hosts"][0]["reference"]
+        .clone();
+    scene.stop_host().await;
+    scene
+        .state_where("a host that is lost", |state| state["host"] == "lost")
+        .await;
+    scene
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the host is forgotten");
+
+    let ended = scene
+        .state_where("the end", |state| {
+            state["ended"]["cause"] == "host_forgotten" && state["setting_up"] == false
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "not_told", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "left_to_host", "{ended}");
+    assert_eq!(
+        ended["ended"]["words"],
+        format!(
+            "This device no longer holds the pairing with the host the call belongs to, so the call was ended. {LEFT_TO_HOST_WORDS}"
+        ),
+        "{ended}"
+    );
+    assert_eq!(
+        left_to_host_notice(&ended),
+        Some(json!(LEFT_TO_HOST_WORDS)),
+        "{ended}"
+    );
+    assert_eq!(ended["owed"][0]["kind"], "revocation", "{ended}");
+}
