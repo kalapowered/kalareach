@@ -822,10 +822,48 @@ fn stripped(text: &str, keep_literals: bool) -> String {
     out
 }
 
+/// Whether `line` is the attribute of an item that only a test build has: `#[cfg(test)]`, or a
+/// `#[cfg(all(..))]` that has `test` among its own arguments, whatever else it asks for. An `any(..)`
+/// or a `not(..)` can be true in a build that is not a test build, so what it guards is product code.
+fn is_test_cfg(line: &str) -> bool {
+    let Some(predicate) = line
+        .trim_end()
+        .strip_prefix("#[cfg(")
+        .and_then(|rest| rest.strip_suffix(")]"))
+    else {
+        return false;
+    };
+    if predicate.trim() == "test" {
+        return true;
+    }
+    let Some(arguments) = predicate
+        .trim()
+        .strip_prefix("all(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    else {
+        return false;
+    };
+    let mut depth = 0_usize;
+    let mut start = 0;
+    let mut is_test = false;
+    for (at, character) in arguments.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                is_test |= arguments[start..at].trim() == "test";
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    is_test || arguments[start..].trim() == "test"
+}
+
 /// The lines of `text` that the product runs, with their numbers, without their comments, and
-/// without the contents of their string literals. A test module (`#[cfg(test)]` on a `mod`, closed
-/// by a `}` in the first column) is left out wherever it stands, and a `#[cfg(test)]` on anything
-/// else leaves the scan where it is.
+/// without the contents of their string literals. A test module (a `mod` under a `cfg` that only a
+/// test build has, see [`is_test_cfg`], closed by a `}` in the first column) is left out wherever it
+/// stands, and such a `cfg` on anything else leaves the scan where it is.
 fn code_lines(text: &str) -> Vec<Line> {
     let code: Vec<String> = stripped(text, false).lines().map(str::to_owned).collect();
     let literal: Vec<String> = stripped(text, true).lines().map(str::to_owned).collect();
@@ -833,7 +871,7 @@ fn code_lines(text: &str) -> Vec<Line> {
     let mut index = 0;
     while index < code.len() {
         let line = &code[index];
-        if line.trim_end() == "#[cfg(test)]" {
+        if is_test_cfg(line) {
             let mut item = index + 1;
             while code
                 .get(item)
@@ -1499,6 +1537,42 @@ fn the_rule_reads_the_whole_of_a_file_outside_its_test_modules() {
 
     let only_in_the_tests = "fn product() {}\n\n#[cfg(test)]\nmod tests {\n    fn t(refusal: Refusal) {\n        assert!(refusal.code == ErrorCode::A);\n        assert!(refusal.message.contains(\"x\"));\n    }\n}\n";
     assert!(read_by(only_in_the_tests).is_empty());
+}
+
+/// A module under `cfg` that compares a code, after a function of the product.
+fn module_under(cfg: &str) -> String {
+    format!(
+        "fn product() {{}}\n\n{cfg}\nmod tests {{\n    fn t(refusal: Refusal) -> bool {{\n        refusal.code == ErrorCode::PermissionDenied\n    }}\n}}\n"
+    )
+}
+
+/// KR-REQ-19.08: a module that only a test build has is left out whatever else its `cfg` asks for:
+/// `test`, and an `all(..)` that has `test` among its own arguments, in any place.
+#[test]
+fn a_module_that_only_a_test_build_has_is_left_out_whatever_else_its_cfg_asks_for() {
+    for cfg in [
+        "#[cfg(test)]",
+        "#[cfg(all(test, feature = \"testing\"))]",
+        "#[cfg(all(test, unix))]",
+        "#[cfg(all(unix, test))]",
+        "#[cfg(all(unix, feature = \"testing\", test))]",
+    ] {
+        assert!(read_by(&module_under(cfg)).is_empty(), "{cfg}");
+    }
+}
+
+/// KR-REQ-19.08: a module that a build that is not a test build can have is read, in the forms that
+/// ask for `test` among other things.
+#[test]
+fn a_module_that_a_build_that_is_not_a_test_build_can_have_is_read() {
+    for cfg in [
+        "#[cfg(any(test, feature = \"testing\"))]",
+        "#[cfg(all(unix, any(test, windows)))]",
+        "#[cfg(not(test))]",
+        "#[cfg(all(unix, feature = \"testing\"))]",
+    ] {
+        assert_eq!(read_by(&module_under(cfg)), [COMPARED], "{cfg}");
+    }
 }
 
 /// KR-REQ-19.08: the constructions that name a code and read no error pass, and so do comments and
