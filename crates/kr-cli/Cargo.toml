@@ -149,7 +149,9 @@ libc.workspace = true
 rustix = { workspace = true, features = ["event", "pipe", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+# Setup's access lists on its own process, threads and token, its debugger check and its crash-report
+# settings.
+windows-sys = { workspace = true, features = ["Win32_Security_Authorization", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp"] }
 # The release archive of a Windows host: parsed before any signature is checked, so it is read
 # under the bounds of `update::archive`.
 zip.workspace = true

@@ -207,6 +207,366 @@ pub fn wait_for_a_blocked_reader<T>(
     }
 }
 
+#[cfg(windows)]
+pub use protection::ProtectionCalls;
+
+/// Protects this process from other programs of the account: the access lists of its token, its
+/// process and its threads, as [`crate::backup::protect`] says, and the settings that keep a crash
+/// from making a report. The token it opened stays open for as long as the answer is kept.
+///
+/// # Errors
+///
+/// Returns the refusal when a list cannot be set or reads back other than it was set, or when a
+/// debugger is attached.
+#[cfg(windows)]
+pub fn protect_this_process()
+-> Result<crate::backup::protect::Protected<ProtectionCalls>, crate::backup::protect::Refusal> {
+    crate::backup::protect::apply(ProtectionCalls { token: None })
+}
+
+#[cfg(windows)]
+mod protection {
+    use std::io;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, LocalFree,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        GetSecurityInfo, SE_KERNEL_OBJECT, SetSecurityInfo,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation,
+        PROTECTED_DACL_SECURITY_INFORMATION, SetTokenInformation, TOKEN_ADJUST_DEFAULT,
+        TOKEN_DEFAULT_DACL, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenUser,
+    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        CheckRemoteDebuggerPresent, EXCEPTION_POINTERS, IsDebuggerPresent, SetErrorMode,
+        SetUnhandledExceptionFilter,
+    };
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentProcessId, GetProcessIdOfThread, OpenProcessToken, OpenThread,
+        TerminateProcess,
+    };
+
+    use crate::backup::protect::{Calls, Entry, List, Open, Previous, acl_image, entries_of};
+
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const THREAD_QUERY_LIMITED_INFORMATION: u32 = 0x0800;
+    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
+    const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
+    const SEM_NOOPENFILEERRORBOX: u32 = 0x8000;
+
+    /// The system's calls for the protection of this process.
+    pub struct ProtectionCalls {
+        /// The process token, opened once and held to the end of the command.
+        pub(super) token: Option<OwnedHandle>,
+    }
+
+    /// A thread of this process, open.
+    pub struct OpenedThread(OwnedHandle);
+
+    fn checked(ok: i32) -> io::Result<()> {
+        if ok == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn status(code: u32) -> io::Result<()> {
+        if code == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(
+                i32::try_from(code).unwrap_or(i32::MAX),
+            ))
+        }
+    }
+
+    /// The bytes copied into words, so that a structure with pointers in it can be read from them.
+    fn aligned(bytes: &[u8]) -> Vec<u64> {
+        bytes
+            .chunks(8)
+            .map(|chunk| {
+                let mut word = [0_u8; 8];
+                word[..chunk.len()].copy_from_slice(chunk);
+                u64::from_ne_bytes(word)
+            })
+            .collect()
+    }
+
+    /// The entries of the list that `acl` points to, and none for no list.
+    ///
+    /// # Safety
+    ///
+    /// `acl` is null or points to a whole access list that stays valid for the call.
+    unsafe fn entries_at(acl: *const ACL) -> io::Result<List> {
+        if acl.is_null() {
+            return Ok(Vec::new());
+        }
+        // SAFETY: the caller says the list is whole, and its header says how large it is.
+        let image =
+            unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), usize::from((*acl).AclSize)) };
+        entries_of(image).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "an access list that is not a list",
+            )
+        })
+    }
+
+    /// Reads the information of `class` that the token holds, in words that suit a pointer.
+    fn token_information(token: HANDLE, class: i32) -> io::Result<Vec<u64>> {
+        let mut length = 0_u32;
+        // SAFETY: the call is asked only how much room it needs; the handle is open.
+        unsafe { GetTokenInformation(token, class, null_mut(), 0, &raw mut length) };
+        let mut buffer = vec![0_u64; usize::try_from(length).unwrap_or(0).div_ceil(8).max(1)];
+        // SAFETY: the buffer has at least the room that the system asked for.
+        checked(unsafe {
+            GetTokenInformation(
+                token,
+                class,
+                buffer.as_mut_ptr().cast(),
+                length,
+                &raw mut length,
+            )
+        })?;
+        Ok(buffer)
+    }
+
+    fn set_security(handle: HANDLE, list: &[Entry]) -> io::Result<()> {
+        let image = aligned(&acl_image(list));
+        // SAFETY: the handle is open with the right to change the list, and the list is a whole
+        // image that stays alive for the call.
+        status(unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                image.as_ptr().cast(),
+                null(),
+            )
+        })
+    }
+
+    fn get_security(handle: HANDLE) -> io::Result<List> {
+        let mut acl: *mut ACL = null_mut();
+        let mut descriptor = null_mut();
+        // SAFETY: the handle is open with the right to read the list, and the pointers are slots.
+        status(unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_KERNEL_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &raw mut acl,
+                null_mut(),
+                &raw mut descriptor,
+            )
+        })?;
+        // SAFETY: the list lives in the descriptor that the system allocated, which is let go of
+        // only after the entries are copied out.
+        let list = unsafe { entries_at(acl) };
+        // SAFETY: the descriptor was allocated by the call above for the caller to free.
+        unsafe { LocalFree(descriptor) };
+        list
+    }
+
+    fn own_token(held: &Option<OwnedHandle>) -> io::Result<HANDLE> {
+        held
+            .as_ref()
+            .map(|token| token.as_raw_handle().cast())
+            .ok_or_else(|| io::Error::other("the token was not opened"))
+    }
+
+    /// Ends the process at once on an unhandled exception that reaches the filter, so that no
+    /// report is made of it.
+    unsafe extern "system" fn end_at_once(_exception: *const EXCEPTION_POINTERS) -> i32 {
+        // SAFETY: the pseudo-handle of this process always names it.
+        unsafe { TerminateProcess(GetCurrentProcess(), 1) };
+        0
+    }
+
+    impl Calls for ProtectionCalls {
+        type Thread = OpenedThread;
+
+        fn account(&mut self) -> io::Result<Vec<u8>> {
+            let mut token: HANDLE = null_mut();
+            // SAFETY: the pseudo-handle of this process needs no close and the pointer is a slot.
+            checked(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token) })?;
+            // SAFETY: the handle was just opened and nothing else owns it.
+            let token = unsafe { OwnedHandle::from_raw_handle(token.cast()) };
+            let buffer = token_information(token.as_raw_handle().cast(), TokenUser)?;
+            // SAFETY: the buffer holds a `TOKEN_USER`, whose identifier lies in the same buffer.
+            let identifier = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+            // SAFETY: the identifier is whole, and the call only reads it.
+            let length = unsafe { GetLengthSid(identifier) } as usize;
+            // SAFETY: as above, for as many bytes as the identifier says it has.
+            Ok(unsafe { std::slice::from_raw_parts(identifier.cast::<u8>(), length) }.to_vec())
+        }
+
+        fn suppress_crash_reports(&mut self) -> Previous {
+            // SAFETY: the calls take flags and a filter that lives as long as the process.
+            let error_mode = unsafe {
+                SetErrorMode(
+                    SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX,
+                )
+            };
+            // SAFETY: as above.
+            let before = unsafe { SetUnhandledExceptionFilter(Some(end_at_once)) };
+            Previous {
+                error_mode,
+                filter: before.map_or(0, |filter| filter as usize),
+            }
+        }
+
+        fn open_token(&mut self) -> io::Result<()> {
+            let mut token: HANDLE = null_mut();
+            // SAFETY: the pseudo-handle needs no close and the pointer is a slot. The handle is not
+            // inheritable, and is kept in `self` until the command ends.
+            checked(unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | READ_CONTROL | WRITE_DAC,
+                    &raw mut token,
+                )
+            })?;
+            // SAFETY: the handle was just opened and nothing else owns it.
+            self.token = Some(unsafe { OwnedHandle::from_raw_handle(token.cast()) });
+            Ok(())
+        }
+
+        fn set_default_list(&mut self, list: &[Entry]) -> io::Result<()> {
+            let token = own_token(&self.token)?;
+            let image = aligned(&acl_image(list));
+            let information = TOKEN_DEFAULT_DACL {
+                DefaultDacl: image.as_ptr().cast_mut().cast(),
+            };
+            // SAFETY: the token is open for the change and the structure points into a whole list
+            // that stays alive for the call.
+            checked(unsafe {
+                SetTokenInformation(
+                    token,
+                    TokenDefaultDacl,
+                    (&raw const information).cast(),
+                    u32::try_from(std::mem::size_of::<TOKEN_DEFAULT_DACL>()).unwrap_or(0),
+                )
+            })
+        }
+
+        fn default_list(&mut self) -> io::Result<List> {
+            let buffer = token_information(own_token(&self.token)?, TokenDefaultDacl)?;
+            // SAFETY: the buffer holds a `TOKEN_DEFAULT_DACL` whose list lies in the same buffer.
+            unsafe { entries_at((*buffer.as_ptr().cast::<TOKEN_DEFAULT_DACL>()).DefaultDacl) }
+        }
+
+        fn set_token_list(&mut self, list: &[Entry]) -> io::Result<()> {
+            set_security(own_token(&self.token)?, list)
+        }
+
+        fn token_list(&mut self) -> io::Result<List> {
+            get_security(own_token(&self.token)?)
+        }
+
+        fn set_process_list(&mut self, list: &[Entry]) -> io::Result<()> {
+            // SAFETY: the pseudo-handle of this process always has the rights the call needs.
+            set_security(unsafe { GetCurrentProcess() }, list)
+        }
+
+        fn process_list(&mut self) -> io::Result<List> {
+            // SAFETY: as above.
+            get_security(unsafe { GetCurrentProcess() })
+        }
+
+        fn thread_ids(&mut self) -> io::Result<Vec<u32>> {
+            // SAFETY: the call takes integers and returns a handle or an invalid value.
+            let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+            if snapshot.is_null() || snapshot as isize == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the snapshot is open and nothing else owns it.
+            let snapshot = unsafe { OwnedHandle::from_raw_handle(snapshot.cast()) };
+            // SAFETY: the structure is plain data that the calls fill.
+            let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+            entry.dwSize = u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(0);
+            // SAFETY: the call takes no arguments.
+            let own = unsafe { GetCurrentProcessId() };
+            let mut ids = Vec::new();
+            // SAFETY: the snapshot is open and the pointer is a live structure.
+            let mut more =
+                unsafe { Thread32First(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
+            while more {
+                if entry.th32OwnerProcessID == own {
+                    ids.push(entry.th32ThreadID);
+                }
+                // SAFETY: as above.
+                more =
+                    unsafe { Thread32Next(snapshot.as_raw_handle().cast(), &raw mut entry) } != 0;
+            }
+            Ok(ids)
+        }
+
+        fn open_thread(&mut self, id: u32, to_write: bool) -> io::Result<Open<OpenedThread>> {
+            let rights = READ_CONTROL
+                | THREAD_QUERY_LIMITED_INFORMATION
+                | if to_write { WRITE_DAC } else { 0 };
+            // SAFETY: the call takes integers and returns a handle or null.
+            let handle = unsafe { OpenThread(rights, 0, id) };
+            if handle.is_null() {
+                let error = io::Error::last_os_error();
+                return match u32::try_from(error.raw_os_error().unwrap_or(0)) {
+                    Ok(ERROR_ACCESS_DENIED) => Ok(Open::Denied),
+                    Ok(ERROR_INVALID_PARAMETER) => Ok(Open::Gone),
+                    _ => Err(error),
+                };
+            }
+            // SAFETY: the handle was just opened and nothing else owns it.
+            Ok(Open::Opened(OpenedThread(unsafe {
+                OwnedHandle::from_raw_handle(handle.cast())
+            })))
+        }
+
+        fn thread_is_ours(&mut self, thread: &OpenedThread) -> io::Result<bool> {
+            // SAFETY: the handle is open with the query right the call needs.
+            let owner = unsafe { GetProcessIdOfThread(thread.0.as_raw_handle().cast()) };
+            if owner == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the call takes no arguments.
+            Ok(owner == unsafe { GetCurrentProcessId() })
+        }
+
+        fn set_thread_list(&mut self, thread: &OpenedThread, list: &[Entry]) -> io::Result<()> {
+            set_security(thread.0.as_raw_handle().cast(), list)
+        }
+
+        fn thread_list(&mut self, thread: &OpenedThread) -> io::Result<List> {
+            get_security(thread.0.as_raw_handle().cast())
+        }
+
+        fn debugger_present(&mut self) -> bool {
+            // SAFETY: the call takes no arguments.
+            if unsafe { IsDebuggerPresent() } != 0 {
+                return true;
+            }
+            let mut attached = 0_i32;
+            // SAFETY: the pseudo-handle names this process and the pointer is a slot.
+            let asked =
+                unsafe { CheckRemoteDebuggerPresent(GetCurrentProcess(), &raw mut attached) };
+            asked != 0 && attached != 0
+        }
+    }
+}
+
 #[cfg(not(unix))]
 pub use console::{ControllingTerminal, SavedModes};
 
@@ -732,7 +1092,11 @@ mod tests {
         });
         drop(ended);
         assert!(!waited.still_running);
-        assert_eq!(asked.load(Ordering::SeqCst), 0, "no cancel in the first second");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "no cancel in the first second"
+        );
     }
 
     /// A thread that does not end within the wait is left, and the wait says so, without joining it.

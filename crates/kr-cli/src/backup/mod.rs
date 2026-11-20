@@ -6,6 +6,7 @@
 //! | `setup` (Unix) | The owner's setup: the plan, the kit shown once, the daemon's call and its outcomes |
 //! | [`restore`] | The restore itself: the plan, its digest, the confirmation, the files, the record |
 //! | [`kit`] | Reading the recovery kit from a file, a pipe or the terminal, and clearing it |
+//! | [`protect`] | The access lists that keep other programs of the account from setup on Windows |
 //! | [`directory`] | The folder the files go into, held open for the run |
 //! | [`source`] | The control daemon's relay as the place ciphertext is read from |
 //! | [`interrupt`] | What ends a run early |
@@ -13,6 +14,7 @@
 pub mod directory;
 pub mod interrupt;
 pub mod kit;
+pub mod protect;
 pub mod restore;
 #[cfg(unix)]
 pub mod setup;
