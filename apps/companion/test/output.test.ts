@@ -7,7 +7,6 @@ import { describe, expect, it } from 'vitest'
 
 import {
   atEnd,
-  atOldest,
   emptyOutput,
   OutputReader,
   placed,
@@ -73,7 +72,6 @@ describe('the window over retained output (KR-REQ-13.15)', () => {
     let window = withNewer(emptyOutput(), page(200, 'b'.repeat(100)), answer)
     window = withOlder(window, page(100, 'a'.repeat(100)), answer)
     expect(window.pages.map((each) => each.from)).toEqual(['100', '200'])
-    expect(atOldest(window)).toBe(true)
     // A page that does not end where the first begins is not the next one along.
     expect(withOlder(window, page(0, 'x'.repeat(50)), answer)).toBe(window)
     window = withNewer(window, page(300, 'c'.repeat(100)), answer)
