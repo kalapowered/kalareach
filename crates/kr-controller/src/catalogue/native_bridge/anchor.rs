@@ -968,7 +968,7 @@ mod tests {
                 allows,
             },
         };
-        let said = |refusal: Option<ControllerError>| detail(refusal.expect("refused"));
+        let said = |refusal: Option<ControllerError>| refusal.map(detail);
         let plain = protection(501, 20, 0o600, &[], false);
         assert!(
             copy_refusal(&plain, None, path).is_none(),
@@ -984,7 +984,7 @@ mod tests {
                 None,
                 path
             )),
-            detail(new_file_listed(path)),
+            Some(detail(new_file_listed(path))),
             "a new file with an allow entry"
         );
         let unreadable_copy = Protection {
@@ -994,7 +994,7 @@ mod tests {
         for existing in [None, Some(&plain)] {
             assert_eq!(
                 said(copy_refusal(&unreadable_copy, existing, path)),
-                detail(unreadable(path, path)),
+                Some(detail(unreadable(path, path))),
                 "a list that cannot be read"
             );
         }
@@ -1010,7 +1010,7 @@ mod tests {
         ] {
             assert_eq!(
                 said(copy_refusal(&plain, Some(&other), path)),
-                detail(copy_differs(path)),
+                Some(detail(copy_differs(path))),
                 "{what}"
             );
         }

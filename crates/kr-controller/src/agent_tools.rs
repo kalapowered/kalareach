@@ -6341,10 +6341,13 @@ mod tests {
                 })
                 .collect();
         });
-        walk.write(&place, b"one", 0o640, None).expect("a new file");
+        let written = walk.write(&place, b"one", 0o666, None);
+        assert!(written.is_ok(), "a new file is written: {written:?}");
+        // A mode with the write bits of the group and of every user is one that a creation mask
+        // narrows, so a staged file that is not given its mode again shows the narrower one.
         assert_eq!(
             *seen.borrow(),
-            [(true, 0o640)],
+            [(true, 0o666)],
             "one temporary entry stands beside the place: a regular file of the staged mode"
         );
     }
@@ -6372,7 +6375,11 @@ mod tests {
             .expect("opens")
             .expect("a root");
         let place = shared.join("doc.json");
-        walk.write(&place, b"one", 0o644, None).expect("a new file");
+        let written = walk.write(&place, b"one", 0o644, None);
+        assert!(
+            written.is_ok(),
+            "a new file that carries what its folder passes to files is written: {written:?}"
+        );
         let entries = exacl::getfacl(&place, None).expect("its list");
         assert_eq!(
             entries.len(),

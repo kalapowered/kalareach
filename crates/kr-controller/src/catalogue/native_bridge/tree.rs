@@ -950,6 +950,10 @@ mod platform {
                 "a group that is not the user's primary"
             );
             assert!(
+                !is_private_group(alone, "ana:x:100:\n", 1000, 100),
+                "a group named after the user, with no other member, that is not the user's primary"
+            );
+            assert!(
                 !is_private_group(alone, groups, 4242, 4242),
                 "a user the file does not know"
             );
