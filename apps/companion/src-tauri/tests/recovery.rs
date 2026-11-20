@@ -1746,7 +1746,7 @@ async fn publish_generation(
 
     // The generation, sealed for the recovery recipient.
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
-    assert!(recipients.add_recovery(&seed.recipient().expect("a recipient")));
+    assert!(recipients.add(*seed.recipient().expect("a recipient").public()));
     let staged: Vec<_> = members
         .iter()
         .enumerate()

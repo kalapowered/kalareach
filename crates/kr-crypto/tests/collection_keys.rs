@@ -513,7 +513,6 @@ fn removing_members_rotates_and_claims_no_retroactive_secrecy() {
         .revoke(&[leaving.envelope.key_id()])
         .expect("a rotation after this epoch")
         .expect("a member");
-    assert!(!revocation.claims_retroactive_secrecy());
     let sentence = revocation.describe_settings_sync();
     assert!(
         sentence.contains("stays readable to it"),

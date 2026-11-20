@@ -2980,7 +2980,7 @@ async fn a_restore_with_only_the_kit_reaches_the_archive_and_trusts_only_the_bun
 
     // A recovery-enabled collection wraps its manifest key for the recovery recipient.
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
-    assert!(recipients.add_recovery(&recovery));
+    assert!(recipients.add(*recovery.public()));
     let staged = stage_object(
         &ObjectSource {
             object_id: BackupObjectId::new(Uuid::from_bytes([0x21; 16])),

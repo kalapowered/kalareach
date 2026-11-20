@@ -7,7 +7,7 @@
 
 use kr_protocol::scalars::Nonce192;
 
-use crate::error::{CryptoError, Result};
+use crate::error::Result;
 use crate::secret::{SecretVec, SymmetricKey};
 use crate::sodium;
 
@@ -62,25 +62,10 @@ pub const fn sealed_len(plaintext_len: usize) -> usize {
     plaintext_len + TAG_LEN
 }
 
-/// Returns the plaintext length a ciphertext of `ciphertext_len` bytes carries.
-///
-/// # Errors
-///
-/// Returns [`CryptoError::Truncated`] when the ciphertext is shorter than one tag.
-pub const fn opened_len(ciphertext_len: usize) -> Result<usize> {
-    match ciphertext_len.checked_sub(TAG_LEN) {
-        Some(len) => Ok(len),
-        None => Err(CryptoError::Truncated {
-            what: "an XChaCha20-Poly1305 ciphertext",
-            minimum: TAG_LEN,
-            actual: ciphertext_len,
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CryptoError;
 
     #[test]
     fn a_sealed_message_opens_under_the_same_additional_data() {
@@ -115,14 +100,5 @@ mod tests {
         let (first, _) = seal(&key, b"", b"x").expect("a ciphertext");
         let (second, _) = seal(&key, b"", b"x").expect("a ciphertext");
         assert_ne!(first, second);
-    }
-
-    #[test]
-    fn a_ciphertext_shorter_than_a_tag_is_truncated() {
-        assert!(matches!(
-            opened_len(TAG_LEN - 1),
-            Err(CryptoError::Truncated { .. })
-        ));
-        assert_eq!(opened_len(TAG_LEN), Ok(0));
     }
 }

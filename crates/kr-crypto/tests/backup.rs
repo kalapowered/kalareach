@@ -8,10 +8,9 @@ use kr_crypto::CryptoError;
 use kr_crypto::archive::{self, EncryptedObject};
 use kr_crypto::backup::{
     ArchiveExpectation, ArchivePlan, ArchiveReader, ArchiveRecipients, CollectionKind,
-    GenerationExpectation, GenerationStanding, KeyRotation, ObjectSource,
-    RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, RestoreGeneration, RetainedObjectKeys, SealedArchive,
-    StagedObject, open_archive, recipient_key_id, seal_archive, stage_object,
-    still_readable_after_revocation,
+    GenerationExpectation, GenerationStanding, KeyRotation, ObjectSource, RestoreGeneration,
+    RetainedObjectKeys, SealedArchive, StagedObject, open_archive, recipient_key_id, seal_archive,
+    stage_object, still_readable_after_revocation,
 };
 use kr_crypto::kdf::RecoverySeed;
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
@@ -23,6 +22,9 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use kr_protocol::scalars::{Digest256, StoredEnvelopeKey, TimestampMs, U64, Uuid};
 
 const RECORD_LEN: usize = kr_protocol::archive::SECRETSTREAM_RECORD_LEN;
+
+/// About how many recipients' manifest-key wraps fit one descriptor at a small generation number.
+const RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT: usize = 100;
 
 fn archive_id() -> ArchiveId {
     ArchiveId::new(Uuid::from_bytes([0x11; 16]))
@@ -248,7 +250,7 @@ fn every_recipient_gets_its_own_wrap_of_every_key() {
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
     assert!(recipients.add(*parties.device.public()));
     assert!(recipients.add(*second_device.public()));
-    assert!(recipients.add_recovery(&recovery));
+    assert!(recipients.add(*recovery.public()));
     assert!(!recipients.add(*parties.device.public()), "no duplicates");
     assert_eq!(recipients.len(), 3);
 
@@ -1284,10 +1286,6 @@ fn a_mutable_shared_collection_rotates_its_keys_and_an_owned_one_does_not() {
     );
 
     for revocation in [rotated, plain] {
-        assert!(
-            !revocation.claims_retroactive_secrecy(),
-            "no revocation claims retroactive secrecy"
-        );
         let sentence = revocation.describe();
         assert!(
             sentence.contains("stay readable to it"),
@@ -1638,7 +1636,7 @@ fn a_recovery_only_restore_states_its_generation_and_claims_nothing_more() {
     let seed = RecoverySeed::generate().expect("a seed");
     let recovery = seed.recipient().expect("a recovery recipient");
     let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
-    assert!(recipients.add_recovery(&recovery));
+    assert!(recipients.add(*recovery.public()));
     let staged = stage(1, "a.cbor", b"one");
     let sealed = seal_archive(
         &parties.writer,

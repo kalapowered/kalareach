@@ -334,12 +334,6 @@ impl ChallengeLedger {
     pub fn is_empty(&self) -> bool {
         self.outstanding.is_empty()
     }
-
-    /// Returns how many consumed challenges are still remembered.
-    #[must_use]
-    pub fn retained_consumed(&self) -> usize {
-        self.consumed.len()
-    }
 }
 
 /// Returns the domain the transcript is separated by, for callers that record it.
@@ -587,7 +581,7 @@ mod tests {
             }
         }
         assert_eq!(ledger.len(), 0);
-        assert!(ledger.retained_consumed() <= 4);
+        assert!(ledger.consumed.len() <= 4);
     }
 
     /// KR-REQ-23.16: a set of proofs is accepted once.

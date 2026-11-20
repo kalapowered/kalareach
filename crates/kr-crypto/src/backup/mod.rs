@@ -30,7 +30,7 @@
 //!
 //! Section 20 gives the public descriptor two defaults: 64 KiB and 128 recipients. The first
 //! applicable one binds, and in this encoding that is the byte limit, at about
-//! [`RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT`] recipients rather than at 128, because a sealed key wrap
+//! a hundred recipients rather than at 128, because a sealed key wrap
 //! carries its whole authenticated context beside the box. The exact figure moves with the
 //! generation's integer width, so [`seal_archive`] enforces the encoded size rather than a count
 //! and names the limit it hit.
@@ -71,8 +71,7 @@ pub use crate::backup::members::{
     member_material,
 };
 pub use crate::backup::produce::{
-    ArchivePlan, ObjectSource, RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, SealedArchive, StagedObject,
-    seal_archive, stage_object,
+    ArchivePlan, ObjectSource, SealedArchive, StagedObject, seal_archive, stage_object,
 };
 pub use crate::backup::recipients::{
     ArchiveRecipients, CollectionKind, KeyRotation, RetainedObjectKeys, Revocation,
