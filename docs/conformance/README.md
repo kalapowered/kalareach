@@ -362,26 +362,37 @@ given a pattern of `*`, `?` and `[...]`. `--workspace` or `--all` takes every me
 removes the members that match. Cargo ignores `-p` beside `--workspace`, and so does the report.
 
 With no target flag, a step covers each selected package's targets that the manifest says `cargo
-test` builds: the library, the binaries and the integration tests, and an example that sets
-`test = true`. `--tests` selects the same set. `--bins`, `--examples`, `--all-targets`, `--bin`,
-`--test`, `--bench` and `--example` select a target whatever its manifest says. `--benches` selects
-the library, every binary and the benchmarks, `--lib` selects the library, and `--doc` selects no
-target. A test of the report builds 29 commands in three workspaces with `cargo test --no-run
---message-format=json` and requires the covered set to equal the targets Cargo builds. Cargo refuses
-`--doc` with `--no-run`, so unit cases cover that flag.
+test` builds: the library, the binaries and the integration tests, and an example or a benchmark that
+sets `test = true`. A test name with no target flag makes Cargo build the library whatever its `test`
+key says, then the same targets. `--tests` selects every target that is tested, of any kind.
+`--benches` selects every target that is benchmarked: the library, the binaries and the benchmarks
+unless their manifest says `bench = false`, and a test or an example that sets `bench = true`.
+`--all-targets` selects the library, every binary and every example, and what `--tests` and
+`--benches` select. `--lib` selects the library. `--bins`, `--examples`, `--bin`, `--example`,
+`--test` and `--bench` select targets whatever their manifest says, and the singular flags take a name
+or a pattern of `*`, `?` and `[...]`. A test of the report builds 200 commands in five workspaces
+with `cargo test --no-run --message-format=json` and requires the covered set to equal the targets
+Cargo builds.
 
-The report does not read feature flags, `--target`, a `bench = false` entry in a manifest or a
-target's `required-features`. A target that Cargo leaves out for one of these counts as covered, and
-its tests read as not run, because no listing returned them.
+A target with `required-features` is covered only when the command turns on each one: with
+`--all-features`; with `--features` naming it, or a feature that enables it, as `f` or
+`<package>/f`; through the package's `default` feature, unless `--no-default-features` is given; or
+through a dev-dependency of the package on itself. Cargo can turn a feature on in other ways, such as
+through another workspace member. The report does not read those, and a target that Cargo then
+builds shows as a problem of the result. `--target` does not change the selection; a test's command
+repeats it.
 
 The loader refuses a step that reads the output of `cargo test` and gives a command the report
 cannot read. These are a command that is not `cargo test`, which includes `cargo +nightly test` and
 any other program, `--manifest-path` (the directory is the workspace), `-Z`, `--exclude` without
-`--workspace`, a flag that `cargo test --help` does not list, a flag without its value, a package
-given with a version, a URL or a path, a pattern with a `[` that no `]` closes, and `--doc` beside
-another flag that selects targets. The refusal names the step and the word.
+`--workspace`, a flag that `cargo test --help` does not list, a flag without its value, `--timings`
+with a value, `-h` and `--help`, `--doc`, a package given with a version, a URL or a path, and a
+pattern that Cargo refuses: a `[` that no `]` closes, or a run of `*` that is neither one `*` nor
+the whole pattern `**`. The refusal names the step and the word.
 
-A Rust test that no step ran is not run, and its reason is the first of these that applies:
+A Rust test with the standard harness that no step ran is not run, and its reason is the first of
+these that applies. A target that has a harness of its own has a reason of its own, and this list does
+not apply to it:
 
 - the plan's text for its package, when the platform leaves the package out;
 - `<step> built this target, and no run of it can be read from that step (<why>)`, when a step
@@ -392,8 +403,9 @@ A Rust test that no step ran is not run, and its reason is the first of these th
   no listing returned it;
 - `no step of this selection covers this target`, when the target's workspace holds a selected step,
   and `no step of this selection covers this workspace`, when it holds none. A benchmark reads the
-  plan's text for benchmarks, then `, and` and that sentence, and the reason of a group that runs
-  nothing on the platform follows the sentence after a `;`.
+  plan's text for benchmarks, then `, and` and that sentence. Any other target reads that sentence
+  and, after a `;`, the reason of a group that runs nothing on the platform. A benchmark never
+  reads both.
 
 A step in a directory is named `cd <directory> && <command>` in these reasons.
 
@@ -401,11 +413,16 @@ A target that a step built or ran and that no step of the selection covers is a 
 result: `step <number> built or ran <target>, but no step of this selection covers it: the selection
 rule and Cargo disagree`. The run does not pass.
 
-A test's `command` is the step's that ran it, or the first step that covers its target where none
-did. It begins `cd <directory> && ` when the test's workspace is not the root. It repeats the step's
-variables whose value holds no placeholder, written `NAME=value`, and the step's features and
-profile. A variable whose value holds a placeholder is named in the test's `needs`, because the
-step's own set-up gave it that value.
+A Rust test's `command` is a POSIX shell line. It comes from the step that ran the test or, where
+none did, from the first step that covers its target, narrowed to the test's package, target and
+name. It begins `cd <directory> && ` when the test's workspace is not the root. It repeats the step's
+variables whose value holds no placeholder, written `NAME=value`, and the step's profile, `--target`,
+`--config` and feature flags. The feature flags are cut to what a command for the test's package
+alone accepts: the package's own features and its dependencies' stay, and the features of other
+packages go. The options the step passes the test binary stay with their values, except the filters,
+`--skip`, `--exact`, `--list`, `--show-output` and `--logfile`. A variable whose value holds a
+placeholder is named in the test's `needs`, and an option whose value holds one is left out, because
+the run gives a placeholder its value. The command of a TypeScript test is not changed.
 
 ## How a test names what it proves
 
