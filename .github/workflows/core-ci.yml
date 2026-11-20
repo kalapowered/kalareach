@@ -1609,10 +1609,12 @@ jobs:
       # The companion's recovery commands against the real Windows file system: the kit, its QR code
       # and the offline copy are written to files that take an access list of their own, set before
       # the file is emptied. The cases that read the list grant Authenticated Users to the folder
-      # first, because a folder under the runner's profile passes no such entry down.
-      - name: Test the companion's recovery commands and the access list of a saved kit
+      # first, because a folder under the runner's profile passes no such entry down. The data
+      # folder's case runs here too: the companion's records belong in Local AppData, which stays on
+      # this computer, and not in the roaming folder.
+      - name: Test the companion's recovery commands, the access list of a saved kit and the data folder
         if: ${{ !cancelled() && matrix.part == 'second' }}
-        run: cargo test --locked -p companion-tauri --lib --test recovery
+        run: cargo test --locked -p companion-tauri --lib --test recovery --test data_dir
 
       # The real-worker host tests under cargo, whose own job kills on close and forbids breakaway:
       # each daemon starts its workers through the environment's scheduled task, as the shipping
